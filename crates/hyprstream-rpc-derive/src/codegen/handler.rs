@@ -762,7 +762,29 @@ fn generate_dispatch_fn(
         }
     };
 
+    let leaf_fn_name = format_ident!("derive_leaf_path_{}", to_snake_case(pascal));
+    let leaf_doc = format!(
+        "Derive the full numeric method leaf path for a {pascal} request body.\n\n         Decodes the signed body once and returns the chain of Cap'n Proto union\n         discriminants selecting the leaf. This is the key dispatch resolves the\n         generated method policy with (v16 §5.2). An undecodable body or a\n         discriminant absent from this schema revision returns `None`, which\n         denies — it never falls back to a coarser row."
+    );
+
     quote! {
+        #[doc = #leaf_doc]
+        pub fn #leaf_fn_name(payload: &[u8]) -> Option<Vec<u16>> {
+            use crate::#capnp_mod::#req_snake::Which;
+            let reader = capnp::serialize::read_message(
+                &mut std::io::Cursor::new(payload),
+                capnp::message::ReaderOptions::new(),
+            )
+            .ok()?;
+            let req = reader.get_root::<crate::#capnp_mod::#req_snake::Reader>().ok()?;
+            let discriminant = match req.which().ok()? {
+                #(#method_discriminator_arms)*
+                #[allow(unreachable_patterns)]
+                _ => return None,
+            };
+            Some(vec![discriminant])
+        }
+
         #[doc = #doc]
         pub async fn #fn_name<H: #trait_name>(handler: &H, ctx: &hyprstream_rpc::service::EnvelopeContext, payload: &[u8]) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
             use crate::#capnp_mod::#req_snake::Which;

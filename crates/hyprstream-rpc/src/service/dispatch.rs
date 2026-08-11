@@ -478,17 +478,21 @@ where
     // signed leaf to resolve, and is governed by the legacy checks below until
     // the migration completes.
     if let (Some(proof), Some(verified)) = (parsed_proof.as_ref(), verified_proof.as_ref()) {
-        let leaf_path = match ctx.browser_method_discriminator {
-            Some(method) => method.to_string(),
-            // No derived leaf path: an empty path denies rather than falling
-            // back to a coarser, more permissive row.
-            None => {
-                warn!(
-                    "{} proof-bearing request has no derived leaf path (id={})",
-                    service.name(),
-                    request_id
+        // The leaf comes from the signed body, decoded by the service's own
+        // generated decoder — not from a transport-specific hint such as the
+        // browser transcript's method commitment, which does not exist on
+        // other carriers. An undecodable body, an unknown discriminant, or an
+        // empty path is a denial, never a fall back to a coarser row.
+        let leaf_path = match service.derive_leaf_path(&payload) {
+            Some(path) if !path.is_empty() => path
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join("."),
+            _ => {
+                return dispatch_denied(
+                    "no method leaf derivable from the signed body for this service",
                 );
-                return dispatch_denied("dispatch denied");
             }
         };
         let decision = match crate::proof::policy::global_method_policy() {

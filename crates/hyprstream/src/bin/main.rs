@@ -1916,17 +1916,24 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>)
     // The mesh roster is consulted only to learn which keys already belong to
     // another protocol, so a manifest cannot silently reuse one. Absent
     // manifest, nothing is enrolled and authenticated proofs deny.
-    if let Some(oauth) = oauth {
-        let manifest_path = HyprConfig::resolve_secrets_dir()
-            .map(|dir| dir.join("proof-enrollment.toml"))
-            .ok();
+    {
+        let secrets_dir = HyprConfig::resolve_secrets_dir().ok();
+        let manifest_path = secrets_dir
+            .as_ref()
+            .map(|dir| dir.join("proof-enrollment.toml"));
         match manifest_path {
             Some(path) if path.exists() => {
                 match hyprstream_core::auth::proof_enrollment::ProofEnrollmentManifest::load(&path)
                 {
                     Ok(manifest) => {
+                        // Foreign keys come from every protocol source this
+                        // node holds — the remote mesh roster and its own
+                        // local bootstrap identities alike.
                         let foreign =
-                            hyprstream_core::auth::proof_enrollment::mesh_protocol_keys(oauth);
+                            hyprstream_core::auth::proof_enrollment::foreign_protocol_keys(
+                                oauth,
+                                secrets_dir.as_deref(),
+                            );
                         let entries = manifest.entries.len();
                         let resolver = hyprstream_core::auth::proof_enrollment::build_resolver(
                             &manifest,

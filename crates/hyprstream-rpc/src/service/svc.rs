@@ -728,6 +728,29 @@ pub trait RequestService: 'static {
         payload: &[u8],
     ) -> Result<(Vec<u8>, Option<Continuation>)>;
 
+    /// Derive the full numeric method leaf path from the **signed request
+    /// body**, decoding it exactly once (v16 §5.2 step 4).
+    ///
+    /// The leaf path is the chain of Cap'n Proto union discriminants from the
+    /// root request type down to the selected leaf, so a nested union selects
+    /// a distinct row rather than collapsing onto its parent. It is the key
+    /// dispatch resolves the generated method policy with, and it comes from
+    /// the signed body — never from a transport-specific hint such as the
+    /// browser transcript's method commitment, which does not exist on other
+    /// carriers and is not the signed leaf.
+    ///
+    /// The default returns `None`: a service that has not yet been generated
+    /// against a schema has no leaf to derive, and a proof-bearing request to
+    /// it denies rather than being dispatched under an unresolved policy.
+    /// Requests carrying no proof are unaffected during the migration.
+    ///
+    /// An unknown discriminant, a malformed body, or an empty path is `None`
+    /// — the same denial as an unlisted leaf, never a coarser fallback.
+    fn derive_leaf_path(&self, signed_body: &[u8]) -> Option<Vec<u16>> {
+        let _ = signed_body;
+        None
+    }
+
     /// Service name (for logging and registry).
     fn name(&self) -> &str;
 

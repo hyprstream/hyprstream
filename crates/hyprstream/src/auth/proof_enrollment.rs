@@ -129,11 +129,34 @@ pub fn build_resolver(
     now: u64,
 ) -> InMemoryEnrollmentResolver {
     let mut resolver = InMemoryEnrollmentResolver::new();
+
+    // Component-key separation is not only cross-protocol: within the manifest
+    // a component key may appear exactly once, across every entry, suite,
+    // role, and logical group. A key present twice would let one holder occupy
+    // two logical signers, satisfy a threshold alone, or carry a suite it was
+    // not analysed for — so a repeated key disqualifies *every* entry using
+    // it, not just the later one. Detecting it up front, before enrolling
+    // anything, is what makes that possible.
+    let mut seen: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    for entry in &manifest.entries {
+        for component in &entry.components {
+            if let Ok(public) = hex::decode(&component.public_hex) {
+                *seen.entry(public).or_insert(0) += 1;
+            }
+        }
+    }
+    let reused: HashSet<Vec<u8>> = seen
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(key, _)| key)
+        .collect();
+
     for entry in &manifest.entries {
         match enrol_one(
             &mut resolver,
             entry,
             foreign_protocol_keys,
+            &reused,
             exception_policy_ids,
             now,
         ) {
@@ -153,10 +176,12 @@ pub fn build_resolver(
     resolver
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enrol_one(
     resolver: &mut InMemoryEnrollmentResolver,
     entry: &ManifestEntry,
     foreign_protocol_keys: &HashSet<Vec<u8>>,
+    reused_within_manifest: &HashSet<Vec<u8>>,
     exception_policy_ids: &HashSet<String>,
     now: u64,
 ) -> Result<()> {
@@ -181,9 +206,18 @@ fn enrol_one(
         }
         let public = hex::decode(&component.public_hex).context("public key is not hex")?;
 
-        // Component-key separation (§4.4): a key already enrolled for another
-        // protocol cannot also be a request-proof component, absent an
-        // explicit operator-approved exception policy.
+        // Component-key separation (§4.4). A key may not be shared with
+        // another protocol, and may not appear twice within this manifest —
+        // across entries, suites, roles, or logical groups. Only the
+        // cross-protocol case is waivable, and only under an explicit
+        // operator-approved exception policy; intra-manifest reuse is never
+        // waivable, because no analysis can make one key two logical signers.
+        if reused_within_manifest.contains(&public) {
+            bail!(
+                "component key appears in more than one manifest entry; \
+                 a key is exactly one logical signer"
+            );
+        }
         if foreign_protocol_keys.contains(&public)
             && !exception_policy_ids.contains(&entry.enrollment_policy_id)
         {
@@ -258,23 +292,75 @@ fn enrol_one(
     }
 }
 
-/// The mesh/envelope identity keys this node already trusts for another
-/// protocol, as raw public-key bytes.
+/// Every public key this node already holds for another protocol, as raw
+/// public-key bytes.
 ///
-/// These are exactly the keys a proof enrollment must not silently reuse.
-pub fn mesh_protocol_keys(oauth: &crate::config::OAuthConfig) -> HashSet<Vec<u8>> {
+/// These are exactly the keys a request-proof enrollment must not silently
+/// reuse. The set is deliberately a superset rather than one source: the mesh
+/// peer roster (remote identities) *and* this node's own bootstrap identity
+/// keys (local identities), because reuse is equally a violation in either
+/// direction. Anything unreadable is skipped — a key we cannot decode is not
+/// a key we can prove is foreign, and the cross-protocol check is a refusal,
+/// so a miss here can only make the manifest more permissive, never less
+/// correct about the keys it does know.
+pub fn foreign_protocol_keys(
+    oauth: Option<&crate::config::OAuthConfig>,
+    secrets_dir: Option<&Path>,
+) -> HashSet<Vec<u8>> {
     use hyprstream_rpc::did_key::{decode_multikey, MULTICODEC_ED25519_PUB, MULTICODEC_ML_DSA_65_PUB};
 
     let mut keys = HashSet::new();
-    for peer in oauth.mesh_peers.values() {
-        if let Ok(ed) = decode_multikey(&peer.ed25519_multibase, &MULTICODEC_ED25519_PUB) {
-            keys.insert(ed);
-        }
-        if let Ok(pq) = decode_multikey(&peer.mldsa65_multibase, &MULTICODEC_ML_DSA_65_PUB) {
-            keys.insert(pq);
+
+    // Remote: the admin-anchored mesh peer roster.
+    if let Some(oauth) = oauth {
+        for peer in oauth.mesh_peers.values() {
+            if let Ok(ed) = decode_multikey(&peer.ed25519_multibase, &MULTICODEC_ED25519_PUB) {
+                keys.insert(ed);
+            }
+            if let Ok(pq) = decode_multikey(&peer.mldsa65_multibase, &MULTICODEC_ML_DSA_65_PUB) {
+                keys.insert(pq);
+            }
         }
     }
+
+    // Local: this node's own OS-owned bootstrap public keys, which anchor the
+    // local services' envelope identities.
+    if let Some(dir) = secrets_dir {
+        collect_bootstrap_pubkeys(dir, &mut keys);
+    }
+
     keys
+}
+
+/// Read raw public keys out of the OS-owned bootstrap-pubkeys directory.
+///
+/// The file format is the provisioning wizard's; entries that do not decode as
+/// hex or base64 public keys are ignored rather than guessed at.
+fn collect_bootstrap_pubkeys(secrets_dir: &Path, keys: &mut HashSet<Vec<u8>>) {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let dir = secrets_dir.join("bootstrap-pubkeys");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for token in text.split_whitespace() {
+            if let Ok(bytes) = hex::decode(token) {
+                if bytes.len() == 32 || bytes.len() == 1952 {
+                    keys.insert(bytes);
+                    continue;
+                }
+            }
+            if let Ok(bytes) = STANDARD.decode(token) {
+                if bytes.len() == 32 || bytes.len() == 1952 {
+                    keys.insert(bytes);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +394,101 @@ mod tests {
             service_domain: None,
             components: vec![ed_component(key, "client-1")],
         }
+    }
+
+    /// Two entries sharing a component key disqualify BOTH: no analysis can
+    /// make one key two logical signers, so the reuse is never waivable.
+    #[test]
+    fn a_component_key_reused_across_entries_disqualifies_both() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut approver = primary_entry(&key);
+        approver.principal = "approver".into();
+        approver.role = ManifestRole::Approver;
+        approver.approver_role = Some("security".into());
+
+        let resolver = build(vec![primary_entry(&key), approver]);
+        assert!(
+            resolver.resolve_primary(&key.verifying_key()).is_none(),
+            "the primary entry must be disqualified"
+        );
+        assert!(
+            resolver.resolve_approver(b"client-1").is_none(),
+            "the approver entry must be disqualified too"
+        );
+    }
+
+    /// Reuse across suites is equally forbidden, and an exception policy does
+    /// not waive it — the exception covers cross-protocol reuse only.
+    #[test]
+    fn intra_manifest_reuse_is_not_waivable_by_an_exception_policy() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut hybrid = primary_entry(&key);
+        hybrid.principal = "client-hybrid".into();
+        hybrid.suite_id = hyprstream_rpc::proof::SUITE_HYBRID.into();
+        hybrid.enrollment_policy_id = "approved-overlap".into();
+        let mut classical = primary_entry(&key);
+        classical.enrollment_policy_id = "approved-overlap".into();
+
+        let mut exceptions = HashSet::new();
+        exceptions.insert("approved-overlap".to_owned());
+        let resolver = build_resolver(
+            &ProofEnrollmentManifest {
+                entries: vec![hybrid, classical],
+            },
+            &HashSet::new(),
+            &exceptions,
+            NOW,
+        );
+        assert!(resolver.resolve_primary(&key.verifying_key()).is_none());
+    }
+
+    /// A manifest still loads with no mesh configuration: the foreign set is
+    /// then whatever local material exists, and enrollment is not skipped.
+    #[test]
+    fn a_manifest_loads_without_any_mesh_configuration() {
+        let key = SigningKey::generate(&mut OsRng);
+        let foreign = foreign_protocol_keys(None, None);
+        assert!(foreign.is_empty());
+        let resolver = build_resolver(
+            &ProofEnrollmentManifest {
+                entries: vec![primary_entry(&key)],
+            },
+            &foreign,
+            &HashSet::new(),
+            NOW,
+        );
+        assert!(resolver.resolve_primary(&key.verifying_key()).is_some());
+    }
+
+    /// The node's own bootstrap identity keys are foreign to proof
+    /// enrollment: local reuse is a violation just as remote reuse is.
+    #[test]
+    fn local_bootstrap_keys_count_as_foreign() {
+        let key = SigningKey::generate(&mut OsRng);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bootstrap = dir.path().join("bootstrap-pubkeys");
+        std::fs::create_dir_all(&bootstrap).expect("mkdir");
+        std::fs::write(
+            bootstrap.join("registry"),
+            hex::encode(key.verifying_key().to_bytes()),
+        )
+        .expect("write");
+
+        let foreign = foreign_protocol_keys(None, Some(dir.path()));
+        assert!(foreign.contains(key.verifying_key().to_bytes().as_slice()));
+
+        let resolver = build_resolver(
+            &ProofEnrollmentManifest {
+                entries: vec![primary_entry(&key)],
+            },
+            &foreign,
+            &HashSet::new(),
+            NOW,
+        );
+        assert!(
+            resolver.resolve_primary(&key.verifying_key()).is_none(),
+            "a local envelope identity key must not be enrolled as a proof signer"
+        );
     }
 
     fn build(entries: Vec<ManifestEntry>) -> InMemoryEnrollmentResolver {
@@ -486,7 +667,7 @@ mod tests {
             },
         );
 
-        let foreign = mesh_protocol_keys(&oauth);
+        let foreign = foreign_protocol_keys(Some(&oauth), None);
         assert!(foreign.contains(ed.verifying_key().to_bytes().as_slice()));
 
         // And a manifest that tries to reuse the mesh key is refused.
