@@ -1712,16 +1712,22 @@ impl RequestService for TuiService {
         Some(self.moq_origin.clone())
     }
 
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        // The ONE bounded decode (v16 §5.2): the generated decoder derives
+        // the full method leaf; the hand-written dispatch below reads from
+        // the same decoded message.
+        crate::services::generated::tui_client::decode_tui_request_body(signed_body)
+    }
+
     async fn handle_request(
         &self,
         _ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
-        let reader = serialize::read_message_from_flat_slice(
-            &mut &payload[..],
-            capnp::message::ReaderOptions::default(),
-        )?;
-        let request = reader.get_root::<tui_capnp::tui_request::Reader<'_>>()?;
+        let request = body.root::<tui_capnp::tui_request::Reader<'_>>()?;
         let request_id = request.get_id();
 
         match request.which()? {

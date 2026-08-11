@@ -986,12 +986,21 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl RequestService for EchoService {
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> AnyhowResult<hyprstream_rpc::service::DecodedRequestBody> {
+            Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(
+                signed_body.to_vec(),
+            ))
+        }
+
         async fn handle_request(
             &self,
             _ctx: &hyprstream_rpc::service::EnvelopeContext,
-            payload: &[u8],
+            body: &hyprstream_rpc::service::DecodedRequestBody,
         ) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
-            Ok((payload.to_vec(), None))
+            Ok((body.bytes().to_vec(), None))
         }
 
         fn name(&self) -> &str {

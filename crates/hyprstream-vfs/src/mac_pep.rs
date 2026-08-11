@@ -186,7 +186,7 @@ pub struct DenyUnlabeledResolver;
 
 #[cfg(not(target_arch = "wasm32"))]
 impl RpcObjectLabelResolver for DenyUnlabeledResolver {
-    fn resolve(&self, _service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
+    fn resolve(&self, _service_domain: &str, _method: Option<&[u16]>) -> Option<SecurityLabel> {
         None
     }
 }
@@ -386,7 +386,7 @@ mod tests {
     /// A resolver that labels the first path component as a level (test-only).
     struct PathLevelResolver;
     impl RpcObjectLabelResolver for PathLevelResolver {
-        fn resolve(&self, service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
+        fn resolve(&self, service_domain: &str, _method: Option<&[u16]>) -> Option<SecurityLabel> {
             match service_domain {
                 "/public" => Some(label(Level::Public)),
                 "/secret" => Some(label(Level::Secret)),

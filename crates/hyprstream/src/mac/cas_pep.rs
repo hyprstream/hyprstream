@@ -159,7 +159,7 @@ impl CasObjectLabelResolver {
 }
 
 impl RpcObjectLabelResolver for CasObjectLabelResolver {
-    fn resolve(&self, service_domain: &str, method: Option<u16>) -> Option<SecurityLabel> {
+    fn resolve(&self, service_domain: &str, method: Option<&[u16]>) -> Option<SecurityLabel> {
         if service_domain == CAS_SERVICE_DOMAIN && method.is_none() {
             self.label
         } else {
@@ -576,7 +576,7 @@ mod tests {
         let resolver = CasObjectLabelResolver::from_domain(&DedupDomain::local_default());
         assert!(resolver.resolve(CAS_SERVICE_DOMAIN, None).is_some());
         assert!(resolver.resolve("registry", None).is_none());
-        assert!(resolver.resolve(CAS_SERVICE_DOMAIN, Some(1)).is_none());
+        assert!(resolver.resolve(CAS_SERVICE_DOMAIN, Some(&[1][..])).is_none());
     }
 
     // ── DenyAllClearanceSource ──────────────────────────────────────────────

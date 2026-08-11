@@ -3276,6 +3276,16 @@ impl WorktreeHandler for RegistryService {
 
 #[async_trait(?Send)]
 impl RequestService for RegistryService {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        // The ONE bounded decode (v16 §5.2): the generated decoder derives
+        // the full method leaf and returns the decoded message that policy,
+        // MAC, and dispatch below all consume.
+        crate::services::generated::registry_client::decode_registry_request_body(signed_body)
+    }
+
     fn producer_reach_config_handle(&self) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
         Some(self.reach_config.clone())
     }
@@ -3284,8 +3294,8 @@ impl RequestService for RegistryService {
         Some(self.moq_origin.clone())
     }
 
-    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
-        dispatch_registry(self, ctx, payload).await
+    async fn handle_request(&self, ctx: &EnvelopeContext, body: &hyprstream_rpc::service::DecodedRequestBody,) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
+        dispatch_registry(self, ctx, body).await
     }
 
     fn name(&self) -> &str {

@@ -1845,6 +1845,21 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    // The generated method-policy inventory (v16 §6.1): every linked
+    // generated service module contributed one row per method leaf via
+    // `inventory`; install the validated, deterministically sorted table as
+    // the process policy. A failure installs nothing — proof-bearing dispatch
+    // then denies at policy resolution, never serves a partial table.
+    match hyprstream_rpc::proof::policy::install_generated_method_policy() {
+        Ok(rows) => tracing::info!(
+            "generated dispatch method policy installed ({rows} leaf row(s))"
+        ),
+        Err(e) => tracing::error!(
+            "generated dispatch method policy failed validation/install; \
+             proof-bearing dispatch denies: {e:#}"
+        ),
+    }
+
     // The replay admission domain is an operator statement about deployment
     // topology, not something startup may assume. "Admitted once" means once
     // per service domain, so a node that shares its service domain with other

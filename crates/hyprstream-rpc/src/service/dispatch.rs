@@ -467,7 +467,27 @@ where
         }
     };
 
-    // 2d. Generated per-method signature policy (§5.2 step 5, §4.4). The
+    // 2d. The ONE bounded decode of the request body (§5.2 step 4). The
+    // service's generated decoder decodes the signed bytes exactly once and
+    // derives the full nested numeric leaf path; the same `DecodedRequestBody`
+    // then feeds the generated method policy below, the dispatch MAC PEP, and
+    // finally the handler — no dispatch component re-reads discriminants and
+    // no second decode with different traversal or resource limits can select
+    // a handler. Deliberately placed after signature verification so
+    // unauthenticated garbage cannot trigger Cap'n Proto decode work.
+    let decoded_body = match service.decode_request_body(&payload) {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(
+                "{} request body decode failed (id={}): {e:#}",
+                service.name(),
+                request_id
+            );
+            return dispatch_denied("dispatch denied");
+        }
+    };
+
+    // 2e. Generated per-method signature policy (§5.2 step 5, §4.4). The
     // decoded leaf — not the caller — decides whether this method may be
     // dispatched unattributed at all, which cryptographic suite its primary
     // logical signer must use, and which enrolled approvers must sign.
@@ -483,13 +503,9 @@ where
         // browser transcript's method commitment, which does not exist on
         // other carriers. An undecodable body, an unknown discriminant, or an
         // empty path is a denial, never a fall back to a coarser row.
-        let leaf_path = match service.derive_leaf_path(&payload) {
-            Some(path) if !path.is_empty() => path
-                .iter()
-                .map(u16::to_string)
-                .collect::<Vec<_>>()
-                .join("."),
-            _ => {
+        let leaf_path = match decoded_body.leaf_path_string() {
+            Some(path) => path,
+            None => {
                 return dispatch_denied(
                     "no method leaf derivable from the signed body for this service",
                 );
@@ -538,14 +554,18 @@ where
     // long-running continuations against revoked authority is a DEFERRED
     // follow-up (#1267 scope expansion — `StaleAuthority` variant is reserved
     // for that future gate, not used today).
+    // The MAC object coordinate is the same decoded leaf the generated policy
+    // consumed — never a transport-specific hint such as the browser
+    // transcript's method commitment (v16 §5.1: one derived method identity
+    // feeds policy, PEP, and handler).
     let mac_decision = crate::auth::mac::check_dispatch_mac(
         &ctx,
         actual_service_domain,
-        ctx.browser_method_discriminator,
+        decoded_body.leaf_path(),
     );
     if let crate::auth::mac::MacDecision::Deny(reason) = mac_decision {
-        let mac_resource = match ctx.browser_method_discriminator {
-            Some(method) => format!("{actual_service_domain}:method:{method}"),
+        let mac_resource = match decoded_body.leaf_path_string() {
+            Some(leaf) => format!("{actual_service_domain}:method:{leaf}"),
             None => format!("{actual_service_domain}:*"),
         };
         // S7/#1274: a mandatory-MAC rejection is an authorization decision,
@@ -712,8 +732,9 @@ where
       }
     }
 
-    // 3. Handle request
-    let (response_payload, continuation) = match service.handle_request(&ctx, &payload).await {
+    // 3. Handle request — from the same decoded body the policy and MAC
+    //    gates consumed (v16 §5.1: signed == decoded == handler body).
+    let (response_payload, continuation) = match service.handle_request(&ctx, &decoded_body).await {
         Ok((resp, cont)) => (resp, cont),
         Err(e) => {
             error!("{} request handling error: {}", service.name(), e);

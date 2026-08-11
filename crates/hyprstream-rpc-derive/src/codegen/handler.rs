@@ -116,6 +116,16 @@ pub fn generate_handler(service_name: &str, resolved: &ResolvedSchema, scope_han
         resolved,
     );
 
+    // The ONE bounded signed-body decoder (v16 §5.2): decodes the request
+    // exactly once and derives the full nested method leaf path. Services wire
+    // it through `RequestService::decode_request_body`; the same decoded body
+    // then feeds generated policy, the dispatch MAC PEP, and dispatch below.
+    let body_decoder = super::leaf::generate_body_decoder(service_name, resolved);
+
+    // The method-policy inventory rows (v16 §6.1) — same tree walk as the
+    // decoder, submitted to the process-wide inventory for startup install.
+    let policy_rows = super::leaf::generate_method_policy_rows(service_name, resolved);
+
     quote! {
         #scope_traits
         #scope_serializers
@@ -123,6 +133,8 @@ pub fn generate_handler(service_name: &str, resolved: &ResolvedSchema, scope_han
         #handler_trait
         #dispatch_fn
         #serializer
+        #body_decoder
+        #policy_rows
     }
 }
 
@@ -201,7 +213,7 @@ fn generate_handler_trait(
                     let doc_str = format!("Handle `{}` request (raw bytes for inner dispatch).", v.name);
                     return quote! {
                         #[doc = #doc_str]
-                        async fn #method_name(&self, ctx: &hyprstream_rpc::service::EnvelopeContext, request_id: u64, payload: &[u8]) -> anyhow::Result<Vec<u8>>;
+                        async fn #method_name(&self, ctx: &hyprstream_rpc::service::EnvelopeContext, request_id: u64, body: &hyprstream_rpc::service::DecodedRequestBody) -> anyhow::Result<Vec<u8>>;
                     };
                 }
 
@@ -251,7 +263,7 @@ fn generate_handler_trait(
                     let doc_str = format!("Handle `{}` request (raw bytes for inner dispatch).", v.name);
                     return quote! {
                         #[doc = #doc_str]
-                        async fn #method_name(&self, ctx: &hyprstream_rpc::service::EnvelopeContext, request_id: u64, payload: &[u8]) -> anyhow::Result<Vec<u8>>;
+                        async fn #method_name(&self, ctx: &hyprstream_rpc::service::EnvelopeContext, request_id: u64, body: &hyprstream_rpc::service::DecodedRequestBody) -> anyhow::Result<Vec<u8>>;
                     };
                 }
 
@@ -301,9 +313,9 @@ fn handler_method_params(
         CapnpType::Struct(ref name) => {
             if let Some(sdef) = resolved.find_struct(name) {
                 // Union-only struct (e.g., scope structs like RuntimeRequest):
-                // handler needs raw payload to dispatch the inner union
+                // handler needs the decoded body to dispatch the inner union
                 if sdef.is_pure_union() {
-                    return vec![quote! { payload: &[u8] }];
+                    return vec![quote! { body: &hyprstream_rpc::service::DecodedRequestBody }];
                 }
                 // Option 2: Accept whole struct instead of individual fields
                 let struct_name = format_ident!("{}", name);
@@ -382,15 +394,14 @@ fn generate_dispatch_fn(
                     return quote! {
                         Which::#variant_pascal(_) => {
                             drop(req);
-                            drop(reader);
-                            return #scope_dispatch_fn(handler, ctx, request_id, payload).await;
+                            return #scope_dispatch_fn(handler, ctx, request_id, body).await;
                         }
                     };
                 } else {
                     // Old pattern: pass raw bytes to handler method
                     return quote! {
                         Which::#variant_pascal(_) => {
-                            return Ok((handler.#handler_method(ctx, request_id, payload).await?, None));
+                            return Ok((handler.#handler_method(ctx, request_id, body).await?, None));
                         }
                     };
                 }
@@ -399,9 +410,9 @@ fn generate_dispatch_fn(
             // Union-only struct variants (non-scoped): pass raw bytes, return directly
             if is_union_only_struct_variant(v, resolved) {
                 let call = if scope_handlers {
-                    quote! { #trait_name::#handler_method(handler, ctx, request_id, payload).await }
+                    quote! { #trait_name::#handler_method(handler, ctx, request_id, body).await }
                 } else {
-                    quote! { handler.#handler_method(ctx, request_id, payload).await }
+                    quote! { handler.#handler_method(ctx, request_id, body).await }
                 };
                 return quote! {
                     Which::#variant_pascal(_) => {
@@ -486,7 +497,7 @@ fn generate_dispatch_fn(
                     CapnpType::Struct(ref name) => {
                         if let Some(sdef) = resolved.find_struct(name) {
                             if sdef.is_pure_union() {
-                                let call = call_handler!(payload);
+                                let call = call_handler!(body);
                                 quote! {
                                     Which::#variant_pascal(_) => {
                                         return Ok((#call?, None));
@@ -622,12 +633,12 @@ fn generate_dispatch_fn(
                 },
                 CapnpType::Struct(ref name) => {
                     if let Some(sdef) = resolved.find_struct(name) {
-                        // Union-only struct (e.g., scope structs): pass raw payload
+                        // Union-only struct (e.g., scope structs): pass the decoded body
                         if sdef.is_pure_union() {
                             let call = if scope_handlers {
-                                quote! { #trait_name::#handler_method(handler, ctx, request_id, payload).await }
+                                quote! { #trait_name::#handler_method(handler, ctx, request_id, body).await }
                             } else {
-                                quote! { handler.#handler_method(ctx, request_id, payload).await }
+                                quote! { handler.#handler_method(ctx, request_id, body).await }
                             };
                             return quote! {
                                 Which::#variant_pascal(v) => {
@@ -710,12 +721,12 @@ fn generate_dispatch_fn(
             if scoped_names.contains(&v.name.as_str()) {
                 let scope_dispatch_fn = format_ident!("dispatch_{}", resolved.name(&v.name).snake);
                 quote! {
-                    #disc => return #scope_dispatch_fn(handler, ctx, request_id, payload).await,
+                    #disc => return #scope_dispatch_fn(handler, ctx, request_id, body).await,
                 }
             } else if is_union_only_struct_variant(v, resolved) {
                 let handler_method = format_ident!("handle_{}", resolved.name(&v.name).snake);
                 quote! {
-                    #disc => return Ok((#trait_name::#handler_method(handler, ctx, request_id, payload).await?, None)),
+                    #disc => return Ok((#trait_name::#handler_method(handler, ctx, request_id, body).await?, None)),
                 }
             } else {
                 quote! {
@@ -731,9 +742,8 @@ fn generate_dispatch_fn(
                 #[allow(unreachable_patterns)]
                 _ => anyhow::bail!("Unknown request variant (not in schema)"),
             };
-            // Reader dropped here
+            // Root reader borrow dropped here; the decoded message lives in `body`.
             drop(req);
-            drop(reader);
 
             // Phase 2: Dispatch on discriminant (safe to await)
             match disc {
@@ -762,37 +772,15 @@ fn generate_dispatch_fn(
         }
     };
 
-    let leaf_fn_name = format_ident!("derive_leaf_path_{}", to_snake_case(pascal));
-    let leaf_doc = format!(
-        "Derive the full numeric method leaf path for a {pascal} request body.\n\n         Decodes the signed body once and returns the chain of Cap'n Proto union\n         discriminants selecting the leaf. This is the key dispatch resolves the\n         generated method policy with (v16 §5.2). An undecodable body or a\n         discriminant absent from this schema revision returns `None`, which\n         denies — it never falls back to a coarser row."
-    );
-
     quote! {
-        #[doc = #leaf_doc]
-        pub fn #leaf_fn_name(payload: &[u8]) -> Option<Vec<u16>> {
-            use crate::#capnp_mod::#req_snake::Which;
-            let reader = capnp::serialize::read_message(
-                &mut std::io::Cursor::new(payload),
-                capnp::message::ReaderOptions::new(),
-            )
-            .ok()?;
-            let req = reader.get_root::<crate::#capnp_mod::#req_snake::Reader>().ok()?;
-            let discriminant = match req.which().ok()? {
-                #(#method_discriminator_arms)*
-                #[allow(unreachable_patterns)]
-                _ => return None,
-            };
-            Some(vec![discriminant])
-        }
-
         #[doc = #doc]
-        pub async fn #fn_name<H: #trait_name>(handler: &H, ctx: &hyprstream_rpc::service::EnvelopeContext, payload: &[u8]) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
+        pub async fn #fn_name<H: #trait_name>(handler: &H, ctx: &hyprstream_rpc::service::EnvelopeContext, body: &hyprstream_rpc::service::DecodedRequestBody) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
             use crate::#capnp_mod::#req_snake::Which;
-            let reader = capnp::serialize::read_message(
-                &mut std::io::Cursor::new(payload),
-                capnp::message::ReaderOptions::new(),
-            )?;
-            let req = reader.get_root::<crate::#capnp_mod::#req_snake::Reader>()?;
+            // Read the typed request from the ONE decoded message (v16 §5.2):
+            // pointer traversal over the body whose derived leaf the policy
+            // and MAC gates already consumed — never a second decode of the
+            // signed bytes.
+            let req = body.root::<crate::#capnp_mod::#req_snake::Reader>()?;
             let request_id = req.get_id();
             let __decoded_method_discriminator = match req.which()? {
                 #(#method_discriminator_arms)*
@@ -1118,7 +1106,7 @@ fn scope_handler_method_params(
         CapnpType::Struct(ref name) => {
             if let Some(sdef) = resolved.find_struct(name) {
                 if sdef.is_pure_union() {
-                    return vec![quote! { payload: &[u8] }];
+                    return vec![quote! { body: &hyprstream_rpc::service::DecodedRequestBody }];
                 }
                 // Option 2: Accept whole struct instead of individual fields
                 // (Consistent with handler_method_params for maintainability)
@@ -1247,7 +1235,7 @@ fn generate_scope_dispatch_fn(
             handler: &H,
             ctx: &hyprstream_rpc::service::EnvelopeContext,
             request_id: u64,
-            payload: &[u8],
+            body: &hyprstream_rpc::service::DecodedRequestBody,
         ) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
             // Phase 1: Extract all Cap'n Proto data to owned types
             #variant_tag_enum
@@ -1331,7 +1319,7 @@ fn generate_nested_scope_dispatch_fn(
             ctx: &hyprstream_rpc::service::EnvelopeContext,
             request_id: u64,
             #(#all_ancestor_scope_params,)*
-            payload: &[u8],
+            body: &hyprstream_rpc::service::DecodedRequestBody,
         ) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
             // Phase 1: Extract all Cap'n Proto data to owned types
             #variant_tag_enum
@@ -1781,11 +1769,8 @@ fn generate_scope_extraction_phase(
 
     quote! {
         let (variant_tag, scope_fields, params) = {
-            let reader = capnp::serialize::read_message(
-                &mut std::io::Cursor::new(payload),
-                capnp::message::ReaderOptions::new(),
-            )?;
-            let req = reader.get_root::<crate::#capnp_mod::#outer_req_snake::Reader>()?;
+            // Navigate the ONE decoded message (v16 §5.2) — no re-decode.
+            let req = body.root::<crate::#capnp_mod::#outer_req_snake::Reader>()?;
 
             let inner = match req.which()? {
                 crate::#capnp_mod::#outer_req_snake::Which::#scope_variant_pascal(r) => r?,
@@ -1986,7 +1971,7 @@ fn generate_scope_dispatch_phase(
         let nested_dispatch_fn = format_ident!("dispatch_{}", to_snake_case(&nc.factory_name));
         quote! {
             #tag_enum::#variant_pascal => {
-                return #nested_dispatch_fn(handler, ctx, request_id, #(#scope_field_args,)* payload).await;
+                return #nested_dispatch_fn(handler, ctx, request_id, #(#scope_field_args,)* body).await;
             }
         }
     }).collect();
@@ -2179,11 +2164,8 @@ fn generate_nested_scope_extraction_phase(
 
     quote! {
         let (variant_tag, nested_scope_fields, params) = {
-            let reader = capnp::serialize::read_message(
-                &mut std::io::Cursor::new(payload),
-                capnp::message::ReaderOptions::new(),
-            )?;
-            let req = reader.get_root::<crate::#capnp_mod::#outer_req_snake::Reader>()?;
+            // Navigate the ONE decoded message (v16 §5.2) — no re-decode.
+            let req = body.root::<crate::#capnp_mod::#outer_req_snake::Reader>()?;
 
             // Navigate through ancestor scopes to reach nc
             #(#nav_stmts)*
@@ -2400,7 +2382,7 @@ fn generate_nested_scope_dispatch_phase(
         // Pass all ancestor scope args + nc's own scope args
         quote! {
             #tag_enum::#variant_pascal => {
-                return #nested_dispatch_fn(handler, ctx, request_id, #(#parent_scope_args,)* #(#nested_scope_args,)* payload).await;
+                return #nested_dispatch_fn(handler, ctx, request_id, #(#parent_scope_args,)* #(#nested_scope_args,)* body).await;
             }
         }
     }).collect();

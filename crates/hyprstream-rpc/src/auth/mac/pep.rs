@@ -253,7 +253,7 @@ mod tests {
     }
 
     impl RpcObjectLabelResolver for StaticResolver {
-        fn resolve(&self, service_domain: &str, method: Option<u16>) -> Option<SecurityLabel> {
+        fn resolve(&self, service_domain: &str, method: Option<&[u16]>) -> Option<SecurityLabel> {
             assert_eq!(method, None, "event/MoQ checks are not browser RPC");
             if service_domain == self.secret_track {
                 Some(secret_label())

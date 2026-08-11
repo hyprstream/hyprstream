@@ -39,11 +39,21 @@ struct StreamingEcho {
 
 #[async_trait(?Send)]
 impl RequestService for StreamingEcho {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(
+            signed_body.to_vec(),
+        ))
+    }
+
     async fn handle_request(
         &self,
         _ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
+        let payload = body.bytes();
         let tx = self.fired.lock().await.take();
         let cont: Continuation = Box::pin(async move {
             if let Some(tx) = tx {

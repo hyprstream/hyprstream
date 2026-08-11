@@ -163,6 +163,282 @@ impl DispatchMethodPolicy for InMemoryMethodPolicy {
     }
 }
 
+/// Whether a generated row admits the `Unauthenticated` disposition (v16 §6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationRequirement {
+    /// The method requires a verified credential; `$scope`-annotated leaves.
+    CredentialRequired,
+    /// The method is publicly dispatchable (`$scopeExempt` leaves) — legal
+    /// only together with an `UnauthenticatedOrTokenBound` signature policy
+    /// and a recorded public reason.
+    UnauthenticatedAllowed,
+}
+
+/// One generated method-policy row (v16 §6.1).
+///
+/// Rows are emitted by `generate_rpc_service!` from the same leaf-tree walk
+/// that produces the service's signed-body decoder, so the decoder can never
+/// derive a leaf the inventory does not list and vice versa. They are
+/// aggregated across all linked service crates through [`inventory`] and
+/// installed once at startup by [`install_generated_method_policy`].
+#[derive(Debug, Clone)]
+pub struct GeneratedMethodPolicyRow {
+    /// Canonical service domain (the dispatcher's `RequestService::name`).
+    pub service: &'static str,
+    /// Full numeric union-discriminant chain from the service root union.
+    pub leaf_path: &'static [u16],
+    /// Dotted human-readable path — review metadata, never a lookup key.
+    pub symbolic_path: &'static str,
+    /// `$scope`/`$capability` action; empty only for `$scopeExempt` leaves.
+    pub scope_action: &'static str,
+    /// Whether the leaf admits the `Unauthenticated` disposition.
+    pub authentication: AuthenticationRequirement,
+    /// The signing topology the leaf requires.
+    pub signature_policy: SignaturePolicy,
+    /// The audited reason a publicly dispatchable leaf is public.
+    pub public_reason: Option<&'static str>,
+}
+
+impl GeneratedMethodPolicyRow {
+    /// The dotted numeric leaf key the policy table is resolved with.
+    pub fn leaf_key(&self) -> String {
+        self.leaf_path
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+}
+
+/// Inventory registration submitted by every server-side generated module.
+pub struct GeneratedMethodPolicyProvider {
+    /// The schema/service name the rows belong to.
+    pub service: &'static str,
+    /// Builder for the service's complete generated row set.
+    pub rows_fn: fn() -> Vec<GeneratedMethodPolicyRow>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+inventory::collect!(GeneratedMethodPolicyProvider);
+
+/// Validate one complete generated row set (v16 §6.1 build gates).
+///
+/// Every violation here is a **build error** — this function runs both in a
+/// permanent unit test over the full linked inventory (so CI fails when a
+/// schema change produces an invalid inventory) and at startup installation
+/// (so a production process refuses to serve under an invalid table rather
+/// than serving a partial one).
+pub fn validate_generated_rows(rows: &[GeneratedMethodPolicyRow]) -> Result<()> {
+    use std::collections::HashSet;
+    let mut leaf_keys: HashSet<(&str, String)> = HashSet::new();
+    let mut symbolic: HashSet<(&str, &str)> = HashSet::new();
+
+    for row in rows {
+        if row.leaf_path.is_empty() {
+            bail!(
+                "generated policy row '{}':'{}' has an empty leaf path",
+                row.service,
+                row.symbolic_path
+            );
+        }
+        if row.symbolic_path.is_empty() {
+            bail!("generated policy row '{}' has an empty symbolic path", row.service);
+        }
+        if !leaf_keys.insert((row.service, row.leaf_key())) {
+            bail!(
+                "generated policy collision: duplicate leaf '{}':'{}' ({})",
+                row.service,
+                row.leaf_key(),
+                row.symbolic_path
+            );
+        }
+        if !symbolic.insert((row.service, row.symbolic_path)) {
+            bail!(
+                "generated policy symbolic-name drift: duplicate '{}':'{}'",
+                row.service,
+                row.symbolic_path
+            );
+        }
+
+        // A publicly dispatchable row and an identity-only signer policy are
+        // contradictory in both directions (v16 §6.1).
+        match row.authentication {
+            AuthenticationRequirement::UnauthenticatedAllowed => {
+                if !row.signature_policy.allows_unattributed() {
+                    bail!(
+                        "public leaf '{}':'{}' carries an identity-only signature policy",
+                        row.service,
+                        row.symbolic_path
+                    );
+                }
+                let reason_ok = row
+                    .public_reason
+                    .map(|r| !r.trim().is_empty())
+                    .unwrap_or(false);
+                if !reason_ok {
+                    bail!(
+                        "public leaf '{}':'{}' has no recorded public reason",
+                        row.service,
+                        row.symbolic_path
+                    );
+                }
+                if !row.scope_action.is_empty() {
+                    bail!(
+                        "public leaf '{}':'{}' also declares scope action '{}'",
+                        row.service,
+                        row.symbolic_path,
+                        row.scope_action
+                    );
+                }
+            }
+            AuthenticationRequirement::CredentialRequired => {
+                if row.signature_policy.allows_unattributed() {
+                    bail!(
+                        "credential-required leaf '{}':'{}' carries an unauthenticated-capable signature policy",
+                        row.service,
+                        row.symbolic_path
+                    );
+                }
+                if row.scope_action.is_empty() {
+                    bail!(
+                        "credential-required leaf '{}':'{}' has no scope action",
+                        row.service,
+                        row.symbolic_path
+                    );
+                }
+            }
+        }
+
+        // Approver rules must be satisfiable and exact.
+        if let SignaturePolicy::TokenBoundAndApproved { approver_rule, .. } =
+            &row.signature_policy
+        {
+            validate_approver_rule(row, approver_rule)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_approver_rule(row: &GeneratedMethodPolicyRow, rule: &ApproverRule) -> Result<()> {
+    let groups = rule.allowed_groups();
+    if groups.is_empty() {
+        bail!(
+            "approved leaf '{}':'{}' names no allowed approver groups",
+            row.service,
+            row.symbolic_path
+        );
+    }
+    let mut ids: Vec<u64> = groups.iter().map(|g| g.group_id).collect();
+    let count = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() != count {
+        bail!(
+            "approved leaf '{}':'{}' names a duplicate approver group ID",
+            row.service,
+            row.symbolic_path
+        );
+    }
+    for group in groups {
+        if group.role.trim().is_empty() {
+            bail!(
+                "approved leaf '{}':'{}' names approver group {} with an empty role",
+                row.service,
+                row.symbolic_path,
+                group.group_id
+            );
+        }
+    }
+    match rule {
+        ApproverRule::All { .. } => Ok(()),
+        ApproverRule::KOfN { k, groups } => {
+            if *k == 0 || *k > groups.len() {
+                bail!(
+                    "approved leaf '{}':'{}' has an unsatisfiable threshold {k} of {}",
+                    row.service,
+                    row.symbolic_path,
+                    groups.len()
+                );
+            }
+            Ok(())
+        }
+        ApproverRule::Role { role, k, groups } => {
+            if role.trim().is_empty() {
+                bail!(
+                    "approved leaf '{}':'{}' has a role rule with an empty role",
+                    row.service,
+                    row.symbolic_path
+                );
+            }
+            let holding = groups.iter().filter(|g| g.role == *role).count();
+            if *k == 0 || *k > holding {
+                bail!(
+                    "approved leaf '{}':'{}' requires {k} group(s) holding role '{role}' but names {holding}",
+                    row.service,
+                    row.symbolic_path
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Collect the complete generated inventory, deterministically sorted by
+/// `(service, numeric leaf path)`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn collect_generated_rows() -> Result<Vec<GeneratedMethodPolicyRow>> {
+    let mut rows: Vec<GeneratedMethodPolicyRow> = Vec::new();
+    for provider in inventory::iter::<GeneratedMethodPolicyProvider> {
+        let provided = (provider.rows_fn)();
+        for row in &provided {
+            if row.service != provider.service {
+                bail!(
+                    "generated policy provider '{}' emitted a row for service '{}'",
+                    provider.service,
+                    row.service
+                );
+            }
+        }
+        rows.extend(provided);
+    }
+    rows.sort_by(|a, b| {
+        a.service
+            .cmp(b.service)
+            .then_with(|| a.leaf_path.cmp(b.leaf_path))
+    });
+    Ok(rows)
+}
+
+/// Build and validate the complete generated method-policy table.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn build_generated_method_policy() -> Result<(InMemoryMethodPolicy, usize)> {
+    let rows = collect_generated_rows()?;
+    if rows.is_empty() {
+        bail!("no generated method-policy rows are linked into this binary");
+    }
+    validate_generated_rows(&rows)?;
+    let mut table = InMemoryMethodPolicy::new();
+    let count = rows.len();
+    for row in rows {
+        table.insert(row.service, &row.leaf_key(), row.signature_policy);
+    }
+    Ok((table, count))
+}
+
+/// Install the complete generated method-policy inventory as the process
+/// policy table (v16 §6.1). Returns the number of installed rows.
+///
+/// Fails — leaving proof-bearing dispatch fail-closed with **no** table —
+/// when the inventory is empty, inconsistent, colliding, or contradictory,
+/// or when a table was already installed.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn install_generated_method_policy() -> Result<usize> {
+    let (table, count) = build_generated_method_policy()?;
+    set_global_method_policy(Box::new(table))
+        .map_err(|_| anyhow::anyhow!("a global method-policy table is already installed"))?;
+    Ok(count)
+}
+
 static METHOD_POLICY: OnceLock<Box<dyn DispatchMethodPolicy>> = OnceLock::new();
 
 pub fn set_global_method_policy(
@@ -362,6 +638,146 @@ mod tests {
             suite: CryptoSuite::Classical,
             role: role.to_owned(),
         }
+    }
+
+    // ── Generated-inventory validation: seeded negative controls ─────────
+    //
+    // Each control seeds one invalid generated-row shape and proves the
+    // validator fails the build/install for it (v16 §6.1). CI fails if any
+    // seeded invalid case stops failing.
+
+    fn valid_row(leaf: &'static [u16], symbolic: &'static str) -> GeneratedMethodPolicyRow {
+        GeneratedMethodPolicyRow {
+            service: "svc",
+            leaf_path: leaf,
+            symbolic_path: symbolic,
+            scope_action: "query",
+            authentication: AuthenticationRequirement::CredentialRequired,
+            signature_policy: SignaturePolicy::TokenBound {
+                suite: CryptoSuite::Hybrid,
+            },
+            public_reason: None,
+        }
+    }
+
+    fn public_row(leaf: &'static [u16], symbolic: &'static str) -> GeneratedMethodPolicyRow {
+        GeneratedMethodPolicyRow {
+            service: "svc",
+            leaf_path: leaf,
+            symbolic_path: symbolic,
+            scope_action: "",
+            authentication: AuthenticationRequirement::UnauthenticatedAllowed,
+            signature_policy: SignaturePolicy::UnauthenticatedOrTokenBound {
+                suite: CryptoSuite::Hybrid,
+            },
+            public_reason: Some("declared $scopeExempt in the service schema"),
+        }
+    }
+
+    #[test]
+    fn a_valid_generated_inventory_validates() {
+        let rows = vec![valid_row(&[0], "a"), valid_row(&[1, 0], "b.c"), public_row(&[2], "p")];
+        validate_generated_rows(&rows).expect("valid inventory must validate");
+    }
+
+    #[test]
+    fn a_leaf_path_collision_fails_the_build() {
+        let rows = vec![valid_row(&[0], "a"), valid_row(&[0], "b")];
+        assert!(validate_generated_rows(&rows).is_err());
+    }
+
+    #[test]
+    fn symbolic_name_drift_fails_the_build() {
+        let rows = vec![valid_row(&[0], "a"), valid_row(&[1], "a")];
+        assert!(validate_generated_rows(&rows).is_err());
+    }
+
+    #[test]
+    fn an_empty_leaf_path_fails_the_build() {
+        assert!(validate_generated_rows(&[valid_row(&[], "a")]).is_err());
+    }
+
+    #[test]
+    fn a_public_row_without_a_reason_fails_the_build() {
+        let mut row = public_row(&[0], "p");
+        row.public_reason = None;
+        assert!(validate_generated_rows(&[row.clone()]).is_err());
+        row.public_reason = Some("  ");
+        assert!(validate_generated_rows(&[row]).is_err());
+    }
+
+    /// The §6.1 contradiction in both directions: a public method with an
+    /// identity-only signer policy, and a credential-required method with an
+    /// unauthenticated-capable signer policy.
+    #[test]
+    fn public_and_identity_only_contradictions_fail_the_build() {
+        let mut public_identity_only = public_row(&[0], "p");
+        public_identity_only.signature_policy = SignaturePolicy::TokenBound {
+            suite: CryptoSuite::Hybrid,
+        };
+        assert!(validate_generated_rows(&[public_identity_only]).is_err());
+
+        let mut credential_unattributed = valid_row(&[0], "a");
+        credential_unattributed.signature_policy = SignaturePolicy::UnauthenticatedOrTokenBound {
+            suite: CryptoSuite::Hybrid,
+        };
+        assert!(validate_generated_rows(&[credential_unattributed]).is_err());
+    }
+
+    #[test]
+    fn a_credential_required_row_without_a_scope_fails_the_build() {
+        let mut row = valid_row(&[0], "a");
+        row.scope_action = "";
+        assert!(validate_generated_rows(&[row]).is_err());
+    }
+
+    #[test]
+    fn unsatisfiable_or_malformed_approver_rules_fail_the_build() {
+        let approved = |rule: ApproverRule| {
+            let mut row = valid_row(&[0], "a");
+            row.signature_policy = SignaturePolicy::TokenBoundAndApproved {
+                primary_suite: CryptoSuite::Hybrid,
+                approver_rule: rule,
+            };
+            row
+        };
+        // No allowed groups at all.
+        assert!(validate_generated_rows(&[approved(ApproverRule::All { groups: vec![] })]).is_err());
+        // Threshold of zero, and threshold above the allowed set.
+        assert!(validate_generated_rows(&[approved(ApproverRule::KOfN {
+            k: 0,
+            groups: vec![group(2, "security")],
+        })])
+        .is_err());
+        assert!(validate_generated_rows(&[approved(ApproverRule::KOfN {
+            k: 2,
+            groups: vec![group(2, "security")],
+        })])
+        .is_err());
+        // Duplicate group IDs in the allowed set.
+        assert!(validate_generated_rows(&[approved(ApproverRule::All {
+            groups: vec![group(2, "security"), group(2, "finance")],
+        })])
+        .is_err());
+        // A role rule naming a role no allowed group holds (unknown group/role).
+        assert!(validate_generated_rows(&[approved(ApproverRule::Role {
+            role: "legal".into(),
+            k: 1,
+            groups: vec![group(2, "security")],
+        })])
+        .is_err());
+        // An empty role on an allowed group.
+        assert!(validate_generated_rows(&[approved(ApproverRule::KOfN {
+            k: 1,
+            groups: vec![group(2, "")],
+        })])
+        .is_err());
+        // The satisfiable control stays green.
+        assert!(validate_generated_rows(&[approved(ApproverRule::KOfN {
+            k: 1,
+            groups: vec![group(2, "security")],
+        })])
+        .is_ok());
     }
 
     #[test]

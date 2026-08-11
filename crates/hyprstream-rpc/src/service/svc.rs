@@ -714,7 +714,12 @@ pub trait RequestService: 'static {
     /// # Arguments
     ///
     /// * `ctx` - Verified envelope context with identity
-    /// * `payload` - Raw inner request bytes (Cap'n Proto encoded)
+    /// * `body` - The request body decoded exactly once by
+    ///   [`RequestService::decode_request_body`] (v16 §5.2). Generated
+    ///   dispatch reads the typed request from [`DecodedRequestBody::root`]
+    ///   — the same decoded message whose derived leaf fed the generated
+    ///   method policy and the dispatch MAC PEP — never from a second decode
+    ///   of the bytes.
     ///
     /// Returns `(response_bytes, optional_continuation)`:
     /// - `response_bytes`: Cap'n Proto encoded response sent as REP
@@ -725,31 +730,35 @@ pub trait RequestService: 'static {
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &crate::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)>;
 
-    /// Derive the full numeric method leaf path from the **signed request
-    /// body**, decoding it exactly once (v16 §5.2 step 4).
+    /// Decode the signed request body **exactly once** (bounded) and derive
+    /// the full numeric method leaf path (v16 §5.2 step 4).
     ///
-    /// The leaf path is the chain of Cap'n Proto union discriminants from the
-    /// root request type down to the selected leaf, so a nested union selects
-    /// a distinct row rather than collapsing onto its parent. It is the key
-    /// dispatch resolves the generated method policy with, and it comes from
-    /// the signed body — never from a transport-specific hint such as the
-    /// browser transcript's method commitment, which does not exist on other
-    /// carriers and is not the signed leaf.
+    /// The returned [`DecodedRequestBody`] is the one decode for the entire
+    /// request lifetime: its leaf path keys the generated method policy and
+    /// the dispatch MAC PEP, and its decoded message is what
+    /// [`RequestService::handle_request`] dispatches from. The leaf comes
+    /// from the signed body — never from a transport-specific hint such as
+    /// the browser transcript's method commitment, which does not exist on
+    /// other carriers and is not the signed leaf.
     ///
-    /// The default returns `None`: a service that has not yet been generated
-    /// against a schema has no leaf to derive, and a proof-bearing request to
-    /// it denies rather than being dispatched under an unresolved policy.
-    /// Requests carrying no proof are unaffected during the migration.
+    /// This method is **required** — there is deliberately no default. A
+    /// schema-generated service delegates to its generated
+    /// `decode_<service>_request_body` function; a service with no Cap'n
+    /// Proto request schema must affirmatively construct
+    /// [`DecodedRequestBody::opaque`], which denies proof-bearing dispatch at
+    /// leaf derivation instead of silently passing a policy row it never
+    /// resolved.
     ///
-    /// An unknown discriminant, a malformed body, or an empty path is `None`
-    /// — the same denial as an unlisted leaf, never a coarser fallback.
-    fn derive_leaf_path(&self, signed_body: &[u8]) -> Option<Vec<u16>> {
-        let _ = signed_body;
-        None
-    }
+    /// An unknown discriminant, a malformed body, or a body exceeding the
+    /// reviewed decode caps is an error — the same denial as an unlisted
+    /// leaf, never a coarser fallback.
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> Result<crate::service::DecodedRequestBody>;
 
     /// Service name (for logging and registry).
     fn name(&self) -> &str;
@@ -1498,9 +1507,16 @@ mod empty_iss_gate_tests {
         async fn handle_request(
             &self,
             _ctx: &EnvelopeContext,
-            _payload: &[u8],
+            _body: &crate::service::DecodedRequestBody,
         ) -> Result<(Vec<u8>, Option<Continuation>)> {
             Ok((vec![], None))
+        }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> Result<crate::service::DecodedRequestBody> {
+            // Byte-oriented mock: no Cap'n Proto schema, no derivable leaf.
+            Ok(crate::service::DecodedRequestBody::opaque(signed_body.to_vec()))
         }
         fn name(&self) -> &str {
             "mock"
@@ -2120,9 +2136,15 @@ mod ipc_key_identity_tests {
         async fn handle_request(
             &self,
             _ctx: &EnvelopeContext,
-            _payload: &[u8],
+            _body: &crate::service::DecodedRequestBody,
         ) -> Result<(Vec<u8>, Option<Continuation>)> {
             Ok((vec![], None))
+        }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> Result<crate::service::DecodedRequestBody> {
+            Ok(crate::service::DecodedRequestBody::opaque(signed_body.to_vec()))
         }
         fn name(&self) -> &str {
             "discovery"
