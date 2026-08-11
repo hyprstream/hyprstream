@@ -297,7 +297,7 @@ fn request_envelope(payload: &[u8]) -> RequestEnvelope {
         request_id: 7,
         payload: payload.to_vec(),
         iat: envelope::current_timestamp(),
-        nonce: [0u8; 16],
+        nonce: hyprstream_rpc::envelope::generate_nonce(),
         authorization: Authorization::None,
         delegation_token: None,
         wth: None,

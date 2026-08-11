@@ -355,11 +355,14 @@ pub fn current_timestamp() -> i64 {
     }
 }
 
-// DELETED: `generate_nonce()` was removed per v16 constitution §0.5.
-// Nonce-based replay protection is superseded by proof-CWT `cti`-based
-// replay admission. The `nonce` field remains on `RequestEnvelope` for
-// wire-compat serialization but is initialized to zeros and never used
-// for security decisions.
+/// Generate a random 16-byte nonce for replay protection.
+///
+/// Retained for the active legacy envelope path. Will be removed when the
+/// v16 proof-CWT `cti` replay admission fully replaces it.
+pub fn generate_nonce() -> [u8; 16] {
+    use rand::Rng;
+    rand::rngs::OsRng.gen()
+}
 
 /// Authorization subject for Casbin policy checks and resource isolation.
 ///
@@ -592,7 +595,7 @@ impl RequestEnvelope {
             request_id: next_request_id(),
             payload,
             iat: current_timestamp(),
-            nonce: [0u8; 16],
+            nonce: generate_nonce(),
             authorization: Authorization::None,
             delegation_token: None,
             wth: None,
@@ -1525,14 +1528,17 @@ impl SignedEnvelope {
     /// `sig`/`cnf` are always populated with the raw EdDSA signature + signer
     /// public key for the cnf key-binding path.
     pub fn new_signed_with_policy(
-        envelope: RequestEnvelope,
+        mut envelope: RequestEnvelope,
         signing_key: &SigningKey,
         pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
         policy: crate::crypto::CryptoPolicy,
     ) -> Result<Self> {
-        // wth auto-population removed per v16 §0.5: credential hash binding
-        // is now in the proof CWT credential_hash claim (-70001). The legacy
-        // wth field remains on the wire for compat but is always None.
+        if envelope.wth.is_none() {
+            if let Some(jwt) = envelope.jwt_token() {
+                use sha2::{Digest, Sha256};
+                envelope.wth = Some(Sha256::digest(jwt.as_bytes()).into());
+            }
+        }
 
         let envelope_bytes = envelope.to_bytes();
         let signature = signing_key.sign(&envelope_bytes);
@@ -1597,12 +1603,17 @@ impl SignedEnvelope {
     /// the ephemeral X25519 leg of HyKEM and from rotated `#mesh-kem` prekeys
     /// (S1 `KemPrekey`).
     pub fn new_signed_encrypted_mesh_kem(
-        envelope: RequestEnvelope,
+        mut envelope: RequestEnvelope,
         signing_key: &SigningKey,
         pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
         server_kem_public: &crate::crypto::hybrid_kem::RecipientPublic,
     ) -> EnvelopeResult<Self> {
-        // wth auto-population removed per v16 §0.5.
+        if envelope.wth.is_none() {
+            if let Some(jwt) = envelope.jwt_token() {
+                use sha2::{Digest, Sha256};
+                envelope.wth = Some(Sha256::digest(jwt.as_bytes()).into());
+            }
+        }
         // Serialize + seal via the shared helper so the framing and the
         // replay-bound external AAD stay identical to the client path.
         let cose_ct = seal_request_envelope(&envelope, server_kem_public)?;
@@ -3469,7 +3480,7 @@ mod tests {
         let envelope = RequestEnvelope {
             request_id: 42,
             payload: vec![1, 2, 3],
-            nonce: [0u8; 16],
+            nonce: generate_nonce(),
             iat: 1699999000,
             authorization: Authorization::IdJag("my-jwt-token".to_owned()),
             delegation_token: Some("delegated".to_owned()),
@@ -3514,7 +3525,7 @@ mod tests {
         let envelope = RequestEnvelope {
             request_id: req_id,
             payload: payload.clone(),
-            nonce: [0u8; 16],
+            nonce: generate_nonce(),
             iat: current_timestamp(),
             authorization: Authorization::None,
             delegation_token: None,
@@ -3574,7 +3585,7 @@ mod tests {
 
         // Bind the original replay nonce so the tamper below can derive a
         // provably-distinct value without a second hard-coded literal.
-        let original_nonce = [0u8; 16];
+        let original_nonce = generate_nonce();
         let envelope = RequestEnvelope {
             request_id: 42,
             payload: vec![1, 2, 3],
@@ -3625,7 +3636,7 @@ mod tests {
         let kem_pub = derive_mesh_kem_recipient(&node_sk)
             .expect("derive #mesh-kem")
             .public();
-        let original_nonce = [0u8; 16];
+        let original_nonce = generate_nonce();
         let original = SignedEnvelope::new_signed_encrypted_mesh_kem(
             RequestEnvelope {
                 request_id: 553,
@@ -3706,7 +3717,8 @@ mod tests {
         // The signature covers the unchanged ciphertext and remains valid, but
         // the distinct outer nonce changes authenticated external AAD. Failed
         // AEAD authentication likewise must not touch replay state.
-        let invalid_aad = original.clone();        invalid_aad
+        let invalid_aad = original.clone();
+        invalid_aad
             .verify_signature_only(&node_vk)
             .expect("ciphertext signature remains valid");
         assert!(unwrap_and_verify(&signed_envelope_to_wire(&invalid_aad), &options()).is_err());
@@ -3829,7 +3841,7 @@ mod tests {
         let envelope = RequestEnvelope {
             request_id: 100,
             payload: vec![1, 2, 3],
-            nonce: [0u8; 16],
+            nonce: generate_nonce(),
             iat: current_timestamp(),
             authorization: Authorization::None,
             delegation_token: None,
@@ -3877,7 +3889,7 @@ mod tests {
         let envelope = RequestEnvelope {
             request_id: 100,
             payload: vec![1, 2, 3],
-            nonce: [0u8; 16],
+            nonce: generate_nonce(),
             iat: current_timestamp(),
             authorization: Authorization::None,
             delegation_token: None,
@@ -4765,12 +4777,13 @@ mod tests {
                 "service-a",
             )
             .is_err());
+        let wrong_nonce = distinct_test_nonce(&nonce);
         assert!(response
             .open_encrypted(
                 &recipient,
                 &public,
                 1234,
-                &[0u8; 16],
+                &wrong_nonce,
                 &server_vk.to_bytes(),
                 "service-a",
             )

@@ -141,7 +141,7 @@ fn test_envelope_canonical_form() {
     let envelope = RequestEnvelope {
         request_id: 789,
         payload: vec![],
-        nonce: [0u8; 16],
+        nonce: hyprstream_rpc::envelope::generate_nonce(),
         iat: 1111111111,
         authorization: Authorization::None,
         delegation_token: None,
