@@ -109,6 +109,60 @@ where
         }
         _ => {}
     }
+
+    // Proof-CWT verification: if a proof CWT is present on the envelope,
+    // parse and validate it against the signed request body and service
+    // domain (v16 §5.2 pipeline step: parse canonical COSE and proof
+    // payload under bounds). This is the production-path integration of
+    // the hs-rpc-proof-v1 parser.
+    if let Some(proof_cwt) = &ctx.envelope_proof_cwt {
+        let proof = crate::proof::parser::ParsedProof::parse(proof_cwt)
+            .with_context(|| format!("{} proof-CWT parse failed", service.name()))?;
+
+        // The proof's aud MUST match the service domain.
+        if proof.claims.aud != actual_service_domain {
+            warn!(
+                "{} proof aud '{}' does not match dispatcher '{}'",
+                service.name(), proof.claims.aud, actual_service_domain
+            );
+            anyhow::bail!("proof aud mismatch");
+        }
+
+        // The proof's capnp_request_bytes MUST equal the actual payload.
+        if proof.claims.capnp_request_bytes != payload {
+            warn!(
+                "{} proof request body hash mismatch ({} vs {} bytes)",
+                service.name(),
+                proof.claims.capnp_request_bytes.len(),
+                payload.len()
+            );
+            anyhow::bail!("proof request body mismatch");
+        }
+
+        // Freshness check: iat within clock-skew tolerance, exp not exceeded.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let skew_tolerance = 30u64; // seconds
+        let proof_max_lifetime = 300u64; // 5 minutes for authenticated
+        if proof.claims.iat.abs_diff(now_secs) > skew_tolerance {
+            warn!("{} proof iat outside clock-skew tolerance", service.name());
+            anyhow::bail!("proof freshness: iat outside tolerance");
+        }
+        if proof.claims.exp <= now_secs || proof.claims.exp > now_secs + proof_max_lifetime {
+            warn!("{} proof exp invalid", service.name());
+            anyhow::bail!("proof freshness: exp invalid");
+        }
+
+        debug!(
+            "{} proof-CWT verified: kind={:?} disposition={:?} request_id={}",
+            service.name(),
+            proof.kind,
+            proof.disposition,
+            hex::encode(proof.claims.request_id)
+        );
+    }
     let transcript_policy = if carrier.requires_browser_provisioning() {
         crate::browser_provisioning::BrowserTranscriptPolicy::Required {
             request_id,

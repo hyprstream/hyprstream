@@ -162,6 +162,9 @@ pub struct EnvelopeContext {
     pub(crate) response_kem_recipient: Option<crate::crypto::hybrid_kem::RecipientPublic>,
     pub(crate) service_domain: Option<String>,
 
+    /// v16 proof CWT bytes, if present on the verified envelope.
+    pub(crate) envelope_proof_cwt: Option<Vec<u8>>,
+
     /// Browser-only method commitment independently checked by generated
     /// service dispatch after the sealed transcript is recovered.
     pub(crate) browser_method_discriminator: Option<u16>,
@@ -203,6 +206,7 @@ impl EnvelopeContext {
             request_nonce: envelope.envelope.nonce,
             response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
             service_domain: envelope.envelope.service_domain.clone(),
+            envelope_proof_cwt: envelope.envelope.proof_cwt.clone(),
             browser_method_discriminator: None,
             // AnySigner / networked plane — NOT a local caller (#328).
             is_local_caller: false,
@@ -231,6 +235,7 @@ impl EnvelopeContext {
             request_nonce: envelope.envelope.nonce,
             response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
             service_domain: envelope.envelope.service_domain.clone(),
+            envelope_proof_cwt: envelope.envelope.proof_cwt.clone(),
             browser_method_discriminator: None,
             // FixedSigner mutual-auth plane — genuine in-process / IPC caller (#328).
             is_local_caller: true,
@@ -263,6 +268,7 @@ impl EnvelopeContext {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             // Internal self-call that never crosses a network boundary (#328).
             is_local_caller: true,
@@ -309,6 +315,7 @@ impl EnvelopeContext {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         }
@@ -461,6 +468,7 @@ impl EnvelopeContext {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         }
@@ -1528,6 +1536,7 @@ mod empty_iss_gate_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller,
         }
@@ -2139,6 +2148,7 @@ mod ipc_key_identity_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             // AnySigner / networked-or-UDS plane.
             is_local_caller: false,
@@ -2441,6 +2451,7 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: true,
         }
@@ -2499,6 +2510,7 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         };
@@ -2567,6 +2579,7 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         }

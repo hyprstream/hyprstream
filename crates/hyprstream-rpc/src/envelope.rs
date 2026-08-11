@@ -2263,11 +2263,14 @@ impl FromCapnp for RequestEnvelope {
             client_kem_public,
             response_kem_recipient,
             service_domain,
-            proof_cwt: reader
-                .reborrow()
-                .get_proof_cwt()
-                .ok()
-                .map(<[u8]>::to_vec),
+            proof_cwt: {
+                let has = reader.reborrow().has_proof_cwt();
+                if !has {
+                    None
+                } else {
+                    Some(reader.get_proof_cwt()?.to_vec())
+                }
+            },
         })
     }
 }
