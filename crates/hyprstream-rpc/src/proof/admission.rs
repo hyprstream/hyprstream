@@ -214,6 +214,90 @@ impl ProofReplayStore for InMemoryProofReplayStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Single-verifier sole-membership lease (§4.6 topology enforcement)
+// ---------------------------------------------------------------------------
+
+/// An exclusive, process-lifetime lease proving this process is the **sole**
+/// verifier for a replay admission domain (§4.6, shape 1).
+///
+/// The `SingleVerifierInstance` guarantee is only sound if exactly one process
+/// admits for the domain. An operator env string alone cannot establish that —
+/// two replicas can each set it and silently recreate a per-process replay
+/// split. This lease converts the claim into an OS-enforced fact: it holds an
+/// **exclusive, non-blocking** advisory lock (`flock(LOCK_EX|LOCK_NB)`) on an
+/// operator-configured lease path for the whole process lifetime. A second
+/// process attempting to acquire the same lease fails, so its proof admission
+/// stays closed rather than admitting under a guarantee it cannot honour.
+///
+/// The lease path's storage defines the domain the exclusion spans: a
+/// same-host domain uses any local path; a multi-host domain MUST place the
+/// lease on storage shared and lock-coherent across every verifier (an
+/// operator responsibility the mechanism cannot infer, but which — unlike a
+/// bare env string — it does enforce wherever the lock is actually coherent).
+#[cfg(not(target_arch = "wasm32"))]
+pub struct SingleVerifierLease {
+    // The open file whose exclusive flock is released when this handle drops.
+    // Kept process-global so the lock outlives startup.
+    _file: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SingleVerifierLease {
+    /// Acquire the exclusive sole-verifier lease, or fail closed.
+    ///
+    /// Returns `Err` when another process already holds the lease (the domain
+    /// already has a verifier) or the path cannot be opened/locked. The caller
+    /// MUST NOT install a `SingleVerifierInstance` store without holding this.
+    pub fn acquire(path: &std::path::Path) -> Result<Self> {
+        use nix::fcntl::{flock, FlockArg};
+        use std::os::fd::AsRawFd;
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| {
+                anyhow::anyhow!("cannot open single-verifier lease {}: {e}", path.display())
+            })?;
+        // Non-blocking exclusive lock: a second holder fails immediately rather
+        // than queueing, so a misconfigured second replica denies at once.
+        flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock).map_err(|e| {
+            anyhow::anyhow!(
+                "another process already holds the single-verifier lease {} \
+                 (this domain already has a verifier): {e}",
+                path.display()
+            )
+        })?;
+        Ok(Self {
+            _file: file,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// The lease path (for diagnostics).
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+// The held lease is parked here so the exclusive lock lives for the whole
+// process, not just past startup. Dropping it would release the lock and let a
+// second verifier acquire it.
+#[cfg(not(target_arch = "wasm32"))]
+static SINGLE_VERIFIER_LEASE: OnceLock<SingleVerifierLease> = OnceLock::new();
+
+/// Park an acquired sole-verifier lease for the process lifetime.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn hold_single_verifier_lease(
+    lease: SingleVerifierLease,
+) -> std::result::Result<(), SingleVerifierLease> {
+    SINGLE_VERIFIER_LEASE.set(lease)
+}
+
 // Process-global registration. There is no auto-install: an absent store is a
 // denial, never a locally-defaulted admission.
 static PROOF_REPLAY_STORE: OnceLock<Box<dyn ProofReplayStore>> = OnceLock::new();
@@ -699,6 +783,42 @@ mod tests {
             ),
             ProofAdmissionResult::Failed
         );
+    }
+
+    // -- single-verifier lease ---------------------------------------------
+
+    /// The lease is exclusive: a second acquisition on the same path — the
+    /// "two replicas both set single-verifier-instance" case — fails, so the
+    /// second verifier cannot install a per-process store under a domain-wide
+    /// guarantee it does not hold.
+    #[test]
+    fn the_single_verifier_lease_is_exclusive() {
+        let path = std::env::temp_dir().join(format!(
+            "hyprstream-replay-lease-{}.lock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let held = SingleVerifierLease::acquire(&path).expect("first acquisition succeeds");
+        assert_eq!(held.path(), path.as_path());
+
+        // A second process (here, a second acquisition of the same path while
+        // the first lock is still held) must fail — this is exactly the
+        // misconfigured-second-replica case.
+        let second = SingleVerifierLease::acquire(&path);
+        assert!(
+            second.is_err(),
+            "a second verifier must not be able to hold the same lease"
+        );
+
+        // Once the first lease drops, the lock is released and the path is
+        // acquirable again (a genuine single-verifier restart).
+        drop(held);
+        assert!(
+            SingleVerifierLease::acquire(&path).is_ok(),
+            "the lease is reacquirable after release"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A linearizable shared store owns every namespace by construction.

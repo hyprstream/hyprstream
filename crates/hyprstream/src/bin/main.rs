@@ -1872,7 +1872,51 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>)
     // rather than a silent per-node guarantee that reads as domain-wide.
     let declared_domain = std::env::var("HYPRSTREAM_REPLAY_ADMISSION_DOMAIN").ok();
     let guarantee = match declared_domain.as_deref() {
-        Some("single-verifier-instance") => Some(ReplayDomainGuarantee::SingleVerifierInstance),
+        Some("single-verifier-instance") => {
+            // The single-verifier shape is only sound if this process is
+            // genuinely the sole verifier for the domain. A bare env string
+            // cannot establish that — two replicas can each set it. Require an
+            // OS-enforced exclusive lease: acquire it here and hold it for the
+            // process lifetime, so a second replica setting the same string
+            // fails to acquire and its admission stays closed (§4.6).
+            let lease_path = std::env::var("HYPRSTREAM_REPLAY_SINGLE_VERIFIER_LEASE").ok();
+            let Some(lease_path) = lease_path else {
+                tracing::error!(
+                    "HYPRSTREAM_REPLAY_ADMISSION_DOMAIN=single-verifier-instance requires \
+                     HYPRSTREAM_REPLAY_SINGLE_VERIFIER_LEASE=<path> to an exclusive lease \
+                     file: the env string alone cannot prove sole verification. Proof \
+                     admission denies until the lease is configured."
+                );
+                return;
+            };
+            match hyprstream_rpc::proof::admission::SingleVerifierLease::acquire(
+                std::path::Path::new(&lease_path),
+            ) {
+                Ok(lease) => {
+                    tracing::info!(
+                        "acquired exclusive single-verifier lease at {} \
+                         (this process is the sole verifier for its domain)",
+                        lease.path().display()
+                    );
+                    // Park the lease so its exclusive lock lives for the whole
+                    // process, not just this function.
+                    if hyprstream_rpc::proof::admission::hold_single_verifier_lease(lease).is_err() {
+                        tracing::error!(
+                            "a single-verifier lease is already held; proof admission denies"
+                        );
+                        return;
+                    }
+                    Some(ReplayDomainGuarantee::SingleVerifierInstance)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "cannot claim sole-verifier lease; another verifier already holds it or \
+                         the path is unusable. Proof admission denies: {e:#}"
+                    );
+                    return;
+                }
+            }
+        }
         Some(other) => {
             tracing::error!(
                 "HYPRSTREAM_REPLAY_ADMISSION_DOMAIN='{other}' names a topology this build \
