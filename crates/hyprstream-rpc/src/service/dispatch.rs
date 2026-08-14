@@ -101,82 +101,20 @@ where
 
     let request_id = ctx.request_id;
     let actual_service_domain = service.name();
-    crate::envelope::validate_service_domain(actual_service_domain).with_context(|| {
-        format!("service exposes non-canonical domain '{actual_service_domain}'")
-    })?;
-    match ctx.service_domain.as_deref() {
-        Some(expected) if expected != actual_service_domain => {
-            anyhow::bail!(
-                "authenticated request service domain '{expected}' does not match dispatcher '{actual_service_domain}'"
-            );
-        }
-        None if carrier.forbids_cleartext_envelope() => {
-            anyhow::bail!(
-                "authenticated network request omitted serviceDomain; dropping without response"
-            );
-        }
-        _ => {}
-    }
 
-    let transcript_policy = if carrier.requires_browser_provisioning() {
-        crate::browser_provisioning::BrowserTranscriptPolicy::Required {
-            request_id,
-            service_name: actual_service_domain,
-            carrier_profile:
-                crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
-        }
-    } else {
-        crate::browser_provisioning::BrowserTranscriptPolicy::NotBrowserCarrier
-    };
-    let (browser_transcript, payload) =
-        crate::browser_provisioning::recover_request_payload(&payload, transcript_policy)?;
-
-    ctx.browser_method_discriminator = browser_transcript
-        .as_ref()
-        .map(|transcript| transcript.method_discriminator);
-    if carrier.forbids_cleartext_envelope() && ctx.response_kem_recipient.is_none() {
-        anyhow::bail!(
-            "authenticated network request omitted responseKemRecipient; dropping without response"
-        );
-    }
     // Refuse before dispatch if the service cannot emit the mandatory pinned
     // hybrid response suite. Missing key material is never a signal to
     // construct a classical response. Deliberately checked only after envelope
     // authentication: the default `pq_signing_key()` derives an ML-DSA key per
     // call, and unauthenticated input must not be able to trigger that work.
+    //
+    // This is a server-configuration fault, not a per-request denial, and it
+    // is not attacker-controlled: without a response signing key there is no
+    // way to emit ANY signed response — denial or success — so this drops
+    // rather than routing through the uniform surface below.
     let response_pq_key = service.pq_signing_key().ok_or_else(|| {
         anyhow::anyhow!("service has no ML-DSA-65 response signing key (mandatory Hybrid suite)")
     })?;
-    if carrier.requires_browser_provisioning() {
-        let binding = &browser_transcript
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow::anyhow!("authenticated WebTransport request omitted browser binding")
-            })?
-            .binding;
-        anyhow::ensure!(
-            binding.service_name == actual_service_domain,
-            "browser provisioning service '{}' does not match dispatcher '{}'",
-            binding.service_name,
-            actual_service_domain
-        );
-        anyhow::ensure!(
-            binding.capability == "hyprstream-rpc/1"
-                && binding.scope == actual_service_domain
-                && binding.carrier_profile
-                    == crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
-            "browser provisioning capability/scope/carrier misclassification"
-        );
-        let verifier = crate::envelope::global_browser_currentness_verifier().ok_or_else(|| {
-            anyhow::anyhow!(
-                "checkpoint-backed browser currentness verifier is not installed; dropping without response"
-            )
-        })?;
-        verifier
-            .ensure_current(binding)
-            .await
-            .context("browser accepted-current evidence rejected at dispatch")?;
-    }
     let response_recipient = ctx.response_kem_recipient.clone();
     let request_iat = ctx.request_iat;
     let request_nonce = ctx.request_nonce;
@@ -254,6 +192,91 @@ where
         let signed = sign_response_with_challenge(payload, challenge)?;
         serialize_response(&signed)
     };
+
+    // Post-authentication pre-handler gates (§14.2). Every one of these — a
+    // non-canonical or mismatched service domain, an absent domain on an
+    // encrypted carrier, a browser carrier-recovery failure, an absent
+    // response recipient, a browser binding/currentness failure — now leaves
+    // through the ONE uniform `dispatch_denied` surface, so it is externally
+    // indistinguishable from a claims/proof/policy/MAC/replay denial and
+    // carries the same challenge slot. Before v16 these returned `Err` and
+    // dropped the connection, which was an observable oracle distinguishing
+    // "which gate failed". The unauthenticated envelope-verification failure
+    // above remains a silent drop (the ratified INV-2 anti-oracle boundary):
+    // uniform denial begins only once a request is authenticated.
+    if crate::envelope::validate_service_domain(actual_service_domain).is_err() {
+        return dispatch_denied(&format!(
+            "service exposes non-canonical domain '{actual_service_domain}'"
+        ));
+    }
+    match ctx.service_domain.as_deref() {
+        Some(expected) if expected != actual_service_domain => {
+            return dispatch_denied(&format!(
+                "request service domain '{expected}' does not match dispatcher '{actual_service_domain}'"
+            ));
+        }
+        None if carrier.forbids_cleartext_envelope() => {
+            return dispatch_denied("authenticated network request omitted serviceDomain");
+        }
+        _ => {}
+    }
+
+    let transcript_policy = if carrier.requires_browser_provisioning() {
+        crate::browser_provisioning::BrowserTranscriptPolicy::Required {
+            request_id,
+            service_name: actual_service_domain,
+            carrier_profile:
+                crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+        }
+    } else {
+        crate::browser_provisioning::BrowserTranscriptPolicy::NotBrowserCarrier
+    };
+    let (browser_transcript, payload) =
+        match crate::browser_provisioning::recover_request_payload(&payload, transcript_policy) {
+            Ok(recovered) => recovered,
+            Err(e) => return dispatch_denied(&format!("browser carrier recovery: {e:#}")),
+        };
+
+    ctx.browser_method_discriminator = browser_transcript
+        .as_ref()
+        .map(|transcript| transcript.method_discriminator);
+    if carrier.forbids_cleartext_envelope() && ctx.response_kem_recipient.is_none() {
+        return dispatch_denied("authenticated network request omitted responseKemRecipient");
+    }
+    if carrier.requires_browser_provisioning() {
+        let recovered = match browser_transcript.as_ref() {
+            Some(transcript) => &transcript.binding,
+            None => {
+                return dispatch_denied("authenticated WebTransport request omitted browser binding")
+            }
+        };
+        let binding = recovered;
+        if binding.service_name != actual_service_domain {
+            return dispatch_denied(&format!(
+                "browser provisioning service '{}' does not match dispatcher '{}'",
+                binding.service_name, actual_service_domain
+            ));
+        }
+        if !(binding.capability == "hyprstream-rpc/1"
+            && binding.scope == actual_service_domain
+            && binding.carrier_profile
+                == crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport)
+        {
+            return dispatch_denied("browser provisioning capability/scope/carrier misclassification");
+        }
+        let verifier = match crate::envelope::global_browser_currentness_verifier() {
+            Some(verifier) => verifier,
+            None => {
+                return dispatch_denied(
+                    "checkpoint-backed browser currentness verifier is not installed",
+                )
+            }
+        };
+        if let Err(e) = verifier.ensure_current(binding).await {
+            return dispatch_denied(&format!("browser accepted-current evidence rejected: {e:#}"));
+        }
+    }
+
     debug!(
         "{} verified request from {} (id={})",
         service.name(),

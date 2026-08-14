@@ -281,6 +281,13 @@ async fn exact_same_key_request_is_bound_to_destination_service() {
     .unwrap();
     let wire = to_wire(&signed);
 
+    // v16 §14.2: a service-domain mismatch is an authenticated pre-handler
+    // denial, so it leaves through the ONE uniform DispatchDenied surface —
+    // a signed, encrypted response externally indistinguishable from the
+    // matching-service success below — NOT a dropped connection. The handler
+    // still never runs, which is the security invariant; what changed is that
+    // "wrong destination" is no longer an observable oracle distinct from any
+    // other pre-handler denial.
     let forwarded = process_request(
         &wire,
         &service_b,
@@ -289,12 +296,17 @@ async fn exact_same_key_request_is_bound_to_destination_service() {
         &envelope::InMemoryNonceCache::new(),
         CarrierContext::iroh(),
     )
-    .await;
+    .await
+    .expect("a domain mismatch is a uniform signed denial, not a dropped stream");
+    let denial = decode_response(&forwarded);
     assert!(
-        forwarded.is_err(),
-        "service B must reject A's exact request"
+        !invoked_b.load(Ordering::SeqCst),
+        "service B's handler must never run for A's request"
     );
-    assert!(!invoked_b.load(Ordering::SeqCst));
+    assert!(
+        denial.encrypted_response.is_some(),
+        "the denial keeps the uniform encrypted response shape"
+    );
 
     let matching = process_request(
         &wire,
@@ -310,6 +322,13 @@ async fn exact_same_key_request_is_bound_to_destination_service() {
     assert!(invoked_a.load(Ordering::SeqCst));
     assert!(response.payload.is_empty());
     assert!(response.encrypted_response.is_some());
+    // The denial and the success are the same wire shape: both encrypted,
+    // neither leaking which gate (if any) failed.
+    assert_eq!(
+        denial.encrypted_response.is_some(),
+        response.encrypted_response.is_some(),
+        "denial and success must be externally indistinguishable in shape"
+    );
 }
 
 fn request_envelope(payload: &[u8]) -> RequestEnvelope {
@@ -327,6 +346,75 @@ fn request_envelope(payload: &[u8]) -> RequestEnvelope {
         service_domain: Some("inv2-sentinel".to_owned()),
         proof_cwt: None,
     }
+}
+
+/// v16 §14.2: two DISTINCT authenticated pre-handler gates — a service-domain
+/// mismatch and a service-domain absence — both leave through the ONE uniform
+/// DispatchDenied surface, and neither invokes the handler. The external
+/// response payloads are byte-identical: the surface reveals nothing about
+/// which gate failed. Before v16 both dropped the connection with distinct
+/// internal errors; the point is that the observable outcome is now uniform.
+#[tokio::test]
+async fn distinct_authenticated_gates_produce_indistinguishable_denials() {
+    let k = keys();
+    let (service, invoked) = SentinelService::new_named(k.server_sk.clone(), "uniform-svc");
+    let server_recipient = derive_mesh_kem_recipient(&k.server_sk).unwrap();
+
+    let sealed = |service_domain: Option<&str>| {
+        let response_recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .unwrap();
+        let mut request = request_envelope(b"uniform-denial")
+            .with_response_kem_recipient(response_recipient.public());
+        request.service_domain = service_domain.map(str::to_owned);
+        let signed = SignedEnvelope::new_signed_encrypted_mesh_kem(
+            request,
+            &k.client_sk,
+            &k.client_pq,
+            &server_recipient.public(),
+        )
+        .unwrap();
+        to_wire(&signed)
+    };
+
+    // Gate A: signed service domain does not match the dispatcher.
+    let mismatch = process_request(
+        &sealed(Some("some-other-service")),
+        &service,
+        EnvelopeVerification::AnySigner,
+        &k.server_sk,
+        &envelope::InMemoryNonceCache::new(),
+        CarrierContext::iroh(),
+    )
+    .await
+    .expect("mismatch is a uniform signed denial");
+
+    // Gate B: no signed service domain at all on an encrypted carrier.
+    let absent = process_request(
+        &sealed(None),
+        &service,
+        EnvelopeVerification::AnySigner,
+        &k.server_sk,
+        &envelope::InMemoryNonceCache::new(),
+        CarrierContext::iroh(),
+    )
+    .await
+    .expect("absence is a uniform signed denial");
+
+    assert!(
+        !invoked.load(Ordering::SeqCst),
+        "no authenticated gate may invoke the handler"
+    );
+
+    let a = decode_response(&mismatch);
+    let b = decode_response(&absent);
+    assert!(a.encrypted_response.is_some() && b.encrypted_response.is_some());
+    // The application error payload is the same constant for every gate.
+    assert_eq!(
+        a.payload, b.payload,
+        "distinct gates must produce the same visible denial payload"
+    );
 }
 
 fn to_wire(signed: &SignedEnvelope) -> Vec<u8> {
@@ -403,6 +491,12 @@ async fn browser_dispatch_recovers_exact_bytes_and_rejects_post_refetch_advance(
 
     // Simulate accepted-current state advancing after the client's last
     // defense-in-depth refetch but before dispatch/key release.
+    //
+    // v16 §14.2: a browser-currentness failure is an authenticated
+    // pre-handler denial, so it leaves through the uniform DispatchDenied
+    // surface (a signed encrypted response) rather than dropping the stream.
+    // The handler still never runs — no new payload is recorded — which is
+    // the security invariant.
     verifier.advanced.store(true, Ordering::SeqCst);
     let rejected = process_request(
         &make_wire(24),
@@ -412,9 +506,18 @@ async fn browser_dispatch_recovers_exact_bytes_and_rejects_post_refetch_advance(
         &envelope::InMemoryNonceCache::new(),
         CarrierContext::browser_web_transport(),
     )
-    .await;
-    assert!(rejected.is_err());
-    assert_eq!(&*payloads.lock(), &[application]);
+    .await
+    .expect("a currentness failure is a uniform signed denial, not a dropped stream");
+    let denial = decode_response(&rejected);
+    assert!(
+        denial.encrypted_response.is_some(),
+        "the denial keeps the uniform encrypted response shape"
+    );
+    assert_eq!(
+        &*payloads.lock(),
+        &[application],
+        "the handler must not run for a stale-currentness request"
+    );
 }
 
 /// A validly hybrid-signed **cleartext** envelope from an authorized signer is
@@ -504,10 +607,15 @@ async fn encrypted_on_untrusted_carrier_dispatches() {
     assert!(response.encrypted_response.is_some());
 }
 
-/// A verified, sealed request that omits the response recipient must be
-/// dropped before claims/handler work on every untrusted carrier. The server
-/// cannot safely construct either a success or error response, so no
-/// cleartext fallback is permitted.
+/// A verified, sealed request that omits the response recipient still drops
+/// before claims/handler work on every untrusted carrier — even under v16's
+/// uniform denial surface. The gate routes to `dispatch_denied` like every
+/// other authenticated pre-handler failure, but on an encrypted carrier the
+/// denial itself cannot be sealed to an absent recipient, so it falls back to
+/// a drop rather than emitting a cleartext response. That is not an oracle:
+/// the omission is the caller's own input, and revealing that one cannot
+/// respond to a caller who supplied no return channel discloses no server
+/// state. The handler still never runs.
 #[tokio::test]
 async fn missing_response_recipient_drops_without_handler_on_all_network_carriers() {
     let k = keys();
