@@ -23,6 +23,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize as _;
 
 use hyprstream_rpc::proof::enrollment::{
     ComponentKey, EnrolledComponent, InMemoryEnrollmentResolver, SignerRole, SignerSuiteRecord,
@@ -323,43 +324,71 @@ pub fn foreign_protocol_keys(
         }
     }
 
-    // Local: this node's own OS-owned bootstrap public keys, which anchor the
-    // local services' envelope identities.
+    // Local: this node's own OS-owned key material, which anchors the local
+    // services' envelope identities. Every local protocol source is
+    // enumerated — reusing any of them as a proof-signer component key is the
+    // same violation as reusing a remote peer key.
     if let Some(dir) = secrets_dir {
         collect_bootstrap_pubkeys(dir, &mut keys);
+        collect_local_ca_and_node_keys(dir, &mut keys);
     }
 
     keys
 }
 
-/// Read raw public keys out of the OS-owned bootstrap-pubkeys directory.
+/// Read this node's OS-owned bootstrap public keys via the SAME parser the
+/// identity store writes and reads them with
+/// ([`identity_store::load_bootstrap_pubkeys_hybrid`]).
 ///
-/// The file format is the provisioning wizard's; entries that do not decode as
-/// hex or base64 public keys are ignored rather than guessed at.
+/// The store format is one flat JSON file (`{ "<service>": "<base64>" }`),
+/// **not** a directory of token files. Each entry's Ed25519 anchor and its
+/// bound ML-DSA-65 half are inserted as separate raw component keys, because
+/// the overlap check compares raw component keys — a hybrid entry contributes
+/// two foreign keys, either of which a proof manifest is forbidden to reuse.
 fn collect_bootstrap_pubkeys(secrets_dir: &Path, keys: &mut HashSet<Vec<u8>>) {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-
-    let dir = secrets_dir.join("bootstrap-pubkeys");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    let Ok(entries) = crate::auth::identity_store::load_bootstrap_pubkeys_hybrid(secrets_dir) else {
         return;
     };
-    for entry in entries.flatten() {
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        for token in text.split_whitespace() {
-            if let Ok(bytes) = hex::decode(token) {
-                if bytes.len() == 32 || bytes.len() == 1952 {
-                    keys.insert(bytes);
-                    continue;
-                }
-            }
-            if let Ok(bytes) = STANDARD.decode(token) {
-                if bytes.len() == 32 || bytes.len() == 1952 {
-                    keys.insert(bytes);
-                }
-            }
+    for entry in entries.values() {
+        keys.insert(entry.ed25519.as_bytes().to_vec());
+        if let Some(pq) = &entry.ml_dsa_65 {
+            keys.insert(hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(pq));
         }
+    }
+}
+
+/// Enumerate the remaining local protocol key sources: the JWT/credential CA
+/// verifying keys (classical + post-quantum) and this node's own envelope
+/// signing key with its derived ML-DSA-65 half.
+///
+/// These are distinct protocol/domain identities from a request-proof signer,
+/// so §4.4 forbids a proof manifest from reusing their component keys. Each
+/// source is read through its identity-store loader; a source this node does
+/// not hold is simply absent, never guessed at.
+fn collect_local_ca_and_node_keys(secrets_dir: &Path, keys: &mut HashSet<Vec<u8>>) {
+    use crate::auth::identity_store;
+
+    // The credential-CA verifying keys (JWT/WIT issuance trust anchor).
+    if let Ok(ca_ed) = identity_store::load_ca_verifying_key(secrets_dir) {
+        keys.insert(ca_ed.as_bytes().to_vec());
+    }
+    if let Ok(ca_pq) = identity_store::load_ca_ml_dsa_verifying_key(secrets_dir) {
+        keys.insert(hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&ca_pq));
+    }
+
+    // This node's own envelope/mesh signing identity: the Ed25519 verifying
+    // key and its deterministically derived ML-DSA-65 half (the same pair the
+    // response-signing default and the published `#mesh-pq` method use). Read
+    // the seed directly — enumeration must never GENERATE a key as a side
+    // effect, so the generate-on-miss loader is deliberately not used here.
+    if let Ok(Some(mut seed)) = identity_store::read_secret(secrets_dir, "signing-key") {
+        if let Ok(arr) = <[u8; 32]>::try_from(seed.as_slice()) {
+            let node_sk = ed25519_dalek::SigningKey::from_bytes(&arr);
+            keys.insert(node_sk.verifying_key().as_bytes().to_vec());
+            let node_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&node_sk);
+            keys.insert(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&node_pq));
+        }
+        seed.zeroize();
     }
 }
 
@@ -462,20 +491,40 @@ mod tests {
 
     /// The node's own bootstrap identity keys are foreign to proof
     /// enrollment: local reuse is a violation just as remote reuse is.
+    ///
+    /// The store format is the identity store's flat JSON file — written and
+    /// read through the SAME parser production uses
+    /// (`write_bootstrap_pubkeys_hybrid` / `load_bootstrap_pubkeys_hybrid`),
+    /// not the invented directory layout the previous scanner assumed. This
+    /// test therefore fails if the scanner ever regresses to reading a
+    /// directory that production never writes.
     #[test]
     fn local_bootstrap_keys_count_as_foreign() {
+        use crate::auth::identity_store::{write_bootstrap_pubkeys_hybrid, BootstrapPubkey};
+
         let key = SigningKey::generate(&mut OsRng);
         let dir = tempfile::tempdir().expect("tempdir");
-        let bootstrap = dir.path().join("bootstrap-pubkeys");
-        std::fs::create_dir_all(&bootstrap).expect("mkdir");
-        std::fs::write(
-            bootstrap.join("registry"),
-            hex::encode(key.verifying_key().to_bytes()),
-        )
-        .expect("write");
+
+        // Write a real hybrid bootstrap entry the way production does.
+        let entry = BootstrapPubkey::for_service_key(&key).expect("hybrid entry");
+        let ed_bytes = key.verifying_key().to_bytes().to_vec();
+        let pq_bytes = match &entry.ml_dsa_65 {
+            Some(pq) => hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(pq),
+            None => panic!("for_service_key must produce a hybrid entry"),
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert("registry".to_owned(), entry);
+        write_bootstrap_pubkeys_hybrid(dir.path(), &map).expect("write bootstrap-pubkeys");
 
         let foreign = foreign_protocol_keys(None, Some(dir.path()));
-        assert!(foreign.contains(key.verifying_key().to_bytes().as_slice()));
+        assert!(
+            foreign.contains(ed_bytes.as_slice()),
+            "the Ed25519 anchor must be foreign"
+        );
+        assert!(
+            foreign.contains(pq_bytes.as_slice()),
+            "the bound ML-DSA-65 half must be foreign too"
+        );
 
         let resolver = build_resolver(
             &ProofEnrollmentManifest {
@@ -489,6 +538,29 @@ mod tests {
             resolver.resolve_primary(&key.verifying_key()).is_none(),
             "a local envelope identity key must not be enrolled as a proof signer"
         );
+    }
+
+    /// The credential-CA verifying keys are also enumerated as foreign: a
+    /// proof manifest cannot relabel the JWT/WIT issuance anchor as a signer.
+    #[test]
+    fn local_ca_pubkeys_count_as_foreign() {
+        use crate::auth::identity_store::{
+            write_ca_ml_dsa_verifying_key, write_ca_verifying_key,
+        };
+
+        let ca_ed = SigningKey::generate(&mut OsRng);
+        let ca_pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca_ed);
+        let ca_pq_vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&ca_pq_sk);
+        let ca_pq_vk =
+            hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&ca_pq_vk_bytes).expect("vk");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_ca_verifying_key(dir.path(), &ca_ed.verifying_key()).expect("write ca-pubkey");
+        write_ca_ml_dsa_verifying_key(dir.path(), &ca_pq_vk).expect("write ca-mldsa-pubkey");
+
+        let foreign = foreign_protocol_keys(None, Some(dir.path()));
+        assert!(foreign.contains(ca_ed.verifying_key().to_bytes().as_slice()));
+        assert!(foreign.contains(ca_pq_vk_bytes.as_slice()));
     }
 
     fn build(entries: Vec<ManifestEntry>) -> InMemoryEnrollmentResolver {
