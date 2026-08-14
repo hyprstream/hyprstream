@@ -132,6 +132,32 @@ impl CredentialUse {
     }
 }
 
+/// The exact transaction a `OneShotTransaction` credential authorizes (§3.4).
+///
+/// A one-shot credential is permitted **only** for a short-lived credential
+/// bound by claims to an exact audience, method, resource, subject, actor, and
+/// transaction intent. The audience is the credential `aud`, the subject the
+/// credential `sub`, and the actor the terminal `act`; the remaining
+/// dimensions — the exact method leaf, the resource, and the transaction
+/// intent — are carried here so a verifier can confirm the credential was
+/// minted for *this* request before consuming its ID. The whole binding is
+/// covered by the token signature, so neither the caller nor the method can
+/// forge or reinterpret it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OneShotTransactionBinding {
+    /// The exact numeric method leaf path (dotted, e.g. `1.1.6`) this
+    /// credential authorizes. It MUST equal the leaf derived from the signed
+    /// request body at dispatch — a one-shot credential cannot be replayed
+    /// against a different method.
+    pub method_leaf: String,
+    /// The exact resource the transaction acts on (e.g. a repository ID or an
+    /// object coordinate). Opaque to this type; compared for equality.
+    pub resource: String,
+    /// The transaction intent — the application-level operation the issuer
+    /// authorized (e.g. `merge`, `transfer`). Non-empty by construction.
+    pub intent: String,
+}
+
 /// JWT claims for authentication.
 ///
 /// Casbin remains the server-side policy authority. OAuth access tokens also
@@ -185,6 +211,16 @@ pub struct Claims {
     /// verified, issuer-signed claims.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_use: Option<CredentialUse>,
+
+    /// **One-shot transaction binding (§3.4).** Present iff `credential_use`
+    /// is `OneShotTransaction`: the exact method leaf, resource, and intent
+    /// the issuer minted this credential for. A verifier MUST confirm this
+    /// binding against the actual request before consuming the credential ID
+    /// (see [`Claims::verify_one_shot_binding`]). Covered by the token
+    /// signature; JSON-carried on the JWT, so it survives the credential-hash
+    /// binding the proof signs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_binding: Option<OneShotTransactionBinding>,
 
     /// Original JWT token for end-to-end verification.
     /// When present, downstream services MUST verify this token
@@ -356,6 +392,7 @@ impl FromCapnp for Claims {
             // The credential use profile is issuer-signed and rides the JWT;
             // the envelope Claims carrier cannot assert it. Absent = Reusable.
             credential_use: None,
+            transaction_binding: None,
             token,
             // MAC clearance (S8/#574) is not carried on the Cap'n Proto envelope
             // surface today; it rides the JWT (the hybrid-signed authority token).
@@ -385,11 +422,136 @@ impl Claims {
             scope: None,
             cnf: None,
             credential_use: None,
+            transaction_binding: None,
             token: None,
             clearance: None,
             act: None,
             cap: None,
         }
+    }
+
+    /// **Mint a one-shot transaction credential (§3.4).**
+    ///
+    /// The issuer minting path calls this to produce the claim set for a
+    /// short-lived credential bound to an exact `(audience, method leaf,
+    /// resource, subject, actor, transaction intent)`. It sets
+    /// `credential_use = OneShotTransaction`, the transaction binding, a fresh
+    /// random `jti` (the ID consumed as the single replay-admission action),
+    /// and the audience/subject/actor. The caller supplies a **short** `exp`;
+    /// this constructor refuses a non-positive lifetime so a one-shot
+    /// credential can never be minted already-expired.
+    ///
+    /// The returned claims are the mintable artifact — the issuer signs them
+    /// with its JWT/WIT key exactly as it signs any other credential, so the
+    /// binding is covered by the token signature. A caller cannot mark its own
+    /// token one-shot (it does not hold the issuer key) and a method cannot
+    /// reinterpret a reusable token as one-shot (the value is read only from
+    /// verified issuer-signed claims).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint_one_shot_transaction(
+        issuer: String,
+        subject: String,
+        audience: String,
+        actor: Option<ActClaim>,
+        binding: OneShotTransactionBinding,
+        iat: i64,
+        exp: i64,
+    ) -> Result<Self> {
+        anyhow::ensure!(exp > iat, "one-shot credential must have a positive lifetime");
+        anyhow::ensure!(!issuer.is_empty(), "one-shot credential must name an issuer");
+        anyhow::ensure!(!audience.is_empty(), "one-shot credential must name an audience");
+        anyhow::ensure!(
+            !binding.method_leaf.trim().is_empty(),
+            "one-shot binding must name a method leaf"
+        );
+        anyhow::ensure!(
+            !binding.intent.trim().is_empty(),
+            "one-shot binding must name a transaction intent"
+        );
+        Ok(Self::new(subject, iat, exp)
+            .with_issuer(issuer)
+            .with_audience(Some(audience))
+            .with_jti()
+            .with_one_shot_transaction(binding)
+            .with_actor(actor))
+    }
+
+    /// Attach the one-shot credential-use profile and its transaction binding.
+    pub fn with_one_shot_transaction(mut self, binding: OneShotTransactionBinding) -> Self {
+        self.credential_use = Some(CredentialUse::OneShotTransaction);
+        self.transaction_binding = Some(binding);
+        self
+    }
+
+    /// Attach a delegation actor (RFC 8693 `act`).
+    pub fn with_actor(mut self, actor: Option<ActClaim>) -> Self {
+        self.act = actor;
+        self
+    }
+
+    /// **Verify a one-shot credential's binding against the actual request
+    /// (§3.4).** Called at dispatch immediately before the credential ID is
+    /// consumed, so a one-shot credential minted for one transaction can never
+    /// be replayed against another.
+    ///
+    /// Every dimension must match exactly: the credential must declare the
+    /// one-shot profile and carry a binding; its audience must equal the
+    /// dispatching `service_domain`; the binding's method leaf must equal the
+    /// leaf derived from the signed request body; the credential subject must
+    /// equal the authenticated `subject`; and the terminal actor must equal
+    /// `actor` (both present or both absent). The resource and intent must be
+    /// non-empty — the issuer minted them, and an empty value is a malformed
+    /// credential, never a wildcard.
+    pub fn verify_one_shot_binding(
+        &self,
+        service_domain: &str,
+        leaf_key: &str,
+        subject: &str,
+        actor: Option<&str>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.credential_use == Some(CredentialUse::OneShotTransaction),
+            "credential is not one-shot"
+        );
+        let binding = self
+            .transaction_binding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("one-shot credential carries no transaction binding"))?;
+        anyhow::ensure!(
+            self.aud.as_deref() == Some(service_domain),
+            "one-shot credential audience does not match the dispatching service domain"
+        );
+        anyhow::ensure!(
+            binding.method_leaf == leaf_key,
+            "one-shot credential is bound to a different method leaf"
+        );
+        anyhow::ensure!(
+            self.sub == subject,
+            "one-shot credential subject does not match the authenticated subject"
+        );
+        let terminal_actor = self.terminal_actor();
+        anyhow::ensure!(
+            terminal_actor == actor,
+            "one-shot credential actor does not match the request's terminal actor"
+        );
+        anyhow::ensure!(
+            !binding.resource.trim().is_empty(),
+            "one-shot credential binds an empty resource"
+        );
+        anyhow::ensure!(
+            !binding.intent.trim().is_empty(),
+            "one-shot credential binds an empty transaction intent"
+        );
+        Ok(())
+    }
+
+    /// The terminal (deepest) actor subject in the delegation chain, if any.
+    pub fn terminal_actor(&self) -> Option<&str> {
+        let mut current = self.act.as_ref()?;
+        while let Some(next) = current.act.as_deref() {
+            current = next;
+        }
+        Some(current.sub.as_str())
     }
 
     /// Set a random JWT ID (RFC 7519 `jti` claim) for revocation support.
@@ -1111,7 +1273,7 @@ impl IdTokenClaims {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod id_token_tests {
     use super::*;
 
@@ -1190,5 +1352,145 @@ mod id_token_tests {
     fn test_one_or_many_collapse_single_element() {
         let aud = OneOrMany::from_vec(vec!["only-one".into()]);
         assert_eq!(aud, OneOrMany::One("only-one".into()));
+    }
+
+    // ── One-shot transaction credential (§3.4) ──────────────────────────
+
+    fn binding() -> OneShotTransactionBinding {
+        OneShotTransactionBinding {
+            method_leaf: "1.1.6".into(),
+            resource: "repo:abc".into(),
+            intent: "merge".into(),
+        }
+    }
+
+    fn minted() -> Claims {
+        Claims::mint_one_shot_transaction(
+            "https://issuer.example".into(),
+            "user:alice".into(),
+            "registry".into(),
+            None,
+            binding(),
+            1000,
+            1030,
+        )
+        .expect("mints")
+    }
+
+    /// A minted one-shot credential declares the profile, carries a random
+    /// jti, and binds its exact transaction — the issuer's mintable artifact.
+    #[test]
+    fn minting_a_one_shot_credential_sets_the_profile_binding_and_id() {
+        let c = minted();
+        assert_eq!(c.credential_use, Some(CredentialUse::OneShotTransaction));
+        assert_eq!(c.transaction_binding.as_ref().unwrap().method_leaf, "1.1.6");
+        assert_eq!(c.aud.as_deref(), Some("registry"));
+        assert!(c.jti.is_some(), "the credential ID is the replay-admission key");
+    }
+
+    /// Minting refuses a non-positive lifetime, an empty issuer/audience, and
+    /// an empty method leaf or intent — a one-shot credential is never minted
+    /// already-expired or unbound.
+    #[test]
+    fn minting_rejects_malformed_one_shot_requests() {
+        assert!(Claims::mint_one_shot_transaction(
+            "iss".into(), "s".into(), "aud".into(), None, binding(), 1000, 1000,
+        )
+        .is_err());
+        assert!(Claims::mint_one_shot_transaction(
+            String::new(), "s".into(), "aud".into(), None, binding(), 1000, 1030,
+        )
+        .is_err());
+        let mut empty_leaf = binding();
+        empty_leaf.method_leaf = "  ".into();
+        assert!(Claims::mint_one_shot_transaction(
+            "iss".into(), "s".into(), "aud".into(), None, empty_leaf, 1000, 1030,
+        )
+        .is_err());
+        let mut empty_intent = binding();
+        empty_intent.intent = String::new();
+        assert!(Claims::mint_one_shot_transaction(
+            "iss".into(), "s".into(), "aud".into(), None, empty_intent, 1000, 1030,
+        )
+        .is_err());
+    }
+
+    /// The binding verifies only against the EXACT request it was minted for.
+    #[test]
+    fn one_shot_binding_verifies_the_exact_transaction() {
+        let c = minted();
+        assert!(c
+            .verify_one_shot_binding("registry", "1.1.6", "user:alice", None)
+            .is_ok());
+        // Wrong method leaf: a one-shot credential cannot cross methods.
+        assert!(c
+            .verify_one_shot_binding("registry", "1.1.7", "user:alice", None)
+            .is_err());
+        // Wrong service domain: cannot cross services.
+        assert!(c
+            .verify_one_shot_binding("model", "1.1.6", "user:alice", None)
+            .is_err());
+        // Wrong subject.
+        assert!(c
+            .verify_one_shot_binding("registry", "1.1.6", "user:bob", None)
+            .is_err());
+        // Unexpected actor where none was minted.
+        assert!(c
+            .verify_one_shot_binding("registry", "1.1.6", "user:alice", Some("service:mcp"))
+            .is_err());
+    }
+
+    /// A reusable credential is never one-shot, so binding verification
+    /// refuses it: a method cannot reinterpret a reusable token as one-shot.
+    #[test]
+    fn a_reusable_credential_is_not_one_shot() {
+        let c = Claims::new("user:alice".into(), 1000, 2000);
+        assert!(c
+            .verify_one_shot_binding("registry", "1.1.6", "user:alice", None)
+            .is_err());
+    }
+
+    /// The terminal actor is the deepest hop of the delegation chain, and a
+    /// delegated one-shot credential must match it exactly.
+    #[test]
+    fn one_shot_binding_matches_the_terminal_actor() {
+        let inner = ActClaim {
+            sub: "service:worker".into(),
+            clearance: None,
+            act: None,
+        };
+        let outer = ActClaim {
+            sub: "service:mcp".into(),
+            clearance: None,
+            act: Some(Box::new(inner)),
+        };
+        let c = Claims::mint_one_shot_transaction(
+            "iss".into(),
+            "user:alice".into(),
+            "registry".into(),
+            Some(outer),
+            binding(),
+            1000,
+            1030,
+        )
+        .unwrap();
+        assert_eq!(c.terminal_actor(), Some("service:worker"));
+        assert!(c
+            .verify_one_shot_binding("registry", "1.1.6", "user:alice", Some("service:worker"))
+            .is_ok());
+        assert!(c
+            .verify_one_shot_binding("registry", "1.1.6", "user:alice", Some("service:mcp"))
+            .is_err());
+    }
+
+    /// The binding survives a JSON round-trip: the issuer signs JSON, and the
+    /// proof's credential-hash binding covers exactly those bytes.
+    #[test]
+    fn one_shot_binding_survives_json_round_trip() {
+        let c = minted();
+        let json = serde_json::to_string(&c).unwrap();
+        let back: Claims = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.credential_use, Some(CredentialUse::OneShotTransaction));
+        assert_eq!(back.transaction_binding, c.transaction_binding);
     }
 }

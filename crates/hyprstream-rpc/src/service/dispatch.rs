@@ -675,24 +675,53 @@ where
                     .filter(|use_profile| use_profile.is_one_shot())
                     .map(|_| claims)
             })
-            .map(|claims| -> Result<crate::proof::admission::OneShotCredentialId> {
+            .map(|claims| -> Result<(crate::proof::admission::OneShotCredentialId, u64)> {
+                // The one-shot credential must be bound to EXACTLY this
+                // request before its ID is consumed (§3.4): audience = the
+                // dispatching service domain, method leaf = the leaf derived
+                // from the signed body, subject = the authenticated subject,
+                // actor = the terminal actor. Otherwise a credential minted
+                // for one transaction could be replayed against another.
+                let leaf_key = decoded_body.leaf_path_string().ok_or_else(|| {
+                    anyhow::anyhow!("one-shot credential presented to a method with no derivable leaf")
+                })?;
+                let subject = ctx.subject().to_string();
+                claims.verify_one_shot_binding(
+                    actual_service_domain,
+                    &leaf_key,
+                    &subject,
+                    claims.terminal_actor(),
+                )?;
+
                 // A one-shot credential with no credential ID cannot be
                 // consumed, so it can never be admitted.
                 let value = claims.jti.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("one-shot credential carries no credential ID (jti/cti)")
                 })?;
-                Ok(crate::proof::admission::OneShotCredentialId {
-                    issuer: claims.iss.clone(),
-                    value: value.as_bytes().to_vec(),
-                })
+
+                // The credential ID is retained for the CREDENTIAL's lifetime,
+                // not merely the proof's: a replay could otherwise present a
+                // fresh proof with the same one-shot credential after the first
+                // proof expired but while the credential is still valid. The
+                // credential exp bounds the retention (§3.4, Appendix B). A
+                // non-positive exp cannot outlive anything, so it floors to the
+                // proof's replay window.
+                let credential_exp = u64::try_from(claims.exp).unwrap_or(0).max(replay_expiry);
+                Ok((
+                    crate::proof::admission::OneShotCredentialId {
+                        issuer: claims.iss.clone(),
+                        value: value.as_bytes().to_vec(),
+                    },
+                    credential_exp,
+                ))
             })
             .transpose()?;
 
-        if let Some(credential_id) = one_shot {
+        if let Some((credential_id, credential_exp)) = one_shot {
             return match crate::proof::admission::consume_one_shot_credential(
                 replay_store,
                 &credential_id,
-                replay_expiry,
+                credential_exp,
             ) {
                 crate::proof::admission::ProofAdmissionResult::Admitted => {
                     debug!("{} one-shot credential consumed", service.name());

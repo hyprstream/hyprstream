@@ -609,6 +609,30 @@ mod tests {
         );
     }
 
+    /// A consumed one-shot credential ID is retained until its expiry, so a
+    /// second presentation before expiry is a replay even if a fresh proof
+    /// carries it. Retention is keyed by the `expires_at` the caller supplies
+    /// (dispatch supplies the CREDENTIAL lifetime, not the proof's).
+    #[test]
+    fn a_consumed_one_shot_credential_is_retained_until_expiry() {
+        let store = InMemoryProofReplayStore::single_verifier_instance(16);
+        let id = OneShotCredentialId {
+            issuer: "https://issuer.example".into(),
+            value: b"txn-1".to_vec(),
+        };
+        // Consumed with a far-future (credential-lifetime) expiry.
+        assert_eq!(
+            consume_one_shot_credential(&store, &id, far_future()),
+            ProofAdmissionResult::Admitted
+        );
+        // A second presentation — even under a different, later proof — is a
+        // replay while the credential is still valid.
+        assert_eq!(
+            consume_one_shot_credential(&store, &id, far_future()),
+            ProofAdmissionResult::Replayed
+        );
+    }
+
     /// Credential IDs are issuer-scoped: two issuers producing the same value
     /// never consume each other's credential.
     #[test]
