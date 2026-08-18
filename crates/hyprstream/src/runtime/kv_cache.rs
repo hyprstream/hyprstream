@@ -2045,6 +2045,18 @@ impl KVCacheManager {
         }
     }
 
+    /// Insert a fresh cache for `layer_idx` if none exists yet.
+    ///
+    /// Architectures with auxiliary KV-consuming modules beyond the main
+    /// decoder layers (the Qwen3.5 MTP draft head, whose slot sits at index
+    /// `num_hidden_layers`) call this when a session cache is swapped in: the
+    /// registry may have created the manager with only the main layer count.
+    pub fn ensure_layer_cache(&self, layer_idx: usize) {
+        self.layer_caches
+            .entry(layer_idx)
+            .or_insert_with(|| LayerKVCache::new(self.max_seq_len, self.quant_type));
+    }
+
     /// The compatibility fingerprint stamped on this cache, or `None` until the
     /// cache is first populated (#1277).
     pub fn compat_fingerprint(&self) -> Option<KvCompatFingerprint> {

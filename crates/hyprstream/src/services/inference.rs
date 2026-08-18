@@ -3449,6 +3449,9 @@ impl StreamChunkMessage {
                     inference_time_ms: stats.inference_time_ms,
                     inference_tokens_per_sec: stats.inference_tokens_per_sec,
                     inference_tokens_per_sec_ema: stats.inference_tokens_per_sec_ema,
+                    // The streaming wire protocol has no speculative counters yet.
+                    speculative_accepted: 0,
+                    speculative_rejected: 0,
                 };
                 StreamChunkMessage::Complete { stats: gen_stats }
             }
@@ -3631,6 +3634,8 @@ mod tests {
             inference_time_ms: 0,
             inference_tokens_per_sec: 0.0,
             inference_tokens_per_sec_ema: 0.0,
+            speculative_accepted: 0,
+            speculative_rejected: 0,
         }
     }
 

@@ -12,6 +12,10 @@
 //!   `prompt` | `generated`, `model`, and an **opaque keyed-hash** tenant id.
 //! - `inference_request_tokens` — `Histogram<u64>` (unit `{token}`), total tokens
 //!   (prompt + generated) per request, with `model` / `tenant` attributes only.
+//! - `inference_speculative_tokens_total` — `Counter<u64>` (unit `{token}`),
+//!   MTP self-speculative draft outcomes, with attribute `kind` =
+//!   `accepted` | `rejected` plus `model` / opaque tenant. Integer draft counts
+//!   only — never token IDs or text.
 //!
 //! # Security
 //!
@@ -40,11 +44,14 @@ mod metered {
     const METER_NAME: &str = "hyprstream.inference";
     const METRIC_TOKENS_TOTAL: &str = "inference_tokens_total";
     const METRIC_REQUEST_TOKENS: &str = "inference_request_tokens";
+    const METRIC_SPECULATIVE_TOKENS: &str = "inference_speculative_tokens_total";
     /// UCUM custom-unit form for token counts (OTel convention: `{unit}`).
     const UNIT: &str = "{token}";
 
     const KIND_PROMPT: &str = "prompt";
     const KIND_GENERATED: &str = "generated";
+    const KIND_ACCEPTED: &str = "accepted";
+    const KIND_REJECTED: &str = "rejected";
 
     /// The tenant attribute: opaque keyed-hash id, never the raw subject.
     fn tenant_attr(tenant: Option<u64>) -> KeyValue {
@@ -78,6 +85,7 @@ mod metered {
     pub struct TokenBurnMeter {
         tokens_total: opentelemetry::metrics::Counter<u64>,
         request_tokens: opentelemetry::metrics::Histogram<u64>,
+        speculative_tokens: opentelemetry::metrics::Counter<u64>,
     }
 
     impl TokenBurnMeter {
@@ -101,6 +109,13 @@ mod metered {
                     .u64_histogram(METRIC_REQUEST_TOKENS)
                     .with_unit(UNIT)
                     .with_description("Total tokens per inference request (prompt + generated)")
+                    .build(),
+                speculative_tokens: meter
+                    .u64_counter(METRIC_SPECULATIVE_TOKENS)
+                    .with_unit(UNIT)
+                    .with_description(
+                        "MTP self-speculative draft outcomes (accepted + rejected), by kind/model/tenant",
+                    )
                     .build(),
             }
         }
@@ -128,6 +143,27 @@ mod metered {
             // Record even when total == 0 so an empty-generation request is still
             // observable as a sample; the counter carries the non-zero breakdown.
             self.request_tokens.record(total, &request_attrs(model, tenant));
+        }
+
+        /// Record MTP self-speculative draft outcomes for a completed request.
+        ///
+        /// Integer draft counts only — never token IDs or text (#1253). Each
+        /// kind is skipped when zero so non-speculative requests add no points.
+        pub fn record_speculative(
+            &self,
+            model: &str,
+            tenant: Option<u64>,
+            accepted: u64,
+            rejected: u64,
+        ) {
+            if accepted > 0 {
+                self.speculative_tokens
+                    .add(accepted, &counter_attrs(KIND_ACCEPTED, model, tenant));
+            }
+            if rejected > 0 {
+                self.speculative_tokens
+                    .add(rejected, &counter_attrs(KIND_REJECTED, model, tenant));
+            }
         }
     }
 
@@ -164,6 +200,14 @@ impl TokenBurnMeter {
     pub fn record_prompt(&self, _model: &str, _tenant: Option<u64>, _count: u64) {}
     pub fn record_generated(&self, _model: &str, _tenant: Option<u64>, _count: u64) {}
     pub fn record_request_total(&self, _model: &str, _tenant: Option<u64>, _total: u64) {}
+    pub fn record_speculative(
+        &self,
+        _model: &str,
+        _tenant: Option<u64>,
+        _accepted: u64,
+        _rejected: u64,
+    ) {
+    }
 }
 
 /// Shared no-op instruments for non-`otel` / wasm32 builds.
