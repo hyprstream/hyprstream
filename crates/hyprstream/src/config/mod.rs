@@ -2150,6 +2150,15 @@ pub struct RuntimeConfig {
     /// `HYPRSTREAM_CONTINUOUS_BATCH_MAX`.
     #[serde(default = "default_continuous_batch_max")]
     pub continuous_batch_max: usize,
+    /// Materialize FP8 weights as BF16 once at load time (applying the
+    /// block-wise `_scale_inv` scales during load) and drop the FP8+scale
+    /// tensors, instead of dequantizing inside every matmul on the hot path.
+    /// Trades ~2x weight VRAM for zero per-matmul dequant work. Tunable via
+    /// `HYPRSTREAM_FP8_DEQUANT_LOAD` (truthy = on). Off by default — off keeps
+    /// the FP8-in-VRAM behavior, which is required when the BF16 equivalent
+    /// would exceed VRAM.
+    #[serde(default = "default_fp8_dequant_load")]
+    pub fp8_dequant_load: bool,
 }
 
 /// Default for [`RuntimeConfig::continuous_batching`]: off unless
@@ -2169,6 +2178,15 @@ fn default_continuous_batch_max() -> usize {
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(16)
+}
+
+/// Default for [`RuntimeConfig::fp8_dequant_load`]: off unless
+/// `HYPRSTREAM_FP8_DEQUANT_LOAD` is set truthy. Off is the safe default — it
+/// keeps FP8 weights at FP8 size in VRAM with lazy per-matmul dequantization.
+fn default_fp8_dequant_load() -> bool {
+    std::env::var("HYPRSTREAM_FP8_DEQUANT_LOAD")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 /// Default for [`RuntimeConfig::strict_device`]: strict (fail-fast) unless
@@ -2233,6 +2251,7 @@ impl Default for RuntimeConfig {
             default_model_load_timeout_ms: 300000, // 5 minutes
             continuous_batching: default_continuous_batching(),
             continuous_batch_max: default_continuous_batch_max(),
+            fp8_dequant_load: default_fp8_dequant_load(),
         }
     }
 }
