@@ -78,6 +78,12 @@ Per-owner manager holding one `LayerKVCache` per transformer layer
 
 - `cached_token_ids: Vec<i64>` — the token sequence this cache was computed
   for, recorded after each generation so the next turn can prefix-match
+- `ssm_snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>` — for
+  hybrid recurrent models (Qwen3.5 GDN), a deep copy of the conv/rec state as
+  of end-of-prefill, recorded alongside `cached_token_ids` so a later prefix
+  hit can rewind the recurrent state (see below). `None` for pure-attention
+  models; one snapshot per cache, overwritten each turn and carried across
+  `offload_to_cpu()` / `restore_to_gpu()`
 - `last_access_ms` / `access_count` — LRU bookkeeping (atomics)
 - `location: CacheLocation::{Gpu, Cpu}` — where the tensors currently reside
 
@@ -151,7 +157,8 @@ conversation turns:
    (`swap_session_cache`).
 2. `prefix_match_len(&prompt_tokens)` compares the new prompt against
    `cached_token_ids` from the previous turn.
-3. On a hit, the cache is `truncate_to(prefix_len)` (discarding the stale
+3. On a hit, `rewind_session_state` rewinds the cache: for pure-attention
+   models the cache is `truncate_to(prefix_len)` (discarding the stale
    suffix, e.g. the previous turn's generation) and **prefill starts at
    `prefix_len`** instead of 0 — only the new suffix is computed.
 4. On a miss, the cache is cleared and prefill starts fresh.
@@ -160,6 +167,32 @@ conversation turns:
 
 A typical multi-turn chat reuses the entire shared history, skipping most of
 the prefill cost.
+
+### Hybrid recurrent models (Qwen3.5 GDN)
+
+Qwen3.5 layers are mostly GatedDeltaNet linear attention whose conv/recurrent
+state lives in single-slot, model-global `conv_states`/`rec_states` — outside
+the `KVCacheManager`, and Markovian: unlike KV rows it cannot be truncated to
+an arbitrary position, only restored to a point that was snapshotted. Prefix
+reuse for these models therefore works differently:
+
+- `save_cached_tokens` stores, alongside the prompt tokens, a deep-copied SSM
+  snapshot captured at the **end of that turn's prefill**
+  (`KVCacheManager::set_cached_tokens_with_ssm`; the snapshot is taken in
+  `TextStream::sample_next_token` before decode advances the state).
+- On a prefix hit, `rewind_session_state` reuses the prefix **only when the
+  full cached sequence matched** (`prefix_len == cached_token_count()`) and a
+  snapshot is present: it truncates KV *and* restores the snapshot
+  (`Qwen3_5Model::restore_ssm_states`). A partial match or a missing snapshot
+  discards KV + SSM state and forces a full recompute — decoding from
+  truncated KV with stale recurrent state would silently condition on the
+  wrong context.
+- On a miss (and for stateless requests) `clear_kv_cache` resets both the KV
+  cache and all conv/rec slots, so no recurrent state leaks across requests.
+
+One snapshot is kept per session cache (overwritten each turn) and travels
+with the cache across `offload_to_cpu` / `restore_to_gpu`; eviction drops it
+with the cache.
 
 ## TTT Delta-Dependency Invalidation
 

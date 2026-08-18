@@ -1604,6 +1604,58 @@ impl TorchEngine {
     }
 }
 
+/// Rewind the model's installed session cache to a matched prefix.
+///
+/// Pure-attention models: truncating the KV cache to `prefix_len` is exact, so
+/// any prefix length is reusable (unchanged behavior).
+///
+/// Hybrid recurrent models (Qwen3.5): the GDN conv/rec state is Markovian and
+/// cannot be truncated to an arbitrary position — it can only be restored to
+/// the end-of-prefill snapshot stored with the cached tokens (see
+/// [`KVCacheManager::set_cached_tokens_with_ssm`]). A prefix hit is therefore
+/// reusable only when the FULL cached sequence matched
+/// (`prefix_len == cached_token_count()`) and a snapshot is present; anything
+/// else discards KV + SSM state and forces a full recompute, because decoding
+/// from a truncated KV with stale recurrent state silently produces tokens
+/// conditioned on the wrong context.
+///
+/// Returns the number of reusable prefix tokens (0 = cache cleared, full
+/// prefill required).
+pub(crate) fn rewind_session_state(model: &dyn ModelOperations, prefix_len: usize) -> usize {
+    let Some(cache) = model.get_kv_cache() else {
+        return 0;
+    };
+    let q35 = model
+        .as_any()
+        .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>();
+    let Some(q35) = q35 else {
+        cache.lock().truncate_to(prefix_len);
+        return prefix_len;
+    };
+
+    let snapshot = {
+        let cache_guard = cache.lock();
+        if prefix_len == cache_guard.cached_token_count() {
+            cache_guard.ssm_snapshot()
+        } else {
+            None
+        }
+    };
+    match snapshot {
+        Some((conv_snap, rec_snap)) => {
+            cache.lock().truncate_to(prefix_len);
+            q35.restore_ssm_states(conv_snap, rec_snap);
+            prefix_len
+        }
+        None => {
+            // Partial prefix match (or no snapshot): recurrent state cannot be
+            // rewound to an intermediate position — recompute from scratch.
+            model.clear_kv_cache();
+            0
+        }
+    }
+}
+
 impl TorchEngine {
     /// Stable, content-free label identifying the loaded model for OTel metric
     /// attributes (#1261). Prefers the model name (set on load); falls back to
@@ -3253,6 +3305,12 @@ pub struct TextStream<'a> {
     prompt_len: usize,
     /// Position from which prefill should start (0 = full prefill, >0 = partial via prefix cache hit)
     prefill_start_pos: usize,
+    /// SSM (conv/rec) state snapshot captured at end-of-prefill (hybrid
+    /// recurrent models only; `None` for pure-attention models). Saved into
+    /// the session cache by `save_cached_tokens` so a later prefix hit can
+    /// rewind the recurrent state alongside the KV truncation
+    /// (`rewind_session_state`).
+    prefill_ssm_snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>,
     /// KV cache position tracking for this stream
     /// Each stream has exclusive access via &mut self, so no atomic needed
     kv_cache_position: usize,
@@ -3399,15 +3457,19 @@ impl<'a> TextStream<'a> {
             };
 
             if prefix_len > 0 && prefix_len <= prompt_len {
-                // Truncate cache to the matched prefix (discard stale suffix from prior turn)
+                // Rewind session state to the matched prefix. Pure-attention
+                // models truncate the KV cache; hybrid recurrent models
+                // (Qwen3.5) additionally restore the end-of-prefill GDN
+                // conv/rec snapshot saved with the cached tokens — or fall
+                // back to a full recompute (returns 0) when the recurrent
+                // state cannot be rewound exactly (partial match / no
+                // snapshot). See `rewind_session_state`.
                 if let Some(model_arc) = &engine.persistent_model {
                     let model = model_arc.lock();
-                    if let Some(cache) = model.get_kv_cache() {
-                        let cache_guard = cache.lock();
-                        cache_guard.truncate_to(prefix_len);
-                    }
+                    rewind_session_state(model.as_ref(), prefix_len)
+                } else {
+                    0
                 }
-                prefix_len
             } else {
                 // No match — clear and start fresh
                 engine.clear_kv_cache();
@@ -3490,6 +3552,7 @@ impl<'a> TextStream<'a> {
             decode_stream,
             prompt_len,
             prefill_start_pos,
+            prefill_ssm_snapshot: None, // Captured after prefill (see sample_next_token)
             // KV cache starts with prompt already in it after first forward
             kv_cache_position: prompt_len,
             tokens_generated: 0,
@@ -3583,7 +3646,10 @@ impl<'a> TextStream<'a> {
     /// Save the current token sequence (prompt + generated) to the session KV cache.
     ///
     /// Called when generation finishes so the next turn can detect prefix overlap.
-    fn save_cached_tokens(&self) {
+    /// For hybrid recurrent models (Qwen3.5) the end-of-prefill SSM snapshot
+    /// captured in `sample_next_token` is stored alongside the tokens, making
+    /// the next turn's prefix hit rewindable (`rewind_session_state`).
+    fn save_cached_tokens(&mut self) {
         if let Some(model_arc) = &self.engine.persistent_model {
             let model = model_arc.lock();
             if let Some(cache) = model.get_kv_cache() {
@@ -3592,7 +3658,10 @@ impl<'a> TextStream<'a> {
                 // We only save the prompt (not generated tokens) because the next turn's
                 // prompt will include the assistant's response via the chat template —
                 // so the entire current prompt becomes a prefix of the next turn's prompt.
-                cache_guard.set_cached_tokens(self.prompt_tokens.clone());
+                cache_guard.set_cached_tokens_with_ssm(
+                    self.prompt_tokens.clone(),
+                    self.prefill_ssm_snapshot.take(),
+                );
                 tracing::debug!(
                     "Saved {} cached tokens for prefix matching on next turn",
                     cache_guard.cached_token_count()
@@ -3672,6 +3741,13 @@ impl<'a> TextStream<'a> {
                 }
             };
             let prefill_elapsed = prefill_start.elapsed();
+
+            // Hybrid recurrent models (Qwen3.5): capture the SSM conv/rec state
+            // as of end-of-prefill, before decode advances it. `save_cached_tokens`
+            // stores it with the prompt tokens so a later session prefix hit can
+            // rewind the recurrent state (KV truncation alone cannot). This is a
+            // cheap downcast returning `None` for pure-attention models.
+            self.prefill_ssm_snapshot = self.engine.snapshot_ssm_states();
 
             // Store prefill timing
             self.prefill_time_ms = Some(prefill_elapsed.as_millis() as u64);
