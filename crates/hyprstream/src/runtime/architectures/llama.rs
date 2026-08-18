@@ -51,25 +51,184 @@ pub(crate) struct LinearProjection {
     /// Block-wise scale for FP8 weights: shape [out/block, in/block], BF16.
     /// None for non-FP8 weights.
     pub(crate) scale: Option<Tensor>,
+    /// `scale` repacked at load time for the `_scaled_mm_v2`
+    /// `BlockWise128x128` recipe: shape `[N/128, L4]` contiguous (f32), where
+    /// `L4 = round_up(K/128, 4)` — K-block-minor order with the K-block
+    /// dimension zero-padded to a multiple of 4 (cuBLASLt TMA requirement, cf.
+    /// `_pad_128x128_scales` in pytorch's test_scaled_matmul_cuda.py). The
+    /// call site passes `scale_v2.t()`, yielding `[L4, N/128]` with strides
+    /// `(1, L4)` as the kernel's TORCH_CHECK_VALUE preconditions demand.
+    /// Derived in `with_scale`; None when `scale` is None.
+    pub(crate) scale_v2: Option<Tensor>,
+}
+
+/// Cached read of the FP8-GEMM gate ([`crate::config::RuntimeConfig::fp8_gemm`]).
+///
+/// The runtime reads the env default directly (same precedent as
+/// `RuntimeConfig.mmap`, which `model_factory` also reads from the env): the
+/// model-construction path has no `RuntimeConfig` plumbing today, so
+/// `LinearProjection::apply` consults this cached value. Static per process.
+fn fp8_gemm_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(crate::config::default_fp8_gemm)
+}
+
+/// Quantize activations to FP8 e4m3 with per-token 1x128 block scales.
+///
+/// Input: `[M, K]` float tensor (any float kind; K must be a multiple of 128).
+/// Returns `(q, scale)` where `q` is e4m3 `[M, K]` and `scale` is f32
+/// `[M, K/128]` **row-major** with `x ≈ q * scale` per 128-wide block. The
+/// `_scaled_mm_v2` call site must repack the scale to column-major
+/// (strides `(1, M)`) — the `BlockWise1x128` recipe requires it.
+/// Scales are amax-based (`amax / 448`); 448 is the max finite e4m3 value.
+/// Values are clamped to ±448 before the cast so out-of-range inputs saturate
+/// instead of producing inf/nan bytes. The input is made contiguous first:
+/// `to_kind` on an already-f32 tensor is a shallow clone, so a non-contiguous
+/// input would otherwise panic in `view`.
+fn quantize_activations_1x128(x: &Tensor) -> (Tensor, Tensor) {
+    const FP8_MAX: f64 = 448.0; // e4m3 max finite value
+    let x = x.contiguous();
+    let size = x.size();
+    let (m, k) = (size[0], size[1]);
+    let blocks = k / 128;
+    let x3 = x.to_kind(tch::Kind::Float).view([m, blocks, 128]);
+    let amax = x3.abs().amax(-1, false); // [m, blocks]
+    let scale = (amax / FP8_MAX).clamp_min(1e-12);
+    let q = (x3 / scale.unsqueeze(-1))
+        .clamp(-FP8_MAX, FP8_MAX)
+        .to_kind(tch::Kind::Float8e4m3fn)
+        .view([m, k]);
+    (q, scale)
+}
+
+/// `ScalingType::BlockWise1x128` / `BlockWise128x128` and `SwizzleType::NO_SWIZZLE`
+/// (ATen/BlasBackend.h) as the `IntList` values `_scaled_mm_v2` expects.
+const RECIPE_BLOCKWISE_1X128: i64 = 4;
+const RECIPE_BLOCKWISE_128X128: i64 = 5;
+const NO_SWIZZLE: i64 = 0;
+
+/// Sticky kernel-failure latch for the `_scaled_mm_v2` path. The deepseek
+/// (1x128 × 128x128) recipe hard-errors off NVIDIA Hopper (SM90 + cuBLASLt ≥
+/// 12.9: `_check_deepseek_support` in ScaledBlas.cpp — ROCm, SM89/SM100/SM120
+/// all fail), and tch-rs exposes no compute-capability query, so the first
+/// kernel error latches this and every later call skips the FP8 arm silently
+/// (one warning total, no per-token quant+kernel-error churn). Process-global:
+/// a recipe that fails on one device fails on all devices of the same build.
+static SCALED_MM_V2_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Repack a `[K/128, N/128]` block scale into the `_scaled_mm_v2`
+/// `BlockWise128x128` layout: `[N/128, L4]` contiguous f32 with
+/// `L4 = round_up(K/128, 4)` (K-block dim zero-padded to a multiple of 4).
+fn pack_scale_b_v2(scale: &Tensor) -> Tensor {
+    let size = scale.size();
+    let kb = size[0];
+    let l4 = (kb + 3) / 4 * 4; // i64::div_ceil is unstable on this toolchain
+    // [N/128, K/128] contiguous, then zero-pad the K-block dim to L4.
+    let t = scale.to_kind(tch::Kind::Float).transpose(0, 1).contiguous();
+    if l4 == kb {
+        t
+    } else {
+        t.constant_pad_nd([0, l4 - kb]) // right-pad last dim with zeros
+    }
+    .contiguous()
+}
+
+impl LinearProjection {
+    /// FP8 GEMM via `at::_scaled_mm_v2` (blockwise recipes). Returns `None`
+    /// when this projection can't use the path: weight not e4m3, no block
+    /// scale, not on CUDA (torch 2.10 has no CPU `_scaled_mm_v2` kernel —
+    /// dispatch covers CUDA/XPU only; the CPU `_scaled_mm` v1 kernel is
+    /// per-tensor-scale only, which cannot express the checkpoint's 128x128
+    /// weight scales), K not a multiple of 128, or a prior kernel failure
+    /// (see [`SCALED_MM_V2_FAILED`]; the recipe is additionally Hopper-only —
+    /// SM90 + cuBLASLt ≥ 12.9 — and hard-errors elsewhere).
+    ///
+    /// Layout: `weight` is stored `[in, out]` (K, N) after `take()`; the kernel
+    /// wants `mat2` column-major `[K, N]`, so we materialize one FP8 transpose
+    /// per call (spike overhead; a load-time orientation change is the fix if
+    /// the GPU numbers justify it). Scales: `scale_a` is repacked per call to
+    /// `[M, K/128]` with strides `(1, M)` (column-major, like pytorch's own
+    /// `x_scales.t().contiguous().t()`); `scale_b` uses the load-time-packed
+    /// `scale_v2` (`[N/128, L4]` contiguous, passed as `.t()` → `[L4, N/128]`
+    /// strides `(1, L4)`). The stored scale is already a *multiply* factor (HF
+    /// `weight_scale_inv` semantics, matching the lazy path), so no reciprocal
+    /// is needed.
+    pub(crate) fn apply_fp8_scaled_mm(&self, input: &Tensor) -> Option<Tensor> {
+        if self.weight.kind() != tch::Kind::Float8e4m3fn || !matches!(self.weight.device(), Device::Cuda(_)) {
+            return None;
+        }
+        if SCALED_MM_V2_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let scale_v2 = self.scale_v2.as_ref()?;
+        let in_dims = input.size();
+        let k = *in_dims.last()?;
+        if k % 128 != 0 {
+            return None;
+        }
+        let m: i64 = in_dims[..in_dims.len() - 1].iter().product();
+        let n = self.weight.size()[1];
+        let x2 = input.reshape([m, k]);
+        let (q, scale_a) = quantize_activations_1x128(&x2);
+        // Column-major mat2 [K, N]: contiguous [N, K] copy, transposed view.
+        let mat2 = self.weight.transpose(0, 1).contiguous().transpose(0, 1);
+        // BlockWise1x128 scale_a must be [M, K/128] with strides (1, M).
+        let scale_a = scale_a.transpose(0, 1).contiguous().transpose(0, 1);
+        // BlockWise128x128 scale_b must be [L4, N/128] with strides (1, L4).
+        let scale_b = scale_v2.transpose(0, 1);
+        let scale_a_refs = [&scale_a];
+        let scale_b_refs = [&scale_b];
+        let bias = self.bias.as_ref().map(|b| b.to_kind(tch::Kind::BFloat16));
+        let out = q
+            .f_internal_scaled_mm_v2(
+                &mat2,
+                &scale_a_refs,
+                [RECIPE_BLOCKWISE_1X128],
+                [NO_SWIZZLE],
+                &scale_b_refs,
+                [RECIPE_BLOCKWISE_128X128],
+                [NO_SWIZZLE],
+                bias.as_ref(),
+                tch::Kind::BFloat16,
+                [] as [i64; 0],
+                false,
+            )
+            .map_err(|e| {
+                SCALED_MM_V2_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    "FP8 _scaled_mm_v2 failed (latching off for this process, \
+                     using lazy dequant from here on): {e}"
+                );
+                e
+            })
+            .ok()?;
+        let mut out_dims = in_dims;
+        *out_dims.last_mut()? = n;
+        Some(out.reshape(out_dims))
+    }
 }
 
 impl LinearProjection {
     /// Create projection from weight only (no bias, no scale).
     #[inline]
     pub(crate) fn new(weight: Tensor) -> Self {
-        Self { weight, bias: None, scale: None }
+        Self { weight, bias: None, scale: None, scale_v2: None }
     }
 
     /// Create projection with weight and bias (no scale).
     #[inline]
     pub(crate) fn with_bias(weight: Tensor, bias: Tensor) -> Self {
-        Self { weight, bias: Some(bias), scale: None }
+        Self { weight, bias: Some(bias), scale: None, scale_v2: None }
     }
 
-    /// Create FP8 projection with block-wise scale.
+    /// Create FP8 projection with block-wise scale `[K/128, N/128]` (the
+    /// post-`take()` orientation). Also derives the load-time-packed
+    /// `_scaled_mm_v2` scale layout (`scale_v2`) so the FP8 GEMM arm pays no
+    /// per-call repack/padding cost.
     #[inline]
     pub(crate) fn with_scale(weight: Tensor, scale: Tensor) -> Self {
-        Self { weight, bias: None, scale: Some(scale) }
+        let scale_v2 = pack_scale_b_v2(&scale);
+        Self { weight, bias: None, scale: Some(scale), scale_v2: Some(scale_v2) }
     }
 
     /// Move all owned tensors to `device` (no-op per tensor already there).
@@ -80,6 +239,7 @@ impl LinearProjection {
             weight: self.weight.to_device(device),
             bias: self.bias.map(|b| b.to_device(device)),
             scale: self.scale.map(|s| s.to_device(device)),
+            scale_v2: self.scale_v2.map(|s| s.to_device(device)),
         }
     }
 
@@ -94,6 +254,18 @@ impl LinearProjection {
     /// multiplies on each forward pass (keeping VRAM at FP8 size).
     #[inline]
     pub(crate) fn apply(&self, input: &Tensor) -> Tensor {
+        // FP8 GEMM spike: config-gated (`RuntimeConfig::fp8_gemm` /
+        // HYPRSTREAM_FP8_GEMM), NVIDIA Hopper (SM90, cuBLASLt ≥ 12.9) only in
+        // practice. Falls through to lazy dequant when the path is unavailable
+        // or has latched off after a kernel error.
+        let fp8_out = if fp8_gemm_enabled() {
+            self.apply_fp8_scaled_mm(input)
+        } else {
+            None
+        };
+        if let Some(out) = fp8_out {
+            return out;
+        }
         let w = match self.weight.kind() {
             tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2 => {
                 // Cast FP8 → BF16 on GPU (ROCm 7.1+ dispatches on-device, no CPU fallback).
@@ -3743,5 +3915,296 @@ mod pipeline_tests {
         let emb = Tensor::randn([1, 3, HIDDEN], (DType::Float, Device::Cpu));
         assert!(stage.forward_layers_train(&emb, 0..2, None).is_err(), "range below window");
         assert!(stage.forward_layers_train(&emb, 2..LAYERS, None).is_ok(), "owned range ok");
+    }
+}
+
+// ============================================================================
+// FP8 _scaled_mm spike — CPU capability contract + numerics + microbenchmark.
+// ============================================================================
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout, clippy::print_stderr)]
+mod fp8_gemm_tests {
+    use super::*;
+    use tch::Kind;
+
+    const FP8: Kind = Kind::Float8e4m3fn;
+    const OPT: (Kind, Device) = (Kind::Float, Device::Cpu);
+
+    /// Deterministic small float tensor, RNG-free so parallel tests can't
+    /// interleave `manual_seed`.
+    fn det(dims: &[i64], salt: i64) -> Tensor {
+        let n: i64 = dims.iter().product();
+        ((Tensor::arange(n, OPT) + salt).sin() * 2.0).reshape(dims)
+    }
+
+    fn max_rel_err(a: &Tensor, b: &Tensor) -> f64 {
+        let a = a.to_kind(Kind::Double);
+        let b = b.to_kind(Kind::Double);
+        let num = (&a - &b).abs();
+        let den = b.abs().clamp_min(1e-6);
+        (num / den).max().double_value(&[])
+    }
+
+    /// ‖a−b‖ / ‖b‖ (Frobenius) — stable under near-zero elements, unlike the
+    /// per-element ratio.
+    fn rel_frob_err(a: &Tensor, b: &Tensor) -> f64 {
+        let a = a.to_kind(Kind::Double);
+        let b = b.to_kind(Kind::Double);
+        let num = (&a - &b).norm().double_value(&[]);
+        let den = b.norm().double_value(&[]).max(1e-12);
+        num / den
+    }
+
+    /// Deterministic pseudo-random in [-1, 1]: frac(sin(i·12.9898)·43758.5453),
+    /// computed in f64 for argument precision. RNG-free like `det()`, but
+    /// without `sin(flat_index)`'s catastrophic dot-product cancellation
+    /// (which inflates relative error metrics ~20x — a data artifact).
+    fn det_rand(dims: &[i64], salt: i64) -> Tensor {
+        let n: i64 = dims.iter().product();
+        let idx = Tensor::arange(n, (Kind::Double, Device::Cpu)) + salt;
+        let h = (idx * 12.9898).sin() * 43758.5453;
+        ((&h - h.floor()) * 2.0 - 1.0).to_kind(Kind::Float).reshape(dims)
+    }
+
+    /// Asserted CPU capability contract for torch 2.10 `_scaled_mm` with e4m3
+    /// (measured by this spike; update if a future libtorch widens it):
+    ///  - v1 CPU: per-TENSOR scales only ("_scaled_mm only supports per-tensor
+    ///    scaling for CPU backend", ATen/native/Blas.cpp). Row/col/blockwise
+    ///    scale layouts are rejected.
+    ///  - v2 CPU: not registered at all — dispatch covers CUDA/XPU only
+    ///    (native_functions.yaml; no CPU kernel). The 1x128/128x128 recipe is
+    ///    further restricted to NVIDIA Hopper (SM90 + cuBLASLt ≥ 12.9) by
+    ///    `_check_deepseek_support`.
+    #[test]
+    fn scaled_mm_cpu_capability_contract() {
+        let (m, k, n) = (8, 128, 64);
+        let a = det(&[m, k], 1).to_kind(FP8);
+        let b = det(&[k, n], 2).to_kind(FP8);
+        let one = Tensor::ones([1, 1], OPT);
+        // v1 tensorwise: works, BF16 out.
+        let out = a
+            .f_internal_scaled_mm(&b, &one, &one, None::<&Tensor>, None::<&Tensor>, Kind::BFloat16, false)
+            .expect("v1 tensorwise e4m3 must work on CPU (torch 2.10)");
+        assert_eq!(out.size(), [m, n]);
+        assert_eq!(out.kind(), Kind::BFloat16);
+        // Sanity: scale == 1 so out == dequant(a) @ dequant(b) in bf16 tolerance.
+        let expect = a.to_kind(Kind::Float).matmul(&b.to_kind(Kind::Float));
+        assert!(
+            max_rel_err(&out, &expect) < 1e-2,
+            "v1 tensorwise result diverged from plain matmul of dequantized inputs"
+        );
+        // v1 rowwise: rejected on CPU.
+        let sa = Tensor::ones([m, 1], OPT);
+        let sb = Tensor::ones([1, n], OPT);
+        let err = a
+            .f_internal_scaled_mm(&b, &sa, &sb, None::<&Tensor>, None::<&Tensor>, Kind::BFloat16, false)
+            .expect_err("v1 rowwise must be rejected on CPU");
+        assert!(err.to_string().contains("per-tensor scaling"), "unexpected: {err}");
+        // v2: not registered for CPU at all.
+        let sa_refs = [&sa];
+        let sb_refs = [&sb];
+        let err = a
+            .f_internal_scaled_mm_v2(
+                &b, &sa_refs, [RECIPE_BLOCKWISE_1X128], [NO_SWIZZLE],
+                &sb_refs, [RECIPE_BLOCKWISE_128X128], [NO_SWIZZLE],
+                None::<&Tensor>, Kind::BFloat16, [] as [i64; 0], false,
+            )
+            .expect_err("v2 must be unavailable on CPU");
+        assert!(err.to_string().contains("_scaled_mm_v2"), "unexpected: {err}");
+    }
+
+    /// The 1x128 activation quantizer: roundtrip q*scale ≈ x. This is the
+    /// device-independent half of the FP8 path — the CUDA kernel consumes
+    /// exactly these (q, scale) tensors, so their error bounds the end-to-end
+    /// error regardless of backend.
+    #[test]
+    fn quantize_activations_1x128_roundtrip() {
+        let x = det(&[7, 256], 3);
+        let (q, scale) = quantize_activations_1x128(&x);
+        assert_eq!(q.kind(), FP8);
+        assert_eq!(q.size(), x.size());
+        assert_eq!(scale.kind(), Kind::Float);
+        assert_eq!(scale.size(), [7, 2]);
+        // Dequantize and compare.
+        let xq = (q.to_kind(Kind::Float).view([7, 2, 128]) * scale.unsqueeze(-1)).view([7, 256]);
+        let rel = max_rel_err(&xq, &x);
+        // e4m3 has 3 mantissa bits → per-element rel err ≤ 2^-4 = 6.25% for
+        // NORMAL outputs (round-to-nearest can tie exactly at the bound, hence
+        // `<=`). Subnormal-quantized outputs can exceed 2^-4 in relative
+        // terms, but amax normalization keeps block magnitudes ≳ 448·2^-9,
+        // well above the e4m3 subnormal floor — so the bound holds here.
+        assert!(rel <= 0.0625, "roundtrip max rel err {rel} exceeds e4m3 ulp bound");
+        assert!(q.to_kind(Kind::Float).abs().max().double_value(&[]) <= 448.0);
+    }
+
+    /// Simulate the full scaled_mm math (activation 1x128 quant + weight
+    /// 128x128 block dequant) in plain f32 ops — exactly what the CUDA v2
+    /// kernel computes — and bound the error vs (a) the lazy-dequant BF16
+    /// baseline and (b) a full-precision reference. The kernel accumulates in
+    /// f32, so real-GPU error should be at or below this envelope.
+    ///
+    /// Uses hash-based pseudo-random data, NOT `det()`: `sin(flat_index)`
+    /// rows/columns produce dot products with catastrophic cancellation
+    /// (signal O(1), error at the sqrt(K)·term scale), which inflated the
+    /// measured rel err to ~0.4 — an artifact of the data, not the scheme.
+    #[test]
+    fn fp8_blockwise_matmul_error_envelope() {
+        let (m, k, n) = (8, 256, 256);
+        let w = det_rand(&[k, n], 4) * 0.05; // weight-scale values
+        let x = det_rand(&[m, k], 5);
+
+        // Quantize weight per 128x128 block (what the checkpoint stores).
+        let w4 = w.view([k / 128, 128, n / 128, 128]);
+        let ws = w4.abs().amax(-1, false).amax(1, false).clamp_min(1e-12) / 448.0; // [k/128, n/128]
+        let wq = (w4 / ws.view([k / 128, 1, n / 128, 1])).clamp(-448.0, 448.0).to_kind(FP8);
+        let w_deq = (wq.to_kind(Kind::Float) * ws.view([k / 128, 1, n / 128, 1])).view([k, n]);
+
+        // Simulated scaled_mm: quantize activations, dequantize both, matmul.
+        let (q, sa) = quantize_activations_1x128(&x);
+        let x_deq = (q.to_kind(Kind::Float).view([m, k / 128, 128]) * sa.unsqueeze(-1)).view([m, k]);
+        let out_sim = x_deq.matmul(&w_deq);
+
+        // (a) vs lazy-dequant baseline: BF16 cast of w_deq then matmul.
+        let out_lazy = x.to_kind(Kind::BFloat16).matmul(&w_deq.to_kind(Kind::BFloat16)).to_kind(Kind::Float);
+        let rel_vs_lazy = rel_frob_err(&out_sim, &out_lazy);
+        // (b) vs full-precision reference.
+        let out_ref = x.matmul(&w);
+        let rel_vs_ref = rel_frob_err(&out_sim, &out_ref);
+        // Error is dominated by the e4m3 mantissa (≤ 6.25% per element,
+        // ~2.3% RMS measured above, partially averaged over K=256
+        // accumulation). The observed envelope is printed for the spike
+        // report; assert conservative bounds.
+        assert!(rel_vs_ref < 0.10, "sim vs full-precision rel err {rel_vs_ref}");
+        assert!(rel_vs_lazy < 0.10, "sim vs lazy-dequant rel err {rel_vs_lazy}");
+        println!(
+            "error envelope (frob rel): x_deq={:.4} w_deq={:.4} sim_vs_lazy={:.4} sim_vs_ref={:.4}",
+            rel_frob_err(&x_deq, &x),
+            rel_frob_err(&w_deq, &w),
+            rel_vs_lazy,
+            rel_vs_ref
+        );
+    }
+
+    /// Load-time `scale_b` packing: `[K/128, N/128]` → `[N/128, L4]`
+    /// contiguous with the K-block dim zero-padded to a multiple of 4
+    /// (cuBLASLt TMA). CPU-verifiable layout contract.
+    #[test]
+    fn fp8_scale_v2_packed_layout() {
+        // K=256 → K/128=2 blocks → L4=4 (padding exercised); N=384 → 3 blocks.
+        let scale = det(&[2, 3], 9);
+        let packed = pack_scale_b_v2(&scale);
+        assert_eq!(packed.size(), [3, 4]);
+        assert_eq!(packed.kind(), Kind::Float);
+        assert!(packed.is_contiguous());
+        // K-block-minor order: packed[j, i] == scale[i, j] for real blocks.
+        let expect = scale.transpose(0, 1);
+        assert!(packed.narrow(1, 0, 2).allclose(&expect, 0.0, 0.0, false));
+        // Padding region is zeros (never read by the kernel; TMA allocation only).
+        assert_eq!(packed.narrow(1, 2, 2).abs().max().double_value(&[]), 0.0);
+        // Passed as .t() at the call site: [L4, N/128] with strides (1, L4).
+        let passed = packed.transpose(0, 1);
+        assert_eq!(passed.size(), [4, 3]);
+        assert_eq!(passed.stride(), [1, 4]);
+        // Exact-multiple case (K/128=4) must not pad.
+        let packed4 = pack_scale_b_v2(&det(&[4, 2], 10));
+        assert_eq!(packed4.size(), [2, 4]);
+        // with_scale derives scale_v2 automatically.
+        let proj = LinearProjection::with_scale(
+            det(&[256, 384], 11).to_kind(FP8),
+            det(&[2, 3], 9),
+        );
+        assert_eq!(proj.scale_v2.as_ref().unwrap().size(), [3, 4]);
+    }
+
+    /// On CPU the gated path must decline (no CUDA) and `apply` must fall back
+    /// to the lazy-dequant result unchanged.
+    #[test]
+    fn fp8_scaled_mm_declines_on_cpu() {
+        let w = det(&[128, 256], 6).clamp(-2.0, 2.0).to_kind(FP8); // [in, out]
+        let scale = Tensor::ones([1, 2], OPT); // [in/128, out/128]
+        let proj = LinearProjection::with_scale(w, scale);
+        let x = det(&[3, 128], 7).to_kind(Kind::BFloat16);
+        assert!(proj.apply_fp8_scaled_mm(&x).is_none(), "CPU must decline the scaled_mm path");
+        // Lazy fallback still computes.
+        let out = proj.apply(&x);
+        assert_eq!(out.size(), [3, 256]);
+    }
+
+    /// End-to-end on CUDA: gated path vs lazy-dequant baseline. K=256 gives
+    /// K/128=2 weight-scale blocks, so the L4=4 zero-padding in
+    /// `pack_scale_b_v2` is exercised; `with_scale` packs the scale at
+    /// "load" time exactly as `take()` does.
+    /// Ignored: run on a Hopper box (SM90 + cuBLASLt ≥ 12.9) with
+    /// `cargo test -p hyprstream --lib fp8_gemm_tests -- --ignored`.
+    /// On non-Hopper CUDA the kernel hard-errors and trips the sticky latch —
+    /// that is the expected behavior there, not a test failure mode to fix.
+    #[test]
+    #[ignore = "requires NVIDIA Hopper (SM90, cuBLASLt >= 12.9): torch 2.10 has no CPU _scaled_mm_v2 kernel"]
+    fn fp8_scaled_mm_matches_lazy_dequant_cuda() {
+        if !tch::Cuda::is_available() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let dev = Device::Cuda(0);
+        let (m, k, n) = (8, 256, 256);
+        let w = (det_rand(&[k, n], 4) * 0.05).to_device(dev);
+        let w4 = w.view([k / 128, 128, n / 128, 128]);
+        let ws = w4.abs().amax(-1, false).amax(1, false).clamp_min(1e-12) / 448.0;
+        let wq = (w4 / ws.view([k / 128, 1, n / 128, 1])).clamp(-448.0, 448.0).to_kind(FP8).view([k, n]);
+        let proj = LinearProjection::with_scale(wq, ws.view([k / 128, n / 128]));
+        // Load-time pack: [N/128, L4] with L4 = round_up(2, 4) = 4.
+        assert_eq!(proj.scale_v2.as_ref().unwrap().size(), [n / 128, 4]);
+        let x = det_rand(&[m, k], 5).to_kind(Kind::BFloat16).to_device(dev);
+
+        let out_fp8 = proj.apply_fp8_scaled_mm(&x).expect("CUDA scaled_mm path must succeed");
+        let out_lazy = proj.apply(&x); // flag off in tests → lazy dequant
+        let rel = rel_frob_err(&out_fp8, &out_lazy);
+        println!("CUDA scaled_mm vs lazy-dequant max rel err: {rel:.4}");
+        assert!(rel < 0.10, "CUDA scaled_mm diverged: {rel}");
+    }
+
+    /// Microbenchmark: lazy-dequant matmul vs the scaled_mm path composition
+    /// at a realistic layer shape. On CPU the v2 kernel is unavailable, so
+    /// this times (a) lazy apply, (b) activation quantization alone (the added
+    /// per-call overhead), (c) v1 tensorwise scaled_mm as a GEMM proxy. Real
+    /// GPU latency numbers must be taken on the CUDA box (run --ignored).
+    #[test]
+    #[ignore = "microbenchmark — run explicitly; GPU numbers need the CUDA box"]
+    fn bench_fp8_gemm_vs_lazy_dequant() {
+        let (m, k, n) = (1, 5120, 5120);
+        let w = Tensor::zeros([k, n], OPT).clamp(-1.0, 1.0).to_kind(FP8);
+        let scale = Tensor::ones([k / 128, n / 128], OPT);
+        let proj = LinearProjection::with_scale(w, scale);
+        let x = det(&[m, k], 8).to_kind(Kind::BFloat16);
+        let iters = 20;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = proj.apply(&x);
+        }
+        let lazy_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        let x2 = x.reshape([m, k]);
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = quantize_activations_1x128(&x2);
+        }
+        let quant_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        // v1 tensorwise scaled_mm (the only CPU kernel) as a GEMM-time proxy.
+        let one = Tensor::ones([1, 1], OPT);
+        let (q, _) = quantize_activations_1x128(&x2);
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = q.internal_scaled_mm(
+                &proj.weight, &one, &one, None::<&Tensor>, None::<&Tensor>, Kind::BFloat16, false,
+            );
+        }
+        let smm_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        println!(
+            "shape [{m},{k}]x[{k},{n}] CPU: lazy_dequant={lazy_us:.0}us \
+             act_quant={quant_us:.0}us v1_tensorwise_scaled_mm={smm_us:.0}us"
+        );
     }
 }

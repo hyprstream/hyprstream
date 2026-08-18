@@ -2150,6 +2150,28 @@ pub struct RuntimeConfig {
     /// `HYPRSTREAM_CONTINUOUS_BATCH_MAX`.
     #[serde(default = "default_continuous_batch_max")]
     pub continuous_batch_max: usize,
+
+    /// FP8 GEMM via torch `_scaled_mm` for FP8 (e4m3) weight projections.
+    /// **Default: off.**
+    ///
+    /// When enabled, `LinearProjection::apply` computes FP8-weight matmuls
+    /// with `at::_scaled_mm_v2` — activations quantized per-token to e4m3 with
+    /// 1x128 block scales — instead of the lazy BF16 dequant-then-matmul.
+    ///
+    /// Hardware support is narrow: torch 2.10's `_check_deepseek_support`
+    /// (ScaledBlas.cpp) restricts the 1x128/128x128 blockwise recipe to
+    /// **NVIDIA Hopper (SM90) with cuBLASLt ≥ 12.9 on CUDA** — it hard-errors
+    /// on ROCm, SM89, SM100, and SM120, and there is no CPU kernel at all.
+    /// The runtime latches off permanently after the first kernel error and
+    /// falls back to lazy dequant, so enabling this on unsupported hardware
+    /// costs one warning, not a failure.
+    ///
+    /// Precedence note: like `mmap`, this field is currently **env-only in
+    /// effect** — model construction has no `RuntimeConfig` plumbing, so the
+    /// runtime reads `HYPRSTREAM_FP8_GEMM` directly (cached per process);
+    /// setting the field programmatically does not reach the model path.
+    #[serde(default = "default_fp8_gemm")]
+    pub fp8_gemm: bool,
 }
 
 /// Default for [`RuntimeConfig::continuous_batching`]: off unless
@@ -2169,6 +2191,16 @@ fn default_continuous_batch_max() -> usize {
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(16)
+}
+
+/// Default for [`RuntimeConfig::fp8_gemm`]: off unless `HYPRSTREAM_FP8_GEMM`
+/// is set truthy. Off is the safe default — the lazy BF16 dequant matmul is
+/// the verified reference, and the `_scaled_mm_v2` blockwise path requires
+/// NVIDIA Hopper (SM90) + cuBLASLt ≥ 12.9 (no CPU/ROCm kernel in torch 2.10).
+pub(crate) fn default_fp8_gemm() -> bool {
+    std::env::var("HYPRSTREAM_FP8_GEMM")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 /// Default for [`RuntimeConfig::strict_device`]: strict (fail-fast) unless
@@ -2233,6 +2265,7 @@ impl Default for RuntimeConfig {
             default_model_load_timeout_ms: 300000, // 5 minutes
             continuous_batching: default_continuous_batching(),
             continuous_batch_max: default_continuous_batch_max(),
+            fp8_gemm: default_fp8_gemm(),
         }
     }
 }
