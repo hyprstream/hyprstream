@@ -107,14 +107,38 @@ const RECIPE_BLOCKWISE_1X128: i64 = 4;
 const RECIPE_BLOCKWISE_128X128: i64 = 5;
 const NO_SWIZZLE: i64 = 0;
 
-/// Sticky kernel-failure latch for the `_scaled_mm_v2` path. The deepseek
-/// (1x128 × 128x128) recipe hard-errors off NVIDIA Hopper (SM90 + cuBLASLt ≥
-/// 12.9: `_check_deepseek_support` in ScaledBlas.cpp — ROCm, SM89/SM100/SM120
-/// all fail), and tch-rs exposes no compute-capability query, so the first
-/// kernel error latches this and every later call skips the FP8 arm silently
-/// (one warning total, no per-token quant+kernel-error churn). Process-global:
-/// a recipe that fails on one device fails on all devices of the same build.
-static SCALED_MM_V2_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Per-CUDA-device sticky kernel-failure latch for the `_scaled_mm_v2` path.
+/// The deepseek (1x128 × 128x128) recipe hard-errors off NVIDIA Hopper (SM90 +
+/// cuBLASLt ≥ 12.9: `_check_deepseek_support` in ScaledBlas.cpp), and tch-rs
+/// exposes no compute-capability query, so the first kernel error *on a given
+/// device* latches only that device off: later calls on it skip the FP8 arm
+/// silently (one warning per device), while other devices keep using the
+/// kernel. Per-device rather than process-global because a multi-GPU
+/// `LayerDeviceMap` can mix Hopper with another CUDA architecture — support is
+/// a per-device compute-capability property (PR #1523 review). Failed state
+/// only ever transitions false → true.
+#[derive(Default)]
+struct DeviceLatch(parking_lot::Mutex<std::collections::HashSet<usize>>);
+
+impl DeviceLatch {
+    /// True if the kernel has already failed on CUDA device `idx`.
+    fn is_failed(&self, idx: usize) -> bool {
+        self.0.lock().contains(&idx)
+    }
+
+    /// Mark CUDA device `idx` failed. Returns true iff this call was the
+    /// first failure for the device — i.e. the caller should log the warning
+    /// (warn-once-per-device).
+    fn mark_failed(&self, idx: usize) -> bool {
+        self.0.lock().insert(idx)
+    }
+}
+
+static SCALED_MM_V2_FAILED: std::sync::OnceLock<DeviceLatch> = std::sync::OnceLock::new();
+
+fn scaled_mm_v2_latch() -> &'static DeviceLatch {
+    SCALED_MM_V2_FAILED.get_or_init(DeviceLatch::default)
+}
 
 /// Repack a `[K/128, N/128]` block scale into the `_scaled_mm_v2`
 /// `BlockWise128x128` layout: `[N/128, L4]` contiguous f32 with
@@ -139,9 +163,10 @@ impl LinearProjection {
     /// scale, not on CUDA (torch 2.10 has no CPU `_scaled_mm_v2` kernel —
     /// dispatch covers CUDA/XPU only; the CPU `_scaled_mm` v1 kernel is
     /// per-tensor-scale only, which cannot express the checkpoint's 128x128
-    /// weight scales), K not a multiple of 128, or a prior kernel failure
-    /// (see [`SCALED_MM_V2_FAILED`]; the recipe is additionally Hopper-only —
-    /// SM90 + cuBLASLt ≥ 12.9 — and hard-errors elsewhere).
+    /// weight scales), K not a multiple of 128, or a prior kernel failure on
+    /// the weight's device (see [`SCALED_MM_V2_FAILED`]; the recipe is
+    /// additionally Hopper-only — SM90 + cuBLASLt ≥ 12.9 — and hard-errors
+    /// elsewhere).
     ///
     /// Layout: `weight` is stored `[in, out]` (K, N) after `take()`; the kernel
     /// wants `mat2` column-major `[K, N]`, so we materialize one FP8 transpose
@@ -154,10 +179,17 @@ impl LinearProjection {
     /// `weight_scale_inv` semantics, matching the lazy path), so no reciprocal
     /// is needed.
     pub(crate) fn apply_fp8_scaled_mm(&self, input: &Tensor) -> Option<Tensor> {
-        if self.weight.kind() != tch::Kind::Float8e4m3fn || !matches!(self.weight.device(), Device::Cuda(_)) {
+        if self.weight.kind() != tch::Kind::Float8e4m3fn {
             return None;
         }
-        if SCALED_MM_V2_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        // The kernel runs where the weight lives (the model's forward moves
+        // the input to the layer's device), so the gate and the failure latch
+        // key on the *weight's* CUDA device index — correct under a
+        // multi-GPU LayerDeviceMap.
+        let Device::Cuda(dev_idx) = self.weight.device() else {
+            return None;
+        };
+        if scaled_mm_v2_latch().is_failed(dev_idx) {
             return None;
         }
         let scale_v2 = self.scale_v2.as_ref()?;
@@ -194,11 +226,12 @@ impl LinearProjection {
                 false,
             )
             .map_err(|e| {
-                SCALED_MM_V2_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(
-                    "FP8 _scaled_mm_v2 failed (latching off for this process, \
-                     using lazy dequant from here on): {e}"
-                );
+                if scaled_mm_v2_latch().mark_failed(dev_idx) {
+                    tracing::warn!(
+                        "FP8 _scaled_mm_v2 failed on CUDA device {dev_idx} (latched off for \
+                         this device, using lazy dequant there from here on): {e}"
+                    );
+                }
                 e
             })
             .ok()?;
@@ -4114,6 +4147,25 @@ mod fp8_gemm_tests {
             det(&[2, 3], 9),
         );
         assert_eq!(proj.scale_v2.as_ref().unwrap().size(), [3, 4]);
+    }
+
+    /// The failure latch is per-CUDA-device (PR #1523 review): a failure on
+    /// one device must not disable the FP8 arm on another, and each device
+    /// warns exactly once. CPU-testable without GPUs since the latch is keyed
+    /// on the device index alone.
+    #[test]
+    fn device_latch_isolation() {
+        let latch = DeviceLatch::default();
+        assert!(!latch.is_failed(0) && !latch.is_failed(1));
+        // First failure on device 0 reports (caller warns); repeats don't.
+        assert!(latch.mark_failed(0));
+        assert!(!latch.mark_failed(0));
+        // Device 0 latched, device 1 unaffected.
+        assert!(latch.is_failed(0));
+        assert!(!latch.is_failed(1));
+        // Device 1 failing later reports independently.
+        assert!(latch.mark_failed(1));
+        assert!(latch.is_failed(1));
     }
 
     /// On CPU the gated path must decline (no CUDA) and `apply` must fall back
