@@ -2141,7 +2141,22 @@ impl KVCacheManager {
             return 0;
         }
 
-        self.layer_caches.iter().map(|c| c.memory_usage()).sum()
+        // Include the SSM snapshot (Qwen3.5 GDN conv/rec state): it holds
+        // device tensors and must count toward the eviction budget, or
+        // `evict_to_budget` undercounts and skips offloading.
+        let ssm_bytes: usize = self
+            .ssm_snapshot
+            .as_ref()
+            .map(|(conv, rec)| {
+                conv.iter()
+                    .chain(rec.iter())
+                    .flatten()
+                    .map(|t| t.numel() * dtype_element_size(t.kind()))
+                    .sum()
+            })
+            .unwrap_or(0);
+
+        self.layer_caches.iter().map(|c| c.memory_usage()).sum::<usize>() + ssm_bytes
     }
 
     /// Get the quantization type
@@ -2411,6 +2426,28 @@ mod tests {
         let manager = KVCacheManager::new(num_layers, max_seq_len, KVQuantType::Nf4);
 
         assert_eq!(manager.quant_type(), KVQuantType::Nf4);
+    }
+
+    /// The SSM snapshot (Qwen3.5 GDN conv/rec state) holds device tensors and
+    /// must count toward the eviction budget: `memory_usage` grows when a
+    /// snapshot is recorded and shrinks back when it is dropped.
+    #[test]
+    fn test_memory_usage_includes_ssm_snapshot() {
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+        let baseline = manager.memory_usage();
+
+        let opt = (DType::Float, Device::Cpu);
+        let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
+        let rec = vec![Some(Tensor::zeros([4], opt)), None];
+        let expected = (2 * 3 + 4) * dtype_element_size(DType::Float);
+
+        manager.set_cached_tokens_with_ssm(vec![1, 2, 3], Some((conv, rec)));
+        assert_eq!(manager.memory_usage(), baseline + expected);
+
+        // Recording tokens without a snapshot drops it (no stale state) and
+        // the budget accounting shrinks back.
+        manager.set_cached_tokens(vec![1, 2, 3, 4]);
+        assert_eq!(manager.memory_usage(), baseline);
     }
 
     #[test]
