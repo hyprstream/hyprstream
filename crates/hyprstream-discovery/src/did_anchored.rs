@@ -290,17 +290,78 @@ fn document_names_at9p(document: &Value, at9p_did: &str) -> bool {
         .is_some_and(|aliases| aliases.iter().any(|alias| alias.as_str() == Some(at9p_did)))
 }
 
-/// Extract the deployment CA from the primary hybrid subject key that signed
-/// the GATE-verified capsule.
+/// Enforce the deployment-specific, closed anchor-capsule profile.
+///
+/// Generic at9p capsules intentionally have set semantics and may carry
+/// rotation or delegation material. A deployment anchor is narrower: every
+/// signed claim must be one the anchor minter and this resolver consume.
+fn validate_deployment_anchor_profile(
+    verified: &VerifiedCapsule,
+    configured_did_web: &str,
+) -> Result<()> {
+    let body = &verified.capsule().body;
+    anyhow::ensure!(
+        body.subject_keys.len() == 1,
+        "closed deployment-anchor profile violation: subjectKeys must contain exactly one pinned-Hybrid signer (got {})",
+        body.subject_keys.len()
+    );
+    anyhow::ensure!(
+        body.services.len() == 1,
+        "closed deployment-anchor profile violation: services must contain exactly one #ns NinePExport entry (got {})",
+        body.services.len()
+    );
+    let service = &body.services[0];
+    anyhow::ensure!(
+        service.id == DEPLOYMENT_REACH_SERVICE
+            && service.service_type == ServiceType::NinePExport,
+        "closed deployment-anchor profile violation: sole service must be #ns with type NinePExport"
+    );
+    let aliases = body.also_known_as.as_deref().unwrap_or_default();
+    anyhow::ensure!(
+        aliases.len() == 1 && aliases[0] == configured_did_web,
+        "closed deployment-anchor profile violation: alsoKnownAs must contain exactly the configured did:web {configured_did_web:?}"
+    );
+    anyhow::ensure!(
+        body.next_key_commitments.is_empty(),
+        "closed deployment-anchor profile violation: nextKeyCommitments are forbidden"
+    );
+    anyhow::ensure!(
+        body.label_hints.is_none(),
+        "closed deployment-anchor profile violation: labelHints are forbidden"
+    );
+    anyhow::ensure!(
+        body.delegations.is_none(),
+        "closed deployment-anchor profile violation: delegations are forbidden"
+    );
+    anyhow::ensure!(
+        body.witnesses.is_none(),
+        "closed deployment-anchor profile violation: witnesses are forbidden"
+    );
+    anyhow::ensure!(
+        service.endpoint.export.is_none(),
+        "closed deployment-anchor profile violation: the #ns endpoint export field is forbidden"
+    );
+    match service.endpoint.transport {
+        At9pTransport::Iroh => {}
+        At9pTransport::Quic => anyhow::ensure!(
+            service.endpoint.node_id.is_none() && service.endpoint.relay.is_none(),
+            "closed deployment-anchor profile violation: QUIC #ns endpoints must not carry iroh nodeId or relay fields"
+        ),
+        ref other => bail!(
+            "closed deployment-anchor profile violation: #ns transport must be iroh or quic (got {other:?})"
+        ),
+    }
+    Ok(())
+}
+
+/// Extract the deployment CA from the sole hybrid subject key that signed the
+/// GATE-verified, closed-profile capsule.
 fn ca_key_from_capsule(verified: &VerifiedCapsule) -> Result<HybridDeploymentCa> {
-    let primary = verified
-        .capsule()
-        .body
-        .subject_keys
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("GATE-verified capsule has no subject key"))?;
-    HybridDeploymentCa::from_public_key_bytes(&primary.ed25519_pub, &primary.mldsa65_pub)
-        .context("capsule primary subject key is not a valid hybrid deployment CA")
+    let [subject] = verified.capsule().body.subject_keys.as_slice() else {
+        bail!("closed deployment-anchor profile violation: subjectKeys must contain exactly one pinned-Hybrid signer");
+    };
+    HybridDeploymentCa::from_public_key_bytes(&subject.ed25519_pub, &subject.mldsa65_pub)
+        .context("capsule sole subject key is not a valid hybrid deployment CA")
 }
 
 /// Extract Discovery reach from the capsule's typed `#ns` service. The
@@ -468,6 +529,8 @@ async fn resolve_anchor_pair(
         "mutual-alias resolver did not preserve configured at9p authority"
     );
 
+    validate_deployment_anchor_profile(&verified, &anchors.cluster_did_web)?;
+
     // The document contributes only the reciprocal identifier vouch above.
     // Everything installed is content-bound to the configured did:at9p pin.
     let ca_verifying_key = ca_key_from_capsule(&verified)?;
@@ -557,9 +620,10 @@ mod tests {
     use ed25519_dalek::{Signer as _, SigningKey};
     use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes, MlDsaSigningKey};
     use hyprstream_pds::at9p::{
-        CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
-        ML_DSA65_PUBLIC_KEY_LEN,
+        CapsuleBody, Delegation, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType,
+        Transport, ML_DSA65_PUBLIC_KEY_LEN,
     };
+    use hyprstream_pds::at9p_gate::verify_did_at9p;
     use hyprstream_pds::at9p_sign::sign_capsule;
     use hyprstream_pds::dag_cbor::DagCbor;
     use hyprstream_rpc::{
@@ -830,6 +894,49 @@ mod tests {
         capsule_with_carrier(classical_alias, tag, Some([0xC0; 32]))
     }
 
+    fn anchor_body(classical_alias: &str, signer: &CapsuleSigner) -> CapsuleBody {
+        let mut endpoint = ServiceEndpoint::new(Transport::Iroh, "iroh://anchor").unwrap();
+        endpoint.node_id = Some(multikey(&[0xC0; 32]));
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        let mut body = CapsuleBody::new(vec![signer.pair.clone()], vec![service]).unwrap();
+        body.also_known_as = Some(vec![classical_alias.to_owned()]);
+        body
+    }
+
+    fn signed_capsule(body: CapsuleBody, signer: &CapsuleSigner) -> (Vec<u8>, String) {
+        let capsule = sign_capsule(body, &signer.ed, &signer.pq).unwrap();
+        let bytes = capsule.to_dag_cbor().unwrap();
+        let did = format!("did:at9p:{}", capsule.cid512().unwrap());
+        (bytes, did)
+    }
+
+    async fn closed_profile_error(web: &str, bytes: Vec<u8>, at9p: String) -> anyhow::Error {
+        let anchors = DidAnchors {
+            cluster_at9p_did: at9p.clone(),
+            cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
+        };
+        verify_anchor_material(
+            &anchors,
+            &document(web, Some(&at9p)),
+            Arc::new(FixedCapsuleSource(bytes)),
+        )
+        .await
+        .expect_err("non-profile anchor capsule unexpectedly accepted")
+    }
+
+    fn assert_closed_profile_error(error: &anyhow::Error, field: &str) {
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("closed deployment-anchor profile violation"),
+            "failure did not come from the closed profile: {chain}"
+        );
+        assert!(
+            chain.contains(field),
+            "closed-profile failure did not identify {field}: {chain}"
+        );
+    }
+
     fn document(web: &str, at9p: Option<&str>) -> Value {
         let mut document = json!({ "id": web });
         if let Some(at9p) = at9p {
@@ -957,33 +1064,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutual_alias_accepts_at9p_as_authoritative() {
+    async fn closed_anchor_profile_preserves_the_exact_minted_deployment_ca() {
         let web = "did:web:cluster.example";
-        let (bytes, at9p) = capsule(web, 4);
+        let signer = capsule_signer(4);
+        let mut deployment_ca = signer.pair.ed25519_pub.clone();
+        deployment_ca.extend_from_slice(&signer.pair.mldsa65_pub);
+        let (bytes, at9p) = signed_capsule(anchor_body(web, &signer), &signer);
         let anchors = DidAnchors {
             cluster_at9p_did: at9p.clone(),
             cluster_did_web: web.to_owned(),
             extra_root_cert_pem: None,
         };
-        let trust = verify_did_anchored_document(
+        let verified = verify_anchor_material(
             &anchors,
             &document(web, Some(&at9p)),
             Arc::new(FixedCapsuleSource(bytes)),
-            "unused-test-credential".to_owned(),
-            unused_authority_log(),
         )
         .await
         .unwrap();
-        assert_eq!(trust.authoritative_identity.at9p_did.as_str(), at9p);
-        assert_eq!(trust.authoritative_identity.classical_did.as_str(), web);
-        assert_eq!(trust.ca_verifying_key.ed25519_bytes(), capsule_ca(4));
+        assert_eq!(verified.at9p_did, at9p);
         assert_eq!(
-            trust.ca_verifying_key.ml_dsa_65_bytes().len(),
-            ML_DSA65_PUBLIC_KEY_LEN
+            verified.deployment_ca_public, deployment_ca,
+            "resolved deployment CA must be byte-identical to deployment-ca.hybrid"
         );
-        match trust.discovery_transport.endpoint {
+        assert_eq!(
+            verified.deployment_ca_public.len(),
+            32 + ML_DSA65_PUBLIC_KEY_LEN
+        );
+        match verified.discovery_transport.endpoint {
             EndpointType::Iroh { node_id, .. } => assert_eq!(node_id, [0xC0; 32]),
             other => panic!("expected iroh reach from capsule, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_anchor_profile_rejects_two_subject_keys_signed_by_the_second() {
+        let web = "did:web:cluster.example";
+        let untrusted_first = capsule_signer(0x41);
+        let actual_signer = capsule_signer(0x42);
+        let mut body = anchor_body(web, &actual_signer);
+        body.subject_keys = vec![untrusted_first.pair, actual_signer.pair.clone()];
+        let (bytes, at9p) = signed_capsule(body, &actual_signer);
+
+        verify_did_at9p(&at9p, &bytes)
+            .expect("generic set-semantic GATE must accept the second subject as signer");
+        let error = closed_profile_error(web, bytes, at9p).await;
+        assert_closed_profile_error(&error, "subjectKeys");
+    }
+
+    #[tokio::test]
+    async fn closed_anchor_profile_rejects_an_extra_service() {
+        let web = "did:web:cluster.example";
+        let signer = capsule_signer(0x43);
+        let mut body = anchor_body(web, &signer);
+        let endpoint = ServiceEndpoint::new(Transport::Https, "https://pds.example").unwrap();
+        body.services
+            .push(ServiceEntry::new("#pds", ServiceType::AtprotoPds, endpoint).unwrap());
+        let (bytes, at9p) = signed_capsule(body, &signer);
+
+        verify_did_at9p(&at9p, &bytes).expect("extra-service capsule must pass generic GATE");
+        let error = closed_profile_error(web, bytes, at9p).await;
+        assert_closed_profile_error(&error, "services");
+    }
+
+    #[tokio::test]
+    async fn closed_anchor_profile_rejects_an_extra_alias() {
+        let web = "did:web:cluster.example";
+        let signer = capsule_signer(0x44);
+        let mut body = anchor_body(web, &signer);
+        body.also_known_as = Some(vec![
+            web.to_owned(),
+            "did:web:unexpected.example".to_owned(),
+        ]);
+        let (bytes, at9p) = signed_capsule(body, &signer);
+
+        verify_did_at9p(&at9p, &bytes).expect("extra-alias capsule must pass generic GATE");
+        let error = closed_profile_error(web, bytes, at9p).await;
+        assert_closed_profile_error(&error, "alsoKnownAs");
+    }
+
+    #[tokio::test]
+    async fn closed_anchor_profile_rejects_forbidden_signed_authority_metadata() {
+        let web = "did:web:cluster.example";
+        let signer = capsule_signer(0x45);
+
+        let mut next_key = anchor_body(web, &signer);
+        next_key
+            .next_key_commitments
+            .push(signer.pair.commitment_digest());
+        let mut label_hints = anchor_body(web, &signer);
+        label_hints.label_hints = Some(vec!["deployment".to_owned()]);
+        let mut delegations = anchor_body(web, &signer);
+        delegations.delegations = Some(vec![Delegation::new(
+            "operator",
+            "did:web:delegate.example",
+            vec!["admin".to_owned()],
+        )
+        .unwrap()]);
+        let mut witnesses = anchor_body(web, &signer);
+        witnesses.witnesses = Some(vec!["did:web:witness.example".to_owned()]);
+
+        for (field, body) in [
+            ("nextKeyCommitments", next_key),
+            ("labelHints", label_hints),
+            ("delegations", delegations),
+            ("witnesses", witnesses),
+        ] {
+            let (bytes, at9p) = signed_capsule(body, &signer);
+            verify_did_at9p(&at9p, &bytes)
+                .unwrap_or_else(|error| panic!("{field} capsule must pass generic GATE: {error}"));
+            let error = closed_profile_error(web, bytes, at9p).await;
+            assert_closed_profile_error(&error, field);
         }
     }
 
