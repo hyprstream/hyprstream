@@ -3932,9 +3932,9 @@ mod fp8_gemm_tests {
 
     /// Deterministic small float tensor, RNG-free so parallel tests can't
     /// interleave `manual_seed`.
-    fn det(dims: &[i64], salt: i64) -> Tensor {
+    fn det(dims: &[i64], seed: i64) -> Tensor {
         let n: i64 = dims.iter().product();
-        ((Tensor::arange(n, OPT) + salt).sin() * 2.0).reshape(dims)
+        ((Tensor::arange(n, OPT) + seed).sin() * 2.0).reshape(dims)
     }
 
     fn max_rel_err(a: &Tensor, b: &Tensor) -> f64 {
@@ -3959,9 +3959,9 @@ mod fp8_gemm_tests {
     /// computed in f64 for argument precision. RNG-free like `det()`, but
     /// without `sin(flat_index)`'s catastrophic dot-product cancellation
     /// (which inflates relative error metrics ~20x — a data artifact).
-    fn det_rand(dims: &[i64], salt: i64) -> Tensor {
+    fn det_rand(dims: &[i64], seed: i64) -> Tensor {
         let n: i64 = dims.iter().product();
-        let idx = Tensor::arange(n, (Kind::Double, Device::Cpu)) + salt;
+        let idx = Tensor::arange(n, (Kind::Double, Device::Cpu)) + seed;
         let h = (idx * 12.9898).sin() * 43758.5453;
         ((&h - h.floor()) * 2.0 - 1.0).to_kind(Kind::Float).reshape(dims)
     }
