@@ -99,6 +99,35 @@ pub(crate) fn dequantize_fp8_weights_at_load(weights: &mut HashMap<String, Tenso
     converted
 }
 
+/// Run load-time FP8 dequantization when requested — but never for a
+/// multi-device pipeline: every checkpoint tensor is loaded onto the pool's
+/// *primary* device first, so materializing the whole model as BF16 there
+/// (before `stage_from_weights_with_config` spreads layers across the pool)
+/// would peak at full-BF16 on one device and could OOM a model whose BF16
+/// weights only fit across the pool. In that case the flag is ignored with a
+/// warning and the FP8 lazy-dequant path is kept.
+fn maybe_dequantize_fp8_weights_at_load(
+    weights: &mut HashMap<String, Tensor>,
+    fp8_dequant_load: bool,
+    device_pool: Option<&DevicePool>,
+) {
+    if !fp8_dequant_load {
+        return;
+    }
+    if device_pool.is_some_and(|p| !p.is_single()) {
+        warn!(
+            "FP8 dequant-at-load ignored for multi-device pipeline: all weights land on the \
+             primary device before layer distribution, so full-model BF16 materialization \
+             there could OOM; keeping FP8 lazy per-matmul dequant"
+        );
+        return;
+    }
+    let converted = dequantize_fp8_weights_at_load(weights);
+    if converted > 0 {
+        info!("Dequantized {} FP8 weight tensor(s) to BF16 at load", converted);
+    }
+}
+
 /// Glob-fallback shard discovery, shared by the sync/async loader paths.
 ///
 /// Loud by design (#315): a multi-shard model reached via glob (no index.json) is
@@ -364,12 +393,7 @@ impl ModelFactory {
         let mut weights =
             Self::load_weights_for_stage_plan(plan, request.layer_range.clone(), device, dtype)
                 .await?;
-        if fp8_dequant_load {
-            let converted = dequantize_fp8_weights_at_load(&mut weights);
-            if converted > 0 {
-                info!("Dequantized {} FP8 weight tensor(s) to BF16 at load", converted);
-            }
-        }
+        maybe_dequantize_fp8_weights_at_load(&mut weights, fp8_dequant_load, device_pool);
 
         Self::create_llama_model(
             config,
@@ -1490,12 +1514,7 @@ impl ModelFactory {
         // its block scale applied, before any architecture constructor consumes
         // the map. Downstream FP8 lazy-dequant branches then never trigger —
         // the per-matmul dequant disappears from the hot path.
-        if fp8_dequant_load {
-            let converted = dequantize_fp8_weights_at_load(&mut weights);
-            if converted > 0 {
-                info!("Dequantized {} FP8 weight tensor(s) to BF16 at load", converted);
-            }
-        }
+        maybe_dequantize_fp8_weights_at_load(&mut weights, fp8_dequant_load, device_pool);
 
         // Multi-device is only wired for Llama-family architectures today (the
         // only family with a `stage_from_weights_with_config` that honors a

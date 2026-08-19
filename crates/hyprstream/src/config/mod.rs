@@ -2156,7 +2156,9 @@ pub struct RuntimeConfig {
     /// Trades ~2x weight VRAM for zero per-matmul dequant work. Tunable via
     /// `HYPRSTREAM_FP8_DEQUANT_LOAD` (truthy = on). Off by default — off keeps
     /// the FP8-in-VRAM behavior, which is required when the BF16 equivalent
-    /// would exceed VRAM.
+    /// would exceed VRAM. Ignored (with a warning) for multi-device pipelines:
+    /// weights are loaded onto the pool's primary device before layers are
+    /// distributed, so full-model BF16 materialization there could OOM.
     #[serde(default = "default_fp8_dequant_load")]
     pub fp8_dequant_load: bool,
 }
