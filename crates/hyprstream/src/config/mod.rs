@@ -2164,10 +2164,25 @@ pub struct RuntimeConfig {
     /// `HYPRSTREAM_SPECULATIVE_DECODE` (truthy = on). Correctness is gated by
     /// `mtp_decode_matches_serial`.
     ///
-    /// Perf caveat: every verify round deep-copies the GDN conv/rec SSM state
-    /// (`snapshot_ssm_states`) so a reject can restore it. For a 27B-scale model
-    /// that copy is sizeable and could eat much of the speculative speedup —
-    /// measure end-to-end tokens/sec on GPU before advertising this flag.
+    /// # Performance envelope (measured)
+    ///
+    /// **Experimental — measured regression, keep default-off.** GPU validation
+    /// (RTX 5090 / SM120, Qwen3.5-27B FP8) found the path functionally correct
+    /// but ~76% SLOWER than serial decode. The naive cost model — accept = 1
+    /// forward per 2 tokens, reject = 2 forwards per 1 token, breakeven at
+    /// α ≈ 0.5 acceptance with speedup ≈ (1+α)/(2−α) — holds only BEFORE
+    /// structural per-round overheads:
+    ///
+    /// - a full GDN conv/rec SSM-state deep copy (`snapshot_ssm_states`) every
+    ///   round — fixed cost at 27B scale, suspected dominant (profile this
+    ///   first if this is ever optimized);
+    /// - the reject-path single-token re-forward that re-syncs SSM state;
+    /// - the per-round MTP draft forward itself.
+    ///
+    /// These push the real breakeven well above α = 0.5. Enable only per
+    /// workload after measuring acceptance via the
+    /// `inference_speculative_tokens_total` counter (kind=accepted|rejected);
+    /// if a workload shows <~60–70% acceptance this flag is a pessimization.
     #[serde(default = "default_speculative_decoding")]
     pub speculative_decoding: bool,
 }

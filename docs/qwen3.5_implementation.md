@@ -305,7 +305,34 @@ token `x_t` with `embed(x_{t+1})` at absolute RoPE/KV position `t`, predicting
 `num_hidden_layers`. v1 restrictions: batch=1, greedy (temperature ≤ 0.01),
 no tenant LoRA delta, no quantized KV, dense only. Correctness gate:
 `mtp_decode_matches_serial` (and the forced-reject / oracle-accept /
-prefix-cache-hit variants) in `qwen3_5.rs`.
+prefix-cache-hit / context-boundary variants) in `qwen3_5.rs`.
+
+#### Performance envelope (measured — read before enabling)
+
+**Experimental; measured regression on GPU. The flag stays default-off.**
+
+GPU validation (RTX 5090 / SM120, Qwen3.5-27B FP8) found the speculative path
+functionally correct — token-for-token identical to serial greedy — but
+**~76% slower** than serial decode end-to-end. The naive cost model says:
+accept = 1 forward per 2 tokens, reject = 2 forwards per 1 token, so the
+breakeven sits at α ≈ 0.5 draft acceptance with speedup ≈ (1+α)/(2−α). That
+model ignores the structural per-round overheads this implementation carries:
+
+- **Full GDN SSM-state deep copy every round** — `snapshot_ssm_states`
+  deep-copies all conv/rec states before each verify so a reject can restore
+  them. At 27B scale this is a large fixed cost per round and is the
+  **suspected dominant overhead** — profile it first if this path is ever
+  optimized. (No optimization has been attempted; the algorithm is frozen at
+  the correctness-verified v1.)
+- **Reject-path re-forward** — the single-token re-forward that re-syncs GDN
+  state with the kept KV after a rewind (see the rewind note above).
+- **The MTP draft forward itself** — one small-model pass per round.
+
+Together these push the real breakeven far above α = 0.5. Enable only per
+workload, and only after measuring acceptance with the
+`inference_speculative_tokens_total` counter (`kind=accepted|rejected`,
+emitted per request): if a workload shows **<~60–70% acceptance, this flag is
+a pessimization** on current hardware.
 
 ---
 
