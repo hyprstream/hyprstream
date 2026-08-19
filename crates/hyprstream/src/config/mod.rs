@@ -2167,20 +2167,21 @@ pub struct RuntimeConfig {
     /// # Performance envelope (measured)
     ///
     /// **Experimental — measured regression, keep default-off.** GPU validation
-    /// (RTX 5090 / SM120, Qwen3.5-27B FP8) found the path functionally correct
-    /// but ~76% SLOWER than serial decode. The naive cost model — accept = 1
-    /// forward per 2 tokens, reject = 2 forwards per 1 token, breakeven at
-    /// α ≈ 0.5 acceptance with speedup ≈ (1+α)/(2−α) — holds only BEFORE
-    /// structural per-round overheads:
+    /// (RTX 5090 / SM120, Qwen3.5-4B BF16) found the path functionally correct
+    /// but 0.237x serial throughput (48.84% draft acceptance). The naive cost
+    /// model — accept = 1 forward per 2 tokens, reject = 2 forwards per 1
+    /// token, breakeven at α ≈ 0.5 acceptance with speedup ≈ (1+α)/(2−α) —
+    /// holds only BEFORE structural per-round overheads:
     ///
     /// - a full GDN conv/rec SSM-state deep copy (`snapshot_ssm_states`) every
-    ///   round — fixed cost at 27B scale, suspected dominant (profile this
-    ///   first if this is ever optimized);
+    ///   round — fixed cost per round, suspected dominant (profile this first
+    ///   if this is ever optimized);
     /// - the reject-path single-token re-forward that re-syncs SSM state;
     /// - the per-round MTP draft forward itself.
     ///
-    /// These push the real breakeven well above α = 0.5. Enable only per
-    /// workload after measuring acceptance via the
+    /// At 4B with k=1 these overheads dominate the verify savings; break-even
+    /// needs the verification cost amortized (larger backbone) or a cheaper
+    /// draft path. Enable only per workload after measuring acceptance via the
     /// `inference_speculative_tokens_total` counter (kind=accepted|rejected);
     /// if a workload shows <~60–70% acceptance this flag is a pessimization.
     #[serde(default = "default_speculative_decoding")]

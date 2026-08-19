@@ -311,24 +311,30 @@ prefix-cache-hit / context-boundary variants) in `qwen3_5.rs`.
 
 **Experimental; measured regression on GPU. The flag stays default-off.**
 
-GPU validation (RTX 5090 / SM120, Qwen3.5-27B FP8) found the speculative path
+GPU validation (RTX 5090 / SM120, Qwen3.5-4B BF16) found the speculative path
 functionally correct — token-for-token identical to serial greedy — but
-**~76% slower** than serial decode end-to-end. The naive cost model says:
-accept = 1 forward per 2 tokens, reject = 2 forwards per 1 token, so the
-breakeven sits at α ≈ 0.5 draft acceptance with speedup ≈ (1+α)/(2−α). That
-model ignores the structural per-round overheads this implementation carries:
+**0.237x serial throughput** end-to-end at **48.84% draft acceptance**. The
+naive cost model says: accept = 1 forward per 2 tokens, reject = 2 forwards
+per 1 token, so the breakeven sits at α ≈ 0.5 draft acceptance with speedup ≈
+(1+α)/(2−α). That model ignores the structural per-round overheads this
+implementation carries:
 
 - **Full GDN SSM-state deep copy every round** — `snapshot_ssm_states`
   deep-copies all conv/rec states before each verify so a reject can restore
-  them. At 27B scale this is a large fixed cost per round and is the
-  **suspected dominant overhead** — profile it first if this path is ever
-  optimized. (No optimization has been attempted; the algorithm is frozen at
-  the correctness-verified v1.)
+  them. This is a large fixed cost per round and is the **suspected dominant
+  overhead** — profile it first if this path is ever optimized. (No
+  optimization has been attempted; the algorithm is frozen at the
+  correctness-verified v1.)
 - **Reject-path re-forward** — the single-token re-forward that re-syncs GDN
   state with the kept KV after a rewind (see the rewind note above).
 - **The MTP draft forward itself** — one small-model pass per round.
 
-Together these push the real breakeven far above α = 0.5. Enable only per
+At 4B with k=1 these overheads dominate the verification savings: break-even
+needs the verify cost amortized (a larger backbone, where the draft is
+relatively cheaper) or a cheaper draft path. A retest on the largest
+checkpoint that fits the validation box (Qwen3.5-14B FP8 candidate) will
+decide whether the verdict improves with scale; if the regression holds there
+too, this stays parked as functionally-correct/perf-parked. Enable only per
 workload, and only after measuring acceptance with the
 `inference_speculative_tokens_total` counter (`kind=accepted|rejected`,
 emitted per request): if a workload shows **<~60–70% acceptance, this flag is
