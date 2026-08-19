@@ -130,7 +130,7 @@ docker build -t hyprstream:rocm --build-arg VARIANT=rocm71 .
 |----------|---------|-------------|
 | `VARIANT` | `cpu` | Build variant: `cpu`, `cuda128`, `cuda130`, `rocm71` |
 | `DEBIAN_VERSION` | `trixie` | Debian base image version |
-| `LIBTORCH_VERSION` | `2.10.0` | PyTorch/LibTorch version |
+| `LIBTORCH_VERSION` | `2.11.0` | PyTorch/LibTorch version |
 
 ## Privileged Containers
 

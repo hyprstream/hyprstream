@@ -3,7 +3,7 @@
 
 ARG VARIANT=cpu
 ARG DEBIAN_VERSION=trixie
-ARG LIBTORCH_VERSION=2.10.0
+ARG LIBTORCH_VERSION=2.11.0
 
 # LibTorch download URLs for manual installation
 ARG LIBTORCH_CUDA128_URL=https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcu128.zip
@@ -213,7 +213,7 @@ FROM builder-base AS builder-cpu-arm64
 ARG LIBTORCH_VERSION
 
 # tch-rs's fork keys its ABI check to the exact libtorch version string; the pip
-# wheel reports the same 2.10.0 but bypass keeps us resilient to wheel-suffix skew.
+# wheel reports the same 2.11.0 but bypass keeps us resilient to wheel-suffix skew.
 ENV LIBTORCH_BYPASS_VERSION_CHECK=1
 
 # Python + pip to fetch the aarch64 torch wheel.
@@ -269,7 +269,7 @@ RUN cd /tmp/tc \
 #############################################
 #
 # NVIDIA CUDA supports arm64-sbsa, and PyTorch publishes aarch64 CUDA wheels.
-# This uses the project's pinned 2.10.0 libtorch release with the CUDA 13.0
+# This uses the project's pinned 2.11.0 libtorch release with the CUDA 13.0
 # aarch64 wheel. It remains dispatch-only until a GPU-equipped ARM runner
 # validates runtime execution.
 FROM builder-base AS builder-cuda130-arm64-spike
@@ -282,7 +282,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install --break-system-packages \
         --extra-index-url https://download.pytorch.org/whl/cu130 \
-        'torch==2.10.0+cu130' \
+        'torch==2.11.0+cu130' \
     && TORCH_DIR="$(python3 -c 'import torch, os; print(os.path.dirname(torch.__file__))')" \
     && ln -s "$TORCH_DIR" /opt/libtorch \
     && python3 -c 'import torch; assert torch.version.cuda == "13.0"; print(torch.__version__, torch.version.cuda)' \

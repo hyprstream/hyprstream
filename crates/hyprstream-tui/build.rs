@@ -7,7 +7,7 @@ fn main() {
     // Emit compile-time libtorch metadata for the wizard's environment detection.
     // These are read by `backend.rs` via `env!()`.
 
-    let version = option_env!("LIBTORCH_VERSION").unwrap_or("2.10.0");
+    let version = option_env!("LIBTORCH_VERSION").unwrap_or("2.11.0");
     println!("cargo:rustc-env=LIBTORCH_VERSION={version}");
 
     // ABI: pre-cxx11 (default for PyTorch pip wheels) or cxx11
