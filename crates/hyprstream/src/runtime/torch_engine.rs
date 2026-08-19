@@ -4146,6 +4146,23 @@ impl<'a> TextStream<'a> {
         } else {
             // ---- VERIFY ROUND ----
             let pos = self.kv_cache_position;
+
+            // Context boundary: the 2-token verify forward writes KV at `pos`
+            // and `pos + 1`, and LayerKVCache::update hard-errors past
+            // max_seq_len. When fewer than two slots remain, the serial path
+            // can still forward `last` in the final slot — fall back to a
+            // single-token step for THIS round (not a permanent latch; the
+            // next round re-checks and ends exactly as the serial path would).
+            if let Some(cap) = self.spec_kv_capacity() {
+                if pos + 2 > cap {
+                    let token = self.sample_next_token()?;
+                    // poll_next's per-token increment is skipped on the
+                    // speculative path, so advance here like a serial step.
+                    self.kv_cache_position += 1;
+                    return Ok(vec![token]);
+                }
+            }
+
             let last = self.last_generated.ok_or_else(|| {
                 anyhow::anyhow!("Internal error: last_generated not set after {} tokens", self.tokens_generated)
             })?;
@@ -4208,6 +4225,17 @@ impl<'a> TextStream<'a> {
         self.spec_out_queue
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("Speculative sampler produced no tokens"))
+    }
+
+    /// KV capacity (max sequence length) of the model's cache manager — the
+    /// hard bound `LayerKVCache::update` enforces. `None` when no model/cache
+    /// is installed (caller then skips the boundary check).
+    fn spec_kv_capacity(&self) -> Option<usize> {
+        let model_arc = self.engine.persistent_model.as_ref()?;
+        let model = model_arc.lock();
+        let cache = model.get_kv_cache()?;
+        let cap = cache.lock().max_seq_len();
+        Some(cap)
     }
 }
 

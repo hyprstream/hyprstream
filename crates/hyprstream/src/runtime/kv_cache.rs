@@ -1919,7 +1919,6 @@ pub struct KVCacheManager {
     /// Cache for each layer (lock-free concurrent access)
     layer_caches: DashMap<usize, LayerKVCache>,
     /// Maximum sequence length
-    #[allow(dead_code)]
     max_seq_len: usize,
     /// Whether caching is enabled
     enabled: bool,
@@ -2055,6 +2054,12 @@ impl KVCacheManager {
         self.layer_caches
             .entry(layer_idx)
             .or_insert_with(|| LayerKVCache::new(self.max_seq_len, self.quant_type));
+    }
+
+    /// Maximum sequence length every layer cache is bounded by
+    /// (`LayerKVCache::update` errors past it).
+    pub fn max_seq_len(&self) -> usize {
+        self.max_seq_len
     }
 
     /// The compatibility fingerprint stamped on this cache, or `None` until the

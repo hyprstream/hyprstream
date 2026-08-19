@@ -3371,6 +3371,155 @@ mod mtp_tests {
         assert!(accepted > 0, "oracle drafts never accepted — accept path untested");
     }
 
+    /// Context-boundary regression: when only one KV slot remains
+    /// (`kv_position == max_seq_len - 1`), the 2-token verify forward would
+    /// exceed LayerKVCache::update's hard `end_pos <= max_seq_len` bound and
+    /// kill the stream with a cache-overflow error. The speculative driver must
+    /// fall back to a serial single-token step for that round (only that
+    /// round), yielding the same final token the serial path produces.
+    ///
+    /// Mirrors `TextStream::sample_speculative_tokens`' boundary check at the
+    /// model level with forced-reject drafts (deterministic positions: every
+    /// round advances exactly one slot, so a round provably starts at
+    /// `cap - 1`). The KV manager is swapped for a small-capacity one so the
+    /// KV bound — not the RoPE table range (both default to
+    /// max_position_embeddings) — is the operative limit, matching production
+    /// with a `max_context` override.
+    #[test]
+    fn mtp_decode_falls_back_to_serial_at_context_boundary() {
+        let _g = tch::no_grad_guard();
+        const CAP: usize = 12; // prompt (6) + exactly 6 forwards fit
+        let build = || {
+            let mut w = tiny_weights_mtp();
+            let mut model = Qwen3_5Model::from_weights(
+                &mut w, tiny_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+            )
+            .unwrap();
+            let layers = model.num_layers();
+            model.set_kv_cache(std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::runtime::kv_cache::KVCacheManager::new(layers + 1, CAP, KVQuantType::None),
+            )));
+            model
+        };
+
+        // Serial reference: decode until the cache overflows; keep the tokens.
+        let serial_until_error = |model: &Qwen3_5Model| -> (Vec<i64>, Option<String>) {
+            let prompt_t = Tensor::from_slice(&PROMPT).reshape([1, PROMPT.len() as i64]);
+            let mut out = Vec::new();
+            match model.forward_with_cache(&prompt_t, 0) {
+                Ok(l) => out.push(argmax1(&l)),
+                Err(e) => return (out, Some(e.to_string())),
+            }
+            let mut pos = PROMPT.len();
+            loop {
+                let dec = Tensor::from_slice(&[*out.last().unwrap()]).reshape([1, 1]);
+                match model.forward_with_cache(&dec, pos) {
+                    Ok(l) => {
+                        out.push(argmax1(&l));
+                        pos += 1;
+                    }
+                    Err(e) => return (out, Some(e.to_string())),
+                }
+            }
+        };
+
+        // Speculative driver with the boundary fallback, mirroring
+        // `sample_speculative_tokens` (forced-reject drafts for determinism).
+        // `fallback_enabled = false` reproduces the pre-fix behavior.
+        let spec_until_error = |model: &Qwen3_5Model, fallback_enabled: bool| -> (Vec<i64>, u64, Option<String>) {
+            let prompt_t = Tensor::from_slice(&PROMPT).reshape([1, PROMPT.len() as i64]);
+            let mut out: Vec<i64> = Vec::new();
+            let mut fallbacks = 0u64;
+            let (logits, hidden) = match model.forward_with_cache_hidden(&prompt_t, 0, true) {
+                Ok(v) => v,
+                Err(e) => return (out, fallbacks, Some(e.to_string())),
+            };
+            let mut last = argmax1(&logits);
+            out.push(last);
+            let mut mtp_tokens: Vec<i64> = PROMPT[1..].to_vec();
+            mtp_tokens.push(last);
+            let mtp_in = Tensor::from_slice(&mtp_tokens).reshape([1, mtp_tokens.len() as i64]);
+            let mut pending = argmax1(&model.mtp_forward(&mtp_in, &hidden, 0).unwrap());
+
+            let mut pos = PROMPT.len();
+            loop {
+                if fallback_enabled && pos + 2 > CAP {
+                    // Boundary fallback: serial single-token step, this round only.
+                    let dec = Tensor::from_slice(&[last]).reshape([1, 1]);
+                    match model.forward_with_cache(&dec, pos) {
+                        Ok(l) => {
+                            last = argmax1(&l);
+                            out.push(last);
+                            pos += 1;
+                            fallbacks += 1;
+                        }
+                        Err(e) => return (out, fallbacks, Some(e.to_string())),
+                    }
+                    continue;
+                }
+                let draft = (pending + 1) % VOCAB; // forced reject
+                let snapshot = model.snapshot_ssm_states();
+                let verify_in = Tensor::from_slice(&[last, draft]).reshape([1, 2]);
+                let (logits, hidden) = match model.forward_with_cache_hidden(&verify_in, pos, false) {
+                    Ok(v) => v,
+                    Err(e) => return (out, fallbacks, Some(e.to_string())),
+                };
+                let v1 = argmax1(&logits.select(1, 0));
+                if v1 == draft {
+                    // Accidental accept: same handling as the accept path.
+                    let v2 = argmax1(&logits.select(1, 1));
+                    let mtp_in = Tensor::from_slice(&[v1, v2]).reshape([1, 2]);
+                    pending = argmax1(&model.mtp_forward(&mtp_in, &hidden, pos).unwrap());
+                    out.push(v1);
+                    out.push(v2);
+                    last = v2;
+                    pos += 2;
+                } else {
+                    model.restore_ssm_states(snapshot.0, snapshot.1);
+                    model.get_kv_cache().unwrap().lock().truncate_to(pos + 1);
+                    let re_in = Tensor::from_slice(&[last]).reshape([1, 1]);
+                    let (_, hidden2) = model.forward_with_cache_hidden(&re_in, pos, true).unwrap();
+                    let mtp_in = Tensor::from_slice(&[v1]).reshape([1, 1]);
+                    pending = argmax1(&model.mtp_forward(&mtp_in, &hidden2, pos).unwrap());
+                    out.push(v1);
+                    last = v1;
+                    pos += 1;
+                }
+            }
+        };
+
+        let (serial_out, serial_err) = serial_until_error(&build());
+        assert!(
+            serial_err.as_deref().is_some_and(|e| e.contains("Cache overflow")),
+            "serial driver must end at the context boundary, got {serial_err:?}"
+        );
+        assert_eq!(serial_out.len(), 7, "prefill token + forwards at pos 6..=11");
+
+        // Pre-fix behavior (no fallback): the 2-token verify at pos = CAP-1
+        // overflows and the stream dies one token earlier than serial.
+        let (old_out, _, old_err) = spec_until_error(&build(), false);
+        assert!(
+            old_err.as_deref().is_some_and(|e| e.contains("Cache overflow")),
+            "pre-fix behavior must overflow, got {old_err:?}"
+        );
+        assert!(
+            old_out.len() < serial_out.len(),
+            "pre-fix driver must lose the final token (old={}, serial={})",
+            old_out.len(),
+            serial_out.len()
+        );
+
+        // Fixed behavior: the boundary round falls back to a serial step and
+        // yields the same tokens as serial, erroring only at the true boundary.
+        let (spec_out, fallbacks, spec_err) = spec_until_error(&build(), true);
+        assert_eq!(spec_out, serial_out, "boundary fallback diverged from serial");
+        assert!(fallbacks >= 1, "serial fallback never engaged at the boundary");
+        assert!(
+            spec_err.as_deref().is_some_and(|e| e.contains("Cache overflow")),
+            "spec driver must end at the true boundary like serial, got {spec_err:?}"
+        );
+    }
+
     /// Same gate across a session prefix-cache hit: turn 2 shares turn 1's
     /// prompt prefix, so only the suffix is prefilled. Both drivers get the
     /// identical treatment (KV truncated to the prefix; GDN conv/rec state is
