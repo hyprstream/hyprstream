@@ -1919,7 +1919,6 @@ pub struct KVCacheManager {
     /// Cache for each layer (lock-free concurrent access)
     layer_caches: DashMap<usize, LayerKVCache>,
     /// Maximum sequence length
-    #[allow(dead_code)]
     max_seq_len: usize,
     /// Whether caching is enabled
     enabled: bool,
@@ -2043,6 +2042,24 @@ impl KVCacheManager {
         for mut cache_ref in self.layer_caches.iter_mut() {
             cache_ref.clear();
         }
+    }
+
+    /// Insert a fresh cache for `layer_idx` if none exists yet.
+    ///
+    /// Architectures with auxiliary KV-consuming modules beyond the main
+    /// decoder layers (the Qwen3.5 MTP draft head, whose slot sits at index
+    /// `num_hidden_layers`) call this when a session cache is swapped in: the
+    /// registry may have created the manager with only the main layer count.
+    pub fn ensure_layer_cache(&self, layer_idx: usize) {
+        self.layer_caches
+            .entry(layer_idx)
+            .or_insert_with(|| LayerKVCache::new(self.max_seq_len, self.quant_type));
+    }
+
+    /// Maximum sequence length every layer cache is bounded by
+    /// (`LayerKVCache::update` errors past it).
+    pub fn max_seq_len(&self) -> usize {
+        self.max_seq_len
     }
 
     /// The compatibility fingerprint stamped on this cache, or `None` until the

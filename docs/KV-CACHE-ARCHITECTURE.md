@@ -82,9 +82,20 @@ Per-owner manager holding one `LayerKVCache` per transformer layer
 - `location: CacheLocation::{Gpu, Cpu}` — where the tensors currently reside
 
 `truncate_to(pos)` discards KV entries past a token position (used when a
-prefix matches but the suffix changed); `offload_to_cpu()` /
+prefix matches but the suffix changed, and by MTP self-speculative decoding to
+rewind a rejected draft token); `offload_to_cpu()` /
 `restore_to_gpu(device)` move all layer tensors between devices while
 preserving contents.
+
+Architectures with auxiliary KV-consuming modules may hold slots beyond the
+main decoder layers: a Qwen3.5 model loaded with an MTP draft head keeps the
+head's KV at layer index `num_hidden_layers`, so manager-wide `clear_all` /
+`truncate_to` / session swaps cover it with no special casing.
+`ensure_layer_cache(idx)` inserts a missing slot when a session cache created
+before the model was installed is swapped in. Note the speculative reject
+rewind relies on `truncate_to` being a true (O(1)) truncation — for Quantized
+storage it falls back to a full `clear()`, so speculative decoding refuses to
+activate when `kv_quant_type` is set.
 
 ## Storage Modes (`KVStorage`)
 

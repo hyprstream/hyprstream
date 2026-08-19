@@ -1584,6 +1584,88 @@ impl TorchEngine {
         }
     }
 
+    // ========================================================================
+    // MTP self-speculative decoding (Qwen3.5, v1: dense + greedy + batch=1)
+    // ========================================================================
+
+    /// Whether the loaded model can self-speculate: a Qwen3.5 with a loaded
+    /// (dense) MTP draft head. Pipeline/multi-device stage loads never own the
+    /// MTP head, so this is false there too.
+    pub fn speculative_supported(&self) -> bool {
+        let Some(model_arc) = &self.persistent_model else { return false };
+        let model = model_arc.lock();
+        model
+            .as_any()
+            .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()
+            .is_some_and(crate::runtime::architectures::qwen3_5::Qwen3_5Model::has_mtp)
+    }
+
+    /// Speculative prefill/verify forward: returns per-position logits plus the
+    /// pre-final-norm hidden states the MTP head consumes.
+    ///
+    /// Never delta-adapted: speculation is disabled for tenant-delta streams at
+    /// stream construction, so this always runs the base model.
+    ///
+    /// Returns `(logits [1, seq|1, vocab], hidden [1, seq, hidden_size])`.
+    pub fn forward_speculative(
+        &self,
+        input_ids: &[i64],
+        start_pos: usize,
+        last_logits_only: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        let input_tensor = Tensor::from_slice(input_ids)
+            .to_kind(tch::Kind::Int64)
+            .to_device(self.device)
+            .unsqueeze(0);
+
+        let model = model_arc.lock();
+        let q35 = model
+            .as_any()
+            .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()
+            .ok_or_else(|| anyhow!("Speculative decoding requires a Qwen3.5 model"))?;
+        let _no_grad = tch::no_grad_guard();
+        q35.forward_with_cache_hidden(&input_tensor, start_pos, last_logits_only)
+    }
+
+    /// MTP draft forward over `token_ids.len()` consecutive slots. Slot `i`
+    /// pairs `hiddens[.., i, ..]` with `embed(token_ids[i])` at absolute
+    /// position `base + i`. Returns the last slot's logits `[1, 1, vocab]`.
+    pub fn forward_mtp_draft(
+        &self,
+        token_ids: &[i64],
+        hiddens: &Tensor,
+        base: usize,
+    ) -> Result<Tensor> {
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        let ids_tensor = Tensor::from_slice(token_ids)
+            .to_kind(tch::Kind::Int64)
+            .to_device(self.device)
+            .unsqueeze(0);
+
+        let model = model_arc.lock();
+        let q35 = model
+            .as_any()
+            .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()
+            .ok_or_else(|| anyhow!("Speculative decoding requires a Qwen3.5 model"))?;
+        let _no_grad = tch::no_grad_guard();
+        q35.mtp_forward(&ids_tensor, hiddens, base)
+    }
+
     /// Sample next token using bundled parameters with tiered repeat penalty.
     fn sample_token_with_params(
         &self,
@@ -3210,6 +3292,12 @@ pub struct GenerationStats {
     pub inference_tokens_per_sec: f32,
     /// Exponential moving average (responsive for real-time adaptive batching)
     pub inference_tokens_per_sec_ema: f32,
+
+    // MTP self-speculative decoding outcomes (0 when speculation is off)
+    /// Draft tokens accepted by greedy exact-match verify this request
+    pub speculative_accepted: u64,
+    /// Draft tokens rejected (and rewound) this request
+    pub speculative_rejected: u64,
 }
 
 /// Stream that yields decoded UTF-8 text chunks during generation.
@@ -3302,6 +3390,22 @@ pub struct TextStream<'a> {
     /// Opaque (hashed) tenant id for token-burn metric attributes — never the
     /// raw request subject (#1253). `None` when no tenant is in scope.
     tenant_hash: Option<u64>,
+
+    // MTP self-speculative decoding state (v1: greedy, batch=1, dense Qwen3.5).
+    /// Whether this stream decodes via MTP draft + verify. Decided once at
+    /// construction from the engine config, model capability, and request
+    /// sampling params (see `new_with_delta`).
+    speculative: bool,
+    /// Draft token proposed by the MTP head for the position after
+    /// `last_generated`; always `Some` between speculative decode rounds.
+    spec_pending_draft: Option<u32>,
+    /// Accepted tokens from the current speculative round not yet consumed by
+    /// `poll_next` (1 on reject, up to 2 on accept).
+    spec_out_queue: VecDeque<u32>,
+    /// Draft outcome counters for this request (OTel `record_speculative` at
+    /// drop + `GenerationStats`). Plain fields, never gated on collect_metrics.
+    spec_accepted: u64,
+    spec_rejected: u64,
 }
 
 impl<'a> TextStream<'a> {
@@ -3477,6 +3581,34 @@ impl<'a> TextStream<'a> {
         // PERF: Cache vocab_size to avoid lock acquisition per token
         let vocab_size = engine.get_vocab_size();
 
+        // MTP self-speculative decoding (v1): opt-in via config, and only when
+        // every correctness prerequisite holds. Reasons are logged once here
+        // (counts/config only — never content, #1253).
+        let speculative = if !engine.config.speculative_decoding {
+            false
+        } else if delta.is_some() {
+            // The MTP head is never delta-adapted, so acceptance would degrade
+            // under a tenant delta. Correctness would be preserved (verify runs
+            // the delta'd model), but v1 keeps the two features disjoint.
+            info!("Speculative decoding disabled: tenant LoRA delta active (MTP head is not delta-adapted)");
+            false
+        } else if engine.config.kv_quant_type != crate::runtime::KVQuantType::None {
+            // Quantized LayerKVCache::truncate_to falls back to a full clear(),
+            // which would silently break the reject rewind.
+            info!("Speculative decoding disabled: quantized KV cache (reject rewind needs O(1) truncate)");
+            false
+        } else if sampling_params.temperature > 0.01 {
+            // Greedy-only v1: exact-match verify is only exact under argmax.
+            info!("Speculative decoding disabled: non-greedy sampling (v1 is greedy-only)");
+            false
+        } else if !engine.speculative_supported() {
+            info!("Speculative decoding disabled: model has no dense MTP draft head");
+            false
+        } else {
+            info!("Speculative decoding enabled (MTP self-draft, k=1, greedy)");
+            true
+        };
+
         Ok(Self {
             engine,
             delta,
@@ -3511,6 +3643,11 @@ impl<'a> TextStream<'a> {
             ema_tokens_per_sec: 0.0,
             model_label,
             tenant_hash,
+            speculative,
+            spec_pending_draft: None,
+            spec_out_queue: VecDeque::new(),
+            spec_accepted: 0,
+            spec_rejected: 0,
         })
     }
 
@@ -3573,6 +3710,9 @@ impl<'a> TextStream<'a> {
             inference_time_ms,
             inference_tokens_per_sec,
             inference_tokens_per_sec_ema,
+
+            speculative_accepted: self.spec_accepted,
+            speculative_rejected: self.spec_rejected,
         }
     }
 
@@ -3869,6 +4009,234 @@ impl<'a> TextStream<'a> {
 
         Ok(next_token as u32)
     }
+
+    /// Sample one token for the speculative path with the standard tiered
+    /// repeat penalty. `extra_window` holds tokens accepted earlier in the
+    /// current round but not yet pushed to `recent_tokens` by `poll_next`, so
+    /// the penalty window matches what serial decoding would see at this
+    /// position. Mirrors the sampling section of `sample_next_token`.
+    fn sample_spec_position(&mut self, logits: &Tensor, extra_window: &[i64]) -> Result<u32> {
+        let vocab_size = self.vocab_size;
+
+        // PERF: Cache model_vocab_size on first call (from logits shape)
+        let model_vocab_size = if self.model_vocab_size == 0 {
+            let logits_shape = logits.size();
+            let size = logits_shape[logits_shape.len() - 1] as usize;
+            self.model_vocab_size = size;
+            size
+        } else {
+            self.model_vocab_size
+        };
+
+        if vocab_size == 0 {
+            return Err(anyhow::anyhow!(
+                "Cannot sample tokens: tokenizer vocabulary size is 0 (tokenizer not loaded)"
+            ));
+        }
+
+        let params = self.sampling_params;
+        // Reuse the PERF buffer: recent_tokens (penalty window) + round-local extras.
+        self.recent_tokens_buffer.clear();
+        self.recent_tokens_buffer.extend(self.recent_tokens.iter().copied());
+        self.recent_tokens_buffer.extend(extra_window.iter().copied());
+        let next_token = self.engine.sample_token_with_params(
+            logits, &params, &self.recent_tokens_buffer, &self.penalty_exempt_tokens,
+        )?;
+
+        if model_vocab_size > 0 && next_token >= model_vocab_size {
+            return Err(anyhow::anyhow!(
+                "Generated out-of-bounds token {}: exceeds model vocab size {}",
+                next_token,
+                model_vocab_size
+            ));
+        }
+        if next_token >= vocab_size {
+            tracing::warn!(
+                "⚠️ Sampled token {} is beyond tokenizer vocab ({}) but within model vocab ({}). This may indicate a vocab mismatch.",
+                next_token, vocab_size, model_vocab_size
+            );
+        }
+        Ok(next_token as u32)
+    }
+
+    /// Greedy argmax of draft logits `[1, 1, vocab]` (no repeat penalty — the
+    /// draft only proposes; the penalty-applied verify decides acceptance).
+    fn spec_argmax_draft(draft_logits: &Tensor) -> u32 {
+        draft_logits.reshape([-1i64]).argmax(-1, false).int64_value(&[]) as u32
+    }
+
+    /// One speculative decode step (MTP self-draft, k=1, greedy exact-match
+    /// verify). Returns the 1–2 tokens accepted this round, in order.
+    ///
+    /// Round structure (decode phase; `last_generated` = x_pos is emitted but
+    /// not yet forwarded, `kv_cache_position` = pos, and `spec_pending_draft`
+    /// holds the MTP head's candidate for position pos+1):
+    ///
+    /// 1. Snapshot the GDN conv/rec state (before the verify forward mutates it).
+    /// 2. Verify: one main forward over `[x_pos, draft]` at `pos`. Logits at
+    ///    position 0 check the draft; logits at position 1 yield the bonus
+    ///    token when the draft matches.
+    /// 3. Accept (draft == verifier's token): emit both tokens; the verify
+    ///    forward already consumed exactly the true sequence, so KV and SSM
+    ///    state are consistent. Draft the next round from the two new slots.
+    ///    Reject: emit only the verifier's correction token, restore the SSM
+    ///    snapshot, truncate KV to `pos + 1` (dropping the rejected draft's
+    ///    KV), then re-forward `x_pos` alone — the 2-token verify advanced the
+    ///    GDN state through the rejected draft as well, so the restore alone
+    ///    would leave SSM one accepted token behind the kept KV. Re-draft from
+    ///    the correction token's slot.
+    ///
+    /// Invariants: `last_generated`/`tokens_generated`/`recent_tokens`/
+    /// `decode_stream` advance only per accepted token (the rejected draft
+    /// never enters the penalty window or decode stream);
+    /// `kv_cache_position` advances by exactly the accepted count.
+    fn sample_speculative_tokens(&mut self) -> Result<Vec<u32>> {
+        if self.tokens_generated == 0 {
+            // ---- PREFILL (full, or partial on a session prefix-cache hit) ----
+            let prefill_start = std::time::Instant::now();
+            let prompt_len = self.prompt_tokens.len();
+            let partial = self.prefill_start_pos > 0 && self.prefill_start_pos < prompt_len;
+            // Owned copy: the forward + sampling below need `&mut self`.
+            let (slice, start_pos) = if partial {
+                tracing::info!(
+                    "Partial prefill: processing {} new tokens (skipped {} cached)",
+                    prompt_len - self.prefill_start_pos,
+                    self.prefill_start_pos
+                );
+                (self.prompt_tokens[self.prefill_start_pos..].to_vec(), self.prefill_start_pos)
+            } else {
+                (self.prompt_tokens.clone(), 0)
+            };
+
+            let (logits, hidden) = self.engine.forward_speculative(&slice, start_pos, true)?;
+
+            let prefill_elapsed = prefill_start.elapsed();
+            self.prefill_time_ms = Some(prefill_elapsed.as_millis() as u64);
+            self.first_token_time = Some(std::time::Instant::now());
+            tracing::info!(
+                "PREFILL: {} tokens in {:?} ({:.2} tok/sec){} [speculative]",
+                slice.len(),
+                prefill_elapsed,
+                if prefill_elapsed.as_secs_f32() > 0.0 {
+                    slice.len() as f32 / prefill_elapsed.as_secs_f32()
+                } else {
+                    0.0
+                },
+                if partial {
+                    format!(" [prefix cached: {} tokens]", self.prefill_start_pos)
+                } else {
+                    String::new()
+                },
+            );
+
+            let next = self.sample_spec_position(&logits, &[])?;
+
+            // MTP prompt prefill + first draft in one call: slot t pairs
+            // (hidden after x_t, embed(x_{t+1})); the final slot pairs the
+            // last hidden with the just-sampled token, yielding the draft for
+            // the following position. On a prefix-cache hit the pre-hit slots
+            // keep the swapped-in cache's contents (stale or zero entries only
+            // degrade acceptance, never correctness — the verify is decisive).
+            let mut mtp_tokens: Vec<i64> = slice[1..].to_vec();
+            mtp_tokens.push(next as i64);
+            let draft_logits = self.engine.forward_mtp_draft(&mtp_tokens, &hidden, start_pos)?;
+            self.spec_pending_draft = Some(Self::spec_argmax_draft(&draft_logits));
+
+            Ok(vec![next])
+        } else {
+            // ---- VERIFY ROUND ----
+            let pos = self.kv_cache_position;
+
+            // Context boundary: the 2-token verify forward writes KV at `pos`
+            // and `pos + 1`, and LayerKVCache::update hard-errors past
+            // max_seq_len. When fewer than two slots remain, the serial path
+            // can still forward `last` in the final slot — fall back to a
+            // single-token step for THIS round (not a permanent latch; the
+            // next round re-checks and ends exactly as the serial path would).
+            if let Some(cap) = self.spec_kv_capacity() {
+                if pos + 2 > cap {
+                    let token = self.sample_next_token()?;
+                    // poll_next's per-token increment is skipped on the
+                    // speculative path, so advance here like a serial step.
+                    self.kv_cache_position += 1;
+                    return Ok(vec![token]);
+                }
+            }
+
+            let last = self.last_generated.ok_or_else(|| {
+                anyhow::anyhow!("Internal error: last_generated not set after {} tokens", self.tokens_generated)
+            })?;
+            let draft = self.spec_pending_draft.take().ok_or_else(|| {
+                anyhow::anyhow!("Internal error: speculative round without a pending draft")
+            })?;
+
+            let snapshot = self.engine.snapshot_ssm_states();
+
+            let (logits, hidden) =
+                self.engine.forward_speculative(&[last, draft as i64], pos, false)?;
+            let v1 = self.sample_spec_position(&logits.select(1, 0), &[])?;
+
+            if v1 == draft {
+                // ACCEPT: the draft was the verifier's own greedy choice, so the
+                // verify forward consumed exactly the true sequence (KV + SSM
+                // consistent). Emit the verified draft plus the bonus token.
+                let v2 = self.sample_spec_position(&logits.select(1, 1), &[v1 as i64])?;
+                let next_draft_logits =
+                    self.engine.forward_mtp_draft(&[v1 as i64, v2 as i64], &hidden, pos)?;
+                self.spec_pending_draft = Some(Self::spec_argmax_draft(&next_draft_logits));
+                self.kv_cache_position += 2;
+                self.spec_accepted += 1;
+                Ok(vec![v1, v2])
+            } else {
+                // REJECT: emit only the verifier's correction token and rewind.
+                self.engine.restore_ssm_states(snapshot);
+                // Drop the rejected draft's KV; the +1 keeps the KV the verify
+                // forward wrote for `last`. The MTP slot lags one position
+                // behind the main cache (it never consumed the rejected draft),
+                // so this manager-wide truncate is a no-op for it.
+                if let Some(model_arc) = &self.engine.persistent_model {
+                    let model = model_arc.lock();
+                    if let Some(cache) = model.get_kv_cache() {
+                        cache.lock().truncate_to(pos + 1);
+                    }
+                }
+                // Re-forward `last` alone to re-sync the GDN conv/rec state
+                // with the kept KV (see fn docs); rewrites identical KV at pos.
+                let (_logits, hidden2) = self.engine.forward_speculative(&[last], pos, true)?;
+                let next_draft_logits =
+                    self.engine.forward_mtp_draft(&[v1 as i64], &hidden2, pos)?;
+                self.spec_pending_draft = Some(Self::spec_argmax_draft(&next_draft_logits));
+                self.kv_cache_position += 1;
+                self.spec_rejected += 1;
+                Ok(vec![v1])
+            }
+        }
+    }
+
+    /// Next token from the speculative path: drains the current round's
+    /// accepted-token queue, running a new speculative round when empty.
+    /// `kv_cache_position` is advanced inside `sample_speculative_tokens`
+    /// (per accepted token), so unlike the serial path no increment happens here.
+    fn next_speculative_token(&mut self) -> Result<u32> {
+        if self.spec_out_queue.is_empty() {
+            let tokens = self.sample_speculative_tokens()?;
+            self.spec_out_queue.extend(tokens);
+        }
+        self.spec_out_queue
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("Speculative sampler produced no tokens"))
+    }
+
+    /// KV capacity (max sequence length) of the model's cache manager — the
+    /// hard bound `LayerKVCache::update` enforces. `None` when no model/cache
+    /// is installed (caller then skips the boundary check).
+    fn spec_kv_capacity(&self) -> Option<usize> {
+        let model_arc = self.engine.persistent_model.as_ref()?;
+        let model = model_arc.lock();
+        let cache = model.get_kv_cache()?;
+        let cap = cache.lock().max_seq_len();
+        Some(cap)
+    }
 }
 
 // SAFETY: TextStream can be Send because:
@@ -3913,19 +4281,34 @@ impl<'a> Stream for TextStream<'a> {
             }
 
             // Sample next token
-            let next_token = match self.sample_next_token() {
-                Ok(token) => {
-                    // FIX: Increment KV cache position after successful token sampling
-                    // This ensures KV cache stays synchronized with generation state
-                    if self.tokens_generated > 0 {  // Don't increment on initial prompt
-                        self.kv_cache_position += 1;
+            // The `!self.collect_metrics` guard keeps metrics-collecting
+            // (training-quality) requests on the serial path: the speculative
+            // sampler does not replicate the per-token logprob/entropy
+            // accumulator block from `sample_next_token`.
+            let next_token = if self.speculative && !self.collect_metrics {
+                match self.next_speculative_token() {
+                    Ok(token) => token,
+                    Err(e) => {
+                        self.finished = true;
+                        self.finish_reason = Some(FinishReason::Error(e.to_string()));
+                        return Poll::Ready(Some(Err(e)));
                     }
-                    token
-                },
-                Err(e) => {
-                    self.finished = true;
-                    self.finish_reason = Some(FinishReason::Error(e.to_string()));
-                    return Poll::Ready(Some(Err(e)));
+                }
+            } else {
+                match self.sample_next_token() {
+                    Ok(token) => {
+                        // FIX: Increment KV cache position after successful token sampling
+                        // This ensures KV cache stays synchronized with generation state
+                        if self.tokens_generated > 0 {  // Don't increment on initial prompt
+                            self.kv_cache_position += 1;
+                        }
+                        token
+                    },
+                    Err(e) => {
+                        self.finished = true;
+                        self.finish_reason = Some(FinishReason::Error(e.to_string()));
+                        return Poll::Ready(Some(Err(e)));
+                    }
                 }
             };
 
@@ -4032,6 +4415,13 @@ impl<'a> Drop for TextStream<'a> {
             &self.model_label,
             self.tenant_hash,
             self.prompt_len as u64 + generated,
+        );
+        // MTP self-speculative draft outcomes (integer counts only, #1253).
+        meter.record_speculative(
+            &self.model_label,
+            self.tenant_hash,
+            self.spec_accepted,
+            self.spec_rejected,
         );
     }
 }
