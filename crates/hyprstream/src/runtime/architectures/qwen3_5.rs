@@ -190,7 +190,10 @@ fn cat_projs(projs: Vec<LinearProjection>) -> LinearProjection {
         } else {
             None
         };
-        LinearProjection { weight: fused_weight, bias: None, scale }
+        match scale {
+            Some(s) => LinearProjection::with_scale(fused_weight, s),
+            None => LinearProjection::new(fused_weight),
+        }
     } else if any_fp8 {
         // Mixed FP8/BF16: dequantize FP8 projections to BF16 before catting.
         // Occurs for small gating projections in hybrid layers; memory impact is minor.

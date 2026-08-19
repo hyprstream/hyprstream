@@ -51,25 +51,362 @@ pub(crate) struct LinearProjection {
     /// Block-wise scale for FP8 weights: shape [out/block, in/block], BF16.
     /// None for non-FP8 weights.
     pub(crate) scale: Option<Tensor>,
+    /// `scale` repacked at load time for the `_scaled_mm_v2`
+    /// `BlockWise128x128` recipe: shape `[N/128, L4]` contiguous (f32), where
+    /// `L4 = round_up(K/128, 4)` — K-block-minor order with the K-block
+    /// dimension zero-padded to a multiple of 4 (cuBLASLt TMA requirement, cf.
+    /// `_pad_128x128_scales` in pytorch's test_scaled_matmul_cuda.py). The
+    /// call site passes `scale_v2.t()`, yielding `[L4, N/128]` with strides
+    /// `(1, L4)` as the kernel's TORCH_CHECK_VALUE preconditions demand.
+    /// Derived in `with_scale`; None when `scale` is None.
+    pub(crate) scale_v2: Option<Tensor>,
+    /// Rowwise-requantized copy of the FP8 weight for the v1 rowwise recipe —
+    /// the SM100/SM120 arm (see `apply_fp8_scaled_mm`; needs torch ≥ 2.11 on
+    /// SM120, issue #1524): `(weight [K, N] e4m3, scale_b [1, N] f32)` with
+    /// per-output-channel amax/448 scales. Derived at load in `with_scale`
+    /// ONLY when `HYPRSTREAM_FP8_GEMM` is on (costs +1x FP8 weight memory;
+    /// per-column scales are coarser than the checkpoint's 128x128 blocks —
+    /// measured envelope in `fp8_rowwise_requant_error_envelope`). None when
+    /// the flag is off or `scale` is None. Boxed: keeps `LinearProjection`
+    /// small enough for the `Qwen3_5Mlp` enum (clippy large_enum_variant).
+    pub(crate) rowwise: Option<Box<(Tensor, Tensor)>>,
+}
+
+/// Cached read of the FP8-GEMM gate ([`crate::config::RuntimeConfig::fp8_gemm`]).
+///
+/// The runtime reads the env default directly (same precedent as
+/// `RuntimeConfig.mmap`, which `model_factory` also reads from the env): the
+/// model-construction path has no `RuntimeConfig` plumbing today, so
+/// `LinearProjection::apply` consults this cached value. Static per process.
+fn fp8_gemm_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(crate::config::default_fp8_gemm)
+}
+
+/// Quantize activations to FP8 e4m3 with per-token 1x128 block scales.
+///
+/// Input: `[M, K]` float tensor (any float kind; K must be a multiple of 128).
+/// Returns `(q, scale)` where `q` is e4m3 `[M, K]` and `scale` is f32
+/// `[M, K/128]` **row-major** with `x ≈ q * scale` per 128-wide block. The
+/// `_scaled_mm_v2` call site must repack the scale to column-major
+/// (strides `(1, M)`) — the `BlockWise1x128` recipe requires it.
+/// Scales are amax-based (`amax / 448`); 448 is the max finite e4m3 value.
+/// Values are clamped to ±448 before the cast so out-of-range inputs saturate
+/// instead of producing inf/nan bytes. The input is made contiguous first:
+/// `to_kind` on an already-f32 tensor is a shallow clone, so a non-contiguous
+/// input would otherwise panic in `view`.
+fn quantize_activations_1x128(x: &Tensor) -> (Tensor, Tensor) {
+    const FP8_MAX: f64 = 448.0; // e4m3 max finite value
+    let x = x.contiguous();
+    let size = x.size();
+    let (m, k) = (size[0], size[1]);
+    let blocks = k / 128;
+    let x3 = x.to_kind(tch::Kind::Float).view([m, blocks, 128]);
+    let amax = x3.abs().amax(-1, false); // [m, blocks]
+    let scale = (amax / FP8_MAX).clamp_min(1e-12);
+    let q = (x3 / scale.unsqueeze(-1))
+        .clamp(-FP8_MAX, FP8_MAX)
+        .to_kind(tch::Kind::Float8e4m3fn)
+        .view([m, k]);
+    (q, scale)
+}
+
+/// Quantize activations to FP8 e4m3 with per-token (rowwise) scales for the
+/// v1 rowwise recipe. Input `[M, K]`; returns `(q [M, K] e4m3, scale [M, 1]
+/// f32 contiguous)` with `x ≈ q * scale` per row. Coarser than the 1x128
+/// block quantizer used by the v2 arm — one scale covers the whole token.
+fn quantize_activations_rowwise(x: &Tensor) -> (Tensor, Tensor) {
+    const FP8_MAX: f64 = 448.0; // e4m3 max finite value
+    let x = x.contiguous();
+    let xf = x.to_kind(tch::Kind::Float);
+    let scale = (xf.abs().amax(-1, false) / FP8_MAX)
+        .clamp_min(1e-12)
+        .unsqueeze(-1)
+        .contiguous(); // [M, 1]
+    let q = (xf / &scale)
+        .clamp(-FP8_MAX, FP8_MAX)
+        .to_kind(tch::Kind::Float8e4m3fn);
+    (q, scale)
+}
+
+/// Derive the v1-rowwise weight pair from the checkpoint's 128x128-block FP8
+/// weight: dequantize to f32 via the block scales (same broadcast as the lazy
+/// path), take the per-output-channel (column) amax over K, requantize to e4m3
+/// with `amax/448` scales. Returns `(weight [K, N] e4m3, scale_b [1, N] f32)`.
+///
+/// Precision trade vs 128x128 blocks: one scale now covers the whole K extent
+/// of an output channel, so channels with large dynamic range along K lose
+/// resolution — measured envelope in `fp8_rowwise_requant_error_envelope`.
+fn build_rowwise_requant(weight: &Tensor, scale: &Tensor) -> (Tensor, Tensor) {
+    const FP8_MAX: f64 = 448.0;
+    let ws = weight.size(); // [K, N]
+    let ss = scale.size(); // [K/128, N/128]
+    let (br, bc) = (ws[0] / ss[0], ws[1] / ss[1]);
+    let w_f = (weight.to_kind(tch::Kind::Float).view([ss[0], br, ss[1], bc])
+        * scale.to_kind(tch::Kind::Float).view([ss[0], 1, ss[1], 1]))
+    .reshape([ws[0], ws[1]]);
+    let s_b = (w_f.abs().amax(0, false) / FP8_MAX).clamp_min(1e-12); // [N]
+    let w_rq = (w_f / s_b.unsqueeze(0))
+        .clamp(-FP8_MAX, FP8_MAX)
+        .to_kind(tch::Kind::Float8e4m3fn)
+        .contiguous();
+    (w_rq, s_b.view([1, ws[1]]).contiguous())
+}
+
+/// `ScalingType::BlockWise1x128` / `BlockWise128x128` and `SwizzleType::NO_SWIZZLE`
+/// (ATen/BlasBackend.h) as the `IntList` values `_scaled_mm_v2` expects.
+const RECIPE_BLOCKWISE_1X128: i64 = 4;
+const RECIPE_BLOCKWISE_128X128: i64 = 5;
+const NO_SWIZZLE: i64 = 0;
+
+/// Which `_scaled_mm` recipe a latch entry refers to — failures are latched
+/// per (device, recipe) so a blockwise failure on SM120 doesn't suppress the
+/// rowwise arm on the same device, and neither affects other devices.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum ScaledMmRecipe {
+    /// v2: 1x128 activation × 128x128 weight blocks (Hopper SM90 only).
+    BlockwiseV2,
+    /// v1: per-token × per-output-channel scales (SM89+; SM120 needs
+    /// torch ≥ 2.11 — the 2.10 gate routes SM120 rowwise to cuBLASLt,
+    /// which rejects it, so this latches off there until #1524).
+    RowwiseV1,
+}
+
+/// Per-(CUDA-device, recipe) sticky kernel-failure latch. The deepseek
+/// (1x128 × 128x128) recipe hard-errors off NVIDIA Hopper (SM90 + cuBLASLt ≥
+/// 12.9: `_check_deepseek_support` in ScaledBlas.cpp), and tch-rs exposes no
+/// compute-capability query, so the first kernel error *for a given recipe on
+/// a given device* latches only that combination off: later calls skip that
+/// arm silently (one warning per device per recipe), while other recipes and
+/// other devices stay live. Per-device rather than process-global because a
+/// multi-GPU `LayerDeviceMap` can mix Hopper with another CUDA architecture —
+/// support is a per-device compute-capability property (PR #1523 review).
+/// Failed state only ever transitions false → true.
+#[derive(Default)]
+struct DeviceLatch(parking_lot::Mutex<std::collections::HashSet<(usize, ScaledMmRecipe)>>);
+
+impl DeviceLatch {
+    /// True if `recipe` has already failed on CUDA device `dev`.
+    fn is_failed(&self, dev: usize, recipe: ScaledMmRecipe) -> bool {
+        self.0.lock().contains(&(dev, recipe))
+    }
+
+    /// Mark `recipe` failed on CUDA device `dev`. Returns true iff this call
+    /// was the first failure for the combination — i.e. the caller should log
+    /// the warning (warn-once per device per recipe).
+    fn mark_failed(&self, dev: usize, recipe: ScaledMmRecipe) -> bool {
+        self.0.lock().insert((dev, recipe))
+    }
+}
+
+static SCALED_MM_FAILED: std::sync::OnceLock<DeviceLatch> = std::sync::OnceLock::new();
+
+fn scaled_mm_latch() -> &'static DeviceLatch {
+    SCALED_MM_FAILED.get_or_init(DeviceLatch::default)
+}
+
+/// Repack a `[K/128, N/128]` block scale into the `_scaled_mm_v2`
+/// `BlockWise128x128` layout: `[N/128, L4]` contiguous f32 with
+/// `L4 = round_up(K/128, 4)` (K-block dim zero-padded to a multiple of 4).
+fn pack_scale_b_v2(scale: &Tensor) -> Tensor {
+    let size = scale.size();
+    let kb = size[0];
+    let l4 = (kb + 3) / 4 * 4; // i64::div_ceil is unstable on this toolchain
+    // [N/128, K/128] contiguous, then zero-pad the K-block dim to L4.
+    let t = scale.to_kind(tch::Kind::Float).transpose(0, 1).contiguous();
+    if l4 == kb {
+        t
+    } else {
+        t.constant_pad_nd([0, l4 - kb]) // right-pad last dim with zeros
+    }
+    .contiguous()
+}
+
+impl LinearProjection {
+    /// FP8 GEMM via torch `_scaled_mm`. Returns `None` when this projection
+    /// can't use any FP8 path: weight not e4m3, no block scale, not on CUDA
+    /// (torch 2.10 has no CPU kernel — the CPU `_scaled_mm` v1 kernel is
+    /// per-tensor-scale only, which cannot express the checkpoint's scales),
+    /// K not a multiple of 128, or every recipe latched off on the weight's
+    /// device (see [`SCALED_MM_FAILED`]).
+    ///
+    /// Each recipe latches off per device on kernel error; lazy dequant
+    /// remains the final fallback. The gate and latch key on the *weight's*
+    /// CUDA device — the kernel runs where the weight lives (the model's
+    /// forward moves activations to the layer's device), which is correct
+    /// under a multi-GPU `LayerDeviceMap`.
+    ///
+    /// Recipe selection (verified against release/2.10 + release/2.11
+    /// ScaledBlas.cpp / RowwiseScaledMM.cu):
+    ///
+    ///  1. v2 blockwise: 1x128 activation × 128x128 weight blocks — Hopper
+    ///     (SM90) + cuBLASLt ≥ 12.9 ONLY (`_check_deepseek_support`
+    ///     hard-errors elsewhere, incl. SM120).
+    ///  2. v1 rowwise: per-token × per-output-channel scales — SM89+ via the
+    ///     CUTLASS `f8f8bf16_rowwise` kernel, EXCEPT on SM120 under shipped
+    ///     torch 2.10: `_scaled_rowwise_rowwise`'s CUTLASS gate is
+    ///     `dprops->major == 10` (exactly SM100), so SM120 (major 12) with
+    ///     cuBLAS ≥ 12.9 is routed to cuBLASLt rowwise instead — which has no
+    ///     FP8 rowwise kernel for SM120 and fails with
+    ///     `CUBLAS_STATUS_NOT_SUPPORTED` out of `cublasLtMatmulAlgoGetHeuristic`
+    ///     even with the required TN layout (column-major B). The arm therefore
+    ///     latches off on SM120 under 2.10 and lazy dequant serves; release/2.11
+    ///     widens the gate to `major >= 10`, so the SM120 CUTLASS kernel lights
+    ///     up with the libtorch upgrade tracked in #1524 — no code change
+    ///     needed here. Uses the load-time requantized `rowwise` weight pair.
+    pub(crate) fn apply_fp8_scaled_mm(&self, input: &Tensor) -> Option<Tensor> {
+        if self.weight.kind() != tch::Kind::Float8e4m3fn {
+            return None;
+        }
+        let Device::Cuda(dev_idx) = self.weight.device() else {
+            return None;
+        };
+        let in_dims = input.size();
+        let k = *in_dims.last()?;
+        if k % 128 != 0 {
+            return None;
+        }
+        let m: i64 = in_dims[..in_dims.len() - 1].iter().product();
+        let out = self
+            .try_blockwise_v2(dev_idx, input, m, k)
+            .or_else(|| self.try_rowwise_v1(dev_idx, input, m, k))?;
+        let mut out_dims = in_dims;
+        *out_dims.last_mut()? = self.weight.size()[1];
+        Some(out.reshape(out_dims))
+    }
+
+    /// v2 blockwise arm (1x128 activation × 128x128 weight blocks) — Hopper
+    /// (SM90) + cuBLASLt ≥ 12.9 only. Returns None if unavailable or latched.
+    ///
+    /// Layout: `weight` is stored `[in, out]` (K, N) after `take()`; the kernel
+    /// wants `mat2` column-major `[K, N]`, so we materialize one FP8 transpose
+    /// per call (spike overhead; a load-time orientation change is the fix if
+    /// the GPU numbers justify it). Scales: `scale_a` is repacked per call to
+    /// `[M, K/128]` with strides `(1, M)` (column-major, like pytorch's own
+    /// `x_scales.t().contiguous().t()`); `scale_b` uses the load-time-packed
+    /// `scale_v2` (`[N/128, L4]` contiguous, passed as `.t()` → `[L4, N/128]`
+    /// strides `(1, L4)`). The stored scale is already a *multiply* factor (HF
+    /// `weight_scale_inv` semantics, matching the lazy path), so no reciprocal
+    /// is needed.
+    fn try_blockwise_v2(&self, dev_idx: usize, input: &Tensor, m: i64, k: i64) -> Option<Tensor> {
+        let scale_v2 = self.scale_v2.as_ref()?;
+        if scaled_mm_latch().is_failed(dev_idx, ScaledMmRecipe::BlockwiseV2) {
+            return None;
+        }
+        let x2 = input.reshape([m, k]);
+        let (q, scale_a) = quantize_activations_1x128(&x2);
+        // Column-major mat2 [K, N]: contiguous [N, K] copy, transposed view.
+        let mat2 = self.weight.transpose(0, 1).contiguous().transpose(0, 1);
+        // BlockWise1x128 scale_a must be [M, K/128] with strides (1, M).
+        let scale_a = scale_a.transpose(0, 1).contiguous().transpose(0, 1);
+        // BlockWise128x128 scale_b must be [L4, N/128] with strides (1, L4).
+        let scale_b = scale_v2.transpose(0, 1);
+        let scale_a_refs = [&scale_a];
+        let scale_b_refs = [&scale_b];
+        let bias = self.bias.as_ref().map(|b| b.to_kind(tch::Kind::BFloat16));
+        q.f_internal_scaled_mm_v2(
+            &mat2,
+            &scale_a_refs,
+            [RECIPE_BLOCKWISE_1X128],
+            [NO_SWIZZLE],
+            &scale_b_refs,
+            [RECIPE_BLOCKWISE_128X128],
+            [NO_SWIZZLE],
+            bias.as_ref(),
+            tch::Kind::BFloat16,
+            [] as [i64; 0],
+            false,
+        )
+        .map_err(|e| {
+            if scaled_mm_latch().mark_failed(dev_idx, ScaledMmRecipe::BlockwiseV2) {
+                tracing::warn!(
+                    "FP8 _scaled_mm_v2 (1x128 x 128x128) failed on CUDA device {dev_idx} \
+                     (latched off for this device; trying rowwise/lazy fallback): {e}"
+                );
+            }
+            e
+        })
+        .ok()
+    }
+
+    /// v1 rowwise arm (per-token activation scale × per-output-channel weight
+    /// scale) — SM89+ via the CUTLASS `f8f8bf16_rowwise` kernel. On SM120 this
+    /// requires torch ≥ 2.11: release/2.10's `_scaled_rowwise_rowwise` gate
+    /// (`dprops->major == 10`, ScaledBlas.cpp) sends SM120 to the cuBLASLt
+    /// rowwise path, which rejects the problem
+    /// (`CUBLAS_STATUS_NOT_SUPPORTED` from `cublasLtMatmulAlgoGetHeuristic`)
+    /// even with the correct TN layout; the first failure then latches this
+    /// recipe off and lazy dequant serves until the #1524 libtorch upgrade.
+    /// Uses the load-time-requantized `rowwise` weight pair; returns None if
+    /// it wasn't built (flag off at load) or the recipe is latched off on
+    /// this device.
+    ///
+    /// Layout (RowwiseScaledMM.cu `check_inputs`, identical in 2.10/2.11): A
+    /// `[M, K]` row-major, `scale_a` `[M, 1]` f32 contiguous, `scale_b`
+    /// `[1, N]` f32 contiguous, and `mat2` `[K, N]` COLUMN-major
+    /// (stride(0) == 1) — the requantized weight is stored row-major
+    /// `[K, N]`, so we materialize one FP8 transpose per call (same spike
+    /// overhead as the blockwise arm).
+    fn try_rowwise_v1(&self, dev_idx: usize, input: &Tensor, m: i64, k: i64) -> Option<Tensor> {
+        let (w_rq, scale_b) = self.rowwise.as_deref()?;
+        if scaled_mm_latch().is_failed(dev_idx, ScaledMmRecipe::RowwiseV1) {
+            return None;
+        }
+        let x2 = input.reshape([m, k]);
+        let (q, scale_a) = quantize_activations_rowwise(&x2);
+        // Column-major mat2 [K, N]: contiguous [N, K] copy, transposed view.
+        let mat2 = w_rq.transpose(0, 1).contiguous().transpose(0, 1);
+        let bias = self.bias.as_ref().map(|b| b.to_kind(tch::Kind::BFloat16));
+        q.f_internal_scaled_mm(
+            &mat2,
+            &scale_a,
+            scale_b,
+            bias.as_ref(),
+            None::<&Tensor>,
+            tch::Kind::BFloat16,
+            false,
+        )
+        .map_err(|e| {
+            if scaled_mm_latch().mark_failed(dev_idx, ScaledMmRecipe::RowwiseV1) {
+                tracing::warn!(
+                    "FP8 rowwise _scaled_mm failed on CUDA device {dev_idx} \
+                     (latched off for this device; using lazy dequant there): {e}"
+                );
+            }
+            e
+        })
+        .ok()
+    }
 }
 
 impl LinearProjection {
     /// Create projection from weight only (no bias, no scale).
     #[inline]
     pub(crate) fn new(weight: Tensor) -> Self {
-        Self { weight, bias: None, scale: None }
+        Self { weight, bias: None, scale: None, scale_v2: None, rowwise: None }
     }
 
     /// Create projection with weight and bias (no scale).
     #[inline]
     pub(crate) fn with_bias(weight: Tensor, bias: Tensor) -> Self {
-        Self { weight, bias: Some(bias), scale: None }
+        Self { weight, bias: Some(bias), scale: None, scale_v2: None, rowwise: None }
     }
 
-    /// Create FP8 projection with block-wise scale.
+    /// Create FP8 projection with block-wise scale `[K/128, N/128]` (the
+    /// post-`take()` orientation). Also derives the load-time-packed
+    /// `_scaled_mm_v2` scale layout (`scale_v2`) so the FP8 GEMM arm pays no
+    /// per-call repack/padding cost, and — only when `HYPRSTREAM_FP8_GEMM` is
+    /// on — the rowwise-requantized weight pair (`rowwise`) for the v1 recipe
+    /// arm (SM89+; SM120 needs torch ≥ 2.11, see `apply_fp8_scaled_mm`).
     #[inline]
     pub(crate) fn with_scale(weight: Tensor, scale: Tensor) -> Self {
-        Self { weight, bias: None, scale: Some(scale) }
+        let scale_v2 = pack_scale_b_v2(&scale);
+        let rowwise = if fp8_gemm_enabled() {
+            Some(Box::new(build_rowwise_requant(&weight, &scale)))
+        } else {
+            None
+        };
+        Self { weight, bias: None, scale: Some(scale), scale_v2: Some(scale_v2), rowwise }
     }
 
     /// Move all owned tensors to `device` (no-op per tensor already there).
@@ -80,6 +417,8 @@ impl LinearProjection {
             weight: self.weight.to_device(device),
             bias: self.bias.map(|b| b.to_device(device)),
             scale: self.scale.map(|s| s.to_device(device)),
+            scale_v2: self.scale_v2.map(|s| s.to_device(device)),
+            rowwise: self.rowwise.map(|bs| Box::new((bs.0.to_device(device), bs.1.to_device(device)))),
         }
     }
 
@@ -94,6 +433,18 @@ impl LinearProjection {
     /// multiplies on each forward pass (keeping VRAM at FP8 size).
     #[inline]
     pub(crate) fn apply(&self, input: &Tensor) -> Tensor {
+        // FP8 GEMM spike: config-gated (`RuntimeConfig::fp8_gemm` /
+        // HYPRSTREAM_FP8_GEMM), NVIDIA Hopper (SM90, cuBLASLt ≥ 12.9) only in
+        // practice. Falls through to lazy dequant when the path is unavailable
+        // or has latched off after a kernel error.
+        let fp8_out = if fp8_gemm_enabled() {
+            self.apply_fp8_scaled_mm(input)
+        } else {
+            None
+        };
+        if let Some(out) = fp8_out {
+            return out;
+        }
         let w = match self.weight.kind() {
             tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2 => {
                 // Cast FP8 → BF16 on GPU (ROCm 7.1+ dispatches on-device, no CPU fallback).
@@ -3743,5 +4094,458 @@ mod pipeline_tests {
         let emb = Tensor::randn([1, 3, HIDDEN], (DType::Float, Device::Cpu));
         assert!(stage.forward_layers_train(&emb, 0..2, None).is_err(), "range below window");
         assert!(stage.forward_layers_train(&emb, 2..LAYERS, None).is_ok(), "owned range ok");
+    }
+}
+
+// ============================================================================
+// FP8 _scaled_mm spike — CPU capability contract + numerics + microbenchmark.
+// ============================================================================
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout, clippy::print_stderr)]
+mod fp8_gemm_tests {
+    use super::*;
+    use tch::Kind;
+
+    const FP8: Kind = Kind::Float8e4m3fn;
+    const OPT: (Kind, Device) = (Kind::Float, Device::Cpu);
+
+    /// Deterministic small float tensor, RNG-free so parallel tests can't
+    /// interleave `manual_seed`.
+    fn det(dims: &[i64], seed: i64) -> Tensor {
+        let n: i64 = dims.iter().product();
+        ((Tensor::arange(n, OPT) + seed).sin() * 2.0).reshape(dims)
+    }
+
+    fn max_rel_err(a: &Tensor, b: &Tensor) -> f64 {
+        let a = a.to_kind(Kind::Double);
+        let b = b.to_kind(Kind::Double);
+        let num = (&a - &b).abs();
+        let den = b.abs().clamp_min(1e-6);
+        (num / den).max().double_value(&[])
+    }
+
+    /// ‖a−b‖ / ‖b‖ (Frobenius) — stable under near-zero elements, unlike the
+    /// per-element ratio.
+    fn rel_frob_err(a: &Tensor, b: &Tensor) -> f64 {
+        let a = a.to_kind(Kind::Double);
+        let b = b.to_kind(Kind::Double);
+        let num = (&a - &b).norm().double_value(&[]);
+        let den = b.norm().double_value(&[]).max(1e-12);
+        num / den
+    }
+
+    /// Deterministic pseudo-random in [-1, 1]: frac(sin(i·12.9898)·43758.5453),
+    /// computed in f64 for argument precision. RNG-free like `det()`, but
+    /// without `sin(flat_index)`'s catastrophic dot-product cancellation
+    /// (which inflates relative error metrics ~20x — a data artifact).
+    fn det_rand(dims: &[i64], seed: i64) -> Tensor {
+        let n: i64 = dims.iter().product();
+        let idx = Tensor::arange(n, (Kind::Double, Device::Cpu)) + seed;
+        let h = (idx * 12.9898).sin() * 43758.5453;
+        ((&h - h.floor()) * 2.0 - 1.0).to_kind(Kind::Float).reshape(dims)
+    }
+
+    /// Asserted CPU capability contract for torch 2.10 `_scaled_mm` with e4m3
+    /// (measured by this spike; update if a future libtorch widens it):
+    ///  - v1 CPU: per-TENSOR scales only ("_scaled_mm only supports per-tensor
+    ///    scaling for CPU backend", ATen/native/Blas.cpp). Row/col/blockwise
+    ///    scale layouts are rejected.
+    ///  - v2 CPU: not registered at all — dispatch covers CUDA/XPU only
+    ///    (native_functions.yaml; no CPU kernel). The 1x128/128x128 recipe is
+    ///    further restricted to NVIDIA Hopper (SM90 + cuBLASLt ≥ 12.9) by
+    ///    `_check_deepseek_support`.
+    #[test]
+    fn scaled_mm_cpu_capability_contract() {
+        let (m, k, n) = (8, 128, 64);
+        let a = det(&[m, k], 1).to_kind(FP8);
+        let b = det(&[k, n], 2).to_kind(FP8);
+        let one = Tensor::ones([1, 1], OPT);
+        // v1 tensorwise: works, BF16 out.
+        let out = a
+            .f_internal_scaled_mm(&b, &one, &one, None::<&Tensor>, None::<&Tensor>, Kind::BFloat16, false)
+            .expect("v1 tensorwise e4m3 must work on CPU (torch 2.10)");
+        assert_eq!(out.size(), [m, n]);
+        assert_eq!(out.kind(), Kind::BFloat16);
+        // Sanity: scale == 1 so out == dequant(a) @ dequant(b) in bf16 tolerance.
+        let expect = a.to_kind(Kind::Float).matmul(&b.to_kind(Kind::Float));
+        assert!(
+            max_rel_err(&out, &expect) < 1e-2,
+            "v1 tensorwise result diverged from plain matmul of dequantized inputs"
+        );
+        // v1 rowwise: rejected on CPU.
+        let sa = Tensor::ones([m, 1], OPT);
+        let sb = Tensor::ones([1, n], OPT);
+        let err = a
+            .f_internal_scaled_mm(&b, &sa, &sb, None::<&Tensor>, None::<&Tensor>, Kind::BFloat16, false)
+            .expect_err("v1 rowwise must be rejected on CPU");
+        assert!(err.to_string().contains("per-tensor scaling"), "unexpected: {err}");
+        // v2: not registered for CPU at all.
+        let sa_refs = [&sa];
+        let sb_refs = [&sb];
+        let err = a
+            .f_internal_scaled_mm_v2(
+                &b, &sa_refs, [RECIPE_BLOCKWISE_1X128], [NO_SWIZZLE],
+                &sb_refs, [RECIPE_BLOCKWISE_128X128], [NO_SWIZZLE],
+                None::<&Tensor>, Kind::BFloat16, [] as [i64; 0], false,
+            )
+            .expect_err("v2 must be unavailable on CPU");
+        assert!(err.to_string().contains("_scaled_mm_v2"), "unexpected: {err}");
+    }
+
+    /// The 1x128 activation quantizer: roundtrip q*scale ≈ x. This is the
+    /// device-independent half of the FP8 path — the CUDA kernel consumes
+    /// exactly these (q, scale) tensors, so their error bounds the end-to-end
+    /// error regardless of backend.
+    #[test]
+    fn quantize_activations_1x128_roundtrip() {
+        let x = det(&[7, 256], 3);
+        let (q, scale) = quantize_activations_1x128(&x);
+        assert_eq!(q.kind(), FP8);
+        assert_eq!(q.size(), x.size());
+        assert_eq!(scale.kind(), Kind::Float);
+        assert_eq!(scale.size(), [7, 2]);
+        // Dequantize and compare.
+        let xq = (q.to_kind(Kind::Float).view([7, 2, 128]) * scale.unsqueeze(-1)).view([7, 256]);
+        let rel = max_rel_err(&xq, &x);
+        // e4m3 has 3 mantissa bits → per-element rel err ≤ 2^-4 = 6.25% for
+        // NORMAL outputs (round-to-nearest can tie exactly at the bound, hence
+        // `<=`). Subnormal-quantized outputs can exceed 2^-4 in relative
+        // terms, but amax normalization keeps block magnitudes ≳ 448·2^-9,
+        // well above the e4m3 subnormal floor — so the bound holds here.
+        assert!(rel <= 0.0625, "roundtrip max rel err {rel} exceeds e4m3 ulp bound");
+        assert!(q.to_kind(Kind::Float).abs().max().double_value(&[]) <= 448.0);
+    }
+
+    /// Simulate the full scaled_mm math (activation 1x128 quant + weight
+    /// 128x128 block dequant) in plain f32 ops — exactly what the CUDA v2
+    /// kernel computes — and bound the error vs (a) the lazy-dequant BF16
+    /// baseline and (b) a full-precision reference. The kernel accumulates in
+    /// f32, so real-GPU error should be at or below this envelope.
+    ///
+    /// Uses hash-based pseudo-random data, NOT `det()`: `sin(flat_index)`
+    /// rows/columns produce dot products with catastrophic cancellation
+    /// (signal O(1), error at the sqrt(K)·term scale), which inflated the
+    /// measured rel err to ~0.4 — an artifact of the data, not the scheme.
+    #[test]
+    fn fp8_blockwise_matmul_error_envelope() {
+        let (m, k, n) = (8, 256, 256);
+        let w = det_rand(&[k, n], 4) * 0.05; // weight-scale values
+        let x = det_rand(&[m, k], 5);
+
+        // Quantize weight per 128x128 block (what the checkpoint stores).
+        let w4 = w.view([k / 128, 128, n / 128, 128]);
+        let ws = w4.abs().amax(-1, false).amax(1, false).clamp_min(1e-12) / 448.0; // [k/128, n/128]
+        let wq = (w4 / ws.view([k / 128, 1, n / 128, 1])).clamp(-448.0, 448.0).to_kind(FP8);
+        let w_deq = (wq.to_kind(Kind::Float) * ws.view([k / 128, 1, n / 128, 1])).view([k, n]);
+
+        // Simulated scaled_mm: quantize activations, dequantize both, matmul.
+        let (q, sa) = quantize_activations_1x128(&x);
+        let x_deq = (q.to_kind(Kind::Float).view([m, k / 128, 128]) * sa.unsqueeze(-1)).view([m, k]);
+        let out_sim = x_deq.matmul(&w_deq);
+
+        // (a) vs lazy-dequant baseline: BF16 cast of w_deq then matmul.
+        let out_lazy = x.to_kind(Kind::BFloat16).matmul(&w_deq.to_kind(Kind::BFloat16)).to_kind(Kind::Float);
+        let rel_vs_lazy = rel_frob_err(&out_sim, &out_lazy);
+        // (b) vs full-precision reference.
+        let out_ref = x.matmul(&w);
+        let rel_vs_ref = rel_frob_err(&out_sim, &out_ref);
+        // Error is dominated by the e4m3 mantissa (≤ 6.25% per element,
+        // ~2.3% RMS measured above, partially averaged over K=256
+        // accumulation). The observed envelope is printed for the spike
+        // report; assert conservative bounds.
+        assert!(rel_vs_ref < 0.10, "sim vs full-precision rel err {rel_vs_ref}");
+        assert!(rel_vs_lazy < 0.10, "sim vs lazy-dequant rel err {rel_vs_lazy}");
+        println!(
+            "error envelope (frob rel): x_deq={:.4} w_deq={:.4} sim_vs_lazy={:.4} sim_vs_ref={:.4}",
+            rel_frob_err(&x_deq, &x),
+            rel_frob_err(&w_deq, &w),
+            rel_vs_lazy,
+            rel_vs_ref
+        );
+    }
+
+    /// Error envelope for the v1 rowwise arm (per-token activation scale ×
+    /// per-output-channel weight scale — the SM120/Blackwell path), simulating
+    /// exactly the math the rowwise kernel computes: quantize activations
+    /// rowwise, requantize the block-quantized weight per column, dequantize
+    /// both, matmul. Compared vs (a) the lazy-dequant BF16 baseline and (b) a
+    /// full-precision reference. The measured bound justifies the tolerance in
+    /// `fp8_scaled_mm_kernel_cuda` for the rowwise arm.
+    #[test]
+    fn fp8_rowwise_requant_error_envelope() {
+        let (m, k, n) = (8, 256, 256);
+        let w = det_rand(&[k, n], 4) * 0.05; // weight-scale values
+        let x = det_rand(&[m, k], 5);
+
+        // Quantize weight per 128x128 block (what the checkpoint stores).
+        let w4 = w.view([k / 128, 128, n / 128, 128]);
+        let ws = w4.abs().amax(-1, false).amax(1, false).clamp_min(1e-12) / 448.0; // [k/128, n/128]
+        let wq = (w4 / ws.view([k / 128, 1, n / 128, 1])).clamp(-448.0, 448.0).to_kind(FP8);
+        let w_deq_block = (wq.to_kind(Kind::Float) * ws.view([k / 128, 1, n / 128, 1])).view([k, n]);
+
+        // Load-time rowwise requant from the FP8 checkpoint tensors.
+        let (w_rq, s_b) = build_rowwise_requant(&wq.view([k, n]), &ws);
+        assert_eq!(s_b.size(), [1, n]);
+
+        // Simulated v1 rowwise scaled_mm.
+        let (q, s_a) = quantize_activations_rowwise(&x);
+        assert_eq!(s_a.size(), [m, 1]);
+        let x_deq = q.to_kind(Kind::Float) * s_a;
+        let w_deq = w_rq.to_kind(Kind::Float) * s_b; // [K, N] * [1, N] broadcast
+        let out_sim = x_deq.matmul(&w_deq);
+
+        // (a) vs lazy-dequant baseline (block scales, BF16 matmul).
+        let out_lazy = x.to_kind(Kind::BFloat16).matmul(&w_deq_block.to_kind(Kind::BFloat16)).to_kind(Kind::Float);
+        let rel_vs_lazy = rel_frob_err(&out_sim, &out_lazy);
+        // (b) vs full-precision reference.
+        let out_ref = x.matmul(&w);
+        let rel_vs_ref = rel_frob_err(&out_sim, &out_ref);
+        // Rowwise is coarser than 128x128 blocks (one scale per output channel
+        // over all K) — measured envelope printed; assert generous-but-real
+        // bounds (see spike report for observed values).
+        assert!(rel_vs_ref < 0.30, "rowwise sim vs full-precision rel err {rel_vs_ref}");
+        assert!(rel_vs_lazy < 0.30, "rowwise sim vs lazy-dequant rel err {rel_vs_lazy}");
+        println!(
+            "rowwise error envelope (frob rel): x_deq={:.4} w_deq={:.4} sim_vs_lazy={:.4} sim_vs_ref={:.4}",
+            rel_frob_err(&x_deq, &x),
+            rel_frob_err(&w_deq, &w_deq_block),
+            rel_vs_lazy,
+            rel_vs_ref
+        );
+    }
+
+    /// Load-time `scale_b` packing: `[K/128, N/128]` → `[N/128, L4]`
+    /// contiguous with the K-block dim zero-padded to a multiple of 4
+    /// (cuBLASLt TMA). CPU-verifiable layout contract.
+    #[test]
+    fn fp8_scale_v2_packed_layout() {
+        // K=256 → K/128=2 blocks → L4=4 (padding exercised); N=384 → 3 blocks.
+        let scale = det(&[2, 3], 9);
+        let packed = pack_scale_b_v2(&scale);
+        assert_eq!(packed.size(), [3, 4]);
+        assert_eq!(packed.kind(), Kind::Float);
+        assert!(packed.is_contiguous());
+        // K-block-minor order: packed[j, i] == scale[i, j] for real blocks.
+        let expect = scale.transpose(0, 1);
+        assert!(packed.narrow(1, 0, 2).allclose(&expect, 0.0, 0.0, false));
+        // Padding region is zeros (never read by the kernel; TMA allocation only).
+        assert_eq!(packed.narrow(1, 2, 2).abs().max().double_value(&[]), 0.0);
+        // Passed as .t() at the call site: [L4, N/128] with strides (1, L4).
+        let passed = packed.transpose(0, 1);
+        assert_eq!(passed.size(), [4, 3]);
+        assert_eq!(passed.stride(), [1, 4]);
+        // Exact-multiple case (K/128=4) must not pad.
+        let packed4 = pack_scale_b_v2(&det(&[4, 2], 10));
+        assert_eq!(packed4.size(), [2, 4]);
+        // with_scale derives scale_v2 automatically.
+        let proj = LinearProjection::with_scale(
+            det(&[256, 384], 11).to_kind(FP8),
+            det(&[2, 3], 9),
+        );
+        assert_eq!(proj.scale_v2.as_ref().unwrap().size(), [3, 4]);
+    }
+
+    /// The failure latch is per-(CUDA-device, recipe) (PR #1523 review +
+    /// SM120 rowwise arm): a failure of one recipe on one device must not
+    /// disable the other recipe or other devices, and each combination warns
+    /// exactly once. CPU-testable without GPUs since the latch is keyed on
+    /// the (device, recipe) pair alone.
+    #[test]
+    fn device_latch_isolation() {
+        use ScaledMmRecipe::{BlockwiseV2, RowwiseV1};
+        let latch = DeviceLatch::default();
+        assert!(!latch.is_failed(0, BlockwiseV2) && !latch.is_failed(1, BlockwiseV2));
+        // First failure on (0, BlockwiseV2) reports (caller warns); repeats don't.
+        assert!(latch.mark_failed(0, BlockwiseV2));
+        assert!(!latch.mark_failed(0, BlockwiseV2));
+        // Device 0 blockwise latched; device 1 and the rowwise recipe unaffected.
+        assert!(latch.is_failed(0, BlockwiseV2));
+        assert!(!latch.is_failed(1, BlockwiseV2));
+        assert!(!latch.is_failed(0, RowwiseV1));
+        // Rowwise on the same device fails and reports independently.
+        assert!(latch.mark_failed(0, RowwiseV1));
+        assert!(latch.is_failed(0, RowwiseV1));
+        // Device 1 failing later still reports.
+        assert!(latch.mark_failed(1, BlockwiseV2));
+        assert!(latch.is_failed(1, BlockwiseV2));
+    }
+
+    /// Sticky-latch / warn-once contract for a FAILING recipe — the SM120 +
+    /// torch 2.10 case, where every rowwise call errors with
+    /// `CUBLAS_STATUS_NOT_SUPPORTED` (2.10 gates the CUTLASS rowwise kernel to
+    /// `major == 10`, so SM120 goes to cuBLASLt, which rejects it; #1524).
+    /// Drives a `DeviceLatch` through exactly the guard sequence the
+    /// `try_blockwise_v2`/`try_rowwise_v1` arms use — `is_failed` check before
+    /// touching the kernel, `mark_failed` on error with the warning emitted
+    /// only on first failure — with a stub kernel that always errors. Asserts
+    /// the kernel is attempted exactly once, the warning decision fires
+    /// exactly once, and every later call short-circuits to the lazy fallback
+    /// without re-attempting or re-warning. CPU-testable: the hardware tester
+    /// couldn't reach this assertion on the 5090 because no recipe ever ran,
+    /// but the latch state machine itself needs no GPU.
+    #[test]
+    fn failing_recipe_latches_off_without_warning_spam() {
+        let latch = DeviceLatch::default();
+        let attempts = std::cell::Cell::new(0);
+        let warnings = std::cell::Cell::new(0);
+        // Mirrors the try_* arm bodies: None when latched off or when the
+        // (here always-failing) kernel errors; the caller then falls back to
+        // lazy dequant.
+        let arm = |latch: &DeviceLatch| -> Option<()> {
+            if latch.is_failed(0, ScaledMmRecipe::RowwiseV1) {
+                return None; // latched: straight to lazy, no kernel, no warning
+            }
+            attempts.set(attempts.get() + 1);
+            let res: Result<(), &str> = Err("CUBLAS_STATUS_NOT_SUPPORTED");
+            res.inspect_err(|_| {
+                if latch.mark_failed(0, ScaledMmRecipe::RowwiseV1) {
+                    warnings.set(warnings.get() + 1); // the tracing::warn! site
+                }
+            })
+            .ok()
+        };
+        for _ in 0..8 {
+            assert!(arm(&latch).is_none());
+        }
+        assert_eq!(attempts.get(), 1, "kernel must only be attempted before the latch trips");
+        assert_eq!(warnings.get(), 1, "warn-once per (device, recipe)");
+        assert!(latch.is_failed(0, ScaledMmRecipe::RowwiseV1));
+        // The other recipe on the same device is unaffected.
+        assert!(!latch.is_failed(0, ScaledMmRecipe::BlockwiseV2));
+    }
+
+    /// On CPU the gated path must decline (no CUDA) and `apply` must fall back
+    /// to the lazy-dequant result unchanged.
+    #[test]
+    fn fp8_scaled_mm_declines_on_cpu() {
+        let w = det(&[128, 256], 6).clamp(-2.0, 2.0).to_kind(FP8); // [in, out]
+        let scale = Tensor::ones([1, 2], OPT); // [in/128, out/128]
+        let proj = LinearProjection::with_scale(w, scale);
+        let x = det(&[3, 128], 7).to_kind(Kind::BFloat16);
+        assert!(proj.apply_fp8_scaled_mm(&x).is_none(), "CPU must decline the scaled_mm path");
+        // Lazy fallback still computes.
+        let out = proj.apply(&x);
+        assert_eq!(out.size(), [3, 256]);
+    }
+
+    /// Real-kernel test on CUDA: when a recipe runs it must match the
+    /// lazy-dequant baseline. Not ignored — self-skips without CUDA. Hopper
+    /// (SM90, cuBLASLt ≥ 12.9) exercises the v2 blockwise arm (tight 0.10
+    /// bound, matching the blockwise CPU envelope); SM89/SM100 and — after the
+    /// libtorch 2.11 upgrade tracked in #1524 — SM120/Blackwell exercise the
+    /// v1 rowwise arm with per-column weight scales (looser 0.30 bound,
+    /// matching the rowwise CPU envelope — coarser scales by design). K=256 →
+    /// K/128=2 blocks, so the L4=4 zero-padding in `pack_scale_b_v2` is
+    /// exercised.
+    ///
+    /// SM120 under shipped torch 2.10 is the expected-failure case:
+    /// release/2.10 `_scaled_rowwise_rowwise` gates the CUTLASS path on
+    /// `dprops->major == 10` (ScaledBlas.cpp), so SM120 (major 12) rowwise is
+    /// routed to cuBLASLt, which has no FP8 rowwise kernel for SM120 and fails
+    /// with `CUBLAS_STATUS_NOT_SUPPORTED` from `cublasLtMatmulAlgoGetHeuristic`
+    /// regardless of layout (the TN layout below is the only one its
+    /// TORCH_CHECK admits). There both recipes must latch off — proving the
+    /// arms were attempted and failed rather than silently skipped — and lazy
+    /// dequant must keep serving. release/2.11 widens the gate to
+    /// `major >= 10`, so this branch becomes unreachable once #1524 lands and
+    /// the rowwise numerics assert below lights up instead.
+    #[test]
+    fn fp8_scaled_mm_kernel_cuda() {
+        if !tch::Cuda::is_available() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let dev = Device::Cuda(0);
+        let (m, k, n) = (8, 256, 256);
+        let w = det_rand(&[k, n], 4) * 0.05;
+        let w4 = w.view([k / 128, 128, n / 128, 128]);
+        let ws = w4.abs().amax(-1, false).amax(1, false).clamp_min(1e-12) / 448.0;
+        let wq = (w4 / ws.view([k / 128, 1, n / 128, 1])).clamp(-448.0, 448.0).to_kind(FP8).view([k, n]);
+        // Flag is off in test env, so with_scale doesn't build the rowwise
+        // pair — build it explicitly (exactly what the gated load path does).
+        let mut proj = LinearProjection::with_scale(wq, ws.view([k / 128, n / 128]));
+        proj.rowwise = Some(Box::new(build_rowwise_requant(&proj.weight, proj.scale.as_ref().unwrap())));
+        // Load-time pack: [N/128, L4] with L4 = round_up(2, 4) = 4.
+        assert_eq!(proj.scale_v2.as_ref().unwrap().size(), [n / 128, 4]);
+        let proj = proj.into_device(dev);
+        let x = det_rand(&[m, k], 5).to_kind(Kind::BFloat16).to_device(dev);
+
+        let out_lazy = proj.apply(&x); // flag off in tests → lazy dequant
+        if let Some(out) = proj.try_blockwise_v2(0, &x, m, k) {
+            let rel = rel_frob_err(&out, &out_lazy);
+            println!("blockwise v2 (Hopper) vs lazy-dequant frob rel err: {rel:.4}");
+            assert!(rel < 0.10, "blockwise v2 diverged: {rel}");
+        } else if let Some(out) = proj.try_rowwise_v1(0, &x, m, k) {
+            let rel = rel_frob_err(&out, &out_lazy);
+            println!("rowwise v1 (SM120-capable) vs lazy-dequant frob rel err: {rel:.4}");
+            assert!(rel < 0.30, "rowwise v1 diverged: {rel}");
+        } else {
+            // SM120 + torch 2.10 (see doc comment): both recipes attempted,
+            // failed, and latched off. A failure to latch would mean an arm
+            // silently skipped its kernel instead of erroring — a regression.
+            assert!(
+                scaled_mm_latch().is_failed(0, ScaledMmRecipe::BlockwiseV2),
+                "blockwise v2 neither ran nor latched off on this CUDA device"
+            );
+            assert!(
+                scaled_mm_latch().is_failed(0, ScaledMmRecipe::RowwiseV1),
+                "rowwise v1 neither ran nor latched off on this CUDA device \
+                 (unexpected on SM120 + torch 2.10; on torch >= 2.11 the \
+                 rowwise arm above must run — issue #1524)"
+            );
+            // Sticky latch: repeat calls decline both arms without retrying,
+            // and lazy dequant still serves.
+            assert!(proj.try_blockwise_v2(0, &x, m, k).is_none());
+            assert!(proj.try_rowwise_v1(0, &x, m, k).is_none());
+            assert!(proj.apply_fp8_scaled_mm(&x).is_none());
+            let out = proj.apply(&x);
+            assert_eq!(out.size(), [m, n]);
+            assert!(out.allclose(&out_lazy, 0.0, 0.0, false), "lazy fallback diverged");
+        }
+    }
+
+    /// Microbenchmark: lazy-dequant matmul vs the scaled_mm path composition
+    /// at a realistic layer shape. On CPU the v2 kernel is unavailable, so
+    /// this times (a) lazy apply, (b) activation quantization alone (the added
+    /// per-call overhead), (c) v1 tensorwise scaled_mm as a GEMM proxy. Real
+    /// GPU latency numbers must be taken on the CUDA box (run --ignored).
+    #[test]
+    #[ignore = "microbenchmark — run explicitly; GPU numbers need the CUDA box"]
+    fn bench_fp8_gemm_vs_lazy_dequant() {
+        let (m, k, n) = (1, 5120, 5120);
+        let w = Tensor::zeros([k, n], OPT).clamp(-1.0, 1.0).to_kind(FP8);
+        let scale = Tensor::ones([k / 128, n / 128], OPT);
+        let proj = LinearProjection::with_scale(w, scale);
+        let x = det(&[m, k], 8).to_kind(Kind::BFloat16);
+        let iters = 20;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = proj.apply(&x);
+        }
+        let lazy_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        let x2 = x.reshape([m, k]);
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = quantize_activations_1x128(&x2);
+        }
+        let quant_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        // v1 tensorwise scaled_mm (the only CPU kernel) as a GEMM-time proxy.
+        let one = Tensor::ones([1, 1], OPT);
+        let (q, _) = quantize_activations_1x128(&x2);
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = q.internal_scaled_mm(
+                &proj.weight, &one, &one, None::<&Tensor>, None::<&Tensor>, Kind::BFloat16, false,
+            );
+        }
+        let smm_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        println!(
+            "shape [{m},{k}]x[{k},{n}] CPU: lazy_dequant={lazy_us:.0}us \
+             act_quant={quant_us:.0}us v1_tensorwise_scaled_mm={smm_us:.0}us"
+        );
     }
 }
