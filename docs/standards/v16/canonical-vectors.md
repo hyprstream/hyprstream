@@ -13,7 +13,7 @@ Machine-readable files (the normative form — this page is the human index):
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 8 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 48 vectors that MUST deny |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 53 vectors that MUST deny |
 | [`vectors/proof-v1-thumbprints.json`](vectors/proof-v1-thumbprints.json) | Cross-implementation replay-namespace thumbprint vectors (C1) |
 
 Each JSON vector carries `id`, `title`, `expect` (`accept` / `deny`),
@@ -295,6 +295,11 @@ Ed25519 signature over the stripped object.
 | N-41 | group-id-order | `signature_plan` with group IDs out of ascending order | 562 |
 | N-42 | unattributed-keyset | Unattributed key set with three elements, over the 1..2 ceiling | 944 |
 | N-43 | response-aud-binding | Bound response proof whose `aud` differs from the originating request (P-4) | 1602 |
+| N-44 | parser-cap | `capnp_body_bytes` of 1 MiB + 1, one byte over the 1048576 cap | 1048952 |
+| N-45 | nonce-length | Unattributed proof whose Nonce is 15 bytes, under the 16-byte floor | 469 |
+| N-46 | nonce-length | Unattributed proof whose Nonce is 65 bytes, over the 64-byte ceiling | 520 |
+| N-47 | parser-cap | `kid` of 0 bytes, under the 1-byte floor | 1594 |
+| N-48 | cbor-truncation | Truncated CBOR: response signature bstr header declares 65 bytes with 64 present | 374 |
 
 ### Notes on individual negatives
 
@@ -333,6 +338,32 @@ Ed25519 signature over the stripped object.
   in the CDDL text and enforced numerically by the gate over every fixture, and
   N-13 is asserted to exceed the 64-byte cap — so a widening to 128 turns the
   gate red.
+- **Byte-range boundary coverage (E1) — N-44 / N-45 / N-46 / N-47.** The pinned
+  pycddl 0.3.0 strips **every** `.size (LO..HI)` byte-length range (it mis-evaluates
+  them as integer-value bounds), so each stripped range needs a causal boundary
+  negative that the numeric gate rejects. Beyond `suite_id`/`kid`/`aud` uppers
+  (N-12/N-13/N-26) these close the remaining ends: **N-44** carries a
+  `capnp_body_bytes` of exactly 1 MiB + 1 (upper of `0..1048576`), staying under
+  the 2 MiB object cap so it denies solely on the body-length rule; **N-45** and
+  **N-46** carry a 15-byte and a 65-byte Nonce (the lower and upper of the
+  `server-challenge` `16..64` range) on an otherwise-valid unattributed proof;
+  **N-47** carries a 0-byte `kid` (the lower of `kid` `1..64`), independent of the
+  `aud` `.regexp`. A gate meta-guard (§3h) discovers every stripped range straight
+  from the CDDL and requires each violable end to map to a boundary negative
+  sitting *exactly* on `LO-1`/`HI+1` (or an explicit mechanical justification: the
+  `aud` lower end is subsumed by the service-domain `.regexp`, and the
+  `capnp_body_bytes` lower end is 0, the minimum) — so a newly added `.size` range
+  cannot ship without boundary coverage.
+- **N-48 (strict CBOR truncation, E2).** A length-delimited (`bstr`/`tstr`) value
+  whose header over-declares its length must be rejected as truncated, not
+  silently accepted by lenient slicing. N-48 is **P-3 with its trailing Ed25519
+  signature `bstr` header widened from `58 40` (64 bytes) to `58 41` (65 bytes)
+  with no byte added** — the reviewer's exact exploit (`58 41` followed by only
+  64 bytes). The shared strict decoder now raises when `len(rest) < declared`, so
+  a proof whose surviving signature would otherwise verify is refused at the
+  parser; the causality inventory (§12) asserts N-48 fails to decode with a
+  truncation error. A `tstr` truncation probe (`63 61 61` — three declared bytes,
+  two present) exercises the same guard on the text-string branch.
 - **N-12 / N-28 (suite ↔ component-plan binding).** Each suite_id is bound to its
   exact ordered algorithms and component count: `hs-cose-sign-ed25519-v1` is
   exactly one Ed25519 component, `hs-cose-sign-ed25519-mldsa65-wns-v1` is exactly

@@ -1840,6 +1840,87 @@ def main() -> None:
             notes="Only aud differs; cti and response_binding still equal P-4's; signature valid.",
         )
 
+        # ---- E1: byte-range boundary negatives for the stripped .size ranges ----
+        # The pinned pycddl 0.3.0 strips every `.size (LO..HI)` control, so each
+        # stripped range needs a causal boundary negative that the numeric gate
+        # rejects. suite_id/kid/aud uppers are N-12/N-13/N-26; these close the
+        # remaining boundaries (body upper, Nonce lower+upper, kid lower).
+
+        # N-44: capnp_body_bytes one byte over the 1 MiB cap (upper boundary of
+        # capnp-body-bytes = bstr .size (0..1048576)). The whole object still fits
+        # under the 2 MiB object cap, so it denies solely on the body-length rule.
+        n44_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH, body=b"\x00" * (1048576 + 1)
+        )
+        n44, _, _ = sign1(p4_protected, n44_claims, sk_c_ed)
+        record(
+            negatives, "N-44",
+            "capnp_body_bytes of 1 MiB + 1, one byte over the 1048576 cap",
+            "deny", "COSE_Sign1", n44,
+            deny_class="parser-cap",
+            deny_rule="capnp-body-bytes is 0..1048576 (1 MiB body cap)",
+            notes="Object stays under the 2 MiB cap; denies solely on the body-length rule.",
+        )
+
+        # N-45: Nonce (server challenge) of 15 bytes, one under the 16-byte floor
+        # (lower boundary of server-challenge = bstr .size (16..64)).
+        n45_claims = request_claims(credential_hash=None, nonce=b"\x00" * 15)
+        n45, _, _ = sign1(p1_protected, n45_claims, sk_u_ed)
+        record(
+            negatives, "N-45",
+            "Unattributed proof whose Nonce is 15 bytes, under the 16-byte floor",
+            "deny", "COSE_Sign1", n45,
+            deny_class="nonce-length",
+            deny_rule="server-challenge is 16..64 bytes",
+            notes="Valid unattributed structure/signature; denies solely on the Nonce lower bound.",
+        )
+
+        # N-46: Nonce of 65 bytes, one over the 64-byte ceiling (upper boundary).
+        n46_claims = request_claims(credential_hash=None, nonce=b"\x00" * 65)
+        n46, _, _ = sign1(p1_protected, n46_claims, sk_u_ed)
+        record(
+            negatives, "N-46",
+            "Unattributed proof whose Nonce is 65 bytes, over the 64-byte ceiling",
+            "deny", "COSE_Sign1", n46,
+            deny_class="nonce-length",
+            deny_rule="server-challenge is 16..64 bytes",
+            notes="Valid unattributed structure/signature; denies solely on the Nonce upper bound.",
+        )
+
+        # N-47: empty kid, under the 1-byte floor (lower boundary of
+        # kid = bstr .size (1..64)); mirrors N-13 (kid upper) with a 0-length kid.
+        n47_protected = dict(p4_protected)
+        n47_protected[H_KID] = b""
+        n47_protected[H_PLAN] = [
+            group(1, SUITE_CLASSICAL, [component(ALG_ED25519, b"")])
+        ]
+        n47, _, _ = sign1(n47_protected, p4_claims, sk_c_ed)
+        record(
+            negatives, "N-47",
+            "kid of 0 bytes, under the 1-byte floor",
+            "deny", "COSE_Sign1", n47,
+            deny_class="parser-cap",
+            deny_rule="proof-v1 cap: kid 1..64 bytes",
+            notes="Empty kid violates the kid lower bound independently of the aud .regexp.",
+        )
+
+        # N-48 (E2): P-3 with its trailing Ed25519 signature bstr header widened
+        # from `58 40` (64 bytes) to `58 41` (65 bytes) with NO byte added — the
+        # declared length exceeds the bytes present, so the strict decoder MUST
+        # reject the truncation (the reviewer's exact exploit). This is the
+        # `58 41` + 64 bytes shape; a lenient slicing decoder would "decode" and
+        # even verify the surviving signature.
+        assert p3[-66:-64] == b"\x58\x40", "P-3 must end with a 64-byte Ed25519 sig bstr header"
+        n48 = p3[:-66] + b"\x58\x41" + p3[-64:]
+        record(
+            negatives, "N-48",
+            "Truncated CBOR: response signature bstr header declares 65 bytes with 64 present",
+            "deny", "COSE_Sign1", n48,
+            deny_class="cbor-truncation",
+            deny_rule="a length-delimited value must have at least the declared number of bytes",
+            notes="Header widened 58 40 -> 58 41, no byte added; strict decoder rejects (len(rest) < val).",
+        )
+
     meta = {
         "vector_set_version": 1,
         "profile": "hs-rpc-proof-v1",

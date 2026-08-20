@@ -697,6 +697,87 @@ def gate_caps(cddl: str, positives, negatives) -> None:
         print(f"   3g over-cap object: {len(oversized)} bytes (fixed), valid structure, "
               f"rejected by size (> {MAX_OBJECT_BYTES})")
 
+    # 3h. Byte-range coverage meta-guard (E1). Every `.size (LO..HI)` range that
+    #     strip_size_ranges() removes for the pycddl pass MUST have a causal
+    #     boundary negative (or an explicit mechanical justification) for each
+    #     violable end, so a newly added stripped range cannot drip-feed without
+    #     coverage. Discover the ranges straight from the CDDL and require an
+    #     entry per rule; a mismatch (new range, or drifted LO/HI) fails here.
+    range_rules = {
+        m.group(1): (int(m.group(2)), int(m.group(3)))
+        for m in re.finditer(
+            r"(?m)^\s*([a-z0-9-]+)\s*=.*?\.size\s*\(\s*(\d+)\s*\.\.\s*(\d+)\s*\)", cddl
+        )
+    }
+
+    def kid_extremum(hex_, which):
+        kids, _ = kids_and_suites(hex_)
+        lens = [len(k) for k in kids] or [None]
+        return (max if which == "max" else min)(lens)
+
+    # For each stripped range: how to measure the boundary field, and which
+    # vector (or justification) covers each violable end.
+    RANGE_COVERAGE = {
+        "canonical-service-domain": {
+            "field": lambda h: len(claims_of(h)[C_AUD].encode()),
+            "upper": "N-26",
+            # lower end is length 0, which also fails the service-domain .regexp
+            # (first byte must be [a-z0-9]); it is subsumed by the syntax rule
+            # (N-29/N-30), so no independent length-only vector is meaningful.
+            "lower": ("syntax-subsumed", lambda: not valid_service_domain("")),
+        },
+        "kid": {
+            "field": lambda h: kid_extremum(h, "max"),
+            "field_lower": lambda h: kid_extremum(h, "min"),
+            "upper": "N-13",
+            "lower": "N-47",
+        },
+        "server-challenge": {
+            "field": lambda h: len(claims_of(h).get(C_NONCE, b"")),
+            "lower": "N-45",
+            "upper": "N-46",
+        },
+        "capnp-body-bytes": {
+            "field": lambda h: len(claims_of(h)[C_BODY_BYTES]),
+            "upper": "N-44",
+            # lower end is length 0 — the minimum, so no shorter value exists.
+            "lower": ("min-is-zero", lambda: True),
+        },
+    }
+
+    check(set(range_rules) == set(RANGE_COVERAGE),
+          f"every stripped .size range must have boundary coverage; "
+          f"CDDL has {sorted(range_rules)}, coverage maps {sorted(RANGE_COVERAGE)}")
+
+    for name, (lo, hi) in sorted(range_rules.items()):
+        cov = RANGE_COVERAGE.get(name)
+        if cov is None:
+            continue  # already flagged by the set-equality guard above
+        for end, target, boundary in (("lower", cov.get("lower"), lo - 1),
+                                       ("upper", cov.get("upper"), hi + 1)):
+            if isinstance(target, tuple):  # justified non-vector boundary
+                why, predicate = target
+                check(predicate(), f"{name} {end} boundary justification '{why}' does not hold")
+                print(f"   3h {name} {end} boundary: {why} (no independent vector)")
+                continue
+            check(target is not None, f"{name} {end} boundary has no coverage")
+            v = by_id.get(target)
+            check(v is not None, f"{name} {end} boundary negative {target} is missing")
+            if v is None:
+                continue
+            extractor = cov["field_lower"] if (end == "lower" and "field_lower" in cov) else cov["field"]
+            try:
+                measured = extractor(v["cbor_hex"])
+            except Exception as exc:  # noqa: BLE001
+                check(False, f"{target}: could not measure {name} {end} boundary: {exc}")
+                continue
+            check(measured == boundary,
+                  f"{target} must sit exactly on the {name} {end} boundary "
+                  f"({'LO-1' if end == 'lower' else 'HI+1'} = {boundary}); measured {measured}")
+            if measured == boundary:
+                print(f"   3h {name} {end} boundary: {target} field length {measured} "
+                      f"(range {lo}..{hi})")
+
 
 # --------------------------------------------------------------------------
 # 4. Closed response map, orthogonal enums, recipient/encryption relation
@@ -1234,6 +1315,14 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
                 return False, "payload decoded deterministically"
             except StrictError:
                 return True, "payload not deterministic CBOR"
+        # E2: a length-delimited (bstr/tstr) value whose header over-declares its
+        # length must be rejected as truncated by the strict decoder.
+        if dc == "cbor-truncation":
+            try:
+                decode(raw)
+                return False, "decoded without a truncation error"
+            except StrictError as e:
+                return ("truncat" in str(e)), f"strict decoder: {e}"
         if obj is None or pm is None:
             return False, "unexpectedly non-decodable"
         claims = claims_or_none(obj)
@@ -1267,6 +1356,18 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
                 return any(isinstance(k, (bytes, bytearray)) and len(k) > SUITE_KID_MAX for k in kids), "kid over 64 bytes"
             if vid == "N-26":
                 return claims and len(claims[C_AUD].encode()) > MAX_SERVICE_DOMAIN_BYTES, "aud over 128 bytes"
+            if vid == "N-44":  # E1 body upper boundary
+                return claims is not None and len(claims[C_BODY_BYTES]) > MAX_BODY_BYTES, \
+                    f"capnp body over the {MAX_BODY_BYTES}-byte cap"
+            if vid == "N-47":  # E1 kid lower boundary (empty kid)
+                kids, _ = kids_and_suites(vec["cbor_hex"])
+                return any(len(k) < 1 for k in kids), "an empty (0-byte) kid, under the 1-byte floor"
+        if dc == "nonce-length":  # E1 server-challenge boundary (16..64)
+            nonce = claims.get(C_NONCE) if claims else None
+            if nonce is None:
+                return False, "no Nonce present"
+            return not (NONCE_MIN <= len(nonce) <= NONCE_MAX), \
+                f"Nonce length {len(nonce)} out of {NONCE_MIN}..{NONCE_MAX}"
         if dc == "closed-claim-set":
             if vid == "N-8":
                 return claims is not None and bool(set(claims) - ALLOWED_CLAIMS), "unknown claim key present"

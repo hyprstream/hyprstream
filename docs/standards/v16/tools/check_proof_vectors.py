@@ -86,8 +86,20 @@ def _decode(b: bytes, strict: bool):
     if major == 1:
         return -1 - val, rest
     if major == 2:
+        # E2: a length-delimited value MUST have at least `val` bytes remaining;
+        # Python slicing silently truncates, so an over-declared length (e.g. the
+        # `58 41` header before only 64 bytes, or a widened signature header) would
+        # otherwise "decode" and even verify. Reject truncation explicitly.
+        if len(rest) < val:
+            raise StrictError(
+                f"byte string truncated: header declares {val} bytes, {len(rest)} remain"
+            )
         return rest[:val], rest[val:]
     if major == 3:
+        if len(rest) < val:
+            raise StrictError(
+                f"text string truncated: header declares {val} bytes, {len(rest)} remain"
+            )
         return rest[:val].decode("utf-8"), rest[val:]
     if major == 4:
         out = []
