@@ -1277,23 +1277,44 @@ def main() -> None:
             deny_rule="RFC 9864 fully-specified algorithms: Ed25519 components use -19",
         )
 
-        # N-12: an unknown suite_id (65 bytes of "h") outside the closed suite
-        # set. The suite registry is closed, so this denies as an unknown suite;
-        # it also exceeds the 64-byte length the cap historically bounded.
+        # N-12 (O1): an IN-RANGE (<= 64 bytes) unknown suite_id outside the closed
+        # suite set. Every sibling requirement is satisfied — deterministic CBOR,
+        # size caps, typ/domain, plan structure, and a valid Ed25519 signature — so
+        # its SOLE denial reason is that the suite is not in the frozen registry
+        # (swapping in a known suite makes the same plan valid). The >64-byte rule
+        # is proven separately by N-52.
+        UNKNOWN_SUITE = "hs-cose-sign-unknown-suite-v1"   # 29 bytes; not registered
         n12_protected = dict(p4_protected)
         n12_protected[H_PLAN] = [
-            group(1, "h" * 65, [component(ALG_ED25519, KID_CLIENT_ED)])
+            group(1, UNKNOWN_SUITE, [component(ALG_ED25519, KID_CLIENT_ED)])
         ]
         n12, _, _ = sign1(n12_protected, p4_claims, sk_c_ed)
         record(
             negatives,
             "N-12",
-            "Unknown suite_id (65 bytes) outside the closed suite set",
+            "In-range (<=64B) unknown suite_id outside the closed suite set",
             "deny",
             "COSE_Sign1",
             n12,
             deny_class="suite-plan",
-            deny_rule="the suite registry is closed; an unknown suite_id denies (also > 64 bytes)",
+            deny_rule="the suite registry is closed; an unknown suite_id denies (registry closure only)",
+            notes="All non-registry predicates pass; swapping in a known suite validates the same plan.",
+        )
+
+        # N-52 (O1): the SEPARATE suite_id size-boundary negative — a 65-byte suite
+        # over the 64-byte cap — the sole proof of the >64-byte rule.
+        n52_protected = dict(p4_protected)
+        n52_protected[H_PLAN] = [group(1, "h" * 65, [component(ALG_ED25519, KID_CLIENT_ED)])]
+        n52, _, _ = sign1(n52_protected, p4_claims, sk_c_ed)
+        record(
+            negatives,
+            "N-52",
+            "suite_id of 65 bytes, over the 64-byte cap",
+            "deny",
+            "COSE_Sign1",
+            n52,
+            deny_class="parser-cap",
+            deny_rule="proof-v1 cap: suite_id 1..64 bytes",
         )
 
         # N-13: kid longer than 64 bytes.

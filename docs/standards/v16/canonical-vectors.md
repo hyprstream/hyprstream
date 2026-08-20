@@ -13,7 +13,7 @@ Machine-readable files (the normative form — this page is the human index):
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 9 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 56 vectors that MUST deny |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 57 vectors that MUST deny |
 | [`vectors/proof-v1-thumbprints.json`](vectors/proof-v1-thumbprints.json) | Cross-implementation replay-namespace thumbprint vectors (C1) |
 | [`vectors/proof-v1-credentials.json`](vectors/proof-v1-credentials.json) | Frozen `verifier_now` clock (F1) and the issuer-signed at+jwt tokens the authenticated positives hash (F2) |
 
@@ -66,10 +66,12 @@ a byte-identical regeneration. It also proves the negatives deny by their rule:
   the cleartext map alternative is `stream_setup` only, so cleartext unary has
   the single canonical null encoding;
 - a **hybrid→classical downgrade** (N-28: the hybrid suite with only its Ed25519
-  component) and an **unknown suite_id** (N-12) are rejected at the
+  component) and an **in-range unknown suite_id** (N-12) are rejected at the
   `signature-plan` level — each suite is bound to its exact ordered algorithms
   and component count, and the checker additionally requires a `COSE_Sign1` plan
-  to have exactly one component;
+  to have exactly one component. N-12 is deliberately **in-range (≤64 bytes)** so
+  its **sole** denial is registry closure (swapping in a known suite validates the
+  same plan); the separate >64-byte `suite_id` size rule is proven by **N-52** (O1);
 - an **`aud` violating the service-domain syntax** (N-29 uppercase, N-30 illegal
   first byte) is rejected — the gate ports `validate_service_domain` and applies
   it to every fixture, so the profile's audience namespace is no broader than the
@@ -108,7 +110,7 @@ a byte-identical regeneration. It also proves the negatives deny by their rule:
 - **documented vector counts must match the manifests** — the gate asserts
   README.md and canonical-vectors.md both read the actual positive/negative
   counts;
-- the **size-cap** negatives N-12 (65-byte `suite_id`), N-13 (65-byte `kid`), and
+- the **size-cap** negatives N-52 (65-byte `suite_id`), N-13 (65-byte `kid`), and
   N-26 (129-byte `aud`) are each asserted over their numeric caps, and the CDDL
   cap text (`kid` = `1..64`, `aud` = `1..128` plus its `.regexp`) is pinned so a
   widening drifts the gate to red; and
@@ -335,7 +337,8 @@ Ed25519 signature over the stripped object.
 | N-10e | crit-set | `crit` in descending label order | 1626 |
 | N-10f | disposition-confusion | Credential-bound proof carrying `hs_unattributed_key_set` | 1697 |
 | N-11 | algorithm | Deprecated polymorphic `EdDSA` (−8) | 1626 |
-| N-12 | suite-plan | Unknown `suite_id` (65 bytes) outside the closed suite set | 1669 |
+| N-12 | suite-plan | In-range (≤64B) unknown `suite_id` outside the closed suite set (registry closure only) | 1633 |
+| N-52 | parser-cap | `suite_id` of 65 bytes, over the 64-byte cap (the sole >64-byte suite proof) | 1669 |
 | N-13 | parser-cap | `kid` of 65 bytes | 1727 |
 | N-14 | closed-claim-set | Required `credential_hash` absent rather than null | 356 |
 | N-15 | credential-binding | Credential presented with a null signed `credential_hash` | 362 |
@@ -495,10 +498,19 @@ Ed25519 signature over the stripped object.
   exactly one Ed25519 component, `hs-cose-sign-ed25519-mldsa65-wns-v1` is exactly
   Ed25519 then ML-DSA-65. The suite set is closed. N-28 is a causal
   **hybrid→classical downgrade** — the hybrid suite with only its Ed25519
-  component — and denies because the hybrid group requires both. N-12 is an
-  unknown suite_id (also over-long) and denies as an unrecognized suite. Both are
-  rejected by the normative CDDL at the `signature-plan` level, and the checker
-  additionally requires a `COSE_Sign1` plan to have exactly one component.
+  component — and denies because the hybrid group requires both. **N-12 (O1)** is
+  a deterministic **in-range (≤64-byte)** unknown suite_id
+  (`hs-cose-sign-unknown-suite-v1`) that satisfies every sibling structural, size,
+  type, plan/key-set, and signature requirement, so its **sole** denial reason is
+  that the suite is not in the frozen registry — the gate proves this isolation by
+  swapping in a known suite (classical, for its single Ed25519 component) and
+  showing the same plan then validates. The separate **>64-byte** suite rule is the
+  sole province of **N-52** (a 65-byte `suite_id`), which stays armed as the size
+  boundary. Both N-12 and N-28 are rejected by the normative CDDL at the
+  `signature-plan` level, and the checker additionally requires a `COSE_Sign1` plan
+  to have exactly one component. (The unknown value is **not** registered; a
+  verifier that accepted in-range unknown suites, or a revert of N-12 to the
+  65-byte value, turns the gate red.)
 - **N-29 / N-30 (aud lexical syntax).** `aud` reuses the shared
   `validate_service_domain` syntax: lowercase ASCII only, first byte a lowercase
   letter or digit, alphabet `[a-z0-9._/-]`. N-29 (`Registry.svc`, uppercase) and

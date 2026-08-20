@@ -385,6 +385,28 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
         except ValidationError:
             print(f"   #1 {nid} rejected by CDDL ({what})")
 
+    # O1: N-12 must violate ONLY the closed-suite registry. Its suite is in-range
+    # and absent from the registry; swapping in a KNOWN suite (classical for its
+    # single Ed25519 component) makes the SAME plan validate, proving the unknown
+    # suite is the sole failure. N-52 remains the separate >64-byte size boundary.
+    import copy as _c
+    n12 = by_id.get("N-12")
+    check(n12 is not None, "N-12 (in-range unknown suite) must exist")
+    if n12 is not None:
+        pl12 = plan_of(n12["cbor_hex"])
+        suite12 = pl12[0][2]
+        check(len(suite12.encode()) <= SUITE_KID_MAX,
+              f"N-12 suite must be in-range (<= {SUITE_KID_MAX} bytes); got {len(suite12.encode())}")
+        check(suite12 not in (SUITE_CLASSICAL, SUITE_HYBRID),
+              f"N-12 suite {suite12!r} must be absent from the closed registry")
+        known12 = _c.deepcopy(pl12); known12[0][2] = SUITE_CLASSICAL
+        try:
+            plan_schema.validate_cbor(enc(known12))
+            print("   O1 N-12 isolated: unknown suite is the sole plan failure "
+                  "(known-suite swap validates the same plan)")
+        except ValidationError as exc:
+            check(False, f"N-12 isolation broken: a known-suite swap must validate the plan; {exc}")
+
     # Thread B2 (q5d) — every (alg, kid) pair is unique across the whole plan,
     # regardless of group ID (CDDL cannot express this, so it is enforced here
     # and in the vector checker). Every positive plan is unique; N-33 repeats one
@@ -646,7 +668,8 @@ def gate_caps(cddl: str, positives, negatives) -> None:
     # All three stripped size-limit negatives (finding arYj7) are exercised by
     # their numeric rule, not merely measured over positives: N-12 suite_id,
     # N-13 kid, N-26 aud.
-    over_cap("N-12", lambda h: max((len(s.encode()) for s in kids_and_suites(h)[1]), default=0),
+    # N-52 is the SEPARATE suite_id size-boundary (O1); N-12 is now registry-only.
+    over_cap("N-52", lambda h: max((len(s.encode()) for s in kids_and_suites(h)[1]), default=0),
              SUITE_KID_MAX, "suite_id")
     over_cap("N-13", lambda h: max((len(k) for k in kids_and_suites(h)[0]), default=0),
              SUITE_KID_MAX, "kid")
@@ -1442,6 +1465,9 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
             if vid == "N-13":
                 kids = [k for k, _ in [((c[2]), 0) for c in comps]] + ([pm.get(H_KID)] if isinstance(pm.get(H_KID), (bytes, bytearray)) else [])
                 return any(isinstance(k, (bytes, bytearray)) and len(k) > SUITE_KID_MAX for k in kids), "kid over 64 bytes"
+            if vid == "N-52":  # O1 suite_id size boundary
+                _, suites = kids_and_suites(vec["cbor_hex"])
+                return any(len(s.encode()) > SUITE_KID_MAX for s in suites), "suite_id over 64 bytes"
             if vid == "N-26":
                 return claims and len(claims[C_AUD].encode()) > MAX_SERVICE_DOMAIN_BYTES, "aud over 128 bytes"
             if vid == "N-44":  # E1 body upper boundary
