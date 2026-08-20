@@ -605,11 +605,15 @@ def main() -> None:
             H_PLAN: plan_classical_client,
             H_GROUP: 1,
         }
+        # The originating request's response_binding (reused by the bound
+        # response proof P-7 and the mismatch negative N-32 for field-for-field
+        # equality testing).
+        p4_response_binding = response_binding(
+            KIND_UNARY, PROTECTION_ENCRYPTED, kem_recipient()
+        )
         p4_claims = request_claims(
             credential_hash=CREDENTIAL_HASH,
-            response_binding=response_binding(
-                KIND_UNARY, PROTECTION_ENCRYPTED, kem_recipient()
-            ),
+            response_binding=p4_response_binding,
         )
         p4, p4_prot, p4_payload = sign1(p4_protected, p4_claims, sk_c_ed)
         record(
@@ -699,6 +703,35 @@ def main() -> None:
             notes="Two groups, two principals, one approval each; not a countersignature.",
         )
 
+        # ---------------- P-7: BOUND response proof -------------------------
+        # A response proof whose realized response_binding equals the originating
+        # request's (P-4) field-for-field. This exercises §4's rule that the
+        # response proof's binding MUST equal the request's map where both are
+        # present — not merely local map shape.
+        p7_protected = dict(p3_protected)  # response typ/domain, service key, classical plan
+        p7_claims = request_claims(
+            credential_hash=None,
+            schema_id=SCHEMA_ID_RESPONSE,
+            body=CAPNP_RESPONSE_BYTES,
+            response_binding=p4_response_binding,   # identical to the request's binding
+        )
+        p7, p7_prot, p7_payload = sign1(p7_protected, p7_claims, sk_s_ed)
+        record(
+            positives,
+            "P-7",
+            "Bound response proof whose response_binding equals the originating request (P-4)",
+            "accept",
+            "COSE_Sign1",
+            p7,
+            protected_hex=p7_prot.hex(),
+            payload_hex=p7_payload.hex(),
+            originating_request="P-4",
+            notes=(
+                "Realized response binding equals P-4's request binding "
+                "field-for-field; cti echoes the request_id."
+            ),
+        )
+
         # =================== NEGATIVE VECTORS ===============================
 
         # N-1: a genuinely VALID CWT credential presented in the proof slot.
@@ -714,6 +747,12 @@ def main() -> None:
             H_KID: KID_ISSUER_ED,
             H_TYP: "application/cwt",
         }
+        # A PROFILE-VALID credential: registered claims plus the frozen
+        # amendment-10 credential claims. cnf (8) is a valid RFC 8747 PoP binding
+        # (a COSE_Key confirmation to the client's Ed25519 key); -70005 tenant and
+        # -70006 clearance ([level, compartments]; value 11) are the frozen
+        # credential keys. It deliberately does NOT carry credential_use_profile
+        # (the fenced -70008 allocation): only its presentation slot is wrong.
         n1_claims = {
             1: "https://issuer.hyprstream.test",  # iss
             2: "user-1",                          # sub
@@ -721,24 +760,31 @@ def main() -> None:
             C_EXP: EXP,
             C_IAT: IAT,
             C_CTI: bytes.fromhex("a1b2c3d4e5f60718293a4b5c6d7e8f90"),  # cti
+            8: {1: cose_key_okp_ed25519(          # cnf: RFC 8747 COSE_Key PoP binding
+                KID_CLIENT_ED, sk_c_ed.public_key().public_bytes_raw()
+            )},
+            -70005: "tenant-alpha",               # tenant (amendment 10)
+            -70006: [2, [5, 7]],                  # clearance [level, compartments]; assurance absent
         }
         n1, _, _ = sign1(n1_protected, n1_claims, sk_i_ed)
         record(
             negatives,
             "N-1",
-            "Valid issuer-signed CWT credential (application/cwt) presented in the proof slot",
+            "Profile-valid issuer-signed CWT credential (cnf/tenant/clearance) presented in the proof slot",
             "deny",
             "COSE_Sign1",
             n1,
             deny_class="type-confusion",
             deny_rule=(
-                "a valid credential (typ application/cwt, issuer-signed) is not a "
-                "request proof: its typ is not application/vnd.hyprstream.proof+cwt "
-                "and it is not signed by a cnf-bound proof key"
+                "a valid credential (typ application/cwt, issuer-signed, with cnf, "
+                "tenant, and clearance) is not a request proof: its typ is not "
+                "application/vnd.hyprstream.proof+cwt and it is not signed by a "
+                "cnf-bound proof key"
             ),
             notes=(
-                "A well-formed credential; only its presentation slot is wrong. "
-                "Denies before any claim is interpreted."
+                "A profile-valid credential: registered claims, RFC 8747 cnf PoP "
+                "binding, tenant -70005, clearance -70006. Only its presentation "
+                "slot is wrong. Carries no credential_use_profile (fenced -70008)."
             ),
         )
 
@@ -1475,6 +1521,36 @@ def main() -> None:
             n30,
             deny_class="aud-syntax",
             deny_rule="the first byte must be a lowercase ASCII letter or digit (validate_service_domain)",
+        )
+
+        # N-32: a response proof whose response_binding does NOT match the
+        # originating request's (P-4) binding — the root_type_id differs. It is a
+        # structurally valid response proof (passes local map-shape checks), so it
+        # denies only under field-for-field equality with the request it answers.
+        # Carries the originating-request id so the suite can compare the two.
+        n32_binding = dict(p4_response_binding)
+        n32_binding[1] = SCHEMA_ID_REQUEST  # root_type_id != the request's response schema id
+        n32_claims = request_claims(
+            credential_hash=None,
+            schema_id=SCHEMA_ID_RESPONSE,
+            body=CAPNP_RESPONSE_BYTES,
+            response_binding=n32_binding,
+        )
+        n32, _, _ = sign1(p3_protected, n32_claims, sk_s_ed)
+        record(
+            negatives,
+            "N-32",
+            "Response proof whose response_binding mismatches the originating request (P-4)",
+            "deny",
+            "COSE_Sign1",
+            n32,
+            deny_class="response-binding-equality",
+            deny_rule=(
+                "a response proof's response_binding MUST equal the originating "
+                "request's map field-for-field; a differing root_type_id denies"
+            ),
+            originating_request="P-4",
+            notes="Locally valid map shape; denies only against the request it answers.",
         )
 
     meta = {

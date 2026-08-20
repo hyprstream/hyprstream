@@ -540,12 +540,33 @@ def gate_caps(cddl: str, positives, negatives) -> None:
             check(False, f"{nid}: could not extract {what}: {exc}")
             return
         check(val > cap, f"{nid} must exceed the {what} cap {cap} (got {val})")
-        print(f"   {nid}: {what} = {val} bytes > cap {cap} (denies by numeric rule)")
+        if val > cap:
+            print(f"   {nid}: {what} = {val} bytes > cap {cap} (denies by numeric rule)")
 
+    # All three stripped size-limit negatives (finding arYj7) are exercised by
+    # their numeric rule, not merely measured over positives: N-12 suite_id,
+    # N-13 kid, N-26 aud.
+    over_cap("N-12", lambda h: max((len(s.encode()) for s in kids_and_suites(h)[1]), default=0),
+             SUITE_KID_MAX, "suite_id")
     over_cap("N-13", lambda h: max((len(k) for k in kids_and_suites(h)[0]), default=0),
              SUITE_KID_MAX, "kid")
     over_cap("N-26", lambda h: len(claims_of(h)[C_AUD].encode()),
              MAX_SERVICE_DOMAIN_BYTES, "aud")
+
+    # 3g. Total-object cap (finding 4D71): the complete-object CDDL cannot bound
+    #     the signature byte strings, so the 2 MiB cap is a validator-side numeric
+    #     check. Construct an object OVER the cap (a proof-shaped object padded
+    #     past 2 MiB) and assert the numeric object-cap rejects it — proving the
+    #     positive-only length check is a real boundary, not decoration. It is
+    #     built here rather than shipped as a multi-megabyte fixture.
+    if positives["vectors"]:
+        base = bytes.fromhex(positives["vectors"][0]["cbor_hex"])
+        oversized = base + b"\x00" * (MAX_OBJECT_BYTES + 1 - len(base))
+        check(len(oversized) > MAX_OBJECT_BYTES, "constructed object must exceed 2 MiB")
+        check(not (len(oversized) <= MAX_OBJECT_BYTES),
+              "the object-cap check must reject an object over 2 MiB")
+        print(f"   3g over-cap object: {len(oversized)} bytes > {MAX_OBJECT_BYTES} "
+              "rejected by the numeric object-cap check")
 
     # 3f. aud lexical syntax (finding ary-137b): the CDDL declares the shared
     #     service-domain `.regexp`; the pinned pycddl does not enforce it, so pin
@@ -715,9 +736,24 @@ def gate_type_confusion(negatives) -> None:
         pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(issuer["public_hex"]))
         try:
             pub.verify(obj[3], tbs)
-            print("   #3 N-1 is a valid issuer-signed credential (typ application/cwt)")
+            print("   N-1 issuer signature verifies (typ application/cwt)")
         except InvalidSignature:
             check(False, "N-1 issuer signature does not verify — not a well-formed credential")
+        # Finding 4D7u: N-1 must be PROFILE-VALID — cnf PoP binding, tenant
+        # (-70005), clearance (-70006) — so only its presentation slot is wrong.
+        n1c = decode(obj[2])
+        cnf = n1c.get(8)
+        check(isinstance(cnf, dict) and isinstance(cnf.get(1), dict),
+              "N-1 must carry a cnf (8) PoP binding with a COSE_Key confirmation")
+        if isinstance(cnf, dict) and isinstance(cnf.get(1), dict):
+            ck = cnf[1]
+            check(ck.get(1) == 1 and ck.get(3) == -19 and isinstance(ck.get(-2), (bytes, bytearray)),
+                  "N-1 cnf must be a valid OKP/Ed25519 COSE_Key (a PoP key)")
+        check(isinstance(n1c.get(-70005), str), "N-1 must carry tenant (-70005)")
+        check(-70006 in n1c, "N-1 must carry clearance (-70006)")
+        # Fence: N-1 must NOT self-allocate credential_use_profile (-70008).
+        check(-70008 not in n1c, "N-1 must not carry the fenced credential_use_profile (-70008)")
+        print("   #2 N-1 is profile-valid (cnf PoP + tenant -70005 + clearance -70006; no -70008)")
 
     # N-2 (ary-137m): the two-entry COSE_Sign proof presented as a credential.
     # Its structure label must be COSE_Sign and its bytes must be a COSE_Sign.
@@ -729,6 +765,45 @@ def gate_type_confusion(negatives) -> None:
         check(isinstance(obj[3], list) and bool(obj[3]) and isinstance(obj[3][0], list),
               "N-2 bytes must be a COSE_Sign (a signatures array), matching its label")
         print("   #4 N-2 labelled COSE_Sign, matching its two-entry signature array")
+
+
+# --------------------------------------------------------------------------
+# 8. Response-binding field-for-field equality (bound response proofs)
+# --------------------------------------------------------------------------
+
+
+def gate_response_binding_equality(positives, negatives) -> None:
+    section("8. Response-binding field-for-field equality (finding 4D78)")
+    by_id = {v["id"]: v for v in positives["vectors"]}
+    by_id.update({v["id"]: v for v in negatives["vectors"]})
+
+    def rb_of(vid: str):
+        return claims_of(by_id[vid]["cbor_hex"]).get(C_RESPONSE_BINDING)
+
+    # A response proof's realized response_binding MUST equal the originating
+    # request's map field-for-field. The bound positive (P-7) equals it; the
+    # mismatch negative (N-32) differs. Both carry the originating request id, so
+    # the suite tests equality against the actual request, not only map shape.
+    bound = next((v for v in positives["vectors"] if v.get("originating_request")), None)
+    check(bound is not None, "a bound response-proof positive (originating_request) must exist")
+    if bound is not None:
+        req = bound["originating_request"]
+        check(req in by_id, f"{bound['id']} originating_request {req} must be a known vector")
+        if req in by_id:
+            check(rb_of(bound["id"]) == rb_of(req) and rb_of(bound["id"]) is not None,
+                  f"{bound['id']} response_binding must equal request {req} field-for-field")
+            print(f"   #4 {bound['id']} binding == {req} binding (field-for-field bound)")
+
+    mismatch = next((v for v in negatives["vectors"] if v.get("originating_request")), None)
+    check(mismatch is not None, "a mismatch response-proof negative (originating_request) must exist")
+    if mismatch is not None:
+        req = mismatch["originating_request"]
+        check(req in by_id, f"{mismatch['id']} originating_request {req} must be a known vector")
+        if req in by_id:
+            a, b = rb_of(mismatch["id"]), rb_of(req)
+            check(a is not None and b is not None and a != b,
+                  f"{mismatch['id']} response_binding must MISMATCH request {req} field-for-field")
+            print(f"   #4 {mismatch['id']} binding != {req} binding (mismatch denies)")
 
 
 # --------------------------------------------------------------------------
@@ -752,6 +827,7 @@ def main() -> None:
     gate_response_binding(positives)
     gate_collisions()
     gate_type_confusion(negatives)
+    gate_response_binding_equality(positives, negatives)
     gate_canonical(positives, negatives)
 
     print()

@@ -12,8 +12,8 @@ Machine-readable files (the normative form — this page is the human index):
 | File | Contents |
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
-| [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 6 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 38 vectors that MUST deny |
+| [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 7 vectors that MUST verify |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 39 vectors that MUST deny |
 
 Each JSON vector carries `id`, `title`, `expect` (`accept` / `deny`),
 `structure`, `size_bytes`, `sha256`, full `cbor_hex`, and — for negatives — a
@@ -71,12 +71,20 @@ a byte-identical regeneration. It also proves the negatives deny by their rule:
 - an **`aud` violating the service-domain syntax** (N-29 uppercase, N-30 illegal
   first byte) is rejected — the gate ports `validate_service_domain` and applies
   it to every fixture, so the profile's audience namespace is no broader than the
-  transport's; and
-- the **size-cap** negatives N-13 (65-byte `kid`) and N-26 (129-byte `aud`) are
-  asserted over their numeric caps, and the CDDL cap text (`kid` = `1..64`,
-  `aud` = `1..128` plus its `.regexp`) is pinned so a widening drifts the gate to
-  red — the pinned `pycddl` version cannot enforce `.size` byte-length ranges or
-  `.regexp`, so these numeric/ported checks are load-bearing.
+  transport's;
+- a **response proof whose `response_binding` mismatches its originating
+  request** (N-32) is rejected — the gate compares P-7's (bound) and N-32's
+  (mismatch) bindings against P-4's request binding field-for-field, not merely
+  by local map shape;
+- the **size-cap** negatives N-12 (65-byte `suite_id`), N-13 (65-byte `kid`), and
+  N-26 (129-byte `aud`) are each asserted over their numeric caps, and the CDDL
+  cap text (`kid` = `1..64`, `aud` = `1..128` plus its `.regexp`) is pinned so a
+  widening drifts the gate to red; and
+- an **object over the 2 MiB total cap** is rejected by a validator-side numeric
+  check (the complete-object CDDL cannot bound the signature byte strings), which
+  the gate exercises by constructing an over-cap object — the pinned `pycddl`
+  version cannot enforce `.size` byte-length ranges or `.regexp`, so these
+  numeric/ported checks are load-bearing.
 
 See [`README.md`](README.md) for the one remaining tooling note.
 
@@ -105,6 +113,7 @@ Object encoding is untagged: typing is performed by the protected `typ` header
 | P-4 | `COSE_Sign1` | 1626 | Authenticated classical proof with an encrypted `response_binding` (unary, `protection_mode` encrypted, ML-KEM-768 recipient, alg −70200) | `68730f7ebf3b94c3b9379f01a6d9cc03fef76cc9f47dede44a6ccf8e99a2b637` |
 | P-5 | `COSE_Sign` | 562 | `TokenBoundAndApproved`: two distinct logical signer groups, two principals, one approval each — signature entries, not countersignatures | `ca76143118078498920a862de7b084af8e4f264a49a8bf25c1d89c7b8213a723` |
 | P-6 | `COSE_Sign1` | 411 | Authenticated classical proof with a cleartext stream-setup `response_binding` (`response_kind` stream_setup, `protection_mode` cleartext, null recipient) — exercises the orthogonal axes | `86f50e9862a45d0805786ae207fc310693e75f60dc50d44682b9ae1846030201` |
+| P-7 | `COSE_Sign1` | 1605 | Bound response proof whose `response_binding` equals the originating request (P-4) field-for-field | `ab0b26bd2956ad31dcd047869a76e663171e2c57f0414d9d91d7795ba99aa5ab` |
 
 ### P-1 — unattributed `COSE_Sign1` (complete CBOR)
 
@@ -176,7 +185,7 @@ e77e1443512ed80f27693a98d646c00290658b4b33050f
 response root type ID, `-70003` is the exact response bytes, and `-70001` is
 null. N-19 and N-22 are its negatives.
 
-### P-2, P-4, P-5, P-6
+### P-2, P-4, P-5, P-6, P-7
 
 Their complete `cbor_hex`, protected buckets, and payloads are in
 [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) (P-2 carries
@@ -188,7 +197,11 @@ with `hs_logical_signer_group = 1`; P-5 differs only in carrying two groups
 `COSE_Sign1` shape and differ only in the `response_binding`: P-4 is
 `protection_mode` encrypted (a present ML-KEM-768 recipient at alg −70200),
 P-6 is `response_kind` stream_setup with `protection_mode` cleartext and a null
-recipient — the two together fix all four values of the orthogonal axes.
+recipient — the two together fix all four values of the orthogonal axes. P-7 is
+a **bound response proof**: a response-typed `COSE_Sign1` signed by the service
+key whose `response_binding` equals P-4's request binding field-for-field, so the
+suite tests §4's realized-binding equality rule, not only local map shape (its
+mismatch counterpart is N-32).
 
 ## Negative vectors
 
@@ -202,7 +215,7 @@ Ed25519 signature over the stripped object.
 
 | ID | Deny class | Vector | Bytes |
 |---|---|---|---|
-| N-1 | type-confusion | Valid issuer-signed CWT credential (`application/cwt`) presented in the proof slot | 213 |
+| N-1 | type-confusion | Profile-valid issuer-signed CWT credential (`cnf`/tenant/clearance) presented in the proof slot | 304 |
 | N-2 | type-confusion | Proof CWT (`COSE_Sign`) presented in the credential/authorization slot | 3789 |
 | N-3 | missing-typ | Protected `typ` (label 16) absent | 1587 |
 | N-4 | domain-separation | Correct `typ` with the response-proof `hs_domain` | 1628 |
@@ -240,18 +253,21 @@ Ed25519 signature over the stripped object.
 | N-28 | suite-plan | Hybrid suite plan with only one Ed25519 component (hybrid→classical downgrade) | 1639 |
 | N-29 | aud-syntax | `aud` with an uppercase byte (`Registry.svc`) | 378 |
 | N-30 | aud-syntax | `aud` with an illegal first byte (`-registry.svc`) | 379 |
+| N-32 | response-binding-equality | Response proof whose `response_binding` mismatches the originating request (P-4) | 1605 |
 
 ### Notes on individual negatives
 
 - **N-1 / N-2 (type confusion, both directions).** A proof and a credential are
   disjoint by construction: different protected `typ`, different signing keys
   (issuer key versus `cnf`-bound proof key), different domain separator. Both
-  directions deny before any claim is interpreted. N-1 is a **genuine**
-  issuer-signed CWT credential (`typ = application/cwt`, signed by the issuer
-  key — the gate re-verifies that signature) presented in the proof slot, so it
-  exercises rejection of a *well-formed* credential, not a malformed token. N-2
-  is the two-entry `COSE_Sign` P-2 verbatim in the credential slot, labelled
-  `COSE_Sign` to match its bytes.
+  directions deny before any claim is interpreted. N-1 is a **profile-valid**
+  issuer-signed CWT credential — `typ = application/cwt`, an issuer signature the
+  gate re-verifies, an RFC 8747 `cnf` PoP binding, tenant (−70005), and clearance
+  (−70006) — presented in the proof slot, so it exercises rejection of a
+  *well-formed* credential, not a malformed token. It deliberately carries **no**
+  `credential_use_profile` (the fenced −70008 allocation). N-2 is the two-entry
+  `COSE_Sign` P-2 verbatim in the credential slot, labelled `COSE_Sign` to match
+  its bytes.
 - **N-4 (domain confusion).** `typ` and `hs_domain` are **paired** in the
   normative CDDL, not independent choices: a request proof carries exactly
   (`proof-typ`, `request-proof-domain`) and a response proof exactly
@@ -287,6 +303,19 @@ Ed25519 signature over the stripped object.
   `validate_profile.py` ports the exact syntax and applies it to every fixture
   and to these causal negatives, so the profile's audience namespace matches the
   transport's.
+- **P-7 / N-32 (response-binding field-for-field equality).** A response proof's
+  realized `response_binding` MUST equal the originating request's map
+  field-for-field (§4). P-7 is a bound response proof whose binding equals P-4's
+  request binding; N-32 is a response proof whose binding differs (a different
+  `root_type_id`) yet is locally well-formed, so it denies only under equality
+  with the request it answers. Both carry the originating request id, and the
+  gate compares the two maps directly — testing equality, not just local map
+  shape.
+- **Total-object cap (2 MiB).** The complete-object CDDL cannot bound the
+  signature byte strings, so the 2 MiB total-object cap is a validator-side
+  numeric check. The gate constructs an object just over 2 MiB and asserts the
+  numeric object-cap rejects it (built at validation time rather than shipped as
+  a multi-megabyte fixture).
 - **N-19 (response overlay).** A response proof uses the distinct
   `hyprstream-response-proof-claims` rule, which forbids the `Nonce` claim key
   and requires `credential_hash` to be exactly `null`; a response claims set
@@ -355,7 +384,10 @@ therefore stated as verifier obligations rather than shipped here:
    `-70005..-70007`, and `credential_use_profile` (Reusable / OneShotTransaction)
    has no correct existing signed-claim encoding, so encoding it requires a new
    allocation the operator must approve. See the operator-disposition handoff
-   `.fleet-coord/handoffs/mac-v16-a-credential-use-profile-disposition.md`. Until
-   then the credential claims set (cnf/clearance encoding included) is not frozen
-   here, so credential vectors are deferred rather than baking in unapproved
-   choices.
+   `.fleet-coord/handoffs/mac-v16-a-credential-use-profile-disposition.md`. The
+   type-confusion negative N-1 already carries the frozen credential claims — a
+   valid `cnf` PoP binding, tenant (−70005), and clearance (−70006) — to be a
+   profile-valid credential in the proof slot; a **dedicated credential-plane
+   positive vector set** (and the `credential_use_profile` claim) stays deferred
+   pending the operator allocation, rather than freezing the full credential
+   claims set (and `credential_use_profile`) here without approval.
