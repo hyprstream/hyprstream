@@ -795,12 +795,6 @@ fn provision_service_identities(
         } else {
             identity_store::load_or_generate_service_signing_key(credentials_dir, service_name)?
         };
-        let service_vk = service_key.verifying_key();
-
-        let jwt = crate::auth::service_jwt::issue_or_load_service_jwt(
-            credentials_dir, service_name, ca_jwt_key, &service_vk, local_issuer_url, now,
-        )?;
-        identity_store::write_service_jwt(credentials_dir, service_name, &jwt)?;
 
         // The hybrid entry: the Ed25519 identity plus the ML-DSA-65 key derived
         // from it. This is what `seed_bootstrap_pq_bindings` later anchors, and
@@ -812,6 +806,50 @@ fn provision_service_identities(
     }
 
     identity_store::write_bootstrap_pubkeys_hybrid(credentials_dir, &bootstrap_pubkeys)?;
+
+    // v16 §11: the enrollment manifest is derived BEFORE any credential is
+    // minted, so every bootstrap service JWT is clearance-bearing from first
+    // issue. The manifest is the authority for target clearance; minting
+    // consults it per service. On first provision the manifest is written
+    // with wizard defaults; on re-provision the existing manifest is
+    // authoritative — any drift (missing/extra service, changed Ed25519 or
+    // PQ half) is a hard error until the operator edits the manifest
+    // deliberately (the reviewed rotation).
+    let freshly_written;
+    let enrollment =
+        match crate::auth::service_enrollment::ServiceEnrollmentManifest::load(credentials_dir)? {
+            Some(existing) => {
+                freshly_written = false;
+                existing
+            }
+            None => {
+                let manifest =
+                    crate::auth::service_enrollment::ServiceEnrollmentManifest::from_bootstrap(
+                        &bootstrap_pubkeys,
+                    );
+                manifest.write(credentials_dir)?;
+                freshly_written = true;
+                manifest
+            }
+        };
+    if !freshly_written {
+        enrollment
+            .reconcile_with_bootstrap(&bootstrap_pubkeys)
+            .context("service enrollment manifest disagrees with bootstrap keys")?;
+    }
+
+    for (service_name, entry) in &bootstrap_pubkeys {
+        let jwt = crate::auth::service_jwt::issue_or_load_service_jwt(
+            credentials_dir,
+            service_name,
+            ca_jwt_key,
+            &entry.ed25519,
+            local_issuer_url,
+            now,
+            enrollment.clearance_for_service(service_name).as_ref(),
+        )?;
+        identity_store::write_service_jwt(credentials_dir, service_name, &jwt)?;
+    }
 
     Ok(bootstrap_pubkeys)
 }

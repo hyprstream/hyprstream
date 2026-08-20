@@ -36,7 +36,7 @@ use tracing::info;
 
 use crate::auth::identity_store::credentials_dir;
 use crate::auth::PolicyManager;
-use crate::config::{HyprConfig, TokenConfig};
+use crate::config::HyprConfig;
 use crate::services::generated::policy_client::{RefreshServiceTokenRequest, RegisterServiceKey};
 use crate::services::{
     DiscoveryService, McpConfig, McpService, PolicyClient, PolicyService, RegistryClient,
@@ -834,13 +834,30 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     });
 
     let config = load_config();
+    // Bind issuance and revocation horizons by construction: the revocation
+    // authority's retention bound derives from every configured issuance
+    // maximum (plus one day of clock-skew margin), so an operator raising
+    // token TTLs automatically raises the revocation horizon — no issuable
+    // credential can outlive its revocability. The service-JWT renewal clamp
+    // (policy.capnp RefreshServiceTokenRequest, hard 30 days) has no config
+    // field and is included as a constant.
+    const SERVICE_JWT_MAX_TTL_SECS: u32 = 2_592_000; // 30 days
+    let revocation_max_ttl_secs = i64::from(
+        config
+            .token
+            .max_ttl_seconds
+            .max(config.oauth.token_ttl_seconds)
+            .max(config.oauth.refresh_token_ttl_seconds)
+            .max(SERVICE_JWT_MAX_TTL_SECS),
+    ) + 86_400;
     let mut policy_service = PolicyService::new(
         policy_manager,
         Arc::new(ctx.signing_key().clone()),
-        TokenConfig::default(),
+        config.token.clone(),
         git2db,
         ctx.transport("policy", SocketKind::Rep),
     );
+    policy_service = policy_service.with_revocation_max_ttl_secs(revocation_max_ttl_secs);
     if let Some(issuer) = ctx.oauth_issuer_url() {
         policy_service = policy_service.with_default_audience(issuer.to_owned());
     }
@@ -875,8 +892,9 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         policy_service = policy_service.with_ml_dsa_key_store(ml_dsa_store);
     }
 
-    // The credential-revocation store is published once per process by
-    // `services::revocation::init_process_credential_revocation_store` from
+    // The authority stores (credential revocation + session registry) are
+    // published once per process by
+    // `services::revocation::init_process_authority_stores` from
     // the main.rs startup block, before any factory runs — not here.
 
     Ok(ctx.into_spawnable_quic(policy_service, config.policy.quic_port))
@@ -2130,7 +2148,19 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                             }
                             // Credential revocation check — fail-closed on
                             // store absence: a token with a jti that cannot
-                            // be checked for revocation is rejected.
+                            // be checked for revocation is rejected. Local
+                            // tokens MUST carry a jti (profile REQUIRED
+                            // claim); a local token without one is rejected.
+                            let token_is_local =
+                                hyprstream_rpc::auth::is_local_iss(&claims.iss, &local_issuers);
+                            if token_is_local && claims.jti.is_none() {
+                                tracing::warn!(%method, %uri, iss = %claims.iss, "MCP: local token without jti rejected");
+                                let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                    res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                }
+                                return res;
+                            }
                             if let Some(ref jti) = claims.jti {
                                 let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
                                 let revoked_or_unavailable = match hyprstream_rpc::auth::global_credential_revocation_store() {
@@ -2147,6 +2177,39 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                         res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
                                     }
                                     return res;
+                                }
+                            }
+                            // Session check (v16 §3.3): a local token carrying
+                            // a session ID is rejected when the session is
+                            // revoked, unknown, or cannot be checked.
+                            if token_is_local {
+                                let session_key = match claims.session_key() {
+                                    Ok(key) => key,
+                                    Err(e) => {
+                                        tracing::warn!(%method, %uri, error = %e, "MCP: malformed session claims rejected");
+                                        let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                        if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                            res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                        }
+                                        return res;
+                                    }
+                                };
+                                if let Some(session_key) = session_key {
+                                    let session_inactive = match hyprstream_rpc::auth::global_session_registry() {
+                                        Some(registry) => registry.is_revoked(&session_key).await,
+                                        None => {
+                                            tracing::warn!(%method, %uri, "MCP: no session registry configured — rejecting token with session id");
+                                            true // fail-closed
+                                        }
+                                    };
+                                    if session_inactive {
+                                        tracing::warn!(%method, %uri, sub = %claims.sub, "MCP: token with revoked/unknown session presented");
+                                        let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                        if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                            res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                        }
+                                        return res;
+                                    }
                                 }
                             }
                             // DPoP binding enforcement (RFC 9449 §7):

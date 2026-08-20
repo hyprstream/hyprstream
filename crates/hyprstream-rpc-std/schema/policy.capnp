@@ -105,6 +105,25 @@ struct PolicyRequest {
     # anonymous/end-user callers have no legitimate read.
     checkCredentialRevocation @23 :CheckCredentialRevocation
       $scope(query);
+
+    # Register a new session with the canonical session registry. Restricted
+    # to the OAuth authority (service:oauth), which owns user-session
+    # lifecycle at issuance. Session identifiers are never reassigned.
+    registerSession @24 :RegisterSession
+      $scope(manage);
+
+    # Revoke a session: every credential carrying it is then rejected.
+    # Restricted to the OAuth authority (service:oauth).
+    revokeSession @25 :RevokeSession
+      $scope(manage);
+
+    # Ask the session authority whether a session is active.
+    # Service-identities only (service:*); the result Bool is true = ACTIVE
+    # and known — revoked, expired, unknown, or malformed all read false
+    # (fail-closed; note the opposite polarity from
+    # checkCredentialRevocationResult, which reports revoked=true).
+    checkSession @26 :CheckSession
+      $scope(query);
   }
 }
 
@@ -121,6 +140,16 @@ struct PolicyCheck {
 
   # Operation being performed (e.g., "infer", "query", "write")
   operation @3 :Text;
+}
+
+# Issuance profile selected by the authority-owned caller. The default is the
+# session-bound interactive profile so an older or malformed caller cannot turn
+# a missing profile into an unsessioned user credential.
+enum IssueTokenProfile {
+  interactiveSession @0;
+  rfc8693 @1;
+  rfc7523 @2;
+  service @3;
 }
 
 # JWT token issuance parameters
@@ -163,6 +192,18 @@ struct IssueToken {
   # clearance for the subject before minting. The resolved clearance is
   # clamped to Classical assurance and stamped into the signed claims.
   requireClearance @8 :Bool;
+
+  # OIDC session ID (`sid` claim) to stamp on the minted token. Set by the
+  # OAuth authority for interactive user sessions only; the caller owns the
+  # session lifecycle (registration is a separate authority operation —
+  # issuance never registers). Empty/absent = no session (standalone service
+  # credentials carry no session — v16 §3.3).
+  sessionId @9 :Text $optional;
+
+  # Credential issuance profile. Interactive user/OIDC issuance MUST carry
+  # `sessionId`; RFC 8693 and RFC 7523 are deliberate non-interactive
+  # profiles; service issuance is limited to `service:*` subjects.
+  issuanceProfile @10 :IssueTokenProfile;
 }
 
 # Apply a built-in policy template
@@ -275,6 +316,16 @@ struct PolicyResponse {
 
     # Revocation check result (true = revoked or unknown — fail-closed)
     checkCredentialRevocationResult @24 :Bool;
+
+    # Session registration acknowledged (durable)
+    registerSessionResult @25 :Void;
+
+    # Session revocation acknowledged (durable)
+    revokeSessionResult @26 :Void;
+
+    # Session check result (true = ACTIVE and known; false = revoked,
+    # expired, unknown, or malformed — fail-closed)
+    checkSessionResult @27 :Bool;
   }
 }
 
@@ -475,4 +526,41 @@ struct RevokeCredential {
 # Query the revocation authority for a credential's revocation state.
 struct CheckCredentialRevocation {
   credential @0 :CredentialIdRef;
+}
+
+# Issuer-scoped session identifier (iss, sid/workload_session_id). The two
+# variants are disjoint typed namespaces — mirrors SessionIdentifier.
+struct SessionKeyRef {
+  # The token `iss` claim identifying the session's issuer.
+  issuer @0 :Text;
+  union {
+    # OIDC user-session ID (the registered `sid` claim).
+    oidcSid @1 :Text;
+    # Workload credential family session ID.
+    workloadSessionId @2 :Text;
+  }
+}
+
+# Register a new session. `expiresAt` bounds the session's lifetime (checked
+# against the authority's configured horizon, same as revocation entries).
+struct RegisterSession {
+  session @0 :SessionKeyRef;
+  # Subject identifier (`sub`) the session belongs to.
+  subject @1 :Text;
+  # Verified tenant/domain the session is bound to.
+  tenant @2 :Text;
+  # Session expiry (Unix seconds).
+  expiresAt @3 :Int64;
+  # Clearance epoch at registration.
+  clearanceEpoch @4 :UInt64;
+}
+
+# Revoke a session: every credential carrying it is then rejected.
+struct RevokeSession {
+  session @0 :SessionKeyRef;
+}
+
+# Query the session authority for a session's active state.
+struct CheckSession {
+  session @0 :SessionKeyRef;
 }

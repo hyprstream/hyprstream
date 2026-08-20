@@ -571,6 +571,105 @@ async fn file_backed_store_recovers_torn_tail() -> Result<()> {
     Ok(())
 }
 
+/// Writer-lock dedup: repeating a revocation for the same credential with an
+/// equal-or-shorter retention appends NOTHING (a replayed revocation request
+/// cannot grow the log or force an fsync per request). A later revocation
+/// with a LONGER retention extends the entry and appends exactly one record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_backed_store_deduplicates_repeated_revocations() -> Result<()> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("credential-revocations.jsonl");
+    let now = chrono::Utc::now().timestamp();
+    let id = CredentialId::jwt("https://issuer.example", "jti-dedup");
+
+    let store = FileBackedCredentialRevocationStore::open(&path)?;
+    store.revoke_credential(id.clone(), now + 3600).await?;
+    // Equal and shorter repeats: deduplicated.
+    store.revoke_credential(id.clone(), now + 3600).await?;
+    store.revoke_credential(id.clone(), now + 60).await?;
+    assert!(store.is_revoked(&id).await);
+    let content = std::fs::read_to_string(&path)?;
+    assert_eq!(
+        content.matches("jti-dedup").count(),
+        1,
+        "equal/older revocations must not append"
+    );
+
+    // A longer retention extends the entry: one more record, and the
+    // longer expiry is the one that survives a reload.
+    store.revoke_credential(id.clone(), now + 7200).await?;
+    let content = std::fs::read_to_string(&path)?;
+    assert_eq!(
+        content.matches("jti-dedup").count(),
+        2,
+        "a longer-retention revocation appends exactly once"
+    );
+    drop(store);
+    let reopened = FileBackedCredentialRevocationStore::open(&path)?;
+    assert!(reopened.is_revoked(&id).await);
+    Ok(())
+}
+
+/// The publication horizon is a configured property of the authority, not a
+/// hardcoded constant: with a small configured horizon, a publication beyond
+/// it is rejected while one inside it is accepted — issuance and revocation
+/// horizons stay bound by construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publication_horizon_is_configured_not_hardcoded() -> Result<()> {
+    support::install_explicit_dispatch_pep();
+    install_hybrid_verify_config();
+    install_test_service_identities();
+
+    let store_temp = TempDir::new()?;
+    let (_authority, _installed) = install_authority_store(&store_temp)?;
+
+    // Same harness as make_policy_service, but with a 100-second horizon.
+    let temp = TempDir::new()?;
+    let models_dir = temp.path().to_path_buf();
+    let policies_dir = models_dir.join(".registry").join("policies");
+    let policy_manager = Arc::new(PolicyManager::new(&policies_dir).await?);
+    let git2db = Arc::new(RwLock::new(Git2DB::open(&models_dir).await?));
+    let server_signing = server_signing_key();
+    let service = PolicyService::new(
+        Arc::clone(&policy_manager),
+        Arc::new(server_signing.clone()),
+        TokenConfig::default(),
+        git2db,
+        TransportConfig::inproc("policy-horizon-unused"),
+    )
+    .with_revocation_max_ttl_secs(100);
+    let server_vk = server_signing.verifying_key();
+    let (server, server_addr) = serve_over_iroh(service, &server_signing).await?;
+    let (substrate_a, process_a) =
+        revocation_store_for(server_addr, server_vk, process_a_signing_key()).await?;
+
+    let now = chrono::Utc::now().timestamp();
+    let within = CredentialId::jwt("https://issuer.example", "jti-within-horizon");
+    let beyond = CredentialId::jwt("https://issuer.example", "jti-beyond-horizon");
+
+    process_a
+        .revoke_credential(within.clone(), now + 50)
+        .await
+        .map_err(|e| anyhow::anyhow!("publication within the horizon must be accepted: {e}"))?;
+    assert!(process_a.is_revoked(&within).await);
+
+    assert!(
+        process_a
+            .revoke_credential(beyond.clone(), now + 200)
+            .await
+            .is_err(),
+        "publication beyond the configured horizon must be rejected"
+    );
+    // The rejected publication is invisible to checks (an unexpired,
+    // never-published ID reads not-revoked for an authorized checker).
+    assert!(!process_a.is_revoked(&beyond).await);
+
+    drop(process_a);
+    substrate_a.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
 /// A subject context cached in a distinct verifier process must stop
 /// resolving once the credential it was derived from is revoked through the
 /// authority. The cache is process-global in this test binary, so "process B"
@@ -670,7 +769,7 @@ async fn cached_subject_read_fails_closed_with_dead_authority() -> Result<()> {
     let dead_store = PolicyAuthorityRevocationStore::new(PolicyClient::new(Arc::new(rpc)));
 
     assert!(
-        hyprstream_rpc::auth::mac::subject_context_with(Some(&dead_store), &subject, None)
+        hyprstream_rpc::auth::mac::subject_context_with(Some(&dead_store), None, &subject, None)
             .await
             .is_none(),
         "dead authority must fail the credential-bearing cached read closed"

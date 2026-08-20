@@ -307,6 +307,147 @@ impl fmt::Display for SecurityLabel {
     }
 }
 
+/// The **credential-clearance wire projection** of a [`SecurityLabel`] (v16
+/// §11, operator Gate-2 value 11). A credential's `clearance` claim is the
+/// semantic two-element array `[level, [compartments]]` and NOTHING else — the
+/// assurance axis is **structurally absent from the wire** and is derived only
+/// from verified key material at credential admission (see
+/// [`super::SecurityContext::new`]). The authority-asserted clearance claim
+/// therefore carries THIS type, never a full [`SecurityLabel`], so a synthetic
+/// assurance can never ride in on the wire.
+///
+/// Wire grammar (identical for the JWT JSON value and the CWT CBOR value):
+/// - element 0 `level`: a uint with the frozen mapping `0=Public, 1=Internal,
+///   2=Confidential, 3=Secret`;
+/// - element 1 `compartments`: an array of compartment **bit indices**, each a
+///   uint `0..=63`, strictly ascending and unique (empty allowed) — the
+///   credential projection of the versioned compartment vocabulary, never a
+///   bitmask integer and never names;
+/// - the outer array has **exactly two** elements.
+///
+/// Unknown levels, out-of-range/duplicate/descending compartments, a bitmask
+/// integer, names, extra elements, or any assurance field all fail
+/// deserialization (fail-closed).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CredentialClearance {
+    /// MLS sensitivity level (element 0 of the wire array).
+    pub level: Level,
+    /// Need-to-know compartments (bitset; the wire form is the ascending index
+    /// list of element 1).
+    pub compartments: CompartmentSet,
+}
+
+impl CredentialClearance {
+    /// The wire projection of a full label: level + compartments, dropping the
+    /// crypto-derived assurance axis (which is never issuer-asserted).
+    pub fn from_label(label: SecurityLabel) -> Self {
+        Self {
+            level: label.level,
+            compartments: label.compartments,
+        }
+    }
+}
+
+impl From<SecurityLabel> for CredentialClearance {
+    fn from(label: SecurityLabel) -> Self {
+        Self::from_label(label)
+    }
+}
+
+impl fmt::Debug for CredentialClearance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Assurance is deliberately absent — this is the wire projection.
+        write!(f, "{}", self.level)?;
+        if !self.compartments.is_empty() {
+            let joined = self
+                .compartments
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            write!(f, ":{{c{joined}}}")?;
+        }
+        Ok(())
+    }
+}
+
+impl serde::Serialize for CredentialClearance {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq as _;
+        let indices: Vec<u8> = self.compartments.iter().map(|i| i as u8).collect();
+        let mut seq = serializer.serialize_seq(Some(2))?;
+        seq.serialize_element(&(self.level as u8))?;
+        seq.serialize_element(&indices)?;
+        seq.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CredentialClearance {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct WireVisitor;
+        impl<'de> serde::de::Visitor<'de> for WireVisitor {
+            type Value = CredentialClearance;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a two-element credential-clearance array [level, [compartment indices]]",
+                )
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<CredentialClearance, A::Error> {
+                use serde::de::Error as _;
+                let level_raw: u8 = seq
+                    .next_element()?
+                    .ok_or_else(|| A::Error::custom("clearance: missing level element"))?;
+                let level = match level_raw {
+                    0 => Level::Public,
+                    1 => Level::Internal,
+                    2 => Level::Confidential,
+                    3 => Level::Secret,
+                    other => {
+                        return Err(A::Error::custom(format!(
+                            "clearance: unknown level {other} (0..=3)"
+                        )));
+                    }
+                };
+                let indices: Vec<u8> = seq
+                    .next_element()?
+                    .ok_or_else(|| A::Error::custom("clearance: missing compartments array"))?;
+                // Exactly two elements: any third element (e.g. an appended
+                // assurance) is a malformed, assurance-bearing wire value.
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(A::Error::custom(
+                        "clearance: array must have exactly two elements",
+                    ));
+                }
+                let mut bits: u64 = 0;
+                let mut prev: Option<u8> = None;
+                for idx in indices {
+                    if u32::from(idx) >= MAX_COMPARTMENTS {
+                        return Err(A::Error::custom(format!(
+                            "clearance: compartment index {idx} out of range 0..={}",
+                            MAX_COMPARTMENTS - 1
+                        )));
+                    }
+                    if prev.is_some_and(|p| idx <= p) {
+                        return Err(A::Error::custom(
+                            "clearance: compartment indices must be strictly ascending and unique",
+                        ));
+                    }
+                    prev = Some(idx);
+                    bits |= 1u64 << idx;
+                }
+                Ok(CredentialClearance {
+                    level,
+                    compartments: CompartmentSet(bits),
+                })
+            }
+        }
+        deserializer.deserialize_seq(WireVisitor)
+    }
+}
+
 impl SecurityLabel {
     /// Construct a label from its axes. There is intentionally **no `Default`** —
     /// every label must be chosen explicitly so "unlabeled" can never silently
@@ -667,5 +808,84 @@ mod tests {
         assert_eq!(l, back);
         // canonical: re-serializing yields identical bytes (content-binding needs this)
         assert_eq!(json, serde_json::to_string(&back).unwrap());
+    }
+
+    // ── CredentialClearance two-axis wire grammar (v16 §11, H2) ─────────────
+
+    /// The canonical fixture `[2,[5,7]]` is Confidential with compartments
+    /// {5,7}; serialization is exactly that two-element array and round-trips,
+    /// and every frozen level maps.
+    #[test]
+    fn credential_clearance_wire_is_canonical_two_axis() {
+        let value = CredentialClearance::from_label(label(Level::Confidential, Assurance::Classical, &[5, 7]));
+        let json = serde_json::to_string(&value).unwrap();
+        assert_eq!(json, "[2,[5,7]]", "exact two-axis wire form");
+        let back: CredentialClearance = serde_json::from_str(&json).unwrap();
+        assert_eq!(value, back);
+
+        let parsed: CredentialClearance = serde_json::from_str("[2,[5,7]]").unwrap();
+        assert_eq!(parsed.level, Level::Confidential);
+        assert!(parsed.compartments.contains(5) && parsed.compartments.contains(7));
+        assert_eq!(parsed.compartments.len(), 2);
+
+        // Empty compartments are allowed.
+        let empty: CredentialClearance = serde_json::from_str("[0,[]]").unwrap();
+        assert_eq!(empty.level, Level::Public);
+        assert!(empty.compartments.is_empty());
+
+        // The frozen level domain 0..=3 maps exactly.
+        for (raw, lvl) in [
+            (0, Level::Public),
+            (1, Level::Internal),
+            (2, Level::Confidential),
+            (3, Level::Secret),
+        ] {
+            let v: CredentialClearance =
+                serde_json::from_str(&format!("[{raw},[]]")).unwrap();
+            assert_eq!(v.level, lvl);
+        }
+    }
+
+    /// Every malformed / noncanonical / assurance-bearing wire value denies.
+    #[test]
+    fn credential_clearance_wire_rejects_malformed() {
+        let reject = |s: &str| {
+            assert!(
+                serde_json::from_str::<CredentialClearance>(s).is_err(),
+                "must reject {s}"
+            );
+        };
+        reject("[4,[]]"); // unknown level (domain 0..=3)
+        reject("[1,[64]]"); // compartment index out of range (0..=63)
+        reject("[1,[5,5]]"); // duplicate index
+        reject("[1,[7,5]]"); // descending / non-ascending order
+        reject("[1,[],1]"); // three elements (an appended assurance axis)
+        reject("[1]"); // one element (missing compartments)
+        reject("[]"); // empty array
+        reject("[1,160]"); // compartments as a bitmask integer, not an index array
+        reject(r#"[1,["pii"]]"#); // compartment NAMES instead of indices
+        reject(r#"["confidential",[]]"#); // level as a name string
+        // The struct/object form (assurance-bearing) never parses as clearance.
+        reject(r#"{"level":1,"assurance":"classical","compartments":0}"#);
+    }
+
+    /// The wire projection is assurance-free: two labels differing ONLY in the
+    /// assurance axis project to the identical wire value and bytes.
+    #[test]
+    fn credential_clearance_wire_drops_assurance() {
+        let classical =
+            CredentialClearance::from_label(label(Level::Internal, Assurance::Classical, &[3]));
+        let hybrid =
+            CredentialClearance::from_label(label(Level::Internal, Assurance::PqHybrid, &[3]));
+        assert_eq!(classical, hybrid, "assurance is not part of the wire identity");
+        let json = serde_json::to_string(&hybrid).unwrap();
+        assert_eq!(json, serde_json::to_string(&classical).unwrap());
+        assert_eq!(json, "[1,[3]]");
+        assert!(
+            !json.contains("assurance")
+                && !json.contains("classical")
+                && !json.contains("pq"),
+            "no assurance token on the wire: {json}"
+        );
     }
 }

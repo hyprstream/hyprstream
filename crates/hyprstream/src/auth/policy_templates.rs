@@ -82,6 +82,13 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     // Revocation checks: every enrolled service verifies credentials (and
     // probes the authority at startup); anonymous/end-user callers may not.
     ServicePolicyRule { subject: "service:*", domain: "*", resource: "policy:CheckCredentialRevocation", action: "query", effect: "allow" },
+    // Session lifecycle: only the OAuth authority (which owns user-session
+    // issuance) may register or revoke sessions.
+    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "policy:RegisterSession", action: "manage", effect: "allow" },
+    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "policy:RevokeSession", action: "manage", effect: "allow" },
+    // Session checks: every enrolled service verifies session-bearing
+    // credentials; anonymous/end-user callers may not.
+    ServicePolicyRule { subject: "service:*", domain: "*", resource: "policy:CheckSession", action: "query", effect: "allow" },
     // Services that perform policy authorization checks
     ServicePolicyRule { subject: "service:registry", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
     ServicePolicyRule { subject: "service:model", domain: "*", resource: "policy:*", action: "check", effect: "allow" },

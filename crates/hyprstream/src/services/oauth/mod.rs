@@ -1393,6 +1393,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn oauth_handler_atproto_and_legacy_conformance() -> anyhow::Result<()> {
         crate::mac::install_explicit_test_dispatch_pep();
+        // Interactive OAuth issuance (v16 §3.3) registers a fresh session with
+        // the canonical registry, and the in-process policy authority validates
+        // it before minting; both live in THIS process, so publish one isolated
+        // in-memory session registry (plus a revocation store) — mirroring
+        // production `init_process_authority_stores`, which this bespoke
+        // in-process test bypasses. Guarded so a sibling that published first
+        // keeps its handle; the registrations use distinct keys.
+        if hyprstream_rpc::auth::global_session_registry().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_session_registry(std::sync::Arc::new(
+                hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+            ));
+        }
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(std::sync::Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
         use base64::{
             engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
             Engine as _,
@@ -1411,7 +1428,7 @@ mod tests {
         use super::token_store::RocksDbTokenStore;
         use crate::auth::rocksdb_store::RocksDbUserStore;
         use crate::auth::{PolicyManager, UserProfile, UserStore};
-        use crate::services::generated::policy_client::IssueToken;
+        use crate::services::generated::policy_client::{IssueToken, IssueTokenProfile};
         use crate::services::{DiscoveryClient, PolicyClient, PolicyService};
 
         const ISSUER: &str = "https://pds.example.test:8443";
@@ -2777,6 +2794,8 @@ mod tests {
                 issuer: None,
                 tenant: Some(HOSTED_TENANT.to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
             })
             .await?
             .token;
@@ -2807,6 +2826,8 @@ mod tests {
                 issuer: None,
                 tenant: Some("other.example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
             })
             .await?
             .token;
@@ -2837,6 +2858,8 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
             })
             .await?
             .token;
@@ -2885,6 +2908,8 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
             })
             .await?
             .token;
@@ -2940,6 +2965,8 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
             })
             .await?
             .token;
@@ -3088,6 +3115,8 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
             })
             .await?
             .token;
@@ -3238,6 +3267,8 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
             })
             .await?
             .token;
@@ -3288,6 +3319,8 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
             })
             .await?
             .token;
@@ -3460,6 +3493,8 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
             })
             .await?
             .token;
@@ -3558,6 +3593,8 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
             })
             .await?
             .token;
@@ -3604,6 +3641,8 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
             })
             .await?
             .token;

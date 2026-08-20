@@ -156,7 +156,7 @@ pub async fn issue_mount_ticket(
         .with_issuer(state.issuer_url.clone())
         .with_audience(Some(audience.clone()))
         .with_cap(capability.clone())
-        .with_clearance(clearance);
+        .with_credential_clearance(clearance);
     if domain != "*" {
         claims = claims.with_tenant(domain);
     }

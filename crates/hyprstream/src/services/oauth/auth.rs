@@ -241,16 +241,38 @@ pub(super) async fn validate_oauth_access_token(
 
     // Fail-closed revocation: if the token carries a jti but no store is
     // configured, reject — a potentially-revoked credential must not be
-    // admitted when revocation status cannot be checked.
-    if let Some(jti) = claims.jti.as_deref() {
-        let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
-        match hyprstream_rpc::auth::global_credential_revocation_store() {
-            Some(store) => {
-                if store.is_revoked(&cred_id).await {
-                    return Err("JWT revoked");
+    // admitted when revocation status cannot be checked. The credential
+    // profile makes jti REQUIRED on locally issued tokens (issuer locality
+    // is enforced above), so a missing jti is a hard rejection, not a skip.
+    match claims.jti.as_deref() {
+        Some(jti) => {
+            let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
+            match hyprstream_rpc::auth::global_credential_revocation_store() {
+                Some(store) => {
+                    if store.is_revoked(&cred_id).await {
+                        return Err("JWT revoked");
+                    }
+                }
+                None => return Err("revocation store unavailable"),
+            }
+        }
+        None => return Err("local credential missing required jti"),
+    }
+
+    // Session check (v16 §3.3): a token carrying a session ID is rejected
+    // when the session is revoked, expired, unknown, or cannot be checked.
+    let session_key = match claims.session_key() {
+        Ok(key) => key,
+        Err(_) => return Err("malformed session claims"),
+    };
+    if let Some(session_key) = session_key {
+        match hyprstream_rpc::auth::global_session_registry() {
+            Some(registry) => {
+                if registry.is_revoked(&session_key).await {
+                    return Err("session revoked");
                 }
             }
-            None => return Err("revocation store unavailable"),
+            None => return Err("session registry unavailable"),
         }
     }
     Ok(claims)

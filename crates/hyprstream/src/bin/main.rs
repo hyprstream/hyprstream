@@ -2640,6 +2640,34 @@ fn main() -> Result<()> {
                                     }
                                 }
 
+                                // ServiceEnrollmentManifest (v16 §11): load the
+                                // authority manifest and bind it against the
+                                // bootstrap trust anchors (both key halves).
+                                // Present-but-invalid or key disagreement aborts
+                                // startup (fail-closed); absence is
+                                // legacy-tolerated for this staging wave with a
+                                // loud warning — service credentials then carry
+                                // no manifest-backed clearance.
+                                {
+                                    let secrets_dir =
+                                        hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
+                                    match hyprstream_core::auth::service_enrollment::ServiceEnrollmentManifest::load_and_validate(&secrets_dir)
+                                        .context("service enrollment manifest validation failed")?
+                                    {
+                                        Some(manifest) => {
+                                            let count = manifest.services.len();
+                                            hyprstream_core::auth::service_enrollment::set_global_service_enrollment(std::sync::Arc::new(manifest))
+                                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                            tracing::info!(services = count, "Service enrollment manifest installed");
+                                        }
+                                        None => {
+                                            tracing::warn!(
+                                                "No service-enrollment manifest — legacy mode: service credentials carry no manifest-backed clearance"
+                                            );
+                                        }
+                                    }
+                                }
+
                                 if quic_cfg.enabled {
                                     // The checkpoint gate: QUIC announcements require
                                     // checkpoint-verified accepted states.
@@ -2954,20 +2982,22 @@ fn main() -> Result<()> {
                                 // Compute dependency-aware startup stages.
                                 let stages = hyprstream_service::startup_stages(&service_names);
 
-                                // Publish the process-global credential-revocation
-                                // store BEFORE any factory runs. The policy process
-                                // owns the one canonical store (durable local file);
-                                // every other process publishes a policy-authority
-                                // RPC client store after probing the authority.
-                                // Fail-closed: an unreachable authority or an
-                                // unreadable durable file aborts startup.
-                                hyprstream_core::services::revocation::init_process_credential_revocation_store(
+                                // Publish the process-global authority stores
+                                // (credential revocation + session registry)
+                                // BEFORE any factory runs. The policy process
+                                // owns the canonical stores (durable local
+                                // files); every other process publishes
+                                // policy-authority RPC client stores after
+                                // probing the authority. Fail-closed: an
+                                // unreachable authority or an unreadable
+                                // durable file aborts startup.
+                                hyprstream_core::services::revocation::init_process_authority_stores(
                                     &ctx,
                                     ctx.signing_key(),
                                     service_names.iter().any(|n| n == "policy"),
                                 )
                                 .await
-                                .context("credential revocation authority initialization failed")?;
+                                .context("revocation/session authority initialization failed")?;
 
                                 // #275: in the systemd / --ipc deployment each service
                                 // runs in its OWN process. Only the `event` service's

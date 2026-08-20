@@ -9,7 +9,7 @@ use crate::auth::policy_templates;
 use crate::services::{EnvelopeContext, RequestService};
 use crate::services::generated::policy_client::{
     ErrorInfo, PolicyHandler, PolicyResponseVariant, TokenInfo, ScopeList,
-    PolicyCheck, IssueToken,
+    PolicyCheck, IssueToken, IssueTokenProfile,
     ApplyTemplate, ApplyDraft, RollbackPolicy, GetHistory, GetDiff,
     PolicyInfo, PolicyRule, Grouping,
     PolicyHistory, PolicyHistoryEntry, DraftStatus,
@@ -19,6 +19,7 @@ use crate::services::generated::policy_client::{
     ResolveServiceKey, RegisterServiceKey, ServiceKeyCandidate, ServiceKeyResponse,
     RefreshServiceTokenRequest, ExchangeWit,
     RevokeCredential, CheckCredentialRevocation,
+    RegisterSession, RevokeSession, CheckSession,
     dispatch_policy, serialize_response,
 };
 use anyhow::{anyhow, Result};
@@ -106,6 +107,12 @@ fn validate_event_prefix_registration(
     Ok(())
 }
 
+/// Default revocation-publication horizon: covers the hard 30-day
+/// service-JWT renewal clamp with margin. Production construction derives
+/// the horizon from the configured issuance maxima instead — see
+/// `PolicyService::with_revocation_max_ttl_secs`.
+const DEFAULT_REVOCATION_MAX_TTL_SECS: i64 = 45 * 24 * 3600;
+
 pub struct PolicyService {
     // Business logic
     policy_manager: Arc<PolicyManager>,
@@ -137,6 +144,11 @@ pub struct PolicyService {
     token_clearance_resolver: Arc<
         dyn Fn(&str) -> Option<hyprstream_rpc::auth::mac::SecurityLabel> + Send + Sync,
     >,
+    /// Maximum retention horizon the revocation authority accepts for a
+    /// published entry (`expires_at - now`). Derived at construction from the
+    /// configured issuance maxima so no issuable credential can outlive its
+    /// revocability — see `with_revocation_max_ttl_secs`.
+    revocation_max_ttl_secs: i64,
 }
 
 impl PolicyService {
@@ -168,7 +180,18 @@ impl PolicyService {
                 let policy = crate::mac::compiled_policy()?;
                 policy.clearance_for(subject)
             }),
+            revocation_max_ttl_secs: DEFAULT_REVOCATION_MAX_TTL_SECS,
         }
+    }
+
+    /// Set the revocation-publication horizon. The service factory computes
+    /// this as max(every configured issuance maximum) plus a clock-skew
+    /// margin, so an operator raising token TTLs automatically raises the
+    /// authority's retention horizon — issuance and revocation horizons are
+    /// bound by construction rather than by a shared default.
+    pub fn with_revocation_max_ttl_secs(mut self, secs: i64) -> Self {
+        self.revocation_max_ttl_secs = secs;
+        self
     }
 
     /// Set the default audience for issued tokens (typically the OAuth issuer URL).
@@ -584,8 +607,6 @@ impl PolicyHandler for PolicyService {
     ) -> Result<PolicyResponseVariant> {
         trace!("Issuing JWT token");
 
-        let is_service_token = data.subject.as_ref().is_some_and(|s| s.starts_with("service:"));
-
         // Determine subject: explicit subject (if provided and authorized) or envelope identity.
         // JWT sub must contain a bare username (e.g. "randy", "birdetta") — the identity
         // system adds the namespace prefix ("token:randy") when the JWT is decoded.
@@ -636,8 +657,59 @@ impl PolicyHandler for PolicyService {
             // Use bare username from the envelope identity.
             ctx.user().to_owned()
         };
+        let is_service_token = subject.starts_with("service:");
 
-        let subject_clearance = if data.require_clearance {
+        // `IssueToken` is the shared signing boundary. Its zero/default wire
+        // value is deliberately `InteractiveSession`, so a caller that omits
+        // the profile cannot silently mint an unsessioned user credential.
+        // The only sid-less user profiles are the separately typed RFC 8693
+        // and RFC 7523 exchanges; service credentials have their own profile
+        // and are never allowed to carry an interactive sid.
+        match data.issuance_profile {
+            IssueTokenProfile::InteractiveSession => {
+                if is_service_token {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "service credentials must use the service issuance profile".to_owned(),
+                        code: "INVALID_ISSUANCE_PROFILE".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+                if data.session_id.as_deref().is_none_or(str::is_empty) {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "interactive user/OIDC issuance requires a session id".to_owned(),
+                        code: "MISSING_SESSION".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+            }
+            IssueTokenProfile::Rfc8693 | IssueTokenProfile::Rfc7523 => {
+                if is_service_token {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "service credentials must use the service issuance profile".to_owned(),
+                        code: "INVALID_ISSUANCE_PROFILE".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+                if data.session_id.is_some() {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "non-interactive RFC issuance cannot carry an OIDC session id".to_owned(),
+                        code: "INVALID_SESSION".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+            }
+            IssueTokenProfile::Service => {
+                if !is_service_token || data.session_id.is_some() {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "service issuance requires a service subject and no OIDC session id".to_owned(),
+                        code: "INVALID_ISSUANCE_PROFILE".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+            }
+        }
+
+        let mut subject_clearance = if data.require_clearance {
             (self.token_clearance_resolver)(&subject).map(|clearance| {
                 let context = hyprstream_rpc::auth::mac::SecurityContext::from_clearance(
                     clearance,
@@ -700,6 +772,42 @@ impl PolicyHandler for PolicyService {
         let now = chrono::Utc::now().timestamp();
         let audience = data.audience.as_ref().filter(|s| !s.is_empty()).cloned()
             .or_else(|| self.default_audience.clone());
+
+        // ServiceEnrollmentManifest (v16 §11): for service subjects the
+        // manifest is the authoritative target-clearance and audience source.
+        // Clearance is stamped from the manifest for every enrolled service
+        // (issuance cannot gain, and renewal cannot preserve, authority the
+        // manifest does not grant); a declared audience list is enforced
+        // fail-closed.
+        if let Some(service_name) = subject.strip_prefix("service:") {
+            if let Some(manifest) = crate::auth::service_enrollment::global_service_enrollment()
+            {
+                let Some(clearance) = manifest.clearance_for_service(service_name) else {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: format!(
+                            "service '{service_name}' has no enrollment entry"
+                        ),
+                        code: "UNENROLLED_SERVICE".to_owned(),
+                        details: String::new(),
+                    }));
+                };
+                subject_clearance = Some(clearance);
+                // A declared audience list requires the effective audience to
+                // be present AND a member — an enrolled service cannot mint
+                // without an exact allowed audience.
+                if !manifest.allows_audience(service_name, audience.as_deref()) {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: format!(
+                            "audience '{}' is not enrolled for service '{service_name}'",
+                            audience.as_deref().unwrap_or("<none>")
+                        ),
+                        code: "AUDIENCE_NOT_ENROLLED".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+            }
+        }
+
         let granted_scope = data.requested_scopes.as_ref().map(|scopes| {
             scopes.iter()
                 .map(String::as_str)
@@ -783,17 +891,65 @@ impl PolicyHandler for PolicyService {
             .or_else(|| self.default_audience.clone())
             .unwrap_or_default();
         let mut claims = hyprstream_rpc::auth::Claims::new(
-            subject,
+            subject.clone(),
             now,
             now + requested_ttl as i64,
-        ).with_issuer(issuer)
+        ).with_issuer(issuer.clone())
          .with_audience(audience)
          .with_scope(granted_scope);
         if target_domain != "*" {
-            claims = claims.with_tenant(target_domain);
+            claims = claims.with_tenant(target_domain.clone());
         }
         if let Some(clearance) = subject_clearance {
             claims = claims.with_clearance(clearance);
+        }
+        // Session binding (v16 §3.3): the OIDC `sid` profile is enforced at
+        // the authority boundary. Service credentials NEVER carry an
+        // interactive session (workload IDs enter only through the enrolled
+        // renewal family, not this field). A user session ID is stamped only
+        // when the canonical registry holds an ACTIVE record bound to this
+        // exact subject and tenant — unknown, revoked, expired, cross-subject,
+        // or cross-tenant sessions are rejected (no session fixation).
+        if let Some(sid) = data.session_id.as_deref().filter(|s| !s.is_empty()) {
+            if sid.len() > 1024 {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "session id exceeds 1024 bytes".to_owned(),
+                    code: "INVALID_ARGUMENT".to_owned(),
+                    details: String::new(),
+                }));
+            }
+            if subject.starts_with("service:") {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "service credentials cannot carry an OIDC session id".to_owned(),
+                    code: "INVALID_ARGUMENT".to_owned(),
+                    details: String::new(),
+                }));
+            }
+            let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "session registry is not initialized".to_owned(),
+                    code: "UNAVAILABLE".to_owned(),
+                    details: String::new(),
+                }));
+            };
+            let session_key = hyprstream_rpc::auth::SessionKey::oidc(&issuer, sid);
+            let bindable = match registry.session_state(&session_key).await {
+                Some(state) => {
+                    state.status == hyprstream_rpc::auth::ActiveOrRevoked::Active
+                        && state.expires_at > now
+                        && state.subject == subject
+                        && state.tenant == target_domain
+                }
+                None => false,
+            };
+            if !bindable {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "session is unknown, inactive, expired, or bound to a different subject/tenant".to_owned(),
+                    code: "INVALID_SESSION".to_owned(),
+                    details: String::new(),
+                }));
+            }
+            claims = claims.with_sid(sid);
         }
 
         // DPoP jkt takes priority over userPubKey (RFC 9449 § 6).
@@ -1814,8 +1970,111 @@ impl PolicyHandler for PolicyService {
 
         let issuer = self.default_audience.clone().unwrap_or_default();
         let tenant = ctx.domain()?;
-        let claims =
-            renewed_service_claims(subject.clone(), now, expires_at, &issuer, tenant, &ctx.cnf);
+        let mut claims =
+            renewed_service_claims(subject.clone(), now, expires_at, &issuer, tenant.clone(), &ctx.cnf);
+
+        // ServiceEnrollmentManifest (v16 §11): renewal re-derives clearance
+        // from the manifest — authority removed from enrollment never
+        // survives a renewal, and renewal never gains authority.
+        if let Some(manifest) = crate::auth::service_enrollment::global_service_enrollment() {
+            let Some(clearance) = manifest.clearance_for_service(svc_name) else {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("service '{svc_name}' has no enrollment entry"),
+                    code: "UNENROLLED_SERVICE".to_owned(),
+                    details: String::new(),
+                }));
+            };
+            claims = claims.with_clearance(clearance);
+        }
+
+        // Workload credential family (v16 §3.3): only an enrolled workload
+        // family carries `workload_session_id`. Renewal chains the family
+        // session: an existing ACTIVE session ID is re-stamped; a revoked or
+        // expired family session DENIES the renewal (session revocation
+        // prevents refresh); a family with no session yet is created here
+        // (bootstrap mints offline, before the authority exists).
+        let old_wsid = ctx
+            .claims()
+            .and_then(|c| c.workload_session_id.as_deref())
+            .map(str::to_owned);
+        let family_policy = crate::auth::service_enrollment::global_service_enrollment()
+            .map(|m| m.workload_session_policy(svc_name));
+        let family_allowed = family_policy.unwrap_or(true); // no manifest: legacy continuity
+        match (old_wsid, family_allowed) {
+            (Some(wsid), allowed) => {
+                // A carried workload session must be ACTIVE before renewal,
+                // regardless of current enrollment policy — otherwise
+                // removing the family policy would let a revoked family
+                // renew into an unsessioned credential.
+                let session_key =
+                    hyprstream_rpc::auth::SessionKey::workload(issuer.clone(), wsid.clone());
+                let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "session registry is not initialized".to_owned(),
+                        code: "UNAVAILABLE".to_owned(),
+                        details: String::new(),
+                    }));
+                };
+                if registry.is_revoked(&session_key).await {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "workload session is revoked or expired; re-bootstrap the service credential".to_owned(),
+                        code: "SESSION_REVOKED".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+                if allowed {
+                    claims = claims.with_workload_session_id(wsid);
+                }
+                // !allowed: deliberate narrowing of a LIVE family — the
+                // session ID does not survive this renewal (the session
+                // itself expires naturally; no credential carries it forward).
+            }
+            (None, true) => {
+                // First online renewal of an enrolled family: create the
+                // workload session with the canonical registry.
+                if family_policy == Some(true) {
+                    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                    use rand::RngCore;
+                    let mut id_bytes = [0u8; 32];
+                    rand::rngs::OsRng.fill_bytes(&mut id_bytes);
+                    let wsid = URL_SAFE_NO_PAD.encode(id_bytes);
+                    let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+                        return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                            message: "session registry is not initialized".to_owned(),
+                            code: "UNAVAILABLE".to_owned(),
+                            details: String::new(),
+                        }));
+                    };
+                    let session_state = hyprstream_rpc::auth::SessionState {
+                        subject: subject.clone(),
+                        tenant,
+                        kind: hyprstream_rpc::auth::SessionKind::Workload,
+                        created_at: now,
+                        expires_at: now + self.revocation_max_ttl_secs,
+                        status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                        clearance_epoch: 0,
+                    };
+                    if let Err(e) = registry
+                        .register_session(
+                            hyprstream_rpc::auth::SessionKey::workload(
+                                issuer.clone(),
+                                wsid.clone(),
+                            ),
+                            session_state,
+                        )
+                        .await
+                    {
+                        return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                            message: "workload session registration failed".to_owned(),
+                            code: "UNAVAILABLE".to_owned(),
+                            details: e.to_string(),
+                        }));
+                    }
+                    claims = claims.with_workload_session_id(wsid);
+                }
+            }
+            (None, false) => {}
+        }
 
         let token = match self.sign_token(&claims, true).await {
             Ok(t) => t,
@@ -1959,19 +2218,23 @@ impl PolicyHandler for PolicyService {
                 details: String::new(),
             }));
         };
-        // Server-side publication bounds. Legitimate lifetimes: service JWTs
-        // clamp to 30 days, access tokens far shorter — 45 days covers every
-        // issuer with margin. A caller-controlled far-future exp would make an
-        // entry effectively permanent (never GC'd, never dropped on load), and
-        // unbounded issuer/value sizes would fill the authority's durable log.
-        // Reject, never clamp: a clamped exp would silently un-revoke a
+        // Server-side publication bounds. The retention horizon is derived
+        // from the configured issuance maxima at construction (default 45
+        // days covers the hard 30-day service-JWT clamp with margin), so no
+        // issuable credential can outlive its revocability. A
+        // caller-controlled far-future exp would otherwise make an entry
+        // effectively permanent (never GC'd, never dropped on load), and
+        // unbounded issuer/value sizes would fill the authority's durable
+        // log. Reject, never clamp: a clamped exp would silently un-revoke a
         // still-live token after reload.
-        const MAX_REVOCATION_TTL_SECS: i64 = 45 * 24 * 3600;
         const MAX_ID_FIELD_BYTES: usize = 1024;
         let now = chrono::Utc::now().timestamp();
-        if data.expires_at <= 0 || data.expires_at > now + MAX_REVOCATION_TTL_SECS {
+        if data.expires_at <= 0 || data.expires_at > now + self.revocation_max_ttl_secs {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: "expires_at out of bounds (must be 0 < exp <= now + 45d)".to_owned(),
+                message: format!(
+                    "expires_at out of bounds (must be 0 < exp <= now + {}s)",
+                    self.revocation_max_ttl_secs
+                ),
                 code: "INVALID_ARGUMENT".to_owned(),
                 details: String::new(),
             }));
@@ -2023,6 +2286,142 @@ impl PolicyHandler for PolicyService {
             None => true,
         };
         Ok(PolicyResponseVariant::CheckCredentialRevocationResult(revoked))
+    }
+
+    /// Register a session with the canonical registry this service owns.
+    /// Fail-closed: a malformed record, an out-of-horizon expiry, an
+    /// uninitialized registry, or a failed durable write is an error, never
+    /// a silent success. Issuance callers own the session lifecycle; the
+    /// registry never mints session IDs.
+    async fn handle_register_session(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RegisterSession,
+    ) -> Result<PolicyResponseVariant> {
+        const MAX_FIELD_BYTES: usize = 1024;
+        let invalid = |message: &str| {
+            Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: message.to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }))
+        };
+        let Some(key) = crate::services::revocation::session_key_from_ref(&data.session) else {
+            return invalid("malformed session key (empty issuer or identifier)");
+        };
+        let now = chrono::Utc::now().timestamp();
+        if data.subject.is_empty()
+            || data.tenant.is_empty()
+            || data.subject.len() > MAX_FIELD_BYTES
+            || data.tenant.len() > MAX_FIELD_BYTES
+        {
+            return invalid("session subject/tenant empty or over 1024 bytes");
+        }
+        if data.expires_at <= 0 || data.expires_at > now + self.revocation_max_ttl_secs {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!(
+                    "expires_at out of bounds (must be 0 < exp <= now + {}s)",
+                    self.revocation_max_ttl_secs
+                ),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+        let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "session registry is not initialized".to_owned(),
+                code: "UNAVAILABLE".to_owned(),
+                details: String::new(),
+            }));
+        };
+        let kind = match &key.id {
+            hyprstream_rpc::auth::SessionIdentifier::OidcSid(_) => {
+                hyprstream_rpc::auth::SessionKind::Interactive
+            }
+            hyprstream_rpc::auth::SessionIdentifier::WorkloadSessionId(_) => {
+                hyprstream_rpc::auth::SessionKind::Workload
+            }
+        };
+        let state = hyprstream_rpc::auth::SessionState {
+            subject: data.subject.clone(),
+            tenant: data.tenant.clone(),
+            kind,
+            created_at: now,
+            expires_at: data.expires_at,
+            status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+            clearance_epoch: data.clearance_epoch,
+        };
+        match registry.register_session(key, state).await {
+            Ok(()) => Ok(PolicyResponseVariant::RegisterSessionResult),
+            Err(e) => {
+                let code = match &e {
+                    hyprstream_rpc::auth::SessionRegisterError::Exists(_) => "ALREADY_EXISTS",
+                    hyprstream_rpc::auth::SessionRegisterError::PublicationFailed(_) => {
+                        "UNAVAILABLE"
+                    }
+                    _ => "INVALID_ARGUMENT",
+                };
+                Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: e.to_string(),
+                    code: code.to_owned(),
+                    details: String::new(),
+                }))
+            }
+        }
+    }
+
+    /// Revoke a session: every credential carrying it is then rejected.
+    /// Fail-closed: an uninitialized registry or a failed durable write is an
+    /// error, never a silent success.
+    async fn handle_revoke_session(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RevokeSession,
+    ) -> Result<PolicyResponseVariant> {
+        let Some(key) = crate::services::revocation::session_key_from_ref(&data.session) else {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "malformed session key (empty issuer or identifier)".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        };
+        let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "session registry is not initialized".to_owned(),
+                code: "UNAVAILABLE".to_owned(),
+                details: String::new(),
+            }));
+        };
+        if let Err(e) = registry.revoke_session(&key).await {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "session revocation was not durably accepted".to_owned(),
+                code: "UNAVAILABLE".to_owned(),
+                details: e.to_string(),
+            }));
+        }
+        Ok(PolicyResponseVariant::RevokeSessionResult)
+    }
+
+    /// Answer a session check from the canonical registry. True means ACTIVE
+    /// and known; revoked, expired, unknown, malformed, or an uninitialized
+    /// registry all read false — a session whose state cannot be checked is
+    /// never reported active.
+    async fn handle_check_session(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &CheckSession,
+    ) -> Result<PolicyResponseVariant> {
+        let active = match crate::services::revocation::session_key_from_ref(&data.session) {
+            Some(key) => match hyprstream_rpc::auth::global_session_registry() {
+                Some(registry) => !registry.is_revoked(&key).await,
+                None => false,
+            },
+            None => false,
+        };
+        Ok(PolicyResponseVariant::CheckSessionResult(active))
     }
 }
 
@@ -2425,6 +2824,8 @@ mod tests {
             issuer: None,
             tenant: None,
             require_clearance: false,
+            session_id: None,
+            issuance_profile: IssueTokenProfile::Rfc8693,
         }
     }
 
@@ -2607,6 +3008,16 @@ mod tests {
                 pq_store: None,
             },
         );
+        // Independently runnable: RPC-path token verification fails closed
+        // without a process-global revocation store. Publish an isolated empty
+        // store when none exists (guarded, matching the convention in
+        // middleware/oauth::revocation tests) so this security test does not
+        // depend on a sibling publishing the store first.
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
 
         let manager = Arc::new(
             PolicyManager::new_in_memory()
@@ -2903,6 +3314,432 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn interactive_issue_token_rejects_missing_session_id() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+        let mut request = issue("alice");
+        request.issuance_profile = IssueTokenProfile::InteractiveSession;
+        request.session_id = None;
+
+        let response = service
+            .handle_issue_token(&ctx, 1, &request)
+            .await
+            .expect("missing-session denial is a policy response");
+        assert!(matches!(
+            response,
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "MISSING_SESSION"
+        ));
+    }
+
+    #[tokio::test]
+    async fn deliberate_noninteractive_rfc_profiles_mint_without_session_id() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+
+        for profile in [IssueTokenProfile::Rfc8693, IssueTokenProfile::Rfc7523] {
+            let mut request = issue("alice");
+            request.issuance_profile = profile;
+            request.session_id = None;
+            let response = service
+                .handle_issue_token(&ctx, 1, &request)
+                .await
+                .expect("non-interactive issuance is a policy response");
+            // The RFC profiles require no session id: reaching the mint proves
+            // the profile gate accepted without one. test_service provisions no
+            // composite signing authority, so a cleared gate surfaces as
+            // SIGNING_NOT_CONFIGURED rather than a session/profile rejection.
+            match response {
+                PolicyResponseVariant::IssueTokenResult(_) => {}
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. })
+                    if code == "SIGNING_NOT_CONFIGURED" => {}
+                other => panic!("RFC profile must pass the gate without a session: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn service_subject_rejects_noninteractive_user_profile() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+        let mut request = issue("service:model");
+        request.issuance_profile = IssueTokenProfile::Rfc8693;
+
+        let response = service
+            .handle_issue_token(&ctx, 1, &request)
+            .await
+            .expect("profile-mismatch denial is a policy response");
+        assert!(matches!(
+            response,
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. })
+                if code == "INVALID_ISSUANCE_PROFILE"
+        ));
+    }
+
+    /// Process-global in-memory session registry for the issuance-profile
+    /// tests (guarded/idempotent). `handle_issue_token` binds a supplied `sid`
+    /// against the PROCESS-GLOBAL registry, so the interactive contracts are
+    /// proven against that exact handle. `register_session`/`revoke_session`
+    /// are trait methods, so registering through the returned `dyn` handle
+    /// works regardless of which sibling test published the global first (both
+    /// publish an InMemory registry and use distinct keys).
+    fn interactive_test_session_registry(
+    ) -> &'static std::sync::Arc<dyn hyprstream_rpc::auth::SessionRegistry> {
+        if hyprstream_rpc::auth::global_session_registry().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_session_registry(std::sync::Arc::new(
+                hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+            ));
+        }
+        hyprstream_rpc::auth::global_session_registry()
+            .expect("session registry is published above")
+    }
+
+    fn active_oidc_session(
+        subject: &str,
+        tenant: &str,
+        now: i64,
+    ) -> hyprstream_rpc::auth::SessionState {
+        hyprstream_rpc::auth::SessionState {
+            subject: subject.to_owned(),
+            tenant: tenant.to_owned(),
+            kind: hyprstream_rpc::auth::SessionKind::Interactive,
+            created_at: now,
+            expires_at: now + 3600,
+            status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+            clearance_epoch: 0,
+        }
+    }
+
+    /// Contract 1 (empty sid): the interactive profile treats an empty-string
+    /// `sid` exactly like a missing one — both deny before minting.
+    #[tokio::test]
+    async fn interactive_issue_token_rejects_empty_session_id() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+        let mut request = issue("alice");
+        request.issuance_profile = IssueTokenProfile::InteractiveSession;
+        request.session_id = Some(String::new());
+        let response = service
+            .handle_issue_token(&ctx, 1, &request)
+            .await
+            .expect("empty-session denial is a policy response");
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "MISSING_SESSION"
+            ),
+            "an empty sid must deny like a missing one: {response:?}"
+        );
+    }
+
+    /// Contract 3: an interactive credential whose `sid` names a registered,
+    /// ACTIVE session bound to this exact subject and tenant mints, and the
+    /// registered `sid` is stamped into the signed claims.
+    #[tokio::test]
+    async fn interactive_issue_token_with_registered_session_succeeds() {
+        let (service, _root) = test_service().await;
+        let reg = interactive_test_session_registry();
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+        let issuer = "https://issuer.interactive-ok.test";
+        let tenant = "tenant-interactive-ok";
+        let sid = "sid-interactive-ok";
+        let now = chrono::Utc::now().timestamp();
+        reg.register_session(
+            hyprstream_rpc::auth::SessionKey::oidc(issuer, sid),
+            active_oidc_session("alice", tenant, now),
+        )
+        .await
+        .expect("register active session");
+
+        let mut request = issue("alice");
+        request.issuance_profile = IssueTokenProfile::InteractiveSession;
+        request.issuer = Some(issuer.to_owned());
+        request.tenant = Some(tenant.to_owned());
+        request.session_id = Some(sid.to_owned());
+        let response = service
+            .handle_issue_token(&ctx, 1, &request)
+            .await
+            .expect("interactive issuance is a policy response");
+        match response {
+            PolicyResponseVariant::IssueTokenResult(info) => {
+                let claims = hyprstream_rpc::auth::decode_unverified(&info.token)
+                    .expect("issued token decodes");
+                assert_eq!(
+                    claims.sid.as_deref(),
+                    Some(sid),
+                    "the registered sid is stamped into the minted claims"
+                );
+            }
+            // test_service provisions no global composite signing authority, so
+            // a mint that clears the session gate fails at the signing boundary
+            // instead. Reaching it proves the correctly-registered session was
+            // ACCEPTED (the contract here); the sid-stamping assertion above is
+            // exercised whenever the full-suite run provisions signing.
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. })
+                if code == "SIGNING_NOT_CONFIGURED" => {}
+            other => panic!("a correctly-registered interactive session was rejected: {other:?}"),
+        }
+    }
+
+    /// Contract 2: an interactive `sid` that is unknown, revoked, or bound to a
+    /// different subject/tenant is rejected — the registry is the authority and
+    /// there is no session fixation.
+    #[tokio::test]
+    async fn interactive_issue_token_denies_unknown_revoked_or_mismatched_session() {
+        let (service, _root) = test_service().await;
+        let reg = interactive_test_session_registry();
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+        let issuer = "https://issuer.interactive-deny.test";
+        let tenant = "tenant-interactive-deny";
+        let now = chrono::Utc::now().timestamp();
+
+        let request_for = |sid: &str| {
+            let mut r = issue("alice");
+            r.issuance_profile = IssueTokenProfile::InteractiveSession;
+            r.issuer = Some(issuer.to_owned());
+            r.tenant = Some(tenant.to_owned());
+            r.session_id = Some(sid.to_owned());
+            r
+        };
+        let assert_denied = |response: PolicyResponseVariant, label: &str| {
+            assert!(
+                matches!(
+                    response,
+                    PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "INVALID_SESSION"
+                ),
+                "{label} must deny with INVALID_SESSION: {response:?}"
+            );
+        };
+
+        // Unknown: never registered.
+        assert_denied(
+            service
+                .handle_issue_token(&ctx, 1, &request_for("never-registered"))
+                .await
+                .unwrap(),
+            "an unknown sid",
+        );
+
+        // Revoked: registered then revoked.
+        let revoked = "sid-revoked";
+        reg.register_session(
+            hyprstream_rpc::auth::SessionKey::oidc(issuer, revoked),
+            active_oidc_session("alice", tenant, now),
+        )
+        .await
+        .unwrap();
+        reg.revoke_session(&hyprstream_rpc::auth::SessionKey::oidc(issuer, revoked))
+            .await
+            .unwrap();
+        assert_denied(
+            service
+                .handle_issue_token(&ctx, 2, &request_for(revoked))
+                .await
+                .unwrap(),
+            "a revoked sid",
+        );
+
+        // Mismatched subject: session bound to a different user.
+        let cross_subject = "sid-cross-subject";
+        reg.register_session(
+            hyprstream_rpc::auth::SessionKey::oidc(issuer, cross_subject),
+            active_oidc_session("bob", tenant, now),
+        )
+        .await
+        .unwrap();
+        assert_denied(
+            service
+                .handle_issue_token(&ctx, 3, &request_for(cross_subject))
+                .await
+                .unwrap(),
+            "a cross-subject sid",
+        );
+
+        // Mismatched tenant: session bound to a different tenant.
+        let cross_tenant = "sid-cross-tenant";
+        reg.register_session(
+            hyprstream_rpc::auth::SessionKey::oidc(issuer, cross_tenant),
+            active_oidc_session("alice", "some-other-tenant", now),
+        )
+        .await
+        .unwrap();
+        assert_denied(
+            service
+                .handle_issue_token(&ctx, 4, &request_for(cross_tenant))
+                .await
+                .unwrap(),
+            "a cross-tenant sid",
+        );
+    }
+
+    /// Contract 4: a service subject can never acquire a user session — neither
+    /// under the service profile carrying a `sid`, nor by relabeling itself
+    /// interactive. Both deny at the profile gate before any registry lookup.
+    #[tokio::test]
+    async fn service_subject_with_user_session_is_denied() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+
+        let mut service_profile = issue("service:model");
+        service_profile.issuance_profile = IssueTokenProfile::Service;
+        service_profile.session_id = Some("sid-illegal".to_owned());
+        let response = service
+            .handle_issue_token(&ctx, 1, &service_profile)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "INVALID_ISSUANCE_PROFILE"
+            ),
+            "service profile + sid must deny: {response:?}"
+        );
+
+        let mut relabeled = issue("service:model");
+        relabeled.issuance_profile = IssueTokenProfile::InteractiveSession;
+        relabeled.session_id = Some("sid-illegal".to_owned());
+        let response = service.handle_issue_token(&ctx, 2, &relabeled).await.unwrap();
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "INVALID_ISSUANCE_PROFILE"
+            ),
+            "a service subject relabeled interactive must deny: {response:?}"
+        );
+    }
+
+    /// Contract 5 (negative): the non-interactive RFC profiles cannot smuggle a
+    /// session, and a non-interactive exchange cannot relabel itself
+    /// interactive to bypass session verification — a fabricated (unregistered)
+    /// sid denies, and an absent sid denies for want of a registered session.
+    #[tokio::test]
+    async fn noninteractive_profiles_cannot_smuggle_or_relabel_a_session() {
+        let (service, _root) = test_service().await;
+        // Ensure the registry is initialized so the relabel case reaches
+        // INVALID_SESSION rather than an UNAVAILABLE registry error.
+        let _ = interactive_test_session_registry();
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+
+        for profile in [IssueTokenProfile::Rfc8693, IssueTokenProfile::Rfc7523] {
+            let mut smuggle = issue("alice");
+            smuggle.issuance_profile = profile;
+            smuggle.session_id = Some("smuggled-sid".to_owned());
+            let response = service.handle_issue_token(&ctx, 1, &smuggle).await.unwrap();
+            assert!(
+                matches!(
+                    response,
+                    PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "INVALID_SESSION"
+                ),
+                "an RFC profile carrying a sid must deny: {response:?}"
+            );
+        }
+
+        // Relabel to interactive with a fabricated, unregistered sid → denied.
+        let mut fabricated = issue("alice");
+        fabricated.issuance_profile = IssueTokenProfile::InteractiveSession;
+        fabricated.issuer = Some("https://issuer.relabel.test".to_owned());
+        fabricated.session_id = Some("fabricated-unregistered".to_owned());
+        let response = service
+            .handle_issue_token(&ctx, 2, &fabricated)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "INVALID_SESSION"
+            ),
+            "relabel with a fabricated sid must deny: {response:?}"
+        );
+
+        // Relabel to interactive with no sid → denied for want of a session.
+        let mut no_sid = issue("alice");
+        no_sid.issuance_profile = IssueTokenProfile::InteractiveSession;
+        no_sid.session_id = None;
+        let response = service.handle_issue_token(&ctx, 3, &no_sid).await.unwrap();
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "MISSING_SESSION"
+            ),
+            "relabel without a sid must deny: {response:?}"
+        );
+    }
+
+    /// Gate 2 (v16 §3.3): a carried `workload_session_id` must be ACTIVE before
+    /// a service credential may renew. A revoked family session DENIES the
+    /// renewal — the revocation is checked BEFORE the enrollment-policy branch,
+    /// so removing the workload-family policy (family narrowing) can never let
+    /// a revoked family renew into an unsessioned credential.
+    #[tokio::test]
+    async fn revoked_workload_session_denies_service_renewal() {
+        let (service, _root) = test_service().await;
+        let service = service.with_default_audience("https://issuer.gate2.test".to_owned());
+        let issuer = "https://issuer.gate2.test";
+        let reg = interactive_test_session_registry();
+        let now = chrono::Utc::now().timestamp();
+        let wsid = "wl-gate2-revoked";
+
+        // Register then revoke the workload family session.
+        let workload_key = hyprstream_rpc::auth::SessionKey::workload(issuer, wsid);
+        reg.register_session(
+            workload_key.clone(),
+            hyprstream_rpc::auth::SessionState {
+                subject: "service:model".to_owned(),
+                tenant: "tenant-a".to_owned(),
+                kind: hyprstream_rpc::auth::SessionKind::Workload,
+                created_at: now,
+                expires_at: now + 3600,
+                status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                clearance_epoch: 0,
+            },
+        )
+        .await
+        .unwrap();
+        reg.revoke_session(&workload_key).await.unwrap();
+
+        // The renewing caller's key must be trust-registered for the service.
+        let caller = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        let trust = hyprstream_service::global_trust_store();
+        trust.insert(
+            caller,
+            hyprstream_service::Attestation {
+                scopes: std::iter::once("model".to_owned()).collect(),
+                subject: None,
+                jwt: Some("gate2-renew".to_owned()),
+                expires_at: now + 300,
+                attested_by: None,
+            },
+        );
+
+        // The presented credential carries the now-revoked workload session.
+        let carried =
+            hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 3600)
+                .with_workload_session_id(wsid);
+        let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+            Subject::new("service:model"),
+            "tenant-a",
+            caller,
+            carried,
+        );
+
+        let response = service
+            .handle_refresh_service_token(
+                &ctx,
+                1,
+                &RefreshServiceTokenRequest { ttl_seconds: 3600 },
+            )
+            .await
+            .expect("refresh is a policy response");
+        trust.remove(&caller);
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "SESSION_REVOKED"
+            ),
+            "a carried revoked workload session must deny renewal: {response:?}"
+        );
+    }
+
     #[test]
     fn resolve_service_key_publishes_every_overlap_candidate() {
         let trust = hyprstream_service::TrustStore::new();
@@ -2962,6 +3799,7 @@ mod tests {
             .to_bytes();
 
         let mut request = issue("service:rotation-error-test");
+        request.issuance_profile = IssueTokenProfile::Service;
         request.user_pub_key = Some("not-base64url!".to_owned());
         let malformed = service
             .handle_issue_token(&ctx, 1, &request)
@@ -3003,6 +3841,7 @@ mod tests {
         let mut ctx = EnvelopeContext::from_callback_service(1, "rotation-sibling-test");
         ctx.cnf = caller.to_bytes();
         let mut request = issue("service:rotation-sibling-test");
+        request.issuance_profile = IssueTokenProfile::Service;
         request.user_pub_key = Some(URL_SAFE_NO_PAD.encode(requested.as_bytes()));
         let response = service.handle_issue_token(&ctx, 1, &request).await;
         trust.remove(&caller);

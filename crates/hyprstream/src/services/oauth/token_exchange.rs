@@ -21,7 +21,7 @@ use subtle::ConstantTimeEq as _;
 
 use super::state::{DpopJtiAdmission, OAuthState};
 use crate::mac::exchange::{GrantDecision, GrantError, GrantRequest, GrantedAccess};
-use crate::services::generated::policy_client::IssueToken;
+use crate::services::generated::policy_client::{IssueToken, IssueTokenProfile};
 use hyprstream_pds::repo_authority::is_path_form_did_web;
 // #1425: the browser RFC 8693 sender-bound contract. The public client_id is
 // the single source of truth shared with the WASM client (`hyprstream-rpc`),
@@ -177,6 +177,12 @@ pub async fn exchange_token_exchange(
             issuer: Some(output_issuer),
             tenant,
             require_clearance: verified.require_clearance,
+            session_id: None,
+            issuance_profile: if verified.sub.starts_with("service:") {
+                IssueTokenProfile::Service
+            } else {
+                IssueTokenProfile::Rfc8693
+            },
         })
         .await;
 
@@ -529,6 +535,12 @@ pub(super) async fn exchange_browser_token_exchange(
             issuer: Some(output_issuer),
             tenant,
             require_clearance: verified.require_clearance,
+            session_id: None,
+            issuance_profile: if verified.sub.starts_with("service:") {
+                IssueTokenProfile::Service
+            } else {
+                IssueTokenProfile::Rfc8693
+            },
         })
         .await;
 
@@ -1292,7 +1304,8 @@ fn resolve_grant_subject(
             // reader can re-take the meet off the one verified token. `None` if
             // the actor is unresolved — in which case `ctx` above is already
             // `None` and the grant fails closed before minting.
-            clearance: actor_ctx.map(|c| *c.clearance()),
+            clearance: actor_ctx
+                .map(|c| hyprstream_rpc::auth::mac::CredentialClearance::from_label(*c.clearance())),
             act: None,
         }),
     };
@@ -1892,6 +1905,7 @@ async fn issue_grant_refresh_token(
         dpop_jkt: None,
         client_assertion_jkt: None,
         ucan_grant: grant_refresh,
+        session_id: None,
     };
 
     if let Some(db) = &state.token_db {
@@ -2343,6 +2357,7 @@ mod tests {
                 requested_scope: Some("read:model:llama".to_owned()),
                 audience: Some("https://api.example".to_owned()),
             }),
+            session_id: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: super::super::state::RefreshTokenEntry = serde_json::from_str(&json).unwrap();

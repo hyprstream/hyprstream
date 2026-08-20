@@ -2593,6 +2593,28 @@ mod tests {
             .block_on(async {
                 install_signing_authority(&dir, true).await?;
                 wait_path(&dir.join("authority-policy.sock"));
+                // Mirror production `init_process_authority_stores`: a non-policy
+                // process (this OAuth child) publishes RPC-client authority
+                // stores that DELEGATE to the canonical policy-owned authority
+                // over the policy socket — never private in-memory stores, which
+                // the separate policy process (where `issue_token` actually runs)
+                // could not see. A fresh sid registered here therefore crosses
+                // RPC into the canonical registry that `handle_issue_token`
+                // validates against, and issued-token verification checks the
+                // same canonical revocation store. Fail-closed is preserved: an
+                // unreachable authority answers not-active / revoked. Isolated to
+                // this re-exec'd single-test subprocess — the main-binary
+                // invocation of this fn early-returns above before reaching here.
+                let _ = hyprstream_rpc::auth::set_global_session_registry(Arc::new(
+                    crate::services::revocation::PolicyAuthoritySessionRegistry::new(
+                        policy_client_for_socket(&dir)?,
+                    ),
+                ));
+                let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                    crate::services::revocation::PolicyAuthorityRevocationStore::new(
+                        policy_client_for_socket(&dir)?,
+                    ),
+                ));
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
                 let address = listener.local_addr()?;
                 let mut config = test_config();
@@ -2694,6 +2716,20 @@ mod tests {
         runtime
             .block_on(async {
                 install_signing_authority(&dir, true).await?;
+                // Canonical policy-owned authority stores (v16 §3.3): the policy
+                // process owns the single session registry and credential
+                // revocation store. Every other process delegates to it over RPC
+                // (see the OAuth child's PolicyAuthority* stores), so a sid the
+                // OAuth child registers crosses RPC into THIS registry, which
+                // `handle_issue_token` then validates against. Published before
+                // the PolicyService serves. Isolated to this re-exec'd
+                // single-test subprocess.
+                let _ = hyprstream_rpc::auth::set_global_session_registry(Arc::new(
+                    hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+                ));
+                let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                    hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+                ));
                 let db = dir.join(format!("policy-db-{}", std::process::id()));
                 std::fs::create_dir_all(&db)?;
                 let policy_manager = Arc::new(
@@ -2743,6 +2779,8 @@ mod tests {
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
                     })
                     .await?
                     .token;
@@ -2871,6 +2909,8 @@ mod tests {
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
                     })
                     .await;
                 anyhow::ensure!(result.is_err(), "stale PolicyService minted a token");
@@ -3032,6 +3072,8 @@ mod tests {
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
                     })
                     .await?
                     .token;
@@ -3168,6 +3210,8 @@ mod tests {
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
                     })
                     .await?;
                 let client = reqwest::Client::new();
@@ -3399,6 +3443,8 @@ mod tests {
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
                     })
                     .await?
                     .token;

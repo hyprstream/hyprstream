@@ -29,6 +29,8 @@ pub mod mac;
 pub mod scope;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod scope_registry;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod session_store;
 /// UCAN → Casbin/TE compiler foundation (S5, #571): the UCAN token model,
 /// delegation-chain + ceiling/attenuation validation, and the signed
 /// `(UCAN, bundle_hash)` approval binding (hybrid EdDSA + ML-DSA-65 COSE).
@@ -40,7 +42,8 @@ pub use atproto_perimeter::{AtprotoPerimeterGateway, EnrolledPeer, EnrollmentSto
 // re-exported here so existing `crate::auth::{IdentityResolver, ...}` paths keep working.
 pub use crate::identity::{Ed25519Vk, IdentityKeyCandidate, IdentityKeys, IdentityResolver, MlDsaVk};
 pub use claims::{
-    ActClaim, Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, compute_jkt, is_local_iss,
+    ActClaim, Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, SessionClaimError, compute_jkt,
+    is_local_iss,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use composite::{
@@ -48,9 +51,11 @@ pub use composite::{
     CompositePairState, global_composite_key_set,
 };
 pub use credential::{
-    ActiveOrRevoked, CredentialId, CredentialValue, InMemorySessionRegistry, InvalidSessionRecord,
-    SessionExists, SessionIdentifier, SessionKey, SessionKind, SessionKindMismatch,
-    SessionRegisterError, SessionRegistry, SessionState,
+    ActiveOrRevoked, CredentialId, CredentialValue, GlobalSessionRegistryAlreadySet,
+    InMemorySessionRegistry, InvalidSessionRecord, SessionExists, SessionIdentifier,
+    SessionKey, SessionKind, SessionKindMismatch, SessionPublicationFailed, SessionRegisterError,
+    SessionRegistry, SessionRevokeError, SessionState, global_session_registry,
+    set_global_session_registry,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use federation::{FederationKey, FederationKeySource};
@@ -61,6 +66,8 @@ pub use jti_blocklist::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use jti_blocklist::FileBackedCredentialRevocationStore;
+#[cfg(not(target_arch = "wasm32"))]
+pub use session_store::FileBackedSessionRegistry;
 pub use jwt::{
     CompositeJwtDispatch, JwkThumbprintInput, JwtError, ProtectedHeader,
     RFC9068_ACCESS_TOKEN_TYPES, composite_kid, decode, decode_unverified, decode_with_any_key,

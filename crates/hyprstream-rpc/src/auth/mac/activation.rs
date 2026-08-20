@@ -221,6 +221,10 @@ struct VerifiedSubjectEntry {
     /// from. Typed so eviction targets the exact credential without
     /// cross-issuer or JWT/CWT ambiguity.
     credential_id: Option<crate::auth::CredentialId>,
+    /// Issuer-scoped session ID `(iss, sid)` this entry was derived from, if
+    /// the credential carried one. Revalidated against the canonical session
+    /// registry on every read, exactly like the credential ID.
+    session_key: Option<crate::auth::SessionKey>,
     generation: u64,
 }
 
@@ -316,12 +320,19 @@ pub fn remember_verified_claims(
         .jti
         .as_ref()
         .map(|jti| crate::auth::CredentialId::jwt(&claims.iss, jti));
+    // Exact-one session parsing (v16 §3.3): a credential with ambiguous or
+    // malformed session claims is never cached — without a cache entry every
+    // PEP read misses and denies (fail-closed).
+    let Ok(session_key) = claims.session_key() else {
+        return;
+    };
     insert_verified_subject_entry(
         name,
         context,
         verified_tenant,
         claims.exp,
         credential_id,
+        session_key,
     );
 }
 
@@ -367,12 +378,19 @@ pub fn remember_verified_claims_with_credential(
     if !credential_id.is_valid() || credential_id.issuer != claims.iss {
         return;
     }
+    // Exact-one session parsing (v16 §3.3): a credential with ambiguous or
+    // malformed session claims is never cached — without a cache entry every
+    // PEP read misses and denies (fail-closed).
+    let Ok(session_key) = claims.session_key() else {
+        return;
+    };
     insert_verified_subject_entry(
         name,
         context,
         verified_tenant,
         claims.exp,
         Some(credential_id),
+        session_key,
     );
 }
 
@@ -382,6 +400,7 @@ fn insert_verified_subject_entry(
     verified_tenant: Option<&str>,
     expires_at: i64,
     credential_id: Option<crate::auth::CredentialId>,
+    session_key: Option<crate::auth::SessionKey>,
 ) {
     let mut cache = verified_subjects().write();
     let generation = cache.generation;
@@ -392,6 +411,7 @@ fn insert_verified_subject_entry(
             tenant: verified_tenant.map(str::to_owned),
             expires_at,
             credential_id,
+            session_key,
             generation,
         },
     );
@@ -407,23 +427,31 @@ fn insert_verified_subject_entry(
 /// `verify_claims`. A revoked credential, an absent store, or an unreachable
 /// authority (the store's own fail-closed `true`) all evict the entry and
 /// deny. Entries without a credential ID keep the cache-only behavior.
+///
+/// Session revalidation: a hit whose entry carries a session ID is likewise
+/// revalidated against the process-global session registry on every read — a
+/// revoked, expired, or unknown session, an absent registry, or an
+/// unreachable authority all evict the entry and deny (v16 §3.3: session
+/// revocation rejects every carrying credential).
 pub async fn subject_context(
     subject: &Subject,
     verified_tenant: Option<&str>,
 ) -> Option<SecurityContext> {
     subject_context_with(
         crate::auth::global_credential_revocation_store().map(std::convert::AsRef::as_ref),
+        crate::auth::global_session_registry().map(std::convert::AsRef::as_ref),
         subject,
         verified_tenant,
     )
     .await
 }
 
-/// [`subject_context`] against an explicit revocation store instead of the
-/// process-global handle. `None` behaves exactly like an unpublished global
-/// store: credential-bearing hits fail closed.
+/// [`subject_context`] against explicit authority handles instead of the
+/// process-global ones. `None` behaves exactly like an unpublished global:
+/// credential-bearing and session-bearing hits fail closed.
 pub async fn subject_context_with(
     store: Option<&dyn crate::auth::CredentialRevocationStore>,
+    session_registry: Option<&dyn crate::auth::SessionRegistry>,
     subject: &Subject,
     verified_tenant: Option<&str>,
 ) -> Option<SecurityContext> {
@@ -455,6 +483,8 @@ pub async fn subject_context_with(
             };
             match entry {
                 Some(entry) => {
+                    // Revalidate the credential AND the session when both are
+                    // present — a revocation of either rejects the entry.
                     if let Some(ref credential_id) = entry.credential_id {
                         let revoked = match store {
                             Some(store) => store.is_revoked(credential_id).await,
@@ -463,13 +493,22 @@ pub async fn subject_context_with(
                         };
                         if revoked {
                             revoke_verified_subject_credential(credential_id);
-                            None
-                        } else {
-                            Some(entry.context)
+                            return global_mac_activation_control().select_context(None);
                         }
-                    } else {
-                        Some(entry.context)
                     }
+                    if let Some(ref session_key) = entry.session_key {
+                        let session_revoked = match session_registry {
+                            Some(registry) => registry.is_revoked(session_key).await,
+                            // No session authority handle published — fail closed.
+                            None => true,
+                        };
+                        if session_revoked {
+                            let mut cache = verified_subjects().write();
+                            cache.subjects.remove(name);
+                            return global_mac_activation_control().select_context(None);
+                        }
+                    }
+                    Some(entry.context)
                 }
                 None => None,
             }
@@ -587,5 +626,52 @@ mod tests {
         let new_generation = flush_verified_subject_cache_generation();
         assert!(new_generation >= old_generation);
         assert!(verified_subjects().read().subjects.is_empty());
+    }
+
+    /// Exact-one session parsing at the CACHE-INSERTION boundary (v16 §3.3): a
+    /// credential carrying BOTH `sid` and `workload_session_id` is ambiguous
+    /// and is NEVER cached — without a cache entry every PEP read misses and
+    /// denies (fail-closed), so an active OIDC sid can never mask a revoked or
+    /// unknown workload session through a stale cached context.
+    #[test]
+    fn ambiguous_session_claims_are_never_cached() {
+        let _guard = CACHE_TEST_LOCK.lock();
+        flush_verified_subject_cache_generation();
+        assert!(verified_subjects().read().subjects.is_empty());
+
+        let now = chrono::Utc::now().timestamp();
+        let clearance =
+            SecurityLabel::new(Level::Secret, Assurance::Classical, CompartmentSet::EMPTY);
+        let mut ambiguous = crate::auth::Claims::new("did:web:alice".to_owned(), now, now + 300)
+            .with_clearance(clearance)
+            .with_sid("oidc-1")
+            .with_workload_session_id("wl-1");
+        ambiguous.iss = "https://local.example".to_owned();
+        ambiguous.jti = Some("ambiguous-jti".to_owned());
+        remember_verified_claims(
+            &Subject::new("did:web:alice"),
+            &ambiguous,
+            VerifiedKeyMaterial::Classical,
+            Some("tenant-a"),
+        );
+        assert!(
+            verified_subjects().read().subjects.is_empty(),
+            "a credential with ambiguous session claims must never be cached"
+        );
+
+        // Control: a well-formed single-session credential IS cached.
+        let mut ok = crate::auth::Claims::new("did:web:alice".to_owned(), now, now + 300)
+            .with_clearance(clearance)
+            .with_sid("oidc-1");
+        ok.iss = "https://local.example".to_owned();
+        ok.jti = Some("ok-jti".to_owned());
+        remember_verified_claims(
+            &Subject::new("did:web:alice"),
+            &ok,
+            VerifiedKeyMaterial::Classical,
+            Some("tenant-a"),
+        );
+        assert_eq!(verified_subjects().read().subjects.len(), 1);
+        flush_verified_subject_cache_generation();
     }
 }

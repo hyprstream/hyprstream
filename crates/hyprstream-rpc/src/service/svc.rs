@@ -478,6 +478,21 @@ impl EnvelopeContext {
         context
     }
 
+    /// Build an authenticated, tenant-bound context fixture that also carries
+    /// verified `claims` — for exercising handlers that read `ctx.claims()`
+    /// (e.g. a service credential's `workload_session_id` on renewal).
+    #[cfg(any(test, feature = "test-classical-policy"))]
+    pub fn for_test_authenticated_subject_with_claims(
+        subject: Subject,
+        tenant: impl Into<String>,
+        signer: ed25519_dalek::VerifyingKey,
+        claims: crate::auth::Claims,
+    ) -> Self {
+        let mut context = Self::for_test_authenticated_subject_in_tenant(subject, tenant, signer);
+        context.claims = Some(claims);
+        context
+    }
+
     /// Get user claims (if present, after verify_claims has run).
     pub fn claims(&self) -> Option<&crate::auth::Claims> {
         self.claims.as_ref()
@@ -1147,8 +1162,44 @@ pub trait RequestService: 'static {
             _ => anyhow::bail!("unsupported JWT algorithm"),
         };
 
-        // Check credential against the revocation store (revoked access tokens)
-        if let Some(ref jti) = verified.jti {
+        // Credential/session checks. The local-issuer set is resolved first:
+        // the credential profile makes `jti` REQUIRED on locally issued
+        // tokens, and the session registry is a local authority — both
+        // enforcements below apply to local issuers. Federated tokens keep
+        // the revocation check only (their sessions are not local state).
+        let local_issuers = key_source.local_issuers();
+        let local_issuers_refs: Vec<&str> = local_issuers.iter().map(String::as_str).collect();
+        let token_is_local = crate::auth::is_local_iss(&verified.iss, &local_issuers_refs);
+
+        // v16 §3.1/§3.3: issuer-scoped credential and session enforcement
+        // applies only to tokens carrying a real authoritative issuer. An
+        // empty `iss` is the in-process provenance sentinel — accepted solely
+        // from in-process callers (gated above where an empty issuer from a
+        // networked caller is rejected) and never issuer-scoped: a
+        // `CredentialId` requires a non-empty issuer by construction (§3.1), so
+        // an empty-iss token has no revocable credential identity and no
+        // issuer namespace to scope a session to. The `jti` that `jwt::encode`
+        // auto-injects is then an encoding artifact, not a credential —
+        // running it through the issuer-scoped gate would build an invalid
+        // `CredentialId`, fail closed, and reject a legitimate in-process
+        // caller. `is_local_iss` deliberately reports empty-iss as local, so
+        // the credential gate must additionally require a non-empty issuer.
+        let issuer_scoped = !verified.iss.is_empty();
+
+        // A locally issued token with a real issuer must carry a jti:
+        // revocation could never observe it otherwise. Reject rather than
+        // skipping the check. Empty-iss in-process provenance is exempt (no
+        // issuer to scope the credential to).
+        if token_is_local && issuer_scoped && verified.jti.is_none() {
+            tracing::warn!(iss = %verified.iss, sub = %verified.sub, "Rejected local-issuer JWT without jti");
+            anyhow::bail!("local credential missing required jti");
+        }
+
+        // Check credential against the revocation store (revoked access
+        // tokens). Only issuer-scoped tokens (non-empty issuer) have a valid
+        // `CredentialId`; empty-iss in-process provenance carries no revocable
+        // credential identity and is exempt.
+        if let Some(jti) = verified.jti.as_ref().filter(|_| issuer_scoped) {
             match self.credential_revocation_store() {
                 Some(store) => {
                     let cred_id = crate::auth::CredentialId::jwt(&verified.iss, jti);
@@ -1167,6 +1218,38 @@ pub trait RequestService: 'static {
             }
         }
 
+        // Session check (v16 §3.3): a local token carrying a session ID is
+        // rejected when the session is revoked, expired, unknown, or cannot
+        // be checked. Only issuer-scoped local tokens participate — an
+        // empty-iss in-process token has no issuer namespace to scope a
+        // session to (a `SessionKey` requires a non-empty issuer).
+        if token_is_local && issuer_scoped {
+            // Exact-one session parsing (v16 §3.3): both-present or empty
+            // session identifiers are malformed and reject here, before any
+            // authorization or cache insertion.
+            let session_key = match verified.session_key() {
+                Ok(key) => key,
+                Err(e) => {
+                    tracing::warn!(iss = %verified.iss, sub = %verified.sub, error = %e, "Rejected JWT with malformed session claims");
+                    anyhow::bail!("malformed session claims");
+                }
+            };
+            if let Some(session_key) = session_key {
+                match crate::auth::global_session_registry() {
+                    Some(registry) => {
+                        if registry.is_revoked(&session_key).await {
+                            tracing::warn!(iss = %verified.iss, sub = %verified.sub, "JWT with revoked/unknown session rejected");
+                            anyhow::bail!("session has been revoked");
+                        }
+                    }
+                    None => {
+                        tracing::warn!(sub = %verified.sub, "Token with session id rejected: no session registry configured");
+                        anyhow::bail!("session registry unavailable");
+                    }
+                }
+            }
+        }
+
         // Store verified claims on context for downstream use
         if verified.sub == UNAUTHENTICATED_DID_SENTINEL {
             tracing::warn!("Rejected JWT whose subject is the reserved unauthenticated sentinel");
@@ -1174,8 +1257,6 @@ pub trait RequestService: 'static {
                 "{UNAUTHENTICATED_DID_SENTINEL} is credential absence and cannot authenticate"
             );
         }
-        let local_issuers = key_source.local_issuers();
-        let local_issuers_refs: Vec<&str> = local_issuers.iter().map(String::as_str).collect();
         // Fu5/#677: MAC clearance is authority-asserted and honored only from
         // local-issuer tokens. An external OIDC issuer trusted for identity is
         // not trusted to assert MAC clearance on this node — strip the claim
@@ -1497,6 +1578,17 @@ mod empty_iss_gate_tests {
         }
         fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn crate::auth::JwtKeySource>> {
             Some(self.key_source.clone())
+        }
+        fn credential_revocation_store(&self) -> Option<&dyn crate::auth::CredentialRevocationStore> {
+            // Test-local revocation store: these tests verify local
+            // jti-bearing tokens, and every production process publishes a
+            // store at startup (the policy-authority bootstrap). Without
+            // this, verification fails closed on store absence and the tests
+            // only pass when an unrelated sibling test happens to publish
+            // the process-global handle first.
+            static STORE: std::sync::OnceLock<crate::auth::InMemoryCredentialRevocationStore> =
+                std::sync::OnceLock::new();
+            Some(STORE.get_or_init(crate::auth::InMemoryCredentialRevocationStore::new))
         }
         fn require_cnf_binding(&self) -> bool {
             false
@@ -1916,8 +2008,12 @@ mod empty_iss_gate_tests {
             cached_subjects: std::sync::Arc::default(),
         };
         let now = chrono::Utc::now().timestamp();
-        let claims =
-            Claims::new("alice".to_owned(), now, now + 60).with_issuer("https://local".to_owned());
+        // Local-issuer credentials must carry a credential ID (jti is a
+        // REQUIRED profile claim); the hand-rolled composite helper does not
+        // inject one, so set it explicitly.
+        let claims = Claims::new("alice".to_owned(), now, now + 60)
+            .with_issuer("https://local".to_owned())
+            .with_jti();
         for typ in crate::auth::RFC9068_ACCESS_TOKEN_TYPES {
             let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"{typ}","kid":"{kid_a}"}}"#);
             let valid = composite_token(&header, &claims, &pq_a, &ed_a, false);
@@ -1931,6 +2027,25 @@ mod empty_iss_gate_tests {
 
         let valid_header =
             format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{kid_a}"}}"#);
+
+        // Exact-one session parsing (v16 §3.3) at the PRIMARY verify boundary: a
+        // local credential carrying BOTH `sid` and `workload_session_id` is
+        // ambiguous and rejected before any authorization — an active OIDC sid
+        // must never mask a revoked/unknown workload session.
+        let both_sessions = Claims::new("alice".to_owned(), now, now + 60)
+            .with_issuer("https://local".to_owned())
+            .with_jti()
+            .with_sid("s1")
+            .with_workload_session_id("w1");
+        let ambiguous_token = composite_token(&valid_header, &both_sessions, &pq_a, &ed_a, false);
+        let ambiguous_err = svc
+            .verify_claims(&mut ctx_with_token(ambiguous_token, false))
+            .await
+            .expect_err("a credential carrying both sid and workload_session_id must be rejected");
+        assert!(
+            ambiguous_err.to_string().contains("malformed session claims"),
+            "unexpected error for ambiguous session claims: {ambiguous_err}"
+        );
 
         let mutations = [
             (
