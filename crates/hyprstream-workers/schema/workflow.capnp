@@ -4,6 +4,7 @@ using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".paramDescription;
 using import "/annotations.capnp".scope;
+using import "/annotations.capnp".dispatchMac;
 using import "/annotations.capnp".vfsPath;
 
 # Cap'n Proto schema for workflow service (independent service)
@@ -20,30 +21,30 @@ struct WorkflowRequest {
   union {
     scanRepo @1 :Text
       $mcpDescription("Scan a repository for workflow definitions")
-      $scope(query)
+      $scope(query) $dispatchMac("internal:pq-hybrid")
       $vfsPath("{arg}/scan");
     register @2 :WorkflowDef
       $mcpDescription("Register a workflow definition")
-      $scope(write);
+      $scope(write) $dispatchMac("internal:pq-hybrid");
     list @3 :Void
       $mcpDescription("List all registered workflows")
-      $scope(query);
+      $scope(query) $dispatchMac("internal:pq-hybrid");
     dispatch @4 :DispatchRequest
       $mcpDescription("Dispatch a workflow run with input parameters")
-      $scope(write);
+      $scope(write) $dispatchMac("internal:pq-hybrid");
     subscribe @5 :SubscribeRequest
       $mcpDescription("Subscribe to workflow events")
-      $scope(write);
+      $scope(write) $dispatchMac("internal:pq-hybrid");
     unsubscribe @6 :Text
       $mcpDescription("Unsubscribe from workflow events")
-      $scope(write);
+      $scope(write) $dispatchMac("internal:pq-hybrid");
     getRun @7 :Text
       $mcpDescription("Get status of a workflow run")
-      $scope(query)
+      $scope(query) $dispatchMac("internal:pq-hybrid")
       $vfsPath("{arg}/run");
     listRuns @8 :Text
       $mcpDescription("List runs for a workflow")
-      $scope(query)
+      $scope(query) $dispatchMac("internal:pq-hybrid")
       $vfsPath("{arg}/runs");
   }
 }

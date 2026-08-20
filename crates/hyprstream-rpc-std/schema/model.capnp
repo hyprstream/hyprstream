@@ -4,6 +4,7 @@ using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".paramDescription;
 using import "/annotations.capnp".scope;
+using import "/annotations.capnp".dispatchMac;
 using import "/annotations.capnp".docExample;
 using import "/annotations.capnp".optional;
 using import "/annotations.capnp".serdeRename;
@@ -51,11 +52,11 @@ struct ModelRequest {
 
   # Request payload (union of request types)
   union {
-    load @1 :LoadModelRequest $mcpDescription("Load a model into memory for inference") $scope(write);
-    unload @2 :UnloadModelRequest $mcpDescription("Unload a model from memory to free resources") $scope(write);
-    status @3 :StatusRequest $mcpDescription("Get status of all loaded/loading models (empty modelRef) or a specific model") $scope(query)
+    load @1 :LoadModelRequest $mcpDescription("Load a model into memory for inference") $scope(write) $dispatchMac("internal:pq-hybrid");
+    unload @2 :UnloadModelRequest $mcpDescription("Unload a model from memory to free resources") $scope(write) $dispatchMac("internal:pq-hybrid");
+    status @3 :StatusRequest $mcpDescription("Get status of all loaded/loading models (empty modelRef) or a specific model") $scope(query) $dispatchMac("internal:pq-hybrid")
         $docExample("cat /srv/model/status");
-    healthCheck @4 :Void $mcpDescription("Check model service health and status") $scope(query)
+    healthCheck @4 :Void $mcpDescription("Check model service health and status") $scope(query) $dispatchMac("internal:pq-hybrid")
         $docExample("cat /srv/model/health");
 
     # Scoped interfaces (require modelRef)
@@ -79,14 +80,14 @@ struct ModelFsRequest {
     # 9P ops. Baseline TE: read-side ops (walk/open/read/stat/clunk) are
     # side-effect-free → query; mutating ops (write/create/remove) → write.
     # Per-(op, path) enforcement (S2) refines this with the node's object-label.
-    walk @1 :Nine.NpWalk $scope(query) $mcpDescription("Walk path components to get a fid");
-    open @2 :Nine.NpOpen $scope(query) $mcpDescription("Open a walked fid for I/O");
-    read @3 :Nine.NpRead $scope(query) $mcpDescription("Read from an opened fid");
-    write @4 :Nine.NpWrite $scope(write) $mcpDescription("Write to an opened fid");
-    clunk @5 :Nine.NpClunk $scope(query) $mcpDescription("Release a fid");
-    stat @6 :Nine.NpStatReq $scope(query) $mcpDescription("Get file metadata");
-    create @7 :Nine.NpCreate $scope(write) $mcpDescription("Create a file/dir under a directory fid");
-    remove @8 :Nine.NpRemove $scope(write) $mcpDescription("Remove a file/dir");
+    walk @1 :Nine.NpWalk $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Walk path components to get a fid");
+    open @2 :Nine.NpOpen $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Open a walked fid for I/O");
+    read @3 :Nine.NpRead $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Read from an opened fid");
+    write @4 :Nine.NpWrite $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Write to an opened fid");
+    clunk @5 :Nine.NpClunk $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Release a fid");
+    stat @6 :Nine.NpStatReq $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Get file metadata");
+    create @7 :Nine.NpCreate $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Create a file/dir under a directory fid");
+    remove @8 :Nine.NpRemove $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Remove a file/dir");
   }
 }
 
@@ -115,27 +116,27 @@ struct ModelFsResponse {
 struct TttRequest {
   modelRef @0 :Text;
   union {
-    init @1 :LoraConfig $scope(train)
+    init @1 :LoraConfig $scope(train) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Initialize the training infrastructure (LoRA parameters, optimizer, delta pool) on a loaded model. Required before ttt.train or TTT-enabled inference. Configure rank, alpha, target modules, and learning rate.");
-    train @2 :TrainStepRequest $scope(train)
+    train @2 :TrainStepRequest $scope(train) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Run TTT gradient steps on input text WITHOUT generating a response. Pure training — use for pre-training on domain text before asking questions. Returns loss metrics and recommendation. Use adaptationStrategy=speculative to keep pending, then call ttt.writeback or ttt.evict.");
-    trainStream @3 :TrainStepRequest $scope(train)
+    trainStream @3 :TrainStepRequest $scope(train) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Stream TTT training on input text. Returns progress and results via streaming. Use for long-running training that would timeout via ttt.train.");
-    writeback @4 :Void $scope(manage)
+    writeback @4 :Void $scope(manage) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Write back a pending TTT adaptation to the tenant delta accumulator. Call after reviewing onlineTrainingMetrics.recommendation from infer.generateStream. Must be called within the pending rollback window (default 60 seconds, configurable via pending_rollback_ms). If the window expires, the adaptation is auto-evicted and this call will return an error.");
-    evict @5 :Void $scope(manage)
+    evict @5 :Void $scope(manage) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Evict (discard) a pending TTT adaptation, restoring the tenant delta accumulator to its pre-adaptation state. Call within the pending rollback window (default 60 seconds, configurable via pending_rollback_ms) if recommendation was false or output quality was poor. If multiple adaptations were stacked, evict restores to the state before the earliest pending adaptation.");
-    zero @6 :Void $scope(manage)
+    zero @6 :Void $scope(manage) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Zero the tenant delta accumulator, clearing all accumulated training. Use after ttt.save or ttt.export to free capacity.");
-    status @7 :Void $scope(query)
+    status @7 :Void $scope(query) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Get tenant delta accumulator metrics: step count, loss improvement, drift. Use to decide if adaptations should be persisted via ttt.save or ttt.export.");
-    save @8 :SaveAdaptationRequest $scope(write)
+    save @8 :SaveAdaptationRequest $scope(write) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Merge the tenant delta accumulator into an on-disk adapter file using a configurable merge strategy (replace/additive/do_merge). For incremental refinement of existing adapters. Call ttt.status first to verify quality. The result is committed to the model's git repository.");
-    snapshot @9 :Void $scope(write)
+    snapshot @9 :Void $scope(write) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Snapshot the tenant delta accumulator to content-addressed storage without merging into an adapter file.");
-    export @10 :ExportPeftRequest $scope(write)
+    export @10 :ExportPeftRequest $scope(write) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Export the tenant delta accumulator as a standalone PEFT-compatible adapter directory (adapter_config.json + adapter_model.safetensors). For interop with HuggingFace and external tools. The exported adapter can be reloaded via adapter.load.");
-    writeTttConfig @11 :WriteTttConfigRequest $scope(write)
+    writeTttConfig @11 :WriteTttConfigRequest $scope(write) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Write hyprstream_training configuration to the model worktree's config.json and optionally reload. Required before ttt.train or TTT-enabled inference. Sets training mode to test_time_training and configures LoRA rank/alpha, target modules, and learning rate.");
   }
 }
@@ -153,15 +154,15 @@ struct TttRequest {
 struct AdapterRequest {
   modelRef @0 :Text;
   union {
-    load @1 :Text $scope(write)
+    load @1 :Text $scope(write) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Load a PEFT adapter from disk into the base_delta register. Applied to all inference until unloaded. Path is relative within the model worktree (e.g. 'adapters/my-adapter').");
-    unload @2 :Void $scope(write)
+    unload @2 :Void $scope(write) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Clear the base_delta register, removing the loaded adapter from GPU/CPU memory.");
-    status @3 :Void $scope(query)
+    status @3 :Void $scope(query) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Check if a LoRA adapter is currently loaded in the base_delta register.");
-    inspect @4 :Text $scope(query)
+    inspect @4 :Text $scope(query) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Validate an on-disk PEFT adapter directory and return its metadata (rank, alpha, target modules, base model). Does not load anything into memory.");
-    merge @5 :MergeLoraRequest $scope(write)
+    merge @5 :MergeLoraRequest $scope(write) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Read a PEFT adapter from disk and merge it into the currently loaded base_delta register using a configurable merge strategy (replace/additive/do_merge). Requires an adapter already loaded via adapter.load.");
   }
 }
@@ -174,13 +175,13 @@ struct AdapterRequest {
 struct InferRequest {
   modelRef @0 :Text;
   union {
-    generateStream @1 :GenerationRequest $scope(infer)
+    generateStream @1 :GenerationRequest $scope(infer) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Run inference with automatic domain adaptation. When TTT is enabled, the model adapts to your prompt BEFORE generating — the response is always produced using the adapted weights, even when adaptationStrategy=speculative. Check onlineTrainingMetrics.recommendation in the response, then call ttt.writeback (if true) or ttt.evict (if false) within the pending rollback window (default 60 seconds). If you call generateStream again before resolving a pending adaptation, the new adaptation stacks on top and evict will restore to the state before the first pending adaptation. Pending adaptations auto-evict after the timeout if writeback/evict is not called.");
-    applyChatTemplate @2 :ChatTemplateRequest $scope(query)
+    applyChatTemplate @2 :ChatTemplateRequest $scope(query) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Apply chat template to messages for a loaded model");
-    status @3 :Void $scope(query)
+    status @3 :Void $scope(query) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Get detailed status information about a model including online training configuration");
-    embed @4 :EmbedImagesRequest $scope(infer)
+    embed @4 :EmbedImagesRequest $scope(infer) $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Compute embeddings for one or more images. Returns embedding vectors from the model's vision encoder (e.g. SigLIP). Synchronous — returns all embeddings in a single response.");
   }
 }

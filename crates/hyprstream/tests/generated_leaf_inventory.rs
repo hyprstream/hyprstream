@@ -1,6 +1,6 @@
 //! Full-leaf derivation and generated method-policy inventory over the REAL
 //! production schemas linked into the hyprstream binary (v16 §5.1/§6.1,
-//! issue #1504).
+//! issues #1504/#1505).
 //!
 //! Proves on real generated artifacts:
 //!
@@ -13,11 +13,21 @@
 //!    validates and installs deterministically. This test IS the build gate:
 //!    a schema change that produces a colliding, contradictory, or
 //!    unannotated row fails here.
+//!
+//! WS-D additions (v16 §6): every row derives from the strict
+//! `$dispatchMac`/`$dispatchPublic` pair — the transitional label is exactly
+//! system low everywhere, MAC rows never target system low. The public rows
+//! are `policy.check` and `policy.checkBatch`, each with the same recorded
+//! circular-authorization reason; `policy
+//! registerServiceKey` is MAC'd (not public) with its control-plane exemption
+//! recorded, and mutation semantics are consistent with the checked
+//! scope-action blocks over the whole real inventory.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use hyprstream_core::registry_capnp;
 use hyprstream_core::services::generated::registry_client::decode_registry_request_body;
+use hyprstream_rpc::auth::mac::{Assurance, Level};
 use hyprstream_rpc::proof::policy;
 
 fn to_bytes(message: &capnp::message::Builder<capnp::message::HeapAllocator>) -> Vec<u8> {
@@ -160,4 +170,126 @@ fn generated_inventory_is_complete_valid_and_lists_derived_leaves() {
     assert_eq!(count, rows.len());
     assert!(table.policy_for("registry", &leaf_key).is_some());
     assert!(table.policy_for("registry", "9999.9999").is_none());
+}
+
+/// WS-D (v16 §6): the strict dispatch pair over the complete REAL inventory.
+///
+/// - every row's transitional label is exactly system low (§7.3);
+/// - every `$dispatchMac` row targets the parsed label — never system low —
+///   and, for the uniform production default, exactly
+///   `internal:pq-hybrid` (the target inventory stays operator-reviewable;
+///   this asserts what the schemas declare today, not a ceiling);
+/// - the public set is exactly `policy.check` and `policy.checkBatch`, each
+///   with its circular-authorization reason recorded; and
+/// - `policy.registerServiceKey` is `$dispatchMac` (credential required), its
+///   control-plane exemption recorded, never public.
+#[test]
+fn the_complete_inventory_carries_the_strict_dispatch_pair() {
+    let rows = policy::collect_generated_rows().expect("inventory collects");
+    policy::validate_generated_rows(&rows).expect("inventory validates");
+
+    let mut public_rows = Vec::new();
+    for row in &rows {
+        assert_eq!(
+            row.transitional_label,
+            policy::SYSTEM_LOW_LABEL,
+            "{}:{} transitional column must be system low",
+            row.service,
+            row.symbolic_path
+        );
+        match row.authentication {
+            policy::AuthenticationRequirement::CredentialRequired => {
+                assert_ne!(
+                    row.target_label,
+                    policy::SYSTEM_LOW_LABEL,
+                    "{}:{} MAC row must not target system low",
+                    row.service,
+                    row.symbolic_path
+                );
+                assert!(
+                    row.public_reason.is_none(),
+                    "{}:{} MAC row carries a public reason",
+                    row.service,
+                    row.symbolic_path
+                );
+                // The uniform production default today (operator-reviewable).
+                assert_eq!(
+                    row.target_label,
+                    policy::dispatch_label(Level::Internal, Assurance::PqHybrid, &[]),
+                    "{}:{} target label is not the declared uniform default",
+                    row.service,
+                    row.symbolic_path
+                );
+            }
+            policy::AuthenticationRequirement::UnauthenticatedAllowed => {
+                assert_eq!(
+                    row.target_label,
+                    policy::SYSTEM_LOW_LABEL,
+                    "{}:{} public row must expand to exactly system low",
+                    row.service,
+                    row.symbolic_path
+                );
+                public_rows.push((row.service, row.symbolic_path));
+            }
+        }
+    }
+
+    assert_eq!(
+        public_rows,
+        vec![("policy", "check"), ("policy", "checkBatch")],
+        "the public dispatch set is exactly the circular-authorization policy checks"
+    );
+    for path in ["check", "checkBatch"] {
+        let row = rows
+            .iter()
+            .find(|row| row.service == "policy" && row.symbolic_path == path)
+            .expect("public policy check row present");
+        assert_eq!(
+            row.public_reason,
+            Some("the authz check itself cannot require authz without circularity; it is the one leaf dispatched unauthenticated"),
+            "policy.{path} records the circular-authorization public reason"
+        );
+    }
+
+    // registerServiceKey: MAC'd, credential-required, control-plane exemption
+    // recorded (scope action empty + scope_exempt), never public.
+    let rsk = rows
+        .iter()
+        .find(|r| r.service == "policy" && r.symbolic_path == "registerServiceKey")
+        .expect("policy.registerServiceKey row present");
+    assert_eq!(
+        rsk.authentication,
+        policy::AuthenticationRequirement::CredentialRequired
+    );
+    assert!(rsk.scope_action.is_empty());
+    assert!(rsk.scope_exempt, "control-plane exemption recorded");
+    assert!(rsk.public_reason.is_none());
+}
+
+/// Mutation semantics are consistent with the checked scope-action blocks
+/// across the whole real inventory — the drift gate between the codegen-time
+/// read-class list and the runtime validator's.
+#[test]
+fn mutation_semantics_follow_the_scope_action_blocks() {
+    let rows = policy::collect_generated_rows().expect("inventory collects");
+    for row in &rows {
+        if row.scope_action.is_empty() {
+            assert!(
+                row.mutation_semantics.is_none(),
+                "{}:{} carries no scope action; mutation gate does not apply",
+                row.service,
+                row.symbolic_path
+            );
+            continue;
+        }
+        let read_class = policy::READ_CLASS_ACTIONS.contains(&row.scope_action);
+        assert_eq!(
+            read_class,
+            row.mutation_semantics.is_none(),
+            "{}:{} (scope {}) read-class ⇔ no mutation semantics",
+            row.service,
+            row.symbolic_path,
+            row.scope_action
+        );
+    }
 }

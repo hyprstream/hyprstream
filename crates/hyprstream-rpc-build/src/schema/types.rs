@@ -59,6 +59,17 @@ pub struct UnionVariant {
     /// genesis-coverage finding (no permissive default).
     #[serde(default)]
     pub vfs_mac: String,
+    /// `$dispatchMac` annotation text — the method's target dispatch MAC label
+    /// in the strict `<level>:<assurance>[:<compartments>]` grammar (v16 §6,
+    /// WS-D). Empty = not declared (a leaf with neither dispatch annotation is
+    /// a build error; a scoped dispatcher carries neither).
+    #[serde(default)]
+    pub dispatch_mac: String,
+    /// `$dispatchPublic` annotation text — the mandatory, reviewable reason a
+    /// leaf may be dispatched unauthenticated (v16 §6). Empty = not declared.
+    /// Expands to exactly system low; public is never inherited.
+    #[serde(default)]
+    pub dispatch_public: String,
 }
 
 /// Payload carried by a tagged-union arm.
@@ -299,6 +310,8 @@ mod vfs_metadata_tests {
             vfs_bulk: false,
             vfs_hidden: false,
             vfs_mac: String::new(),
+            dispatch_mac: String::new(),
+            dispatch_public: String::new(),
         };
         let json = serde_json::to_string(&v).expect("serialize");
         let back: UnionVariant = serde_json::from_str(&json).expect("deserialize");

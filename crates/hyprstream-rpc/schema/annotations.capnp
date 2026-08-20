@@ -79,6 +79,40 @@ annotation capability(field) :ScopeAction;
 # exemption is reviewable. Absence of BOTH `$scope` and `$scopeExempt` = build error.
 annotation scopeExempt(field) :Text;
 
+# ── Dispatch MAC policy (v16 §6, WS-D) ────────────────────────────────────
+# The strict dispatch-policy pair that REPLACES `$scope`/`$scopeExempt` as the
+# source of the generated method-policy inventory (v16 #1505). `$scope` remains
+# the control-plane scope vocabulary (S3); it is no longer the dispatch-floor
+# stand-in.
+#
+# `$dispatchMac` carries the method's target MAC label in the strict grammar:
+#
+#   <level>:<assurance>[:<compartment>[,<compartment>...]]
+#
+#   level        one of public | internal | confidential | secret
+#   assurance    one of unverified | classical | pq-hybrid
+#   compartment  a name resolved through the checked-in, versioned
+#                InitialLabelMap (stable bit assignments, append-only,
+#                tombstoned — never reused), listed in canonical (bit-ascending)
+#                order, no duplicates.
+#
+# `$dispatchPublic("<reason>")` is the ONLY way a leaf may be dispatched by an
+# unauthenticated caller; the reason string is mandatory and reviewable, and the
+# label expands to exactly system low.
+#
+# Enforced by the schema reader / code generator (v16 §6):
+#   - every recursively discovered leaf carries exactly one of the two;
+#   - scoped dispatcher nodes carry neither; their leaves do;
+#   - both annotations on one leaf are a build error;
+#   - `$dispatchPublic` requires a trimmed nonempty reason and appears only on
+#     leaves (public is never inherited through a dispatcher);
+#   - system low written through `$dispatchMac` is a build error;
+#   - empty components, duplicate/unknown compartments, noncanonical ordering,
+#     unknown levels/assurances, and parse failures are build errors;
+#   - an annotation failure can never produce an unlabeled runtime row.
+annotation dispatchMac(field)    :Text;
+annotation dispatchPublic(field) :Text;
+
 # Mark as deprecated with reason
 annotation deprecated(field, union, struct, enum) :Text;
 
