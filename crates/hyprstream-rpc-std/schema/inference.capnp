@@ -4,6 +4,7 @@ using import "/common.capnp".ErrorInfo;
 using import "/streaming.capnp".StreamInfo;
 using import "/annotations.capnp".optional;
 using import "/annotations.capnp".scope;
+using import "/annotations.capnp".dispatchMac;
 using import "/annotations.capnp".paramDescription;
 using import "/annotations.capnp".serdeRename;
 using Opt = import "/optional.capnp";
@@ -35,63 +36,63 @@ struct InferenceRequest {
 
   # Request payload (union of request types)
   union {
-    generateStream @1 :GenerationRequest $scope(infer);
-    modelInfo @2 :Void $scope(query);
-    isReady @3 :Void $scope(query);
-    applyChatTemplate @4 :ChatTemplateRequest $scope(query);
+    generateStream @1 :GenerationRequest $scope(infer) $dispatchMac("internal:pq-hybrid");
+    modelInfo @2 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+    isReady @3 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+    applyChatTemplate @4 :ChatTemplateRequest $scope(query) $dispatchMac("internal:pq-hybrid");
 
     # LoRA operations
-    createLora @5 :LoraConfig $scope(write);
-    loadLora @6 :Text $scope(write);       # path
-    saveLora @7 :Text $scope(write);       # path
-    unloadLora @8 :Void $scope(write);
-    hasLora @9 :Void $scope(query);
+    createLora @5 :LoraConfig $scope(write) $dispatchMac("internal:pq-hybrid");
+    loadLora @6 :Text $scope(write) $dispatchMac("internal:pq-hybrid");       # path
+    saveLora @7 :Text $scope(write) $dispatchMac("internal:pq-hybrid");       # path
+    unloadLora @8 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
+    hasLora @9 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
 
     # Session operations
-    setSession @10 :Text $scope(write);    # session_id
-    clearSession @11 :Void $scope(write);
-    releaseSession @12 :Text $scope(write);
+    setSession @10 :Text $scope(write) $dispatchMac("internal:pq-hybrid");    # session_id
+    clearSession @11 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
+    releaseSession @12 :Text $scope(write) $dispatchMac("internal:pq-hybrid");
 
     # Health/Lifecycle
-    healthCheck @13 :Void $scope(query);
-    shutdown @14 :Void $scope(manage);
+    healthCheck @13 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+    shutdown @14 :Void $scope(manage) $dispatchMac("internal:pq-hybrid");
 
     # Training loop control — tenant-aware TTT (identity from auth envelope)
-    tttWriteback @15 :Void $scope(train);
-    tttEvict @16 :Void $scope(train);
-    trainStep @17 :TrainStepRequest $scope(train);
-    tttZero @18 :Void $scope(manage);
+    tttWriteback @15 :Void $scope(train) $dispatchMac("internal:pq-hybrid");
+    tttEvict @16 :Void $scope(train) $dispatchMac("internal:pq-hybrid");
+    trainStep @17 :TrainStepRequest $scope(train) $dispatchMac("internal:pq-hybrid");
+    tttZero @18 :Void $scope(manage) $dispatchMac("internal:pq-hybrid");
 
     # Persistence operations (identity from auth envelope)
-    getDeltaStatus @19 :Void $scope(query);
-    saveAdaptation @20 :SaveAdaptationRequest $scope(write);
-    snapshotDelta @21 :Void $scope(write);
+    getDeltaStatus @19 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+    saveAdaptation @20 :SaveAdaptationRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    snapshotDelta @21 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
 
     # Streaming training (returns immediately, results via PUB/SUB)
-    trainStepStream @22 :TrainStepRequest $scope(train);
+    trainStepStream @22 :TrainStepRequest $scope(train) $dispatchMac("internal:pq-hybrid");
 
     # Export delta as PEFT adapter directory (identity from auth envelope)
-    exportPeftAdapter @23 :ExportPeftRequest $scope(write);
+    exportPeftAdapter @23 :ExportPeftRequest $scope(write) $dispatchMac("internal:pq-hybrid");
 
     # Merge an on-disk adapter into the loaded base_delta
-    mergeLora @24 :MergeLoraRequest $scope(write);
+    mergeLora @24 :MergeLoraRequest $scope(write) $dispatchMac("internal:pq-hybrid");
 
     # Streaming variants — return StreamInfo immediately, results via PUB/SUB.
     # Use these instead of the non-streaming versions for operations that may
     # involve significant compute or I/O (GPU alloc, disk writes, merges).
-    createLoraStream @25 :LoraConfig $scope(write);
-    loadLoraStream @26 :Text $scope(write);          # path
-    saveLoraStream @27 :Text $scope(write);          # path
-    saveAdaptationStream @28 :SaveAdaptationRequest $scope(write);
-    snapshotDeltaStream @29 :Void $scope(write);
-    exportPeftAdapterStream @30 :ExportPeftRequest $scope(write);
-    mergeLoraStream @31 :MergeLoraRequest $scope(write);
+    createLoraStream @25 :LoraConfig $scope(write) $dispatchMac("internal:pq-hybrid");
+    loadLoraStream @26 :Text $scope(write) $dispatchMac("internal:pq-hybrid");          # path
+    saveLoraStream @27 :Text $scope(write) $dispatchMac("internal:pq-hybrid");          # path
+    saveAdaptationStream @28 :SaveAdaptationRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    snapshotDeltaStream @29 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
+    exportPeftAdapterStream @30 :ExportPeftRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    mergeLoraStream @31 :MergeLoraRequest $scope(write) $dispatchMac("internal:pq-hybrid");
 
     # Vision embeddings (synchronous — returns all embeddings in one response)
-    embed @32 :EmbedImagesRequest $scope(infer);
+    embed @32 :EmbedImagesRequest $scope(infer) $dispatchMac("internal:pq-hybrid");
 
     # TTN layer profile (returns JSON-encoded LayerProfile for diagnostics/tooling)
-    getLayerProfile @33 :Void $scope(query);
+    getLayerProfile @33 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
   }
 }
 

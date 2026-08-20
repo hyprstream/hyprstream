@@ -9,6 +9,7 @@
 
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
+using import "/annotations.capnp".dispatchMac;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
 using import "/annotations.capnp".domainType;
@@ -22,80 +23,80 @@ struct DiscoveryRequest {
   # Request payload (union of request types)
   union {
     # List all registered services with descriptions
-    listServices @1 :Void $scope(query) $mcpDescription("List all registered services with descriptions");
+    listServices @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("List all registered services with descriptions");
 
     # Get all endpoints for a named service
-    getEndpoints @2 :Text $scope(query) $mcpDescription("Get all endpoints for a named service")
+    getEndpoints @2 :Text $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Get all endpoints for a named service")
       $vfsPath("{arg}/endpoints");
 
     # Get schema bytes for a service
-    getSchema @3 :Text $scope(query) $mcpDescription("Get schema bytes for a service")
+    getSchema @3 :Text $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Get schema bytes for a service")
       $vfsPath("{arg}/schema");
 
     # Health check
-    ping @4 :Void $scope(query) $mcpDescription("Health check");
+    ping @4 :Void $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Health check");
 
     # Get OAuth protected resource metadata (RFC 9728) for services
     # Text parameter filters by service name (empty = all services)
-    getAuthMetadata @5 :Text $scope(query) $mcpDescription("Get OAuth protected resource metadata for services")
+    getAuthMetadata @5 :Text $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Get OAuth protected resource metadata for services")
       $vfsPath("{arg}/auth-metadata");
 
     # Removed: prepareStream (was insecure — bypassed DH key exchange).
     # Use StreamChannel::prepare_stream for authenticated streaming.
     # Reserved tombstone wire slots — scoped $manage so the dead handler stays
     # non-public under mandatory-scope (S3, #547).
-    prepareStream @6 :Void $scope(manage);
+    prepareStream @6 :Void $scope(manage) $dispatchMac("internal:pq-hybrid");
 
     # Removed: getStream
-    getStream @7 :Void $scope(manage);
+    getStream @7 :Void $scope(manage) $dispatchMac("internal:pq-hybrid");
 
     # Removed: listStreams
-    listStreams @8 :Void $scope(manage);
+    listStreams @8 :Void $scope(manage) $dispatchMac("internal:pq-hybrid");
 
     # Announce a service endpoint (used by services after QUIC binding)
-    announce @9 :ServiceAnnouncement $scope(write) $mcpDescription("Announce a service endpoint for discovery");
+    announce @9 :ServiceAnnouncement $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Announce a service endpoint for discovery");
 
     # Phase 0.5 Stage D — federation directory
     # Push a signed OpenID Federation 1.0 entity statement for an issuer (called by IdP/OAuth service)
-    registerEntityStatement @10 :RegisterEntityStatementRequest $scope(write) $mcpDescription("Register a signed OIDF entity statement for an issuer");
+    registerEntityStatement @10 :RegisterEntityStatementRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Register a signed OIDF entity statement for an issuer");
 
     # Fetch a cached signed entity statement for an issuer (used by FederationKeyResolver before HTTPS fallback)
-    getEntityStatement @11 :Text $scope(query) $mcpDescription("Fetch cached signed entity statement for issuer URL")
+    getEntityStatement @11 :Text $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Fetch cached signed entity statement for issuer URL")
       $vfsPath("{arg}/entity-statement");
 
     # Push a COSE_KeySet (CBOR) for a service's envelope-signing keys (called by each service at startup + rotation)
-    registerEnvelopeKeyset @12 :RegisterEnvelopeKeysetRequest $scope(write) $mcpDescription("Register envelope COSE_KeySet for a service");
+    registerEnvelopeKeyset @12 :RegisterEnvelopeKeysetRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Register envelope COSE_KeySet for a service");
 
     # Fetch a cached COSE_KeySet for a service's envelope keys
-    getEnvelopeKeyset @13 :Text $scope(query) $mcpDescription("Fetch cached envelope COSE_KeySet for service DID")
+    getEnvelopeKeyset @13 :Text $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Fetch cached envelope COSE_KeySet for service DID")
       $vfsPath("{arg}/envelope-keyset");
 
     # List all known issuer URLs whose entity statements are cached (authenticated)
-    listKnownIssuers @14 :Void $scope(query) $mcpDescription("List issuers with cached entity statements");
+    listKnownIssuers @14 :Void $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("List issuers with cached entity statements");
 
     # #431 — federated record lookup. Fetch an atproto record (ai.hyprstream.model)
     # as a verifiable CARv1 proof so the caller can validate it offline. The
     # auto-generated discovery:query gate runs first; the handler additionally
     # access-control-checks the *target* DID/collection (an at:// CID is public/
     # predictable, so a valid address alone must NOT grant a read).
-    getRecord @15 :GetRecordRequest $scope(query) $mcpDescription("Fetch an atproto record (ai.hyprstream.model) as a verifiable CAR proof");
+    getRecord @15 :GetRecordRequest $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Fetch an atproto record (ai.hyprstream.model) as a verifiable CAR proof");
 
     # #431 — fetch a full atproto repo CAR by DID (commit + MST + all records).
-    getRepo @16 :Text $scope(query) $mcpDescription("Fetch a full atproto repo CAR by DID")
+    getRepo @16 :Text $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Fetch a full atproto repo CAR by DID")
       $vfsPath("{arg}/repo");
 
     # #523 P0 / #524 — placement candidate query (the leaf<->federation seam).
     # Authz-prefiltered per-candidate (fail-closed); bounded result. Selector
     # matches labels on the durable node records; resources check
     # (declared - allocatable). (#628 Scheduling Substrate vocabulary.)
-    queryCandidates @17 :QueryCandidatesRequest $scope(query) $mcpDescription("Query placement candidates by label-selector + resource requests");
+    queryCandidates @17 :QueryCandidatesRequest $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Query placement candidates by label-selector + resource requests");
 
     # #524 P1 — node liveness heartbeat: live allocatable capacity + load for
     # one node. Backs the hard-exclusion-on-staleness rule in queryCandidates
     # (a node with no live/fresh heartbeat is omitted outright, never just
     # flagged stale). Re-inserting (heartbeating) the same node refreshes its
     # TTL entry.
-    reportNodeLiveness @18 :NodeLiveness $scope(write) $mcpDescription("Report live node capacity/load for placement candidate liveness");
+    reportNodeLiveness @18 :NodeLiveness $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Report live node capacity/load for placement candidate liveness");
   }
 }
 

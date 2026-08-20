@@ -2,6 +2,7 @@
 
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
+using import "/annotations.capnp".dispatchMac;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".vfsKind;
 using import "/annotations.capnp".vfsPath;
@@ -44,38 +45,38 @@ struct RegistryRequest {
   # Request payload (union of request types)
   union {
     # List all models available in the registry
-    list @1 :Void $scope(query)
+    list @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("List all repositories registered in the local registry.")
         $vfsKind(dir) $vfsPath(".");
     # Get repository information by ID
-    get @2 :Text $scope(query)
+    get @2 :Text $scope(query) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Get repository information by its id.")
         $vfsKind(file) $vfsPath("by-id/{id}");
     # Get repository information by name
-    getByName @3 :Text $scope(query)
+    getByName @3 :Text $scope(query) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Get repository information by its display name.")
         $vfsKind(file) $vfsPath("{name}");
     # Clone a model repository from a URL
-    clone @4 :CloneRequest $scope(write)
+    clone @4 :CloneRequest $scope(write) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Clone a model repository from a URL into the local registry.")
         $vfsKind(ctl) $vfsPath("ctl");
     # Register an existing local repository
-    register @5 :RegisterRequest $scope(write) $vfsKind(ctl) $vfsPath("ctl");
+    register @5 :RegisterRequest $scope(write) $dispatchMac("internal:pq-hybrid") $vfsKind(ctl) $vfsPath("ctl");
     # Remove a repository from the registry
-    remove @6 :Text $scope(manage) $vfsKind(ctl) $vfsPath("ctl");
+    remove @6 :Text $scope(manage) $dispatchMac("internal:pq-hybrid") $vfsKind(ctl) $vfsPath("ctl");
     # Check registry service health
-    healthCheck @7 :Void $scope(query)
+    healthCheck @7 :Void $scope(query) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Check if the registry service is healthy and responding.")
         $vfsKind(file) $vfsPath("health")
         $vfsMac("internal:pq-hybrid");
     # Clone a model repository from a URL (streaming progress)
-    cloneStream @8 :CloneRequest $scope(write) $mcpDescription("Clone a model repository from a URL (streaming progress)");
+    cloneStream @8 :CloneRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Clone a model repository from a URL (streaming progress)");
 
     # Repository-scoped operations (requires repoId)
     repo @9 :RepositoryRequest $vfsKind(dir) $vfsPath("repo/{repoId}");
 
     # Fetch content-addressed bytes (git OID or XET merkle root) as a stream.
-    getBlob @10 :GetBlobRequest $scope(query) $mcpDescription("Fetch content-addressed bytes (git OID or XET merkle root) as a stream");
+    getBlob @10 :GetBlobRequest $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Fetch content-addressed bytes (git OID or XET merkle root) as a stream");
 
     # Ingest content-addressed bytes IN-BAND (the symmetric write half of getBlob).
     # Epic #654: the missing authenticated upload path. Today writes bypass
@@ -91,9 +92,9 @@ struct RegistryRequest {
     # fine-grained handler check authorize(ctx, "model:{repo}", "write") that
     # mirrors authorize_get_blob's per-repo "query" check, one verb up. A read
     # grant never implies write.
-    putBlob @11 :PutBlobRequest $scope(write) $mcpDescription("Ingest content-addressed bytes; server computes the merkle and binds merkle→repo provenance");
+    putBlob @11 :PutBlobRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Ingest content-addressed bytes; server computes the merkle and binds merkle→repo provenance");
     # #1004: caller supplies untrusted bytes only; GATE/durable predecessor is authority.
-    ingestAt9pCandidate @12 :At9pCandidateRequest $scope(write)
+    ingestAt9pCandidate @12 :At9pCandidateRequest $scope(write) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Submit untrusted did:at9p genesis/update bytes to the durable acceptance PEP");
   }
 }
@@ -105,60 +106,60 @@ struct RepositoryRequest {
   repoId @0 :Text;
   union {
     # Create a new worktree for the repository
-    createWorktree @1 :CreateWorktreeRequest $scope(write)
+    createWorktree @1 :CreateWorktreeRequest $scope(write) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Ensure a worktree exists for a branch, creating if needed");
     # List all worktrees for the repository
-    listWorktrees @2 :Void $scope(query);
+    listWorktrees @2 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
     # Remove a worktree from the repository
-    removeWorktree @3 :RemoveWorktreeRequest $scope(manage);
+    removeWorktree @3 :RemoveWorktreeRequest $scope(manage) $dispatchMac("internal:pq-hybrid");
     # Create a new branch in the repository
-    createBranch @4 :BranchRequest $scope(write);
+    createBranch @4 :BranchRequest $scope(write) $dispatchMac("internal:pq-hybrid");
     # List all branches in the repository
-    listBranches @5 :Void $scope(query);
+    listBranches @5 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
     # DEPRECATED — moved to WorktreeRequest. Kept for wire compatibility.
     # Handlers return an error directing callers to the worktree-scoped API.
     # Scoped $scope(write) per mandatory-scope (S3): mutating git ops; the
     # deprecated stub still requires a non-public scope so it can't widen access.
-    checkout @6 :CheckoutRequest $scope(write);
-    stageAll @7 :Void $scope(write);
-    stageFiles @8 :StageFilesRequest $scope(write);
-    commit @9 :CommitRequest $scope(write);
-    merge @10 :MergeRequest $scope(write);
-    abortMerge @11 :Void $scope(write);
-    continueMerge @12 :ContinueMergeRequest $scope(write);
-    quitMerge @13 :Void $scope(write);
+    checkout @6 :CheckoutRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    stageAll @7 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
+    stageFiles @8 :StageFilesRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    commit @9 :CommitRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    merge @10 :MergeRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    abortMerge @11 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
+    continueMerge @12 :ContinueMergeRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    quitMerge @13 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
     # Get the current HEAD reference
-    getHead @14 :Void $scope(query);
+    getHead @14 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
     # Get information about a specific reference
-    getRef @15 :GetRefRequest $scope(query);
+    getRef @15 :GetRefRequest $scope(query) $dispatchMac("internal:pq-hybrid");
     # Get repository status (short format)
-    status @16 :Void $scope(query);
+    status @16 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
     # Get detailed repository status with file changes
-    detailedStatus @17 :Void $scope(query);
+    detailedStatus @17 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
     # List all remotes for the repository
-    listRemotes @18 :Void $scope(query);
+    listRemotes @18 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
     # Add a new remote to the repository
-    addRemote @19 :AddRemoteRequest $scope(write);
+    addRemote @19 :AddRemoteRequest $scope(write) $dispatchMac("internal:pq-hybrid");
     # Remove a remote from the repository
-    removeRemote @20 :RemoveRemoteRequest $scope(manage);
+    removeRemote @20 :RemoveRemoteRequest $scope(manage) $dispatchMac("internal:pq-hybrid");
     # Set the URL for a remote
-    setRemoteUrl @21 :SetRemoteUrlRequest $scope(write);
+    setRemoteUrl @21 :SetRemoteUrlRequest $scope(write) $dispatchMac("internal:pq-hybrid");
     # Rename a remote
-    renameRemote @22 :RenameRemoteRequest $scope(write);
+    renameRemote @22 :RenameRemoteRequest $scope(write) $dispatchMac("internal:pq-hybrid");
     # Push commits to a remote repository
-    push @23 :PushRequest $scope(write);
+    push @23 :PushRequest $scope(write) $dispatchMac("internal:pq-hybrid");
     # DEPRECATED — moved to WorktreeRequest. Kept for wire compatibility.
-    amendCommit @24 :AmendCommitRequest $scope(write);
-    commitWithAuthor @25 :CommitWithAuthorRequest $scope(write);
-    stageAllIncludingUntracked @26 :Void $scope(write);
+    amendCommit @24 :AmendCommitRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    commitWithAuthor @25 :CommitWithAuthorRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    stageAllIncludingUntracked @26 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
     # List all tags in the repository
-    listTags @27 :Void $scope(query);
+    listTags @27 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
     # Create a new tag
-    createTag @28 :CreateTagRequest $scope(write);
+    createTag @28 :CreateTagRequest $scope(write) $dispatchMac("internal:pq-hybrid");
     # Delete a tag from the repository
-    deleteTag @29 :DeleteTagRequest $scope(manage);
+    deleteTag @29 :DeleteTagRequest $scope(manage) $dispatchMac("internal:pq-hybrid");
     # Pull and update from remote repository
-    update @30 :UpdateRequest $scope(write);
+    update @30 :UpdateRequest $scope(write) $dispatchMac("internal:pq-hybrid");
     # Worktree-scoped filesystem operations
     worktree @31 :WorktreeRequest;
   }
@@ -237,64 +238,64 @@ struct WorktreeRequest {
   name @0 :Text;
   union {
     # Walk: resolve path components to get a fid (like 9P Twalk)
-    walk @1 :NpWalk $scope(query)
+    walk @1 :NpWalk $scope(query) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Resolve path components to a fid (9P walk). Use the returned fid for open (I/O) or ctl operations (git log/diff/blame). Each use requires a separate fid.");
     # Open: open a walked fid for I/O (like 9P Topen)
     # Scope is `write` (NOT `query` like model.capnp's read-only ModelFs.open):
     # a worktree is a mutable git checkout and `NpOpen` may request a write mode,
     # so open is gated at the mutating tier here — fail-safe least-privilege.
-    open @2 :NpOpen $scope(write)
+    open @2 :NpOpen $scope(write) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Open a walked fid for read/write I/O. After open, the fid can only be used for read/write — ctl operations (log, diff, blame) require a separate walked-not-opened fid.");
     # Create: create a file/dir under a walked directory fid (like 9P Tcreate)
-    create @3 :NpCreate $scope(write)
+    create @3 :NpCreate $scope(write) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Create a file or directory under a walked directory fid. The fid is then opened for I/O on the new file.");
     # Read: offset+count read, server clamps to iounit (like 9P Tread)
-    read @4 :NpRead $scope(query)
+    read @4 :NpRead $scope(query) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Read file content or directory listing at offset+count (bounded by iounit). For directories, returns entries as binary: name_len(u32) + name + is_dir(u8) + size(u64).");
     # Write: offset+data write, server rejects if > iounit (like 9P Twrite)
-    write @5 :NpWrite $scope(write)
+    write @5 :NpWrite $scope(write) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Write data to an opened file at offset. Data size must not exceed iounit.");
     # Clunk: release a fid (like 9P Tclunk)
-    clunk @6 :NpClunk $scope(query)
+    clunk @6 :NpClunk $scope(query) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Release a fid (like close). Frees server resources. Always clunk fids when done.");
     # Remove: clunk + delete file/dir (like 9P Tremove)
-    remove @7 :NpRemove $scope(manage)
+    remove @7 :NpRemove $scope(manage) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Remove a file or directory and release its fid.");
     # Stat: get file metadata (like 9P Tstat)
-    npStat @8 :NpStatReq $scope(query)
+    npStat @8 :NpStatReq $scope(query) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Get file metadata (size, mode, timestamps). Works on both walked and opened fids.");
     # Wstat: modify file metadata (like 9P Twstat)
-    wstat @9 :NpWstat $scope(write)
+    wstat @9 :NpWstat $scope(write) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Modify file metadata (truncate, rename). Requires an opened fid for truncate.");
     # Flush: cancel pending operation (like 9P Tflush)
-    flush @10 :NpFlush $scope(query)
+    flush @10 :NpFlush $scope(query) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Cancel a pending operation by its tag.");
     # Per-file control operations, scoped by fid
     ctl @11 :CtlRequest;
 
     # Worktree-scoped git operations
     stageAll @12 :Void
-        $scope(write) $mcpDescription("Stage all modified tracked files in this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Stage all modified tracked files in this worktree");
     stageFiles @13 :StageFilesRequest
-        $scope(write) $mcpDescription("Stage specific files in this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Stage specific files in this worktree");
     stageAllIncludingUntracked @14 :Void
-        $scope(write) $mcpDescription("Stage all files including untracked in this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Stage all files including untracked in this worktree");
     commit @15 :CommitRequest
-        $scope(write) $mcpDescription("Commit staged changes in this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Commit staged changes in this worktree");
     commitWithAuthor @16 :CommitWithAuthorRequest
-        $scope(write) $mcpDescription("Commit staged changes with specified author");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Commit staged changes with specified author");
     amendCommit @17 :AmendCommitRequest
-        $scope(write) $mcpDescription("Amend the last commit in this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Amend the last commit in this worktree");
     checkout @18 :CheckoutRequest
-        $scope(write) $mcpDescription("Checkout a ref in this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Checkout a ref in this worktree");
     merge @19 :MergeRequest
-        $scope(write) $mcpDescription("Merge a branch into this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Merge a branch into this worktree");
     abortMerge @20 :Void
-        $scope(write) $mcpDescription("Abort an in-progress merge in this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Abort an in-progress merge in this worktree");
     continueMerge @21 :ContinueMergeRequest
-        $scope(write) $mcpDescription("Continue a merge after resolving conflicts");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Continue a merge after resolving conflicts");
     quitMerge @22 :Void
-        $scope(write) $mcpDescription("Exit merge state without committing");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Exit merge state without committing");
   }
 }
 
@@ -638,23 +639,23 @@ struct CtlRequest {
   fid @0 :UInt32;           # scope field (curried in generated CtlClient)
   union {
     # ── Git introspection ──
-    status    @1 :Void               $scope(query)  $mcpDescription("Git status of this file. Requires a walked (not opened) fid.");
-    log       @2 :CtlLogRequest      $scope(query)  $mcpDescription("Commits touching this file. Requires a walked (not opened) fid.");
-    diff      @3 :CtlDiffRequest     $scope(query)  $mcpDescription("Diff this file against a ref. Requires a walked (not opened) fid.");
-    blame     @4 :Void               $scope(query)  $mcpDescription("Git blame for this file. Requires a walked (not opened) fid.");
-    checkout  @5 :CtlCheckoutRequest $scope(write)  $mcpDescription("Restore file content from a ref");
+    status    @1 :Void               $scope(query) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Git status of this file. Requires a walked (not opened) fid.");
+    log       @2 :CtlLogRequest      $scope(query) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Commits touching this file. Requires a walked (not opened) fid.");
+    diff      @3 :CtlDiffRequest     $scope(query) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Diff this file against a ref. Requires a walked (not opened) fid.");
+    blame     @4 :Void               $scope(query) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Git blame for this file. Requires a walked (not opened) fid.");
+    checkout  @5 :CtlCheckoutRequest $scope(write) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Restore file content from a ref");
 
     # ── File control ──
-    validate  @6 :Void               $scope(query)  $mcpDescription("Validate file format. Requires a walked (not opened) fid.");
-    info      @7 :Void               $scope(query)  $mcpDescription("File metadata and git state. Requires a walked (not opened) fid.");
+    validate  @6 :Void               $scope(query) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Validate file format. Requires a walked (not opened) fid.");
+    info      @7 :Void               $scope(query) $dispatchMac("internal:pq-hybrid")  $mcpDescription("File metadata and git state. Requires a walked (not opened) fid.");
 
     # ── CRDT editing ──
-    editOpen  @8  :EditOpenRequest   $scope(write)  $mcpDescription("Open file for CRDT editing");
-    editState @9  :Void              $scope(query)  $mcpDescription("Get current CRDT document state");
-    editApply @10 :EditApplyRequest  $scope(write)  $mcpDescription("Apply automerge CRDT change");
-    editClose @11 :Void              $scope(write)  $mcpDescription("Close CRDT editing session");
+    editOpen  @8  :EditOpenRequest   $scope(write) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Open file for CRDT editing");
+    editState @9  :Void              $scope(query) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Get current CRDT document state");
+    editApply @10 :EditApplyRequest  $scope(write) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Apply automerge CRDT change");
+    editClose @11 :Void              $scope(write) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Close CRDT editing session");
     # Flush: serialize CRDT state to disk (does NOT stage or commit)
-    ctlFlush  @12 :Void              $scope(write)  $mcpDescription("Write CRDT state to disk file");
+    ctlFlush  @12 :Void              $scope(write) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Write CRDT state to disk file");
   }
 }
 

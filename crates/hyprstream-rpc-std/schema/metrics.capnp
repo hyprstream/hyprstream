@@ -7,6 +7,7 @@
 
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
+using import "/annotations.capnp".dispatchMac;
 using import "/annotations.capnp".mcpDescription;
 using import "/streaming.capnp".StreamInfo;
 
@@ -79,25 +80,25 @@ struct MetricsRequest {
 
   union {
     ingest       @1 :IngestRequest
-      $scope(write) $mcpDescription("Ingest metric records into the time-series store");
+      $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Ingest metric records into the time-series store");
 
     query        @2 :MetricQuery
-      $scope(query) $mcpDescription("Execute a structured or raw SQL aggregation query");
+      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Execute a structured or raw SQL aggregation query");
 
     queryStream  @3 :MetricQuery
-      $scope(query) $mcpDescription("Stream query results as Arrow IPC RecordBatch chunks");
+      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Stream query results as Arrow IPC RecordBatch chunks");
 
     createView   @4 :ViewSpec
-      $scope(manage) $mcpDescription("Create a materialized view over the metrics table");
+      $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Create a materialized view over the metrics table");
 
     listViews    @5 :Void
-      $scope(query) $mcpDescription("List all materialized views");
+      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("List all materialized views");
 
     dropView     @6 :Text
-      $scope(manage) $mcpDescription("Drop a materialized view by name");
+      $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Drop a materialized view by name");
 
     health       @7 :Void
-      $scope(query) $mcpDescription("Check service health and row count");
+      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Check service health and row count");
   }
 }
 

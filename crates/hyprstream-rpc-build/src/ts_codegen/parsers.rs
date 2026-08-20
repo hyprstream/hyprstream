@@ -1325,18 +1325,21 @@ struct Payload {
     const SERVICE_SCHEMA: &str = r#"
 @0xbeefcafebeefcafe;
 
-# Mandatory scope (S3, #547): a method with no $scope is a build error. A minimal
-# local `scope` annotation mirrors the real annotations.capnp shape for this fixture.
+# Mandatory scope (S3, #547) and mandatory dispatch pair (v16 §6, WS-D): a
+# method with no `$scope` or with neither `$dispatchMac`/`$dispatchPublic` is a
+# build error. Minimal local annotations mirror the real annotations.capnp
+# shapes for this fixture.
 enum ScopeAction {
   query @0;
   write @1;
 }
 annotation scope(field) :ScopeAction;
+annotation dispatchMac(field) :Text;
 
 struct PayloadRequest {
   union {
-    ping @0 :Void $scope(query);
-    echo @1 :Text $scope(write);
+    ping @0 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+    echo @1 :Text $scope(write) $dispatchMac("internal:pq-hybrid");
   }
 }
 
@@ -1687,6 +1690,8 @@ struct EmbedImagesResponse {
                 vfs_bulk: false,
                 vfs_hidden: false,
                 vfs_mac: String::new(),
+                dispatch_mac: String::new(),
+                dispatch_public: String::new(),
             }],
             structs: vec![],
             scoped_clients: vec![],
