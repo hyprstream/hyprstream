@@ -282,10 +282,10 @@ Ed25519 signature over the stripped object.
   issuer-signed CWT credential — `typ = application/cwt`, an issuer signature the
   gate re-verifies, an RFC 8747 `cnf` PoP binding, tenant (−70005), and clearance
   (−70006) — presented in the proof slot, so it exercises rejection of a
-  *well-formed* credential, not a malformed token. It deliberately carries **no**
-  `credential_use_profile` (the fenced −70008 allocation). N-2 is the two-entry
-  `COSE_Sign` P-2 verbatim in the credential slot, labelled `COSE_Sign` to match
-  its bytes.
+  *well-formed* credential, not a malformed token. It is a v16 **Reusable**
+  credential and carries no use-profile field (v16 is Reusable-only; §4 of the
+  credential profile). N-2 is the two-entry `COSE_Sign` P-2 verbatim in the
+  credential slot, labelled `COSE_Sign` to match its bytes.
 - **N-4 (domain confusion).** `typ` and `hs_domain` are **paired** in the
   normative CDDL, not independent choices: a request proof carries exactly
   (`proof-typ`, `request-proof-domain`) and a response proof exactly
@@ -418,8 +418,10 @@ Ed25519 signature over the stripped object.
 These profile rules are not byte-encodable in a standalone vector and are
 therefore stated as verifier obligations rather than shipped here:
 
-1. Replay admission (exact replay of a valid proof denies; the one-shot
-   credential consume path) — needs a stateful verifier harness.
+1. Replay admission (exact replay of a valid proof denies) — needs a stateful
+   verifier harness. v16 credentials are Reusable, so the credential ID is never
+   a replay key; the credential-ID consume path returns only with the deferred
+   `OneShotTransaction` amendment.
 2. Freshness bounds (`iat` within clock-skew tolerance,
    `exp − verifier_now ≤` the per-disposition maximum lifetime) — needs a
    controlled clock.
@@ -428,19 +430,13 @@ therefore stated as verifier obligations rather than shipped here:
    enrollment check, not a wire vector.
 5. Sign-then-encrypt wrapper vectors, pending the COSE HPKE profile
    (watch item; nothing in this profile depends on it).
-6. Credential-CWT vectors for the amendment-10 integer claim keys
-   (`-70005`/`-70006`/`-70007`) and the **`credential_use_profile`** signed wire
-   claim. The proof direction is already covered — a proof carrying any credential
-   key denies via the same closed-claim-set rule as N-8 (the proof claims map is
-   closed at `-70001..-70004`). Adding credential-CWT vectors is **blocked on an
-   operator disposition**: Gate-2 froze exactly the three credential CWT keys
-   `-70005..-70007`, and `credential_use_profile` (Reusable / OneShotTransaction)
-   has no correct existing signed-claim encoding, so encoding it requires a new
-   allocation the operator must approve. See the operator-disposition handoff
-   `.fleet-coord/handoffs/mac-v16-a-credential-use-profile-disposition.md`. The
-   type-confusion negative N-1 already carries the frozen credential claims — a
-   valid `cnf` PoP binding, tenant (−70005), and clearance (−70006) — to be a
-   profile-valid credential in the proof slot; a **dedicated credential-plane
-   positive vector set** (and the `credential_use_profile` claim) stays deferred
-   pending the operator allocation, rather than freezing the full credential
-   claims set (and `credential_use_profile`) here without approval.
+6. A dedicated credential-plane positive vector set for the amendment-10 integer
+   claim keys (`-70005`/`-70006`/`-70007`). The proof direction is already covered
+   — a proof carrying any credential key denies via the same closed-claim-set rule
+   as N-8 (the proof claims map is closed at `-70001..-70004`) — and the
+   type-confusion negative N-1 exercises a profile-valid v16 credential (a valid
+   `cnf` PoP binding, tenant `-70005`, clearance `-70006`, and **no** use-profile
+   field). v16 credentials are **Reusable-only** (operator decision 2026-08-20):
+   there is no `credential_use_profile` claim and none is allocated (`-70008` is
+   not reserved). A full credential-plane positive/negative vector set is future
+   work, coordinated with the credential (WS-B) seat.

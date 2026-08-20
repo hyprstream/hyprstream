@@ -17,7 +17,7 @@
       "cbor_hex": "845826a3013204506973737565722d656432353531392d31106f6170706c69636174696f6e2f637774a058c2a901781e68747470733a2f2f6973737565722e6879707273747265616d2e746573740266757365722d3103781c72656769737472792e7376632e6879707273747265616d2e74657374041a6a74329e061a6a7432800750a1b2c3d4e5f60718293a4b5c6d7e8f9008a101a501010250636c69656e742d656432353531392d310332200621582003a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b83a000111746c74656e616e742d616c7068613a0001117582028205075840d17004fd78f75852187aadbdc5d328b3d32e0238e76f3c48ae947a015eee6aa7866996a48506cb306701ee7933e885e28d607704fe4aec5863cb8d067343cf08",
       "deny_class": "type-confusion",
       "deny_rule": "a valid credential (typ application/cwt, issuer-signed, with cnf, tenant, and clearance) is not a request proof: its typ is not application/vnd.hyprstream.proof+cwt and it is not signed by a cnf-bound proof key",
-      "notes": "A profile-valid credential: registered claims, RFC 8747 cnf PoP binding, tenant -70005, clearance -70006. Only its presentation slot is wrong. Carries no credential_use_profile (fenced -70008)."
+      "notes": "A profile-valid v16 (Reusable) credential: registered claims, RFC 8747 cnf PoP binding, tenant -70005, clearance -70006, and no use-profile field. Only its presentation slot is wrong."
     },
     {
       "id": "N-2",

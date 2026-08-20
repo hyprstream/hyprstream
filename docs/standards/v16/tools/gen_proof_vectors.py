@@ -792,12 +792,12 @@ def main() -> None:
             H_KID: KID_ISSUER_ED,
             H_TYP: "application/cwt",
         }
-        # A PROFILE-VALID credential: registered claims plus the frozen
+        # A PROFILE-VALID v16 credential: registered claims plus the frozen
         # amendment-10 credential claims. cnf (8) is a valid RFC 8747 PoP binding
         # (a COSE_Key confirmation to the client's Ed25519 key); -70005 tenant and
         # -70006 clearance ([level, compartments]; value 11) are the frozen
-        # credential keys. It deliberately does NOT carry credential_use_profile
-        # (the fenced -70008 allocation): only its presentation slot is wrong.
+        # credential keys. v16 credentials are Reusable-only, so there is no
+        # use-profile field at all; only its presentation slot is wrong.
         n1_claims = {
             1: "https://issuer.hyprstream.test",  # iss
             2: "user-1",                          # sub
@@ -827,9 +827,9 @@ def main() -> None:
                 "cnf-bound proof key"
             ),
             notes=(
-                "A profile-valid credential: registered claims, RFC 8747 cnf PoP "
-                "binding, tenant -70005, clearance -70006. Only its presentation "
-                "slot is wrong. Carries no credential_use_profile (fenced -70008)."
+                "A profile-valid v16 (Reusable) credential: registered claims, "
+                "RFC 8747 cnf PoP binding, tenant -70005, clearance -70006, and no "
+                "use-profile field. Only its presentation slot is wrong."
             ),
         )
 

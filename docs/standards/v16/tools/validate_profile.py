@@ -804,9 +804,12 @@ def gate_type_confusion(negatives) -> None:
                   "N-1 cnf must be a valid OKP/Ed25519 COSE_Key (a PoP key)")
         check(isinstance(n1c.get(-70005), str), "N-1 must carry tenant (-70005)")
         check(-70006 in n1c, "N-1 must carry clearance (-70006)")
-        # Fence: N-1 must NOT self-allocate credential_use_profile (-70008).
-        check(-70008 not in n1c, "N-1 must not carry the fenced credential_use_profile (-70008)")
-        print("   #2 N-1 is profile-valid (cnf PoP + tenant -70005 + clearance -70006; no -70008)")
+        # v16 credentials are Reusable-only: there is no use-profile field, and
+        # -70008 is unallocated (OneShotTransaction deferred to a future
+        # amendment). A v16 credential carries neither.
+        check(-70008 not in n1c, "N-1 must carry no use-profile field (v16 is Reusable-only; -70008 unallocated)")
+        print("   #2 N-1 is a profile-valid v16 Reusable credential "
+              "(cnf PoP + tenant -70005 + clearance -70006; no use-profile field)")
 
     # N-2 (ary-137m): the two-entry COSE_Sign proof presented as a credential.
     # Its structure label must be COSE_Sign and its bytes must be a COSE_Sign.

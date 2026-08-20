@@ -2,11 +2,13 @@
 
 Status: **FROZEN** by the accepted Gate-2 vote (v16 §19, 2026-08-19). This
 document freezes the credential side of the v16 dispatch profile: the claims
-table, the credential/session identifier rules, the one-shot versus reusable
-profiles, and the revocation semantics that the request-proof profile
-cross-references. It is not production-closed: the shared media-type
-registrations tracked in [`private-label-registry.md`](private-label-registry.md)
-§5 remain open.
+table, the credential/session identifier rules, and the revocation semantics
+that the request-proof profile cross-references. **v16 credentials are
+Reusable-only** (operator decision 2026-08-20, `DECISION-defer-oneshot-credentials`):
+there is no credential use-profile field, and `OneShotTransaction`/consume-once
+semantics are deferred to a future amendment (§4). It is not production-closed:
+the shared media-type registrations tracked in
+[`private-label-registry.md`](private-label-registry.md) §5 remain open.
 
 Companions: [`hyprstream-proof-cwt.cddl`](hyprstream-proof-cwt.cddl),
 [`private-label-registry.md`](private-label-registry.md),
@@ -71,13 +73,15 @@ The credential ID identifies one issued token instance. Its key is
 the underlying JWT/CWT uniqueness requirements; verifier stores namespace by
 issuer as defense in depth.
 
-Uses, exhaustively:
+Uses, exhaustively (v16, Reusable-only):
 
 1. individual credential revocation;
-2. audit correlation;
-3. cache invalidation; and
-4. the replay key **only** when the token profile declares the credential
-   single-use (§4).
+2. audit correlation; and
+3. cache invalidation.
+
+The credential ID is never a request replay key in v16: request replay is always
+keyed by the proof. (A single-use replay key tied to the credential ID returns
+only with the deferred `OneShotTransaction` amendment; see §4.)
 
 Seeing the same credential ID across many requests is expected and correct for
 reusable credentials. The credential-ID store is a credential-revocation store,
@@ -119,23 +123,33 @@ The authority stores at least: subject, tenant, session kind (interactive or
 workload), creation and expiry times, active/revoked status, and a clearance
 epoch, keyed by `(issuer, session identifier)`.
 
-## 4. Credential use profiles
+## 4. Credential use: Reusable-only (v16)
 
-Every credential carries exactly one issuer-declared profile:
+**v16 credentials are Reusable.** There is no credential use-profile field and
+no consume-once path: the credential ID is never consumed, and replay admission
+is always keyed by the proof — `(credential-bound primary signer-suite
+thumbprint, request_id)` — so many fresh proofs may use one credential.
 
-| Profile | When | Admission behavior |
-|---|---|---|
-| `Reusable` | Default for user access tokens and ordinary workload identity tokens | The credential ID is **not** consumed. Replay admission is keyed by the proof: `(credential-bound primary signer-suite thumbprint, request_id)`. Many fresh proofs may use one credential. |
-| `OneShotTransaction` | Only for a short-lived credential bound by claims to an exact audience, method, resource, subject, actor, and transaction intent | The credential ID is atomically consumed before handler admission, domain-wide and linearizably. `request_id` still correlates the response but creates no second replay entry. |
+| Use | Admission behavior |
+|---|---|
+| Reusable (the only v16 use) | The credential ID is **not** consumed; replay admission is keyed by the proof. |
 
-The profile is issuer-authenticated and covered by the token signature. A
-method cannot reinterpret a reusable token as one-shot because it mutates, and
-a caller cannot mark its own token one-shot.
+**Forward-compatibility rule.** The absence of any use-profile field means
+Reusable — no field is written or expected now. If a future amendment reintroduces
+one-shot credentials, it will allocate a dedicated wire claim at that time, and a
+credential carrying no such claim will continue to mean Reusable.
 
-`Reusable` versus `OneShotTransaction` selects the replay key; it does not
-provide application idempotency. Exactly-once business effects are a separate,
-explicitly declared method property backed by an idempotency/result ledger
-whose lookup binds the retrying principal — not the request-proof replay cache.
+**Deferred: `OneShotTransaction`.** Single-use credentials and their atomic
+consume-`(iss, cti)` replay path are **deferred to a future profile amendment**
+(operator decision 2026-08-20). v16 allocates **no** claim key for a use-profile;
+in particular it does not reserve or allocate one. When exactly-once mutation
+semantics are needed, they return as a scoped amendment with its own claim
+allocation and review.
+
+Reusable credentials do not by themselves provide application idempotency.
+Exactly-once business effects are a separate, explicitly declared method property
+backed by an idempotency/result ledger whose lookup binds the retrying principal
+— not the request-proof replay cache.
 
 ## 5. Credential binding to the request proof
 
@@ -179,20 +193,18 @@ A conforming verifier is checked against at least:
 
 1. `jti` and `cti` normalize without collisions and are issuer-scoped;
 2. reusable tokens succeed across fresh proofs without consuming the
-   credential ID;
-3. a one-shot transaction token admits exactly one proof, and concurrent
-   presentation at two instances of the replay admission domain consumes
-   exactly once;
-4. tokens from one user session have distinct credential IDs and one stable
+   credential ID (v16 credentials are Reusable, so the credential ID is never a
+   replay key);
+3. tokens from one user session have distinct credential IDs and one stable
    `sid`;
-5. credential revocation affects one token; session revocation affects every
+4. credential revocation affects one token; session revocation affects every
    associated token, handle, stream, continuation, and refresh;
-6. a standalone workload token without a session is valid without a fabricated
+5. a standalone workload token without a session is valid without a fabricated
    `sid`;
-7. expired, revoked, wrong-audience, wrong-tenant, wrong-sender,
+6. expired, revoked, wrong-audience, wrong-tenant, wrong-sender,
    clearance-less, or malformed tokens deny with no unauthenticated fallback;
-8. credential bytes substituted after proof signing fail hash binding; and
-9. a token whose primary signer suite does not match `cnf` denies.
+7. credential bytes substituted after proof signing fail hash binding; and
+8. a token whose primary signer suite does not match `cnf` denies.
 
 ## 8. Frozen Gate-2 dispositions
 

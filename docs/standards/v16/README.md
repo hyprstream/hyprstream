@@ -22,7 +22,7 @@ artifact. No value here is PROPOSED any longer.
 | [`private-label-registry.md`](private-label-registry.md) | The checked private-use label registry (claims −70001…−70004, headers −70100…−70103) with presence/null rules and a collision review against the IANA COSE/CWT registries |
 | [`canonical-vectors.md`](canonical-vectors.md) | Human index of the positive and negative vectors, with the deny rule each negative exercises |
 | [`vectors/`](vectors) | Machine-readable vectors: 6 positive, 34 negative, plus the seeded test keys |
-| [`credential-profile.md`](credential-profile.md) | JWT/CWT credential claims table, credential/session identifier rules, one-shot versus reusable profiles, revocation semantics |
+| [`credential-profile.md`](credential-profile.md) | JWT/CWT credential claims table, credential/session identifier rules, Reusable-only credential use (OneShotTransaction deferred), revocation semantics |
 | [`tools/`](tools) | `validate_profile.py` (the mechanical validation gate), `gen_proof_vectors.py` (reproducible generator), `check_proof_vectors.py` (vector verifier), and `requirements.txt` (pinned deps) |
 
 ```sh
@@ -68,18 +68,14 @@ production-closed. Remaining conditions:
 3. **Watch-item re-verification** at production-close time
    (`draft-ietf-jose-pq-composite-sigs`, `draft-ietf-cose-hpke`,
    `draft-ietf-cose-hpke-pq-pqt`). Nothing here depends on them.
-4. **`credential_use_profile` wire encoding — operator disposition required.**
-   The credential's `Reusable` / `OneShotTransaction` profile is normative and
-   issuer-signed but has no wire claim, and there is no correct existing
-   registered JWT/CWT claim for it. Gate-2 froze exactly the three credential
-   CWT keys `−70005..−70007`, so a new allocation must be operator-approved
-   before it (and the amendment-10 credential-CWT vectors) can be added. Options
-   and a recommended value/encoding/collision analysis are in
-   `.fleet-coord/handoffs/mac-v16-a-credential-use-profile-disposition.md`.
 
 Resolved by this freeze (previously open): operator disposition of every
-PROPOSED value (Gate-2 §19, 2026-08-19), and mechanical CDDL validation
-(`tools/validate_profile.py` with a real, pinned CDDL validator). A fully
-`.size`-range-conformant reference validator (e.g. the Ruby `cddl` gem) is an
-optional additional CI layer; the pinned gate re-checks those size ranges in
-Python, so nothing in the freeze depends on it.
+PROPOSED value (Gate-2 §19, 2026-08-19); mechanical CDDL validation
+(`tools/validate_profile.py` with a real, pinned CDDL validator); and the
+**credential use-profile question — v16 credentials are Reusable-only**
+(operator decision 2026-08-20, `DECISION-defer-oneshot-credentials`): there is
+no `credential_use_profile` claim, `-70008` is not allocated, and
+`OneShotTransaction`/consume-once semantics are deferred to a future amendment.
+A fully `.size`-range-conformant reference validator (e.g. the Ruby `cddl` gem)
+is an optional additional CI layer; the pinned gate re-checks those size ranges
+in Python, so nothing in the freeze depends on it.
