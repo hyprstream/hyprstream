@@ -3961,6 +3961,10 @@ mod tests {
             .expect_err("a capsule with no deployment reach must not verify");
         let rendered = format!("{error:#}");
         assert!(
+            rendered.contains("closed deployment-anchor profile violation"),
+            "a node capsule must be rejected by the closed anchor profile: {rendered}"
+        );
+        assert!(
             rendered.contains("mint-anchor-capsule"),
             "rejection must tell the operator how to mint a usable anchor: {rendered}"
         );

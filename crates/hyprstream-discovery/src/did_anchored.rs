@@ -290,6 +290,16 @@ fn document_names_at9p(document: &Value, at9p_did: &str) -> bool {
         .is_some_and(|aliases| aliases.iter().any(|alias| alias.as_str() == Some(at9p_did)))
 }
 
+fn missing_deployment_reach_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach; \
+         the pinned did:at9p must be an ANCHOR capsule signed by the deployment CA, not a node's \
+         own identity capsule (e.g. the `#pds` capsule a node's OAuth service renders for \
+         itself) — mint one with `hyprstream trust mint-anchor-capsule` and publish it \
+         (with its did.json) under the deployment well-known directory"
+    )
+}
+
 /// Enforce the deployment-specific, closed anchor-capsule profile.
 ///
 /// Generic at9p capsules intentionally have set semantics and may carry
@@ -305,16 +315,26 @@ fn validate_deployment_anchor_profile(
         "closed deployment-anchor profile violation: subjectKeys must contain exactly one pinned-Hybrid signer (got {})",
         body.subject_keys.len()
     );
+    // A node's ordinary `#pds` capsule is the most likely wrong input here.
+    // Keep the closed-profile violation as the primary rejection while retaining
+    // the dedicated operator guidance that explains how to mint the missing
+    // deployment anchor. When a valid #ns entry exists alongside extras, the
+    // cardinality check below still rejects it as an over-broad profile.
+    let service = body
+        .services
+        .iter()
+        .find(|service| {
+            service.id == DEPLOYMENT_REACH_SERVICE
+                && service.service_type == ServiceType::NinePExport
+        })
+        .ok_or_else(missing_deployment_reach_error)
+        .context(
+            "closed deployment-anchor profile violation: capsule must contain a #ns NinePExport deployment-reach service",
+        )?;
     anyhow::ensure!(
         body.services.len() == 1,
         "closed deployment-anchor profile violation: services must contain exactly one #ns NinePExport entry (got {})",
         body.services.len()
-    );
-    let service = &body.services[0];
-    anyhow::ensure!(
-        service.id == DEPLOYMENT_REACH_SERVICE
-            && service.service_type == ServiceType::NinePExport,
-        "closed deployment-anchor profile violation: sole service must be #ns with type NinePExport"
     );
     let aliases = body.also_known_as.as_deref().unwrap_or_default();
     anyhow::ensure!(
@@ -377,15 +397,7 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
             service.id == DEPLOYMENT_REACH_SERVICE
                 && service.service_type == ServiceType::NinePExport
         })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-"capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach; \
-                 the pinned did:at9p must be an ANCHOR capsule signed by the deployment CA, not a node's \
-                 own identity capsule (e.g. the `#pds` capsule a node's OAuth service renders for \
-                 itself) — mint one with `hyprstream trust mint-anchor-capsule` and publish it \
-                 (with its did.json) under the deployment well-known directory"
-            )
-        })?;
+        .ok_or_else(missing_deployment_reach_error)?;
     match entry.endpoint.transport {
         At9pTransport::Iroh => {
             let node_id_multibase = entry.endpoint.node_id.as_deref().ok_or_else(|| {
