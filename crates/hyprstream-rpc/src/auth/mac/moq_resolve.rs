@@ -139,9 +139,17 @@ impl MoqEventObjectRef {
     /// [`MAX_TRACK_SEGMENTS`] segments, segment 0 is the canonical service
     /// domain (the event `source`). Segments never contain `/`: the event
     /// namespace is flat per source, and a `/` would alias a broadcast path.
+    ///
+    /// The ninth segment is rejected on observation — before it is cloned or
+    /// otherwise worked on — so an attacker-controlled name cannot amplify
+    /// allocation past `MAX_TRACK_SEGMENTS` bounded segments no matter how
+    /// many separators it carries.
     fn parse_dot_coordinate(coordinate: &str) -> Option<Self> {
-        let mut segments = Vec::new();
+        let mut segments = Vec::with_capacity(MAX_TRACK_SEGMENTS);
         for segment in coordinate.split('.') {
+            if segments.len() == MAX_TRACK_SEGMENTS {
+                return None;
+            }
             check_segment(segment)?;
             // The event namespace is flat per source: a `/` in an event
             // segment would alias the slash-separated broadcast-path
@@ -150,9 +158,6 @@ impl MoqEventObjectRef {
                 return None;
             }
             segments.push(segment.to_owned());
-        }
-        if segments.len() > MAX_TRACK_SEGMENTS {
-            return None;
         }
         let service_domain = canonical_domain(&segments[0])?;
         Some(Self {
@@ -167,13 +172,20 @@ impl MoqEventObjectRef {
     /// service domain (`{tenant}/{service}/…` and `local/{service}/…` both
     /// carry it at index 1). A lone segment has no service coordinate and
     /// denies.
+    ///
+    /// Like the event grammar, the ninth segment is rejected on observation,
+    /// before it is cloned or otherwise worked on: allocation is structurally
+    /// bounded at `MAX_TRACK_SEGMENTS` segments however long the name is.
     fn parse_slash_coordinate(coordinate: &str) -> Option<Self> {
-        let mut segments = Vec::new();
+        let mut segments = Vec::with_capacity(MAX_TRACK_SEGMENTS);
         for segment in coordinate.split('/') {
+            if segments.len() == MAX_TRACK_SEGMENTS {
+                return None;
+            }
             check_segment(segment)?;
             segments.push(segment.to_owned());
         }
-        if segments.len() < 2 || segments.len() > MAX_TRACK_SEGMENTS {
+        if segments.len() < 2 {
             return None;
         }
         let service_domain = canonical_domain(&segments[1])?;
@@ -518,18 +530,79 @@ mod tests {
     }
 
     #[test]
-    fn event_prefix_rejects_oversized_and_unbounded_input() {
+    fn event_prefix_rejects_oversized_segments_and_domain() {
         let long_segment = "w".repeat(MAX_TRACK_SEGMENT_BYTES + 1);
         assert!(MoqEventObjectRef::parse(MoqEventPlane::Event, &long_segment).is_none());
-
-        let too_many = ["worker"; MAX_TRACK_SEGMENTS + 1].join(".");
-        assert!(MoqEventObjectRef::parse(MoqEventPlane::Event, &too_many).is_none());
 
         let oversized_domain = "w".repeat(MAX_SERVICE_DOMAIN_BYTES + 1);
         assert!(
             MoqEventObjectRef::parse(MoqEventPlane::Event, &oversized_domain).is_none(),
             "service domain beyond the shared 128-byte rule denies"
         );
+    }
+
+    // ── segment-count bound: reject the ninth on observation ──────────
+
+    fn dot_name(count: usize) -> String {
+        vec!["worker"; count].join(".")
+    }
+
+    fn slash_name(count: usize) -> String {
+        vec!["worker"; count].join("/")
+    }
+
+    #[test]
+    fn exactly_eight_segments_parse_in_both_syntaxes() {
+        let event = MoqEventObjectRef::parse(MoqEventPlane::Event, &dot_name(MAX_TRACK_SEGMENTS))
+            .expect("eight dot segments parse");
+        assert_eq!(event.segments().len(), MAX_TRACK_SEGMENTS);
+
+        let stream =
+            MoqEventObjectRef::parse(MoqEventPlane::Stream, &slash_name(MAX_TRACK_SEGMENTS))
+                .expect("eight slash segments parse");
+        assert_eq!(stream.segments().len(), MAX_TRACK_SEGMENTS);
+    }
+
+    #[test]
+    fn ninth_segment_rejects_in_both_syntaxes() {
+        // Every segment is individually valid; only the count rejects.
+        assert!(
+            MoqEventObjectRef::parse(MoqEventPlane::Event, &dot_name(MAX_TRACK_SEGMENTS + 1))
+                .is_none()
+        );
+        assert!(MoqEventObjectRef::parse(
+            MoqEventPlane::Stream,
+            &slash_name(MAX_TRACK_SEGMENTS + 1)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn very_large_names_reject_without_segment_amplification() {
+        // A million individually-valid segments: the parsers reject on
+        // observing the ninth, so neither clones segment 9..=N. Before the
+        // on-observation bound this loop cloned every attacker-controlled
+        // segment before the count check.
+        let million_dots = ["a"; 1_000_000].join(".");
+        assert!(MoqEventObjectRef::parse(MoqEventPlane::Event, &million_dots).is_none());
+        let million_slashes = ["a"; 1_000_000].join("/");
+        assert!(MoqEventObjectRef::parse(MoqEventPlane::Stream, &million_slashes).is_none());
+
+        // A very large ninth tail after eight valid segments: rejected at the
+        // ninth boundary too, bounding both work and allocation by segment
+        // count rather than by name length.
+        let huge_tail = format!(
+            "{}.{}",
+            dot_name(MAX_TRACK_SEGMENTS),
+            "x".repeat(4 * 1024 * 1024)
+        );
+        assert!(MoqEventObjectRef::parse(MoqEventPlane::Event, &huge_tail).is_none());
+        let huge_tail = format!(
+            "{}/{}",
+            slash_name(MAX_TRACK_SEGMENTS),
+            "x".repeat(4 * 1024 * 1024)
+        );
+        assert!(MoqEventObjectRef::parse(MoqEventPlane::Stream, &huge_tail).is_none());
     }
 
     #[test]
