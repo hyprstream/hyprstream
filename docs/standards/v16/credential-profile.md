@@ -154,6 +154,24 @@ The authority stores at least: subject, tenant, session kind (interactive or
 workload), creation and expiry times, active/revoked status, and a clearance
 epoch, keyed by `(issuer, session identifier)`.
 
+### 3.5 Credential kind and `sid` coherence
+
+`sid` presence is unambiguous by credential kind (a classification aligned with
+the issuer's `IssueTokenProfile` enum, not a new wire claim):
+
+- **`user-session`** — an interactive OIDC session token; **MUST** carry `sid`
+  (§3.2), and a proof bound to it is additionally bounded by the authoritative
+  session expiry (§3.4).
+- **`rfc8693` / `rfc7523`** — a **non-interactive** token-exchange or JWT-bearer
+  token with a user subject and no interactive session; **MUST NOT** carry `sid`.
+- **`service`** — a standalone service identity with a `service:`-prefixed subject
+  and **no** `sid`.
+
+A user credential is therefore never left with an ambiguous session profile: it is
+either a `user-session` credential with `sid`, or an explicitly non-interactive
+`rfc8693`/`rfc7523` credential without it. The gate enforces this coherence over
+every credential fixture.
+
 ## 4. Credential use: Reusable-only (v16)
 
 **v16 credentials are Reusable.** There is no credential use-profile field and

@@ -642,6 +642,18 @@
       "deny_class": "proof-credential-expiry",
       "deny_rule": "a proof exp MUST NOT exceed the mapped credential (or session) expiry",
       "notes": "Both proof and credential are valid at verifier_now; denies solely on the expiry-binding rule."
+    },
+    {
+      "id": "N-51",
+      "title": "Session-bound proof whose exp (1786000025) exceeds the authoritative session exp (1786000020)",
+      "expect": "deny",
+      "structure": "COSE_Sign1",
+      "size_bytes": 395,
+      "sha256": "b8cbcbd2dc7dea9a6304833d26ba0ce30f201365b92ab515b2e04811417e019d",
+      "cbor_hex": "8458a9a7013202833a000111d53a000111d43a000111d30450636c69656e742d656432353531392d311078246170706c69636174696f6e2f766e642e6879707273747265616d2e70726f6f662b6377743a000111d37768732d7270632d726571756573742d70726f6f662d76313a000111d481a30101027768732d636f73652d7369676e2d656432353531392d76310381a201320250636c69656e742d656432353531392d313a000111d501a0589aa803781c72656769737472792e7376632e6879707273747265616d2e74657374041a6a743299061a6a74328007503f1c9a04b7d2416e8c05a9137b6e2d803a0001117058204086c086c26d11e8ee1d7293cdc8f19683fcca7956e0a50cd05e1bd1c52ad3353a000111711bd4d0f2a1b3c58e673a00011172581a00000000000000000100000017000000010005000000000000003a00011173f6584098b8dbd00b23a899ed0eed79367c67ee3f40580a232e77f350955d99f568dc5715734f395937f609153b633a9b5114118da2f5d01076f55165a479a756665301",
+      "deny_class": "proof-session-expiry",
+      "deny_rule": "a proof exp MUST NOT exceed the authoritative session expiry for a sid-bearing credential",
+      "notes": "proof exp <= credential exp but > session exp; the credential bound is satisfied, only the session bound denies."
     }
   ]
 }

@@ -183,6 +183,12 @@ ISSUER_ISS = "https://issuer.hyprstream.test"
 CREDENTIAL_CLIENT_ID = "hyprstream-oauth-client-1"
 CREDENTIAL_SUBJECT = "user-1"
 CREDENTIAL_TENANT = "tenant-alpha"           # JWT text name for the -70005 tenant claim
+# K1: an OIDC user session (§3.2). The authoritative session expiry lives in the
+# authority's session state keyed by (iss, sid) — NOT on the credential wire. It is
+# EARLIER than the credential expiry (1786000030) but still after verifier_now
+# (1786000015), so the session is active yet a longer-lived proof outlives it.
+SESSION_ID = "sess-6b1e0a7c9d2f4a08"
+SESSION_EXP = 1786000020
 CREDENTIAL_CLEARANCE = [2, [5, 7]]           # [level, compartments]; -70006 (JWT text: clearance)
 ML_KEM_768_RECIPIENT = bytes(range(256)) * 4 + bytes(range(160))  # 1184 bytes
 
@@ -376,10 +382,11 @@ def main() -> None:
         cnf_classical = signer_suite_thumbprint(SUITE_CLASSICAL, [client_ed_pub])
         cnf_hybrid = signer_suite_thumbprint(SUITE_HYBRID, [client_ed_pub, ml_client.public])
 
-        def build_at_jwt(jti: str, cnf_thumbprint: bytes):
+        def build_at_jwt(jti: str, cnf_thumbprint: bytes, *, sid: str = None):
             """A compact JWS (RFC 7519/8725) access token: exact at+jwt header,
             EdDSA over the seeded issuer key, and every required v16
-            authenticated-dispatch claim. Ed25519 + canonical JSON => byte-stable."""
+            authenticated-dispatch claim. Ed25519 + canonical JSON => byte-stable.
+            A user-session credential also carries the OIDC `sid` (§3.2)."""
             header = {"alg": "EdDSA", "kid": KID_ISSUER_ED.decode(), "typ": "at+jwt"}
             claims = {
                 "iss": ISSUER_ISS,
@@ -393,6 +400,8 @@ def main() -> None:
                 "clearance": CREDENTIAL_CLEARANCE,
                 "cnf": {"hs_signer_suite": b64u(cnf_thumbprint)},
             }
+            if sid is not None:
+                claims["sid"] = sid
             hp = b64u(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
             pp = b64u(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
             signing_input = f"{hp}.{pp}".encode("ascii")
@@ -402,8 +411,14 @@ def main() -> None:
 
         cred_classical, hdr_classical, claims_classical = build_at_jwt("cred-classical-1", cnf_classical)
         cred_hybrid, hdr_hybrid, claims_hybrid = build_at_jwt("cred-hybrid-1", cnf_hybrid)
+        # K1: a user-session at+jwt credential carrying OIDC `sid`; its authoritative
+        # session record (below) has an EARLIER expiry than the credential, so a proof
+        # can be within the credential bound yet outlive the session.
+        cred_session, hdr_session, claims_session = build_at_jwt(
+            "cred-session-1", cnf_classical, sid=SESSION_ID)
         CREDENTIAL_HASH = hashlib.sha256(cred_classical.encode("ascii")).digest()
         CREDENTIAL_HASH_HYBRID = hashlib.sha256(cred_hybrid.encode("ascii")).digest()
+        CREDENTIAL_HASH_SESSION = hashlib.sha256(cred_session.encode("ascii")).digest()
 
         keys_doc = {
             "warning": (
@@ -839,6 +854,26 @@ def main() -> None:
                 "hs_unattributed_key_set carries the Ed25519 then ML-DSA-65 public "
                 "keys in the plan's component order; each signature verifies against "
                 "its embedded key."
+            ),
+        )
+
+        # ---------------- P-9: session-bound classical proof (K1) -----------
+        # An authenticated classical proof bound to the user-session credential.
+        # Its exp equals the authoritative session expiry (1786000020) — within BOTH
+        # the credential exp (1786000030) and the session exp — so it accepts. It is
+        # the boundary-accept counterpart to N-51 (which outlives the session).
+        p9_claims = request_claims(credential_hash=CREDENTIAL_HASH_SESSION, extra={C_EXP: SESSION_EXP})
+        p9, p9_prot, p9_payload = sign1(p4_protected, p9_claims, sk_c_ed)
+        record(
+            positives, "P-9",
+            "Session-bound classical proof whose exp equals the authoritative session expiry",
+            "accept", "COSE_Sign1", p9,
+            protected_hex=p9_prot.hex(),
+            payload_hex=p9_payload.hex(),
+            notes=(
+                "Bound to the user-session credential (sid); proof exp 1786000020 <= "
+                "session exp 1786000020 <= credential exp 1786000030, valid at "
+                "verifier_now 1786000015."
             ),
         )
 
@@ -2021,6 +2056,22 @@ def main() -> None:
             notes="Both proof and credential are valid at verifier_now; denies solely on the expiry-binding rule.",
         )
 
+        # N-51 (K1): a correctly-signed proof bound to the user-session credential
+        # whose exp (1786000025) is WITHIN the credential exp (1786000030) but LATER
+        # than the authoritative session exp (1786000020). Proof, credential, and
+        # session are all unexpired at verifier_now (1786000015), so it denies solely
+        # on the session-expiry bound — the credential bound is satisfied.
+        n51_claims = request_claims(credential_hash=CREDENTIAL_HASH_SESSION, extra={C_EXP: 1786000025})
+        n51, _, _ = sign1(p4_protected, n51_claims, sk_c_ed)
+        record(
+            negatives, "N-51",
+            "Session-bound proof whose exp (1786000025) exceeds the authoritative session exp (1786000020)",
+            "deny", "COSE_Sign1", n51,
+            deny_class="proof-session-expiry",
+            deny_rule="a proof exp MUST NOT exceed the authoritative session expiry for a sid-bearing credential",
+            notes="proof exp <= credential exp but > session exp; the credential bound is satisfied, only the session bound denies.",
+        )
+
     meta = {
         "vector_set_version": 1,
         "profile": "hs-rpc-proof-v1",
@@ -2074,6 +2125,7 @@ def main() -> None:
         "credentials": {
             "classical": {
                 "encoding": "at+jwt",
+                "credential_kind": "rfc8693",
                 "token": cred_classical,
                 "header": hdr_classical,
                 "claims": claims_classical,
@@ -2084,6 +2136,7 @@ def main() -> None:
             },
             "hybrid": {
                 "encoding": "at+jwt",
+                "credential_kind": "rfc8693",
                 "token": cred_hybrid,
                 "header": hdr_hybrid,
                 "claims": claims_hybrid,
@@ -2092,12 +2145,55 @@ def main() -> None:
                 "cnf_thumbprint_b64": b64u(cnf_hybrid),
                 "token_sha256": CREDENTIAL_HASH_HYBRID.hex(),
             },
+            "session": {
+                "encoding": "at+jwt",
+                "credential_kind": "user-session",
+                "token": cred_session,
+                "header": hdr_session,
+                "claims": claims_session,
+                "primary_suite": SUITE_CLASSICAL,
+                "cnf_preimage_hex": enc([SUITE_CLASSICAL, [client_ed_pub]]).hex(),
+                "cnf_thumbprint_b64": b64u(cnf_classical),
+                "token_sha256": CREDENTIAL_HASH_SESSION.hex(),
+                "session_id": SESSION_ID,
+            },
         },
+        "session_model": {
+            "note": (
+                "K1: a user-session credential carries the OIDC `sid` (§3.2). The "
+                "AUTHORITATIVE session expiry is the authority's session state keyed "
+                "by (iss, sid) (§3.4) — NOT a credential/wire claim. A proof's exp MUST "
+                "NOT exceed BOTH the credential exp and the session exp; an unknown, "
+                "revoked, expired, or (iss/sub/tenant)-mismatched session denies."
+            ),
+            "credential_kind_note": (
+                "sid presence is unambiguous by classification (metadata aligned with "
+                "B's IssueTokenProfile enum, NOT a wire claim): a `user-session` "
+                "credential is an interactive OIDC session token and MUST carry sid "
+                "(session). A `rfc8693` / `rfc7523` credential is a NON-INTERACTIVE "
+                "token-exchange / JWT-bearer profile that MUST NOT carry sid (classical, "
+                "hybrid — user subject, no interactive session). A `service` credential "
+                "(none shipped) has a `service:`-prefixed subject and no sid. §3.2/§3.3."
+            ),
+        },
+        "sessions": [
+            {
+                "iss": ISSUER_ISS,
+                "sid": SESSION_ID,
+                "sub": CREDENTIAL_SUBJECT,
+                "tenant": CREDENTIAL_TENANT,
+                "session_kind": "interactive",
+                "created": IAT,
+                "expiry": SESSION_EXP,
+                "status": "active",
+            },
+        ],
         "positive_to_credential": {
             "P-2": "hybrid",
             "P-4": "classical",
             "P-5": "classical",
             "P-6": "classical",
+            "P-9": "session",
         },
     }
 

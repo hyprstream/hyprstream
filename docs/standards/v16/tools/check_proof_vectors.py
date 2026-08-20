@@ -165,6 +165,37 @@ def enc(obj) -> bytes:
     raise TypeError(type(obj))
 
 
+def resolve_session(creds_doc, iss, sid):
+    """K1: the authoritative session record keyed by exact (iss, sid) (§3.4),
+    held in the credential context OUTSIDE the credential wire. None if absent."""
+    for s in creds_doc.get("sessions", []):
+        if s.get("iss") == iss and s.get("sid") == sid:
+            return s
+    return None
+
+
+def validate_session(creds_doc, cred_claims, now):
+    """K1: for a `sid`-bearing credential, resolve and validate its authoritative
+    session. Returns (session_record_or_None, failure_list). A non-session
+    credential returns (None, []). An unknown, revoked (non-active), expired
+    (expiry <= now), or (iss/sub/tenant)-mismatched session denies."""
+    sid = cred_claims.get("sid")
+    if sid is None:
+        return None, []
+    s = resolve_session(creds_doc, cred_claims.get("iss"), sid)
+    if s is None:
+        return None, [f"no authoritative session for (iss={cred_claims.get('iss')!r}, sid={sid!r})"]
+    errs = []
+    if s.get("status") != "active":
+        errs.append(f"session status {s.get('status')!r} is not active (revoked)")
+    if not isinstance(s.get("expiry"), int) or s.get("expiry") <= now:
+        errs.append(f"session is not active at verifier_now {now} (expiry {s.get('expiry')!r})")
+    for k in ("iss", "sub", "tenant"):
+        if s.get(k) != cred_claims.get(k):
+            errs.append(f"session {k} {s.get(k)!r} != credential {k} {cred_claims.get(k)!r}")
+    return s, errs
+
+
 def validate_tenant(value):
     """J1: the frozen credential tenant rule (credential-profile §2 tenant row):
     a verified tenant/Casbin domain. Missing, empty, or wildcard tenants deny.
@@ -535,6 +566,10 @@ def main() -> None:
             claims = verify_at_jwt(cred["token"], f"credential {name}")
             if hashlib.sha256(cred["token"].encode("ascii")).hexdigest() != cred["token_sha256"]:
                 fail(f"credential {name}: published token_sha256 does not match the token bytes")
+            # K1: a sid-bearing credential must map to a valid authoritative session.
+            _sess, serrs = validate_session(cd, claims or {}, now)
+            for se in serrs:
+                fail(f"credential {name} session: {se}")
 
         for pid, credname in cd["positive_to_credential"].items():
             cred = cd["credentials"][credname]
@@ -566,6 +601,14 @@ def main() -> None:
                     matches.append(grp[1])
             if len(matches) != 1:
                 fail(f"{pid}: cnf must resolve to exactly one primary plan group; matched {matches}")
+            # K1: proof exp <= credential exp, and for a sid-bearing credential also
+            # <= the authoritative session exp.
+            pexp = pclaims.get(4)
+            if isinstance(pexp, int) and pexp > cred_claims.get("exp", 0):
+                fail(f"{pid}: proof exp {pexp} exceeds credential exp {cred_claims.get('exp')}")
+            sess, _ = validate_session(cd, cred_claims, now)
+            if sess is not None and isinstance(pexp, int) and pexp > sess.get("expiry", 0):
+                fail(f"{pid}: proof exp {pexp} exceeds session exp {sess.get('expiry')}")
 
     total = len(positive["vectors"]) + len(negative["vectors"])
     if FAILURES:

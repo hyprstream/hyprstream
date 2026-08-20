@@ -12,8 +12,8 @@ Machine-readable files (the normative form — this page is the human index):
 | File | Contents |
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
-| [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 8 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 55 vectors that MUST deny |
+| [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 9 vectors that MUST verify |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 56 vectors that MUST deny |
 | [`vectors/proof-v1-thumbprints.json`](vectors/proof-v1-thumbprints.json) | Cross-implementation replay-namespace thumbprint vectors (C1) |
 | [`vectors/proof-v1-credentials.json`](vectors/proof-v1-credentials.json) | Frozen `verifier_now` clock (F1) and the issuer-signed at+jwt tokens the authenticated positives hash (F2) |
 
@@ -214,6 +214,7 @@ Object encoding is untagged: typing is performed by the protected `typ` header
 | P-6 | `COSE_Sign1` | 411 | Authenticated classical proof with a cleartext stream-setup `response_binding` (`response_kind` stream_setup, `protection_mode` cleartext, null recipient) — exercises the orthogonal axes | `86f50e9862a45d0805786ae207fc310693e75f60dc50d44682b9ae1846030201` |
 | P-7 | `COSE_Sign1` | 1605 | Bound response proof whose `response_binding` equals the originating request (P-4) field-for-field | `ab0b26bd2956ad31dcd047869a76e663171e2c57f0414d9d91d7795ba99aa5ab` |
 | P-8 | `COSE_Sign` | 5862 | Hybrid unattributed proof; two embedded keys in plan order, each signature verified against its embedded key | `4f8fdbf677f7b28cf16b45af61067602f7f4082be2ced79b251ede6ecf82e6df` |
+| P-9 | `COSE_Sign1` | 395 | Session-bound classical proof whose `exp` equals the authoritative session expiry (accepts within both bounds) | `bfa6026b0c940b15c050274b640344ef77117585881a6c0c25c1b39671bba77d` |
 
 ### P-1 — unattributed `COSE_Sign1` (complete CBOR)
 
@@ -370,6 +371,7 @@ Ed25519 signature over the stripped object.
 | N-48 | cbor-truncation | Truncated CBOR: response signature bstr header declares 65 bytes with 64 present | 374 |
 | N-49 | integer-truncation | Truncated CBOR integer: claims `iat` argument `19 00` declares 2 bytes with 1 present | 244 |
 | N-50 | proof-credential-expiry | Authenticated proof whose `exp` (1786000060) exceeds its mapped credential's `exp` (1786000030) | 244 |
+| N-51 | proof-session-expiry | Session-bound proof whose `exp` (1786000025) is within the credential expiry but exceeds the authoritative session expiry (1786000020) | 395 |
 
 ### Notes on individual negatives
 
@@ -457,6 +459,30 @@ Ed25519 signature over the stripped object.
   authenticated-context loop (`proof.exp <= mapped credential.exp` for every
   positive) and the causality inventory (§12) resolves N-50's mapped credential
   from its `credential_hash` and asserts `proof.exp > credential.exp`.
+- **P-9 / N-51 (proof expiry cannot exceed the authoritative session, K1).** A
+  credential carrying an OIDC `sid` (§3.2) is bound to an **authoritative session**
+  whose state — including its expiry — the authority stores keyed by `(iss, sid)`
+  (§3.4); it is **not** a credential wire field. A proof's `exp` MUST NOT exceed
+  **both** the credential expiry **and** that session expiry. The fixtures ship a
+  user-session credential (`credential_kind = user-session`, carrying `sid`) whose
+  authoritative session (in `proof-v1-credentials.json` `sessions`, keyed by
+  `(iss, sid)`, `status = active`) expires at `1786000020`, earlier than the
+  credential's `1786000030`. **P-9** is the boundary-accept: a session-bound proof
+  whose `exp` equals the session expiry (`1786000020`), within both bounds.
+  **N-51** is the causal denial: an otherwise-valid, correctly-signed session-bound
+  proof whose `exp` is `1786000025` — within the credential expiry but **past** the
+  session expiry — so it denies **solely** on the session bound (the credential
+  bound is satisfied and all three are unexpired at `verifier_now`). The gate and
+  checker enforce `proof.exp <= session.exp` for a session-bound proof and validate
+  the session as active, `(iss, sid)`-keyed, and `iss`/`sub`/`tenant`-coherent with
+  the credential; an unknown, revoked, expired, or mismatched session denies. The
+  classical and hybrid credentials are typed `credential_kind = rfc8693` —
+  **non-interactive** token-exchange / JWT-bearer tokens (a user subject with no
+  interactive OIDC session) that carry no `sid`. The gate enforces this
+  classification coherence (aligned with B's `IssueTokenProfile` enum) so
+  sid-presence is never ambiguous: a `user-session` credential MUST carry `sid`, a
+  `rfc8693`/`rfc7523` credential MUST NOT, and a `service` credential has a
+  `service:`-prefixed subject and no `sid` (§3.2/§3.3).
 - **N-12 / N-28 (suite ↔ component-plan binding).** Each suite_id is bound to its
   exact ordered algorithms and component count: `hs-cose-sign-ed25519-v1` is
   exactly one Ed25519 component, `hs-cose-sign-ed25519-mldsa65-wns-v1` is exactly
@@ -473,7 +499,13 @@ Ed25519 signature over the stripped object.
   `.regexp` normatively; because the pinned pycddl does not enforce `.regexp`,
   `validate_profile.py` ports the exact syntax and applies it to every fixture
   and to these causal negatives, so the profile's audience namespace matches the
-  transport's.
+  transport's. (**Tracked disposition, K2, non-blocking:** RFC 8610 §3.8.3 `.regexp`
+  uses **XSD whole-string** matching, so the normative `.regexp` is already
+  whole-string; the pinned pycddl's *substring* search is a non-conformant tool bug
+  that is fully compensated by the mechanical `validate_service_domain` gate plus
+  N-29/N-30 — not a v16 correctness defect. PCRE `^`/`$` anchors are **not** added:
+  under XSD semantics they are literal characters, so anchoring would corrupt the
+  grammar rather than tighten it.)
 - **P-7 / N-32 (response-binding field-for-field equality).** A response proof's
   realized `response_binding` MUST equal the originating request's map
   field-for-field (§4). P-7 is a bound response proof whose binding equals P-4's

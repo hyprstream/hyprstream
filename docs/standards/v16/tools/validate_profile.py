@@ -63,7 +63,9 @@ ENVELOPE_RS = REPO_ROOT / "crates" / "hyprstream-rpc" / "src" / "envelope.rs"
 # Import the strict deterministic-CBOR decoder from the vector checker so the
 # gate and the checker share one decoder.
 sys.path.insert(0, str(HERE))
-from check_proof_vectors import decode, StrictError, validate_tenant  # noqa: E402
+from check_proof_vectors import (  # noqa: E402
+    decode, StrictError, validate_tenant, validate_session, resolve_session,
+)
 
 # ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
 
@@ -1278,9 +1280,16 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
     # H1: map each credential's token hash -> its exp, to resolve a proof's mapped
     # credential from the proof's credential_hash claim.
     _creds = _load_credentials()
+    _now = _creds["verifier_now"]
     import hashlib as _hl
     cred_exp_by_hash = {_hl.sha256(c["token"].encode("ascii")).digest(): c["claims"]["exp"]
                         for c in _creds["credentials"].values()}
+    # K1: token hash -> the authoritative session exp of a sid-bearing credential.
+    cred_session_exp_by_hash = {}
+    for c in _creds["credentials"].values():
+        s, _ = validate_session(_creds, c["claims"], _now)
+        if s is not None:
+            cred_session_exp_by_hash[_hl.sha256(c["token"].encode("ascii")).digest()] = s["expiry"]
     PROOF_TYPS = (TYP_REQUEST, TYP_RESPONSE)
     REQUIRED_CLAIMS = {C_AUD, C_EXP, C_IAT, C_CTI, C_CREDENTIAL_HASH, C_SCHEMA_ID, C_BODY_BYTES, C_RESPONSE_BINDING}
     ALLOWED_CLAIMS = REQUIRED_CLAIMS | {C_NONCE}
@@ -1397,6 +1406,18 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
                 return False, "proof's credential_hash resolves to no mapped credential"
             return claims.get(C_EXP, 0) > cred_exp, \
                 f"proof exp {claims.get(C_EXP)} exceeds mapped credential exp {cred_exp}"
+        if dc == "proof-session-expiry":  # K1
+            if claims is None:
+                return False, "claims did not decode"
+            ch = claims.get(C_CREDENTIAL_HASH)
+            sess_exp = cred_session_exp_by_hash.get(ch)
+            cred_exp = cred_exp_by_hash.get(ch)
+            if sess_exp is None:
+                return False, "proof's credential_hash resolves to no session-bearing credential"
+            pexp = claims.get(C_EXP, 0)
+            # Isolated: over the session bound but WITHIN the credential bound.
+            return (pexp > sess_exp and pexp <= cred_exp), \
+                f"proof exp {pexp} vs session exp {sess_exp} / credential exp {cred_exp}"
         if dc == "nonce-length":  # E1 server-challenge boundary (16..64)
             nonce = claims.get(C_NONCE) if claims else None
             if nonce is None:
@@ -1680,6 +1701,13 @@ def gate_credential_context(positives, negatives) -> None:
         # H1: a proof's exp MUST NOT exceed the mapped credential's exp.
         check(pclaims[C_EXP] <= cred["claims"]["exp"],
               f"{pid}: proof exp {pclaims[C_EXP]} must not exceed credential exp {cred['claims']['exp']}")
+        # K1: for a sid-bearing credential, the authoritative session must be valid
+        # and the proof exp must not exceed the session exp either.
+        sess, serrs = validate_session(creds, cred["claims"], now)
+        check(not serrs, f"{pid}: mapped session invalid: {serrs}")
+        if sess is not None:
+            check(pclaims[C_EXP] <= sess["expiry"],
+                  f"{pid}: proof exp {pclaims[C_EXP]} must not exceed session exp {sess['expiry']}")
     print(f"   both credentials valid; {len(creds['positive_to_credential'])} positives bind their "
           f"credential hash + cnf primary group")
 
@@ -1814,6 +1842,57 @@ def gate_credential_context(positives, negatives) -> None:
     check(_validate_clearance([2, [5, 7]]) == [] and _validate_clearance([0, []]) == [],
           "the conforming clearance shapes [2,[5,7]] and [0,[]] must validate")
     print(f"   H2 clearance grammar frozen; shipped clearances conform; 7 malformed clearances rejected")
+
+    # ---- K1: authoritative session-expiry proof bound -------------------------
+    for pin in ("MUST NOT exceed credential or session expiry",):
+        check(pin in prof, f"credential-profile must state the session-expiry bound (missing: {pin!r})")
+    # Coherence: every credential is unambiguously typed (metadata aligned with B's
+    # IssueTokenProfile enum) so sid-presence is never ambiguous — sid is REQUIRED
+    # for OIDC user-session credentials and absent otherwise (§3.2/§3.3):
+    #   user-session  -> MUST carry sid;
+    #   rfc8693/rfc7523 (non-interactive) -> MUST NOT carry sid (user subject);
+    #   service -> subject prefixed `service:` and MUST NOT carry sid.
+    KINDS = {"service", "user-session", "rfc8693", "rfc7523"}
+    NONINTERACTIVE = {"rfc8693", "rfc7523"}
+    for name, cred in creds["credentials"].items():
+        kind = cred.get("credential_kind")
+        sub = cred["claims"].get("sub", "")
+        has_sid = "sid" in cred["claims"]
+        check(kind in KINDS, f"credential {name} credential_kind must be one of {sorted(KINDS)}, got {kind!r}")
+        if kind == "user-session":
+            check(has_sid, f"user-session credential {name} MUST carry sid")
+        elif kind == "service":
+            check(isinstance(sub, str) and sub.startswith("service:"),
+                  f"service credential {name} subject must be 'service:'-prefixed, got {sub!r}")
+            check(not has_sid, f"service credential {name} MUST NOT carry sid")
+        elif kind in NONINTERACTIVE:
+            check(not has_sid, f"non-interactive {kind} credential {name} MUST NOT carry sid")
+    # Every shipped session-bearing credential resolves a valid authoritative session.
+    session_creds = [(n, c) for n, c in creds["credentials"].items() if "sid" in c["claims"]]
+    check(session_creds, "a session-bearing (sid) credential fixture must exist for K1")
+    for name, cred in session_creds:
+        s, serrs = validate_session(creds, cred["claims"], now)
+        check(s is not None and not serrs, f"session credential {name} must resolve a valid session: {serrs}")
+    # Load-bearing counter-proofs on the authoritative session context: unknown,
+    # revoked, expired, and (sub/tenant/iss)-mismatched sessions each deny.
+    sc = session_creds[0][1]["claims"]
+    import copy as _copy
+
+    def session_red(label, mutate):
+        cd = _copy.deepcopy(creds)
+        mutate(cd)
+        _s, e = validate_session(cd, sc, now)
+        check(bool(e), f"K1 session counter '{label}' must deny but validated clean")
+        if e:
+            print(f"   K1 session counter '{label}' denies: {e[0]}")
+
+    session_red("unknown sid", lambda cd: cd.__setitem__("sessions", []))
+    session_red("revoked session", lambda cd: cd["sessions"][0].__setitem__("status", "revoked"))
+    session_red("expired session", lambda cd: cd["sessions"][0].__setitem__("expiry", now))
+    session_red("subject mismatch", lambda cd: cd["sessions"][0].__setitem__("sub", "user-2"))
+    session_red("tenant mismatch", lambda cd: cd["sessions"][0].__setitem__("tenant", "tenant-beta"))
+    print(f"   K1 session-expiry bound enforced; {len(session_creds)} session credential(s) valid; "
+          f"unknown/revoked/expired/mismatched sessions deny")
 
 
 # --------------------------------------------------------------------------
