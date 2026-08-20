@@ -152,7 +152,13 @@ never exposed on a public error surface.
 
 The authority stores at least: subject, tenant, session kind (interactive or
 workload), creation and expiry times, active/revoked status, and a clearance
-epoch, keyed by `(issuer, session identifier)`.
+epoch, keyed by `(issuer, session identifier)`. The `created` time is a
+deterministic integer, and every session-validation path requires it to be
+temporally coherent with the verifier clock and the session expiry:
+`created <= verifier_now < expires_at`. A session whose `created` is missing,
+non-integer, in the future (`created > verifier_now`), or not strictly before its
+own expiry (`created >= expires_at`) is not admissible. Like the rest of session
+state, `created` is authoritative off-wire state, never a credential/wire claim.
 
 ### 3.5 Credential kind and `sid` coherence
 
@@ -237,6 +243,22 @@ backed by an idempotency/result ledger whose lookup binds the retrying principal
   epoch; an unknown, tampered, key/suite-mismatched, inactive, expired,
   cross-tenant, or wrong-role enrollment denies. Being merely *different from `cnf`*
   is insufficient — an unenrolled group is not an authorized approver.
+- **Primary enrollment authority (T1).** The `cnf`-bound primary group is itself
+  backed by an **authoritative, off-wire primary enrollment record** (never a
+  credential/wire claim), resolved by the same content-bound discipline as the
+  approver record: the record is located by **recomputing** its signer-suite
+  thumbprint over its own `suite_id` + ordered public keys and matching it to the
+  `cnf`-resolved signer suite — labels are never trusted. A conforming verifier
+  requires an **active, unexpired** record with the **`primary` role** whose
+  `tenant` and `principal` equal the credential's `tenant` and subject, and a
+  non-negative integer enrollment epoch. The **authenticated replay-namespace
+  `enrollment_epoch` (§7.1) is taken from this resolved record, not from any wire
+  or vector value**, so the published authenticated thumbprint is reproducible only
+  from authoritative primary state; an unknown, tampered, key/suite-mismatched,
+  inactive, expired, cross-tenant, wrong-principal, or wrong-role primary record
+  denies. Primary and approver records are distinct, and the same resolved public
+  key presented as both a `cnf` primary and an approver under different labels is
+  denied (§7.1, content-identity uniqueness).
 - Presenting a credential never leaves a proof in the unattributed branch: with
   a valid credential, the proof MUST be `cnf`-bound, and
   `hs_unattributed_key_set` is forbidden (vector N-10f).

@@ -66,6 +66,7 @@ sys.path.insert(0, str(HERE))
 from check_proof_vectors import (  # noqa: E402
     decode, StrictError, validate_tenant, validate_session, resolve_session,
     resolve_approver_enrollment, validate_approver_enrollment,
+    resolve_primary_enrollment, validate_primary_enrollment, authenticated_replay_thumbprint,
 )
 
 # ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
@@ -1212,6 +1213,31 @@ def gate_replay_thumbprints(cddl: str, positives) -> None:
     check(hashlib.sha256(auth_pre).hexdigest() == a["thumbprint_sha256"],
           "authenticated replay thumbprint does not match its inputs")
 
+    # T1: the authenticated replay `enrollment_epoch` is DERIVED from the cnf-resolved
+    # PRIMARY enrollment record — not the thumbprint vector's literal. Resolve the
+    # primary record for this suite/keys, validate it, and reproduce the published
+    # authenticated thumbprint from the RECORD's epoch. An epoch change re-derives a
+    # different thumbprint (the closed literal-epoch bypass).
+    creds = _load_credentials()
+    a_suite, a_pubs = a["suite_id"], [bytes.fromhex(h) for h in a["component_public_keys_hex"]]
+    a_tp_b64 = _b64u(_suite_thumbprint(a_suite, a_pubs))
+    prec = resolve_primary_enrollment(creds, a_tp_b64)
+    hcred = creds["credentials"]["hybrid"]["claims"]
+    perrs = validate_primary_enrollment(prec, a_tp_b64, hcred["tenant"], hcred["sub"], creds["verifier_now"])
+    check(not perrs, f"the authenticated thumbprint's primary enrollment must be valid: {perrs}")
+    if prec is not None:
+        derived = authenticated_replay_thumbprint(sep["authenticated"], a_suite, a_pubs,
+                                                  prec["enrollment_epoch"]).hex()
+        check(derived == a["thumbprint_sha256"],
+              "the authenticated thumbprint must be reproduced from the primary record's epoch")
+        # De-fang: a changed record epoch re-derives a DIFFERENT thumbprint.
+        other = authenticated_replay_thumbprint(sep["authenticated"], a_suite, a_pubs,
+                                               prec["enrollment_epoch"] + 1).hex()
+        check(other != a["thumbprint_sha256"],
+              "the enrollment_epoch must be load-bearing in the authenticated thumbprint")
+        print(f"   T1 authenticated replay epoch derived from the cnf-resolved primary "
+              f"enrollment record (epoch {prec['enrollment_epoch']}); reproduces the published thumbprint")
+
     # Unattributed thumbprint: recompute from P-1's plan + embedded key set.
     p1 = next((v for v in positives["vectors"] if v["id"] == tp["unattributed"]["from_vector"]), None)
     check(p1 is not None, "unattributed thumbprint source vector must exist")
@@ -1981,6 +2007,14 @@ def gate_credential_context(positives, negatives) -> None:
         cnf_tp = _b64u_dec(cred["claims"]["cnf"]["hs_signer_suite"])
         matched, obj = primary_groups_matching(pid, cnf_tp)
         check(len(matched) == 1, f"{pid}: cnf must resolve to exactly one primary group; matched {matched}")
+        # T1: the cnf primary group MUST resolve to an authoritative PRIMARY
+        # enrollment record (active, role=primary, tenant/principal-coherent,
+        # unexpired), recomputed by content — not merely resolve a cnf thumbprint.
+        cnf_b64 = cred["claims"]["cnf"]["hs_signer_suite"]
+        prec = resolve_primary_enrollment(creds, cnf_b64)
+        perrs = validate_primary_enrollment(prec, cnf_b64, cred["claims"]["tenant"],
+                                            cred["claims"]["sub"], now)
+        check(not perrs, f"{pid}: cnf primary group must resolve a valid primary enrollment: {perrs}")
         pclaims = decode(obj[2])
         ch = pclaims.get(C_CREDENTIAL_HASH)
         check(ch == hashlib.sha256(cred["token"].encode("ascii")).digest(),
@@ -2111,6 +2145,39 @@ def gate_credential_context(positives, negatives) -> None:
     check(resolve_approver_enrollment(creds, _b64u(cnf_classical)) is None,
           "the primary (client) signer-suite record must not resolve an approver enrollment")
 
+    # ---- T1: authoritative PRIMARY enrollment counter-proofs. The cnf must resolve
+    #      to a valid primary record; unknown/tampered/mismatched/wrong-role/tenant/
+    #      principal/inactive/expired records each deny. Primary and approver records
+    #      stay DISTINCT (a primary thumbprint resolves no approver, and vice versa).
+    cnf_hyb_b64 = creds["credentials"]["hybrid"]["claims"]["cnf"]["hs_signer_suite"]
+    p_tenant = creds["credentials"]["hybrid"]["claims"]["tenant"]
+    p_princ = creds["credentials"]["hybrid"]["claims"]["sub"]
+    prec_base = resolve_primary_enrollment(creds, cnf_hyb_b64)
+    check(prec_base is not None, "the hybrid credential cnf must resolve a primary enrollment")
+
+    def primary_red(label, rec, req=cnf_hyb_b64):
+        e = validate_primary_enrollment(rec, req, p_tenant, p_princ, now)
+        check(bool(e), f"T1 primary counter '{label}' must deny but validated clean")
+        if e:
+            print(f"   T1 primary counter '{label}' denies: {e[0]}")
+
+    primary_red("unknown enrollment", None)
+    primary_red("tampered thumbprint_b64", {**prec_base, "thumbprint_b64": _b64u(b"\x00" * 32)})
+    primary_red("wrong role (approver)", {**prec_base, "role": "approver"})
+    primary_red("cross-tenant", {**prec_base, "tenant": "tenant-beta"})
+    primary_red("wrong principal", {**prec_base, "principal": "user-2"})
+    primary_red("inactive", {**prec_base, "status": "inactive"})
+    primary_red("expired (expires_at <= now)", {**prec_base, "expires_at": now})
+    # Primary/approver record independence: a primary thumbprint resolves no approver
+    # record, and the approver thumbprint resolves no primary record.
+    approver_tp_b64 = _b64u(_suite_thumbprint(SUITE_CLASSICAL, [ed_by_kid[b"approver-ed25519-1"]]))
+    check(resolve_primary_enrollment(creds, approver_tp_b64) is None,
+          "the approver signer-suite record must not resolve a PRIMARY enrollment")
+    check(resolve_approver_enrollment(creds, cnf_hyb_b64) is None,
+          "the hybrid primary signer-suite record must not resolve an approver enrollment")
+    print(f"   T1 cnf primary enrollment validated (content-recomputed; role/tenant/principal/"
+          f"status/expiry); primary and approver records are distinct")
+
     # ---- G1: hybrid credentials are at+jwt-only; CWT cnf is single-key/classical.
     prof = CREDENTIAL_PATH.read_text()
     for pin in ("hybrid credentials are", "at+jwt", "no v16 CWT confirmation method",
@@ -2234,6 +2301,16 @@ def gate_credential_context(positives, negatives) -> None:
     session_red("workload session_kind", lambda cd: cd["sessions"][0].__setitem__("session_kind", "workload"))
     session_red("empty session_kind", lambda cd: cd["sessions"][0].__setitem__("session_kind", ""))
     session_red("non-string session_kind", lambda cd: cd["sessions"][0].__setitem__("session_kind", 1))
+    # T2: the session `created` must be an integer with created <= now < expiry.
+    session_red("missing created", lambda cd: cd["sessions"][0].pop("created", None))
+    session_red("non-integer created", lambda cd: cd["sessions"][0].__setitem__("created", "t0"))
+    session_red("future created (> now)", lambda cd: cd["sessions"][0].__setitem__("created", now + 1))
+    def _created_after_expiry(cd):
+        # created >= expiry (coherence ordering); keep created <= now so the ordering
+        # branch — not the future-created branch — is the cause.
+        cd["sessions"][0]["created"] = now - 2
+        cd["sessions"][0]["expiry"] = now - 3
+    session_red("created after expiry", _created_after_expiry)
     print(f"   K1 session-expiry bound enforced; {len(session_creds)} session credential(s) valid; "
           f"unknown/revoked/expired/mismatched sessions deny")
 

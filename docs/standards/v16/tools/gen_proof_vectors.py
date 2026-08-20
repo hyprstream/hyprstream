@@ -386,6 +386,29 @@ def main() -> None:
         cnf_classical = signer_suite_thumbprint(SUITE_CLASSICAL, [client_ed_pub])
         cnf_hybrid = signer_suite_thumbprint(SUITE_HYBRID, [client_ed_pub, ml_client.public])
 
+        # T1: authoritative off-wire PRIMARY enrollment records for the authenticated
+        # credential path, keyed by cryptographic content (suite + ordered public
+        # keys). The credential cnf binds to exactly this record, and the
+        # authenticated replay thumbprint's enrollment_epoch is DERIVED from it (not a
+        # fixture literal). Distinct from approver_enrollments (role "primary").
+        PRIMARY_ENROLLMENT_EPOCH = 1
+
+        def primary_enrollment(suite, pubs):
+            return {
+                "suite_id": suite,
+                "component_public_keys_hex": [p.hex() for p in pubs],
+                "thumbprint_b64": b64u(signer_suite_thumbprint(suite, pubs)),
+                "role": "primary",
+                "tenant": CREDENTIAL_TENANT,
+                "principal": CREDENTIAL_SUBJECT,
+                "status": "active",
+                "expires_at": 1786000060,
+                "enrollment_epoch": PRIMARY_ENROLLMENT_EPOCH,
+            }
+
+        primary_enrollment_classical = primary_enrollment(SUITE_CLASSICAL, [client_ed_pub])
+        primary_enrollment_hybrid = primary_enrollment(SUITE_HYBRID, [client_ed_pub, ml_client.public])
+
         def build_at_jwt(jti: str, cnf_thumbprint: bytes, *, sid: str = None):
             """A compact JWS (RFC 7519/8725) access token: exact at+jwt header,
             EdDSA over the seeded issuer key, and every required v16
@@ -2298,6 +2321,20 @@ def main() -> None:
             ),
             "thumbprint": "base64url(SHA-256(RFC 8949 det-CBOR [suite_id, [ordered raw component public keys]]))",
         },
+        "primary_enrollment_model": {
+            "note": (
+                "T1: the authenticated credential path binds its cnf to an authoritative "
+                "off-wire PRIMARY enrollment record keyed by cryptographic content (the "
+                "primary signer-suite thumbprint over suite_id + ordered public keys, "
+                "recomputed from the record's OWN suite/keys, never labels). It carries "
+                "role=primary, tenant, principal, active status, expiry, and the "
+                "enrollment_epoch that the authenticated replay thumbprint is DERIVED from "
+                "(SHA-256([domain, suite_id, [ordered keys], enrollment_epoch])). An "
+                "unknown, tampered, wrong-role/tenant/principal, inactive/expired, or "
+                "epoch-changed record denies. Distinct from approver_enrollments."
+            ),
+        },
+        "primary_enrollments": [primary_enrollment_classical, primary_enrollment_hybrid],
         "approver_enrollments": [
             {
                 "suite_id": SUITE_CLASSICAL,
@@ -2326,7 +2363,9 @@ def main() -> None:
     # first element is the domain-separator text (see the CDDL §7.1).
     replay_domain_authenticated = "hs-rpc-replay-primary-suite-v1"
     replay_domain_key_set = "hs-rpc-replay-key-set-v1"
-    enrollment_epoch = 1
+    # T1: the authenticated replay epoch is DERIVED from the cnf-resolved PRIMARY
+    # enrollment record (the hybrid primary example here), not a fixture literal.
+    enrollment_epoch = primary_enrollment_hybrid["enrollment_epoch"]
     client_ed_pub = sk_c_ed.public_key().public_bytes_raw()
     # Authenticated example: the hybrid primary group (P-2's suite + ordered
     # public component keys), approver groups excluded.

@@ -274,6 +274,60 @@ def validate_approver_enrollment(rec, requested_thumbprint_b64, expected_tenant,
     return errs
 
 
+def resolve_primary_enrollment(creds_doc, requested_thumbprint_b64):
+    """T1: the authoritative PRIMARY enrollment record for a signer-suite record,
+    matched by its RECOMPUTED cryptographic content (suite + ordered keys), never by
+    the record's self-declared thumbprint field. None if no primary enrollment's own
+    suite/keys hash to the requested thumbprint."""
+    for e in creds_doc.get("primary_enrollments", []):
+        if _enrollment_thumbprint(e) == requested_thumbprint_b64:
+            return e
+    return None
+
+
+def validate_primary_enrollment(rec, requested_thumbprint_b64, expected_tenant, expected_principal, now):
+    """T1: a credential's cnf primary group MUST resolve to an authoritative PRIMARY
+    enrollment whose OWN suite/keys recompute to the requested content thumbprint
+    (record integrity + key/suite binding), that is an active, unexpired `primary`
+    role coherent with the credential tenant and principal. Returns the failure list;
+    an unknown, tampered, key/suite-mismatched, wrong-role, cross-tenant/principal,
+    inactive, or expired record denies."""
+    if rec is None:
+        return ["no authoritative primary enrollment for this signer-suite record"]
+    errs = []
+    recomputed = _enrollment_thumbprint(rec)
+    if recomputed is None:
+        return ["primary enrollment record has a malformed suite_id / public keys"]
+    if rec.get("thumbprint_b64") != recomputed:
+        errs.append("primary enrollment thumbprint_b64 disagrees with its own suite/keys (tampered record)")
+    if requested_thumbprint_b64 is not None and recomputed != requested_thumbprint_b64:
+        errs.append("primary enrollment key/suite does not bind the requested cnf primary group")
+    if rec.get("role") != "primary":
+        errs.append(f"enrollment role {rec.get('role')!r} is not 'primary'")
+    if rec.get("status") != "active":
+        errs.append(f"primary enrollment status {rec.get('status')!r} is not active")
+    ea = rec.get("expires_at")
+    if isinstance(ea, bool) or not isinstance(ea, int):
+        errs.append(f"primary enrollment expires_at must be an integer, got {ea!r}")
+    elif ea <= now:
+        errs.append(f"primary enrollment expired at verifier_now {now} (expires_at {ea})")
+    if expected_tenant is not None and rec.get("tenant") != expected_tenant:
+        errs.append(f"primary enrollment tenant {rec.get('tenant')!r} != credential tenant {expected_tenant!r}")
+    if expected_principal is not None and rec.get("principal") != expected_principal:
+        errs.append(f"primary enrollment principal {rec.get('principal')!r} != credential subject {expected_principal!r}")
+    ee = rec.get("enrollment_epoch")
+    if isinstance(ee, bool) or not isinstance(ee, int) or ee < 0:
+        errs.append(f"enrollment_epoch must be a non-negative integer, got {ee!r}")
+    return errs
+
+
+def authenticated_replay_thumbprint(domain, suite_id, pubs, enrollment_epoch):
+    """T1/C1: the authenticated primary signer-suite replay thumbprint —
+    SHA-256(det-CBOR([domain, suite_id, [ordered public keys], enrollment_epoch])),
+    with the enrollment_epoch taken from the resolved primary enrollment record."""
+    return hashlib.sha256(enc([domain, suite_id, list(pubs), enrollment_epoch])).digest()
+
+
 def resolve_session(creds_doc, iss, sid):
     """K1: the authoritative session record keyed by exact (iss, sid) (§3.4),
     held in the credential context OUTSIDE the credential wire. None if absent."""
@@ -299,6 +353,17 @@ def validate_session(creds_doc, cred_claims, now):
         errs.append(f"session status {s.get('status')!r} is not active (revoked)")
     if not isinstance(s.get("expiry"), int) or s.get("expiry") <= now:
         errs.append(f"session is not active at verifier_now {now} (expiry {s.get('expiry')!r})")
+    # T2 (§3.4): the session's creation time must be an integer and coherently
+    # ordered — created <= verifier_now < expiry. A missing, non-integer,
+    # future-dated, or after-expiry `created` denies.
+    created = s.get("created")
+    if isinstance(created, bool) or not isinstance(created, int):
+        errs.append(f"session created must be an integer, got {created!r}")
+    else:
+        if created > now:
+            errs.append(f"session created {created} is in the future (> verifier_now {now})")
+        if isinstance(s.get("expiry"), int) and created >= s.get("expiry"):
+            errs.append(f"session created {created} is not before expiry {s.get('expiry')}")
     for k in ("iss", "sub", "tenant"):
         if s.get(k) != cred_claims.get(k):
             errs.append(f"session {k} {s.get(k)!r} != credential {k} {cred_claims.get(k)!r}")
@@ -644,6 +709,24 @@ def main() -> None:
             fail("authenticated replay thumbprint does not match its inputs")
         if auth_pre.hex() != a["preimage_hex"]:
             fail("authenticated replay preimage encoding drifted")
+        # T1: the authenticated `enrollment_epoch` is derived from the cnf-resolved
+        # PRIMARY enrollment record (not the vector literal) — resolve it by content,
+        # validate it, and reproduce the published thumbprint from the record's epoch.
+        cpath = vectors_dir / "proof-v1-credentials.json"
+        if cpath.exists():
+            cdoc = json.loads(cpath.read_text())
+            a_pubs = [bytes.fromhex(h) for h in a["component_public_keys_hex"]]
+            a_tp = base64.urlsafe_b64encode(
+                hashlib.sha256(enc([a["suite_id"], a_pubs])).digest()).rstrip(b"=").decode()
+            prec = resolve_primary_enrollment(cdoc, a_tp)
+            hcl = cdoc["credentials"]["hybrid"]["claims"]
+            for e in validate_primary_enrollment(prec, a_tp, hcl.get("tenant"), hcl.get("sub"),
+                                                 cdoc.get("verifier_now")):
+                fail(f"authenticated primary enrollment: {e}")
+            if prec is not None and authenticated_replay_thumbprint(
+                    sep["authenticated"], a["suite_id"], a_pubs,
+                    prec["enrollment_epoch"]).hex() != a["thumbprint_sha256"]:
+                fail("authenticated replay thumbprint must be reproduced from the primary record's epoch")
         # Unattributed: recompute from P-1's plan + embedded key set.
         p1 = next((v for v in positive["vectors"] if v["id"] == tp["unattributed"]["from_vector"]), None)
         if p1 is None:
@@ -808,6 +891,13 @@ def main() -> None:
                     matches.append(grp[1])
             if len(matches) != 1:
                 fail(f"{pid}: cnf must resolve to exactly one primary plan group; matched {matches}")
+            # T1: the cnf primary group MUST resolve to an authoritative PRIMARY
+            # enrollment record (active, role=primary, tenant/principal-coherent).
+            cnf_b64 = cred_claims["cnf"]["hs_signer_suite"]
+            prec = resolve_primary_enrollment(cd, cnf_b64)
+            for e in validate_primary_enrollment(prec, cnf_b64, cred_claims.get("tenant"),
+                                                 cred_claims.get("sub"), now):
+                fail(f"{pid} primary enrollment: {e}")
             # Q1: every ADDITIONAL (approver) signer group — content-resolved, not the
             # primary cnf group — must validate against an authoritative approver
             # enrollment record (§5).

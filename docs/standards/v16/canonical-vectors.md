@@ -497,7 +497,13 @@ Ed25519 signature over the stripped object.
   missing, non-integer, or negative `clearance_epoch` denies. A sid-keyed session
   is a user session, so its **`session_kind` MUST be the exact interactive kind**
   (`interactive`, M2); a missing, wrong-type, empty, or workload/service
-  `session_kind` denies. The
+  `session_kind` denies. The authoritative session also carries a
+  **deterministic integer `created`** (§3.4, T2) — the issuance instant, an
+  off-wire authority field, never a credential claim. Every shared
+  session-validation path requires `created <= verifier_now < expires_at`,
+  including coherent ordering against expiry; a missing, non-integer,
+  future (`created > verifier_now`), or `created >= expires_at` session denies.
+  The
   classical and hybrid credentials are typed `credential_kind = rfc8693` —
   **non-interactive** token-exchange / JWT-bearer tokens (a user subject with no
   interactive OIDC session) that carry no `sid`. The gate enforces this
@@ -658,7 +664,22 @@ Ed25519 signature over the stripped object.
   CBOR array whose first element is one of two distinct domain-separator literals
   (`hs-rpc-replay-primary-suite-v1` / `hs-rpc-replay-key-set-v1`). The
   authenticated preimage is `[sep, suite_id, [ordered primary-group public keys],
-  enrollment_epoch]` (approver groups excluded). The unattributed preimage is
+  enrollment_epoch]` (approver groups excluded). **Authoritative primary
+  enrollment (T1):** the authenticated `enrollment_epoch` is not a vector literal —
+  it is derived from the credential's off-wire **primary** enrollment record (in
+  `proof-v1-credentials.json` `primary_enrollments`), resolved by the **same
+  content-bound discipline** as Q1: the record is located by recomputing its
+  signer-suite thumbprint over the record's own `suite_id` + ordered public keys
+  and matching it to the `cnf`-bound signer suite (labels are never trusted). The
+  gate and checker require an active, **unexpired**, `primary`-role record whose
+  `tenant`/`principal` equal the credential's, then **derive** the published
+  authenticated thumbprint from that record's `enrollment_epoch` and assert it
+  reproduces the frozen bytes for P-2/P-4/P-5/P-6/P-9. An **unknown**, tampered,
+  key/suite-mismatched, **inactive**, **expired**, **cross-tenant**,
+  **wrong-principal**, or **wrong-role** primary record denies, and an
+  `enrollment_epoch` change de-fangs the thumbprint (turning the gate red); primary
+  and approver records stay distinct while the S1 primary/approver resolved-key
+  alias denial is preserved. The unattributed preimage is
   **content-bound (M1)**: `[sep, [ [suite_id, [ordered public keys]] per signer
   group ]]` — it binds each group's suite and its public keys in component order
   and **normalizes the attacker-chosen `group_id`/`kid` labels out**, exactly as
