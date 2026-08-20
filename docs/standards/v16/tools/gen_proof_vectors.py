@@ -2315,6 +2315,33 @@ def main() -> None:
     keyset_preimage = unattributed_replay_preimage(
         replay_domain_key_set, plan_unattributed, keyset_unattributed)
     keyset_thumbprint = hashlib.sha256(keyset_preimage).digest()
+
+    # R1: two cryptographically valid 2-group unattributed proofs — the SAME signer
+    # content {A,B}, in REVERSED plan order (A,B vs B,A) with fresh signatures — that
+    # canonically content-sort to the IDENTICAL replay preimage/namespace.
+    order_A = (b"unatt-order-a-1", sk_u_ed, sk_u_ed.public_key().public_bytes_raw())
+    order_B = (b"unatt-order-b-1", sk_a_ed, sk_a_ed.public_key().public_bytes_raw())
+
+    def two_group_unatt(first, second):
+        (kid1, key1, pub1), (kid2, key2, pub2) = first, second
+        plan = [group(1, SUITE_CLASSICAL, [component(ALG_ED25519, kid1)]),
+                group(2, SUITE_CLASSICAL, [component(ALG_ED25519, kid2)])]
+        keyset = [cose_key_okp_ed25519(kid1, pub1), cose_key_okp_ed25519(kid2, pub2)]
+        body = {
+            H_CRIT: CRIT_SIGN_BODY_UNATTRIBUTED,
+            H_TYP: TYP_REQUEST, H_DOMAIN: DOMAIN_REQUEST,
+            H_PLAN: plan, H_KEYSET: keyset,
+        }
+        entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: kid1, H_GROUP: 1}, key1),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: kid2, H_GROUP: 2}, key2),
+        ]
+        obj, _bp, _pl = sign_multi(body, request_claims(credential_hash=None, nonce=CHALLENGE), entries)
+        pre = unattributed_replay_preimage(replay_domain_key_set, plan, keyset)
+        return obj, pre
+
+    order_ab, pre_ab = two_group_unatt(order_A, order_B)
+    order_ba, pre_ba = two_group_unatt(order_B, order_A)
     thumbprints = {
         **meta,
         "kind": "replay-thumbprints",
@@ -2344,6 +2371,19 @@ def main() -> None:
             "component_public_keys_hex": [unatt_pub.hex()],
             "preimage_hex": keyset_preimage.hex(),
             "thumbprint_sha256": keyset_thumbprint.hex(),
+        },
+        "group_order_canonicalization": {
+            "note": ("R1: the per-group content records [suite_id, [ordered public keys]] are "
+                     "sorted by their RFC 8949 deterministic-CBOR encoding as unsigned byte "
+                     "strings BEFORE hashing — never on group_id/kid/plan position. So the same "
+                     "signer set {A,B} in ANY plan order maps to ONE replay namespace. Component "
+                     "keys inside each group keep their suite-plan order. A different key or "
+                     "suite, or a different multiset, changes the namespace (no over-collapse)."),
+            "order_ab": {"cbor_hex": order_ab.hex(), "preimage_hex": pre_ab.hex(),
+                         "thumbprint_sha256": hashlib.sha256(pre_ab).hexdigest()},
+            "order_ba": {"cbor_hex": order_ba.hex(), "preimage_hex": pre_ba.hex(),
+                         "thumbprint_sha256": hashlib.sha256(pre_ba).hexdigest()},
+            "same_namespace": pre_ab == pre_ba,
         },
     }
 

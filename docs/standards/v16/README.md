@@ -25,6 +25,11 @@ artifact. No value here is PROPOSED any longer.
 | [`credential-profile.md`](credential-profile.md) | JWT/CWT credential claims table, credential/session identifier rules, Reusable-only credential use (OneShotTransaction deferred), revocation semantics |
 | [`tools/`](tools) | `validate_profile.py` (the mechanical validation gate), `gen_proof_vectors.py` (reproducible generator), `check_proof_vectors.py` (vector verifier), and `requirements.txt` (pinned deps) |
 
+**Prerequisite:** the generator and checker shell out to **OpenSSL 3.5 or newer**
+on `PATH` for ML-DSA-65 keygen/sign/verify (`openssl genpkey -algorithm ML-DSA-65`,
+`openssl pkeyutl`). Confirm with `openssl version` before running the commands
+below; an older OpenSSL cannot produce the hybrid fixtures.
+
 ```sh
 # Install the pinned CDDL validator (prebuilt wheel; no Rust toolchain needed):
 python3 -m pip install -r docs/standards/v16/tools/requirements.txt

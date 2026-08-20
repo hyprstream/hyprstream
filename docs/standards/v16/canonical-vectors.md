@@ -644,10 +644,19 @@ Ed25519 signature over the stripped object.
   `group_id`-only relabel and a `kid`-only relabel each keep the **same**
   thumbprint (so the replay key `(thumbprint, cti)` is unchanged and the second use
   is rejected as replay), while a different suite, a public-key byte, or a key
-  reordering yields a **different** thumbprint (group boundaries and order are
-  preserved, so distinct cryptographic identities are never over-collapsed).
-  Reverting to the old verbatim-label derivation turns the gate red.
-  Cross-implementation expected-thumbprint vectors are in
+  reordering yields a **different** thumbprint (component order **inside** each group
+  is preserved, so distinct cryptographic identities are never over-collapsed).
+  Reverting to the old verbatim-label derivation turns the gate red. The per-group
+  content records are additionally **canonically sorted by their RFC 8949
+  deterministic-CBOR encoding as unsigned byte strings before hashing (R1)** — never
+  on `group_id`/`kid`/plan position — so the same signer set `{A, B}` in **any**
+  plan order maps to **one** replay namespace. `proof-v1-thumbprints.json` ships two
+  cryptographically valid two-group unattributed proofs (`A,B` and `B,A`, freshly
+  re-signed); the gate and checker verify both signatures and prove they hash to the
+  **identical** namespace, while replacing a group key, changing a group suite, or a
+  different group multiset stays distinct, and an **unsorted** (plan-order)
+  derivation is order-sensitive (the closed bypass) — so removing the sort turns the
+  gate red. Cross-implementation expected-thumbprint vectors are in
   `vectors/proof-v1-thumbprints.json`, and the gate and checker recompute both from
   the frozen derivation and assert they match — so two verifier implementations
   sharing replay state derive the same namespace for one signer.

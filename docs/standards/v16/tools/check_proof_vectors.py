@@ -191,6 +191,12 @@ def unattributed_replay_preimage(sep, plan, keyset):
         pubs = [cose_key_public(k) for k in (keyset or [])[idx:idx + n]]
         idx += n
         groups.append([g.get(2), pubs])   # [suite_id, [ordered component public keys]]
+    # R1: canonical GROUP ORDER — sort the content-only group records by their
+    # RFC 8949 deterministic-CBOR encoding as unsigned byte strings, so the same
+    # signer set in any plan order (A,B or B,A) hashes identically. This never sorts
+    # on or includes group_id/kid/plan position; component keys INSIDE each group
+    # keep their suite-plan order.
+    groups.sort(key=lambda gr: enc(gr))
     return enc([sep, groups])
 
 
@@ -632,6 +638,38 @@ def main() -> None:
             bad_suite = _copy.deepcopy(plan0); bad_suite[0][2] = "hs-cose-sign-ed25519-mldsa65-wns-v1"
             if _tp(bad_suite, ks0) == base_tp:
                 fail("M1: a suite change must change the replay thumbprint")
+
+            # R1: canonical group-order evidence — two cryptographically valid
+            # 2-group unattributed proofs (A,B and B,A) map to the SAME namespace.
+            ev = tp.get("group_order_canonicalization")
+            if ev is None:
+                fail("R1: group_order_canonicalization evidence is missing")
+            else:
+                order_tps = []
+                for name in ("order_ab", "order_ba"):
+                    o = decode(bytes.fromhex(ev[name]["cbor_hex"]))
+                    hdr = decode(o[0])
+                    embedded, err = unattributed_keyset_correspondence(hdr[H_KEYSET], plan_components(hdr[H_PLAN]))
+                    if err is not None:
+                        fail(f"R1 {name}: key-set correspondence fails: {err}")
+                    # every entry signature verifies against its embedded key.
+                    for entry in o[3]:
+                        sh = decode(entry[0])
+                        a, k = sh[H_ALG], sh[H_KID]
+                        tbs = enc(["Signature", o[0], entry[0], b"", o[2]])
+                        if a == ALG_ED25519 and embedded is not None:
+                            try:
+                                Ed25519PublicKey.from_public_bytes(embedded[(a, k)]).verify(entry[2], tbs)
+                            except InvalidSignature:
+                                fail(f"R1 {name}: entry {k!r} signature must verify (valid proof)")
+                    pre = unattributed_replay_preimage(sep["key_set"], hdr[H_PLAN], hdr[H_KEYSET])
+                    if pre.hex() != ev[name]["preimage_hex"]:
+                        fail(f"R1 {name}: preimage encoding drifted")
+                    order_tps.append(hashlib.sha256(pre).hexdigest())
+                if order_tps[0] != order_tps[1]:
+                    fail("R1: A,B and B,A group orders MUST map to the same replay namespace")
+                if not ev.get("same_namespace"):
+                    fail("R1: group_order evidence must declare same_namespace true")
     else:
         fail("proof-v1-thumbprints.json is missing (C1 replay thumbprint vector)")
 

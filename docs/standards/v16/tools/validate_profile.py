@@ -1254,6 +1254,46 @@ def gate_replay_thumbprints(cddl: str, positives) -> None:
               "the verbatim-label derivation must be label-sensitive (the closed bypass)")
         print(f"   M1 unattributed thumbprint content-bound: group_id/kid relabel collapses, "
               f"key/suite change does not; verbatim-label bypass closed")
+
+        # R1: canonical GROUP ORDER — the same signer set {A,B} in either plan order
+        # (A,B or B,A) maps to ONE replay namespace, while a different key/suite or a
+        # different multiset stays distinct. Removing the content-sort re-opens the
+        # order bypass (the de-fang below turns red under an unsorted derivation).
+        from check_proof_vectors import cose_key_public as _ckp
+        ev = tp.get("group_order_canonicalization")
+        check(ev is not None, "R1: group_order_canonicalization evidence must exist")
+        if ev is not None:
+            def plan_ks(name):
+                h = decode(decode(bytes.fromhex(ev[name]["cbor_hex"]))[0])
+                return h[H_PLAN], h[H_KEYSET]
+            p_ab, k_ab = plan_ks("order_ab")
+            p_ba, k_ba = plan_ks("order_ba")
+            t_ab = hashlib.sha256(unattributed_replay_preimage(sep["key_set"], p_ab, k_ab)).hexdigest()
+            t_ba = hashlib.sha256(unattributed_replay_preimage(sep["key_set"], p_ba, k_ba)).hexdigest()
+            check(t_ab == t_ba, "R1: A,B and B,A plan orders must map to the SAME replay namespace")
+            # No over-collapse: swap one group's key -> different namespace; a
+            # different suite -> different; a different multiset -> different.
+            k_swap = _copy.deepcopy(k_ab)
+            pk = bytearray(_ckp(k_swap[0])); pk[0] ^= 0x01
+            k_swap[0][-2 if k_swap[0].get(1) == 1 else -1] = bytes(pk)
+            t_swap = hashlib.sha256(unattributed_replay_preimage(sep["key_set"], p_ab, k_swap)).hexdigest()
+            check(t_swap != t_ab, "R1: replacing a group key must change the namespace (no over-collapse)")
+            p_suite = _copy.deepcopy(p_ab); p_suite[0][2] = SUITE_HYBRID
+            t_suite = hashlib.sha256(unattributed_replay_preimage(sep["key_set"], p_suite, k_ab)).hexdigest()
+            check(t_suite != t_ab, "R1: changing a group suite must change the namespace")
+            # De-fang: an UNSORTED derivation gives DIFFERENT namespaces for A,B vs B,A.
+            def unsorted_pre(plan, keyset):
+                groups, idx = [], 0
+                for g in plan:
+                    n = len(g[3])
+                    groups.append([g[2], [_ckp(kk) for kk in keyset[idx:idx + n]]])
+                    idx += n
+                return _enc([sep["key_set"], groups])  # NO sort — the closed bypass
+            u_ab = hashlib.sha256(unsorted_pre(p_ab, k_ab)).hexdigest()
+            u_ba = hashlib.sha256(unsorted_pre(p_ba, k_ba)).hexdigest()
+            check(u_ab != u_ba, "the unsorted (plan-order) derivation must be order-sensitive (the closed bypass)")
+            print(f"   R1 unattributed group order canonicalized: A,B == B,A namespace; "
+                  f"key/suite/multiset stay distinct; unsorted order bypass closed")
     print(f"   authenticated thumbprint {a['thumbprint_sha256'][:16]}… and unattributed "
           f"{tp['unattributed']['thumbprint_sha256'][:16]}… recompute exactly")
 
