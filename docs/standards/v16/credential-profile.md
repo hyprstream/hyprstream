@@ -70,7 +70,7 @@ Required semantic fields for authenticated dispatch:
 
 | Field | JWT | CWT | Requirement | Semantics |
 |---|---|---|---|---|
-| Issuer | `iss` | `iss` (1) | REQUIRED, non-empty | The issuing node/authorization server. Scopes every identifier below. Empty issuer denies. |
+| Issuer | `iss` | `iss` (1) | REQUIRED, MUST equal the configured trusted issuer | The issuing node/authorization server. Scopes every identifier below. The verifier pins a configured trusted issuer in its off-wire context and requires `iss` to equal it **exactly** — being non-empty is not sufficient, and trust is never inferred from possession of a valid signing key (U2). An empty, absent, or non-matching `iss` denies. This is the same issuer namespace that scopes `(iss, jti)` credential revocation (§3.1) and `(iss, sid)` session resolution (§3.4). |
 | Subject | `sub` | `sub` (2) | REQUIRED, non-empty | The principal. Empty subject denies. |
 | Audience | `aud` | `aud` (3) | REQUIRED | Exact service/resource audience (RFC 8707 resource indicator semantics). When it names a canonical service domain it uses the one shared `MAX_SERVICE_DOMAIN_BYTES` (128-byte) canonicalization rule (Gate-2 §19 #7), not a second identity rule. Wrong audience denies. |
 | Expiry | `exp` | `exp` (4) | REQUIRED | Credential expiry. Bounds the proof: a proof `exp` MUST NOT exceed credential or session expiry — a proof cannot outlive the authority it presents, even when both are unexpired at the current clock (vector N-50; enforced by the gate's authenticated-context loop and the §12 causality inventory). |
@@ -119,6 +119,19 @@ reusable credentials. The credential-ID store is a credential-revocation store,
 not a general request replay store: request replay is keyed by the proof, not
 the credential (see [`canonical-vectors.md`](canonical-vectors.md) and the
 replay rules the proof profile cross-references).
+
+**Individual credential revocation is normative and enforced (U1).** The
+authority holds a credential-revocation store keyed by the exact credential-ID
+tuple `(iss, jti)` — authoritative off-wire state, never a wire claim and never a
+consume-once behavior (a Reusable credential ID is never consumed). Full
+credential verification MUST consult it **after** issuer-signature and profile
+validation, and **fail closed** for an otherwise-valid, unexpired credential
+whose `(iss, jti)` is listed. The match is the **exact tuple**: a different `jti`,
+or the same `jti` under a different `iss`, does **not** match, so unrelated
+credential identities never collapse. This is **distinct** from session-wide
+revocation (a session's `status` under `(iss, sid)`, §3.4) and from enrollment
+revocation (an enrollment record's `status`, §5) — revoking one credential
+affects exactly that one token.
 
 ### 3.2 User session ID (`sid`)
 
@@ -267,8 +280,8 @@ backed by an idempotency/result ledger whose lookup binds the retrying principal
 
 | Operation | Effect |
 |---|---|
-| Revoke `CredentialId` = `(iss, jti/cti)` | Reject that credential; evict every handle derived from it. |
-| Revoke `SessionKey` = `(iss, sid \| workload_session_id)` | Reject every credential and handle carrying that session ID; terminate or revalidate associated streams and continuations; prevent refresh within the session. |
+| Revoke `CredentialId` = `(iss, jti/cti)` | Reject **that one credential** (exact tuple; §3.1, U1); evict every handle derived from it. Full verification consults the `(iss, jti)` revocation store after issuer-signature/profile validation and fails closed on a match. A different `jti`, or the same `jti` under a different `iss`, is unaffected. |
+| Revoke `SessionKey` = `(iss, sid \| workload_session_id)` | Reject every credential and handle carrying that session ID; terminate or revalidate associated streams and continuations; prevent refresh within the session. **Distinct from** individual `(iss, jti)` credential revocation above. |
 | Disable subject or tenant | A separate authority operation that may revoke multiple sessions. |
 | Expiry of token or session | The same rejection behavior, with no unauthenticated downgrade. |
 

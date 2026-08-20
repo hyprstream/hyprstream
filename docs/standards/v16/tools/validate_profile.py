@@ -67,6 +67,7 @@ from check_proof_vectors import (  # noqa: E402
     decode, StrictError, validate_tenant, validate_session, resolve_session,
     resolve_approver_enrollment, validate_approver_enrollment,
     resolve_primary_enrollment, validate_primary_enrollment, authenticated_replay_thumbprint,
+    configured_issuer, is_credential_revoked,
 )
 
 # ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
@@ -1868,10 +1869,11 @@ def _validate_clearance(cl):
     return errs
 
 
-def _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=None):
+def _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=None, expected_iss=None):
     """Return the list of conformance failures for one at+jwt (empty == valid):
     exact at+jwt/EdDSA header, issuer Ed25519 signature, required claims,
-    audience, and temporal validity at the frozen verifier clock."""
+    audience, temporal validity at the frozen verifier clock, and (U2) an exact
+    match of the signed `iss` to the configured trusted issuer when supplied."""
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     errs = []
@@ -1897,6 +1899,10 @@ def _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=None):
             errs.append(f"missing claim {r}")
     if not claims.get("iss") or not claims.get("sub"):
         errs.append("empty issuer/subject")
+    # U2: the signed `iss` MUST equal the configured trusted issuer exactly — being
+    # non-empty is not enough (trust is never inferred from the signing key).
+    if expected_iss is not None and claims.get("iss") != expected_iss:
+        errs.append(f"iss {claims.get('iss')!r} != configured trusted issuer {expected_iss!r}")
     # RFC 9068 §2.2.1: at+jwt REQUIRES a non-empty string client_id.
     if not isinstance(claims.get("client_id"), str) or not claims.get("client_id"):
         errs.append("client_id must be a non-empty string (RFC 9068)")
@@ -1968,6 +1974,10 @@ def gate_credential_context(positives, negatives) -> None:
     now = creds["verifier_now"]
     issuer_pub = bytes.fromhex(creds["issuer"]["public_hex"])
     issuer_kid = creds["issuer"]["kid"]
+    # U2: the configured trusted issuer — the same namespace that scopes (iss, jti)
+    # credential revocation and (iss, sid) session resolution.
+    issuer_iss = configured_issuer(creds)
+    check(bool(issuer_iss), "the verifier context must configure a trusted issuer (issuer.iss)")
     ed_by_kid, ml_by_kid = _keymaps()
     pos_by_id = {v["id"]: v for v in positives["vectors"]}
 
@@ -1976,11 +1986,17 @@ def gate_credential_context(positives, negatives) -> None:
         txt = (VECTORS_DIR.parent / fn).read_text()
         check("FIXTURE.FIXTURE" not in txt, f"{fn} still carries the .FIXTURE.FIXTURE placeholder")
 
-    # Both credentials verify end to end.
+    # Both credentials verify end to end (incl. U2 exact configured-issuer match).
     for name, cred in creds["credentials"].items():
         errs = _verify_credential(cred["token"], issuer_pub, issuer_kid, now,
-                                  expected_aud=cred["claims"]["aud"])
+                                  expected_aud=cred["claims"]["aud"], expected_iss=issuer_iss)
         check(not errs, f"credential {name} must be a valid at+jwt: {errs}")
+        # U1: after signature/profile validation, consult the authoritative
+        # (iss, jti) revocation store; the shipped live credentials are unrevoked
+        # (positive unrevoked evidence).
+        cl = cred["claims"]
+        check(not is_credential_revoked(creds, cl["iss"], cl["jti"]),
+              f"shipped credential {name} must not be (iss,jti)-revoked")
 
     def primary_groups_matching(pid, cnf_tp):
         obj = decode(bytes.fromhex(pos_by_id[pid]["cbor_hex"]))
@@ -2047,7 +2063,8 @@ def gate_credential_context(positives, negatives) -> None:
     aud = base_claims["aud"]
 
     def rejected(label, token):
-        errs = _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=aud)
+        errs = _verify_credential(token, issuer_pub, issuer_kid, now,
+                                  expected_aud=aud, expected_iss=issuer_iss)
         check(bool(errs), f"counter-proof '{label}' must be rejected but validated clean")
         if errs:
             print(f"   F2 counter '{label}' rejected: {errs[0]}")
@@ -2075,6 +2092,41 @@ def gate_credential_context(positives, negatives) -> None:
     # 6. clock outside validity (re-signed with an expired window).
     rejected("expired at verifier_now",
              _make_jwt(hdr, {**base_claims, "iat": now - 100, "exp": now - 1}, sk_i))
+    # 6b. U2: a token correctly signed by the ISSUER KEY but claiming a different
+    #     `iss` must be rejected — trust binds to the configured issuer, never to
+    #     mere possession of the signing key. Exact configured-issuer admission is
+    #     proven by every shipped credential above validating clean.
+    rejected("wrong iss (foreign issuer, issuer-signed)",
+             _make_jwt(hdr, {**base_claims, "iss": "https://evil-issuer.example"}, sk_i))
+    # 6c. U1: individual credential revocation. Build an OTHERWISE-VALID credential
+    #     whose (iss, jti) is listed in the authoritative revocation store, prove it
+    #     passes signature/profile validation, then prove the (iss, jti) lookup
+    #     denies it (it would pass a verifier that ignored the normative rule).
+    revoked_jti = creds["credential_revocations"][0]["jti"]
+    revoked_tok = _make_jwt(hdr, {**base_claims, "jti": revoked_jti}, sk_i)
+    rcl = json.loads(_b64u_dec(revoked_tok.split(".")[1]))
+    prof_errs = _verify_credential(revoked_tok, issuer_pub, issuer_kid, now,
+                                   expected_aud=aud, expected_iss=issuer_iss)
+    check(not prof_errs, f"the revoked counter-case must be otherwise profile-valid: {prof_errs}")
+    check(is_credential_revoked(creds, rcl["iss"], rcl["jti"]),
+          "U1: an otherwise-valid credential whose (iss,jti) is revoked must be detected as revoked")
+    print(f"   U1 revoked (iss,jti)=({rcl['iss']!r},{rcl['jti']!r}) is profile-valid yet denied by the revocation store")
+    # U1 tuple scoping — unrelated identities never collapse:
+    #  (a) a DIFFERENT jti under the same iss is NOT revoked (the live credentials);
+    #  (b) the SAME jti under a DIFFERENT iss is NOT revoked.
+    for name, cred in creds["credentials"].items():
+        check(not is_credential_revoked(creds, cred["claims"]["iss"], cred["claims"]["jti"]),
+              f"tuple scoping: live credential {name} (distinct jti) must not be revoked")
+    check(not is_credential_revoked(creds, "https://other-issuer.example", revoked_jti),
+          "tuple scoping: the revoked jti under a DIFFERENT iss must not match")
+    check(not is_credential_revoked(creds, rcl["iss"], "cred-classical-1"),
+          "tuple scoping: a DIFFERENT jti under the revoked iss must not match")
+    # U1 distinctness from session-wide and enrollment revocation: the revoked
+    # credential identity is not a session or enrollment record.
+    check(revoked_jti not in {s.get("sid") for s in creds.get("sessions", [])},
+          "credential revocation (iss,jti) is distinct from session (iss,sid) revocation")
+    print(f"   U1 credential revocation is (iss,jti)-exact, non-collapsing, and distinct "
+          f"from session/enrollment revocation")
     # 7. wrong cnf: resolves to no plan group.
     bad_cnf = _make_jwt(hdr, {**base_claims, "cnf": {"hs_signer_suite": _b64u(b"\x00" * 32)}}, sk_i)
     bad_tp = _b64u_dec(json.loads(_b64u_dec(bad_cnf.split(".")[1]))["cnf"]["hs_signer_suite"])

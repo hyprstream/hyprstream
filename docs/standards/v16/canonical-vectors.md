@@ -161,6 +161,32 @@ counter-proofs — a flipped/foreign issuer signature, wrong audience, missing
 claim, wrong `typ`, an expired window, a `cnf` resolving to no group, and a
 tampered proof hash each turn it red.
 
+**Configured issuer binding (U2).** The verifier context pins a **configured
+trusted issuer** (`issuer.iss` in `proof-v1-credentials.json`), and full
+verification requires the signed JWT `iss` to equal it **exactly** — a non-empty
+`iss` is not sufficient, and trust is never inferred from possession of the
+signing key. The gate proves this load-bearing with a re-signed counter-case: a
+token correctly signed by the issuer key but carrying `iss =
+"https://evil-issuer.example"` is **denied** (neutralizing the configured issuer
+turns the gate red), while every shipped credential carrying the exact configured
+`iss` is admitted. This is the same issuer namespace that scopes `(iss, jti)`
+credential revocation and `(iss, sid)` session resolution.
+
+**Authoritative credential revocation (U1).** Individual credential revocation is
+normative (credential-profile §6 / §3.1) and enforced: the authority holds an
+off-wire revocation store keyed by the exact credential-ID tuple `(iss, jti)`,
+consulted **after** issuer-signature and profile validation, failing **closed**
+for an otherwise-valid, unexpired credential whose `(iss, jti)` is listed. The
+shipped store lists `cred-revoked-1`; none of the live credentials are listed
+(**positive unrevoked evidence**). The gate re-signs an otherwise-profile-valid
+credential carrying the revoked `jti`, proves it passes signature/profile checks
+yet is **denied** by the store (removing or bypassing the lookup turns the gate
+red), and proves the match is the **exact tuple** so unrelated identities never
+collapse: a different `jti`, or the same `jti` under a different `iss`, does not
+match. This credential revocation is **distinct** from session-wide `(iss, sid)`
+revocation and from enrollment revocation — it affects exactly one token, adds no
+wire bit, and introduces no consume-once behavior.
+
 **Encoding matrix (G1).** `cnf.hs_signer_suite` is a **JWT** confirmation method and
 binds a signer-suite record of any component count. A **CWT** `cnf` is a single
 RFC 8747 `COSE_Key` (claim 8) — it can pin exactly one key, so it binds a

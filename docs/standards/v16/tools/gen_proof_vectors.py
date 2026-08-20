@@ -2204,6 +2204,12 @@ def main() -> None:
             "positive and every credential below."
         ),
         "issuer": {
+            # U2: the CONFIGURED trusted issuer. Full credential verification MUST
+            # require the signed JWT `iss` to equal this exactly — never merely be
+            # non-empty, and never inferred from possession of the signing key. This
+            # is the same issuer namespace that scopes (iss, jti) credential
+            # revocation and (iss, sid) session resolution below.
+            "iss": ISSUER_ISS,
             "kid": KID_ISSUER_ED.decode(),
             "alg": "EdDSA",
             "typ": "at+jwt",
@@ -2348,6 +2354,28 @@ def main() -> None:
                 "expires_at": 1786000060,
                 "enrollment_epoch": 2,
             },
+        ],
+        "credential_revocation_model": {
+            "note": (
+                "U1 (credential-profile §6/§3.3): individual credential revocation is "
+                "normative and affects EXACTLY ONE token, keyed by the credential "
+                "identity tuple (iss, jti). This authoritative off-wire store is "
+                "consulted AFTER issuer-signature and profile validation; an otherwise-"
+                "valid, unexpired credential whose (iss, jti) is listed fails closed. "
+                "The match is the EXACT tuple — a different jti, or the same jti under a "
+                "different iss, does NOT match, so unrelated identities never collapse. "
+                "This is DISTINCT from session-wide revocation (a session status = "
+                "'revoked', keyed by (iss, sid)) and from enrollment revocation (an "
+                "enrollment status = 'revoked'/'inactive'). It is not a wire claim and "
+                "adds no consume-once behavior; a Reusable credential ID is never "
+                "consumed. The shipped live credentials are NOT listed (positive "
+                "unrevoked evidence); `cred-revoked-1` is a revoked identity a "
+                "conformance runner re-signs to exercise the deny path."
+            ),
+            "tuple": "(iss, jti)",
+        },
+        "credential_revocations": [
+            {"iss": ISSUER_ISS, "jti": "cred-revoked-1"},
         ],
         "positive_to_credential": {
             "P-2": "hybrid",

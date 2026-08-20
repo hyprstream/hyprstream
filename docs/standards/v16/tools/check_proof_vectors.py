@@ -379,6 +379,29 @@ def validate_session(creds_doc, cred_claims, now):
     return s, errs
 
 
+def configured_issuer(creds_doc):
+    """U2: the configured trusted issuer identifier from the off-wire verifier
+    context. This is the authoritative `iss` a credential's signed `iss` claim
+    MUST equal exactly — never inferred from possession of the signing key. It is
+    the same namespace that scopes (iss, jti) credential revocation and (iss, sid)
+    session resolution."""
+    return (creds_doc.get("issuer") or {}).get("iss")
+
+
+def is_credential_revoked(creds_doc, iss, jti):
+    """U1: authoritative (iss, jti) credential-revocation lookup (credential-profile
+    §6/§3.3). EXACT tuple match — a different jti, or the same jti under a different
+    iss, does not match (unrelated identities never collapse). This is DISTINCT from
+    session-wide revocation (a session status='revoked') and from enrollment
+    revocation (an enrollment status='revoked'/'inactive'). It carries no wire bit and
+    no consume-once behavior. Full credential verification consults it AFTER issuer
+    signature/profile validation and fails closed on a match."""
+    for r in creds_doc.get("credential_revocations", []):
+        if r.get("iss") == iss and r.get("jti") == jti:
+            return True
+    return False
+
+
 def validate_tenant(value):
     """J1: the frozen credential tenant rule (credential-profile §2 tenant row):
     a verified tenant/Casbin domain. Missing, empty, or wildcard tenants deny.
@@ -842,6 +865,13 @@ def main() -> None:
                     fail(f"{label}: missing required claim {req!r}")
             if not claims.get("iss") or not claims.get("sub"):
                 fail(f"{label}: empty issuer/subject")
+            # U2: the signed `iss` MUST equal the configured trusted issuer exactly,
+            # not merely be non-empty (trust is never inferred from the signing key).
+            expected_iss = configured_issuer(cd)
+            if not expected_iss:
+                fail(f"{label}: no configured trusted issuer in the verifier context")
+            elif claims.get("iss") != expected_iss:
+                fail(f"{label}: iss {claims.get('iss')!r} != configured trusted issuer {expected_iss!r}")
             if not isinstance(claims.get("client_id"), str) or not claims.get("client_id"):
                 fail(f"{label}: client_id must be a non-empty string (RFC 9068)")
             for te in validate_tenant(claims.get("tenant")):
@@ -850,6 +880,11 @@ def main() -> None:
                 fail(f"{label}: not temporally valid at verifier_now {now}")
             if "hs_signer_suite" not in (claims.get("cnf") or {}):
                 fail(f"{label}: cnf lacks the hs_signer_suite confirmation")
+            # U1: after issuer-signature + profile validation, consult the
+            # authoritative (iss, jti) credential-revocation store; a revoked
+            # credential fails closed (the shipped live credentials are unrevoked).
+            if is_credential_revoked(cd, claims.get("iss"), claims.get("jti")):
+                fail(f"{label}: credential (iss={claims.get('iss')!r}, jti={claims.get('jti')!r}) is revoked")
             return claims
 
         for name, cred in cd["credentials"].items():
