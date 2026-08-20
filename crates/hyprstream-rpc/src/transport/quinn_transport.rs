@@ -532,6 +532,7 @@ impl QuinnRpcServer {
                             );
                             if !moq_authz
                                 .authorize_without_track_hook(&moq_peer)
+                                .await
                                 .is_allowed()
                             {
                                 tracing::warn!(

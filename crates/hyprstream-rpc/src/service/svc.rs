@@ -800,12 +800,17 @@ pub trait RequestService: 'static {
         true
     }
 
-    /// JWT ID blocklist for access token revocation.
+    /// Credential revocation store for access token revocation.
     ///
-    /// When `Some`, `verify_claims()` rejects tokens whose `jti` appears
-    /// in the blocklist. Override to provide a shared blocklist instance.
-    fn jti_blocklist(&self) -> Option<&dyn crate::auth::JtiBlocklist> {
-        None
+    /// Returns the process-global store published at startup: the durable
+    /// authority store in the policy process, or a policy-authority RPC
+    /// client store in every other process (checks cross the RPC bus to the
+    /// policy service, the one canonical revocation authority). When `None`
+    /// (startup not yet complete or authority initialization failed),
+    /// `verify_claims()` rejects tokens with a jti (fail-closed). Override
+    /// only for specialized testing.
+    fn credential_revocation_store(&self) -> Option<&dyn crate::auth::CredentialRevocationStore> {
+        crate::auth::global_credential_revocation_store().map(std::convert::AsRef::as_ref)
     }
 
     /// Fu4/#677: the minimum JWT `alg` policy enforced in `verify_claims`.
@@ -1142,12 +1147,22 @@ pub trait RequestService: 'static {
             _ => anyhow::bail!("unsupported JWT algorithm"),
         };
 
-        // Check jti against blocklist (revoked access tokens)
+        // Check credential against the revocation store (revoked access tokens)
         if let Some(ref jti) = verified.jti {
-            if let Some(blocklist) = self.jti_blocklist() {
-                if blocklist.is_revoked(jti) {
-                    tracing::warn!(jti = %jti, sub = %verified.sub, "Revoked JWT rejected");
-                    anyhow::bail!("JWT has been revoked");
+            match self.credential_revocation_store() {
+                Some(store) => {
+                    let cred_id = crate::auth::CredentialId::jwt(&verified.iss, jti);
+                    if store.is_revoked(&cred_id).await {
+                        tracing::warn!(jti = %jti, iss = %verified.iss, sub = %verified.sub, "Revoked JWT rejected");
+                        anyhow::bail!("JWT has been revoked");
+                    }
+                }
+                None => {
+                    // Fail-closed: a token carrying a jti cannot be verified
+                    // for revocation without a store. Reject rather than
+                    // admitting a potentially-revoked credential.
+                    tracing::warn!(jti = %jti, sub = %verified.sub, "Token with jti rejected: no revocation store configured");
+                    anyhow::bail!("revocation store unavailable");
                 }
             }
         }

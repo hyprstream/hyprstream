@@ -70,12 +70,12 @@ impl MoqAuthzConfig {
     /// Dormant (`None`) preserves the legacy pass-through. Once an authorizer
     /// is installed, its coarse admission decision is mandatory; current
     /// implementations deny until moq-net's #276 per-track callback exists.
-    pub fn authorize_without_track_hook(&self, peer: &PeerIdentity) -> SubscribeDecision {
-        self.authorizer
-            .as_ref()
-            .map_or(SubscribeDecision::Allow, |a| {
-                a.authorize_without_track_hook(peer)
-            })
+    pub async fn authorize_without_track_hook(&self, peer: &PeerIdentity) -> SubscribeDecision {
+        if let Some(authorizer) = self.authorizer.as_ref() {
+            authorizer.authorize_without_track_hook(peer).await
+        } else {
+            SubscribeDecision::Allow
+        }
     }
 }
 
@@ -228,6 +228,7 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
             .inner
             .authz
             .authorize_without_track_hook(&peer)
+            .await
             .is_allowed()
         {
             tracing::warn!(

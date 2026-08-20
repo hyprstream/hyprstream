@@ -1144,7 +1144,7 @@ impl RegistryService {
                 // produces zero bytes of output.
                 let resolver = crate::mac::CasObjectLabelResolver::from_domain(&domain);
                 let decision =
-                    cas_pep.check_read(&subject_id, verified_tenant.as_deref(), &resolver);
+                    cas_pep.check_read(&subject_id, verified_tenant.as_deref(), &resolver).await;
                 if !decision.is_permit() {
                     tracing::warn!(
                         target: "hyprstream.mac.cas_pep",

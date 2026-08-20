@@ -49,7 +49,7 @@ fn load_config() -> HyprConfig {
 }
 
 /// Get the JWT bound to this service instance's exact signing key.
-fn service_token(signing_key: &SigningKey) -> Option<String> {
+pub(crate) fn service_token(signing_key: &SigningKey) -> Option<String> {
     let trust = hyprstream_service::global_trust_store();
     trust
         .get(&signing_key.verifying_key())
@@ -59,13 +59,6 @@ fn service_token(signing_key: &SigningKey) -> Option<String> {
 /// Shared Git2DB registry instance. Lazily initialized by the first factory
 /// that needs it. Both PolicyService and RegistryService share this instance.
 static SHARED_GIT2DB: std::sync::OnceLock<Arc<RwLock<Git2DB>>> = std::sync::OnceLock::new();
-
-/// Shared JTI blocklist Arc — set by `create_policy_service`, read by
-/// `create_oauth_service`. Because PolicyService is always created first
-/// (OAuthService `depends_on = ["policy"]`), the lock is always populated
-/// before `create_oauth_service` runs.
-static SHARED_JTI_BLOCKLIST: std::sync::OnceLock<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>> =
-    std::sync::OnceLock::new();
 
 /// Get or initialize the shared Git2DB registry for the given models directory.
 fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock<Git2DB>>> {
@@ -882,10 +875,9 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         policy_service = policy_service.with_ml_dsa_key_store(ml_dsa_store);
     }
 
-    // Publish the JTI blocklist Arc so OAuthService (created later) can share it.
-    // This wires POST /oauth/revoke → PolicyService RPC enforcement: a revoked
-    // access token is rejected by both the HTTP path and the RPC auth check.
-    let _ = SHARED_JTI_BLOCKLIST.set(policy_service.jti_blocklist_arc());
+    // The credential-revocation store is published once per process by
+    // `services::revocation::init_process_credential_revocation_store` from
+    // the main.rs startup block, before any factory runs — not here.
 
     Ok(ctx.into_spawnable_quic(policy_service, config.policy.quic_port))
 }
@@ -1643,12 +1635,6 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                 resource_url,
                 oauth_issuer_url,
                 &config.oauth.trusted_issuers,
-                // Share the PolicyService-owned JTI blocklist so POST /oauth/revoke
-                // immediately invalidates tokens at the OAI resource server.
-                SHARED_JTI_BLOCKLIST
-                    .get()
-                    .map(Arc::clone)
-                    .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new())),
                 ninep_decider,
             )
             .await
@@ -1708,16 +1694,11 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
             .with_policy_client(Arc::new(policy_client)),
     );
-    let jti_blocklist = SHARED_JTI_BLOCKLIST
-        .get()
-        .map(Arc::clone)
-        .context("PolicyService did not publish the shared JTI blocklist before Xet startup")?;
     let auth = ResourceAuthState::new(
         ctx.jwt_verifying_key(),
         config.xet.resource_url(),
         config.oauth.issuer_url(),
         federation_resolver,
-        jti_blocklist,
     );
     let cas_pep = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(crate::mac::production_cas_pep(
@@ -1804,16 +1785,11 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
             .with_policy_client(Arc::new(policy_client.clone())),
     );
-    let jti_blocklist = SHARED_JTI_BLOCKLIST
-        .get()
-        .map(Arc::clone)
-        .context("PolicyService did not publish the shared JTI blocklist before Flight startup")?;
     let auth = crate::server::state::ResourceAuthState::new(
         ctx.jwt_verifying_key(),
         config.flight.resource_url(),
         config.oauth.issuer_url(),
         federation_resolver,
-        jti_blocklist,
     );
     let authorizer = Arc::new(crate::services::flight::TenantFlightAuthorizer::new(
         auth,
@@ -1875,7 +1851,7 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     // Pass signing key instead of a pre-created PolicyClient.
     // OAuthService runs in its own tokio runtime (separate thread), so the
     // PolicyClient must be created inside that runtime for ZMQ async I/O to work.
-    let mut oauth_service = OAuthService::new(
+    let oauth_service = OAuthService::new(
         config.oauth.clone(),
         config.tls.clone(),
         config.account.clone(),
@@ -1886,13 +1862,6 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     )
     .with_quic_config(config.quic.clone())
     .with_identity_registration_api(identity_registration_api);
-    if let Some(bl) = SHARED_JTI_BLOCKLIST.get() {
-        oauth_service = oauth_service.with_jti_blocklist(Arc::clone(bl));
-    } else {
-        tracing::warn!(
-            "JTI blocklist not set by PolicyService factory — revoked access tokens will not be blocked at RPC layer"
-        );
-    }
 
     Ok(Box::new(oauth_service))
 }
@@ -2024,8 +1993,8 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                     let mcp_oauth_issuer_clone = mcp_oauth_issuer.clone();
                     let mcp_federation_resolver = mcp_federation_resolver.clone();
                     let jwt_key_source = jwt_key_source.clone();
-                    // Capture shared JTI blocklist for revocation checks (RFC 7009)
-                    let mcp_jti_blocklist = SHARED_JTI_BLOCKLIST.get().map(Arc::clone);
+                    // The credential-revocation store is global; no per-service
+                    // capture needed.
                     // DPoP JTI replay cache (separate from OAI server's, RFC 9449).
                     // 1,000 sustained DPoP proofs/s for the admitted 180s
                     // maximum residency (60s future iat skew + 120s), plus
@@ -2043,12 +2012,10 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                         let mcp_oauth_issuer = mcp_oauth_issuer_clone.clone();
                         let federation_resolver = mcp_federation_resolver.clone();
                         let jwt_key_source = jwt_key_source.clone();
-                        let jti_blocklist = mcp_jti_blocklist.clone();
                         let dpop_jti_seen = mcp_dpop_jti_seen.clone();
                         async move {
                             use axum::http::{header, StatusCode};
                             use axum::response::IntoResponse;
-                            use hyprstream_rpc::auth::JtiBlocklist as _;
                             use subtle::ConstantTimeEq as _;
                             let method = req.method().clone();
                             let uri = req.uri().clone();
@@ -2161,10 +2128,19 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                 tracing::warn!(%method, %uri, "MCP auth rejected: invalid subject");
                                 return (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
                             }
-                            // JTI revocation check (RFC 7009)
+                            // Credential revocation check — fail-closed on
+                            // store absence: a token with a jti that cannot
+                            // be checked for revocation is rejected.
                             if let Some(ref jti) = claims.jti {
-                                let revoked = jti_blocklist.as_ref().map(|bl| bl.is_revoked(jti)).unwrap_or(false);
-                                if revoked {
+                                let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
+                                let revoked_or_unavailable = match hyprstream_rpc::auth::global_credential_revocation_store() {
+                                    Some(bl) => bl.is_revoked(&cred_id).await,
+                                    None => {
+                                        tracing::warn!(%method, %uri, %jti, "MCP: no revocation store configured — rejecting token with jti");
+                                        true // fail-closed
+                                    }
+                                };
+                                if revoked_or_unavailable {
                                     tracing::warn!(%method, %uri, %jti, sub = %claims.sub, "MCP: revoked token presented");
                                     let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
                                     if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {

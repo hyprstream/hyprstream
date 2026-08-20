@@ -18,6 +18,7 @@ use crate::services::generated::policy_client::{
     EventPrefixAccess, PendingSubscribers,
     ResolveServiceKey, RegisterServiceKey, ServiceKeyCandidate, ServiceKeyResponse,
     RefreshServiceTokenRequest, ExchangeWit,
+    RevokeCredential, CheckCredentialRevocation,
     dispatch_policy, serialize_response,
 };
 use anyhow::{anyhow, Result};
@@ -128,8 +129,6 @@ pub struct PolicyService {
     /// Event prefix state for secure event transport (Phase 7).
     /// PolicyService is a blind relay — stores opaque wrapped blobs, never plaintext keys.
     event_prefixes: RwLock<HashMap<EventPrefixKey, EventPrefixState>>,
-    /// Shared JWT ID blocklist for access token revocation.
-    jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
     /// ES256 (P-256) key rotation store for DPoP/atproto interop.
     es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 key rotation store for PQ-hybrid composite token issuance.
@@ -163,7 +162,6 @@ impl PolicyService {
             jwt_key_source: None,
             transport,
             event_prefixes: RwLock::new(HashMap::new()),
-            jti_blocklist: Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
             es256_key_store: None,
             ml_dsa_key_store: None,
             token_clearance_resolver: Arc::new(|subject| {
@@ -171,11 +169,6 @@ impl PolicyService {
                 policy.clearance_for(subject)
             }),
         }
-    }
-
-    /// Get a shared reference to the JWT ID blocklist (for wiring into OAuthState).
-    pub fn jti_blocklist_arc(&self) -> Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist> {
-        Arc::clone(&self.jti_blocklist)
     }
 
     /// Set the default audience for issued tokens (typically the OAuth issuer URL).
@@ -1948,6 +1941,89 @@ impl PolicyHandler for PolicyService {
             expires_at,
         }))
     }
+
+    /// Publish a credential revocation into the canonical store this service
+    /// owns. Fail-closed: an uninitialized store or a failed durable write is
+    /// reported as an error, never as a silent success.
+    async fn handle_revoke_credential(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RevokeCredential,
+    ) -> Result<PolicyResponseVariant> {
+        let Some(id) = crate::services::revocation::credential_id_from_ref(&data.credential)
+        else {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "malformed credential id (empty issuer or value)".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        };
+        // Server-side publication bounds. Legitimate lifetimes: service JWTs
+        // clamp to 30 days, access tokens far shorter — 45 days covers every
+        // issuer with margin. A caller-controlled far-future exp would make an
+        // entry effectively permanent (never GC'd, never dropped on load), and
+        // unbounded issuer/value sizes would fill the authority's durable log.
+        // Reject, never clamp: a clamped exp would silently un-revoke a
+        // still-live token after reload.
+        const MAX_REVOCATION_TTL_SECS: i64 = 45 * 24 * 3600;
+        const MAX_ID_FIELD_BYTES: usize = 1024;
+        let now = chrono::Utc::now().timestamp();
+        if data.expires_at <= 0 || data.expires_at > now + MAX_REVOCATION_TTL_SECS {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "expires_at out of bounds (must be 0 < exp <= now + 45d)".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+        let value_len = match &id.value {
+            hyprstream_rpc::auth::CredentialValue::Jwt(jti) => jti.len(),
+            hyprstream_rpc::auth::CredentialValue::Cwt(cti) => cti.len(),
+        };
+        if id.issuer.len() > MAX_ID_FIELD_BYTES || value_len > MAX_ID_FIELD_BYTES {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "credential id field exceeds 1024 bytes".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+        let Some(store) = hyprstream_rpc::auth::global_credential_revocation_store() else {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "revocation authority store is not initialized".to_owned(),
+                code: "UNAVAILABLE".to_owned(),
+                details: String::new(),
+            }));
+        };
+        if let Err(e) = store.revoke_credential(id.clone(), data.expires_at).await {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "revocation publication was not durably accepted".to_owned(),
+                code: "UNAVAILABLE".to_owned(),
+                details: e.to_string(),
+            }));
+        }
+        info!(credential = %id, "Credential revocation published");
+        Ok(PolicyResponseVariant::RevokeCredentialResult)
+    }
+
+    /// Answer a revocation check from the canonical store. Fail-closed twice
+    /// over: a malformed credential ID reports revoked, and an uninitialized
+    /// store reports revoked — a credential whose status cannot be checked is
+    /// never reported live.
+    async fn handle_check_credential_revocation(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &CheckCredentialRevocation,
+    ) -> Result<PolicyResponseVariant> {
+        let revoked = match crate::services::revocation::credential_id_from_ref(&data.credential) {
+            Some(id) => match hyprstream_rpc::auth::global_credential_revocation_store() {
+                Some(store) => store.is_revoked(&id).await,
+                None => true,
+            },
+            None => true,
+        };
+        Ok(PolicyResponseVariant::CheckCredentialRevocationResult(revoked))
+    }
 }
 
 #[async_trait(?Send)]
@@ -1985,9 +2061,8 @@ impl RequestService for PolicyService {
         hyprstream_service::global_trust_store().resolve_subject(signer_pubkey)
     }
 
-    fn jti_blocklist(&self) -> Option<&dyn hyprstream_rpc::auth::JtiBlocklist> {
-        Some(self.jti_blocklist.as_ref())
-    }
+    // credential_revocation_store() uses the default trait impl, which
+    // returns the process-global store. No override needed.
 
     fn cache_key_binding(
         &self,

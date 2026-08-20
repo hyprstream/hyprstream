@@ -260,6 +260,16 @@ async fn make_policy_service_with_manager_and_authority(
     )
     .with_jwt_key_source(Arc::new(key_source));
 
+    // Mirror the production bootstrap: the policy process always publishes
+    // the credential-revocation store at startup. Client JWTs carry a jti
+    // (the composite encoder injects one), so `verify_claims` fails closed
+    // without it. Get-or-init: the OnceLock is per test-binary process.
+    if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+        let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+            hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+        ));
+    }
+
     Ok((service, policy_manager, signing_key, temp, authority))
 }
 

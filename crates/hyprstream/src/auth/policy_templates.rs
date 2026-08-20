@@ -76,6 +76,12 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     ServicePolicyRule { subject: "service:policy", domain: "*", resource: "*", action: "*", effect: "allow" },
     // Token issuance: any service can call PolicyService::issueToken (capnp type name = IssueToken)
     ServicePolicyRule { subject: "service:*", domain: "*", resource: "policy:IssueToken", action: "manage", effect: "allow" },
+    // Credential revocation publication: only the OAuth revocation authority
+    // (the RFC 7009 endpoint) may publish to the canonical store.
+    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "policy:RevokeCredential", action: "manage", effect: "allow" },
+    // Revocation checks: every enrolled service verifies credentials (and
+    // probes the authority at startup); anonymous/end-user callers may not.
+    ServicePolicyRule { subject: "service:*", domain: "*", resource: "policy:CheckCredentialRevocation", action: "query", effect: "allow" },
     // Services that perform policy authorization checks
     ServicePolicyRule { subject: "service:registry", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
     ServicePolicyRule { subject: "service:model", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
