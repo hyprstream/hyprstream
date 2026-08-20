@@ -13,7 +13,7 @@ Machine-readable files (the normative form — this page is the human index):
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 8 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 54 vectors that MUST deny |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 55 vectors that MUST deny |
 | [`vectors/proof-v1-thumbprints.json`](vectors/proof-v1-thumbprints.json) | Cross-implementation replay-namespace thumbprint vectors (C1) |
 | [`vectors/proof-v1-credentials.json`](vectors/proof-v1-credentials.json) | Frozen `verifier_now` clock (F1) and the issuer-signed at+jwt tokens the authenticated positives hash (F2) |
 
@@ -166,6 +166,24 @@ this disposition (credential-profile §1.1), asserts the shipped hybrid credenti
 is a compact JWT and the only shipped CWT credential (N-1) is single-key, and
 proves the causal reject: a single-`COSE_Key` `cnf` resolves the classical primary
 (P-4) but denies the hybrid suite (P-2). See credential-profile.md §1.1.
+
+**Credential clearance grammar (H2, Gate-2 value 11).** The credential `clearance`
+claim (JWT text `clearance`; CWT integer key −70006) carries the **Level** and
+**Compartments** axes only; **assurance is structurally absent** from the credential
+wire (derived from verified key material at admission, never issuer-asserted). The
+value is the same semantic two-element array in both encodings:
+`[level, compartments]` where `level` is a uint `0..3`
+(`0`=Public, `1`=Internal, `2`=Confidential, `3`=Secret, matching the Rust `Level`
+discriminants) and `compartments` is an array of **bit indices** (uint `0..63`)
+into the `CompartmentSet(u64)`, strictly ascending and unique (empty allowed) — the
+credential wire projection of the versioned `InitialLabelMap`, **not** names and
+**not** a bitmask integer. The fixtures' `[2,[5,7]]` conforms. The CDDL freezes the
+shape and domains (`credential-clearance`); the gate enforces the strict-ascending/
+unique order numerically (the pinned pycddl cannot), validates every shipped
+credential clearance (the two at+jwt tokens and the CWT credential N-1), and proves
+it load-bearing with re-signed counter-proofs: an unknown level, an out-of-range or
+duplicate or descending compartment, compartment names, a bitmask integer, and an
+extra (assurance) element each turn the gate red. See credential-profile.md §8.
 
 ## Common fixtures
 
@@ -350,6 +368,7 @@ Ed25519 signature over the stripped object.
 | N-47 | parser-cap | `kid` of 0 bytes, under the 1-byte floor | 1594 |
 | N-48 | cbor-truncation | Truncated CBOR: response signature bstr header declares 65 bytes with 64 present | 374 |
 | N-49 | integer-truncation | Truncated CBOR integer: claims `iat` argument `19 00` declares 2 bytes with 1 present | 244 |
+| N-50 | proof-credential-expiry | Authenticated proof whose `exp` (1786000060) exceeds its mapped credential's `exp` (1786000030) | 244 |
 
 ### Notes on individual negatives
 
@@ -427,6 +446,16 @@ Ed25519 signature over the stripped object.
   1-byte `ai=24`, so `19 00 18` = 24-in-two-bytes is rejected as non-minimal). The
   exact-length counterpart `19 01 00` (= 256, the smallest value that legitimately
   needs `ai=25`) decodes.
+- **N-50 (proof expiry cannot exceed the credential, H1).** A proof's `exp` MUST
+  NOT exceed the `exp` of the credential (or session) it is bound to
+  (credential-profile §5) — a proof cannot outlive the authority it presents. N-50
+  is an otherwise-valid, correctly-signed authenticated proof whose own `exp` is
+  `1786000060`, past its mapped classical credential's `exp` of `1786000030`; both
+  are still valid at `verifier_now = 1786000015`, so a verifier that merely checks
+  each artifact against the clock accepts it. The gate binds the two in the
+  authenticated-context loop (`proof.exp <= mapped credential.exp` for every
+  positive) and the causality inventory (§12) resolves N-50's mapped credential
+  from its `credential_hash` and asserts `proof.exp > credential.exp`.
 - **N-12 / N-28 (suite ↔ component-plan binding).** Each suite_id is bound to its
   exact ordered algorithms and component count: `hs-cose-sign-ed25519-v1` is
   exactly one Ed25519 component, `hs-cose-sign-ed25519-mldsa65-wns-v1` is exactly

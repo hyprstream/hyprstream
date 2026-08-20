@@ -1273,6 +1273,12 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
 
     by_id = {v["id"]: v for v in positives["vectors"]}
     by_id.update({v["id"]: v for v in negatives["vectors"]})
+    # H1: map each credential's token hash -> its exp, to resolve a proof's mapped
+    # credential from the proof's credential_hash claim.
+    _creds = _load_credentials()
+    import hashlib as _hl
+    cred_exp_by_hash = {_hl.sha256(c["token"].encode("ascii")).digest(): c["claims"]["exp"]
+                        for c in _creds["credentials"].values()}
     PROOF_TYPS = (TYP_REQUEST, TYP_RESPONSE)
     REQUIRED_CLAIMS = {C_AUD, C_EXP, C_IAT, C_CTI, C_CREDENTIAL_HASH, C_SCHEMA_ID, C_BODY_BYTES, C_RESPONSE_BINDING}
     ALLOWED_CLAIMS = REQUIRED_CLAIMS | {C_NONCE}
@@ -1380,6 +1386,15 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
             if vid == "N-47":  # E1 kid lower boundary (empty kid)
                 kids, _ = kids_and_suites(vec["cbor_hex"])
                 return any(len(k) < 1 for k in kids), "an empty (0-byte) kid, under the 1-byte floor"
+        if dc == "proof-credential-expiry":  # H1
+            if claims is None:
+                return False, "claims did not decode"
+            ch = claims.get(C_CREDENTIAL_HASH)
+            cred_exp = cred_exp_by_hash.get(ch)
+            if cred_exp is None:
+                return False, "proof's credential_hash resolves to no mapped credential"
+            return claims.get(C_EXP, 0) > cred_exp, \
+                f"proof exp {claims.get(C_EXP)} exceeds mapped credential exp {cred_exp}"
         if dc == "nonce-length":  # E1 server-challenge boundary (16..64)
             nonce = claims.get(C_NONCE) if claims else None
             if nonce is None:
@@ -1488,6 +1503,35 @@ def _make_jwt(header: dict, claims: dict, sk) -> str:
     return f"{hp}.{pp}.{_b64u(sk.sign(si))}"
 
 
+def _validate_clearance(cl):
+    """H2: the frozen two-axis credential clearance grammar (Gate-2 value 11).
+    `[level, compartments]` — level a uint 0..3 (Public/Internal/Confidential/
+    Secret), compartments an array of bit indices (uint 0..63), strictly
+    ascending and unique (empty allowed). Assurance is structurally absent: an
+    extra element, a level out of domain, an out-of-range/duplicate/non-ascending
+    compartment, a bitmask integer, or names all deny. Returns the failure list."""
+    errs = []
+    if not (isinstance(cl, list) and len(cl) == 2):
+        return [f"clearance must be a 2-element [level, compartments] array (assurance absent), got {cl!r}"]
+    level, comps = cl
+    if isinstance(level, bool) or not isinstance(level, int) or not (0 <= level <= 3):
+        errs.append(f"level must be a uint 0..3 (Public/Internal/Confidential/Secret), got {level!r}")
+    if not isinstance(comps, list):
+        errs.append(f"compartments must be an array of bit indices (not a bitmask or name), got {comps!r}")
+    else:
+        prev = -1
+        for c in comps:
+            if isinstance(c, bool) or not isinstance(c, int):
+                errs.append(f"compartment {c!r} must be a uint bit index (not a name)")
+                continue
+            if not (0 <= c <= 63):
+                errs.append(f"compartment {c} out of range 0..63")
+            if c <= prev:
+                errs.append(f"compartments must be strictly ascending and unique; {c} follows {prev}")
+            prev = c
+    return errs
+
+
 def _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=None):
     """Return the list of conformance failures for one at+jwt (empty == valid):
     exact at+jwt/EdDSA header, issuer Ed25519 signature, required claims,
@@ -1523,6 +1567,7 @@ def _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=None):
         errs.append("not temporally valid at verifier_now")
     if "hs_signer_suite" not in (claims.get("cnf") or {}):
         errs.append("cnf lacks hs_signer_suite")
+    errs += [f"clearance: {e}" for e in _validate_clearance(claims.get("clearance"))]
     return errs
 
 
@@ -1621,9 +1666,13 @@ def gate_credential_context(positives, negatives) -> None:
         cnf_tp = _b64u_dec(cred["claims"]["cnf"]["hs_signer_suite"])
         matched, obj = primary_groups_matching(pid, cnf_tp)
         check(len(matched) == 1, f"{pid}: cnf must resolve to exactly one primary group; matched {matched}")
-        ch = decode(obj[2]).get(C_CREDENTIAL_HASH)
+        pclaims = decode(obj[2])
+        ch = pclaims.get(C_CREDENTIAL_HASH)
         check(ch == hashlib.sha256(cred["token"].encode("ascii")).digest(),
               f"{pid}: credential_hash must equal SHA-256 of the mapped {credname} credential")
+        # H1: a proof's exp MUST NOT exceed the mapped credential's exp.
+        check(pclaims[C_EXP] <= cred["claims"]["exp"],
+              f"{pid}: proof exp {pclaims[C_EXP]} must not exceed credential exp {cred['claims']['exp']}")
     print(f"   both credentials valid; {len(creds['positive_to_credential'])} positives bind their "
           f"credential hash + cnf primary group")
 
@@ -1720,6 +1769,37 @@ def gate_credential_context(positives, negatives) -> None:
         check(m_cls == [1], f"a single-COSE_Key cnf must resolve a classical primary (P-4); matched {m_cls}")
         print(f"   G1 single-key CWT cnf resolves classical (P-4) but denies the hybrid suite (P-2): "
               f"hybrid is at+jwt-only")
+
+    # ---- H2: the two-axis credential clearance grammar (Gate-2 value 11) -------
+    cddl = CDDL_PATH.read_text()
+    for pin in ("credential-clearance    = [ clearance-level, clearance-compartments ]",
+                "clearance-level         = 0 / 1 / 2 / 3",
+                "compartment-index       = uint .le 63"):
+        check(pin in cddl, f"CDDL must freeze the clearance grammar (missing: {pin!r})")
+    check("assurance" in prof and "structurally absent" in prof.lower(),
+          "credential-profile must state assurance is structurally absent from the credential wire")
+    # Every shipped credential's clearance conforms (at+jwt via claims; N-1 via CWT).
+    for name, cred in creds["credentials"].items():
+        e = _validate_clearance(cred["claims"].get("clearance"))
+        check(not e, f"credential {name} clearance must conform to the two-axis grammar: {e}")
+    n1 = next((v for v in negatives["vectors"] if v["id"] == "N-1"), None)
+    if n1 is not None:
+        n1_clear = decode(decode(bytes.fromhex(n1["cbor_hex"]))[2]).get(-70006)
+        check(not _validate_clearance(n1_clear),
+              f"the CWT credential N-1 clearance must conform to the two-axis grammar: {n1_clear!r}")
+    # Load-bearing counter-proofs: a valid credential re-signed with a malformed
+    # clearance must be rejected, one case per denial the grammar names.
+    for label, bad in (("unknown level 4", [4, [5, 7]]),
+                       ("compartment out of range 64", [2, [64]]),
+                       ("duplicate compartments", [2, [5, 5]]),
+                       ("descending compartments", [2, [7, 5]]),
+                       ("compartment names not indices", [2, ["pii"]]),
+                       ("compartments as a bitmask integer", [2, 160]),
+                       ("assurance present (3rd element)", [2, [5, 7], 1])):
+        rejected(f"clearance: {label}", _make_jwt(hdr, {**base_claims, "clearance": bad}, sk_i))
+    check(_validate_clearance([2, [5, 7]]) == [] and _validate_clearance([0, []]) == [],
+          "the conforming clearance shapes [2,[5,7]] and [0,[]] must validate")
+    print(f"   H2 clearance grammar frozen; shipped clearances conform; 7 malformed clearances rejected")
 
 
 # --------------------------------------------------------------------------

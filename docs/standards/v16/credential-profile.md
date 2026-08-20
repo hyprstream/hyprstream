@@ -73,7 +73,7 @@ Required semantic fields for authenticated dispatch:
 | Issuer | `iss` | `iss` (1) | REQUIRED, non-empty | The issuing node/authorization server. Scopes every identifier below. Empty issuer denies. |
 | Subject | `sub` | `sub` (2) | REQUIRED, non-empty | The principal. Empty subject denies. |
 | Audience | `aud` | `aud` (3) | REQUIRED | Exact service/resource audience (RFC 8707 resource indicator semantics). When it names a canonical service domain it uses the one shared `MAX_SERVICE_DOMAIN_BYTES` (128-byte) canonicalization rule (Gate-2 §19 #7), not a second identity rule. Wrong audience denies. |
-| Expiry | `exp` | `exp` (4) | REQUIRED | Credential expiry. Bounds the proof: a proof `exp` MUST NOT exceed credential or session expiry. |
+| Expiry | `exp` | `exp` (4) | REQUIRED | Credential expiry. Bounds the proof: a proof `exp` MUST NOT exceed credential or session expiry — a proof cannot outlive the authority it presents, even when both are unexpired at the current clock (vector N-50; enforced by the gate's authenticated-context loop and the §12 causality inventory). |
 | Issued at | `iat` | `iat` (6) | REQUIRED | Issuance time. |
 | Credential ID | `jti` | `cti` (7) | REQUIRED | Unique credential instance identifier. JWT uses a text `jti`; CWT uses a byte-string `cti`. |
 | PoP binding | `cnf` | `cnf` (8) | REQUIRED for dispatch | RFC 7800 / RFC 8747 proof-of-possession key binding. Resolves to exactly one signer-suite record identified by suite ID + the exact ordered component keys of the primary signer group (the verifier additionally consistency-checks principal and enrollment epoch from its own enrollment record; §5). **CWT `cnf` is a single RFC 8747 `COSE_Key` and binds a classical (single-key) primary group only.** A **hybrid** (multi-key) primary group has no v16 CWT confirmation method, so hybrid credentials are **`at+jwt` (JWT) only** — see §1.1. |
@@ -262,3 +262,38 @@ frozen by the accepted Gate-2 vote (v16 §19, 2026-08-19):
    `Compartments` axes only; assurance is structurally absent from the
    credential rather than present-and-ignored, and is derived from verified key
    material at the boundary.
+
+   **Frozen wire grammar.** The `clearance` value (JWT text `clearance`, CWT
+   integer key −70006) is the same semantic two-element array in both encodings:
+
+   ```
+   clearance = [ level, compartments ]
+   ```
+
+   - `level` is a uint with the frozen v16 mapping `0 = Public`, `1 = Internal`,
+     `2 = Confidential`, `3 = Secret` (the `Level` discriminants; §8 lattice).
+   - `compartments` is an array of compartment **bit indices**, each a uint
+     `0..63`, **strictly ascending and unique** (empty is allowed). It is the
+     credential wire projection of the versioned `InitialLabelMap` /
+     `CompartmentSet(u64)` — **not** a list of names, and **not** a bitmask
+     integer.
+   - The outer array has **exactly two** elements. Unknown levels, out-of-range
+     compartments, duplicates, descending or otherwise non-canonical order, names,
+     extra elements, and **any assurance field or value** deny.
+   - **Assurance is never issuer-asserted** on the credential wire: it is derived
+     only from verified key material during credential admission and clamps the
+     resulting runtime security context; a credential can restrict assurance
+     through its clearance level but can never raise it.
+
+   The CDDL freezes the shape and the level/compartment domains
+   (`credential-clearance`); `validate_profile.py` additionally enforces the
+   strict-ascending order and uniqueness numerically (the pinned pycddl cannot),
+   validates every shipped credential clearance, and proves each denial with a
+   re-signed counter-proof. The fixture value `[2, [5, 7]]` (Confidential; bit
+   indices 5 and 7) conforms.
+
+   **WS-B seam.** A serializer that emits `Option<SecurityLabel>` directly cannot
+   be the credential wire type: `SecurityLabel` carries the `assurance` axis, which
+   is forbidden on the wire here. The credential producer/consumer MUST project to
+   and from this two-axis `[level, compartments]` form and derive assurance from
+   verified key material, never from the credential.

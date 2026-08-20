@@ -637,3 +637,27 @@ hyprstream-proof-signature = [
 ; group, alg, and kid. A missing component, duplicate component, extra
 ; signature, reordered or malformed plan, group/suite mismatch, or key outside
 ; the applicable anchored record or unattributed key set denies.
+
+; ===========================================================================
+; Credential clearance wire grammar (Gate-2 value 11) — H2
+; ===========================================================================
+; The credential `clearance` claim (JWT text name `clearance`; CWT integer key
+; -70006) carries the Level and Compartments axes ONLY. Assurance is
+; STRUCTURALLY ABSENT from the credential wire: it is derived from verified key
+; material at credential admission and clamps the resulting runtime security
+; context; it is never issuer-asserted. The value is the same semantic two-
+; element array in both encodings.
+;
+; `compartments` is the credential wire projection of the versioned
+; InitialLabelMap: an array of compartment BIT INDICES (0..63) into the
+; CompartmentSet(u64) — NOT a list of names and NOT a bitmask integer — strictly
+; ascending and unique (empty allowed). Unknown levels, out-of-range or
+; duplicate or non-ascending compartments, a bitmask, names, extra array
+; elements, or any assurance field/value deny. (The outer shape and the level
+; and compartment DOMAINS are fixed here; strict-ascending order and uniqueness
+; are enforced numerically by validate_profile.py, which the pinned pycddl
+; cannot express.)
+credential-clearance    = [ clearance-level, clearance-compartments ]
+clearance-level         = 0 / 1 / 2 / 3   ; Public / Internal / Confidential / Secret
+clearance-compartments  = [ * compartment-index ]
+compartment-index       = uint .le 63

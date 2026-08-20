@@ -2000,6 +2000,23 @@ def main() -> None:
             notes="Outer array decodes; the payload integer argument is truncated (ai=25, 1 of 2 bytes).",
         )
 
+        # N-50 (H1): a correctly-signed authenticated proof whose own `exp`
+        # (1786000060) EXCEEDS its mapped credential's `exp` (1786000030). Both are
+        # still valid at verifier_now (1786000015), so a verifier that merely checks
+        # each artifact against the clock accepts it; the rule "a proof exp MUST NOT
+        # exceed credential/session expiry" (credential-profile §5) denies it. Bound
+        # to the classical credential via credential_hash.
+        n50_claims = request_claims(credential_hash=CREDENTIAL_HASH, extra={C_EXP: 1786000060})
+        n50, _, _ = sign1(p4_protected, n50_claims, sk_c_ed)
+        record(
+            negatives, "N-50",
+            "Authenticated proof whose exp (1786000060) exceeds its mapped credential's exp (1786000030)",
+            "deny", "COSE_Sign1", n50,
+            deny_class="proof-credential-expiry",
+            deny_rule="a proof exp MUST NOT exceed the mapped credential (or session) expiry",
+            notes="Both proof and credential are valid at verifier_now; denies solely on the expiry-binding rule.",
+        )
+
     meta = {
         "vector_set_version": 1,
         "profile": "hs-rpc-proof-v1",

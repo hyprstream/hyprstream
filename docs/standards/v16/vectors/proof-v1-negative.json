@@ -630,6 +630,18 @@
       "deny_class": "integer-truncation",
       "deny_rule": "a CBOR additional-information argument (ai 24/25/26/27) must carry its full 1/2/4/8-byte length",
       "notes": "Outer array decodes; the payload integer argument is truncated (ai=25, 1 of 2 bytes)."
+    },
+    {
+      "id": "N-50",
+      "title": "Authenticated proof whose exp (1786000060) exceeds its mapped credential's exp (1786000030)",
+      "expect": "deny",
+      "structure": "COSE_Sign1",
+      "size_bytes": 395,
+      "sha256": "46b4db67305eec033b46019cd5d02972a95af18eb28dfa15e540f98934338cfd",
+      "cbor_hex": "8458a9a7013202833a000111d53a000111d43a000111d30450636c69656e742d656432353531392d311078246170706c69636174696f6e2f766e642e6879707273747265616d2e70726f6f662b6377743a000111d37768732d7270632d726571756573742d70726f6f662d76313a000111d481a30101027768732d636f73652d7369676e2d656432353531392d76310381a201320250636c69656e742d656432353531392d313a000111d501a0589aa803781c72656769737472792e7376632e6879707273747265616d2e74657374041a6a7432bc061a6a74328007503f1c9a04b7d2416e8c05a9137b6e2d803a000111705820dc922286dc82617535d32a643cc9ed0dc639ce6da65914db9bced7b0f3395b033a000111711bd4d0f2a1b3c58e673a00011172581a00000000000000000100000017000000010005000000000000003a00011173f65840ae28bdec52fe6a4c5466c668e1f8c12f41bec111448ff932714a839b1837b577e1411a5071b1e087181759c0b68800437e8261bfb2de35d337acebca4e6f7406",
+      "deny_class": "proof-credential-expiry",
+      "deny_rule": "a proof exp MUST NOT exceed the mapped credential (or session) expiry",
+      "notes": "Both proof and credential are valid at verifier_now; denies solely on the expiry-binding rule."
     }
   ]
 }
