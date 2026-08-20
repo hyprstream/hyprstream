@@ -287,6 +287,15 @@ pub enum TrackPolicyError {
         plane: MoqEventPlane,
         service_domain: String,
     },
+    /// A row declares a service domain that the declared plane's coordinate
+    /// grammar can never produce, so the row can match nothing and the
+    /// objects it names would instead resolve through a shorter prefix
+    /// row's label. Event coordinates split on `.` and reject `/` outright;
+    /// stream coordinates split on `/`.
+    UnrepresentableServiceDomain {
+        plane: MoqEventPlane,
+        service_domain: String,
+    },
 }
 
 impl std::fmt::Display for TrackPolicyError {
@@ -308,6 +317,15 @@ impl std::fmt::Display for TrackPolicyError {
                 "duplicate track-policy declaration for plane {:?} service {service_domain:?}",
                 plane
             ),
+            TrackPolicyError::UnrepresentableServiceDomain {
+                plane,
+                service_domain,
+            } => write!(
+                f,
+                "track-policy row declares service domain {service_domain:?} that the {:?} \
+                 plane grammar can never represent",
+                plane
+            ),
         }
     }
 }
@@ -327,9 +345,43 @@ pub struct MoqEventPolicyRow {
     pub label: SecurityLabel,
 }
 
+/// Plane-representability guard: a declared service domain must be
+/// producible by the declared plane's own coordinate grammar, or the row is
+/// dead — it can match nothing, while the object it names still parses with
+/// the domain's *prefix* as its service coordinate and can silently take a
+/// weaker neighbouring row's label.
+///
+/// This is deliberately **not** a second identity rule: the canonical rule
+/// ([`validate_service_domain`]) stays the one authority on what a service
+/// domain *is* (and it admits `.`/`/` because the RPC/VFS planes use
+/// dotted and path-shaped domains). This guard only asks whether this
+/// plane's grammar — which splits the event coordinate on `.` (segment 0 =
+/// service, `/` rejected outright as a broadcast-path alias) and the
+/// stream coordinate on `/` (segment 1 = service) — could ever yield the
+/// declared domain back.
+fn check_plane_representable(
+    plane: MoqEventPlane,
+    service_domain: &str,
+) -> Result<(), TrackPolicyError> {
+    let unrepresentable = match plane {
+        MoqEventPlane::Event => service_domain.contains('.') || service_domain.contains('/'),
+        MoqEventPlane::Stream => service_domain.contains('/'),
+    };
+    if unrepresentable {
+        return Err(TrackPolicyError::UnrepresentableServiceDomain {
+            plane,
+            service_domain: service_domain.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 impl MoqEventPolicyRow {
-    /// Build a row, rejecting a noncanonical service domain at construction
-    /// (the shared rule — there is no plane-local rewrite).
+    /// Build a row, rejecting a noncanonical service domain (the shared
+    /// rule — there is no plane-local rewrite) and a domain the declared
+    /// plane's grammar can never represent. `MoqEventPolicyTable::build`
+    /// re-checks both: this type's fields are public, so a struct literal
+    /// bypasses this constructor.
     pub fn new(
         plane: MoqEventPlane,
         service_domain: impl Into<String>,
@@ -339,6 +391,7 @@ impl MoqEventPolicyRow {
         if validate_service_domain(&service_domain).is_err() {
             return Err(TrackPolicyError::NoncanonicalServiceDomain(service_domain));
         }
+        check_plane_representable(plane, &service_domain)?;
         Ok(Self {
             plane,
             service_domain,
@@ -364,10 +417,13 @@ impl MoqEventPolicyTable {
     /// Build the table from declared rows.
     ///
     /// Fails (returning no table) on a revision newer than supported, a
-    /// noncanonical service domain, or two rows declaring the same plane +
-    /// service with different labels. Older or equal revisions are accepted:
-    /// a newer *server* understanding an older table is forward-compatible;
-    /// the reverse is not, and denies.
+    /// noncanonical service domain, a service domain the declared plane's
+    /// grammar can never represent (checked here, not only in
+    /// [`MoqEventPolicyRow::new`], because the row fields are public and a
+    /// struct literal must not bypass the guard), or two rows declaring the
+    /// same plane + service with different labels. Older or equal revisions
+    /// are accepted: a newer *server* understanding an older table is
+    /// forward-compatible; the reverse is not, and denies.
     pub fn build(
         revision: u32,
         rows: impl IntoIterator<Item = MoqEventPolicyRow>,
@@ -385,6 +441,7 @@ impl MoqEventPolicyTable {
                     row.service_domain,
                 ));
             }
+            check_plane_representable(row.plane, &row.service_domain)?;
             let key = (row.plane, row.service_domain);
             if let Some(existing) = map.get(&key) {
                 if *existing != row.label {
@@ -791,6 +848,107 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    // ── plane representability: no dead stronger rows (B1) ───────────
+
+    /// The exact B1 event shape: a dead `foo.bar` SECRET row next to a live
+    /// `foo` PUBLIC row. Before the guard, both were accepted, the
+    /// `foo.bar` row matched nothing (the event grammar splits on `.`, so
+    /// `foo.bar.created` parses with service `foo`), and the object silently
+    /// took the weaker PUBLIC label. Now the declaration refuses.
+    #[test]
+    fn unrepresentable_event_domain_cannot_downgrade_declared_label() {
+        // The constructor rejects early…
+        let err =
+            MoqEventPolicyRow::new(MoqEventPlane::Event, "foo.bar", secret_label()).unwrap_err();
+        assert_eq!(
+            err,
+            TrackPolicyError::UnrepresentableServiceDomain {
+                plane: MoqEventPlane::Event,
+                service_domain: "foo.bar".to_owned(),
+            }
+        );
+        // …and so does `/`, which the event grammar rejects outright.
+        MoqEventPolicyRow::new(MoqEventPlane::Event, "foo/bar", secret_label()).unwrap_err();
+
+        // The struct-literal bypass (row fields are pub) is caught at
+        // `build`, which re-runs the guard for exactly that reason.
+        let literal_row = MoqEventPolicyRow {
+            plane: MoqEventPlane::Event,
+            service_domain: "foo.bar".to_owned(),
+            label: secret_label(),
+        };
+        let prefix_row =
+            MoqEventPolicyRow::new(MoqEventPlane::Event, "foo", public_label()).unwrap();
+        let err =
+            MoqEventPolicyTable::build(SUPPORTED_TRACK_POLICY_REVISION, [literal_row, prefix_row])
+                .unwrap_err();
+        assert_eq!(
+            err,
+            TrackPolicyError::UnrepresentableServiceDomain {
+                plane: MoqEventPlane::Event,
+                service_domain: "foo.bar".to_owned(),
+            }
+        );
+
+        // Causal shape, for the record: with only the representable `foo`
+        // row declared, the object the dead row was written to protect
+        // parses under service `foo` and takes its label — which is why an
+        // unrepresentable stronger row must refuse construction instead of
+        // being accepted as dead.
+        let table = MoqEventPolicyTable::build(
+            SUPPORTED_TRACK_POLICY_REVISION,
+            [MoqEventPolicyRow::new(MoqEventPlane::Event, "foo", public_label()).unwrap()],
+        )
+        .unwrap();
+        let object = MoqEventObjectRef::parse(MoqEventPlane::Event, "foo.bar.created").unwrap();
+        assert_eq!(object.service_domain(), "foo");
+        assert_eq!(table.resolve(&object), Some(public_label()));
+    }
+
+    /// The stream shape: a dead `a/b` SECRET row next to a live `a` PUBLIC
+    /// row (`t/a/b/c` parses with service `a`). Same guard, same refusal.
+    #[test]
+    fn unrepresentable_stream_domain_cannot_downgrade_declared_label() {
+        let err = MoqEventPolicyRow::new(MoqEventPlane::Stream, "a/b", secret_label()).unwrap_err();
+        assert_eq!(
+            err,
+            TrackPolicyError::UnrepresentableServiceDomain {
+                plane: MoqEventPlane::Stream,
+                service_domain: "a/b".to_owned(),
+            }
+        );
+
+        // Struct-literal bypass attempt at `build`.
+        let literal_row = MoqEventPolicyRow {
+            plane: MoqEventPlane::Stream,
+            service_domain: "a/b".to_owned(),
+            label: secret_label(),
+        };
+        let prefix_row =
+            MoqEventPolicyRow::new(MoqEventPlane::Stream, "a", public_label()).unwrap();
+        let err =
+            MoqEventPolicyTable::build(SUPPORTED_TRACK_POLICY_REVISION, [literal_row, prefix_row])
+                .unwrap_err();
+        assert_eq!(
+            err,
+            TrackPolicyError::UnrepresentableServiceDomain {
+                plane: MoqEventPlane::Stream,
+                service_domain: "a/b".to_owned(),
+            }
+        );
+
+        // Causal shape: `t/a/b/c` parses with service `a` and takes the
+        // declared `a` label.
+        let table = MoqEventPolicyTable::build(
+            SUPPORTED_TRACK_POLICY_REVISION,
+            [MoqEventPolicyRow::new(MoqEventPlane::Stream, "a", public_label()).unwrap()],
+        )
+        .unwrap();
+        let object = MoqEventObjectRef::parse(MoqEventPlane::Stream, "t/a/b/c").unwrap();
+        assert_eq!(object.service_domain(), "a");
+        assert_eq!(table.resolve(&object), Some(public_label()));
     }
 
     #[test]
