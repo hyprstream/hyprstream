@@ -709,6 +709,40 @@ impl PolicyHandler for PolicyService {
             }
         }
 
+        // RFC 9068 §2.2.1 `client_id` (v16 credential profile): the user
+        // `at+jwt` profiles (interactive / RFC 8693 / RFC 7523) MUST carry a
+        // non-empty `client_id`; the service profile mints a `wit+jwt` and MUST
+        // NOT carry one. Stamped into the signed claims below so the emitted
+        // credential is profile-compliant by construction.
+        let client_id = data
+            .client_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match data.issuance_profile {
+            IssueTokenProfile::InteractiveSession
+            | IssueTokenProfile::Rfc8693
+            | IssueTokenProfile::Rfc7523 => {
+                if client_id.is_none() {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "at+jwt issuance requires a non-empty client_id (RFC 9068 §2.2.1)"
+                            .to_owned(),
+                        code: "MISSING_CLIENT_ID".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+            }
+            IssueTokenProfile::Service => {
+                if client_id.is_some() {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "service (wit+jwt) issuance cannot carry a client_id".to_owned(),
+                        code: "INVALID_CLIENT_ID".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+            }
+        }
+
         let mut subject_clearance = if data.require_clearance {
             (self.token_clearance_resolver)(&subject).map(|clearance| {
                 let context = hyprstream_rpc::auth::mac::SecurityContext::from_clearance(
@@ -902,6 +936,12 @@ impl PolicyHandler for PolicyService {
         }
         if let Some(clearance) = subject_clearance {
             claims = claims.with_clearance(clearance);
+        }
+        // RFC 9068 §2.2.1: stamp the OAuth `client_id` on the user `at+jwt`
+        // credential (validated non-empty above for those profiles; the service
+        // profile carries none).
+        if let Some(cid) = client_id {
+            claims = claims.with_client_id(cid);
         }
         // Session binding (v16 §3.3): the OIDC `sid` profile is enforced at
         // the authority boundary. Service credentials NEVER carry an
@@ -2826,6 +2866,8 @@ mod tests {
             require_clearance: false,
             session_id: None,
             issuance_profile: IssueTokenProfile::Rfc8693,
+            // The user at+jwt profiles require a non-empty RFC 9068 client_id.
+            client_id: Some("hyprstream-oauth-client-1".to_owned()),
         }
     }
 
@@ -3107,14 +3149,16 @@ mod tests {
             &hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 300)
                 .with_issuer(issuer.to_owned())
                 .with_tenant("did:web:tenant-a.example".to_owned())
-                .with_cnf_jwk(user_key.verifying_key().as_bytes()),
+                .with_cnf_jwk(user_key.verifying_key().as_bytes())
+                .with_client_id("hyprstream-oauth-client-1"),
             &policy_key,
         );
         let other_tenant_token = hyprstream_rpc::auth::jwt::encode(
             &hyprstream_rpc::auth::Claims::new("bob".to_owned(), now, now + 300)
                 .with_issuer(issuer.to_owned())
                 .with_tenant("did:web:tenant-b.example".to_owned())
-                .with_cnf_jwk(other_user_key.verifying_key().as_bytes()),
+                .with_cnf_jwk(other_user_key.verifying_key().as_bytes())
+                .with_client_id("hyprstream-oauth-client-1"),
             &policy_key,
         );
         let client = crate::services::PolicyClient::for_local_endpoint_bootstrap(
@@ -3740,6 +3784,67 @@ mod tests {
         );
     }
 
+    /// RFC 9068 §2.2.1 issuance (v16 credential profile): a user `at+jwt`
+    /// profile without a non-empty `client_id` is denied; a service profile
+    /// carrying a `client_id` is denied; and a supplied `client_id` is stamped
+    /// into the minted `at+jwt` claims (the emitter positive).
+    #[tokio::test]
+    async fn issuance_enforces_and_stamps_client_id() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+
+        // User profile (RFC 8693) with a MISSING client_id → denied.
+        let mut missing = issue("alice");
+        missing.issuance_profile = IssueTokenProfile::Rfc8693;
+        missing.client_id = None;
+        let resp = service.handle_issue_token(&ctx, 1, &missing).await.unwrap();
+        assert!(
+            matches!(resp, PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "MISSING_CLIENT_ID"),
+            "missing client_id: {resp:?}"
+        );
+
+        // Empty/whitespace client_id → denied.
+        let mut empty = issue("alice");
+        empty.issuance_profile = IssueTokenProfile::Rfc8693;
+        empty.client_id = Some("   ".to_owned());
+        let resp = service.handle_issue_token(&ctx, 2, &empty).await.unwrap();
+        assert!(
+            matches!(resp, PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "MISSING_CLIENT_ID"),
+            "empty client_id: {resp:?}"
+        );
+
+        // Service (`wit+jwt`) profile carrying a client_id → denied.
+        let mut svc_cid = issue("service:model");
+        svc_cid.issuance_profile = IssueTokenProfile::Service;
+        svc_cid.client_id = Some("hyprstream-oauth-client-1".to_owned());
+        let resp = service.handle_issue_token(&ctx, 3, &svc_cid).await.unwrap();
+        assert!(
+            matches!(resp, PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "INVALID_CLIENT_ID"),
+            "service + client_id: {resp:?}"
+        );
+
+        // Emitter positive: a supplied client_id is stamped into the minted
+        // at+jwt (test_service may stop at the signing boundary; assert the
+        // stamped value only when a token is actually produced).
+        let mut ok = issue("alice");
+        ok.issuance_profile = IssueTokenProfile::Rfc8693;
+        ok.client_id = Some("hyprstream-oauth-client-1".to_owned());
+        match service.handle_issue_token(&ctx, 4, &ok).await.unwrap() {
+            PolicyResponseVariant::IssueTokenResult(info) => {
+                let claims = hyprstream_rpc::auth::decode_unverified(&info.token)
+                    .expect("issued token decodes");
+                assert_eq!(
+                    claims.client_id.as_deref(),
+                    Some("hyprstream-oauth-client-1"),
+                    "the supplied client_id is stamped into the minted claims"
+                );
+            }
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. })
+                if code == "SIGNING_NOT_CONFIGURED" => {}
+            other => panic!("unexpected issuance response: {other:?}"),
+        }
+    }
+
     #[test]
     fn resolve_service_key_publishes_every_overlap_candidate() {
         let trust = hyprstream_service::TrustStore::new();
@@ -3800,6 +3905,7 @@ mod tests {
 
         let mut request = issue("service:rotation-error-test");
         request.issuance_profile = IssueTokenProfile::Service;
+        request.client_id = None;
         request.user_pub_key = Some("not-base64url!".to_owned());
         let malformed = service
             .handle_issue_token(&ctx, 1, &request)
@@ -3842,6 +3948,7 @@ mod tests {
         ctx.cnf = caller.to_bytes();
         let mut request = issue("service:rotation-sibling-test");
         request.issuance_profile = IssueTokenProfile::Service;
+        request.client_id = None;
         request.user_pub_key = Some(URL_SAFE_NO_PAD.encode(requested.as_bytes()));
         let response = service.handle_issue_token(&ctx, 1, &request).await;
         trust.remove(&caller);

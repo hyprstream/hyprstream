@@ -2781,6 +2781,7 @@ mod tests {
                         require_clearance: false,
                         session_id: None,
                         issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?
                     .token;
@@ -2911,6 +2912,7 @@ mod tests {
                         require_clearance: false,
                         session_id: None,
                         issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await;
                 anyhow::ensure!(result.is_err(), "stale PolicyService minted a token");
@@ -3074,6 +3076,7 @@ mod tests {
                         require_clearance: false,
                         session_id: None,
                         issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?
                     .token;
@@ -3212,6 +3215,7 @@ mod tests {
                         require_clearance: false,
                         session_id: None,
                         issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?;
                 let client = reqwest::Client::new();
@@ -3445,6 +3449,7 @@ mod tests {
                         require_clearance: false,
                         session_id: None,
                         issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?
                     .token;

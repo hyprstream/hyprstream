@@ -1250,6 +1250,25 @@ pub trait RequestService: 'static {
             }
         }
 
+        // RFC 9068 §2.2.1 (v16 credential profile): an issuer-scoped `at+jwt`
+        // credential MUST carry a non-empty `client_id`. Positively typed on
+        // the already-exact-validated JOSE `typ` (parsed once above): a
+        // `wit+jwt` service credential is exempt (it carries no client_id), and
+        // empty-iss in-process provenance is exempt (`issuer_scoped` is false).
+        // This covers EVERY accepted `at+jwt` — local AND trusted
+        // federated/delegated — not merely local ones; `token_is_local` is
+        // deliberately NOT part of the predicate.
+        if issuer_scoped
+            && crate::auth::is_rfc9068_access_token_type(&protected.typ)
+            && verified
+                .client_id
+                .as_deref()
+                .is_none_or(|c| c.trim().is_empty())
+        {
+            tracing::warn!(iss = %verified.iss, sub = %verified.sub, typ = %protected.typ, "Rejected at+jwt without client_id");
+            anyhow::bail!("at+jwt credential missing required client_id");
+        }
+
         // Store verified claims on context for downstream use
         if verified.sub == UNAUTHENTICATED_DID_SENTINEL {
             tracing::warn!("Rejected JWT whose subject is the reserved unauthenticated sentinel");
@@ -1879,7 +1898,8 @@ mod empty_iss_gate_tests {
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
             .with_issuer(federated_issuer.to_owned())
-            .with_tenant("acme".to_owned());
+            .with_tenant("acme".to_owned())
+            .with_client_id("hyprstream-oauth-client-1");
         let token = crate::auth::jwt::encode(&claims, &federated_signer);
         let mut ctx = ctx_with_token(token, /* is_local_caller */ false);
 
@@ -1915,7 +1935,8 @@ mod empty_iss_gate_tests {
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
             .with_issuer(local_issuer.to_owned())
-            .with_tenant("acme".to_owned());
+            .with_tenant("acme".to_owned())
+            .with_client_id("hyprstream-oauth-client-1");
         let token = crate::auth::jwt::encode(&claims, &local_ca);
         let mut ctx = ctx_with_token(token, /* is_local_caller */ false);
 
@@ -1926,6 +1947,142 @@ mod empty_iss_gate_tests {
         assert_eq!(ctx.subject().name(), Some("alice"));
         assert_eq!(ctx.verified_tenant(), Some("acme"));
         assert_eq!(ctx.domain().expect("local tenant domain"), "acme");
+    }
+
+    /// RFC 9068 §2.2.1 (v16 credential profile) at the signed verify boundary:
+    /// an issuer-scoped `at+jwt` credential MUST carry a non-empty `client_id`.
+    /// A missing or empty `client_id` is rejected; a `wit+jwt` service
+    /// credential is positively exempt (it carries no client_id). The
+    /// federated/nonlocal `at+jwt` path is covered by the sibling
+    /// `federated_at_jwt_missing_client_id_is_rejected`.
+    #[tokio::test]
+    async fn local_at_jwt_requires_client_id_and_wit_jwt_is_exempt() {
+        let local_ca = SigningKey::from_bytes(&[11u8; 32]);
+        let local_issuer = "https://this.node";
+        let key_source = std::sync::Arc::new(ClusterKeySource::new(
+            local_ca.verifying_key(),
+            local_issuer.to_owned(),
+        ));
+        let svc = MockService {
+            signing_key: local_ca.clone(),
+            transport: TransportConfig::inproc("mock"),
+            key_source,
+            policy: crate::crypto::CryptoPolicy::Classical,
+            relay: None,
+            cached_subjects: std::sync::Arc::default(),
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        // Local at+jwt WITHOUT client_id → rejected.
+        let missing = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(local_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        let err = svc
+            .verify_claims(&mut ctx_with_token(
+                crate::auth::jwt::encode(&missing, &local_ca),
+                false,
+            ))
+            .await
+            .expect_err("local at+jwt without client_id must be rejected");
+        assert!(
+            err.to_string().contains("client_id"),
+            "unexpected error for missing client_id: {err}"
+        );
+
+        // Local at+jwt with EMPTY client_id → rejected (set directly, bypassing
+        // the empty-filtering builder).
+        let mut empty = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(local_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        empty.client_id = Some(String::new());
+        let err = svc
+            .verify_claims(&mut ctx_with_token(
+                crate::auth::jwt::encode(&empty, &local_ca),
+                false,
+            ))
+            .await
+            .expect_err("local at+jwt with empty client_id must be rejected");
+        assert!(
+            err.to_string().contains("client_id"),
+            "unexpected error for empty client_id: {err}"
+        );
+
+        // A local `wit+jwt` service credential WITHOUT client_id is positively
+        // exempt — it is ADMITTED (not merely un-rejected-for-client_id). The
+        // MockService provides a test-local revocation store, so the
+        // jti-bearing service token verifies.
+        let service = Claims::new("service:model".to_owned(), now, now + 3600)
+            .with_issuer(local_issuer.to_owned())
+            .with_jti();
+        let mut wit_ctx = ctx_with_token(
+            crate::auth::jwt::encode_service_jwt(&service, &local_ca),
+            false,
+        );
+        svc.verify_claims(&mut wit_ctx)
+            .await
+            .expect("local wit+jwt without client_id must be admitted (type-driven exemption)");
+        assert_eq!(wit_ctx.subject().name(), Some("service:model"));
+    }
+
+    /// A trusted federated (nonlocal) `at+jwt` without `client_id` is rejected —
+    /// the requirement is positively typed on `at+jwt` and applies regardless of
+    /// issuer locality.
+    #[tokio::test]
+    async fn federated_at_jwt_missing_or_empty_client_id_is_rejected() {
+        let local_ca = SigningKey::from_bytes(&[9u8; 32]);
+        let federated_signer = SigningKey::from_bytes(&[10u8; 32]);
+        let local_issuer = "https://this.node";
+        let federated_issuer = "https://idp.example.com";
+        let federation = std::sync::Arc::new(MockFederation {
+            issuer: federated_issuer.to_owned(),
+            verifying_key: federated_signer.verifying_key(),
+        });
+        let key_source = std::sync::Arc::new(FederatedKeySource::new(
+            ClusterKeySource::new(local_ca.verifying_key(), local_issuer.to_owned()),
+            federation,
+        ));
+        let svc = MockService {
+            signing_key: local_ca,
+            transport: TransportConfig::inproc("mock"),
+            key_source,
+            policy: crate::crypto::CryptoPolicy::Classical,
+            relay: None,
+            cached_subjects: std::sync::Arc::default(),
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        // Missing client_id → rejected.
+        let missing = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(federated_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        let err = svc
+            .verify_claims(&mut ctx_with_token(
+                crate::auth::jwt::encode(&missing, &federated_signer),
+                false,
+            ))
+            .await
+            .expect_err("federated at+jwt without client_id must be rejected");
+        assert!(
+            err.to_string().contains("client_id"),
+            "unexpected error for federated missing client_id: {err}"
+        );
+
+        // Empty/whitespace client_id → rejected.
+        let mut empty = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(federated_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        empty.client_id = Some("   ".to_owned());
+        let err = svc
+            .verify_claims(&mut ctx_with_token(
+                crate::auth::jwt::encode(&empty, &federated_signer),
+                false,
+            ))
+            .await
+            .expect_err("federated at+jwt with empty client_id must be rejected");
+        assert!(
+            err.to_string().contains("client_id"),
+            "unexpected error for federated empty client_id: {err}"
+        );
     }
 
     fn composite_token(
@@ -2013,7 +2170,8 @@ mod empty_iss_gate_tests {
         // inject one, so set it explicitly.
         let claims = Claims::new("alice".to_owned(), now, now + 60)
             .with_issuer("https://local".to_owned())
-            .with_jti();
+            .with_jti()
+            .with_client_id("hyprstream-oauth-client-1");
         for typ in crate::auth::RFC9068_ACCESS_TOKEN_TYPES {
             let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"{typ}","kid":"{kid_a}"}}"#);
             let valid = composite_token(&header, &claims, &pq_a, &ed_a, false);

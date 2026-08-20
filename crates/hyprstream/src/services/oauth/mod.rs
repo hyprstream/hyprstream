@@ -2796,6 +2796,7 @@ mod tests {
                 require_clearance: false,
                 session_id: None,
                 issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2828,6 +2829,7 @@ mod tests {
                 require_clearance: false,
                 session_id: None,
                 issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2860,6 +2862,7 @@ mod tests {
                 require_clearance: false,
                 session_id: None,
                 issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2910,6 +2913,7 @@ mod tests {
                 require_clearance: false,
                 session_id: None,
                 issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2967,6 +2971,7 @@ mod tests {
                 require_clearance: false,
                 session_id: None,
                 issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3117,6 +3122,7 @@ mod tests {
                 require_clearance: false,
                 session_id: None,
                 issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3269,6 +3275,7 @@ mod tests {
                 require_clearance: false,
                 session_id: None,
                 issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3321,6 +3328,7 @@ mod tests {
                 require_clearance: false,
                 session_id: None,
                 issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3495,6 +3503,7 @@ mod tests {
                 require_clearance: false,
                 session_id: None,
                 issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3595,6 +3604,7 @@ mod tests {
                 require_clearance: false,
                 session_id: None,
                 issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3643,6 +3653,7 @@ mod tests {
                 require_clearance: false,
                 session_id: None,
                 issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;

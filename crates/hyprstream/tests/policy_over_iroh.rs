@@ -204,6 +204,7 @@ impl TestTokenAuthority {
         let claims = hyprstream_rpc::auth::Claims::new(subject.to_owned(), now, now + 300)
             .with_issuer(TEST_ISSUER.to_owned())
             .with_tenant(tenant.to_owned())
+            .with_client_id("hyprstream-oauth-client-1")
             .with_cnf_jwk(signer.verifying_key().as_bytes());
         hyprstream_core::auth::jwt::encode_composite_ml_dsa_65_ed25519(
             &claims,
@@ -214,10 +215,13 @@ impl TestTokenAuthority {
 
     fn service_token(&self, subject: &str, signer: &SigningKey) -> String {
         let now = chrono::Utc::now().timestamp();
+        // Service credentials are WIT (`wit+jwt`), never `at+jwt`: the
+        // type-driven client_id requirement exempts them by construction, so
+        // this helper must not normalize service:* subjects into at+jwt.
         let claims = hyprstream_rpc::auth::Claims::new(subject.to_owned(), now, now + 300)
             .with_issuer(TEST_ISSUER.to_owned())
             .with_cnf_jwk(signer.verifying_key().as_bytes());
-        hyprstream_core::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+        hyprstream_core::auth::jwt::encode_composite_service_jwt(
             &claims,
             &self.ml_dsa,
             &self.ed25519,

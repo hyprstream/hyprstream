@@ -67,6 +67,7 @@ pub async fn exchange_token_exchange(
     output_dpop_jkt: Option<String>,
     requested_token_type: Option<&str>,
     tenant: Option<&str>,
+    client_id: &str,
 ) -> Response {
     // Actor token (delegation) is deferred — RFC 8693 §4.
     if actor_token.is_some() {
@@ -183,6 +184,9 @@ pub async fn exchange_token_exchange(
             } else {
                 IssueTokenProfile::Rfc8693
             },
+            // RFC 9068 §2.2.1: the exchanging OAuth client on the user
+            // `at+jwt`; the service (`wit+jwt`) form carries none.
+            client_id: (!verified.sub.starts_with("service:")).then(|| client_id.to_owned()),
         })
         .await;
 
@@ -541,6 +545,9 @@ pub(super) async fn exchange_browser_token_exchange(
             } else {
                 IssueTokenProfile::Rfc8693
             },
+            // RFC 9068 §2.2.1: the exchanging OAuth client on the user
+            // `at+jwt`; the service (`wit+jwt`) form carries none.
+            client_id: (!verified.sub.starts_with("service:")).then(|| client_id.to_owned()),
         })
         .await;
 
@@ -1004,6 +1011,10 @@ pub async fn exchange_atproto_ucan(
         output_dpop_jkt,
         Some(ISSUED_TOKEN_TYPE),
         Some(&request.tenant),
+        // The atproto XRPC exchange is a public-client (UCAN-authenticated)
+        // flow; the public client identifier is the RFC 9068 `client_id` for a
+        // user `at+jwt` output (unused for a service `wit+jwt` output).
+        BROWSER_PUBLIC_CLIENT_ID,
     ).await;
     if response.status().is_success() {
         return response;

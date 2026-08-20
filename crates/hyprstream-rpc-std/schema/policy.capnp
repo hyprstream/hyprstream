@@ -204,6 +204,13 @@ struct IssueToken {
   # `sessionId`; RFC 8693 and RFC 7523 are deliberate non-interactive
   # profiles; service issuance is limited to `service:*` subjects.
   issuanceProfile @10 :IssueTokenProfile;
+
+  # RFC 9068 §2.2.1 `client_id`: the OAuth client the access token is issued to.
+  # REQUIRED (non-empty) for the user `at+jwt` profiles (interactive/RFC 8693/
+  # RFC 7523); the authority stamps it into the signed `client_id` claim. The
+  # service profile mints a `wit+jwt` and carries no `client_id`. Empty/absent =
+  # not supplied.
+  clientId @11 :Text $optional;
 }
 
 # Apply a built-in policy template

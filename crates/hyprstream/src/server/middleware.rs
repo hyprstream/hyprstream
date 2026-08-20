@@ -608,6 +608,19 @@ pub(crate) async fn verify_resource_token_claims(
         }
     }
 
+    // RFC 9068 §2.2.1 (v16 credential profile): every token admitted on this
+    // resource-server path is an `at+jwt` (the verifier positively rejects any
+    // other `typ` before decoding — see the resource verifier's
+    // `is_rfc9068_access_token_type` gate), so it MUST carry a non-empty
+    // `client_id`. This covers local AND trusted federated at+jwt.
+    if claims
+        .client_id
+        .as_deref()
+        .is_none_or(|c| c.trim().is_empty())
+    {
+        return Err("at+jwt credential missing required client_id");
+    }
+
     // Federation is trusted for identity, never for choosing a local
     // PDS/Casbin tenant or asserting local MAC clearance.
     claims.strip_federated_clearance(local_issuers);

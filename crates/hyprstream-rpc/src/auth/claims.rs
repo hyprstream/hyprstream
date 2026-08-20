@@ -148,6 +148,14 @@ pub struct Claims {
     /// RFC 8707 audience claim for resource indicator binding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<String>,
+    /// RFC 9068 §2.2.1 `client_id` — the OAuth client the access token was
+    /// issued to. REQUIRED (non-empty) on locally issued `at+jwt` credentials
+    /// (v16 credential profile; JWT-only, no CWT mapping). Distinct from `aud`
+    /// (the RFC 8707 resource indicator) and from `sub` (the resource owner).
+    /// Absent on non-`at+jwt` credentials (e.g. `wit+jwt` service tokens) and
+    /// on the in-process empty-issuer provenance path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     /// OAuth 2.0 granted scope set, serialized as a space-delimited string.
     ///
     /// This is optional because non-OAuth service tokens do not originate from
@@ -232,6 +240,7 @@ impl std::fmt::Debug for Claims {
             .field("sid", &self.sid)
             .field("workload_session_id", &self.workload_session_id)
             .field("aud", &self.aud)
+            .field("client_id", &self.client_id)
             .field("scope", &self.scope)
             .field("cnf", &self.cnf)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
@@ -332,6 +341,7 @@ impl FromCapnp for Claims {
             sid: None,
             workload_session_id: None,
             aud,
+            client_id: None,
             // The dedicated OAuth field preserves the signed grant ceiling;
             // the legacy structured scope list remains unused by Claims.
             scope,
@@ -392,6 +402,7 @@ impl Claims {
             sid: None,
             workload_session_id: None,
             aud: None,
+            client_id: None,
             scope: None,
             cnf: None,
             token: None,
@@ -472,6 +483,15 @@ impl Claims {
     /// Create new claims with an audience (RFC 8707 resource indicator).
     pub fn with_audience(mut self, audience: Option<String>) -> Self {
         self.aud = audience;
+        self
+    }
+
+    /// Set the RFC 9068 §2.2.1 `client_id` claim (the OAuth client the access
+    /// token was issued to). An empty/whitespace value is treated as absent so
+    /// a caller cannot satisfy the profile's non-empty requirement with a blank.
+    pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
+        let value = client_id.into();
+        self.client_id = (!value.trim().is_empty()).then_some(value);
         self
     }
 

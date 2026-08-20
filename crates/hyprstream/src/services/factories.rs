@@ -2212,6 +2212,27 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                     }
                                 }
                             }
+                            // RFC 9068 §2.2.1 (v16 credential profile): an
+                            // `at+jwt` access token presented to MCP MUST carry
+                            // a non-empty `client_id`. Positively typed on the
+                            // JOSE `typ`; `wit+jwt`/other types are exempt.
+                            if hyprstream_rpc::auth::parse_protected_header(&t)
+                                .ok()
+                                .is_some_and(|h| {
+                                    hyprstream_rpc::auth::is_rfc9068_access_token_type(&h.typ)
+                                })
+                                && claims
+                                    .client_id
+                                    .as_deref()
+                                    .is_none_or(|c| c.trim().is_empty())
+                            {
+                                tracing::warn!(%method, %uri, sub = %claims.sub, "MCP: at+jwt without client_id rejected");
+                                let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                    res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                }
+                                return res;
+                            }
                             // DPoP binding enforcement (RFC 9449 §7):
                             // cnf.jkt tokens MUST be presented with DPoP scheme + proof header.
                             if let Some(expected_jkt) = claims.cnf_jkt() {

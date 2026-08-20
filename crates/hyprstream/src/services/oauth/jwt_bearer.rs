@@ -118,6 +118,9 @@ pub async fn exchange_jwt_bearer(
             } else {
                 IssueTokenProfile::Rfc7523
             },
+            // RFC 9068 §2.2.1: the RFC 7523 client on the user `at+jwt`; the
+            // service (`wit+jwt`) form carries none.
+            client_id: (!sub.starts_with("service:")).then(|| client_id.to_owned()),
         })
         .await;
 

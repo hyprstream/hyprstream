@@ -275,6 +275,16 @@ pub(super) async fn validate_oauth_access_token(
             None => return Err("session registry unavailable"),
         }
     }
+    // RFC 9068 §2.2.1 (v16 credential profile): this OAuth access token is an
+    // `at+jwt` (`verify_access_token` positively rejects any other `typ`), so
+    // it MUST carry a non-empty `client_id`.
+    if claims
+        .client_id
+        .as_deref()
+        .is_none_or(|c| c.trim().is_empty())
+    {
+        return Err("at+jwt credential missing required client_id");
+    }
     Ok(claims)
 }
 

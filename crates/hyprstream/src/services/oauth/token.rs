@@ -271,6 +271,7 @@ pub async fn exchange_token(
                 output_dpop_jkt,
                 params.requested_token_type.as_deref(),
                 params.tenant.as_deref(),
+                &params.client_id,
             )
             .await
         }
@@ -1451,6 +1452,8 @@ async fn issue_token_with_refresh(
             require_clearance: false,
             session_id: session_id.clone(),
             issuance_profile: IssueTokenProfile::InteractiveSession,
+            // RFC 9068 §2.2.1: the OAuth client this access token is issued to.
+            client_id: Some(client_id.to_owned()),
         })
         .await;
 
