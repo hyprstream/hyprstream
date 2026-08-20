@@ -323,7 +323,7 @@ Ed25519 signature over the stripped object.
 | N-3 | missing-typ | Protected `typ` (label 16) absent | 1587 |
 | N-4 | domain-separation | Correct `typ` with the response-proof `hs_domain` | 1628 |
 | N-5 | component-stripping | Hybrid proof with the ML-DSA-65 entry stripped | 438 |
-| N-6 | parser-cap | `signature_plan` with nine signer groups | 2044 |
+| N-6 | parser-cap | Otherwise-valid nine signer-group `COSE_Sign`, over the 1\*8 group cap (cap is the sole denial) | 2803 |
 | N-7 | parser-cap | Signer group with three components | 1684 |
 | N-8 | closed-claim-set | Unknown claim key −70050 (unallocated) | 413 |
 | N-9a | non-deterministic-encoding | Claims map keys not in deterministic order | 395 |
@@ -412,7 +412,14 @@ Ed25519 signature over the stripped object.
   Raising a cap is an incompatible profile revision. The `kid` byte cap is pinned
   in the CDDL text and enforced numerically by the gate over every fixture, and
   N-13 is asserted to exceed the 64-byte cap — so a widening to 128 turns the
-  gate red.
+  gate red. **N-6 (Q2)** is a **fully otherwise-valid** nine signer-group
+  `COSE_Sign`: every group uses a known (classical) suite with matching ordered key
+  material, every component has a matching **valid** Ed25519 signature (nine
+  independent enrolled signers), and all `(alg, kid)` pairs and `group_id`s are
+  unique and ascending — so a cap-less verifier would accept it and the frozen
+  `1*8` group cap is its **sole** denial. The gate verifies all nine signatures and
+  proves the isolation by showing an **eight-group truncation validates** the plan
+  (a de-fang to eight groups, or a verifier omitting the cap, turns the suite red).
 - **Byte-range boundary coverage (E1) — N-44 / N-45 / N-46 / N-47.** The pinned
   pycddl 0.3.0 strips **every** `.size (LO..HI)` byte-length range (it mis-evaluates
   them as integer-value bounds), so each stripped range needs a causal boundary
@@ -650,7 +657,20 @@ Ed25519 signature over the stripped object.
   denial is scoped to that group; each additional approver group verifies against
   its own enrolled keys, not the client's `cnf`. So P-5's two groups each verify
   against their own enrolled test key (the checker does exactly this), and the
-  approver group is not over-rejected.
+  approver group is not over-rejected. **Authoritative approver enrollment (Q1):**
+  being *different from `cnf`* is not enough — P-5's approver group must be an
+  **authorized** approver. The authority holds an off-wire `approver_enrollments`
+  record (in `proof-v1-credentials.json`) keyed by **cryptographic content** — the
+  group's signer-suite thumbprint over its `suite_id` + ordered public keys, the
+  same content-bound discipline as `cnf`/M1, never the attacker-chosen `group_id`/
+  `kid`. The gate and checker resolve the approver group by **recomputing** that
+  thumbprint (the record's stored thumbprint field is never trusted — it is
+  recomputed from the record's own suite/keys and both must agree), then require an
+  active, **unexpired** (`expires_at` > `verifier_now`) `approver`-role record whose
+  `tenant` matches the credential and whose `enrollment_epoch` is a non-negative
+  integer. An **unknown**, tampered, key/suite-mismatched, **inactive**, **expired**,
+  **cross-tenant**, or **wrong-role** enrollment denies; omitting the validation
+  turns the gate red. It is not a credential/wire claim and allocates no wire space.
 - **N-17 (unprotected authority).** Algorithm identifiers and key material in
   unprotected headers establish no authority; authenticated signer keys are
   resolved from the credential `cnf` and anchored trust stores.

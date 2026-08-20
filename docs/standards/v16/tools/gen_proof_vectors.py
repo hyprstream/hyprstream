@@ -368,6 +368,9 @@ def main() -> None:
         seed_s_ed, sk_s_ed = ed25519_key(0x60)
         seed_u_ed, sk_u_ed = ed25519_key(0x80)
         seed_i_ed, sk_i_ed = ed25519_key(0xC0)  # credential issuer
+        # Q2: nine independent Ed25519 signers for the isolated group-cap negative N-6.
+        cap_signers = [ed25519_key(0xD0 + i) for i in range(9)]  # (seed, sk) per group
+        cap_kids = [f"cap-signer-{i + 1}".encode() for i in range(9)]
         ml_client = MlDsaKey(bytes((0x20 + i) & 0xFF for i in range(32)), work, "client")
         ml_unattributed = MlDsaKey(
             bytes((0xA0 + i) & 0xFF for i in range(32)), work, "unattributed"
@@ -376,6 +379,7 @@ def main() -> None:
         # ---- F2: deterministic profile-valid at+jwt credential context --------
         issuer_pub = sk_i_ed.public_key().public_bytes_raw()
         client_ed_pub = sk_c_ed.public_key().public_bytes_raw()
+        approver_ed_pub = sk_a_ed.public_key().public_bytes_raw()  # Q1 approver enrollment
         # cnf-resolved signer-suite records for the authenticated positives'
         # PRIMARY groups: classical = [client Ed25519]; hybrid = [client Ed25519,
         # client ML-DSA-65] (approver groups bind their own enrollment, never cnf).
@@ -461,6 +465,16 @@ def main() -> None:
                     "seed_hex": seed_i_ed.hex(),
                     "public_hex": sk_i_ed.public_key().public_bytes_raw().hex(),
                 },
+                *[
+                    {
+                        "role": f"group-cap signer {i + 1} (N-6, Q2)",
+                        "kid_hex": cap_kids[i].hex(),
+                        "kid_ascii": cap_kids[i].decode(),
+                        "seed_hex": cap_signers[i][0].hex(),
+                        "public_hex": cap_signers[i][1].public_key().public_bytes_raw().hex(),
+                    }
+                    for i in range(9)
+                ],
             ],
             "ml_dsa_65": [
                 {
@@ -1014,23 +1028,39 @@ def main() -> None:
             notes="The surviving Ed25519 signature is cryptographically valid over the mutated object.",
         )
 
-        # N-6: ninth signer group.
-        plan_nine = [
-            group(i, SUITE_CLASSICAL, [component(ALG_ED25519, KID_CLIENT_ED + bytes([0x30 + i]))])
-            for i in range(1, 10)
+        # N-6 (Q2): a fully otherwise-valid NINE-group COSE_Sign — every group uses a
+        # known suite (classical) with matching ordered key material, every component
+        # has a matching valid Ed25519 signature, all (alg,kid) pairs and group_ids are
+        # unique and ascending. A cap-less verifier accepts it; the frozen 1*8 signer-
+        # group cap is its SOLE denial (truncating to 8 groups validates the plan).
+        n6_plan = [
+            group(i + 1, SUITE_CLASSICAL, [component(ALG_ED25519, cap_kids[i])])
+            for i in range(9)
         ]
-        n6_protected = dict(p4_protected)
-        n6_protected[H_PLAN] = plan_nine
-        n6, _, _ = sign1(n6_protected, p4_claims, sk_c_ed)
+        n6_body = {
+            H_CRIT: CRIT_SIGN_BODY_AUTH,
+            H_TYP: TYP_REQUEST,
+            H_DOMAIN: DOMAIN_REQUEST,
+            H_PLAN: n6_plan,
+        }
+        n6_entries = [
+            (
+                {H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: cap_kids[i], H_GROUP: i + 1},
+                cap_signers[i][1],
+            )
+            for i in range(9)
+        ]
+        n6, _, _ = sign_multi(n6_body, p4_claims, n6_entries)
         record(
             negatives,
             "N-6",
-            "signature_plan with nine signer groups",
+            "Otherwise-valid nine signer-group COSE_Sign, over the 1*8 group cap",
             "deny",
-            "COSE_Sign1",
+            "COSE_Sign",
             n6,
             deny_class="parser-cap",
             deny_rule="proof-v1 cap: 1*8 signer groups",
+            notes="Every group is a known suite with a matching valid signature; only the >8-group cap denies.",
         )
 
         # N-7: third component in one group.
@@ -2220,6 +2250,35 @@ def main() -> None:
                 # L3 (§3.4): the authoritative session's clearance epoch — a
                 # deterministic off-wire integer, never a credential/wire claim.
                 "clearance_epoch": 3,
+            },
+        ],
+        "approver_enrollment_model": {
+            "note": (
+                "Q1: a TokenBoundAndApproved proof's ADDITIONAL (approver) logical signer "
+                "groups bind to their OWN enrolled keys, NOT the credential cnf "
+                "(credential-profile §5). The authority holds an off-wire approver "
+                "enrollment record keyed by CRYPTOGRAPHIC CONTENT — the group's signer-"
+                "suite record thumbprint (suite_id + ordered public keys), the same "
+                "content-bound discipline as cnf/M1 — never the attacker-chosen group_id "
+                "or kid. It is validated for role, active status, tenant coherence, and a "
+                "non-negative integer enrollment_epoch. Unknown, key/suite-mismatched, "
+                "revoked/inactive, or cross-tenant/role-mismatched enrollment denies. Not "
+                "a credential/wire claim; no allocation."
+            ),
+            "thumbprint": "base64url(SHA-256(RFC 8949 det-CBOR [suite_id, [ordered raw component public keys]]))",
+        },
+        "approver_enrollments": [
+            {
+                "suite_id": SUITE_CLASSICAL,
+                "component_public_keys_hex": [approver_ed_pub.hex()],
+                "thumbprint_b64": b64u(signer_suite_thumbprint(SUITE_CLASSICAL, [approver_ed_pub])),
+                "role": "approver",
+                "tenant": CREDENTIAL_TENANT,
+                "status": "active",
+                # Authoritative validity window checked against the injected
+                # verifier_now (1786000015); active and unexpired.
+                "expires_at": 1786000060,
+                "enrollment_epoch": 2,
             },
         ],
         "positive_to_credential": {

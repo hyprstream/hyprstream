@@ -225,7 +225,18 @@ backed by an idempotency/result ledger whose lookup binds the retrying principal
   `cnf` record; approver signatures are not checked against the `cnf`-bound keys.
   So a `TokenBoundAndApproved` proof (e.g. P-5) has one interoperable disposition:
   the primary verifies against `cnf`, each approver against its own enrollment,
-  and none over-rejects the other.
+  and none over-rejects the other. That approver **enrollment record is
+  authoritative, off-wire state** (never a credential/wire claim): it is keyed by
+  the group's **cryptographic content** — a signer-suite thumbprint over its
+  `suite_id` + ordered public keys, the same content-bound discipline as `cnf` and
+  the replay namespace (§7.1), never the group's `group_id`/`kid` labels — and is
+  resolved by **recomputing** that thumbprint from the record's own suite/keys, not
+  by trusting any stored value. A conforming verifier admits an approver group only
+  when its enrollment resolves to an **active, unexpired** record with the
+  **`approver` role**, a `tenant` coherent with the credential, and an enrollment
+  epoch; an unknown, tampered, key/suite-mismatched, inactive, expired,
+  cross-tenant, or wrong-role enrollment denies. Being merely *different from `cnf`*
+  is insufficient — an unenrolled group is not an authorized approver.
 - Presenting a credential never leaves a proof in the unattributed branch: with
   a valid credential, the proof MUST be `cnf`-bound, and
   `hs_unattributed_key_set` is forbidden (vector N-10f).

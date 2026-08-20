@@ -43,6 +43,69 @@
         "kid_ascii": "issuer-ed25519-1",
         "seed_hex": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
         "public_hex": "dde3bccec7f3a66a1115f45d720f4dc135c3ae7c4e22dca38fdb1efd6a495ff8"
+      },
+      {
+        "role": "group-cap signer 1 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d31",
+        "kid_ascii": "cap-signer-1",
+        "seed_hex": "d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeef",
+        "public_hex": "6f0f0eeb3fbff925c66d03e19dce48d5edc9ffee51cd26ae71dd39e56f7fdda2"
+      },
+      {
+        "role": "group-cap signer 2 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d32",
+        "kid_ascii": "cap-signer-2",
+        "seed_hex": "d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0",
+        "public_hex": "b79a5770956e8d5e416f49b671092d075615b1ac6ed0a0507b0c9fb2defb008b"
+      },
+      {
+        "role": "group-cap signer 3 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d33",
+        "kid_ascii": "cap-signer-3",
+        "seed_hex": "d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1",
+        "public_hex": "e22c057fbbcc33e1bedf7729251472cfc4a1d4559336eaaa8079febc96a4e408"
+      },
+      {
+        "role": "group-cap signer 4 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d34",
+        "kid_ascii": "cap-signer-4",
+        "seed_hex": "d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2",
+        "public_hex": "6ad6c5fdc71b3a926c642a1fb1c1bb5c8acb2cf58aaa65772590f3997da9392e"
+      },
+      {
+        "role": "group-cap signer 5 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d35",
+        "kid_ascii": "cap-signer-5",
+        "seed_hex": "d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3",
+        "public_hex": "f97f6f18352e8d0acf5a4bb82ad0732c82f89a042472df8381778752d6695abf"
+      },
+      {
+        "role": "group-cap signer 6 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d36",
+        "kid_ascii": "cap-signer-6",
+        "seed_hex": "d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4",
+        "public_hex": "f27bea00891eaf96b221f60ec25a3ff1b289750ed381ce9d8ce5b2457a758c12"
+      },
+      {
+        "role": "group-cap signer 7 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d37",
+        "kid_ascii": "cap-signer-7",
+        "seed_hex": "d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5",
+        "public_hex": "ae20a678df5f127e5ae657e44c1988845d6c019433e6706d44669c0f63cfd2bc"
+      },
+      {
+        "role": "group-cap signer 8 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d38",
+        "kid_ascii": "cap-signer-8",
+        "seed_hex": "d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6",
+        "public_hex": "eb7f900f4343d1787a15836ff67ac28323f2fa1f2be78da89f40ce8fcb7cced2"
+      },
+      {
+        "role": "group-cap signer 9 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d39",
+        "kid_ascii": "cap-signer-9",
+        "seed_hex": "d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7",
+        "public_hex": "63568e6c2a060e83785cef6af6011da82fb95c20debc3f51cd8ad2aecf2710a7"
       }
     ],
     "ml_dsa_65": [

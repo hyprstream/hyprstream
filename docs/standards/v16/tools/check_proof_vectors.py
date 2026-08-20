@@ -194,6 +194,66 @@ def unattributed_replay_preimage(sep, plan, keyset):
     return enc([sep, groups])
 
 
+def _enrollment_thumbprint(rec):
+    """Recompute an enrollment record's signer-suite thumbprint from its OWN
+    suite_id + ordered public keys — never trust the record's stored thumbprint
+    field (byte-audit). Returns the base64url thumbprint, or None if malformed."""
+    try:
+        suite = rec["suite_id"]
+        pubs = [bytes.fromhex(h) for h in rec["component_public_keys_hex"]]
+    except (KeyError, TypeError, ValueError):
+        return None
+    return base64.urlsafe_b64encode(hashlib.sha256(enc([suite, pubs])).digest()).rstrip(b"=").decode()
+
+
+def resolve_approver_enrollment(creds_doc, requested_thumbprint_b64):
+    """Q1: the authoritative approver enrollment record for a signer-suite record,
+    matched by its RECOMPUTED cryptographic content (suite + ordered keys), NOT by
+    the attacker-chosen group_id/kid and NOT by the record's self-declared thumbprint
+    field. None if no enrollment's own suite/keys hash to the requested thumbprint."""
+    for e in creds_doc.get("approver_enrollments", []):
+        if _enrollment_thumbprint(e) == requested_thumbprint_b64:
+            return e
+    return None
+
+
+def validate_approver_enrollment(rec, requested_thumbprint_b64, expected_tenant, now):
+    """Q1: an additional (approver) signer group MUST resolve to an authoritative
+    enrollment (credential-profile §5) whose OWN suite/keys recompute to the
+    requested content thumbprint (record integrity + key/suite binding), that is an
+    active, unexpired `approver` role coherent with the credential tenant, with a
+    non-negative integer enrollment_epoch. Returns the failure list; an unknown,
+    tampered, key/suite-mismatched, inactive, expired, cross-tenant, or wrong-role
+    record denies."""
+    if rec is None:
+        return ["no authoritative approver enrollment for this signer-suite record"]
+    errs = []
+    recomputed = _enrollment_thumbprint(rec)
+    if recomputed is None:
+        return ["approver enrollment record has a malformed suite_id / public keys"]
+    # Record integrity: the stored thumbprint must equal the recomputed one.
+    if rec.get("thumbprint_b64") != recomputed:
+        errs.append("approver enrollment thumbprint_b64 disagrees with its own suite/keys (tampered record)")
+    # Key/suite binding: the record must bind the REQUESTED group content.
+    if requested_thumbprint_b64 is not None and recomputed != requested_thumbprint_b64:
+        errs.append("approver enrollment key/suite does not bind the requested signer group")
+    if rec.get("role") != "approver":
+        errs.append(f"enrollment role {rec.get('role')!r} is not 'approver'")
+    if rec.get("status") != "active":
+        errs.append(f"enrollment status {rec.get('status')!r} is not active (inactive/revoked)")
+    ea = rec.get("expires_at")
+    if isinstance(ea, bool) or not isinstance(ea, int):
+        errs.append(f"enrollment expires_at must be an integer, got {ea!r}")
+    elif ea <= now:
+        errs.append(f"approver enrollment expired at verifier_now {now} (expires_at {ea})")
+    if expected_tenant is not None and rec.get("tenant") != expected_tenant:
+        errs.append(f"enrollment tenant {rec.get('tenant')!r} != credential tenant {expected_tenant!r}")
+    ee = rec.get("enrollment_epoch")
+    if isinstance(ee, bool) or not isinstance(ee, int) or ee < 0:
+        errs.append(f"enrollment_epoch must be a non-negative integer, got {ee!r}")
+    return errs
+
+
 def resolve_session(creds_doc, iss, sid):
     """K1: the authoritative session record keyed by exact (iss, sid) (§3.4),
     held in the credential context OUTSIDE the credential wire. None if absent."""
@@ -666,6 +726,26 @@ def main() -> None:
                     matches.append(grp[1])
             if len(matches) != 1:
                 fail(f"{pid}: cnf must resolve to exactly one primary plan group; matched {matches}")
+            # Q1: every ADDITIONAL (approver) signer group — content-resolved, not the
+            # primary cnf group — must validate against an authoritative approver
+            # enrollment record (§5).
+            cred_tenant = cred_claims.get("tenant")
+            for grp in plan:
+                pubs, ok = [], True
+                for comp in grp[3]:
+                    alg, kid = comp[1], comp[2]
+                    p = ed_by_kid.get(kid) if alg == ALG_ED25519 else ml_by_kid.get(kid)
+                    if p is None:
+                        ok = False; break
+                    pubs.append(p)
+                if not ok:
+                    continue
+                gtp = base64.urlsafe_b64encode(signer_suite_tp(grp[2], pubs)).rstrip(b"=").decode()
+                if gtp == cred_claims["cnf"]["hs_signer_suite"]:
+                    continue  # the primary cnf group
+                rec = resolve_approver_enrollment(cd, gtp)
+                for e in validate_approver_enrollment(rec, gtp, cred_tenant, now):
+                    fail(f"{pid} approver group_id {grp[1]}: {e}")
             # K1: proof exp <= credential exp, and for a sid-bearing credential also
             # <= the authoritative session exp.
             pexp = pclaims.get(4)

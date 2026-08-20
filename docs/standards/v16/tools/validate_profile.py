@@ -65,6 +65,7 @@ ENVELOPE_RS = REPO_ROOT / "crates" / "hyprstream-rpc" / "src" / "envelope.rs"
 sys.path.insert(0, str(HERE))
 from check_proof_vectors import (  # noqa: E402
     decode, StrictError, validate_tenant, validate_session, resolve_session,
+    resolve_approver_enrollment, validate_approver_enrollment,
 )
 
 # ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
@@ -1584,6 +1585,80 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
 
 
 # --------------------------------------------------------------------------
+# Q2. Group-cap isolation: N-6 must fail ONLY the 1*8 signer-group cap
+# --------------------------------------------------------------------------
+
+
+def gate_group_cap_isolation(cddl, negatives) -> None:
+    section("Q2. Group-cap isolation (N-6 fails only the >8-group cap)")
+    from pycddl import Schema, ValidationError
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from check_proof_vectors import enc as _enc
+    ed_by_kid, ml_by_kid = _keymaps()
+    stripped, _ = strip_size_ranges(cddl)
+    stripped = stripped.replace("=> unattributed-key-set", "=> any")
+    plan_schema = Schema("start = signature-plan\n" + stripped)
+
+    n6 = next((v for v in negatives["vectors"] if v["id"] == "N-6"), None)
+    check(n6 is not None, "N-6 (group-cap) must exist")
+    if n6 is None:
+        return
+    obj = decode(bytes.fromhex(n6["cbor_hex"]))
+    body_prot, payload, entries = obj[0], obj[2], obj[3]
+    plan = decode(body_prot).get(H_PLAN) or []
+    check(len(plan) == 9, f"N-6 must carry nine signer groups; got {len(plan)}")
+    check(len(plan) > 8, "N-6 must be over the 1*8 group cap")
+    # Every group: known suite, unique (alg,kid), ascending unique group_ids.
+    gids = [g[1] for g in plan]
+    check(gids == sorted(set(gids)) and len(gids) == len(set(gids)),
+          "N-6 group_ids must be unique and strictly ascending")
+    akids = [(c[1], c[2]) for g in plan for c in g[3]]
+    check(len(akids) == len(set(akids)), "N-6 (alg,kid) pairs must be unique")
+    for g in plan:
+        check(g[2] in (SUITE_CLASSICAL, SUITE_HYBRID), f"N-6 group suite {g[2]!r} must be known")
+    # Every component has a matching valid signature (signature coverage holds).
+    check(isinstance(entries, list) and len(entries) == 9, "N-6 must carry nine signature entries")
+    for entry in entries:
+        sprot, _un, sig = entry
+        sh = decode(sprot)
+        alg, kid = sh[H_ALG], sh[H_KID]
+        pub = ed_by_kid.get(kid) if alg == ALG_ED25519 else ml_by_kid.get(kid)
+        check(pub is not None, f"N-6 entry kid {kid!r} must resolve a key")
+        if pub is not None and alg == ALG_ED25519:
+            tbs = _enc(["Signature", body_prot, sprot, b"", payload])
+            try:
+                Ed25519PublicKey.from_public_bytes(pub).verify(sig, tbs)
+            except InvalidSignature:
+                check(False, f"N-6 entry kid {kid!r} signature must verify (coverage holds)")
+    # Isolation: truncating to EIGHT groups (and eight entries) validates the plan —
+    # so the ONLY failing rule is the group cap.
+    try:
+        plan_schema.validate_cbor(_enc(plan))
+        check(False, "N-6's nine-group plan must be rejected by the CDDL cap")
+    except ValidationError:
+        pass
+    try:
+        plan_schema.validate_cbor(_enc(plan[:8]))
+    except ValidationError as exc:
+        check(False, f"N-6 isolation broken: an eight-group truncation must validate; {exc}")
+    # Cap-less acceptance of the WHOLE nine-group object: a schema whose ONLY change
+    # is relaxing the 1*8 group cap accepts the full nine-group plan — so the cap is
+    # the sole rejection cause and every other structural rule already passes.
+    check("signature-plan = [ 1*8 signer-group ]" in cddl,
+          "the CDDL must pin the 1*8 signer-group cap")
+    relaxed = stripped.replace("[ 1*8 signer-group ]", "[ 1*99 signer-group ]")
+    relaxed_schema = Schema("start = signature-plan\n" + relaxed)
+    try:
+        relaxed_schema.validate_cbor(_enc(plan))
+        print("   Q2 N-6 isolated: nine valid groups/signatures accepted cap-less "
+              "(full nine-group plan validates once the 1*8 cap is relaxed); only the cap denies")
+    except ValidationError as exc:
+        check(False, f"N-6 cap-less acceptance broken: the full nine-group plan must validate "
+                     f"under a cap-relaxed schema; {exc}")
+
+
+# --------------------------------------------------------------------------
 # F1/F2. Deterministic verifier clock + authenticated credential context
 # --------------------------------------------------------------------------
 
@@ -1844,17 +1919,64 @@ def gate_credential_context(positives, negatives) -> None:
     tampered = decode(obj[2]); tampered[C_CREDENTIAL_HASH] = b"\x00" * 32
     check(tampered[C_CREDENTIAL_HASH] != hashlib.sha256(good["token"].encode("ascii")).digest(),
           "a tampered proof credential_hash must not match the credential")
-    # 9. approver group (P-5 group 2) stays valid against its OWN enrollment and is
-    #    NOT forced into the primary credential cnf.
+    # 9. Q1: a TokenBoundAndApproved proof's ADDITIONAL (approver) signer groups are
+    #    (a) NOT the primary cnf group, and (b) each resolved by CRYPTOGRAPHIC CONTENT
+    #    (suite + ordered public keys) to an authoritative approver ENROLLMENT record
+    #    (credential-profile §5) — not merely "different from cnf".
     cnf_classical = _b64u_dec(creds["credentials"]["classical"]["claims"]["cnf"]["hs_signer_suite"])
-    matched5, _ = primary_groups_matching("P-5", cnf_classical)
+    matched5, obj5 = primary_groups_matching("P-5", cnf_classical)
     check(matched5 == [1],
           f"P-5's cnf must resolve to the primary (client) group only, not the approver; matched {matched5}")
-    approver_pub = ed_by_kid.get(b"approver-ed25519-1")
-    if approver_pub is not None:
-        check(_suite_thumbprint(SUITE_CLASSICAL, [approver_pub]) != cnf_classical,
-              "the approver group must NOT match the primary credential cnf")
-    print(f"   F2 approver group bound to its own enrollment (cnf resolves to the primary only)")
+    cred_tenant = creds["credentials"]["classical"]["claims"]["tenant"]
+
+    def group_thumbprint(grp):
+        pubs = []
+        for comp in grp[3]:
+            alg, kid = comp[1], comp[2]
+            pub = ed_by_kid.get(kid) if alg == ALG_ED25519 else ml_by_kid.get(kid)
+            if pub is None:
+                return None
+            pubs.append(pub)
+        return _suite_thumbprint(grp[2], pubs)
+
+    plan5 = decode(obj5[0]).get(H_PLAN) or []
+    approver_groups = [g for g in plan5 if group_thumbprint(g) != cnf_classical]
+    check(approver_groups, "P-5 must carry at least one additional (approver) signer group")
+    for grp in approver_groups:
+        tpb = _b64u(group_thumbprint(grp))
+        rec = resolve_approver_enrollment(creds, tpb)
+        e = validate_approver_enrollment(rec, tpb, cred_tenant, now)
+        check(not e, f"P-5 approver group (group_id {grp[1]}) must resolve a valid enrollment: {e}")
+    print(f"   Q1 P-5 approver group(s) validated against the authoritative approver enrollment "
+          f"(content-recomputed; role/tenant/status/expiry/epoch); cnf resolves to the primary only")
+
+    # Q1 counter-proofs: unknown, tampered record, key/suite mismatch, INACTIVE,
+    # EXPIRED (distinct), cross-tenant, and wrong-role enrollments each deny.
+    approver_tp = _b64u(group_thumbprint(approver_groups[0]))
+    base_rec = resolve_approver_enrollment(creds, approver_tp)
+
+    def enroll_red(label, rec, req=approver_tp):
+        e = validate_approver_enrollment(rec, req, cred_tenant, now)
+        check(bool(e), f"Q1 approver counter '{label}' must deny but validated clean")
+        if e:
+            print(f"   Q1 approver counter '{label}' denies: {e[0]}")
+
+    enroll_red("unknown enrollment", None)
+    enroll_red("tampered thumbprint_b64", {**base_rec, "thumbprint_b64": _b64u(b"\x00" * 32)})
+    enroll_red("inactive status", {**base_rec, "status": "inactive"})
+    enroll_red("revoked status", {**base_rec, "status": "revoked"})
+    enroll_red("expired (expires_at <= now)", {**base_rec, "expires_at": now})
+    enroll_red("cross-tenant", {**base_rec, "tenant": "tenant-beta"})
+    enroll_red("wrong role", {**base_rec, "role": "primary"})
+    enroll_red("missing enrollment_epoch", {k: v for k, v in base_rec.items() if k != "enrollment_epoch"})
+    # Key/suite mismatch: a record whose OWN keys hash elsewhere does not bind the
+    # requested group (and the primary client thumbprint resolves to no approver).
+    client_pub = ed_by_kid.get(b"client-ed25519-1")
+    enroll_red("key/suite mismatch (wrong keys)",
+               {**base_rec, "component_public_keys_hex": [client_pub.hex()],
+                "thumbprint_b64": _b64u(_suite_thumbprint(SUITE_CLASSICAL, [client_pub]))})
+    check(resolve_approver_enrollment(creds, _b64u(cnf_classical)) is None,
+          "the primary (client) signer-suite record must not resolve an approver enrollment")
 
     # ---- G1: hybrid credentials are at+jwt-only; CWT cnf is single-key/classical.
     prof = CREDENTIAL_PATH.read_text()
@@ -2010,6 +2132,7 @@ def main() -> None:
     gate_readme_counts(positives, negatives)
     gate_response_context(positives, negatives)
     gate_causality_inventory(cddl, positives, negatives)
+    gate_group_cap_isolation(cddl, negatives)
     gate_verifier_clock(positives, negatives)
     gate_credential_context(positives, negatives)
     gate_canonical(positives, negatives)
