@@ -11,13 +11,11 @@
 //!    where failover to a node holding no history for that namespace denies
 //!    rather than admits.
 //!
-//! There is exactly one store family here. Request-proof replay admission and
-//! one-shot credential consumption are two operations on the same trait, not
-//! two stores: a deployment cannot satisfy one and silently miss the other.
-//! One-shot consumption additionally requires a domain-wide linearizable
-//! consume — key-affine routing is not sufficient for it, because the
-//! credential, not the proof signer set, is the admission key and may be
-//! presented at any node.
+//! v16 credentials are Reusable-only: replay admission is keyed by the proof,
+//! so many fresh proofs may use one credential. The `OneShotTransaction`
+//! credential-use profile and its atomic consume-once path were cut from v16
+//! scope (operator decision `DECISION-defer-oneshot-credentials-2026-08-20`)
+//! and are deferred to a future amendment.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
@@ -119,15 +117,6 @@ pub struct ProofReplayKey {
     pub request_id: RequestId,
 }
 
-/// A one-shot credential's admission identity: issuer plus the credential's
-/// own identifier bytes (JWT `jti` text or CWT `cti` bytes, kept in their own
-/// namespace — two issuers producing the same value never collide).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct OneShotCredentialId {
-    pub issuer: String,
-    pub value: Vec<u8>,
-}
-
 /// The outcome of a replay admission check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofAdmissionResult {
@@ -186,18 +175,6 @@ pub trait ProofReplayStore: Send + Sync {
         key: &ProofReplayKey,
         expires_at: u64,
     ) -> ProofAdmissionResult;
-
-    /// Consume a one-shot credential ID exactly once in the domain.
-    ///
-    /// This is the single admission action for a one-shot credential: it does
-    /// not additionally create a proof replay entry. It requires a domain-wide
-    /// linearizable consume; a store whose guarantee is namespace-affine
-    /// routing MUST fail rather than consume locally.
-    fn consume_one_shot_credential(
-        &self,
-        id: &OneShotCredentialId,
-        expires_at: u64,
-    ) -> ProofAdmissionResult;
 }
 
 /// In-memory replay store for a deployment with exactly one verifier instance.
@@ -214,7 +191,6 @@ pub trait ProofReplayStore: Send + Sync {
 pub struct InMemoryProofReplayStore {
     authenticated: parking_lot::Mutex<ExpiryMap<ProofReplayKey>>,
     unattributed: parking_lot::Mutex<ExpiryMap<ProofReplayKey>>,
-    one_shot: parking_lot::Mutex<ExpiryMap<OneShotCredentialId>>,
     max_per_partition: usize,
 }
 
@@ -226,7 +202,6 @@ impl InMemoryProofReplayStore {
         Self {
             authenticated: Default::default(),
             unattributed: Default::default(),
-            one_shot: Default::default(),
             max_per_partition,
         }
     }
@@ -256,16 +231,6 @@ impl ProofReplayStore for InMemoryProofReplayStore {
         let now = current_unix_seconds();
         let max = self.max_per_partition;
         self.lock(partition).admit(key, expires_at, max, now)
-    }
-
-    fn consume_one_shot_credential(
-        &self,
-        id: &OneShotCredentialId,
-        expires_at: u64,
-    ) -> ProofAdmissionResult {
-        let now = current_unix_seconds();
-        let max = self.max_per_partition;
-        self.one_shot.lock().admit(id, expires_at, max, now)
     }
 }
 
@@ -382,23 +347,6 @@ pub fn admit_request_proof(
         return ProofAdmissionResult::Failed;
     }
     store.check_and_insert(partition, key, expires_at)
-}
-
-/// Consume one one-shot credential ID, enforcing the domain guarantee first.
-///
-/// Namespace-affine routing is keyed by the proof signer set, but a one-shot
-/// credential can be presented at any node, so affinity cannot make its
-/// consumption domain-wide. Such a deployment fails closed here rather than
-/// consuming locally and admitting the same credential twice.
-pub fn consume_one_shot_credential(
-    store: &dyn ProofReplayStore,
-    id: &OneShotCredentialId,
-    expires_at: u64,
-) -> ProofAdmissionResult {
-    if store.domain_guarantee() == ReplayDomainGuarantee::NamespaceAffineRouting {
-        return ProofAdmissionResult::Failed;
-    }
-    store.consume_one_shot_credential(id, expires_at)
 }
 
 // ---------------------------------------------------------------------------
@@ -672,96 +620,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_one_shot_credential_is_consumed_exactly_once() {
-        let store = InMemoryProofReplayStore::single_verifier_instance(16);
-        let id = OneShotCredentialId {
-            issuer: "https://issuer.example".into(),
-            value: b"one-shot-1".to_vec(),
-        };
-        assert_eq!(
-            consume_one_shot_credential(&store, &id, far_future()),
-            ProofAdmissionResult::Admitted
-        );
-        assert_eq!(
-            consume_one_shot_credential(&store, &id, far_future()),
-            ProofAdmissionResult::Replayed
-        );
-    }
-
-    /// A consumed one-shot credential ID is retained until its expiry, so a
-    /// second presentation before expiry is a replay even if a fresh proof
-    /// carries it. Retention is keyed by the `expires_at` the caller supplies
-    /// (dispatch supplies the CREDENTIAL lifetime, not the proof's).
-    #[test]
-    fn a_consumed_one_shot_credential_is_retained_until_expiry() {
-        let store = InMemoryProofReplayStore::single_verifier_instance(16);
-        let id = OneShotCredentialId {
-            issuer: "https://issuer.example".into(),
-            value: b"txn-1".to_vec(),
-        };
-        // Consumed with a far-future (credential-lifetime) expiry.
-        assert_eq!(
-            consume_one_shot_credential(&store, &id, far_future()),
-            ProofAdmissionResult::Admitted
-        );
-        // A second presentation — even under a different, later proof — is a
-        // replay while the credential is still valid.
-        assert_eq!(
-            consume_one_shot_credential(&store, &id, far_future()),
-            ProofAdmissionResult::Replayed
-        );
-    }
-
-    /// Credential IDs are issuer-scoped: two issuers producing the same value
-    /// never consume each other's credential.
-    #[test]
-    fn one_shot_credential_ids_are_issuer_scoped() {
-        let store = InMemoryProofReplayStore::single_verifier_instance(16);
-        let a = OneShotCredentialId {
-            issuer: "https://a.example".into(),
-            value: b"same".to_vec(),
-        };
-        let b = OneShotCredentialId {
-            issuer: "https://b.example".into(),
-            value: b"same".to_vec(),
-        };
-        assert_eq!(
-            consume_one_shot_credential(&store, &a, far_future()),
-            ProofAdmissionResult::Admitted
-        );
-        assert_eq!(
-            consume_one_shot_credential(&store, &b, far_future()),
-            ProofAdmissionResult::Admitted
-        );
-    }
-
-    /// One-shot consumption does not create a second proof replay entry: it is
-    /// the single admission action for that credential.
-    #[test]
-    fn one_shot_consumption_is_a_separate_namespace_from_proof_replay() {
-        let store = InMemoryProofReplayStore::single_verifier_instance(16);
-        let id = OneShotCredentialId {
-            issuer: "https://issuer.example".into(),
-            value: vec![1u8; 16],
-        };
-        assert_eq!(
-            consume_one_shot_credential(&store, &id, far_future()),
-            ProofAdmissionResult::Admitted
-        );
-        // A proof whose request_id happens to equal the credential value is
-        // still admissible: the two namespaces do not alias.
-        assert_eq!(
-            admit_request_proof(
-                &store,
-                ProofDisposition::Authenticated,
-                &key(0, 1),
-                far_future()
-            ),
-            ProofAdmissionResult::Admitted
-        );
-    }
-
     // -- domain guarantees --------------------------------------------------
 
     /// A namespace-affine deployment that routes a request to a node holding
@@ -785,13 +643,6 @@ mod tests {
             expires_at: u64,
         ) -> ProofAdmissionResult {
             self.inner.check_and_insert(partition, key, expires_at)
-        }
-        fn consume_one_shot_credential(
-            &self,
-            id: &OneShotCredentialId,
-            expires_at: u64,
-        ) -> ProofAdmissionResult {
-            self.inner.consume_one_shot_credential(id, expires_at)
         }
     }
 
@@ -823,24 +674,6 @@ mod tests {
         );
     }
 
-    /// Key-affine routing cannot make one-shot consumption domain-wide, so an
-    /// affine deployment fails closed rather than consuming locally.
-    #[test]
-    fn affine_routing_cannot_consume_a_one_shot_credential() {
-        let store = AffineStore {
-            owned: [1u8; 32],
-            inner: InMemoryProofReplayStore::single_verifier_instance(16),
-        };
-        let id = OneShotCredentialId {
-            issuer: "https://issuer.example".into(),
-            value: b"one-shot".to_vec(),
-        };
-        assert_eq!(
-            consume_one_shot_credential(&store, &id, far_future()),
-            ProofAdmissionResult::Failed
-        );
-    }
-
     /// A store whose backend is unavailable reports Failed, and Failed is
     /// always a denial — it is never treated as "not seen before".
     #[test]
@@ -858,13 +691,6 @@ mod tests {
             ) -> ProofAdmissionResult {
                 ProofAdmissionResult::Failed
             }
-            fn consume_one_shot_credential(
-                &self,
-                _id: &OneShotCredentialId,
-                _e: u64,
-            ) -> ProofAdmissionResult {
-                ProofAdmissionResult::Failed
-            }
         }
         let store = DeadBackend;
         assert_eq!(
@@ -872,17 +698,6 @@ mod tests {
                 &store,
                 ProofDisposition::Authenticated,
                 &key(1, 1),
-                far_future()
-            ),
-            ProofAdmissionResult::Failed
-        );
-        assert_eq!(
-            consume_one_shot_credential(
-                &store,
-                &OneShotCredentialId {
-                    issuer: "i".into(),
-                    value: vec![1],
-                },
                 far_future()
             ),
             ProofAdmissionResult::Failed
@@ -940,13 +755,6 @@ mod tests {
                 e: u64,
             ) -> ProofAdmissionResult {
                 self.0.check_and_insert(p, k, e)
-            }
-            fn consume_one_shot_credential(
-                &self,
-                id: &OneShotCredentialId,
-                e: u64,
-            ) -> ProofAdmissionResult {
-                self.0.consume_one_shot_credential(id, e)
             }
         }
         let store = Shared(InMemoryProofReplayStore::single_verifier_instance(16));

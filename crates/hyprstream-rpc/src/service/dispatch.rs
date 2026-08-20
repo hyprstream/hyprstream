@@ -691,81 +691,11 @@ where
             None => proof.claims.exp,
         };
 
-        // The issuer-declared credential profile selects the admission key
-        // (§3.4, §4.5). A one-shot credential's ID is consumed atomically and
-        // domain-wide as its SINGLE admission action: request_id still
-        // correlates the response but creates no second replay entry. The
-        // profile is read only from verified, issuer-signed claims — a caller
-        // cannot mark its own token one-shot, and a method cannot reinterpret
-        // a reusable token as one-shot.
-        let one_shot = ctx
-            .claims()
-            .and_then(|claims| {
-                claims
-                    .credential_use
-                    .filter(|use_profile| use_profile.is_one_shot())
-                    .map(|_| claims)
-            })
-            .map(|claims| -> Result<(crate::proof::admission::OneShotCredentialId, u64)> {
-                // The one-shot credential must be bound to EXACTLY this
-                // request before its ID is consumed (§3.4): audience = the
-                // dispatching service domain, method leaf = the leaf derived
-                // from the signed body, subject = the authenticated subject.
-                // The terminal actor is covered by the issuer-signed `act`
-                // chain under the proof's credential-hash binding, so it is not
-                // independently re-checkable here. Otherwise a credential
-                // minted for one transaction could be replayed against another.
-                let leaf_key = decoded_body.leaf_path_string().ok_or_else(|| {
-                    anyhow::anyhow!("one-shot credential presented to a method with no derivable leaf")
-                })?;
-                let subject = ctx.subject().to_string();
-                claims.verify_one_shot_binding(actual_service_domain, &leaf_key, &subject)?;
-
-                // A one-shot credential with no credential ID cannot be
-                // consumed, so it can never be admitted.
-                let value = claims.jti.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("one-shot credential carries no credential ID (jti/cti)")
-                })?;
-
-                // The credential ID is retained for the CREDENTIAL's lifetime,
-                // not merely the proof's: a replay could otherwise present a
-                // fresh proof with the same one-shot credential after the first
-                // proof expired but while the credential is still valid. The
-                // credential exp bounds the retention (§3.4, Appendix B). A
-                // non-positive exp cannot outlive anything, so it floors to the
-                // proof's replay window.
-                let credential_exp = u64::try_from(claims.exp).unwrap_or(0).max(replay_expiry);
-                Ok((
-                    crate::proof::admission::OneShotCredentialId {
-                        issuer: claims.iss.clone(),
-                        value: value.as_bytes().to_vec(),
-                    },
-                    credential_exp,
-                ))
-            })
-            .transpose()?;
-
-        if let Some((credential_id, credential_exp)) = one_shot {
-            return match crate::proof::admission::consume_one_shot_credential(
-                replay_store,
-                &credential_id,
-                credential_exp,
-            ) {
-                crate::proof::admission::ProofAdmissionResult::Admitted => {
-                    debug!("{} one-shot credential consumed", service.name());
-                    Ok(())
-                }
-                crate::proof::admission::ProofAdmissionResult::Replayed => {
-                    anyhow::bail!("one-shot credential already consumed")
-                }
-                crate::proof::admission::ProofAdmissionResult::Failed => {
-                    // Including a deployment whose routing cannot make the
-                    // consume domain-wide linearizable.
-                    anyhow::bail!("one-shot credential consumption could not be guaranteed")
-                }
-            };
-        }
-
+        // v16 credentials are Reusable-only (OneShotTransaction cut from scope,
+        // operator decision 2026-08-20): replay admission is keyed by the proof,
+        // so many fresh proofs may use one credential. There is no per-credential
+        // consume-once path.
+        //
         // The replay namespace comes from verification, not from wire
         // material: the credential-bound primary signer-suite thumbprint
         // (exact suite ID, ordered pinned component keys, enrollment epoch)
