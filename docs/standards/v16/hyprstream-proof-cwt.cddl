@@ -146,7 +146,14 @@ hyprstream-unattributed-proof-claims = {
 ;   10 Nonce — ALWAYS ABSENT: the Nonce claim key is not permitted in the closed
 ;              response claims map, so a response proof carrying one denies
 ;   -70001   — ALWAYS null: a response proof is never credential-bound
-;   -70002   — the Cap'n Proto 64-bit type ID of the response root type
+;   -70002   — the Cap'n Proto 64-bit type ID of the response root type. When
+;              -70004 (response_binding) is non-null, -70002 MUST equal the
+;              realized binding's root_type_id (key 1): the two denote the same
+;              response schema commitment. CDDL cannot express this cross-field
+;              equality of two free uints, so it is a NORMATIVE rule enforced
+;              mechanically by validate_profile.py and check_proof_vectors.py
+;              (bound response fixtures must satisfy it; N-31 changes only -70002
+;              and denies by this rule, not by a signature failure).
 ;   -70003   — the exact Cap'n Proto response body bytes
 ;   -70004   — the realized response binding, or null for an unbound response
 hyprstream-response-proof-claims = {
@@ -155,7 +162,7 @@ hyprstream-response-proof-claims = {
   6  => timestamp,                  ; iat
   7  => request-id,                 ; cti — echoes the request_id
   -70001 => null,                   ; never credential-bound (not bstr/null: exactly null)
-  -70002 => capnp-schema-id,
+  -70002 => capnp-schema-id,        ; == response_binding.root_type_id when -70004 non-null
   -70003 => capnp-body-bytes,
   -70004 => response-binding / null,
 }
@@ -364,7 +371,13 @@ logical-signer-group  = uint .le 255       ; frozen ceiling (Gate-2 value 6)
 ;
 ; Groups are sorted by ascending group_id and group IDs are unique. Component
 ; order is the exact order declared by the versioned suite registry, and every
-; (alg, kid) pair is unique across the complete plan.
+; (alg, kid) pair is unique across the complete plan — regardless of group ID:
+; one key MUST NOT sign under two logical groups, or a single signer could
+; satisfy a multi-party (k-of-n / all) policy. CDDL cannot express uniqueness of
+; a computed (alg, kid) tuple across array elements, so this is a NORMATIVE rule
+; enforced mechanically by validate_profile.py and check_proof_vectors.py (whose
+; duplicate-component key is (alg, kid), NOT (group, alg, kid)); N-33 repeats one
+; (alg, kid) across two groups and denies by this rule.
 
 signature-plan = [ 1*8 signer-group ]
 

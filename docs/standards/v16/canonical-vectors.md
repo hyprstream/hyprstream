@@ -13,7 +13,7 @@ Machine-readable files (the normative form — this page is the human index):
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 7 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 39 vectors that MUST deny |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 41 vectors that MUST deny |
 
 Each JSON vector carries `id`, `title`, `expect` (`accept` / `deny`),
 `structure`, `size_bytes`, `sha256`, full `cbor_hex`, and — for negatives — a
@@ -76,15 +76,22 @@ a byte-identical regeneration. It also proves the negatives deny by their rule:
   request** (N-32) is rejected — the gate compares P-7's (bound) and N-32's
   (mismatch) bindings against P-4's request binding field-for-field, not merely
   by local map shape;
+- a **bound response proof whose `-70002` ≠ the realized binding's
+  `root_type_id`** (N-31) is rejected — the gate and vector checker enforce that
+  cross-field schema-ID equality (which CDDL cannot express) over every bound
+  response fixture;
+- a **`signature_plan` repeating one `(alg, kid)` across two groups** (N-33) is
+  rejected — the gate and checker enforce whole-plan `(alg, kid)` uniqueness
+  regardless of group ID, so a single signer cannot satisfy a two-group policy;
 - the **size-cap** negatives N-12 (65-byte `suite_id`), N-13 (65-byte `kid`), and
   N-26 (129-byte `aud`) are each asserted over their numeric caps, and the CDDL
   cap text (`kid` = `1..64`, `aud` = `1..128` plus its `.regexp`) is pinned so a
   widening drifts the gate to red; and
 - an **object over the 2 MiB total cap** is rejected by a validator-side numeric
   check (the complete-object CDDL cannot bound the signature byte strings), which
-  the gate exercises by constructing an over-cap object — the pinned `pycddl`
-  version cannot enforce `.size` byte-length ranges or `.regexp`, so these
-  numeric/ported checks are load-bearing.
+  the gate exercises by constructing a structurally-valid, fixed-size oversized
+  object — the pinned `pycddl` version cannot enforce `.size` byte-length ranges
+  or `.regexp`, so these numeric/ported checks are load-bearing.
 
 See [`README.md`](README.md) for the one remaining tooling note.
 
@@ -253,7 +260,9 @@ Ed25519 signature over the stripped object.
 | N-28 | suite-plan | Hybrid suite plan with only one Ed25519 component (hybrid→classical downgrade) | 1639 |
 | N-29 | aud-syntax | `aud` with an uppercase byte (`Registry.svc`) | 378 |
 | N-30 | aud-syntax | `aud` with an illegal first byte (`-registry.svc`) | 379 |
+| N-31 | response-schema-binding | Bound response proof whose `-70002` mismatches the realized `response_binding` root_type_id | 1601 |
 | N-32 | response-binding-equality | Response proof whose `response_binding` mismatches the originating request (P-4) | 1605 |
+| N-33 | plan-key-uniqueness | `COSE_Sign` plan repeating one `(alg, kid)` across two logical groups | 558 |
 
 ### Notes on individual negatives
 
@@ -311,11 +320,30 @@ Ed25519 signature over the stripped object.
   with the request it answers. Both carry the originating request id, and the
   gate compares the two maps directly — testing equality, not just local map
   shape.
+- **N-31 (response schema-ID binding).** For a bound response proof, claim
+  `-70002` (response root type ID) and `response_binding[1]` (`root_type_id`)
+  denote the same schema commitment, so `-70002` MUST equal the realized
+  binding's `root_type_id`. CDDL cannot express this cross-field equality of two
+  free uints, so it is a normative rule the gate and vector checker enforce over
+  every bound response fixture. N-31 changes **only** `-70002` (its binding still
+  equals P-4's, and the signature is valid), so it denies by this rule, not by a
+  signature or map-shape failure.
+- **N-33 (plan `(alg, kid)` uniqueness).** Every `(alg, kid)` pair MUST be unique
+  across the whole `signature_plan`, regardless of group ID — one key must not
+  sign under two logical groups, or a single signer could satisfy a two-group
+  (`k-of-n` / `all`) policy. CDDL cannot express this, so the gate and the vector
+  checker enforce it (the checker keys duplicate detection on `(alg, kid)`, not
+  `(group, alg, kid)`). N-33 is a fully signature-valid `COSE_Sign` repeating one
+  `(alg, kid)` across groups 1 and 2, and denies by the uniqueness rule.
 - **Total-object cap (2 MiB).** The complete-object CDDL cannot bound the
   signature byte strings, so the 2 MiB total-object cap is a validator-side
-  numeric check. The gate constructs an object just over 2 MiB and asserts the
-  numeric object-cap rejects it (built at validation time rather than shipped as
-  a multi-megabyte fixture).
+  numeric check. The gate constructs a **structurally valid** oversized object (a
+  real `COSE_Sign1` whose signature `bstr` is enlarged to a fixed ~2.2 MiB — not
+  trailing padding the decoder would reject) and runs it through the **same**
+  object-cap path the fixtures use: it decodes cleanly (so size is a cause
+  distinct from trailing-data) yet is rejected **by size**. The fixed size makes
+  the comparison genuine — raising the cap above it would accept it and turn the
+  check red.
 - **N-19 (response overlay).** A response proof uses the distinct
   `hyprstream-response-proof-claims` rule, which forbids the `Nonce` claim key
   and requires `credential_hash` to be exactly `null`; a response claims set

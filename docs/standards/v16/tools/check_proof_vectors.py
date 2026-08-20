@@ -147,6 +147,8 @@ def enc(obj) -> bytes:
 ALG_ED25519, ALG_ML_DSA_65 = -19, -49
 H_ALG, H_CRIT, H_KID, H_TYP = 1, 2, 4, 16
 H_DOMAIN, H_PLAN, H_GROUP, H_KEYSET = -70100, -70101, -70102, -70103
+TYP_RESPONSE = "application/vnd.hyprstream.response-proof+cwt"
+C_SCHEMA_ID, C_RESPONSE_BINDING = -70002, -70004
 
 
 def ml_dsa_verify(public: bytes, message: bytes, signature: bytes) -> bool:
@@ -260,15 +262,30 @@ def main() -> None:
             fail(f"{vec['id']}: unprotected header is not empty")
         try:
             body_hdr = decode(body_protected)
-            decode(payload)
+            claims = decode(payload)
         except StrictError as exc:
             fail(f"{vec['id']}: protected/payload not deterministic: {exc}")
             continue
+
+        # B1: for a response proof carrying a non-null response_binding, claim
+        # -70002 (response root type id) MUST equal the binding's root_type_id.
+        if body_hdr.get(H_TYP) == TYP_RESPONSE and isinstance(claims, dict):
+            rb = claims.get(C_RESPONSE_BINDING)
+            if isinstance(rb, dict):
+                if claims.get(C_SCHEMA_ID) != rb.get(1):
+                    fail(f"{vec['id']}: response -70002 {claims.get(C_SCHEMA_ID)!r} != "
+                         f"response_binding root_type_id {rb.get(1)!r}")
+
         plan = body_hdr.get(H_PLAN)
         if plan is None:
             fail(f"{vec['id']}: no signature_plan in the body protected headers")
             continue
         components = plan_components(plan)
+        # B2: every (alg, kid) pair is unique across the whole plan, regardless
+        # of group ID — one key must not sign under two logical groups.
+        plan_keys = [(alg, kid) for (_grp, alg, kid) in components]
+        if len(plan_keys) != len(set(plan_keys)):
+            fail(f"{vec['id']}: plan repeats an (alg, kid) across groups")
         if vec["structure"] == "COSE_Sign1":
             # A COSE_Sign1 carries exactly one signature, so it must cover the
             # plan EXACTLY: the plan must have exactly one component. This
@@ -287,6 +304,7 @@ def main() -> None:
             verify_component(vec, alg, kid, tbs, tail)
         else:
             seen = []
+            seen_keys = set()
             for entry in tail:
                 sprot, sunprot, sig = entry
                 if sunprot:
@@ -297,7 +315,12 @@ def main() -> None:
                     fail(f"{vec['id']}: entry {kid!r} matches no plan component")
                 if (grp, alg, kid) in seen:
                     fail(f"{vec['id']}: duplicate plan component {kid!r}")
+                # B2: a key may not sign under two groups — uniqueness is keyed
+                # on (alg, kid), NOT (group, alg, kid).
+                if (alg, kid) in seen_keys:
+                    fail(f"{vec['id']}: (alg, kid) {kid!r} signs under two groups")
                 seen.append((grp, alg, kid))
+                seen_keys.add((alg, kid))
                 verify_component(
                     vec, alg, kid, enc(["Signature", body_protected, sprot, b"", payload]), sig
                 )

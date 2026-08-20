@@ -1553,6 +1553,69 @@ def main() -> None:
             notes="Locally valid map shape; denies only against the request it answers.",
         )
 
+        # N-31 (B1): bound response proof whose -70002 (response root type ID)
+        # does NOT equal its realized response_binding[1] (root_type_id). The
+        # response_binding map is left EQUAL to P-4's (so the equality gate and a
+        # map-shape check still pass); only -70002 is changed, and it is re-signed
+        # by the service key (valid signature). It denies solely because a bound
+        # response proof's -70002 MUST equal the realized binding's root_type_id.
+        n31_claims = request_claims(
+            credential_hash=None,
+            schema_id=0xDEADBEEF,                 # != response_binding[1]
+            body=CAPNP_RESPONSE_BYTES,
+            response_binding=p4_response_binding,  # binding still equals P-4's
+        )
+        n31, _, _ = sign1(p3_protected, n31_claims, sk_s_ed)
+        record(
+            negatives,
+            "N-31",
+            "Bound response proof whose -70002 mismatches the realized response_binding root_type_id",
+            "deny",
+            "COSE_Sign1",
+            n31,
+            deny_class="response-schema-binding",
+            deny_rule=(
+                "for a non-null response_binding, claim -70002 MUST equal the "
+                "binding's root_type_id (key 1)"
+            ),
+            originating_request="P-4",
+            notes="Only -70002 differs; the binding map still equals P-4's and the signature is valid.",
+        )
+
+        # N-33 (B2): a fully signature-valid COSE_Sign whose plan repeats one
+        # (alg, kid) in two logical groups. Both entries are signed by the same
+        # client key, so a verifier that counts groups could satisfy a
+        # multi-party rule (P-5's shape) with a single signer. It denies because
+        # (alg, kid) MUST be unique across the whole plan, regardless of group ID.
+        n33_plan = [
+            group(1, SUITE_CLASSICAL, [component(ALG_ED25519, KID_CLIENT_ED)]),
+            group(2, SUITE_CLASSICAL, [component(ALG_ED25519, KID_CLIENT_ED)]),  # duplicate (alg,kid)
+        ]
+        n33_body = {
+            H_CRIT: CRIT_SIGN_BODY_AUTH,
+            H_TYP: TYP_REQUEST,
+            H_DOMAIN: DOMAIN_REQUEST,
+            H_PLAN: n33_plan,
+        }
+        n33_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_CLIENT_ED, H_GROUP: 1}, sk_c_ed),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_CLIENT_ED, H_GROUP: 2}, sk_c_ed),
+        ]
+        n33, _, _ = sign_multi(
+            n33_body, request_claims(credential_hash=CREDENTIAL_HASH), n33_entries
+        )
+        record(
+            negatives,
+            "N-33",
+            "COSE_Sign plan repeating one (alg, kid) across two logical groups",
+            "deny",
+            "COSE_Sign",
+            n33,
+            deny_class="plan-key-uniqueness",
+            deny_rule="every (alg, kid) pair MUST be unique across the whole plan, regardless of group ID",
+            notes="Both signatures are valid; a single signer must not satisfy a two-group policy.",
+        )
+
     meta = {
         "vector_set_version": 1,
         "profile": "hs-rpc-proof-v1",

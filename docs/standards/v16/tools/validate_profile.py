@@ -367,6 +367,25 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
         except ValidationError:
             print(f"   #1 {nid} rejected by CDDL ({what})")
 
+    # Thread B2 (q5d) — every (alg, kid) pair is unique across the whole plan,
+    # regardless of group ID (CDDL cannot express this, so it is enforced here
+    # and in the vector checker). Every positive plan is unique; N-33 repeats one
+    # (alg, kid) across two groups and must be flagged.
+    def plan_keys(pl):
+        return [(c.get(1), c.get(2)) for g in (pl or []) if isinstance(g, dict)
+                for c in (g.get(3) or []) if isinstance(c, dict)]
+    for v in positives["vectors"]:
+        pk = plan_keys(plan_of(v["cbor_hex"]))
+        check(len(pk) == len(set(pk)),
+              f"positive {v['id']} plan repeats an (alg, kid) across groups")
+    n33 = by_id.get("N-33")
+    check(n33 is not None, "N-33 (duplicate (alg,kid) across groups) is missing")
+    if n33 is not None:
+        pk = plan_keys(plan_of(n33["cbor_hex"]))
+        check(len(pk) != len(set(pk)),
+              "N-33 plan must repeat one (alg, kid) across two groups")
+        print("   B2 N-33: (alg, kid) repeated across two groups — denies by plan-key uniqueness")
+
     # The relation/enum negatives MUST be rejected by the CDDL itself: the
     # machine proof that the closed map, the two enum axes, and the
     # recipient/encryption relation are structural, not prose.
@@ -489,10 +508,15 @@ def gate_caps(cddl: str, positives, negatives) -> None:
         print("   NOTE: envelope.rs not found; skipping shared-constant tie-in "
               "(docs extracted standalone).")
 
+    # The one numeric object-cap path, applied to fixtures (3c) and to the
+    # constructed over-cap object (3g).
+    def object_within_cap(raw: bytes) -> bool:
+        return len(raw) <= MAX_OBJECT_BYTES
+
     # 3c. Every positive fixture respects the caps.
     for v in positives["vectors"]:
         raw = bytes.fromhex(v["cbor_hex"])
-        check(len(raw) <= MAX_OBJECT_BYTES, f"{v['id']} exceeds the 2 MiB object cap")
+        check(object_within_cap(raw), f"{v['id']} exceeds the 2 MiB object cap")
         claims = claims_of(v["cbor_hex"])
         aud = claims[C_AUD]
         check(1 <= len(aud.encode()) <= MAX_SERVICE_DOMAIN_BYTES,
@@ -553,21 +577,6 @@ def gate_caps(cddl: str, positives, negatives) -> None:
     over_cap("N-26", lambda h: len(claims_of(h)[C_AUD].encode()),
              MAX_SERVICE_DOMAIN_BYTES, "aud")
 
-    # 3g. Total-object cap (finding 4D71): the complete-object CDDL cannot bound
-    #     the signature byte strings, so the 2 MiB cap is a validator-side numeric
-    #     check. Construct an object OVER the cap (a proof-shaped object padded
-    #     past 2 MiB) and assert the numeric object-cap rejects it — proving the
-    #     positive-only length check is a real boundary, not decoration. It is
-    #     built here rather than shipped as a multi-megabyte fixture.
-    if positives["vectors"]:
-        base = bytes.fromhex(positives["vectors"][0]["cbor_hex"])
-        oversized = base + b"\x00" * (MAX_OBJECT_BYTES + 1 - len(base))
-        check(len(oversized) > MAX_OBJECT_BYTES, "constructed object must exceed 2 MiB")
-        check(not (len(oversized) <= MAX_OBJECT_BYTES),
-              "the object-cap check must reject an object over 2 MiB")
-        print(f"   3g over-cap object: {len(oversized)} bytes > {MAX_OBJECT_BYTES} "
-              "rejected by the numeric object-cap check")
-
     # 3f. aud lexical syntax (finding ary-137b): the CDDL declares the shared
     #     service-domain `.regexp`; the pinned pycddl does not enforce it, so pin
     #     the CDDL text and assert the causal negatives fail the ported syntax.
@@ -582,6 +591,40 @@ def gate_caps(cddl: str, positives, negatives) -> None:
         check(not valid_service_domain(aud),
               f"{nid} aud {aud!r} must violate the service-domain syntax ({why})")
         print(f"   #2 {nid}: aud {aud!r} rejected by service-domain syntax ({why})")
+
+    # 3g. Total-object cap (finding 4D71 / q5i): the complete-object CDDL cannot
+    #     bound the signature byte strings, so the 2 MiB cap is a validator-side
+    #     numeric check. Build a STRUCTURALLY VALID oversized object (a real
+    #     COSE_Sign1 whose signature bstr is enlarged past 2 MiB — not trailing
+    #     padding the strict decoder would reject) and run it through the SAME
+    #     object-cap path the fixtures use. It must decode cleanly (so size is a
+    #     distinct cause from trailing-data) yet be rejected BY SIZE.
+    from check_proof_vectors import enc as _enc  # deterministic re-encoder
+    sign1 = next((v for v in positives["vectors"] if v["structure"] == "COSE_Sign1"), None)
+    check(sign1 is not None, "a COSE_Sign1 positive is needed to build the over-cap object")
+    if sign1 is not None:
+        # Enlarge the signature bstr to a FIXED size ~2.2 MiB — a fixed target,
+        # NOT one sized relative to MAX_OBJECT_BYTES, so `object_within_cap` is a
+        # genuine comparison (raising the cap above this size would ACCEPT it and
+        # turn the check red) rather than an arithmetic truth.
+        obj = decode(bytes.fromhex(sign1["cbor_hex"]))  # [protected, {}, payload, sig]
+        big_sig = obj[3] + b"\x00" * (2_300_000 - len(obj[3]))  # valid CBOR bstr, fixed length
+        oversized = _enc([obj[0], obj[1], obj[2], big_sig])
+        # It is well-formed CBOR: the strict decoder accepts the STRUCTURE
+        # (4-element array, no trailing data) — size is a separate concern.
+        try:
+            dec = decode(oversized)
+            structurally_valid = isinstance(dec, list) and len(dec) == 4
+        except StrictError:
+            structurally_valid = False
+        check(structurally_valid,
+              "the over-cap object must be structurally valid (size is a distinct cause from decode)")
+        check(len(oversized) > MAX_OBJECT_BYTES,
+              "the constructed object must exceed the 2 MiB cap by its fixed size")
+        check(not object_within_cap(oversized),
+              "the numeric object-cap must reject a structurally-valid object over 2 MiB")
+        print(f"   3g over-cap object: {len(oversized)} bytes (fixed), valid structure, "
+              f"rejected by size (> {MAX_OBJECT_BYTES})")
 
 
 # --------------------------------------------------------------------------
@@ -773,12 +816,40 @@ def gate_type_confusion(negatives) -> None:
 
 
 def gate_response_binding_equality(positives, negatives) -> None:
-    section("8. Response-binding field-for-field equality (finding 4D78)")
+    section("8. Response-binding equality + schema-ID binding (findings 4D78, q5V)")
     by_id = {v["id"]: v for v in positives["vectors"]}
     by_id.update({v["id"]: v for v in negatives["vectors"]})
 
     def rb_of(vid: str):
         return claims_of(by_id[vid]["cbor_hex"]).get(C_RESPONSE_BINDING)
+
+    def is_response(vid: str) -> bool:
+        return decode(decode(bytes.fromhex(by_id[vid]["cbor_hex"]))[0]).get(H_TYP) == TYP_RESPONSE
+
+    # B1 (q5V): for a bound response proof, claim -70002 (response root type id)
+    # MUST equal the realized response_binding root_type_id (key 1) — the two
+    # denote the same schema commitment, and nothing else ties them. Every bound
+    # response positive satisfies it; N-31 changes only -70002 and must violate it.
+    for v in positives["vectors"]:
+        if not is_response(v["id"]):
+            continue
+        claims = claims_of(v["cbor_hex"])
+        rb = claims.get(C_RESPONSE_BINDING)
+        if isinstance(rb, dict):
+            check(claims.get(C_SCHEMA_ID) == rb.get(1),
+                  f"{v['id']} response -70002 must equal response_binding root_type_id")
+    n31 = by_id.get("N-31")
+    check(n31 is not None, "N-31 (response schema-binding mismatch) is missing")
+    if n31 is not None:
+        c = claims_of(n31["cbor_hex"])
+        rb = c.get(C_RESPONSE_BINDING)
+        check(isinstance(rb, dict) and c.get(C_SCHEMA_ID) != rb.get(1),
+              "N-31 must carry -70002 != response_binding root_type_id (binding otherwise equal)")
+        # And the binding itself is still equal to its originating request.
+        if n31.get("originating_request") in by_id:
+            check(rb == rb_of(n31["originating_request"]),
+                  "N-31 response_binding must still equal the originating request (only -70002 differs)")
+        print("   B1 N-31: -70002 != binding root_type_id (binding still equal) — denies by schema binding")
 
     # A response proof's realized response_binding MUST equal the originating
     # request's map field-for-field. The bound positive (P-7) equals it; the
@@ -794,8 +865,8 @@ def gate_response_binding_equality(positives, negatives) -> None:
                   f"{bound['id']} response_binding must equal request {req} field-for-field")
             print(f"   #4 {bound['id']} binding == {req} binding (field-for-field bound)")
 
-    mismatch = next((v for v in negatives["vectors"] if v.get("originating_request")), None)
-    check(mismatch is not None, "a mismatch response-proof negative (originating_request) must exist")
+    mismatch = by_id.get("N-32")   # the field-for-field binding mismatch negative
+    check(mismatch is not None, "N-32 (response_binding mismatch) must exist")
     if mismatch is not None:
         req = mismatch["originating_request"]
         check(req in by_id, f"{mismatch['id']} originating_request {req} must be a known vector")
