@@ -16,8 +16,8 @@ use super::{
     claims::ProofClaims, plan::SignaturePlan, ProofDisposition, ProofKind, ALG_ED25519,
     ALG_ML_DSA_65, COSE_HEADER_ALG, COSE_HEADER_CRIT, COSE_HEADER_KID, COSE_HEADER_TYP,
     HEADER_HS_DOMAIN, HEADER_HS_LOGICAL_SIGNER_GROUP, HEADER_HS_SIGNATURE_PLAN,
-    HEADER_HS_UNATTRIBUTED_KEY_SET, MAX_COSE_OBJECT_BYTES, PROOF_TYP, REQUEST_PROOF_DOMAIN,
-    RESPONSE_PROOF_DOMAIN, RESPONSE_PROOF_TYP,
+    HEADER_HS_UNATTRIBUTED_KEY_SET, MAX_COSE_OBJECT_BYTES, MAX_SIGNER_GROUP_ID, PROOF_TYP,
+    REQUEST_PROOF_DOMAIN, RESPONSE_PROOF_DOMAIN, RESPONSE_PROOF_TYP,
 };
 
 /// A parsed and profile-validated proof-CWT, ready for signature verification.
@@ -190,7 +190,15 @@ impl ParsedProof {
                 _ => bail!("proof: Sign1 missing kid in merged protected header"),
             };
             let group_id = match get_value(&protected_map, HEADER_HS_LOGICAL_SIGNER_GROUP) {
-                Some(CborValue::Integer(i)) => i128::from(*i) as u64,
+                Some(CborValue::Integer(i)) if i128::from(*i) >= 0 => {
+                    let g = i128::from(*i);
+                    if g > MAX_SIGNER_GROUP_ID as i128 {
+                        bail!(
+                            "proof: Sign1 hs_logical_signer_group {g} exceeds ceiling {MAX_SIGNER_GROUP_ID}"
+                        );
+                    }
+                    g as u64
+                }
                 _ => bail!("proof: Sign1 missing hs_logical_signer_group"),
             };
             (
@@ -214,6 +222,14 @@ impl ParsedProof {
         // If this is a response proof, credential_hash must be null.
         if kind == ProofKind::Response && claims.credential_hash.is_some() {
             bail!("proof: response proof must have null credential_hash");
+        }
+
+        // A response proof carries no server challenge: the response overlay
+        // (Gate-2 value 2) says Nonce is always absent. A response proof
+        // presenting a Nonce denies (it is neither an unattributed request nor
+        // subject to the anti-stockpiling challenge).
+        if kind == ProofKind::Response && claims.nonce.is_some() {
+            bail!("proof: response proof must not carry a Nonce (challenge)");
         }
 
         // Credential hash / disposition consistency (finding: N-15).
@@ -359,7 +375,15 @@ fn parse_signature_entry(v: &CborValue) -> Result<ParsedSignature> {
     };
 
     let group_id = match get_value(&pmap, HEADER_HS_LOGICAL_SIGNER_GROUP) {
-        Some(CborValue::Integer(i)) if i128::from(*i) >= 0 => i128::from(*i) as u64,
+        Some(CborValue::Integer(i)) if i128::from(*i) >= 0 => {
+            let g = i128::from(*i);
+            if g > MAX_SIGNER_GROUP_ID as i128 {
+                bail!(
+                    "sig protected: hs_logical_signer_group {g} exceeds ceiling {MAX_SIGNER_GROUP_ID}"
+                );
+            }
+            g as u64
+        }
         _ => bail!("sig protected: missing hs_logical_signer_group"),
     };
 

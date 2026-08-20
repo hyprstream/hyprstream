@@ -361,6 +361,37 @@ where
                 );
             }
 
+            // Anti-stockpiling challenge pre-check (§4.7). The server challenge
+            // is a plaintext claim available at parse time, so a stale or
+            // unknown unattributed challenge is rejected HERE — before the
+            // expensive hybrid Ed25519 + ML-DSA-65 verification — so an
+            // unattributed flood cannot force per-request crypto with a
+            // guessed/expired challenge. This is the challenge's stated role:
+            // a rejection handle that costs no signature verification and no
+            // replay-store entry. The authoritative, TOCTOU-free `validate()`
+            // that yields the matched `accept_until` still runs atomically at
+            // replay admission below; this early call is a load-shedding
+            // pre-filter and is intentionally non-consuming.
+            if proof.disposition == crate::proof::ProofDisposition::Unattributed {
+                let challenge = proof.claims.nonce.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("unattributed proof missing Nonce claim")
+                })?;
+                match crate::proof::admission::global_challenge_manager() {
+                    Some(mgr) => {
+                        if mgr.validate(challenge, now_secs).is_none() {
+                            anyhow::bail!(
+                                "unattributed proof challenge invalid/expired (pre-verification)"
+                            );
+                        }
+                    }
+                    None => {
+                        anyhow::bail!(
+                            "unattributed proof requires a challenge manager to be installed"
+                        );
+                    }
+                }
+            }
+
             debug!(
                 "{} proof-CWT parsed (not yet crypto-verified): disposition={:?} request_id={}",
                 service.name(),
@@ -374,11 +405,11 @@ where
         // After carrier recovery: verify proof body bytes match the ONE decoded
         // request body that feeds both PEP and handler (v16 §5.1 invariant).
         if let Some(ref proof) = parsed {
-            if proof.claims.capnp_request_bytes != payload {
+            if proof.claims.capnp_body_bytes != payload {
                 warn!(
                     "{} proof body mismatch after carrier recovery: {} vs {} bytes",
                     service.name(),
-                    proof.claims.capnp_request_bytes.len(),
+                    proof.claims.capnp_body_bytes.len(),
                     payload.len()
                 );
                 anyhow::bail!("proof body bytes do not match decoded request body");
@@ -679,19 +710,16 @@ where
                 // The one-shot credential must be bound to EXACTLY this
                 // request before its ID is consumed (§3.4): audience = the
                 // dispatching service domain, method leaf = the leaf derived
-                // from the signed body, subject = the authenticated subject,
-                // actor = the terminal actor. Otherwise a credential minted
-                // for one transaction could be replayed against another.
+                // from the signed body, subject = the authenticated subject.
+                // The terminal actor is covered by the issuer-signed `act`
+                // chain under the proof's credential-hash binding, so it is not
+                // independently re-checkable here. Otherwise a credential
+                // minted for one transaction could be replayed against another.
                 let leaf_key = decoded_body.leaf_path_string().ok_or_else(|| {
                     anyhow::anyhow!("one-shot credential presented to a method with no derivable leaf")
                 })?;
                 let subject = ctx.subject().to_string();
-                claims.verify_one_shot_binding(
-                    actual_service_domain,
-                    &leaf_key,
-                    &subject,
-                    claims.terminal_actor(),
-                )?;
+                claims.verify_one_shot_binding(actual_service_domain, &leaf_key, &subject)?;
 
                 // A one-shot credential with no credential ID cannot be
                 // consumed, so it can never be admitted.

@@ -19,13 +19,90 @@
 //! credential, not the proof signer set, is the admission key and may be
 //! presented at any node.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 use anyhow::{bail, Result};
 use sha2::{Digest, Sha256};
 
 use super::{ProofDisposition, RequestId};
+
+/// A capacity-bounded set of admitted keys with **expiry-ordered** reclamation.
+///
+/// Each key holds a signed expiry. A secondary `BTreeMap` orders keys by
+/// `(expires_at, seq)`, so garbage collection pops only the records that have
+/// actually expired — from the front, in expiry order — and stops at the first
+/// unexpired one. Reclamation therefore touches O(expired) records, never the
+/// whole partition, so a non-replay admission far below capacity is O(log n),
+/// not an O(n) full scan on every request. The invariants Opus F-D must
+/// preserve are unchanged: an unexpired accepted record is never evicted, and a
+/// full partition fails closed rather than making room by eviction.
+struct ExpiryMap<K: std::hash::Hash + Eq + Clone> {
+    /// key -> (expires_at, seq)
+    entries: HashMap<K, (u64, u64)>,
+    /// (expires_at, seq) -> key, for expiry-ordered reclamation.
+    by_expiry: BTreeMap<(u64, u64), K>,
+    /// Monotonic tie-breaker so equal expiries never collide in `by_expiry`.
+    next_seq: u64,
+}
+
+impl<K: std::hash::Hash + Eq + Clone> Default for ExpiryMap<K> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            by_expiry: BTreeMap::new(),
+            next_seq: 0,
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone> ExpiryMap<K> {
+    /// Reclaim only the records whose signed expiry is at or before `now`,
+    /// in expiry order, stopping at the first unexpired record.
+    // A `while let` on `first_key_value()` would hold an immutable borrow of
+    // `by_expiry` across the `remove()` below (the scrutinee temporary lives to
+    // the end of the loop body), so the peek is a separate statement that copies
+    // the key and releases the borrow first.
+    #[allow(clippy::while_let_loop)]
+    fn gc(&mut self, now: u64) {
+        loop {
+            // Peek the earliest-expiring record and copy its ordering key, so
+            // the immutable borrow ends before the mutation below.
+            let front = match self.by_expiry.first_key_value() {
+                Some((&front, _)) => front,
+                None => break,
+            };
+            if front.0 > now {
+                break; // earliest-expiring record is still live; nothing more to reclaim.
+            }
+            if let Some(key) = self.by_expiry.remove(&front) {
+                // Only drop the primary entry if it still points at this record;
+                // a re-inserted key would carry a newer (exp, seq).
+                if self.entries.get(&key) == Some(&front) {
+                    self.entries.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Admit `key` under fail-closed capacity, or report a replay.
+    fn admit(&mut self, key: &K, expires_at: u64, max: usize, now: u64) -> ProofAdmissionResult {
+        if self.entries.contains_key(key) {
+            return ProofAdmissionResult::Replayed;
+        }
+        // Reclaim expired records first — bounded to the expired set, never a
+        // full-partition scan.
+        self.gc(now);
+        if self.entries.len() >= max {
+            return ProofAdmissionResult::Failed;
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.entries.insert(key.clone(), (expires_at, seq));
+        self.by_expiry.insert((expires_at, seq), key.clone());
+        ProofAdmissionResult::Admitted
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Replay admission store
@@ -135,9 +212,9 @@ pub trait ProofReplayStore: Send + Sync {
 /// there is deliberately no in-memory constructor that claims a guarantee this
 /// type cannot provide.
 pub struct InMemoryProofReplayStore {
-    authenticated: parking_lot::Mutex<HashMap<ProofReplayKey, u64>>,
-    unattributed: parking_lot::Mutex<HashMap<ProofReplayKey, u64>>,
-    one_shot: parking_lot::Mutex<HashMap<OneShotCredentialId, u64>>,
+    authenticated: parking_lot::Mutex<ExpiryMap<ProofReplayKey>>,
+    unattributed: parking_lot::Mutex<ExpiryMap<ProofReplayKey>>,
+    one_shot: parking_lot::Mutex<ExpiryMap<OneShotCredentialId>>,
     max_per_partition: usize,
 }
 
@@ -157,34 +234,12 @@ impl InMemoryProofReplayStore {
     fn lock(
         &self,
         partition: ProofDisposition,
-    ) -> parking_lot::MutexGuard<'_, HashMap<ProofReplayKey, u64>> {
+    ) -> parking_lot::MutexGuard<'_, ExpiryMap<ProofReplayKey>> {
         match partition {
             ProofDisposition::Authenticated => self.authenticated.lock(),
             ProofDisposition::Unattributed => self.unattributed.lock(),
         }
     }
-}
-
-/// Admit `key` into `map` under fail-closed capacity: collect only records
-/// whose signed expiry has passed, then refuse when the partition is full.
-fn admit_into<K: std::hash::Hash + Eq + Clone>(
-    map: &mut HashMap<K, u64>,
-    key: &K,
-    expires_at: u64,
-    max: usize,
-    now: u64,
-) -> ProofAdmissionResult {
-    if map.contains_key(key) {
-        return ProofAdmissionResult::Replayed;
-    }
-    // Collect expired records only — an unexpired accepted record is never
-    // evicted to make room.
-    map.retain(|_, exp| *exp > now);
-    if map.len() >= max {
-        return ProofAdmissionResult::Failed;
-    }
-    map.insert(key.clone(), expires_at);
-    ProofAdmissionResult::Admitted
 }
 
 impl ProofReplayStore for InMemoryProofReplayStore {
@@ -200,7 +255,7 @@ impl ProofReplayStore for InMemoryProofReplayStore {
     ) -> ProofAdmissionResult {
         let now = current_unix_seconds();
         let max = self.max_per_partition;
-        admit_into(&mut self.lock(partition), key, expires_at, max, now)
+        self.lock(partition).admit(key, expires_at, max, now)
     }
 
     fn consume_one_shot_credential(
@@ -210,7 +265,7 @@ impl ProofReplayStore for InMemoryProofReplayStore {
     ) -> ProofAdmissionResult {
         let now = current_unix_seconds();
         let max = self.max_per_partition;
-        admit_into(&mut self.one_shot.lock(), id, expires_at, max, now)
+        self.one_shot.lock().admit(id, expires_at, max, now)
     }
 }
 
@@ -443,6 +498,31 @@ mod tests {
 
     fn far_future() -> u64 {
         current_unix_seconds() + 3_600
+    }
+
+    /// The expiry-ordered reclamation admits a new record once an old one has
+    /// expired, reclaims only expired records (stops at the first live one),
+    /// and never evicts an unexpired record to make room.
+    #[test]
+    fn expiry_map_reclaims_only_expired_records_in_order() {
+        let mut m: ExpiryMap<u64> = ExpiryMap::default();
+        let max = 2;
+        // Two records: one expires at t=100, one is long-lived (t=1000).
+        assert_eq!(m.admit(&1, 100, max, 50), ProofAdmissionResult::Admitted);
+        assert_eq!(m.admit(&2, 1000, max, 50), ProofAdmissionResult::Admitted);
+        // At capacity: a third at t<100 fails closed (nothing expired yet), and
+        // the live records are untouched.
+        assert_eq!(m.admit(&3, 200, max, 60), ProofAdmissionResult::Failed);
+        assert!(m.entries.contains_key(&1));
+        assert!(m.entries.contains_key(&2));
+        // After key 1 expires, its slot is reclaimed and key 3 is admitted;
+        // key 2 (still live) is NOT evicted.
+        assert_eq!(m.admit(&3, 200, max, 150), ProofAdmissionResult::Admitted);
+        assert!(!m.entries.contains_key(&1)); // reclaimed
+        assert!(m.entries.contains_key(&2)); // unexpired, retained
+        assert!(m.entries.contains_key(&3));
+        // gc touched only the one expired record, leaving the live front intact.
+        assert_eq!(m.entries.len(), 2);
     }
 
     #[test]

@@ -183,10 +183,40 @@ fn load_negative_vectors() -> Vec<(String, Vec<u8>, String)> {
 // Full-vector parametric tests
 // ---------------------------------------------------------------------------
 
-/// Every positive vector MUST be accepted by the parser.
+/// Positive vectors that this C lane's amended parser intentionally no longer
+/// accepts as frozen, pending WS-A re-issuing the fixture at the amended wire
+/// value.
+///
+/// P-4 encodes the **pre-amendment** three-field `response_binding`
+/// (`{1: schema, 2: combined-mode, 3: kem}`). Gate-2 amendments 3+4 replace it
+/// with the orthogonal four-field map
+/// (`{1: root_type_id, 2: response_kind, 3: protection_mode, 4: kem}`), which
+/// this lane now enforces. The four-field decode correctly rejects the old
+/// three-field shape, so P-4-as-frozen no longer parses. WS-A owns
+/// `docs/standards/v16/vectors/` and re-issues the deterministic fixture at the
+/// amended value; C must not hand-edit A's fixtures. Until that handoff lands,
+/// P-4 is a tracked residual blocker, and the amended decode is proven instead
+/// by the inline unit tests in `proof::response` (four-field accept, three-field
+/// reject, exact −70200 enforcement).
+const A_REISSUE_PENDING_POSITIVE_VECTORS: &[&str] = &["P-4"];
+
+/// Every positive vector MUST be accepted by the parser, except those awaiting
+/// a WS-A fixture re-issue at an amended Gate-2 wire value (see the constant).
 #[test]
 fn all_positive_vectors_accept() {
     for (id, cbor) in load_positive_vectors() {
+        if A_REISSUE_PENDING_POSITIVE_VECTORS.contains(&id.as_str()) {
+            // Assert the reason is exactly the amended-binding mismatch, so this
+            // skip cannot silently mask an unrelated regression in P-4.
+            let result = crate::proof::parser::ParsedProof::parse(&cbor);
+            assert!(
+                result.is_err(),
+                "{id} is expected to fail against the amended four-field response_binding \
+                 until WS-A re-issues it; if it now parses, the fixture was re-issued and this \
+                 skip should be removed"
+            );
+            continue;
+        }
         let result = crate::proof::parser::ParsedProof::parse(&cbor);
         assert!(
             result.is_ok(),
@@ -196,7 +226,55 @@ fn all_positive_vectors_accept() {
     }
 }
 
-/// Every negative vector MUST be denied.
+/// The vocabulary a parser denial for `deny_class` must use.
+///
+/// F-E: `is_err()` alone lets a vector deny for an *unintended* structural
+/// reason and still pass. Each frozen negative vector declares the rule it is
+/// meant to trip; this binds that declared `deny_class` to the parser's own
+/// denial vocabulary, so a vector that denies for the wrong reason fails the
+/// test. The sets are the literal substrings the parser/claims/plan/cbor-audit
+/// code emits for each class (an OR: the error chain must contain at least
+/// one). An empty set means the reason is not bound (none here).
+fn deny_reason_tokens(deny_class: &str) -> &'static [&'static str] {
+    match deny_class {
+        "type-confusion" => &["typ/hs_domain mismatch", "hs_domain: missing", "typ: missing"],
+        "missing-typ" => &["typ: missing", "missing (label 16)"],
+        "domain-separation" => &["typ/hs_domain mismatch", "hs_domain"],
+        "component-stripping" => &[
+            "signatures but plan expects",
+            "plan components matched",
+            "not in plan",
+        ],
+        "parser-cap" => &[
+            "exceeds cap",
+            "exceeds",
+            "at most",
+            "must be 1..",
+            "must have at most",
+        ],
+        "closed-claim-set" => &["unknown claim key", "missing"],
+        "non-deterministic-encoding" => &["deterministic CBOR"],
+        // A crit label declared but absent from its bucket is denied either by
+        // the crit-bucket check or, when the absent label is a header the parser
+        // reads first (e.g. hs_domain −70100), by that header's own
+        // "missing (label …)" — the same violation surfacing earlier.
+        "crit-set" => &["crit", "missing (label"],
+        "disposition-confusion" => &[
+            "credential_hash",
+            "response proof must not carry",
+            "unattributed",
+        ],
+        "algorithm" => &["not in profile"],
+        "credential-binding" => &["credential_hash", "credential hash"],
+        "freshness" => &["server challenge", "Nonce", "challenge"],
+        "unprotected-authority" => &["unprotected"],
+        "key-set-strictness" => &["key set", "key-set"],
+        "plan-mismatch" => &["not in plan", "plan expects", "plan group"],
+        _ => &[],
+    }
+}
+
+/// Every negative vector MUST be denied, and — F-E — for the declared reason.
 ///
 /// Two are denied by the verifier rather than the parser, because they are
 /// context-dependent: N-2 is P-2's exact bytes presented in the credential
@@ -206,15 +284,34 @@ fn all_positive_vectors_accept() {
 #[test]
 fn all_negative_vectors_deny() {
     let verifier_side = ["N-2", "N-22"];
+    // Negative vectors whose *denial reason* (not the denial itself) is masked
+    // by the pre-amendment three-field `response_binding` they still carry: the
+    // amended claims decode rejects that binding before reaching the vector's
+    // intended (later) check. They still deny fail-closed — only the reason
+    // binding is deferred until WS-A re-issues them at the four-field value.
+    // Tracked as a residual blocker alongside P-4 (see status-mac-v16-c.md).
+    let reason_pending_a_reissue = ["N-10f"];
     for (id, cbor, deny_class) in load_negative_vectors() {
         if verifier_side.contains(&id.as_str()) {
             continue;
         }
         let result = crate::proof::parser::ParsedProof::parse(&cbor);
-        assert!(
-            result.is_err(),
-            "negative vector {id} ({deny_class}) should deny, but was accepted"
-        );
+        let err = match result {
+            Ok(_) => panic!("negative vector {id} ({deny_class}) should deny, but was accepted"),
+            Err(e) => format!("{e:#}"),
+        };
+        if reason_pending_a_reissue.contains(&id.as_str()) {
+            // Still must deny; the reason binding is deferred (see above).
+            continue;
+        }
+        let tokens = deny_reason_tokens(&deny_class);
+        if !tokens.is_empty() {
+            assert!(
+                tokens.iter().any(|t| err.contains(t)),
+                "negative vector {id} denied, but the reason does not match its declared \
+                 deny_class '{deny_class}'. Expected one of {tokens:?}; got: {err}"
+            );
+        }
     }
 }
 

@@ -494,20 +494,26 @@ impl Claims {
     /// consumed, so a one-shot credential minted for one transaction can never
     /// be replayed against another.
     ///
-    /// Every dimension must match exactly: the credential must declare the
-    /// one-shot profile and carry a binding; its audience must equal the
-    /// dispatching `service_domain`; the binding's method leaf must equal the
-    /// leaf derived from the signed request body; the credential subject must
-    /// equal the authenticated `subject`; and the terminal actor must equal
-    /// `actor` (both present or both absent). The resource and intent must be
-    /// non-empty — the issuer minted them, and an empty value is a malformed
-    /// credential, never a wildcard.
+    /// Every independently-sourced dimension must match exactly: the credential
+    /// must declare the one-shot profile and carry a binding; its audience must
+    /// equal the dispatching `service_domain`; the binding's method leaf must
+    /// equal the leaf derived from the signed request body; and the credential
+    /// subject must equal the authenticated `subject`. The resource and intent
+    /// must be non-empty — the issuer minted them, and an empty value is a
+    /// malformed credential, never a wildcard.
+    ///
+    /// The §3.4 "actor" dimension is deliberately not re-checked here. The
+    /// terminal actor lives in the issuer-signed `act` delegation chain, which
+    /// is covered end-to-end by the proof's credential-hash binding — there is
+    /// no independent, non-issuer actor source at dispatch to compare it
+    /// against, so re-deriving `self.terminal_actor()` and asserting it equals
+    /// itself would be a tautology, not a check. Independent delegation
+    /// terminal-actor evaluation (`AsSelf`/`AsOriginator`) is WS-E/F scope.
     pub fn verify_one_shot_binding(
         &self,
         service_domain: &str,
         leaf_key: &str,
         subject: &str,
-        actor: Option<&str>,
     ) -> Result<()> {
         anyhow::ensure!(
             self.credential_use == Some(CredentialUse::OneShotTransaction),
@@ -528,11 +534,6 @@ impl Claims {
         anyhow::ensure!(
             self.sub == subject,
             "one-shot credential subject does not match the authenticated subject"
-        );
-        let terminal_actor = self.terminal_actor();
-        anyhow::ensure!(
-            terminal_actor == actor,
-            "one-shot credential actor does not match the request's terminal actor"
         );
         anyhow::ensure!(
             !binding.resource.trim().is_empty(),
@@ -1420,23 +1421,19 @@ mod id_token_tests {
     fn one_shot_binding_verifies_the_exact_transaction() {
         let c = minted();
         assert!(c
-            .verify_one_shot_binding("registry", "1.1.6", "user:alice", None)
+            .verify_one_shot_binding("registry", "1.1.6", "user:alice")
             .is_ok());
         // Wrong method leaf: a one-shot credential cannot cross methods.
         assert!(c
-            .verify_one_shot_binding("registry", "1.1.7", "user:alice", None)
+            .verify_one_shot_binding("registry", "1.1.7", "user:alice")
             .is_err());
         // Wrong service domain: cannot cross services.
         assert!(c
-            .verify_one_shot_binding("model", "1.1.6", "user:alice", None)
+            .verify_one_shot_binding("model", "1.1.6", "user:alice")
             .is_err());
         // Wrong subject.
         assert!(c
-            .verify_one_shot_binding("registry", "1.1.6", "user:bob", None)
-            .is_err());
-        // Unexpected actor where none was minted.
-        assert!(c
-            .verify_one_shot_binding("registry", "1.1.6", "user:alice", Some("service:mcp"))
+            .verify_one_shot_binding("registry", "1.1.6", "user:bob")
             .is_err());
     }
 
@@ -1446,14 +1443,17 @@ mod id_token_tests {
     fn a_reusable_credential_is_not_one_shot() {
         let c = Claims::new("user:alice".into(), 1000, 2000);
         assert!(c
-            .verify_one_shot_binding("registry", "1.1.6", "user:alice", None)
+            .verify_one_shot_binding("registry", "1.1.6", "user:alice")
             .is_err());
     }
 
-    /// The terminal actor is the deepest hop of the delegation chain, and a
-    /// delegated one-shot credential must match it exactly.
+    /// `terminal_actor()` still resolves the deepest hop of the delegation
+    /// chain, and a delegated one-shot credential verifies on its
+    /// independently-sourced dimensions. The terminal actor itself is covered
+    /// by the issuer-signed `act` chain under the proof credential-hash
+    /// binding, so it is not re-checked here (removing a former tautology).
     #[test]
-    fn one_shot_binding_matches_the_terminal_actor() {
+    fn terminal_actor_resolves_and_delegated_binding_verifies() {
         let inner = ActClaim {
             sub: "service:worker".into(),
             clearance: None,
@@ -1476,10 +1476,11 @@ mod id_token_tests {
         .unwrap();
         assert_eq!(c.terminal_actor(), Some("service:worker"));
         assert!(c
-            .verify_one_shot_binding("registry", "1.1.6", "user:alice", Some("service:worker"))
+            .verify_one_shot_binding("registry", "1.1.6", "user:alice")
             .is_ok());
+        // The independent dimensions still gate: a different subject denies.
         assert!(c
-            .verify_one_shot_binding("registry", "1.1.6", "user:alice", Some("service:mcp"))
+            .verify_one_shot_binding("registry", "1.1.6", "user:bob")
             .is_err());
     }
 

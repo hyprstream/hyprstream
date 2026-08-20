@@ -10,7 +10,7 @@ use ciborium::value::Value as CborValue;
 
 use super::{
     ALG_ED25519, ALG_ML_DSA_65, MAX_COMPONENTS_PER_GROUP, MAX_KID_BYTES, MAX_SIGNATURE_ENTRIES,
-    MAX_SIGNER_GROUPS, MAX_SUITE_ID_BYTES, SUITE_CLASSICAL, SUITE_HYBRID,
+    MAX_SIGNER_GROUPS, MAX_SIGNER_GROUP_ID, MAX_SUITE_ID_BYTES, SUITE_CLASSICAL, SUITE_HYBRID,
 };
 
 /// A single component within a signer group (one COSE algorithm + key ID).
@@ -124,7 +124,13 @@ impl SignerGroup {
             };
             match ik {
                 1 => {
-                    group_id = Some(decode_uint(val, "group_id")?);
+                    let gid = decode_uint(val, "group_id")?;
+                    if gid > MAX_SIGNER_GROUP_ID {
+                        bail!(
+                            "signer_group: group_id {gid} exceeds ceiling {MAX_SIGNER_GROUP_ID}"
+                        );
+                    }
+                    group_id = Some(gid);
                 }
                 2 => {
                     suite_id = Some(decode_text(val, "suite_id", MAX_SUITE_ID_BYTES)?);

@@ -13,8 +13,8 @@ use ciborium::value::Value as CborValue;
 use super::{
     CredentialHash, RequestId, CLAIM_CAPNP_BODY_BYTES, CLAIM_CAPNP_SCHEMA_ID,
     CLAIM_CREDENTIAL_HASH, CLAIM_RESPONSE_BINDING, CREDENTIAL_HASH_SIZE, CWT_CLAIM_AUD,
-    CWT_CLAIM_CTI, CWT_CLAIM_EXP, CWT_CLAIM_IAT, CWT_CLAIM_NONCE, MAX_AUD_BYTES, MAX_BODY_BYTES,
-    MAX_CHALLENGE_BYTES, MIN_CHALLENGE_BYTES, REQUEST_ID_SIZE,
+    CWT_CLAIM_CTI, CWT_CLAIM_EXP, CWT_CLAIM_IAT, CWT_CLAIM_NONCE, MAX_BODY_BYTES,
+    MAX_CHALLENGE_BYTES, MAX_SERVICE_DOMAIN_BYTES, MIN_CHALLENGE_BYTES, REQUEST_ID_SIZE,
 };
 use crate::proof::response::ResponseBinding;
 
@@ -37,8 +37,9 @@ pub struct ProofClaims {
     pub credential_hash: Option<CredentialHash>,
     /// Cap'n Proto 64-bit root type ID of the signed body.
     pub capnp_schema_id: u64,
-    /// Exact Cap'n Proto body bytes.
-    pub capnp_request_bytes: Vec<u8>,
+    /// Exact Cap'n Proto body bytes (`capnp_body_bytes`, claim −70003 — the one
+    /// neutral name used for both request and response proof bodies).
+    pub capnp_body_bytes: Vec<u8>,
     /// Response binding map, or `None` when unbound (encoded as CBOR `null`).
     pub response_binding: Option<ResponseBinding>,
 }
@@ -75,7 +76,7 @@ impl ProofClaims {
         let mut nonce = None;
         let mut credential_hash = None;
         let mut capnp_schema_id = None;
-        let mut capnp_request_bytes = None;
+        let mut capnp_body_bytes = None;
         let mut response_binding = None;
 
         for (key, val) in map.iter() {
@@ -85,7 +86,7 @@ impl ProofClaims {
             };
             match ik {
                 x if x == CWT_CLAIM_AUD as i128 => {
-                    aud = Some(decode_text(val, "aud", 1, MAX_AUD_BYTES)?);
+                    aud = Some(decode_text(val, "aud", 1, MAX_SERVICE_DOMAIN_BYTES)?);
                 }
                 x if x == CWT_CLAIM_EXP as i128 => {
                     exp = Some(decode_uint(val, "exp")?);
@@ -111,14 +112,14 @@ impl ProofClaims {
                     capnp_schema_id = Some(decode_uint(val, "capnp_schema_id")?);
                 }
                 x if x == CLAIM_CAPNP_BODY_BYTES as i128 => {
-                    let b = decode_bstr(val, "capnp_request_bytes")?;
+                    let b = decode_bstr(val, "capnp_body_bytes")?;
                     if b.len() > MAX_BODY_BYTES {
                         bail!(
-                            "proof claims: capnp_request_bytes exceeds {} bytes",
+                            "proof claims: capnp_body_bytes exceeds {} bytes",
                             MAX_BODY_BYTES
                         );
                     }
-                    capnp_request_bytes = Some(b);
+                    capnp_body_bytes = Some(b);
                 }
                 x if x == CLAIM_RESPONSE_BINDING as i128 => {
                     response_binding = Some(ResponseBinding::decode(val)?);
@@ -136,8 +137,8 @@ impl ProofClaims {
             .ok_or_else(|| anyhow::anyhow!("proof claims: missing credential_hash"))?;
         let capnp_schema_id = capnp_schema_id
             .ok_or_else(|| anyhow::anyhow!("proof claims: missing capnp_schema_id"))?;
-        let capnp_request_bytes = capnp_request_bytes
-            .ok_or_else(|| anyhow::anyhow!("proof claims: missing capnp_request_bytes"))?;
+        let capnp_body_bytes = capnp_body_bytes
+            .ok_or_else(|| anyhow::anyhow!("proof claims: missing capnp_body_bytes"))?;
         let response_binding = response_binding
             .ok_or_else(|| anyhow::anyhow!("proof claims: missing response_binding"))?;
 
@@ -149,7 +150,7 @@ impl ProofClaims {
             nonce,
             credential_hash,
             capnp_schema_id,
-            capnp_request_bytes,
+            capnp_body_bytes,
             response_binding,
         })
     }

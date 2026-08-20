@@ -763,7 +763,17 @@ mod tests {
         assert_eq!(verified.primary_principal.as_deref(), Some("client"));
     }
 
+    // P-4 (the sole authenticated classical *single-group* Sign1 vector) still
+    // encodes the pre-amendment three-field `response_binding`, which this
+    // lane's four-field parser correctly rejects. Positive/topology tests that
+    // are specifically about P-4 are blocked until WS-A re-issues the fixture
+    // (with a fresh signature over the amended payload); denial-path tests that
+    // only need *an* authenticated classical proof are retargeted to P-5 below.
+    // See status-mac-v16-c.md (residual blocker) and the inline four-field
+    // conformance tests in `proof::response`.
     #[test]
+    #[ignore = "blocked on WS-A re-issuing P-4 at the amended 4-field response_binding; \
+                P-4 currently encodes the pre-amendment 3-field binding and cannot parse"]
     fn p4_classical_sign1_verifies_under_its_enrolled_suite() {
         let proof = parse("P-4");
         let resolver = classical_enrollment();
@@ -784,7 +794,12 @@ mod tests {
 
     /// The replay namespace excludes approver groups: the same primary signer
     /// is admitted under one namespace whether or not approvers are present.
+    ///
+    /// This one compares P-4's single-group thumbprint against P-5's, so it
+    /// needs P-4 specifically — blocked on the WS-A P-4 re-issue (see the note
+    /// on `p4_classical_sign1_verifies_under_its_enrolled_suite`).
     #[test]
+    #[ignore = "blocked on WS-A re-issuing P-4 at the amended 4-field response_binding"]
     fn approver_groups_do_not_change_the_replay_namespace() {
         let resolver = classical_enrollment();
         let p4 = verify_proof_signatures(
@@ -809,8 +824,10 @@ mod tests {
     fn unattributed_and_authenticated_namespaces_are_disjoint() {
         let resolver = classical_enrollment();
         let unattributed = verify_proof_signatures(&parse("P-1"), None, None, FIXTURE_NOW).unwrap();
+        // P-5 (also authenticated classical) stands in for P-4 while P-4 awaits
+        // the WS-A re-issue; this test only needs *an* authenticated proof.
         let authenticated = verify_proof_signatures(
-            &parse("P-4"),
+            &parse("P-5"),
             Some(&client_cnf()),
             Some(&resolver),
             FIXTURE_NOW,
@@ -829,7 +846,9 @@ mod tests {
     /// self-asserted branch.
     #[test]
     fn missing_resolver_or_enrollment_denies() {
-        let proof = parse("P-4");
+        // P-5 substitutes for P-4 (blocked on WS-A re-issue): any authenticated
+        // proof exercises the missing-resolver / empty-enrollment denials.
+        let proof = parse("P-5");
         assert!(
             verify_proof_signatures(&proof, Some(&client_cnf()), None, FIXTURE_NOW).is_err(),
             "no resolver installed must deny"
@@ -850,7 +869,9 @@ mod tests {
     #[test]
     fn missing_credential_denies() {
         let resolver = classical_enrollment();
-        for id in ["P-2", "P-4", "P-5"] {
+        // P-4 omitted while it awaits the WS-A re-issue; P-2 and P-5 keep the
+        // no-credential denial covered across both suites and topologies.
+        for id in ["P-2", "P-5"] {
             assert!(
                 verify_proof_signatures(&parse(id), None, Some(&resolver), FIXTURE_NOW).is_err(),
                 "{id} with no credential must deny"
@@ -864,8 +885,9 @@ mod tests {
     fn unenrolled_credential_denies() {
         let stranger = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key();
         let resolver = classical_enrollment();
+        // P-5 substitutes for P-4 (blocked on WS-A re-issue).
         assert!(
-            verify_proof_signatures(&parse("P-4"), Some(&stranger), Some(&resolver), FIXTURE_NOW)
+            verify_proof_signatures(&parse("P-5"), Some(&stranger), Some(&resolver), FIXTURE_NOW)
                 .is_err()
         );
     }
@@ -877,13 +899,13 @@ mod tests {
     fn cross_suite_enrollment_denies() {
         let hybrid = hybrid_enrollment();
         let classical = classical_enrollment();
-        for id in ["P-4", "P-5"] {
-            assert!(
-                verify_proof_signatures(&parse(id), Some(&client_cnf()), Some(&hybrid), FIXTURE_NOW)
-                    .is_err(),
-                "{id} (standalone suite) must deny under a hybrid enrollment"
-            );
-        }
+        // P-4 omitted pending the WS-A re-issue; P-5 (also standalone suite)
+        // keeps the standalone-under-hybrid-enrollment denial covered.
+        assert!(
+            verify_proof_signatures(&parse("P-5"), Some(&client_cnf()), Some(&hybrid), FIXTURE_NOW)
+                .is_err(),
+            "P-5 (standalone suite) must deny under a hybrid enrollment"
+        );
         assert!(
             verify_proof_signatures(
                 &parse("P-2"),
@@ -937,7 +959,10 @@ mod tests {
     /// and a proof that would outlive its credential.
     #[test]
     fn revoked_expired_or_overlong_enrollment_denies() {
-        let proof = parse("P-4");
+        // P-5 substitutes for P-4 (blocked on WS-A re-issue): the revoked /
+        // expired / proof-outlives-credential denials apply to any
+        // credential-bound proof under the same enrollment.
+        let proof = parse("P-5");
         let cnf = client_cnf();
 
         let mut revoked = classical_enrollment();
@@ -1109,8 +1134,10 @@ mod tests {
             "a response proof must never verify through the request path"
         );
         assert!(
+            // P-5 substitutes for P-4 (blocked on WS-A re-issue): any request
+            // proof must be refused through the response path.
             verify_response_proof(
-                &parse("P-4"),
+                &parse("P-5"),
                 "registry.svc.hyprstream.test",
                 &FIXTURE_REQUEST_ID,
                 &resolver,

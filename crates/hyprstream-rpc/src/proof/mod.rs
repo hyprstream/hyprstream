@@ -72,8 +72,16 @@ pub const MAX_SIGNATURE_ENTRIES: usize = 16;
 pub const MAX_SUITE_ID_BYTES: usize = 64;
 /// Maximum bytes for a key ID.
 pub const MAX_KID_BYTES: usize = 64;
-/// Maximum bytes for a canonical service domain (`aud`).
-pub const MAX_AUD_BYTES: usize = 253;
+/// Maximum bytes for a canonical service domain (proof `aud`).
+///
+/// Gate-2 amendment 7: the proof audience is the one canonical RPC service
+/// domain, capped and canonicalized by the single shared
+/// [`crate::envelope::MAX_SERVICE_DOMAIN_BYTES`] rule — not a second identity
+/// cap. Re-exported here so proof code reads one constant.
+pub use crate::envelope::MAX_SERVICE_DOMAIN_BYTES;
+/// Ceiling on the `hs_logical_signer_group` value (Gate-2 amendment 6:
+/// `uint .le 255`). A group ID above this denies at parse time.
+pub const MAX_SIGNER_GROUP_ID: u64 = 255;
 /// Maximum Cap'n Proto body bytes signed by the proof.
 pub const MAX_BODY_BYTES: usize = 1_048_576; // 1 MiB
 /// Maximum total encoded COSE object size.
@@ -120,6 +128,12 @@ pub const COSE_HEADER_TYP: i64 = 16; // RFC 9596
 
 pub const ALG_ED25519: i64 = -19;
 pub const ALG_ML_DSA_65: i64 = -49;
+
+/// Interim project-private COSE algorithm ID for the ML-KEM-768 response
+/// recipient (Gate-2 amendment 5: `hs-kem-ml-kem-768-v1 = -70200`). This is
+/// enforced exactly; a future registered COSE value is an explicit
+/// incompatible profile revision, not a silent alternative.
+pub const ALG_ML_KEM_768: i64 = -70200;
 
 /// A 128-bit request identifier — the CWT `cti` claim.
 pub type RequestId = [u8; REQUEST_ID_SIZE];
