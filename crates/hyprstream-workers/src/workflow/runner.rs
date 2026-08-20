@@ -449,6 +449,7 @@ async fn run_job_steps(
             let (mount, scratch) = candidate.mount_for_job()?;
             forked
                 .bind_mount_as("/src", mount, BindFlag::Replace, subject)
+                .await
                 .map_err(|e| RunnerError::VfsError(format!("bind candidate at /src: {e}")))?;
             Some(scratch)
         } else {
@@ -1271,6 +1272,7 @@ mod tests {
         let mut ns = Namespace::new();
         let subject = test_subject();
         ns.bind_mount_as("/src", mount, BindFlag::Replace, &subject)
+            .await
             .unwrap();
 
         assert_eq!(

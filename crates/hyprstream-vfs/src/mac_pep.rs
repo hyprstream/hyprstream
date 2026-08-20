@@ -105,11 +105,16 @@ pub enum NamespaceAction {
 /// Implementations MUST NOT derive clearance from an unverified,
 /// caller-supplied label (D1 — labels in wire schemas are hints; here the
 /// `Subject` name is even weaker: an unauthenticated string).
+///
+/// Async because the production resolver revalidates credential-bearing
+/// cached subject contexts against the canonical revocation authority on
+/// every read.
 #[cfg(not(target_arch = "wasm32"))]
+#[async_trait::async_trait]
 pub trait SubjectContextResolver: Send + Sync {
     /// Resolve `subject` to its verified security context, or `None` if its
     /// clearance cannot be proven — which the PEP treats as deny.
-    fn resolve(&self, subject: &Subject) -> Option<SecurityContext>;
+    async fn resolve(&self, subject: &Subject) -> Option<SecurityContext>;
 }
 
 /// Fail-closed resolver: no subject resolves to a clearance.
@@ -121,8 +126,9 @@ pub trait SubjectContextResolver: Send + Sync {
 pub struct DenyAllSubjects;
 
 #[cfg(not(target_arch = "wasm32"))]
+#[async_trait::async_trait]
 impl SubjectContextResolver for DenyAllSubjects {
-    fn resolve(&self, _subject: &Subject) -> Option<SecurityContext> {
+    async fn resolve(&self, _subject: &Subject) -> Option<SecurityContext> {
         // No SubjectContextResolver wired (#698 not landed). The authorize()
         // path passes `None` to the authoritative decider, which audits the
         // no-clearance denial before returning it. This low-level crate does
@@ -253,13 +259,13 @@ impl NamespacePep {
     /// canonical resolver's `service_domain` slot; VFS has no browser method
     /// discriminator, so `method` is always `None`. The caller never supplies a
     /// label (D1 — caller labels are forbidden).
-    pub fn authorize(
+    pub async fn authorize(
         &self,
         subject: &Subject,
         object_path: &str,
         action: NamespaceAction,
     ) -> Result<(), NamespaceError> {
-        match self.check(subject, object_path, action) {
+        match self.check(subject, object_path, action).await {
             MacDecision::Permit => Ok(()),
             MacDecision::Deny(reason) => Err(NamespaceError::Denied(
                 action,
@@ -270,14 +276,13 @@ impl NamespacePep {
 
     /// Evaluate one VFS operation using the canonical shared MAC decision
     /// contract. An installed `NamespacePep` is always fail-closed.
-    #[must_use]
-    pub fn check(
+    pub async fn check(
         &self,
         subject: &Subject,
         object_path: &str,
         action: NamespaceAction,
     ) -> MacDecision {
-        let ctx = self.subjects.resolve(subject);
+        let ctx = self.subjects.resolve(subject).await;
         let label = self.labels.resolve(object_path, None);
         self.decider.check(ctx.as_ref(), label, action)
     }
@@ -349,8 +354,9 @@ mod tests {
         name: &'static str,
         ctx: SecurityContext,
     }
+    #[async_trait::async_trait]
     impl SubjectContextResolver for OneSubject {
-        fn resolve(&self, s: &Subject) -> Option<SecurityContext> {
+        async fn resolve(&self, s: &Subject) -> Option<SecurityContext> {
             (s.name() == Some(self.name)).then(|| self.ctx.clone())
         }
     }
@@ -395,8 +401,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn deny_all_pep_denies_every_subject() {
+    #[tokio::test]
+    async fn deny_all_pep_denies_every_subject() {
         // All three seams deny: subject unresolvable ⇒ DenyAllSubjects ⇒ None
         // ⇒ the PEP returns Err before the decider is even consulted.
         let pep = NamespacePep::new(
@@ -406,12 +412,13 @@ mod tests {
         );
         let err = pep
             .authorize(&subject("anyone"), "/x", NamespaceAction::Read)
+            .await
             .unwrap_err();
         assert!(matches!(err, NamespaceError::Denied(_, _)));
     }
 
-    #[test]
-    fn deny_unlabeled_object_denies_even_with_a_valid_subject() {
+    #[tokio::test]
+    async fn deny_unlabeled_object_denies_even_with_a_valid_subject() {
         // Subject resolves, but the object is unlabeled ⇒ deny (invariant 2).
         let pep = NamespacePep::new(
             Arc::new(OneSubject {
@@ -423,11 +430,12 @@ mod tests {
         );
         assert!(pep
             .authorize(&subject("alice"), "/secret", NamespaceAction::Read)
+            .await
             .is_err());
     }
 
-    #[test]
-    fn pep_permits_read_when_clearance_dominates_and_denies_otherwise() {
+    #[tokio::test]
+    async fn pep_permits_read_when_clearance_dominates_and_denies_otherwise() {
         let pep = NamespacePep::new(
             Arc::new(OneSubject {
                 name: "alice",
@@ -440,14 +448,17 @@ mod tests {
         // alice (Secret) reading /secret ⇒ permit.
         assert!(pep
             .authorize(&subject("alice"), "/secret", NamespaceAction::Read)
+            .await
             .is_ok());
         // Write ⇒ deny (write-direction pause).
         assert!(pep
             .authorize(&subject("alice"), "/public", NamespaceAction::Write)
+            .await
             .is_err());
         // Unenrolled subject ⇒ deny (fail-closed clearance).
         assert!(pep
             .authorize(&subject("mallory"), "/public", NamespaceAction::Read)
+            .await
             .is_err());
     }
 }

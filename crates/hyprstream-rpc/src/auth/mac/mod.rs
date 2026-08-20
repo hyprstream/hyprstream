@@ -125,8 +125,8 @@ pub use activation::{
     anonymous_floor, block_identity_widening_for_unverified_attach_transport,
     flush_verified_subject_cache_generation, global_mac_activation_control,
     remember_verified_claims, remember_verified_claims_with_credential, remember_verified_subject,
-    revoke_verified_subject_credential, subject_context, MacActivationControl, MacActivationError,
-    MacActivationEvidence, MacActivationMode,
+    revoke_verified_subject_credential, subject_context, subject_context_with, MacActivationControl,
+    MacActivationError, MacActivationEvidence, MacActivationMode,
 };
 pub use bind::{clamp_descendant, BindLabel, BindLabelMap};
 pub use context::{SecurityContext, SubjectContextClaims, VerifiedKeyMaterial};

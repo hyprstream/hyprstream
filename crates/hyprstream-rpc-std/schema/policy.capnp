@@ -94,12 +94,17 @@ struct PolicyRequest {
       $scope(manage) $mcpDescription("Exchange the caller's envelope WIT for an OAuth at+jwt; identity from signed envelope");
 
     # Publish a credential revocation to the canonical store owned by this service.
+    # Restricted to the OAuth revocation authority (service:oauth) by Casbin —
+    # the RFC 7009 endpoint is the only legitimate publisher.
     revokeCredential @22 :RevokeCredential
-      $scopeExempt("internal revocation-authority operation — publication is gated by verified-token revocation at the OAuth boundary (RFC 7009), not a Casbin scope");
+      $scope(manage);
 
     # Ask the revocation authority whether a credential has been revoked.
+    # Service-identities only (service:*): every enrolled service process
+    # checks revocations on its verification path and probes at startup;
+    # anonymous/end-user callers have no legitimate read.
     checkCredentialRevocation @23 :CheckCredentialRevocation
-      $scopeExempt("revocation check is part of credential verification itself — a scope check would be circular");
+      $scope(query);
   }
 }
 

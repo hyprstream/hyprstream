@@ -320,28 +320,51 @@ impl FileBackedCredentialRevocationStore {
     /// natural token expiry rejects them anyway.
     ///
     /// Uses blocking file IO: called once at startup, before the process
-    /// serves traffic. Fail-closed: ANY unreadable/corrupt line or IO error
-    /// is returned as `Err` and MUST abort startup — a partially-read store
-    /// would silently un-revoke credentials.
+    /// serves traffic.
+    ///
+    /// Corruption policy: a malformed COMPLETE line (newline-terminated) is a
+    /// hard error — genuine corruption fails closed. A malformed or
+    /// newline-less FINAL fragment is a torn tail left by a crash mid-append
+    /// (the writer appends `record + '\n'`, so a newline-terminated line is
+    /// always complete): the file is truncated to just after the last
+    /// complete newline, the recovery is logged loudly, and a fragment that
+    /// still parses as a valid record is re-appended through the normal
+    /// write path so the revocation is not lost.
+    ///
+    /// A newly created file fsyncs its containing directory so the create
+    /// itself is durable; creating a fresh empty store where one should
+    /// pre-exist is logged as a loud warning (all prior revocations lost).
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
-        use std::io::{BufRead, BufReader};
+        use std::io::Write as _;
 
+        let pre_existed = path.exists();
         let file = std::fs::OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
             .open(path)?;
+        if !pre_existed {
+            // The create must survive a crash too: fsync the directory.
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+        }
         let now = chrono::Utc::now().timestamp();
         let store = Self {
             inner: InMemoryCredentialRevocationStore::new(),
             file: parking_lot::Mutex::new(file.try_clone()?),
         };
-        for line in BufReader::new(file).lines() {
-            let line = line?;
-            if line.trim().is_empty() {
+
+        let content = std::fs::read(path)?;
+        // The complete portion ends just after the last newline; anything
+        // beyond it is a torn fragment from a crash mid-append.
+        let complete_len = content.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let mut loaded = 0usize;
+        for line in content[..complete_len].split(|&b| b == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let record: RevocationRecord = serde_json::from_str(&line).map_err(|e| {
+            let record: RevocationRecord = serde_json::from_slice(line).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("corrupt revocation record: {e}"),
@@ -355,7 +378,51 @@ impl FileBackedCredentialRevocationStore {
             })?;
             if record.exp > now {
                 store.inner.insert_loaded(id, record.exp);
+                loaded += 1;
             }
+        }
+
+        let tail = &content[complete_len..];
+        if !tail.is_empty() {
+            // Salvage before truncating: a fragment that still parses as a
+            // valid record carries a revocation that must not be lost.
+            let salvage = serde_json::from_slice::<RevocationRecord>(tail)
+                .ok()
+                .and_then(|record| record.credential_id().map(|id| (record, id)))
+                .filter(|(record, _)| record.exp > now);
+            let salvaged = salvage.is_some();
+            {
+                let mut file = store.file.lock();
+                file.set_len(complete_len as u64)?;
+                if let Some((record, id)) = salvage {
+                    let mut line = serde_json::to_string(&record).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("torn-tail salvage serialization failed: {e}"),
+                        )
+                    })?;
+                    line.push('\n');
+                    file.write_all(line.as_bytes())?;
+                    store.inner.insert_loaded(id, record.exp);
+                    loaded += 1;
+                }
+                file.sync_all()?;
+            }
+            tracing::warn!(
+                path = %path.display(),
+                salvaged,
+                "torn revocation-log tail recovered: truncated to the last complete record"
+            );
+        }
+
+        if pre_existed {
+            tracing::info!(path = %path.display(), loaded, "credential-revocation store loaded");
+        } else {
+            tracing::warn!(
+                path = %path.display(),
+                "credential-revocation store did not exist — created a fresh EMPTY store; \
+                 on a non-fresh deployment every prior revocation is lost"
+            );
         }
         Ok(store)
     }

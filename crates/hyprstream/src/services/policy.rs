@@ -1959,6 +1959,34 @@ impl PolicyHandler for PolicyService {
                 details: String::new(),
             }));
         };
+        // Server-side publication bounds. Legitimate lifetimes: service JWTs
+        // clamp to 30 days, access tokens far shorter — 45 days covers every
+        // issuer with margin. A caller-controlled far-future exp would make an
+        // entry effectively permanent (never GC'd, never dropped on load), and
+        // unbounded issuer/value sizes would fill the authority's durable log.
+        // Reject, never clamp: a clamped exp would silently un-revoke a
+        // still-live token after reload.
+        const MAX_REVOCATION_TTL_SECS: i64 = 45 * 24 * 3600;
+        const MAX_ID_FIELD_BYTES: usize = 1024;
+        let now = chrono::Utc::now().timestamp();
+        if data.expires_at <= 0 || data.expires_at > now + MAX_REVOCATION_TTL_SECS {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "expires_at out of bounds (must be 0 < exp <= now + 45d)".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+        let value_len = match &id.value {
+            hyprstream_rpc::auth::CredentialValue::Jwt(jti) => jti.len(),
+            hyprstream_rpc::auth::CredentialValue::Cwt(cti) => cti.len(),
+        };
+        if id.issuer.len() > MAX_ID_FIELD_BYTES || value_len > MAX_ID_FIELD_BYTES {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "credential id field exceeds 1024 bytes".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
         let Some(store) = hyprstream_rpc::auth::global_credential_revocation_store() else {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: "revocation authority store is not initialized".to_owned(),

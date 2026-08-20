@@ -399,30 +399,83 @@ fn insert_verified_subject_entry(
 
 /// Resolve a VFS/CAS/MoQ subject through the verified-Claims cache and current
 /// activation mode.  Tenant mismatch is a hard miss.
-#[must_use]
-pub fn subject_context(
+///
+/// Revocation revalidation: a cache hit whose entry carries a credential ID
+/// is revalidated against the process-global credential-revocation store on
+/// EVERY read — in non-policy processes that is one authority RPC per hit,
+/// which is deliberate strict observation, mirroring the per-request check in
+/// `verify_claims`. A revoked credential, an absent store, or an unreachable
+/// authority (the store's own fail-closed `true`) all evict the entry and
+/// deny. Entries without a credential ID keep the cache-only behavior.
+pub async fn subject_context(
     subject: &Subject,
     verified_tenant: Option<&str>,
 ) -> Option<SecurityContext> {
-    let verified = subject.name().and_then(|name| {
-        let now = chrono::Utc::now().timestamp();
-        let mut cache = verified_subjects().write();
-        let entry = cache.subjects.get(name)?.clone();
-        if entry.generation != cache.generation {
-            cache.subjects.remove(name);
-            return None;
-        }
-        if entry.expires_at <= now {
-            cache.subjects.remove(name);
-            return None;
-        }
-        if let Some(expected) = verified_tenant {
-            if entry.tenant.as_deref() != Some(expected) {
-                return None;
+    subject_context_with(
+        crate::auth::global_credential_revocation_store().map(std::convert::AsRef::as_ref),
+        subject,
+        verified_tenant,
+    )
+    .await
+}
+
+/// [`subject_context`] against an explicit revocation store instead of the
+/// process-global handle. `None` behaves exactly like an unpublished global
+/// store: credential-bearing hits fail closed.
+pub async fn subject_context_with(
+    store: Option<&dyn crate::auth::CredentialRevocationStore>,
+    subject: &Subject,
+    verified_tenant: Option<&str>,
+) -> Option<SecurityContext> {
+    let verified = match subject.name() {
+        Some(name) => {
+            // Sync screening pass (unchanged rules): generation, expiry,
+            // tenant. A miss here never reaches the store.
+            let entry = {
+                let now = chrono::Utc::now().timestamp();
+                let mut cache = verified_subjects().write();
+                match cache.subjects.get(name) {
+                    Some(entry) => {
+                        let entry = entry.clone();
+                        if entry.generation != cache.generation || entry.expires_at <= now {
+                            cache.subjects.remove(name);
+                            None
+                        } else if let Some(expected) = verified_tenant {
+                            if entry.tenant.as_deref() != Some(expected) {
+                                None
+                            } else {
+                                Some(entry)
+                            }
+                        } else {
+                            Some(entry)
+                        }
+                    }
+                    None => None,
+                }
+            };
+            match entry {
+                Some(entry) => {
+                    if let Some(ref credential_id) = entry.credential_id {
+                        let revoked = match store {
+                            Some(store) => store.is_revoked(credential_id).await,
+                            // No authority handle published — fail closed.
+                            None => true,
+                        };
+                        if revoked {
+                            revoke_verified_subject_credential(credential_id);
+                            None
+                        } else {
+                            Some(entry.context)
+                        }
+                    } else {
+                        Some(entry.context)
+                    }
+                }
+                None => None,
             }
         }
-        Some(entry.context)
-    });
+        None => None,
+    };
     global_mac_activation_control().select_context(verified)
 }
 

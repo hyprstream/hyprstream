@@ -125,9 +125,10 @@ pub async fn production_moq_event_pep(
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VerifiedClaimsMoqClearanceSource;
 
+#[async_trait::async_trait]
 impl ClearanceSource for VerifiedClaimsMoqClearanceSource {
-    fn clearance(&self, subject: &Subject) -> Option<hyprstream_rpc::auth::mac::SecurityContext> {
-        hyprstream_rpc::auth::mac::subject_context(subject, None)
+    async fn clearance(&self, subject: &Subject) -> Option<hyprstream_rpc::auth::mac::SecurityContext> {
+        hyprstream_rpc::auth::mac::subject_context(subject, None).await
     }
 }
 
@@ -186,8 +187,9 @@ mod tests {
 
     struct PublicClearance;
 
+    #[async_trait::async_trait]
     impl ClearanceSource for PublicClearance {
-        fn clearance(&self, _subject: &Subject) -> Option<SecurityContext> {
+        async fn clearance(&self, _subject: &Subject) -> Option<SecurityContext> {
             Some(SecurityContext::from_clearance(
                 SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY),
                 VerifiedKeyMaterial::Classical,
@@ -195,8 +197,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cross_tenant_moq_deny_is_durable_in_signed_wal() {
+    #[tokio::test]
+    async fn cross_tenant_moq_deny_is_durable_in_signed_wal() {
         let dir = tempdir().unwrap();
         let wal = Arc::new(WalAuditStore::open(dir.path(), StubSigner).unwrap());
         let pep = audited_moq_event_pep(
@@ -210,7 +212,8 @@ mod tests {
                 &Subject::new("did:web:tenant-a"),
                 "tenant-b/events/private",
                 MoqEventAction::Subscribe,
-            ),
+            )
+            .await,
             hyprstream_rpc::auth::mac::MacDecision::Deny(
                 hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject
             )
