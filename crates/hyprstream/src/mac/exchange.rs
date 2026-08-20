@@ -1,5 +1,5 @@
 //! **MAC S6 — runtime grant path: UCAN grant-request → access/refresh tokens.**
-//! Ticket #572 of the native-MAC epic (#547).
+//! Part of the native-MAC program.
 //!
 //! This is the **runtime** companion to S5's compile-time UCAN→Casbin/TE compiler.
 //! S5 compiles an *approved* UCAN into a ceiling (a `CompiledPolicy` +
@@ -67,14 +67,15 @@
 //! token minting live in `services::oauth::token_exchange` and call into
 //! [`evaluate_grant`] here.
 //!
-//! **Deferred (documented TODOs, fail-closed until landed):**
+//! **Deferred (fail-closed until landed):**
 //! - Full escalation tiers (static Casbin / agentic / admin-UDF amendment) —
-//!   see [`GrantDecision::Escalate`] and the `TODO(#572-escalation)` markers.
+//!   see [`GrantDecision::Escalate`].
 //! - Refresh-token rotation with re-evaluation plumbing end-to-end (the
 //!   `evaluate_grant` call on refresh is wired; rotation storage is the OAuth
-//!   layer's job) — `TODO(#572-refresh-rotation)`.
-//! - Revocation propagation into the grant path (jti blocklist check at grant
-//!   time) — `TODO(#572-revocation)`.
+//!   layer's job).
+//! - Revocation propagation into the grant path (credential revocation store
+//!   check at grant time — the store exists but the grant path does not yet
+//!   query it).
 
 use hyprstream_rpc::auth::mac::{
     SecurityContext, SecurityLabel, SubjectContextClaims, VerifiedKeyMaterial,
@@ -183,9 +184,9 @@ pub enum GrantDecision {
     /// and a sender-binding is present. The contained [`GrantedAccess`] is what
     /// the token minting layer encodes.
     Permit(GrantedAccess),
-    /// The request exceeds the grant ceiling. Routed to the escalation tier
-    /// (TODO(#572-escalation)); until the tiered-decision lands this is a
-    /// denial. `requested` is the over-ceiling capability for diagnostics.
+    /// The request exceeds the grant ceiling. Routed to the escalation tier;
+    /// until the tiered-decision lands this is a denial. `requested` is the
+    /// over-ceiling capability for diagnostics.
     Escalate { requested: Capability },
 }
 
@@ -337,11 +338,10 @@ pub fn evaluate_grant<V: UcanVerifier + ?Sized>(
         }
         // Over-ceiling. This is the escalation tier ingress. S6 does NOT
         // auto-escalate: a request beyond the ceiling is denied pending a
-        // ceiling amendment via the (deferred) tiered decision.
-        // TODO(#572-escalation): route to the tiered decision (static Casbin /
-        //   agentic / admin-UDF — authority-owned, MAC-bounded). Until that
-        //   lands, over-ceiling is a hard denial via the caller's
-        //   `insufficient_scope` response.
+        // ceiling amendment via the (deferred) tiered decision (static
+        // Casbin / agentic / admin-UDF — authority-owned, MAC-bounded).
+        // Until that lands, over-ceiling is a hard denial via the caller's
+        // `insufficient_scope` response.
         Decision::Deny | Decision::Escalate => Err(GrantError::OverCeiling {
             requested: Capability::with_caveats(
                 request.resource.clone(),
@@ -358,9 +358,9 @@ pub fn evaluate_grant<V: UcanVerifier + ?Sized>(
 /// Refresh is NOT a free re-mint. The presenter must re-present the grant (the
 /// ceiling may have been amended or revoked since the access token was minted),
 /// and the same [`evaluate_grant`] gates run again. This is a thin forwarder
-/// today — the name exists so the refresh path has an obvious, audited call site
-/// distinct from the initial mint, and so the deferred rotation logic
-/// (TODO(#572-refresh-rotation)) has a home.
+/// today — the name exists so the refresh path has an obvious, audited call
+/// site distinct from the initial mint, and so the deferred rotation logic
+/// has a home.
 ///
 /// SECURITY: the refresh MUST supply a fresh DPoP proof (`sender_bound` from a
 /// new proof, not carried over) and the same `now`-threading rules apply.
