@@ -165,6 +165,20 @@ def enc(obj) -> bytes:
     raise TypeError(type(obj))
 
 
+def cross_group_key_aliases(components):
+    """S1: `components` is a list of (group_id, alg, raw_public_key_bytes) for a
+    proof's resolved signer components. A cryptographic public-key IDENTITY —
+    (algorithm, raw public-key bytes), never kid/group_id/enrollment label/plan
+    position — may participate in AT MOST ONE logical signer group. Returns the
+    identities that appear in more than one group. Different algorithms are distinct
+    identities (legitimate hybrid), and the ordered components inside one suite group
+    are unaffected (repeats within a single group are not cross-group aliases)."""
+    groups = {}
+    for gid, alg, pub in components:
+        groups.setdefault((alg, bytes(pub)), set()).add(gid)
+    return [ident for ident, gids in groups.items() if len(gids) > 1]
+
+
 def cose_key_public(k):
     """The raw public key bytes of an unattributed COSE_Key: OKP (kty 1) carries it
     at -2, AKP (kty 7) at -1."""
@@ -576,6 +590,36 @@ def main() -> None:
                 )
             if len(seen) != len(components):
                 fail(f"{vec['id']}: signature entries do not cover the plan exactly")
+
+    # S1: content-identity uniqueness across signer groups — a resolved (alg, raw
+    # public key) may participate in at most one logical signer group. Every
+    # positive satisfies it (distinct algorithms in a hybrid group, distinct keys
+    # across P-5's groups).
+    def resolve_components(vec):
+        obj = decode(bytes.fromhex(vec["cbor_hex"]))
+        body = decode(obj[0])
+        plan = body.get(H_PLAN) or []
+        ks = body.get(H_KEYSET)
+        ks_by_kid = {}
+        if ks:
+            for k in ks:
+                ks_by_kid[k.get(2)] = cose_key_public(k)
+        out = []
+        for g in plan:
+            for comp in g[3]:
+                alg, kid = comp[1], comp[2]
+                if ks:
+                    pub = ks_by_kid.get(kid)
+                else:
+                    pub = ed_by_kid.get(kid) if alg == ALG_ED25519 else ml_by_kid.get(kid)
+                if pub is not None:
+                    out.append((g[1], alg, pub))
+        return out
+
+    for vec in positive["vectors"]:
+        aliases = cross_group_key_aliases(resolve_components(vec))
+        if aliases:
+            fail(f"{vec['id']}: a resolved key participates in >1 signer group (content alias)")
 
     positive_bytes = {v["cbor_hex"] for v in positive["vectors"]}
     for vec in negative["vectors"]:

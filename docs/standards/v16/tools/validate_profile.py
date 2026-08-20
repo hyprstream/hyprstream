@@ -1538,6 +1538,17 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
             # Isolated: over the session bound but WITHIN the credential bound.
             return (pexp > sess_exp and pexp <= cred_exp), \
                 f"proof exp {pexp} vs session exp {sess_exp} / credential exp {cred_exp}"
+        if dc == "cross-group-key-alias":  # S1
+            from check_proof_vectors import cose_key_public as _ckp, cross_group_key_aliases as _cga
+            ks = pm.get(H_KEYSET)
+            ks_by_kid = {k.get(2): _ckp(k) for k in (ks or [])}
+            comps = []
+            for g in (pm.get(H_PLAN) or []):
+                for c in g.get(3, []):
+                    pub = ks_by_kid.get(c[2])
+                    if pub is not None:
+                        comps.append((g[1], c[1], pub))
+            return bool(_cga(comps)), "a resolved public-key identity appears in more than one signer group"
         if dc == "nonce-length":  # E1 server-challenge boundary (16..64)
             nonce = claims.get(C_NONCE) if claims else None
             if nonce is None:
@@ -1622,6 +1633,88 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
     check(checked == all_ids,
           f"causality inventory must cover every negative; missing {sorted(all_ids - checked)}")
     print(f"   causality inventory covers all {len(all_ids)} negatives; each exhibits its violation shape")
+
+
+# --------------------------------------------------------------------------
+# S1. Content-identity uniqueness across signer groups
+# --------------------------------------------------------------------------
+
+
+def gate_content_identity(positives, negatives) -> None:
+    section("S1. Content-identity uniqueness across signer groups (no resolved-key alias)")
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from check_proof_vectors import (enc as _enc, cose_key_public, cross_group_key_aliases,
+                                     unattributed_keyset_correspondence)
+    ed_by_kid, ml_by_kid = _keymaps()
+
+    def resolve(vec_hex):
+        obj = decode(bytes.fromhex(vec_hex))
+        body = decode(obj[0])
+        ks = body.get(H_KEYSET)
+        ks_by_kid = {k.get(2): cose_key_public(k) for k in (ks or [])}
+        out = []
+        for g in (body.get(H_PLAN) or []):
+            for c in g[3]:
+                pub = ks_by_kid.get(c[2]) if ks else (
+                    ed_by_kid.get(c[2]) if c[1] == ALG_ED25519 else ml_by_kid.get(c[2]))
+                if pub is not None:
+                    out.append((g[1], c[1], pub))
+        return out
+
+    # Every positive satisfies content-identity uniqueness — for unattributed
+    # embedded-key proofs AND credential/enrollment-bound proofs. Hybrid groups are
+    # preserved (distinct algorithms are distinct identities).
+    for v in positives["vectors"]:
+        check(cross_group_key_aliases(resolve(v["cbor_hex"])) == [],
+              f"{v['id']} must not reuse a resolved public-key identity across signer groups")
+
+    # N-53: otherwise valid (unique (alg,kid) labels, every signature verifies, known
+    # suites, ascending group_ids) — its SOLE defect is the cross-group key alias.
+    n53 = next((v for v in negatives["vectors"] if v["id"] == "N-53"), None)
+    check(n53 is not None, "N-53 (cross-group key alias) must exist")
+    if n53 is not None:
+        obj = decode(bytes.fromhex(n53["cbor_hex"]))
+        body = decode(obj[0])
+        plan = body[H_PLAN]
+        akids = [(c[1], c[2]) for g in plan for c in g[3]]
+        check(len(akids) == len(set(akids)), "N-53 (alg,kid) labels must be UNIQUE (sibling rule passes)")
+        gids = [g[1] for g in plan]
+        check(gids == sorted(set(gids)) and len(gids) == len(set(gids)),
+              "N-53 group_ids must be unique+ascending (sibling rule passes)")
+        embedded, err = unattributed_keyset_correspondence(
+            body[H_KEYSET], [(g[1], c[1], c[2]) for g in plan for c in g[3]])
+        check(err is None, f"N-53 key-set correspondence must pass: {err}")
+        for entry in obj[3]:
+            sh = decode(entry[0])
+            tbs = _enc(["Signature", obj[0], entry[0], b"", obj[2]])
+            try:
+                Ed25519PublicKey.from_public_bytes(embedded[(sh[H_ALG], sh[H_KID])]).verify(entry[2], tbs)
+            except InvalidSignature:
+                check(False, f"N-53 entry {sh[H_KID]!r} signature must verify (proof is otherwise valid)")
+        comps = resolve(n53["cbor_hex"])
+        check(cross_group_key_aliases(comps) != [],
+              "N-53 must alias one resolved key identity across two signer groups")
+        # De-fang: replace the second group's key with a GENUINELY DISTINCT key -> no
+        # alias (a legitimate two-principal proof).
+        g1, g2 = comps[0], comps[1]
+        distinct = [(g1[0], g1[1], g1[2]), (g2[0], g2[1], b"\x11" * 32)]
+        check(cross_group_key_aliases(distinct) == [],
+              "replacing the second key with a distinct identity must remove the alias")
+        print(f"   S1 N-53 isolated: labels unique, signatures cover, only the resolved-key "
+              f"identity is aliased across groups; a distinct second key is valid")
+
+    # Credential primary/approver alias: if the same resolved key were presented as
+    # BOTH the cnf primary and an approver group (under different labels), the rule
+    # denies. (P-5's real primary vs approver keys are DISTINCT, so P-5 is valid.)
+    client_pub = ed_by_kid.get(b"client-ed25519-1")
+    approver_pub = ed_by_kid.get(b"approver-ed25519-1")
+    if client_pub and approver_pub:
+        check(cross_group_key_aliases([(1, ALG_ED25519, client_pub), (2, ALG_ED25519, approver_pub)]) == [],
+              "distinct primary/approver keys must be allowed (P-5 shape)")
+        check(cross_group_key_aliases([(1, ALG_ED25519, client_pub), (2, ALG_ED25519, client_pub)]) != [],
+              "the SAME resolved key as both primary and approver must deny (credential alias)")
+        print(f"   S1 credential primary/approver alias denied; distinct keys allowed")
 
 
 # --------------------------------------------------------------------------
@@ -2172,6 +2265,7 @@ def main() -> None:
     gate_readme_counts(positives, negatives)
     gate_response_context(positives, negatives)
     gate_causality_inventory(cddl, positives, negatives)
+    gate_content_identity(positives, negatives)
     gate_group_cap_isolation(cddl, negatives)
     gate_verifier_clock(positives, negatives)
     gate_credential_context(positives, negatives)

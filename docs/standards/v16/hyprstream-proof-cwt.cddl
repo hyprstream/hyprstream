@@ -651,6 +651,18 @@ hyprstream-proof-signature = [
 ; group, alg, and kid. A missing component, duplicate component, extra
 ; signature, reordered or malformed plan, group/suite mismatch, or key outside
 ; the applicable anchored record or unattributed key set denies.
+;
+; Signer-group independence is CONTENT-based, not label-based (S1). Beyond the
+; whole-plan (alg, kid) label uniqueness, a resolved cryptographic public-key
+; IDENTITY — (algorithm, raw public-key bytes), never kid / group_id / enrollment
+; label / plan position — MUST participate in at most ONE logical signer group in
+; a proof, checked AFTER key resolution for both unattributed embedded-key proofs
+; and credential/enrollment-bound proofs. One public key re-published under two
+; kids in two groups therefore cannot satisfy a two-logical-group policy. Different
+; algorithms are distinct identities, so a hybrid group (Ed25519 + ML-DSA-65) and
+; the ordered components inside one suite group remain valid. (CDDL cannot express
+; this content constraint; validate_profile.py and check_proof_vectors.py enforce
+; it, and vector N-53 exercises it.)
 
 ; ===========================================================================
 ; Credential clearance wire grammar (Gate-2 value 11) — H2

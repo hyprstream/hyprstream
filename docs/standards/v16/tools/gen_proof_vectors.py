@@ -1347,6 +1347,37 @@ def main() -> None:
             deny_rule="proof-v1 cap: suite_id 1..64 bytes",
         )
 
+        # N-53 (S1): ONE Ed25519 public key published under two different kids in two
+        # logical signer groups, signing both entries — an otherwise-valid two-group
+        # COSE_Sign (distinct (alg,kid) labels, both signatures cryptographically
+        # valid, group_ids unique + ascending, known suites) whose SOLE defect is that
+        # the same RESOLVED public-key identity participates in two groups (a key
+        # alias defeating multi-logical-group independence).
+        n53_body = {
+            H_CRIT: CRIT_SIGN_BODY_UNATTRIBUTED,
+            H_TYP: TYP_REQUEST, H_DOMAIN: DOMAIN_REQUEST,
+            H_PLAN: [group(1, SUITE_CLASSICAL, [component(ALG_ED25519, b"alias-x-1")]),
+                     group(2, SUITE_CLASSICAL, [component(ALG_ED25519, b"alias-y-1")])],
+            H_KEYSET: [cose_key_okp_ed25519(b"alias-x-1", sk_u_ed.public_key().public_bytes_raw()),
+                       cose_key_okp_ed25519(b"alias-y-1", sk_u_ed.public_key().public_bytes_raw())],
+        }
+        n53_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: b"alias-x-1", H_GROUP: 1}, sk_u_ed),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: b"alias-y-1", H_GROUP: 2}, sk_u_ed),
+        ]
+        n53, _, _ = sign_multi(n53_body, request_claims(credential_hash=None, nonce=CHALLENGE), n53_entries)
+        record(
+            negatives,
+            "N-53",
+            "One Ed25519 key under two kids/groups (cross-group resolved-key alias)",
+            "deny",
+            "COSE_Sign",
+            n53,
+            deny_class="cross-group-key-alias",
+            deny_rule="a resolved public-key identity (alg + raw public key) may participate in at most one signer group",
+            notes="Both signatures valid; (alg,kid) labels unique; only the resolved-key identity is aliased across groups.",
+        )
+
         # N-13: kid longer than 64 bytes.
         n13_protected = dict(p4_protected)
         long_kid = b"k" * 65

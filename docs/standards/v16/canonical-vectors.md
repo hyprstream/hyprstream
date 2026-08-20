@@ -13,7 +13,7 @@ Machine-readable files (the normative form — this page is the human index):
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 9 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 57 vectors that MUST deny |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 58 vectors that MUST deny |
 | [`vectors/proof-v1-thumbprints.json`](vectors/proof-v1-thumbprints.json) | Cross-implementation replay-namespace thumbprint vectors (C1) |
 | [`vectors/proof-v1-credentials.json`](vectors/proof-v1-credentials.json) | Frozen `verifier_now` clock (F1) and the issuer-signed at+jwt tokens the authenticated positives hash (F2) |
 
@@ -86,7 +86,11 @@ a byte-identical regeneration. It also proves the negatives deny by their rule:
   response fixture;
 - a **`signature_plan` repeating one `(alg, kid)` across two groups** (N-33) is
   rejected — the gate and checker enforce whole-plan `(alg, kid)` uniqueness
-  regardless of group ID, so a single signer cannot satisfy a two-group policy;
+  regardless of group ID, so a single signer cannot satisfy a two-group policy; and
+  because labels are attacker-selected, a **resolved public-key identity**
+  (`(alg, raw public key)`, never `kid`/`group_id`) may appear in **at most one**
+  signer group after key resolution, so one key re-published under two kids (N-53)
+  cannot satisfy a two-group policy either;
 - an **unattributed proof is verified against its embedded key set** (not any
   out-of-band table): the gate and checker require exact ordered 1:1
   correspondence with the plan (keyed by `(alg, kid)`) and verify each signature
@@ -339,6 +343,7 @@ Ed25519 signature over the stripped object.
 | N-11 | algorithm | Deprecated polymorphic `EdDSA` (−8) | 1626 |
 | N-12 | suite-plan | In-range (≤64B) unknown `suite_id` outside the closed suite set (registry closure only) | 1633 |
 | N-52 | parser-cap | `suite_id` of 65 bytes, over the 64-byte cap (the sole >64-byte suite proof) | 1669 |
+| N-53 | cross-group-key-alias | One Ed25519 key under two kids in two signer groups (resolved-key alias; sole denial) | 633 |
 | N-13 | parser-cap | `kid` of 65 bytes | 1727 |
 | N-14 | closed-claim-set | Required `credential_hash` absent rather than null | 356 |
 | N-15 | credential-binding | Credential presented with a null signed `credential_hash` | 362 |
@@ -577,6 +582,25 @@ Ed25519 signature over the stripped object.
   checker enforce it (the checker keys duplicate detection on `(alg, kid)`, not
   `(group, alg, kid)`). N-33 is a fully signature-valid `COSE_Sign` repeating one
   `(alg, kid)` across groups 1 and 2, and denies by the uniqueness rule.
+- **N-53 (cross-group resolved-key alias — S1).** `(alg, kid)` uniqueness (N-33) is
+  necessary but not sufficient: the labels are attacker-selected, so the **same
+  Ed25519 public key can be published under two *different* kids** in two groups and
+  sign both entries — one key satisfying a two-logical-group policy. The frozen rule
+  is content-based: a **resolved public-key identity — `(algorithm, raw public-key
+  bytes)`, never `kid`/`group_id`/enrollment label/plan position — may participate
+  in at most one logical signer group**. It is enforced *after* key resolution for
+  both unattributed embedded-key proofs and credential/enrollment-bound proofs;
+  different algorithms are distinct identities, so legitimate hybrid groups (Ed25519
+  + ML-DSA-65 in one suite group) and the ordered components inside one group remain
+  valid. N-53 is an otherwise-valid two-group `COSE_Sign` — **unique `(alg, kid)`
+  labels, both signatures cryptographically valid, ascending unique `group_id`s,
+  known suites** — whose sole defect is that one resolved Ed25519 identity appears in
+  both groups. Its label uniqueness and signature coverage pass; **content-identity
+  uniqueness alone denies**, and replacing the second public key with a genuinely
+  distinct key makes the construction valid. The same rule denies a credential
+  **primary/approver alias** — the same resolved key presented as both the `cnf`
+  primary and an approver group under different labels — while distinct primary and
+  approver keys (P-5) stay valid.
 - **Total-object cap (2 MiB).** The complete-object CDDL cannot bound the
   signature byte strings, so the 2 MiB total-object cap is a validator-side
   numeric check. The gate constructs a **structurally valid** oversized object (a
