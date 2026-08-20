@@ -4,6 +4,7 @@
   "status": "frozen by the Gate-2 vote (v16 \u00a719, 2026-08-19); not production-closed",
   "encoding": "RFC 8949 core deterministic encoding; untagged COSE structures",
   "external_aad": "zero-length for every Sig_structure in this profile",
+  "verifier_now": 1786000015,
   "generator": "docs/standards/v16/tools/gen_proof_vectors.py",
   "kind": "replay-thumbprints",
   "domain_separators": {

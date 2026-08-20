@@ -22,6 +22,7 @@ Usage:  python3 gen_proof_vectors.py [output_dir]
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -169,9 +170,31 @@ CAPNP_REQUEST_BYTES = bytes.fromhex(
 CAPNP_RESPONSE_BYTES = bytes.fromhex(
     "0000000000000000010000000f000000020003000000000000"
 )
-CREDENTIAL_BYTES = b"eyJhbGciOiJFZERTQSIsInR5cCI6ImF0K2p3dCJ9.FIXTURE.FIXTURE"
-CREDENTIAL_HASH = hashlib.sha256(CREDENTIAL_BYTES).digest()
+# F2: the authenticated positives hash a REAL, deterministic, profile-valid
+# at+jwt access token signed by the seeded credential-issuer Ed25519 key. The
+# tokens are built inside main() (they need the seeded keys); CREDENTIAL_HASH
+# (classical primary) and CREDENTIAL_HASH_HYBRID are bound there. No placeholder.
+# F1: dispositions are evaluated at this exact instant, injected by a conformance
+# runner instead of wall clock. iat=1786000000 <= verifier_now < exp=1786000030.
+VERIFIER_NOW = 1786000015
+ISSUER_ISS = "https://issuer.hyprstream.test"
+CREDENTIAL_SUBJECT = "user-1"
+CREDENTIAL_TENANT = "tenant-alpha"           # JWT text name for the -70005 tenant claim
+CREDENTIAL_CLEARANCE = [2, [5, 7]]           # [level, compartments]; -70006 (JWT text: clearance)
 ML_KEM_768_RECIPIENT = bytes(range(256)) * 4 + bytes(range(160))  # 1184 bytes
+
+
+def b64u(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+
+def signer_suite_thumbprint(suite_id: str, pubkeys: list) -> bytes:
+    """The cnf-resolved signer-suite record (credential-profile §5): SHA-256 over
+    the RFC 8949 deterministic encoding of [suite_id, [ordered raw component
+    public keys]]. Uniformly covers a classical (1-key) and a hybrid (2-key)
+    primary group. Distinct from the C1 replay thumbprint (no domain separator,
+    no enrollment epoch): this binds key material, replay binds the enrollment."""
+    return hashlib.sha256(enc([suite_id, list(pubkeys)])).digest()
 
 
 # --------------------------------------------------------------------------
@@ -341,6 +364,43 @@ def main() -> None:
             bytes((0xA0 + i) & 0xFF for i in range(32)), work, "unattributed"
         )
 
+        # ---- F2: deterministic profile-valid at+jwt credential context --------
+        issuer_pub = sk_i_ed.public_key().public_bytes_raw()
+        client_ed_pub = sk_c_ed.public_key().public_bytes_raw()
+        # cnf-resolved signer-suite records for the authenticated positives'
+        # PRIMARY groups: classical = [client Ed25519]; hybrid = [client Ed25519,
+        # client ML-DSA-65] (approver groups bind their own enrollment, never cnf).
+        cnf_classical = signer_suite_thumbprint(SUITE_CLASSICAL, [client_ed_pub])
+        cnf_hybrid = signer_suite_thumbprint(SUITE_HYBRID, [client_ed_pub, ml_client.public])
+
+        def build_at_jwt(jti: str, cnf_thumbprint: bytes):
+            """A compact JWS (RFC 7519/8725) access token: exact at+jwt header,
+            EdDSA over the seeded issuer key, and every required v16
+            authenticated-dispatch claim. Ed25519 + canonical JSON => byte-stable."""
+            header = {"alg": "EdDSA", "kid": KID_ISSUER_ED.decode(), "typ": "at+jwt"}
+            claims = {
+                "iss": ISSUER_ISS,
+                "sub": CREDENTIAL_SUBJECT,
+                "aud": SERVICE_DOMAIN,
+                "iat": IAT,
+                "exp": EXP,
+                "jti": jti,
+                "tenant": CREDENTIAL_TENANT,
+                "clearance": CREDENTIAL_CLEARANCE,
+                "cnf": {"hs_signer_suite": b64u(cnf_thumbprint)},
+            }
+            hp = b64u(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
+            pp = b64u(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
+            signing_input = f"{hp}.{pp}".encode("ascii")
+            sig = sk_i_ed.sign(signing_input)
+            token = f"{hp}.{pp}.{b64u(sig)}"
+            return token, header, claims
+
+        cred_classical, hdr_classical, claims_classical = build_at_jwt("cred-classical-1", cnf_classical)
+        cred_hybrid, hdr_hybrid, claims_hybrid = build_at_jwt("cred-hybrid-1", cnf_hybrid)
+        CREDENTIAL_HASH = hashlib.sha256(cred_classical.encode("ascii")).digest()
+        CREDENTIAL_HASH_HYBRID = hashlib.sha256(cred_hybrid.encode("ascii")).digest()
+
         keys_doc = {
             "warning": (
                 "TEST KEYS ONLY. Every key below is derived from a published "
@@ -416,8 +476,9 @@ def main() -> None:
                 "capnp_schema_id_response": SCHEMA_ID_RESPONSE,
                 "capnp_request_bytes_hex": CAPNP_REQUEST_BYTES.hex(),
                 "capnp_response_bytes_hex": CAPNP_RESPONSE_BYTES.hex(),
-                "credential_bytes_ascii": CREDENTIAL_BYTES.decode(),
-                "credential_hash_hex": CREDENTIAL_HASH.hex(),
+                "verifier_now": VERIFIER_NOW,
+                "credential_hash_classical_hex": CREDENTIAL_HASH.hex(),
+                "credential_hash_hybrid_hex": CREDENTIAL_HASH_HYBRID.hex(),
                 "external_aad": "zero-length",
             },
         }
@@ -520,7 +581,7 @@ def main() -> None:
             H_DOMAIN: DOMAIN_REQUEST,
             H_PLAN: plan_hybrid,
         }
-        p2_claims = request_claims(credential_hash=CREDENTIAL_HASH)
+        p2_claims = request_claims(credential_hash=CREDENTIAL_HASH_HYBRID)
         p2_entries = [
             (
                 {
@@ -1927,7 +1988,64 @@ def main() -> None:
         "status": "frozen by the Gate-2 vote (v16 §19, 2026-08-19); not production-closed",
         "encoding": "RFC 8949 core deterministic encoding; untagged COSE structures",
         "external_aad": "zero-length for every Sig_structure in this profile",
+        "verifier_now": VERIFIER_NOW,
         "generator": "docs/standards/v16/tools/gen_proof_vectors.py",
+    }
+
+    # ---- F1/F2: verifier clock + authenticated credential context ------------
+    credentials_doc = {
+        **meta,
+        "kind": "authenticated-credential-context",
+        "verifier_now": VERIFIER_NOW,
+        "verifier_now_note": (
+            "Accept/reject dispositions are evaluated at this exact integer instant. "
+            "A conformance runner MUST inject it as the verifier clock instead of "
+            "using wall-clock time; iat <= verifier_now < exp for every advertised "
+            "positive and every credential below."
+        ),
+        "issuer": {
+            "kid": KID_ISSUER_ED.decode(),
+            "alg": "EdDSA",
+            "typ": "at+jwt",
+            "public_hex": issuer_pub.hex(),
+        },
+        "cnf_model": {
+            "member": "hs_signer_suite",
+            "value": "base64url(SHA-256(RFC 8949 det-CBOR [suite_id, [ordered raw component public keys]]))",
+            "note": (
+                "A profile-defined RFC 8747 confirmation method resolving to the "
+                "credential-profile §5 signer-suite record (suite ID + exact ordered "
+                "component keys of the PRIMARY signer group). Approver groups bind "
+                "their own enrollment and are never placed in cnf. Distinct from the "
+                "C1 replay thumbprint (no domain separator, no enrollment epoch)."
+            ),
+        },
+        "credentials": {
+            "classical": {
+                "token": cred_classical,
+                "header": hdr_classical,
+                "claims": claims_classical,
+                "primary_suite": SUITE_CLASSICAL,
+                "cnf_preimage_hex": enc([SUITE_CLASSICAL, [client_ed_pub]]).hex(),
+                "cnf_thumbprint_b64": b64u(cnf_classical),
+                "token_sha256": CREDENTIAL_HASH.hex(),
+            },
+            "hybrid": {
+                "token": cred_hybrid,
+                "header": hdr_hybrid,
+                "claims": claims_hybrid,
+                "primary_suite": SUITE_HYBRID,
+                "cnf_preimage_hex": enc([SUITE_HYBRID, [client_ed_pub, ml_client.public]]).hex(),
+                "cnf_thumbprint_b64": b64u(cnf_hybrid),
+                "token_sha256": CREDENTIAL_HASH_HYBRID.hex(),
+            },
+        },
+        "positive_to_credential": {
+            "P-2": "hybrid",
+            "P-4": "classical",
+            "P-5": "classical",
+            "P-6": "classical",
+        },
     }
 
     # ---- C1: frozen replay-namespace thumbprint vectors ----------------------
@@ -1984,6 +2102,9 @@ def main() -> None:
     )
     (out_dir / "proof-v1-thumbprints.json").write_text(
         json.dumps(thumbprints, indent=2) + "\n"
+    )
+    (out_dir / "proof-v1-credentials.json").write_text(
+        json.dumps(credentials_doc, indent=2) + "\n"
     )
     print(f"wrote {len(positives)} positive and {len(negatives)} negative vectors to {out_dir}")
 

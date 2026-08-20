@@ -81,6 +81,9 @@ CTI_BYTES = 16
 CREDENTIAL_HASH_BYTES = 32
 NONCE_MIN, NONCE_MAX = 16, 64
 SUITE_KID_MAX = 64
+SUITE_CLASSICAL = "hs-cose-sign-ed25519-v1"
+SUITE_HYBRID = "hs-cose-sign-ed25519-mldsa65-wns-v1"
+ALG_ED25519, ALG_ML_DSA_65 = -19, -49
 GROUPS_MAX, COMPONENTS_MAX = 8, 2
 
 # CBOR/COSE labels
@@ -890,7 +893,8 @@ def gate_canonical(positives, negatives) -> None:
                   f"{gen.stderr.strip()[:120]}")
             check(False, "generator did not run for the reproducibility check")
         else:
-            for name in ("proof-v1-keys.json", "proof-v1-positive.json", "proof-v1-negative.json"):
+            for name in ("proof-v1-keys.json", "proof-v1-positive.json", "proof-v1-negative.json",
+                         "proof-v1-thumbprints.json", "proof-v1-credentials.json"):
                 a = (VECTORS_DIR / name).read_bytes()
                 b = (Path(tmp) / name).read_bytes()
                 check(a == b, f"{name} is not byte-identical to a fresh regeneration "
@@ -1449,6 +1453,227 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
 
 
 # --------------------------------------------------------------------------
+# F1/F2. Deterministic verifier clock + authenticated credential context
+# --------------------------------------------------------------------------
+
+
+def _b64u(b: bytes) -> str:
+    import base64
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+
+def _b64u_dec(s: str) -> bytes:
+    import base64
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _make_jwt(header: dict, claims: dict, sk) -> str:
+    hp = _b64u(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
+    pp = _b64u(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
+    si = f"{hp}.{pp}".encode("ascii")
+    return f"{hp}.{pp}.{_b64u(sk.sign(si))}"
+
+
+def _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=None):
+    """Return the list of conformance failures for one at+jwt (empty == valid):
+    exact at+jwt/EdDSA header, issuer Ed25519 signature, required claims,
+    audience, and temporal validity at the frozen verifier clock."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    errs = []
+    parts = token.split(".")
+    if len(parts) != 3:
+        return ["not a compact JWS"]
+    hp, pp, sp = parts
+    try:
+        header = json.loads(_b64u_dec(hp))
+        claims = json.loads(_b64u_dec(pp))
+    except Exception as e:  # noqa: BLE001
+        return [f"undecodable JWS: {e}"]
+    if (header.get("typ") != "at+jwt" or header.get("alg") != "EdDSA"
+            or header.get("kid") != issuer_kid):
+        errs.append(f"header not exact at+jwt/EdDSA/{issuer_kid}")
+    try:
+        Ed25519PublicKey.from_public_bytes(issuer_pub).verify(
+            _b64u_dec(sp), f"{hp}.{pp}".encode("ascii"))
+    except InvalidSignature:
+        errs.append("issuer signature invalid")
+    for r in ("iss", "sub", "aud", "iat", "exp", "jti", "tenant", "clearance", "cnf"):
+        if r not in claims:
+            errs.append(f"missing claim {r}")
+    if not claims.get("iss") or not claims.get("sub"):
+        errs.append("empty issuer/subject")
+    if expected_aud is not None and claims.get("aud") != expected_aud:
+        errs.append("audience mismatch")
+    if not (claims.get("iat", 0) <= now < claims.get("exp", 0)):
+        errs.append("not temporally valid at verifier_now")
+    if "hs_signer_suite" not in (claims.get("cnf") or {}):
+        errs.append("cnf lacks hs_signer_suite")
+    return errs
+
+
+def _load_credentials():
+    return json.loads((VECTORS_DIR / "proof-v1-credentials.json").read_text())
+
+
+def _keymaps():
+    keys = json.loads((VECTORS_DIR / "proof-v1-keys.json").read_text())["keys"]
+    ed = {bytes.fromhex(k["kid_hex"]): bytes.fromhex(k["public_hex"]) for k in keys["ed25519"]}
+    ml = {bytes.fromhex(k["kid_hex"]): bytes.fromhex(k["public_hex"]) for k in keys["ml_dsa_65"]}
+    return ed, ml
+
+
+def _suite_thumbprint(suite, pubs):
+    import hashlib
+    from check_proof_vectors import enc as _enc
+    return hashlib.sha256(_enc([suite, list(pubs)])).digest()
+
+
+def gate_verifier_clock(positives, negatives) -> None:
+    section("F1. Deterministic verifier clock (verifier_now)")
+    creds = _load_credentials()
+    now = creds.get("verifier_now")
+    check(isinstance(now, int), "verifier_now must be a declared integer")
+    if not isinstance(now, int):
+        return
+    # Metadata agreement across every shipped artifact (no wall-clock ambiguity).
+    for fn in ("proof-v1-positive.json", "proof-v1-negative.json",
+               "proof-v1-thumbprints.json", "proof-v1-keys.json", "proof-v1-credentials.json"):
+        d = json.loads((VECTORS_DIR / fn).read_text())
+        check(d.get("verifier_now") == now, f"{fn} must declare verifier_now == {now}")
+    # Every advertised positive and every credential is temporally valid at that
+    # exact instant (strict at exp: iat <= now < exp).
+    for v in positives["vectors"]:
+        c = claims_of(v["cbor_hex"])
+        check(c[C_IAT] <= now < c[C_EXP],
+              f"{v['id']} must be temporally valid at verifier_now {now} (iat {c[C_IAT]}, exp {c[C_EXP]})")
+    for name, cred in creds["credentials"].items():
+        cl = cred["claims"]
+        check(cl["iat"] <= now < cl["exp"],
+              f"credential {name} must be temporally valid at verifier_now {now}")
+    # Load-bearing: pre-iat, at-exp, and a wall-clock-style instant are all outside
+    # the interval, so evaluating there would deny an advertised positive.
+    c0 = claims_of(positives["vectors"][0]["cbor_hex"])
+    iat, exp = c0[C_IAT], c0[C_EXP]
+    check(not (iat <= (iat - 1) < exp), "pre-iat instant must be rejected by the temporal rule")
+    check(not (iat <= exp < exp), "an instant at exp must be rejected (strict at exp)")
+    check(not (iat <= 4102444800 < exp), "a wall-clock-style instant (2100) must be outside validity")
+    print(f"   verifier_now {now} agrees across artifacts; all positives/credentials valid; "
+          f"pre-iat/at-exp/wall-clock rejected")
+
+
+def gate_credential_context(positives, negatives) -> None:
+    section("F2. Authenticated credential context (issuer-signed at+jwt, cnf, hash)")
+    creds = _load_credentials()
+    now = creds["verifier_now"]
+    issuer_pub = bytes.fromhex(creds["issuer"]["public_hex"])
+    issuer_kid = creds["issuer"]["kid"]
+    ed_by_kid, ml_by_kid = _keymaps()
+    pos_by_id = {v["id"]: v for v in positives["vectors"]}
+
+    # The literal placeholder must be gone from every artifact/tool.
+    for fn in ("tools/gen_proof_vectors.py",):
+        txt = (VECTORS_DIR.parent / fn).read_text()
+        check("FIXTURE.FIXTURE" not in txt, f"{fn} still carries the .FIXTURE.FIXTURE placeholder")
+
+    # Both credentials verify end to end.
+    for name, cred in creds["credentials"].items():
+        errs = _verify_credential(cred["token"], issuer_pub, issuer_kid, now,
+                                  expected_aud=cred["claims"]["aud"])
+        check(not errs, f"credential {name} must be a valid at+jwt: {errs}")
+
+    def primary_groups_matching(pid, cnf_tp):
+        obj = decode(bytes.fromhex(pos_by_id[pid]["cbor_hex"]))
+        plan = decode(obj[0]).get(H_PLAN) or []
+        matched = []
+        for grp in plan:
+            pubs, ok = [], True
+            for comp in grp[3]:
+                alg, kid = comp[1], comp[2]
+                pub = ed_by_kid.get(kid) if alg == ALG_ED25519 else ml_by_kid.get(kid)
+                if pub is None:
+                    ok = False
+                    break
+                pubs.append(pub)
+            if ok and _suite_thumbprint(grp[2], pubs) == cnf_tp:
+                matched.append(grp[1])
+        return matched, obj
+
+    # Each authenticated positive: credential_hash == SHA-256(exact token), and
+    # cnf resolves to EXACTLY ONE plan group (the primary) by suite + ordered keys.
+    import hashlib
+    for pid, credname in creds["positive_to_credential"].items():
+        cred = creds["credentials"][credname]
+        cnf_tp = _b64u_dec(cred["claims"]["cnf"]["hs_signer_suite"])
+        matched, obj = primary_groups_matching(pid, cnf_tp)
+        check(len(matched) == 1, f"{pid}: cnf must resolve to exactly one primary group; matched {matched}")
+        ch = decode(obj[2]).get(C_CREDENTIAL_HASH)
+        check(ch == hashlib.sha256(cred["token"].encode("ascii")).digest(),
+              f"{pid}: credential_hash must equal SHA-256 of the mapped {credname} credential")
+    print(f"   both credentials valid; {len(creds['positive_to_credential'])} positives bind their "
+          f"credential hash + cnf primary group")
+
+    # ---- Load-bearing counter-proofs (re-signed with the seeded issuer key so
+    #      only the named property is wrong; each MUST produce a failure). -------
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    keys = json.loads((VECTORS_DIR / "proof-v1-keys.json").read_text())["keys"]
+    issuer_seed = next(bytes.fromhex(k["seed_hex"]) for k in keys["ed25519"]
+                       if k["kid_ascii"] == issuer_kid)
+    sk_i = Ed25519PrivateKey.from_private_bytes(issuer_seed)
+    other_seed = bytes((0x10 + i) & 0xFF for i in range(32))
+    sk_other = Ed25519PrivateKey.from_private_bytes(other_seed)
+    good = creds["credentials"]["classical"]
+    hdr = dict(good["header"])
+    base_claims = dict(good["claims"])
+    aud = base_claims["aud"]
+
+    def rejected(label, token):
+        errs = _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=aud)
+        check(bool(errs), f"counter-proof '{label}' must be rejected but validated clean")
+        if errs:
+            print(f"   F2 counter '{label}' rejected: {errs[0]}")
+
+    # 1. flipped signature byte.
+    tok = good["token"]
+    hp, pp, sp = tok.split(".")
+    bad_sig = bytearray(_b64u_dec(sp)); bad_sig[0] ^= 0x01
+    rejected("flipped issuer signature", f"{hp}.{pp}.{_b64u(bytes(bad_sig))}")
+    # 2. wrong issuer key (validly signed by a non-issuer key).
+    rejected("wrong issuer key", _make_jwt(hdr, base_claims, sk_other))
+    # 3. wrong audience (re-signed).
+    rejected("wrong audience", _make_jwt(hdr, {**base_claims, "aud": "evil.svc.hyprstream.test"}, sk_i))
+    # 4. missing required claim (re-signed).
+    rejected("missing tenant claim", _make_jwt(hdr, {k: v for k, v in base_claims.items() if k != "tenant"}, sk_i))
+    # 5. wrong typ header (re-signed).
+    rejected("wrong typ header", _make_jwt({**hdr, "typ": "JWT"}, base_claims, sk_i))
+    # 6. clock outside validity (re-signed with an expired window).
+    rejected("expired at verifier_now",
+             _make_jwt(hdr, {**base_claims, "iat": now - 100, "exp": now - 1}, sk_i))
+    # 7. wrong cnf: resolves to no plan group.
+    bad_cnf = _make_jwt(hdr, {**base_claims, "cnf": {"hs_signer_suite": _b64u(b"\x00" * 32)}}, sk_i)
+    bad_tp = _b64u_dec(json.loads(_b64u_dec(bad_cnf.split(".")[1]))["cnf"]["hs_signer_suite"])
+    matched, _ = primary_groups_matching("P-4", bad_tp)
+    check(matched == [], f"a wrong cnf thumbprint must resolve to no plan group; matched {matched}")
+    print(f"   F2 counter 'wrong cnf' resolves to no primary group")
+    # 8. tampered proof credential_hash on a positive.
+    obj = decode(bytes.fromhex(pos_by_id["P-4"]["cbor_hex"]))
+    tampered = decode(obj[2]); tampered[C_CREDENTIAL_HASH] = b"\x00" * 32
+    check(tampered[C_CREDENTIAL_HASH] != hashlib.sha256(good["token"].encode("ascii")).digest(),
+          "a tampered proof credential_hash must not match the credential")
+    # 9. approver group (P-5 group 2) stays valid against its OWN enrollment and is
+    #    NOT forced into the primary credential cnf.
+    cnf_classical = _b64u_dec(creds["credentials"]["classical"]["claims"]["cnf"]["hs_signer_suite"])
+    matched5, _ = primary_groups_matching("P-5", cnf_classical)
+    check(matched5 == [1],
+          f"P-5's cnf must resolve to the primary (client) group only, not the approver; matched {matched5}")
+    approver_pub = ed_by_kid.get(b"approver-ed25519-1")
+    if approver_pub is not None:
+        check(_suite_thumbprint(SUITE_CLASSICAL, [approver_pub]) != cnf_classical,
+              "the approver group must NOT match the primary credential cnf")
+    print(f"   F2 approver group bound to its own enrollment (cnf resolves to the primary only)")
+
+
+# --------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -1475,6 +1700,8 @@ def main() -> None:
     gate_readme_counts(positives, negatives)
     gate_response_context(positives, negatives)
     gate_causality_inventory(cddl, positives, negatives)
+    gate_verifier_clock(positives, negatives)
+    gate_credential_context(positives, negatives)
     gate_canonical(positives, negatives)
 
     print()

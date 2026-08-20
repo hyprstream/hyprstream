@@ -20,6 +20,7 @@ Usage:  python3 check_proof_vectors.py [vectors_dir]
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import subprocess
@@ -454,6 +455,90 @@ def main() -> None:
                 fail("unattributed replay preimage encoding drifted")
     else:
         fail("proof-v1-thumbprints.json is missing (C1 replay thumbprint vector)")
+
+    # F1/F2: authenticated credential context. Every advertised credential is a
+    # real issuer-signed at+jwt, temporally valid at the frozen verifier_now, and
+    # each authenticated positive's credential_hash is SHA-256 over the exact
+    # credential bytes with a cnf resolving to that proof's PRIMARY signer group.
+    cred_path = vectors_dir / "proof-v1-credentials.json"
+    if not cred_path.exists():
+        fail("proof-v1-credentials.json is missing (F2 authenticated credential context)")
+    else:
+        cd = json.loads(cred_path.read_text())
+        now = cd.get("verifier_now")
+        if not isinstance(now, int):
+            fail("verifier_now must be a declared integer")
+        issuer_pub = bytes.fromhex(cd["issuer"]["public_hex"])
+        issuer_kid = cd["issuer"]["kid"]
+        pos_by_id = {v["id"]: v for v in positive["vectors"]}
+
+        def b64u_dec(s: str) -> bytes:
+            return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+        def signer_suite_tp(suite, pubs) -> bytes:
+            return hashlib.sha256(enc([suite, list(pubs)])).digest()
+
+        def verify_at_jwt(token: str, label: str):
+            parts = token.split(".")
+            if len(parts) != 3:
+                fail(f"{label}: not a compact JWS"); return None
+            hp, pp, sp = parts
+            header = json.loads(b64u_dec(hp))
+            claims = json.loads(b64u_dec(pp))
+            if (header.get("typ") != "at+jwt" or header.get("alg") != "EdDSA"
+                    or header.get("kid") != issuer_kid):
+                fail(f"{label}: protected header not exact at+jwt/EdDSA/{issuer_kid}: {header}")
+            try:
+                Ed25519PublicKey.from_public_bytes(issuer_pub).verify(
+                    b64u_dec(sp), f"{hp}.{pp}".encode("ascii"))
+            except InvalidSignature:
+                fail(f"{label}: issuer Ed25519 signature does not verify")
+            for req in ("iss", "sub", "aud", "iat", "exp", "jti", "tenant", "clearance", "cnf"):
+                if req not in claims:
+                    fail(f"{label}: missing required claim {req!r}")
+            if not claims.get("iss") or not claims.get("sub"):
+                fail(f"{label}: empty issuer/subject")
+            if not (claims.get("iat", 0) <= now < claims.get("exp", 0)):
+                fail(f"{label}: not temporally valid at verifier_now {now}")
+            if "hs_signer_suite" not in (claims.get("cnf") or {}):
+                fail(f"{label}: cnf lacks the hs_signer_suite confirmation")
+            return claims
+
+        for name, cred in cd["credentials"].items():
+            claims = verify_at_jwt(cred["token"], f"credential {name}")
+            if hashlib.sha256(cred["token"].encode("ascii")).hexdigest() != cred["token_sha256"]:
+                fail(f"credential {name}: published token_sha256 does not match the token bytes")
+
+        for pid, credname in cd["positive_to_credential"].items():
+            cred = cd["credentials"][credname]
+            v = pos_by_id.get(pid)
+            if v is None:
+                fail(f"credential mapping names unknown positive {pid}"); continue
+            obj = decode(bytes.fromhex(v["cbor_hex"]))
+            pclaims = decode(obj[2])
+            ch = pclaims.get(-70001)  # credential_hash
+            if ch != hashlib.sha256(cred["token"].encode("ascii")).digest():
+                fail(f"{pid}: credential_hash != SHA-256(mapped {credname} credential)")
+            cred_claims = json.loads(b64u_dec(cred["token"].split(".")[1]))
+            if cred_claims.get("aud") != pclaims.get(3):
+                fail(f"{pid}: credential aud != the proof's aud")
+            cnf_tp = b64u_dec(cred_claims["cnf"]["hs_signer_suite"])
+            # The cnf MUST resolve to exactly one plan group (the primary), by
+            # suite ID + exact ordered component keys (credential-profile §5).
+            plan = decode(obj[0]).get(H_PLAN) or []
+            matches = []
+            for grp in plan:
+                pubs, ok = [], True
+                for comp in grp[3]:
+                    alg, kid = comp[1], comp[2]
+                    pub = ed_by_kid.get(kid) if alg == ALG_ED25519 else ml_by_kid.get(kid)
+                    if pub is None:
+                        ok = False; break
+                    pubs.append(pub)
+                if ok and signer_suite_tp(grp[2], pubs) == cnf_tp:
+                    matches.append(grp[1])
+            if len(matches) != 1:
+                fail(f"{pid}: cnf must resolve to exactly one primary plan group; matched {matches}")
 
     total = len(positive["vectors"]) + len(negative["vectors"])
     if FAILURES:

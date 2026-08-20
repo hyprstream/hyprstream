@@ -15,6 +15,7 @@ Machine-readable files (the normative form — this page is the human index):
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 8 vectors that MUST verify |
 | [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 53 vectors that MUST deny |
 | [`vectors/proof-v1-thumbprints.json`](vectors/proof-v1-thumbprints.json) | Cross-implementation replay-namespace thumbprint vectors (C1) |
+| [`vectors/proof-v1-credentials.json`](vectors/proof-v1-credentials.json) | Frozen `verifier_now` clock (F1) and the issuer-signed at+jwt tokens the authenticated positives hash (F2) |
 
 Each JSON vector carries `id`, `title`, `expect` (`accept` / `deny`),
 `structure`, `size_bytes`, `sha256`, full `cbor_hex`, and — for negatives — a
@@ -119,11 +120,46 @@ a byte-identical regeneration. It also proves the negatives deny by their rule:
 
 See [`README.md`](README.md) for the one remaining tooling note.
 
+## Verifier clock and authenticated credential context (F1/F2)
+
+These fixtures are time-dependent, so the disposition of every `accept`/`deny`
+vector is evaluated at one **frozen instant**, `verifier_now = 1786000015`
+(`iat = 1786000000 <= verifier_now < exp = 1786000030`, strict at `exp`). A
+conformance runner MUST inject this integer as its verifier clock instead of
+reading wall-clock time; every artifact declares the same `verifier_now`, and the
+gate rejects a missing, disagreeing, pre-`iat`, at-`exp`, or wall-clock instant.
+
+The authenticated positives **P-2 / P-4 / P-5 / P-6** hash a real, deterministic,
+profile-valid **at+jwt** access token — not a placeholder. Each token is a compact
+JWS with the exact protected header `{"typ":"at+jwt","alg":"EdDSA","kid":"issuer-ed25519-1"}`,
+signed by the seeded credential-issuer Ed25519 key over the required v16
+authenticated-dispatch claims (`iss`, `sub`, service `aud`, `iat`/`exp`, unique
+`jti`, Reusable-only `tenant` and `clearance`, and `cnf`). Two per-suite tokens are
+shipped in [`proof-v1-credentials.json`](vectors/proof-v1-credentials.json) with
+the positive→credential map: a **classical** token (P-4/P-5/P-6, primary group
+`[client Ed25519]`) and a **hybrid** token (P-2, primary group `[client Ed25519,
+client ML-DSA-65]`). Each proof's `credential_hash` (−70001) is SHA-256 over the
+exact token bytes.
+
+The `cnf` uses a profile-defined confirmation method, `cnf.hs_signer_suite` =
+base64url(SHA-256(RFC 8949 det-CBOR `[suite_id, [ordered raw component public
+keys]]`)), which resolves to the credential-profile §5 signer-suite record of the
+**primary** signer group — uniformly covering a classical (one-key) and a hybrid
+(two-key) group. The gate and checker require it to resolve to **exactly one** plan
+group; **approver** groups (e.g. P-5's group 2) bind their own enrollment and are
+never placed in `cnf`. This thumbprint is distinct from the C1 replay thumbprint
+(no domain separator, no enrollment epoch: it binds key material, replay binds the
+enrollment). The gate proves the full chain load-bearing with re-signed
+counter-proofs — a flipped/foreign issuer signature, wrong audience, missing
+claim, wrong `typ`, an expired window, a `cnf` resolving to no group, and a
+tampered proof hash each turn it red.
+
 ## Common fixtures
 
 | Field | Value |
 |---|---|
 | canonical service domain (`aud`) | `registry.svc.hyprstream.test` |
+| `verifier_now` (frozen evaluation instant) | 1786000015 (integer Unix seconds) |
 | `iat` / `exp` | 1786000000 / 1786000030 (integer Unix seconds) |
 | `cti` (`request_id`) | `3f1c9a04b7d2416e8c05a9137b6e2d80` |
 | `Nonce` (server challenge) | `8ad3011f4c76b25e90c4713f5a26ee08` |

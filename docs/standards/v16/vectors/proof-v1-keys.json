@@ -4,6 +4,7 @@
   "status": "frozen by the Gate-2 vote (v16 \u00a719, 2026-08-19); not production-closed",
   "encoding": "RFC 8949 core deterministic encoding; untagged COSE structures",
   "external_aad": "zero-length for every Sig_structure in this profile",
+  "verifier_now": 1786000015,
   "generator": "docs/standards/v16/tools/gen_proof_vectors.py",
   "keys": {
     "warning": "TEST KEYS ONLY. Every key below is derived from a published constant seed and MUST NOT be enrolled or trusted.",
@@ -74,8 +75,9 @@
       "capnp_schema_id_response": 10500073148751533194,
       "capnp_request_bytes_hex": "0000000000000000010000001700000001000500000000000000",
       "capnp_response_bytes_hex": "0000000000000000010000000f000000020003000000000000",
-      "credential_bytes_ascii": "eyJhbGciOiJFZERTQSIsInR5cCI6ImF0K2p3dCJ9.FIXTURE.FIXTURE",
-      "credential_hash_hex": "78fa43168352720cbbee52b6d593f0c9a7f4dd56b8c20cab20b924f4ba3ae081",
+      "verifier_now": 1786000015,
+      "credential_hash_classical_hex": "dc922286dc82617535d32a643cc9ed0dc639ce6da65914db9bced7b0f3395b03",
+      "credential_hash_hybrid_hex": "bfbb3d00f187e1c8bceb32d1fed9cc16cb561c77393f16a6299aab1b64da52e7",
       "external_aad": "zero-length"
     }
   }
