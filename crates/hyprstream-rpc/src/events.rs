@@ -353,6 +353,14 @@ impl EventAuthz for AllowAllEventAuthz {
 /// Constructing this type installs an active PEP, so all missing clearance or
 /// object labels fail closed. Uninstalled publishers/subscribers use
 /// [`DenyAllEventAuthz`], never a dormant permit fallback.
+///
+/// Typed identity (v16 §10 / #1510): each check parses the topic-prefix
+/// grammar exactly once at this boundary. A `prefix` that is not an object
+/// identity — including the tenant-qualified internal map keys the
+/// confidential paths pass (e.g. `"5:tenantworker"`), which are bookkeeping
+/// keys, not identities — denies as an unknown identity. Confidential-prefix
+/// admission therefore stays fail-closed until the event plane carries its
+/// tenant-qualified identity as typed data.
 pub struct MacEventAuthz {
     pep: MoqEventPep,
 }
@@ -366,21 +374,24 @@ impl MacEventAuthz {
 impl EventAuthz for MacEventAuthz {
     fn can_publish(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
-            self.pep.check(caller, prefix, MoqEventAction::Publish),
+            self.pep
+                .check_event_prefix(caller, prefix, MoqEventAction::Publish),
             MacDecision::Permit
         )
     }
 
     fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
-            self.pep.check(caller, prefix, MoqEventAction::Subscribe),
+            self.pep
+                .check_event_prefix(caller, prefix, MoqEventAction::Subscribe),
             MacDecision::Permit
         )
     }
 
     fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
-            self.pep.check(caller, prefix, MoqEventAction::JoinDecrypt),
+            self.pep
+                .check_event_prefix(caller, prefix, MoqEventAction::JoinDecrypt),
             MacDecision::Permit
         )
     }

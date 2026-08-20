@@ -1,16 +1,28 @@
-//! MoQ / event-plane MAC policy-enforcement point (epic #547, #1271).
+//! MoQ / event-plane MAC policy-enforcement point (epic #547, #1271; typed
+//! resolver v16 §10 / #1510).
 //!
-//! This plane consumes the shared RPC-PEP contract rather than defining a
-//! parallel decision vocabulary. An installed [`MoqEventPep`] returns
-//! [`MacDecision`] and resolves labels through [`RpcObjectLabelResolver`].
-//! Missing clearance and missing labels deny, as does a failed lattice-floor
-//! check. Callers preserve the pre-activation behavior by not installing this
-//! PEP; dormant event/MoQ paths remain pass-through.
+//! This plane consumes the shared RPC-PEP decision contract
+//! ([`MacDecision`]) rather than defining a parallel decision vocabulary,
+//! and resolves labels through this plane's **own** typed resolver
+//! ([`MoqEventLabelResolver`]). A track/prefix string is parsed into the
+//! exact typed identity ([`MoqEventObjectRef`]) exactly once at the boundary
+//! helper ([`MoqEventPep::check_event_prefix`] /
+//! [`MoqEventPep::check_stream_track`]); the resolver never sees a string,
+//! so a MoQ/event coordinate can no longer occupy the RPC/VFS resolver's
+//! service-domain slot. Unknown or noncanonical coordinates, unlisted
+//! services, missing clearance, and missing labels all deny; a failed
+//! lattice-floor check denies. Callers preserve the pre-activation behavior
+//! by not installing this PEP; dormant event/MoQ paths remain pass-through.
 
 use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
-use super::dispatch_pep::{MacDecision, MacDenyReason, RpcObjectLabelResolver};
+use super::dispatch_pep::{MacDecision, MacDenyReason};
+// The typed identity and resolver are consumed only by the native check
+// paths; on wasm32 the PEP keeps its historical type-only surface (same gate
+// pattern as the dispatch PEP).
+#[cfg(not(target_arch = "wasm32"))]
+use super::moq_resolve::{MoqEventLabelResolver, MoqEventObjectRef, MoqEventPlane};
 use super::{SecurityContext, SecurityLabel};
 use crate::envelope::Subject;
 
@@ -29,6 +41,29 @@ pub enum MoqEventAction {
     JoinDecrypt,
 }
 
+impl MoqEventAction {
+    /// Wire-stable discriminant for decoded ingress.
+    pub const fn discriminant(self) -> u16 {
+        match self {
+            MoqEventAction::Publish => 0,
+            MoqEventAction::Subscribe => 1,
+            MoqEventAction::JoinDecrypt => 2,
+        }
+    }
+
+    /// Decode an action discriminant. Unknown values return `None`: an
+    /// ingress carrying a verb this PEP does not know denies — it never
+    /// falls back to a coarse default action.
+    pub const fn from_discriminant(value: u16) -> Option<Self> {
+        match value {
+            0 => Some(MoqEventAction::Publish),
+            1 => Some(MoqEventAction::Subscribe),
+            2 => Some(MoqEventAction::JoinDecrypt),
+            _ => None,
+        }
+    }
+}
+
 /// Resolve a verified event/MoQ subject to its MAC security context.
 ///
 /// The event plane does not have an [`EnvelopeContext`](crate::service::EnvelopeContext),
@@ -44,6 +79,14 @@ pub enum MoqMacAuditReason {
     /// A denial returned by the canonical shared MAC contract.
     #[cfg(not(target_arch = "wasm32"))]
     Mac(MacDenyReason),
+    /// The boundary coordinate did not decode into a typed identity.
+    ///
+    /// Malformed grammar, a noncanonical service segment, or an internal
+    /// bookkeeping key (e.g. a tenant-qualified map key) passed where an
+    /// object identity is required. The shared decision surfaces this as
+    /// `Deny(UnlabeledObject)`; this variant keeps the precise cause in the
+    /// plane's audit trail.
+    UnknownObjectIdentity,
     /// An authorizer was installed, but moq-net exposed no per-track callback.
     ///
     /// The transport denies the whole session until #276 lands rather than
@@ -62,7 +105,9 @@ pub enum MoqMacAuditReason {
 pub struct MoqMacAuditRecord {
     /// Independently verified subject, or `None` for anonymous.
     pub subject: Option<String>,
-    /// Track or event prefix whose access was denied.
+    /// Track or event prefix whose access was denied (the raw boundary
+    /// coordinate as received — an audit trail, never an authorization
+    /// input).
     pub object: String,
     /// Operation that was denied.
     pub action: MoqEventAction,
@@ -89,17 +134,18 @@ pub trait MoqMacAuditSink: Send + Sync {
 /// on an installed instance is fail-closed.
 pub struct MoqEventPep {
     #[cfg(not(target_arch = "wasm32"))]
-    resolver: Arc<dyn RpcObjectLabelResolver>,
+    resolver: Arc<dyn MoqEventLabelResolver>,
     clearance: Arc<dyn ClearanceSource>,
     audit: Arc<dyn MoqMacAuditSink>,
 }
 
 impl MoqEventPep {
-    /// Construct an active, fail-closed PEP from the canonical object-label
-    /// resolver, verified-subject clearance source, and mandatory audit sink.
+    /// Construct an active, fail-closed PEP from this plane's typed
+    /// object-label resolver, verified-subject clearance source, and
+    /// mandatory audit sink.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new(
-        resolver: Arc<dyn RpcObjectLabelResolver>,
+        resolver: Arc<dyn MoqEventLabelResolver>,
         clearance: Arc<dyn ClearanceSource>,
         audit: Arc<dyn MoqMacAuditSink>,
     ) -> Self {
@@ -141,24 +187,25 @@ impl MoqEventPep {
         }
     }
 
-    /// Check the per-track/per-event label ceiling.
+    /// Check the per-track/per-event label ceiling for an already-decoded
+    /// typed identity.
     ///
-    /// `track_or_prefix` occupies the canonical resolver's service-domain
-    /// coordinate. MoQ/event checks have no browser method discriminator, so
-    /// the resolver always receives `None`.
+    /// This is the typed core: the object is an
+    /// [`MoqEventObjectRef`], never a string, so no caller can smuggle
+    /// another plane's coordinate into this plane's resolver.
     #[must_use]
     #[cfg(not(target_arch = "wasm32"))]
     pub fn check(
         &self,
         subject: &Subject,
-        track_or_prefix: &str,
+        object: &MoqEventObjectRef,
         action: MoqEventAction,
     ) -> MacDecision {
         let Some(subject_ctx) = self.clearance.clearance(subject) else {
             let reason = MacDenyReason::NoClearance;
             self.audit_deny(
                 subject,
-                track_or_prefix,
+                &object.audit_coordinate(),
                 action,
                 None,
                 None,
@@ -166,11 +213,11 @@ impl MoqEventPep {
             );
             return MacDecision::Deny(reason);
         };
-        let Some(object_label) = self.resolver.resolve(track_or_prefix, None) else {
+        let Some(object_label) = self.resolver.resolve(object) else {
             let reason = MacDenyReason::UnlabeledObject;
             self.audit_deny(
                 subject,
-                track_or_prefix,
+                &object.audit_coordinate(),
                 action,
                 Some(*subject_ctx.clearance()),
                 None,
@@ -184,13 +231,71 @@ impl MoqEventPep {
             let reason = MacDenyReason::FloorDeny;
             self.audit_deny(
                 subject,
-                track_or_prefix,
+                &object.audit_coordinate(),
                 action,
                 Some(*subject_ctx.clearance()),
                 Some(object_label),
                 MoqMacAuditReason::Mac(reason),
             );
             MacDecision::Deny(reason)
+        }
+    }
+
+    /// Boundary check for an event-plane topic prefix.
+    ///
+    /// Parses the dot grammar exactly once; a coordinate that does not
+    /// decode into a typed identity (including the tenant-qualified
+    /// internal map keys the confidential path uses, which are not object
+    /// identities) denies and is audited as such.
+    #[must_use]
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn check_event_prefix(
+        &self,
+        subject: &Subject,
+        prefix: &str,
+        action: MoqEventAction,
+    ) -> MacDecision {
+        match MoqEventObjectRef::parse(MoqEventPlane::Event, prefix) {
+            Some(object) => self.check(subject, &object, action),
+            None => {
+                self.audit_deny(
+                    subject,
+                    prefix,
+                    action,
+                    None,
+                    None,
+                    MoqMacAuditReason::UnknownObjectIdentity,
+                );
+                MacDecision::Deny(MacDenyReason::UnlabeledObject)
+            }
+        }
+    }
+
+    /// Boundary check for a stream-plane track / broadcast name.
+    ///
+    /// Parses the slash grammar exactly once; malformed or noncanonical
+    /// names deny and are audited as unknown identities.
+    #[must_use]
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn check_stream_track(
+        &self,
+        subject: &Subject,
+        track: &str,
+        action: MoqEventAction,
+    ) -> MacDecision {
+        match MoqEventObjectRef::parse(MoqEventPlane::Stream, track) {
+            Some(object) => self.check(subject, &object, action),
+            None => {
+                self.audit_deny(
+                    subject,
+                    track,
+                    action,
+                    None,
+                    None,
+                    MoqMacAuditReason::UnknownObjectIdentity,
+                );
+                MacDecision::Deny(MacDenyReason::UnlabeledObject)
+            }
         }
     }
 
@@ -212,7 +317,7 @@ impl MoqEventPep {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn resolver(&self) -> &Arc<dyn RpcObjectLabelResolver> {
+    pub fn resolver(&self) -> &Arc<dyn MoqEventLabelResolver> {
         &self.resolver
     }
 
@@ -236,7 +341,8 @@ impl ClearanceSource for DenyAllClearanceSource {
 mod tests {
     use super::*;
     use crate::auth::mac::{
-        Assurance, CompartmentSet, DenyAllObjectResolver, Level, VerifiedKeyMaterial,
+        Assurance, CompartmentSet, DenyAllMoqEventResolver, Level, MoqEventPolicyRow,
+        MoqEventPolicyTable, VerifiedKeyMaterial,
     };
     use parking_lot::Mutex;
 
@@ -248,19 +354,22 @@ mod tests {
         SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY)
     }
 
-    struct StaticResolver {
-        secret_track: String,
-    }
-
-    impl RpcObjectLabelResolver for StaticResolver {
-        fn resolve(&self, service_domain: &str, method: Option<u16>) -> Option<SecurityLabel> {
-            assert_eq!(method, None, "event/MoQ checks are not browser RPC");
-            if service_domain == self.secret_track {
-                Some(secret_label())
-            } else {
-                Some(public_label())
-            }
-        }
+    /// Declared track policy: the event `worker` source is secret, `registry`
+    /// and the stream `streams` service are public.
+    fn declared_resolver() -> crate::auth::mac::DeclaredTrackPolicyResolver {
+        crate::auth::mac::DeclaredTrackPolicyResolver::new(
+            MoqEventPolicyTable::build(
+                1,
+                [
+                    MoqEventPolicyRow::new(MoqEventPlane::Event, "worker", secret_label()).unwrap(),
+                    MoqEventPolicyRow::new(MoqEventPlane::Event, "registry", public_label())
+                        .unwrap(),
+                    MoqEventPolicyRow::new(MoqEventPlane::Stream, "streams", public_label())
+                        .unwrap(),
+                ],
+            )
+            .unwrap(),
+        )
     }
 
     struct TieredClearance {
@@ -295,11 +404,21 @@ mod tests {
         }
     }
 
+    fn pep(resolver: Arc<dyn MoqEventLabelResolver>, audit: &Arc<RecordingAudit>) -> MoqEventPep {
+        MoqEventPep::new(
+            resolver,
+            Arc::new(TieredClearance {
+                cleared_did: "did:web:cleared".to_owned(),
+            }),
+            audit.clone(),
+        )
+    }
+
     #[test]
     fn installed_pep_audits_every_missing_clearance_deny() {
         let audit = Arc::new(RecordingAudit::default());
         let pep = MoqEventPep::new(
-            Arc::new(DenyAllObjectResolver),
+            Arc::new(DenyAllMoqEventResolver),
             Arc::new(DenyAllClearanceSource),
             audit.clone(),
         );
@@ -309,7 +428,7 @@ mod tests {
             MoqEventAction::JoinDecrypt,
         ] {
             assert_eq!(
-                pep.check(&Subject::anonymous(), "any", action),
+                pep.check_event_prefix(&Subject::anonymous(), "registry", action),
                 MacDecision::Deny(MacDenyReason::NoClearance)
             );
         }
@@ -323,17 +442,11 @@ mod tests {
     #[test]
     fn installed_pep_denies_unlabeled_object() {
         let audit = Arc::new(RecordingAudit::default());
-        let pep = MoqEventPep::new(
-            Arc::new(DenyAllObjectResolver),
-            Arc::new(TieredClearance {
-                cleared_did: "did:web:cleared".to_owned(),
-            }),
-            audit.clone(),
-        );
+        let pep = pep(Arc::new(DenyAllMoqEventResolver), &audit);
         assert_eq!(
-            pep.check(
+            pep.check_event_prefix(
                 &Subject::new("did:web:cleared"),
-                "missing",
+                "inference",
                 MoqEventAction::Subscribe,
             ),
             MacDecision::Deny(MacDenyReason::UnlabeledObject)
@@ -349,32 +462,24 @@ mod tests {
     #[test]
     fn installed_pep_enforces_label_ceiling_for_every_action() {
         let audit = Arc::new(RecordingAudit::default());
-        let pep = MoqEventPep::new(
-            Arc::new(StaticResolver {
-                secret_track: "tenant/streams/secret".to_owned(),
-            }),
-            Arc::new(TieredClearance {
-                cleared_did: "did:web:cleared".to_owned(),
-            }),
-            audit.clone(),
-        );
+        let pep = pep(Arc::new(declared_resolver()), &audit);
         for action in [
             MoqEventAction::Publish,
             MoqEventAction::Subscribe,
             MoqEventAction::JoinDecrypt,
         ] {
             assert_eq!(
-                pep.check(
+                pep.check_event_prefix(
                     &Subject::new("did:web:public"),
-                    "tenant/streams/secret",
+                    "worker.sandbox1.started",
                     action,
                 ),
                 MacDecision::Deny(MacDenyReason::FloorDeny)
             );
             assert_eq!(
-                pep.check(
+                pep.check_event_prefix(
                     &Subject::new("did:web:cleared"),
-                    "tenant/streams/secret",
+                    "worker.sandbox1.started",
                     action,
                 ),
                 MacDecision::Permit
@@ -385,5 +490,112 @@ mod tests {
         assert!(records
             .iter()
             .all(|record| record.reason == MoqMacAuditReason::Mac(MacDenyReason::FloorDeny)));
+    }
+
+    #[test]
+    fn known_stream_tracks_resolve_and_permit_through_the_typed_boundary() {
+        let audit = Arc::new(RecordingAudit::default());
+        let pep = pep(Arc::new(declared_resolver()), &audit);
+        // Public clearance dominates the declared public `streams` label.
+        assert_eq!(
+            pep.check_stream_track(
+                &Subject::new("did:web:public"),
+                "alice/streams/run-1/i0",
+                MoqEventAction::Subscribe,
+            ),
+            MacDecision::Permit
+        );
+        // The same service on the event plane is a different, unlisted object.
+        assert_eq!(
+            pep.check_event_prefix(
+                &Subject::new("did:web:public"),
+                "streams.session.x",
+                MoqEventAction::Subscribe,
+            ),
+            MacDecision::Deny(MacDenyReason::UnlabeledObject)
+        );
+    }
+
+    #[test]
+    fn unknown_or_noncanonical_coordinates_deny_as_unknown_identities() {
+        let audit = Arc::new(RecordingAudit::default());
+        let pep = pep(Arc::new(declared_resolver()), &audit);
+        let subject = Subject::new("did:web:cleared");
+
+        // Malformed event grammar (uppercase service segment, map-key form).
+        for bad in ["Worker", "5:acmeworker", "wor/ker"] {
+            assert_eq!(
+                pep.check_event_prefix(&subject, bad, MoqEventAction::Publish),
+                MacDecision::Deny(MacDenyReason::UnlabeledObject),
+                "{bad:?} must not decode"
+            );
+        }
+        // Malformed stream grammar (single segment, traversal).
+        for bad in ["alice", "alice/../streams/run"] {
+            assert_eq!(
+                pep.check_stream_track(&subject, bad, MoqEventAction::Subscribe),
+                MacDecision::Deny(MacDenyReason::UnlabeledObject),
+                "{bad:?} must not decode"
+            );
+        }
+
+        let records = audit.records.lock();
+        assert_eq!(records.len(), 5);
+        assert!(records
+            .iter()
+            .all(|record| record.reason == MoqMacAuditReason::UnknownObjectIdentity));
+    }
+
+    #[test]
+    fn unknown_plane_and_action_discriminants_have_no_typed_value_to_check() {
+        // An ingress that decoded an unknown plane or verb cannot construct
+        // the typed inputs of `check`; it denies before the PEP is reached.
+        for unknown in [2u16, 3, u16::MAX] {
+            assert_eq!(MoqEventPlane::from_discriminant(unknown), None);
+        }
+        for unknown in [3u16, 4, u16::MAX] {
+            assert_eq!(MoqEventAction::from_discriminant(unknown), None);
+        }
+        // The known set round-trips.
+        for action in [
+            MoqEventAction::Publish,
+            MoqEventAction::Subscribe,
+            MoqEventAction::JoinDecrypt,
+        ] {
+            assert_eq!(
+                MoqEventAction::from_discriminant(action.discriminant()),
+                Some(action)
+            );
+        }
+        for plane in [MoqEventPlane::Event, MoqEventPlane::Stream] {
+            assert_eq!(
+                MoqEventPlane::from_discriminant(plane.discriminant()),
+                Some(plane)
+            );
+        }
+    }
+
+    #[test]
+    fn empty_declared_table_denies_every_parseable_identity() {
+        let audit = Arc::new(RecordingAudit::default());
+        let pep = pep(
+            Arc::new(crate::auth::mac::DeclaredTrackPolicyResolver::new(
+                MoqEventPolicyTable::empty(),
+            )),
+            &audit,
+        );
+        let subject = Subject::new("did:web:cleared");
+        assert_eq!(
+            pep.check_event_prefix(&subject, "worker", MoqEventAction::Publish),
+            MacDecision::Deny(MacDenyReason::UnlabeledObject)
+        );
+        assert_eq!(
+            pep.check_stream_track(
+                &subject,
+                "alice/streams/run-1/i0",
+                MoqEventAction::Subscribe
+            ),
+            MacDecision::Deny(MacDenyReason::UnlabeledObject)
+        );
     }
 }

@@ -118,6 +118,7 @@ pub mod genesis;
 pub mod label;
 pub mod lattice;
 pub mod manifest;
+pub mod moq_resolve;
 pub mod pep;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -143,10 +144,19 @@ pub use manifest::{
     bind_time_label, import_label, ContentBoundLabel, LabeledObject, ObjectLabelResolver,
     ObjectRef, StaticNodeLabel,
 };
+pub use moq_resolve::{
+    DeclaredTrackPolicyResolver, DenyAllMoqEventResolver, MoqEventLabelResolver, MoqEventObjectRef,
+    MoqEventPlane, MoqEventPolicyRow, MoqEventPolicyTable, TrackPolicyError, MAX_TRACK_SEGMENTS,
+    MAX_TRACK_SEGMENT_BYTES, SUPPORTED_TRACK_POLICY_REVISION,
+};
 pub use pep::{
     ClearanceSource, DenyAllClearanceSource, MoqEventAction, MoqEventPep, MoqMacAuditReason,
     MoqMacAuditRecord, MoqMacAuditSink,
 };
+// `RpcObjectLabelResolver` stays exported for the RPC/VFS/9P planes. The
+// MoQ/event plane deliberately consumes only `MoqEventLabelResolver`
+// (v16 §10: coordinates cannot cross resolver types), so it is not
+// re-exported from `pep`.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
