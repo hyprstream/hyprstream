@@ -537,19 +537,27 @@ replay-domain-key-set       = "hs-rpc-replay-key-set-v1"
 ;   uint,           ; enrollment epoch
 ; ]
 ;
-; Unattributed proof-key-set thumbprint (design §4.7 / §7):
+; Unattributed proof-key-set thumbprint (design §4.7 / §7) — CONTENT-BOUND (M1):
 ;   SHA-256( enc_cbor([
 ;     replay-domain-key-set,              ; tstr, domain separator (first)
-;     signature-plan,                     ; the plan array, verbatim
-;     unattributed-key-set,               ; the embedded key set, verbatim
+;     [ * [ suite_id, [ * bstr ] ] ],     ; per signer group, IN PLAN ORDER: the
+;                                         ;   group's suite_id and its PUBLIC keys
+;                                         ;   in component order (Ed25519 x = 32
+;                                         ;   bytes; ML-DSA-65 pub = 1952 bytes)
 ;   ]) )
-; so every component key and its suite/group interpretation binds the replay key
-; and no single component thumbprint can alias a hybrid signer.
+; The attacker-chosen labels `hs_logical_signer_group` (group_id) and each `kid`
+; are NORMALIZED OUT, exactly as the authenticated derivation excludes them: a
+; SELF-ASSERTED unattributed signer MUST NOT be able to mint a fresh replay
+; namespace by permuting a group_id or kid over identical ordered public keys —
+; the same key material and `cti` must land in ONE replay namespace so the second
+; use is rejected as replay. Group boundaries and component order ARE preserved,
+; so a different suite_id, public-key byte, or group/key ordering yields a
+; different thumbprint and no single component thumbprint can alias a hybrid
+; signer (distinct cryptographic identities are never over-collapsed).
 ;
 ; thumbprint-preimage-key-set = [
 ;   replay-domain-key-set,
-;   signature-plan,
-;   unattributed-key-set,
+;   [ * [ suite-id, [ 1*2 bstr ] ] ],    ; per group: suite + ordered public keys
 ; ]
 ;
 ; Cross-implementation expected-thumbprint vectors are in

@@ -2172,7 +2172,9 @@ def main() -> None:
                 "revoked, expired, or (iss/sub/tenant)-mismatched session denies. The "
                 "session state also carries a deterministic integer clearance_epoch "
                 "(§3.4, L3) — off-wire authority state, never a credential claim; a "
-                "missing/non-integer/negative clearance_epoch denies."
+                "missing/non-integer/negative clearance_epoch denies. A sid-keyed "
+                "session is a user session, so session_kind MUST be 'interactive' (M2); "
+                "missing/wrong-type/empty/workload/service session_kind denies."
             ),
             "credential_kind_note": (
                 "sid presence is unambiguous by classification (metadata aligned with "
@@ -2224,8 +2226,14 @@ def main() -> None:
         enrollment_epoch,
     ])
     auth_thumbprint = hashlib.sha256(auth_preimage).digest()
-    # Unattributed example: P-1's plan and embedded key set, verbatim.
-    keyset_preimage = enc([replay_domain_key_set, plan_unattributed, keyset_unattributed])
+    # Unattributed example (M1): CONTENT-BOUND over P-1's suite + ordered public
+    # keys; the attacker-chosen group_id/kid labels are normalized OUT (mirroring the
+    # authenticated derivation), so a self-asserted signer cannot mint a fresh replay
+    # namespace by permuting labels over identical key material.
+    from check_proof_vectors import unattributed_replay_preimage
+    unatt_pub = sk_u_ed.public_key().public_bytes_raw()
+    keyset_preimage = unattributed_replay_preimage(
+        replay_domain_key_set, plan_unattributed, keyset_unattributed)
     keyset_thumbprint = hashlib.sha256(keyset_preimage).digest()
     thumbprints = {
         **meta,
@@ -2244,8 +2252,16 @@ def main() -> None:
             "thumbprint_sha256": auth_thumbprint.hex(),
         },
         "unattributed": {
-            "note": "unattributed proof-key-set thumbprint (design §4.7/§7) over (signature_plan, unattributed_key_set)",
+            "note": ("unattributed proof-key-set thumbprint (design §4.7/§7), CONTENT-BOUND "
+                     "over per-group (suite_id, ordered public keys); attacker-chosen "
+                     "group_id/kid labels are normalized OUT (M1). Relabeling (group_id-only "
+                     "or kid-only) with identical suite/keys yields the SAME thumbprint, so "
+                     "the replay key (thumbprint, cti) is unchanged and the second use is "
+                     "rejected as replay; a different suite, public-key byte, or group/key "
+                     "ordering yields a DIFFERENT thumbprint (identities are not over-collapsed)."),
             "from_vector": "P-1",
+            "suite_id": SUITE_CLASSICAL,
+            "component_public_keys_hex": [unatt_pub.hex()],
             "preimage_hex": keyset_preimage.hex(),
             "thumbprint_sha256": keyset_thumbprint.hex(),
         },

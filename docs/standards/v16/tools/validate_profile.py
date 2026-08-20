@@ -1192,11 +1192,44 @@ def gate_replay_thumbprints(cddl: str, positives) -> None:
     p1 = next((v for v in positives["vectors"] if v["id"] == tp["unattributed"]["from_vector"]), None)
     check(p1 is not None, "unattributed thumbprint source vector must exist")
     if p1 is not None:
+        import copy as _copy
+        from check_proof_vectors import unattributed_replay_preimage, cose_key_public
         hdr = decode(decode(bytes.fromhex(p1["cbor_hex"]))[0])
-        ks_pre = _enc([sep["key_set"], hdr[H_PLAN], hdr[H_KEYSET]])
+        plan0, ks0 = hdr[H_PLAN], hdr[H_KEYSET]
+        # M1: content-bound derivation (per-group suite + ordered public keys;
+        # attacker-chosen group_id/kid normalized out).
+        ks_pre = unattributed_replay_preimage(sep["key_set"], plan0, ks0)
+        base = hashlib.sha256(ks_pre).hexdigest()
         check(ks_pre.hex() == tp["unattributed"]["preimage_hex"], "unattributed preimage encoding drifted")
-        check(hashlib.sha256(ks_pre).hexdigest() == tp["unattributed"]["thumbprint_sha256"],
-              "unattributed replay thumbprint does not match P-1's plan/key set")
+        check(base == tp["unattributed"]["thumbprint_sha256"],
+              "unattributed replay thumbprint does not match P-1's suite/ordered keys")
+
+        def _tp(plan, keyset):
+            return hashlib.sha256(unattributed_replay_preimage(sep["key_set"], plan, keyset)).hexdigest()
+
+        # M1 collapse: a group_id-only relabel and a kid-only relabel (identical
+        # suite/keys) each map to the SAME thumbprint — the replay key (thumbprint,
+        # cti) is unchanged, so the second use is rejected as replay.
+        gid = _copy.deepcopy(plan0); gid[0][1] = gid[0][1] + 1000
+        check(_tp(gid, ks0) == base, "M1: a group_id-only relabel must keep the SAME replay thumbprint")
+        kplan = _copy.deepcopy(plan0); kks = _copy.deepcopy(ks0)
+        kplan[0][3][0][2] = b"relabel-kid"; kks[0][2] = b"relabel-kid"
+        check(_tp(kplan, kks) == base, "M1: a kid-only relabel must keep the SAME replay thumbprint")
+        # M1 no-over-collapse: a public-key byte, a suite change, or key reordering
+        # yields a DIFFERENT thumbprint, so distinct crypto identities stay distinct.
+        bk = _copy.deepcopy(ks0); pk = bytearray(cose_key_public(bk[0])); pk[0] ^= 0x01
+        bk[0][-2 if bk[0].get(1) == 1 else -1] = bytes(pk)
+        check(_tp(plan0, bk) != base, "M1: a public-key byte change must change the thumbprint")
+        bs = _copy.deepcopy(plan0); bs[0][2] = SUITE_HYBRID
+        check(_tp(bs, ks0) != base, "M1: a suite change must change the thumbprint")
+        # Verbatim-label de-fang: the OLD [sep, plan, keyset] derivation would give a
+        # DIFFERENT thumbprint for the group_id-only relabel — the bypass this closes.
+        old_base = hashlib.sha256(_enc([sep["key_set"], plan0, ks0])).hexdigest()
+        old_gid = hashlib.sha256(_enc([sep["key_set"], gid, ks0])).hexdigest()
+        check(old_base != old_gid,
+              "the verbatim-label derivation must be label-sensitive (the closed bypass)")
+        print(f"   M1 unattributed thumbprint content-bound: group_id/kid relabel collapses, "
+              f"key/suite change does not; verbatim-label bypass closed")
     print(f"   authenticated thumbprint {a['thumbprint_sha256'][:16]}… and unattributed "
           f"{tp['unattributed']['thumbprint_sha256'][:16]}… recompute exactly")
 
@@ -1915,6 +1948,11 @@ def gate_credential_context(positives, negatives) -> None:
     session_red("missing clearance_epoch", lambda cd: cd["sessions"][0].pop("clearance_epoch", None))
     session_red("non-integer clearance_epoch", lambda cd: cd["sessions"][0].__setitem__("clearance_epoch", "3"))
     session_red("negative clearance_epoch", lambda cd: cd["sessions"][0].__setitem__("clearance_epoch", -1))
+    # M2: the user-session's session_kind MUST be the interactive kind.
+    session_red("missing session_kind", lambda cd: cd["sessions"][0].pop("session_kind", None))
+    session_red("workload session_kind", lambda cd: cd["sessions"][0].__setitem__("session_kind", "workload"))
+    session_red("empty session_kind", lambda cd: cd["sessions"][0].__setitem__("session_kind", ""))
+    session_red("non-string session_kind", lambda cd: cd["sessions"][0].__setitem__("session_kind", 1))
     print(f"   K1 session-expiry bound enforced; {len(session_creds)} session credential(s) valid; "
           f"unknown/revoked/expired/mismatched sessions deny")
 

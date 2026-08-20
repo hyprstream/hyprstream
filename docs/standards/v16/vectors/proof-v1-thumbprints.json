@@ -24,9 +24,13 @@
     "thumbprint_sha256": "6a67de21ed7648f8f008e7a8604cbbd91cc89cb2eb64b77effb6c7b25161dc5b"
   },
   "unattributed": {
-    "note": "unattributed proof-key-set thumbprint (design \u00a74.7/\u00a77) over (signature_plan, unattributed_key_set)",
+    "note": "unattributed proof-key-set thumbprint (design \u00a74.7/\u00a77), CONTENT-BOUND over per-group (suite_id, ordered public keys); attacker-chosen group_id/kid labels are normalized OUT (M1). Relabeling (group_id-only or kid-only) with identical suite/keys yields the SAME thumbprint, so the replay key (thumbprint, cti) is unchanged and the second use is rejected as replay; a different suite, public-key byte, or group/key ordering yields a DIFFERENT thumbprint (identities are not over-collapsed).",
     "from_vector": "P-1",
-    "preimage_hex": "83781868732d7270632d7265706c61792d6b65792d7365742d763181a30101027768732d636f73652d7369676e2d656432353531392d76310381a201320256756e617474726962757465642d656432353531392d3181a501010256756e617474726962757465642d656432353531392d3103322006215820cd14b37f956e953194ff7fb73b3d81dcc561d61a7538094b7c3e1a643ee5f3aa",
-    "thumbprint_sha256": "0cbd553329f6f84b5ceea2601ebc3bfe28c86a2acc17ac4c8fed095bea901fcb"
+    "suite_id": "hs-cose-sign-ed25519-v1",
+    "component_public_keys_hex": [
+      "cd14b37f956e953194ff7fb73b3d81dcc561d61a7538094b7c3e1a643ee5f3aa"
+    ],
+    "preimage_hex": "82781868732d7270632d7265706c61792d6b65792d7365742d763181827768732d636f73652d7369676e2d656432353531392d7631815820cd14b37f956e953194ff7fb73b3d81dcc561d61a7538094b7c3e1a643ee5f3aa",
+    "thumbprint_sha256": "6ee75efe397d9aee87d841abd2b0672b19afa6d76a6f272243cf7666f7cb3ae8"
   }
 }

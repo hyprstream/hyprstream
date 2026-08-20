@@ -165,6 +165,35 @@ def enc(obj) -> bytes:
     raise TypeError(type(obj))
 
 
+def cose_key_public(k):
+    """The raw public key bytes of an unattributed COSE_Key: OKP (kty 1) carries it
+    at -2, AKP (kty 7) at -1."""
+    if k.get(1) == 1:
+        return k.get(-2)
+    if k.get(1) == 7:
+        return k.get(-1)
+    return None
+
+
+def unattributed_replay_preimage(sep, plan, keyset):
+    """M1: the CONTENT-BOUND unattributed replay-namespace preimage. For each signer
+    group (in plan order) it binds the group's `suite_id` and that group's public
+    keys IN COMPONENT ORDER, drawn from the embedded key set (which corresponds 1:1
+    to the plan components per B4). The attacker-chosen `group_id`/`kid` labels are
+    normalized OUT, matching the authenticated derivation's discipline — so a
+    self-asserted signer cannot mint a fresh replay namespace by permuting labels
+    over identical key material. Group boundaries and order ARE preserved (a
+    different suite, key byte, or group/key ordering yields a different thumbprint),
+    so distinct cryptographic identities are never over-collapsed."""
+    groups, idx = [], 0
+    for g in (plan or []):
+        n = len(g.get(3, []) or [])
+        pubs = [cose_key_public(k) for k in (keyset or [])[idx:idx + n]]
+        idx += n
+        groups.append([g.get(2), pubs])   # [suite_id, [ordered component public keys]]
+    return enc([sep, groups])
+
+
 def resolve_session(creds_doc, iss, sid):
     """K1: the authoritative session record keyed by exact (iss, sid) (§3.4),
     held in the credential context OUTSIDE the credential wire. None if absent."""
@@ -198,6 +227,10 @@ def validate_session(creds_doc, cred_claims, now):
     ce = s.get("clearance_epoch")
     if isinstance(ce, bool) or not isinstance(ce, int) or ce < 0:
         errs.append(f"session clearance_epoch must be a non-negative integer, got {ce!r}")
+    # M2 (§3.4): a sid-keyed session is a user session; its session_kind MUST be the
+    # exact interactive kind. Missing, wrong type, empty, or workload/service denies.
+    if s.get("session_kind") != "interactive":
+        errs.append(f"session_kind must be 'interactive' for a user-session credential, got {s.get('session_kind')!r}")
     return s, errs
 
 
@@ -506,12 +539,39 @@ def main() -> None:
         if p1 is None:
             fail("unattributed thumbprint source vector missing")
         else:
+            import copy as _copy
             hdr = decode(decode(bytes.fromhex(p1["cbor_hex"]))[0])
-            ks_pre = enc([sep["key_set"], hdr[H_PLAN], hdr[H_KEYSET]])
-            if hashlib.sha256(ks_pre).hexdigest() != tp["unattributed"]["thumbprint_sha256"]:
-                fail("unattributed replay thumbprint does not match P-1's plan/key set")
+            plan0, ks0 = hdr[H_PLAN], hdr[H_KEYSET]
+            # M1: content-bound derivation (per-group suite + ordered public keys;
+            # group_id/kid normalized out).
+            ks_pre = unattributed_replay_preimage(sep["key_set"], plan0, ks0)
+            base_tp = hashlib.sha256(ks_pre).hexdigest()
+            if base_tp != tp["unattributed"]["thumbprint_sha256"]:
+                fail("unattributed replay thumbprint does not match P-1's suite/ordered keys")
             if ks_pre.hex() != tp["unattributed"]["preimage_hex"]:
                 fail("unattributed replay preimage encoding drifted")
+
+            def _tp(plan, keyset):
+                return hashlib.sha256(unattributed_replay_preimage(sep["key_set"], plan, keyset)).hexdigest()
+
+            # Collapse (relabel -> SAME thumbprint), each label mutated independently.
+            gid_only = _copy.deepcopy(plan0); gid_only[0][1] = gid_only[0][1] + 1000
+            if _tp(gid_only, ks0) != base_tp:
+                fail("M1: a group_id-only relabel must map to the SAME replay thumbprint")
+            kid_only_plan = _copy.deepcopy(plan0); kid_only_ks = _copy.deepcopy(ks0)
+            kid_only_plan[0][3][0][2] = b"relabel-kid"
+            kid_only_ks[0][2] = b"relabel-kid"
+            if _tp(kid_only_plan, kid_only_ks) != base_tp:
+                fail("M1: a kid-only relabel must map to the SAME replay thumbprint")
+            # No over-collapse (distinct crypto identity -> DIFFERENT thumbprint).
+            bad_key = _copy.deepcopy(ks0)
+            pk = bytearray(cose_key_public(bad_key[0])); pk[0] ^= 0x01
+            bad_key[0][-2 if bad_key[0].get(1) == 1 else -1] = bytes(pk)
+            if _tp(plan0, bad_key) == base_tp:
+                fail("M1: a public-key byte change must change the replay thumbprint")
+            bad_suite = _copy.deepcopy(plan0); bad_suite[0][2] = "hs-cose-sign-ed25519-mldsa65-wns-v1"
+            if _tp(bad_suite, ks0) == base_tp:
+                fail("M1: a suite change must change the replay thumbprint")
     else:
         fail("proof-v1-thumbprints.json is missing (C1 replay thumbprint vector)")
 

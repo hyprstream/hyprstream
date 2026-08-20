@@ -479,7 +479,10 @@ Ed25519 signature over the stripped object.
   authoritative session state also carries a **deterministic integer
   `clearance_epoch`** (§3.4, L3) — an off-wire authority field, never a credential
   claim; the gate and checker require it present and a non-negative integer, and a
-  missing, non-integer, or negative `clearance_epoch` denies. The
+  missing, non-integer, or negative `clearance_epoch` denies. A sid-keyed session
+  is a user session, so its **`session_kind` MUST be the exact interactive kind**
+  (`interactive`, M2); a missing, wrong-type, empty, or workload/service
+  `session_kind` denies. The
   classical and hybrid credentials are typed `credential_kind = rfc8693` —
   **non-interactive** token-exchange / JWT-bearer tokens (a user subject with no
   interactive OIDC session) that carry no `sid`. The gate enforces this
@@ -612,12 +615,23 @@ Ed25519 signature over the stripped object.
   CBOR array whose first element is one of two distinct domain-separator literals
   (`hs-rpc-replay-primary-suite-v1` / `hs-rpc-replay-key-set-v1`). The
   authenticated preimage is `[sep, suite_id, [ordered primary-group public keys],
-  enrollment_epoch]` (approver groups excluded); the unattributed preimage is
-  `[sep, signature_plan, unattributed_key_set]`. Cross-implementation
-  expected-thumbprint vectors are in `vectors/proof-v1-thumbprints.json`, and the
-  gate and checker recompute both from the frozen derivation and assert they
-  match — so two verifier implementations sharing replay state derive the same
-  namespace for one signer.
+  enrollment_epoch]` (approver groups excluded). The unattributed preimage is
+  **content-bound (M1)**: `[sep, [ [suite_id, [ordered public keys]] per signer
+  group ]]` — it binds each group's suite and its public keys in component order
+  and **normalizes the attacker-chosen `group_id`/`kid` labels out**, exactly as
+  the authenticated derivation excludes them. A self-asserted unattributed signer
+  therefore cannot mint a fresh replay namespace by permuting a `group_id` or a
+  `kid` over identical ordered public keys: the gate and checker prove that a
+  `group_id`-only relabel and a `kid`-only relabel each keep the **same**
+  thumbprint (so the replay key `(thumbprint, cti)` is unchanged and the second use
+  is rejected as replay), while a different suite, a public-key byte, or a key
+  reordering yields a **different** thumbprint (group boundaries and order are
+  preserved, so distinct cryptographic identities are never over-collapsed).
+  Reverting to the old verbatim-label derivation turns the gate red.
+  Cross-implementation expected-thumbprint vectors are in
+  `vectors/proof-v1-thumbprints.json`, and the gate and checker recompute both from
+  the frozen derivation and assert they match — so two verifier implementations
+  sharing replay state derive the same namespace for one signer.
 - **P-5 (TokenBoundAndApproved disposition — C3).** The credential-bound primary
   group is selected by content — the plan group whose suite ID and exact component
   keys equal the `cnf`-resolved signer-suite record — and the exact-`cnf`-key
