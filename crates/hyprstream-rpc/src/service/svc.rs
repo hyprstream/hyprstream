@@ -162,6 +162,9 @@ pub struct EnvelopeContext {
     pub(crate) response_kem_recipient: Option<crate::crypto::hybrid_kem::RecipientPublic>,
     pub(crate) service_domain: Option<String>,
 
+    /// v16 proof CWT bytes, if present on the verified envelope.
+    pub(crate) envelope_proof_cwt: Option<Vec<u8>>,
+
     /// Browser-only method commitment independently checked by generated
     /// service dispatch after the sealed transcript is recovered.
     pub(crate) browser_method_discriminator: Option<u16>,
@@ -203,6 +206,7 @@ impl EnvelopeContext {
             request_nonce: envelope.envelope.nonce,
             response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
             service_domain: envelope.envelope.service_domain.clone(),
+            envelope_proof_cwt: envelope.envelope.proof_cwt.clone(),
             browser_method_discriminator: None,
             // AnySigner / networked plane — NOT a local caller (#328).
             is_local_caller: false,
@@ -231,6 +235,7 @@ impl EnvelopeContext {
             request_nonce: envelope.envelope.nonce,
             response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
             service_domain: envelope.envelope.service_domain.clone(),
+            envelope_proof_cwt: envelope.envelope.proof_cwt.clone(),
             browser_method_discriminator: None,
             // FixedSigner mutual-auth plane — genuine in-process / IPC caller (#328).
             is_local_caller: true,
@@ -263,6 +268,7 @@ impl EnvelopeContext {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             // Internal self-call that never crosses a network boundary (#328).
             is_local_caller: true,
@@ -309,6 +315,7 @@ impl EnvelopeContext {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         }
@@ -461,6 +468,7 @@ impl EnvelopeContext {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         }
@@ -706,7 +714,12 @@ pub trait RequestService: 'static {
     /// # Arguments
     ///
     /// * `ctx` - Verified envelope context with identity
-    /// * `payload` - Raw inner request bytes (Cap'n Proto encoded)
+    /// * `body` - The request body decoded exactly once by
+    ///   [`RequestService::decode_request_body`] (v16 §5.2). Generated
+    ///   dispatch reads the typed request from [`DecodedRequestBody::root`]
+    ///   — the same decoded message whose derived leaf fed the generated
+    ///   method policy and the dispatch MAC PEP — never from a second decode
+    ///   of the bytes.
     ///
     /// Returns `(response_bytes, optional_continuation)`:
     /// - `response_bytes`: Cap'n Proto encoded response sent as REP
@@ -717,8 +730,35 @@ pub trait RequestService: 'static {
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &crate::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)>;
+
+    /// Decode the signed request body **exactly once** (bounded) and derive
+    /// the full numeric method leaf path (v16 §5.2 step 4).
+    ///
+    /// The returned [`DecodedRequestBody`] is the one decode for the entire
+    /// request lifetime: its leaf path keys the generated method policy and
+    /// the dispatch MAC PEP, and its decoded message is what
+    /// [`RequestService::handle_request`] dispatches from. The leaf comes
+    /// from the signed body — never from a transport-specific hint such as
+    /// the browser transcript's method commitment, which does not exist on
+    /// other carriers and is not the signed leaf.
+    ///
+    /// This method is **required** — there is deliberately no default. A
+    /// schema-generated service delegates to its generated
+    /// `decode_<service>_request_body` function; a service with no Cap'n
+    /// Proto request schema must affirmatively construct
+    /// [`DecodedRequestBody::opaque`], which denies proof-bearing dispatch at
+    /// leaf derivation instead of silently passing a policy row it never
+    /// resolved.
+    ///
+    /// An unknown discriminant, a malformed body, or a body exceeding the
+    /// reviewed decode caps is an error — the same denial as an unlisted
+    /// leaf, never a coarser fallback.
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> Result<crate::service::DecodedRequestBody>;
 
     /// Service name (for logging and registry).
     fn name(&self) -> &str;
@@ -1467,9 +1507,16 @@ mod empty_iss_gate_tests {
         async fn handle_request(
             &self,
             _ctx: &EnvelopeContext,
-            _payload: &[u8],
+            _body: &crate::service::DecodedRequestBody,
         ) -> Result<(Vec<u8>, Option<Continuation>)> {
             Ok((vec![], None))
+        }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> Result<crate::service::DecodedRequestBody> {
+            // Byte-oriented mock: no Cap'n Proto schema, no derivable leaf.
+            Ok(crate::service::DecodedRequestBody::opaque(signed_body.to_vec()))
         }
         fn name(&self) -> &str {
             "mock"
@@ -1528,6 +1575,7 @@ mod empty_iss_gate_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller,
         }
@@ -2088,9 +2136,15 @@ mod ipc_key_identity_tests {
         async fn handle_request(
             &self,
             _ctx: &EnvelopeContext,
-            _payload: &[u8],
+            _body: &crate::service::DecodedRequestBody,
         ) -> Result<(Vec<u8>, Option<Continuation>)> {
             Ok((vec![], None))
+        }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> Result<crate::service::DecodedRequestBody> {
+            Ok(crate::service::DecodedRequestBody::opaque(signed_body.to_vec()))
         }
         fn name(&self) -> &str {
             "discovery"
@@ -2139,6 +2193,7 @@ mod ipc_key_identity_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             // AnySigner / networked-or-UDS plane.
             is_local_caller: false,
@@ -2441,6 +2496,7 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: true,
         }
@@ -2499,6 +2555,7 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         };
@@ -2567,6 +2624,7 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         }

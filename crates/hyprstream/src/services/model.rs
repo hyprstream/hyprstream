@@ -1974,18 +1974,19 @@ impl ParsedLoadRequest {
 }
 
 impl ModelService {
-    /// Try to parse a load request from the raw Cap'n Proto payload.
+    /// Try to parse a load request from the ONE decoded request body.
     /// Returns `None` for all other request variants (list, unload, health, scoped, etc.).
-    fn try_parse_load_request(payload: &[u8]) -> Option<(u64, ParsedLoadRequest)> {
+    ///
+    /// Reads from the already-decoded message (v16 §5.2) — pointer traversal,
+    /// not a second decode of the signed bytes.
+    fn try_parse_load_request(
+        body: &hyprstream_rpc::service::DecodedRequestBody,
+    ) -> Option<(u64, ParsedLoadRequest)> {
         use crate::model_capnp::model_request;
         use crate::model_capnp::KVQuantType as CKV;
         use crate::optional_capnp::option_uint32;
         use crate::model_capnp::option_k_v_quant_type;
-        let reader = capnp::serialize::read_message(
-            &mut std::io::Cursor::new(payload),
-            capnp::message::ReaderOptions::new(),
-        ).ok()?;
-        let req = reader.get_root::<model_request::Reader>().ok()?;
+        let req = body.root::<model_request::Reader>().ok()?;
         let request_id = req.get_id();
         match req.which().ok()? {
             model_request::Which::Load(data) => {
@@ -2012,7 +2013,17 @@ impl ModelService {
 
 #[async_trait(?Send)]
 impl crate::services::RequestService for ModelService {
-    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        // The ONE bounded decode (v16 §5.2): the generated decoder derives
+        // the full method leaf and returns the decoded message that policy,
+        // MAC, the load fast-path, and dispatch below all consume.
+        crate::services::generated::model_client::decode_model_request_body(signed_body)
+    }
+
+    async fn handle_request(&self, ctx: &EnvelopeContext, body: &hyprstream_rpc::service::DecodedRequestBody) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         debug!(
             "Model request from {} (id={})",
             ctx.subject(),
@@ -2024,7 +2035,7 @@ impl crate::services::RequestService for ModelService {
         // block all other model service requests (list, health, info, etc.).
         // Instead, return an immediate "accepted" response and do the actual
         // load in a Continuation (spawned via spawn_local after the REP is sent).
-        if let Some((request_id, load_data)) = Self::try_parse_load_request(payload) {
+        if let Some((request_id, load_data)) = Self::try_parse_load_request(body) {
             // This fast path bypasses generated dispatch, so reproduce its
             // mandatory operation-level authorization and audit record exactly
             // (`load` is `$scope(write)` in model.capnp).
@@ -2120,7 +2131,7 @@ impl crate::services::RequestService for ModelService {
             return Ok((response, Some(continuation)));
         }
 
-        dispatch_model(self, ctx, payload).await
+        dispatch_model(self, ctx, body).await
     }
 
     fn name(&self) -> &str {

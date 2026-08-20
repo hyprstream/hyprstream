@@ -2359,10 +2359,17 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl crate::services::RequestService for ProductionAuthorityVerifier {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(signed_body.to_vec()))
+    }
+
         async fn handle_request(
             &self,
             _ctx: &crate::services::EnvelopeContext,
-            _payload: &[u8],
+            _body: &hyprstream_rpc::service::DecodedRequestBody,
         ) -> anyhow::Result<(Vec<u8>, Option<crate::services::Continuation>)> {
             self.accepted.store(true, Ordering::Release);
             Ok((Vec::new(), None))

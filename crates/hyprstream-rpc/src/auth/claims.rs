@@ -109,6 +109,13 @@ pub struct ActClaim {
     pub act: Option<Box<ActClaim>>,
 }
 
+// v16 credentials are Reusable-only. The `OneShotTransaction` credential-use
+// profile and its atomic consume-(iss,cti) path were CUT from v16 scope
+// (operator decision `DECISION-defer-oneshot-credentials-2026-08-20`); if
+// exactly-once mutation semantics are needed later they return as a scoped
+// future amendment with its own claim allocation and review. Absence of any
+// use-profile == Reusable, so no field is carried.
+
 /// JWT claims for authentication.
 ///
 /// Casbin remains the server-side policy authority. OAuth access tokens also
@@ -352,6 +359,21 @@ impl Claims {
             act: None,
             cap: None,
         }
+    }
+
+    /// Attach a delegation actor (RFC 8693 `act`).
+    pub fn with_actor(mut self, actor: Option<ActClaim>) -> Self {
+        self.act = actor;
+        self
+    }
+
+    /// The terminal (deepest) actor subject in the delegation chain, if any.
+    pub fn terminal_actor(&self) -> Option<&str> {
+        let mut current = self.act.as_ref()?;
+        while let Some(next) = current.act.as_deref() {
+            current = next;
+        }
+        Some(current.sub.as_str())
     }
 
     /// Set a random JWT ID (RFC 7519 `jti` claim) for revocation support.
@@ -1073,7 +1095,7 @@ impl IdTokenClaims {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod id_token_tests {
     use super::*;
 
@@ -1152,5 +1174,30 @@ mod id_token_tests {
     fn test_one_or_many_collapse_single_element() {
         let aud = OneOrMany::from_vec(vec!["only-one".into()]);
         assert_eq!(aud, OneOrMany::One("only-one".into()));
+    }
+
+    // ── Delegation actor chain (RFC 8693 `act`) ─────────────────────────
+
+    /// `terminal_actor()` resolves the deepest hop of the delegation chain.
+    /// (v16 credentials are Reusable-only; the one-shot credential-use profile
+    /// was cut from scope — see the module comment.)
+    #[test]
+    fn terminal_actor_resolves_the_deepest_delegation_hop() {
+        let inner = ActClaim {
+            sub: "service:worker".into(),
+            clearance: None,
+            act: None,
+        };
+        let outer = ActClaim {
+            sub: "service:mcp".into(),
+            clearance: None,
+            act: Some(Box::new(inner)),
+        };
+        let c = Claims::new("user:alice".into(), 1000, 1030).with_actor(Some(outer));
+        assert_eq!(c.terminal_actor(), Some("service:worker"));
+
+        // No delegation chain resolves to no terminal actor.
+        let plain = Claims::new("user:alice".into(), 1000, 1030);
+        assert_eq!(plain.terminal_actor(), None);
     }
 }

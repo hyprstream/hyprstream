@@ -132,7 +132,7 @@ pub(crate) fn install_explicit_test_dispatch_pep() {
             &self,
             _ctx: &hyprstream_rpc::service::EnvelopeContext,
             _service_domain: &str,
-            _method: Option<u16>,
+            _method: Option<&[u16]>,
         ) -> hyprstream_rpc::auth::mac::MacDecision {
             hyprstream_rpc::auth::mac::MacDecision::Permit
         }

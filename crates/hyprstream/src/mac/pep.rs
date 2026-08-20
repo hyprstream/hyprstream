@@ -657,7 +657,7 @@ mod tests {
     }
 
     impl hyprstream_rpc::auth::mac::RpcObjectLabelResolver for FixtureVfsLabels {
-        fn resolve(&self, service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
+        fn resolve(&self, service_domain: &str, _method: Option<&[u16]>) -> Option<SecurityLabel> {
             match service_domain {
                 "/public" => Some(self.public),
                 "/secret" => Some(self.secret),

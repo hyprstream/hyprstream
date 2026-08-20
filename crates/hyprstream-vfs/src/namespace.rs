@@ -1939,7 +1939,7 @@ mod tests {
     /// Labels `/public/**` Public and everything else `None` (deny).
     struct PublicOnlyResolver;
     impl RpcObjectLabelResolver for PublicOnlyResolver {
-        fn resolve(&self, service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
+        fn resolve(&self, service_domain: &str, _method: Option<&[u16]>) -> Option<SecurityLabel> {
             service_domain
                 .strip_prefix("/public")
                 .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))

@@ -182,7 +182,7 @@ impl DynamicClient {
             request_id: 7,
             payload: payload.to_vec(),
             iat: envelope::current_timestamp(),
-            nonce: envelope::generate_nonce(),
+            nonce: hyprstream_rpc::envelope::generate_nonce(),
             authorization: Authorization::None,
             delegation_token: None,
             wth: None,
@@ -190,6 +190,7 @@ impl DynamicClient {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: Some(service.to_owned()),
+            proof_cwt: None,
         };
         let response_recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
             hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
@@ -244,11 +245,21 @@ impl ObservingService {
 
 #[async_trait(?Send)]
 impl RequestService for ObservingService {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(
+            signed_body.to_vec(),
+        ))
+    }
+
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
+        let payload = body.bytes();
         self.invoked.store(true, Ordering::SeqCst);
         *self.signer.lock() = Some(ctx.cnf);
         *self.key_material.lock() = Some(ctx.verified_key_material());
