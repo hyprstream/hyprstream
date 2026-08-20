@@ -13,7 +13,7 @@ Machine-readable files (the normative form — this page is the human index):
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 8 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 44 vectors that MUST deny |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 47 vectors that MUST deny |
 
 Each JSON vector carries `id`, `title`, `expect` (`accept` / `deny`),
 `structure`, `size_bytes`, `sha256`, full `cbor_hex`, and — for negatives — a
@@ -85,9 +85,17 @@ a byte-identical regeneration. It also proves the negatives deny by their rule:
   regardless of group ID, so a single signer cannot satisfy a two-group policy;
 - an **unattributed proof is verified against its embedded key set** (not any
   out-of-band table): the gate and checker require exact ordered 1:1
-  correspondence with the plan and verify each signature against the embedded
-  key, so a mismatched embedded key (N-35), surplus (N-18), duplicate (N-37), or
-  reordered (N-38) key set is rejected;
+  correspondence with the plan (keyed by `(alg, kid)`) and verify each signature
+  against the embedded key, so a mismatched embedded key (N-35), surplus (N-18),
+  duplicate (N-37), reordered (N-38), or over-the-1..2-ceiling (N-42) key set is
+  rejected;
+- an **authenticated request proof must carry the 32-byte `credential_hash`** —
+  never null (null is the unattributed case): the CDDL pins the hash in the
+  authenticated request claims rule and N-15 (authenticated, null hash, no key
+  set) is CDDL-rejected;
+- **signer-group IDs are unique and strictly ascending** across the plan: the
+  gate and checker reject a duplicate `group_id` (N-40) or an out-of-order plan
+  (N-41), so two logical groups cannot collapse to one;
 - the **size-cap** negatives N-12 (65-byte `suite_id`), N-13 (65-byte `kid`), and
   N-26 (129-byte `aud`) are each asserted over their numeric caps, and the CDDL
   cap text (`kid` = `1..64`, `aud` = `1..128` plus its `.regexp`) is pinned so a
@@ -272,6 +280,9 @@ Ed25519 signature over the stripped object.
 | N-35 | unattributed-keyset | Unattributed proof whose embedded key set does not match the signing key | 470 |
 | N-37 | unattributed-keyset | Hybrid unattributed key set duplicating the Ed25519 element (no ML-DSA-65 key) | 3942 |
 | N-38 | unattributed-keyset | Hybrid unattributed key set with elements reordered out of plan component order | 5862 |
+| N-40 | group-id-order | `signature_plan` with two groups sharing one `group_id` | 562 |
+| N-41 | group-id-order | `signature_plan` with group IDs out of ascending order | 562 |
+| N-42 | unattributed-keyset | Unattributed key set with three elements, over the 1..2 ceiling | 944 |
 
 ### Notes on individual negatives
 
@@ -365,29 +376,45 @@ Ed25519 signature over the stripped object.
 - **N-11 (EdDSA −8).** RFC 9864 fully-specified algorithms: Ed25519 components
   use −19. The current implementation signs with the polymorphic identifier, so
   this vector is also the migration's regression test.
-- **N-15 (token stripping).** The reverse direction — no credential presented
-  with a non-null signed hash — is the same rule read the other way and is a
-  presentation-context case rather than a distinct byte string; a verifier under
-  test must reject both.
+- **N-15 (authenticated null credential_hash — B5).** An authenticated request
+  proof is credential-bound, so `credential_hash` (−70001) is the REQUIRED
+  32-byte hash — never null. Null means "no credential", which is the
+  unattributed case (a key set is then required), so the authenticated request
+  claims rule pins `-70001 => credential-hash` (no null) and N-15 (authenticated
+  shape, null hash, no key set) fails structural CDDL validation. The reverse
+  direction — no credential presented with a non-null signed hash — is the same
+  rule read the other way (a presentation-context case); a verifier must reject
+  both.
+- **N-40 / N-41 (group-ID order — B6).** Signer-group IDs MUST be unique and
+  strictly ascending across the plan, so two logical groups can never collapse to
+  one `group_id` (which would let a single logical group satisfy a multi-party
+  policy) and order is canonical. CDDL cannot express this, so the gate and the
+  vector checker enforce it. N-40 repeats a `group_id` (both groups id 1) and
+  N-41 is out of ascending order (ids 2 then 1); both carry valid signatures and
+  deny solely on the group-ID rule.
 - **N-17 (unprotected authority).** Algorithm identifiers and key material in
   unprotected headers establish no authority; authenticated signer keys are
   resolved from the credential `cnf` and anchored trust stores.
-- **P-8 / N-18 / N-35 / N-37 / N-38 (unattributed key-set correspondence).** An
-  unattributed proof's embedded `hs_unattributed_key_set` is the **only** key
+- **P-8 / N-18 / N-35 / N-37 / N-38 / N-42 (unattributed key-set correspondence).**
+  An unattributed proof's embedded `hs_unattributed_key_set` is the **only** key
   material it has, so verification MUST use the embedded keys — not any
   out-of-band table. The gate and the vector checker require exact ordered 1:1
   correspondence with the plan (kid, alg, closed COSE_Key field set, key type /
-  curve or parameter set, and exact public-key byte length) and verify each
-  unattributed signature against its embedded key. P-8 is a valid hybrid
-  unattributed proof (Ed25519 + ML-DSA-65 embedded, in plan order). The causal
-  failures: **N-35** keeps a well-formed key set with a *different* public key
+  curve or parameter set, exact public-key byte length, and the frozen 1..2
+  element ceiling) and verify each unattributed signature against its embedded
+  key — the embedded map is keyed by `(alg, kid)` (B7), so a plan validly reusing
+  one kid across algorithms neither overwrites a key nor crashes. P-8 is a valid
+  hybrid unattributed proof (Ed25519 + ML-DSA-65 embedded, in plan order). The
+  causal failures: **N-35** keeps a well-formed key set with a *different* public key
   (correct kid/alg/crv, re-signed with the real key) and denies at embedded-key
   verification; **N-18** carries a surplus element; **N-37** duplicates the
   Ed25519 element (so element 1 is not the ML-DSA-65 key); **N-38** reorders the
-  two elements out of plan order. The pinned `pycddl` (0.9.1) panics validating
-  the AKP/ML-DSA-65 `COSE_Key`, so the key set is passed to it opaquely for the
-  protected-bucket pass only; its full validation is the stronger gate/checker
-  correspondence above, and the normative CDDL is unchanged.
+  two elements out of plan order; **N-42** carries three key-set elements, over
+  the frozen 1..2 ceiling. The pinned `pycddl` (0.3.0, embedding the Rust `cddl`
+  crate 0.9.1) panics validating the AKP/ML-DSA-65 `COSE_Key`, so the key set is
+  passed to it opaquely for the protected-bucket pass only; its full validation
+  (including the 1..2 element cap) is the stronger gate/checker correspondence
+  above, and the normative CDDL is unchanged.
 - **N-23 / N-24 (recipient/encryption relation).** The frozen 4-key
   `response_binding` (Gate-2 §19 #3/#4) makes the recipient non-null iff
   `protection_mode` is encrypted. N-23 is the encrypted shape with a null

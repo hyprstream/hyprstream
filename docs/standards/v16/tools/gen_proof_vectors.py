@@ -1735,6 +1735,82 @@ def main() -> None:
             notes="Element 0 is ML-DSA-65 where component 0 is Ed25519.",
         )
 
+        # N-40 (B6): two logical groups sharing one group_id. Both signatures are
+        # valid and the (alg, kid) pairs are distinct (so B2 passes), but the two
+        # groups collapse to a single group_id — a single logical group can then
+        # masquerade as two for a multi-party policy.
+        n40_plan = [
+            group(1, SUITE_CLASSICAL, [component(ALG_ED25519, KID_CLIENT_ED)]),
+            group(1, SUITE_CLASSICAL, [component(ALG_ED25519, KID_APPROVER_ED)]),  # duplicate group_id
+        ]
+        n40_body = {H_CRIT: CRIT_SIGN_BODY_AUTH, H_TYP: TYP_REQUEST, H_DOMAIN: DOMAIN_REQUEST, H_PLAN: n40_plan}
+        n40_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_CLIENT_ED, H_GROUP: 1}, sk_c_ed),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_APPROVER_ED, H_GROUP: 1}, sk_a_ed),
+        ]
+        n40, _, _ = sign_multi(n40_body, request_claims(credential_hash=CREDENTIAL_HASH), n40_entries)
+        record(
+            negatives, "N-40",
+            "signature_plan with two groups sharing one group_id",
+            "deny", "COSE_Sign", n40,
+            deny_class="group-id-order",
+            deny_rule="group IDs MUST be unique and strictly ascending across the plan",
+            notes="Both signatures valid; distinct (alg,kid); denies solely on the duplicate group_id.",
+        )
+
+        # N-41 (B6): group IDs out of ascending order (2 then 1).
+        n41_plan = [
+            group(2, SUITE_CLASSICAL, [component(ALG_ED25519, KID_CLIENT_ED)]),
+            group(1, SUITE_CLASSICAL, [component(ALG_ED25519, KID_APPROVER_ED)]),  # descending
+        ]
+        n41_body = {H_CRIT: CRIT_SIGN_BODY_AUTH, H_TYP: TYP_REQUEST, H_DOMAIN: DOMAIN_REQUEST, H_PLAN: n41_plan}
+        n41_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_CLIENT_ED, H_GROUP: 2}, sk_c_ed),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_APPROVER_ED, H_GROUP: 1}, sk_a_ed),
+        ]
+        n41, _, _ = sign_multi(n41_body, request_claims(credential_hash=CREDENTIAL_HASH), n41_entries)
+        record(
+            negatives, "N-41",
+            "signature_plan with group IDs out of ascending order",
+            "deny", "COSE_Sign", n41,
+            deny_class="group-id-order",
+            deny_rule="group IDs MUST be strictly ascending across the plan",
+            notes="Both signatures valid; groups are 2 then 1.",
+        )
+
+        # N-42 (B8): unattributed key set with three elements, over the frozen
+        # 1..2 element ceiling (the pycddl AKP workaround drops the `1*2` bound,
+        # so the gate/checker re-impose it). Three classical groups, three
+        # embedded OKP keys, all signatures valid.
+        n42_plan = [
+            group(1, SUITE_CLASSICAL, [component(ALG_ED25519, b"unattributed-ed25519-1")]),
+            group(2, SUITE_CLASSICAL, [component(ALG_ED25519, b"unattributed-ed25519-2")]),
+            group(3, SUITE_CLASSICAL, [component(ALG_ED25519, b"unattributed-ed25519-3")]),
+        ]
+        n42_keyset = [
+            cose_key_okp_ed25519(b"unattributed-ed25519-1", sk_u_ed.public_key().public_bytes_raw()),
+            cose_key_okp_ed25519(b"unattributed-ed25519-2", sk_a_ed.public_key().public_bytes_raw()),
+            cose_key_okp_ed25519(b"unattributed-ed25519-3", sk_s_ed.public_key().public_bytes_raw()),
+        ]
+        n42_body = {
+            H_CRIT: CRIT_SIGN_BODY_UNATTRIBUTED, H_TYP: TYP_REQUEST, H_DOMAIN: DOMAIN_REQUEST,
+            H_PLAN: n42_plan, H_KEYSET: n42_keyset,
+        }
+        n42_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: b"unattributed-ed25519-1", H_GROUP: 1}, sk_u_ed),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: b"unattributed-ed25519-2", H_GROUP: 2}, sk_a_ed),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: b"unattributed-ed25519-3", H_GROUP: 3}, sk_s_ed),
+        ]
+        n42, _, _ = sign_multi(n42_body, request_claims(credential_hash=None, nonce=CHALLENGE), n42_entries)
+        record(
+            negatives, "N-42",
+            "Unattributed key set with three elements, over the 1..2 ceiling",
+            "deny", "COSE_Sign", n42,
+            deny_class="unattributed-keyset",
+            deny_rule="the unattributed key set carries 1..2 elements (frozen cap)",
+            notes="All signatures valid; denies solely on the over-ceiling key-set size.",
+        )
+
     meta = {
         "vector_set_version": 1,
         "profile": "hs-rpc-proof-v1",

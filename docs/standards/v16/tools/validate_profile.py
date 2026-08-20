@@ -209,11 +209,12 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
           f"structural pass (re-checked numerically in section 3):")
     for s in strips:
         print(f"     - {s}")
-    # pycddl 0.9.1 PANICS (Rust unwrap-on-None) validating the AKP/ML-DSA-65
-    # COSE_Key inside the unattributed key set, so the key set is passed opaquely
-    # to pycddl for the protected-bucket pass ONLY. It is NOT left unvalidated:
-    # section 9 (B4) enforces the full key shape (closed COSE_Key field set,
-    # kty/crv or parameter set, exact public-key byte length), exact ordered 1:1
+    # pycddl 0.3.0 (embedding the Rust `cddl` crate 0.9.1) PANICS (unwrap-on-None)
+    # validating the AKP/ML-DSA-65 COSE_Key inside the unattributed key set, so
+    # the key set is passed opaquely to pycddl for the protected-bucket pass ONLY.
+    # It is NOT left unvalidated: section 9 (B4) enforces the full key shape
+    # (closed COSE_Key field set, kty/crv or parameter set, exact public-key byte
+    # length), the frozen 1..2 element ceiling (B8), exact ordered 1:1
     # correspondence with the plan, and embedded-key signature verification —
     # strictly stronger than the CDDL key-shape rule. The normative CDDL is
     # unchanged.
@@ -395,6 +396,40 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
         check(len(pk) != len(set(pk)),
               "N-33 plan must repeat one (alg, kid) across two groups")
         print("   B2 N-33: (alg, kid) repeated across two groups — denies by plan-key uniqueness")
+
+    # Thread B6 (cddl:382) — group IDs MUST be unique and strictly ascending
+    # across the plan (CDDL cannot express it; enforced in gate + checker). Every
+    # positive is strictly ascending; N-40 repeats a group_id, N-41 is out of
+    # order — each must be flagged.
+    def group_ids(pl):
+        return [g.get(1) for g in (pl or []) if isinstance(g, dict)]
+
+    def strictly_ascending_unique(ids):
+        return ids == sorted(set(ids)) and len(ids) == len(set(ids))
+    for v in positives["vectors"]:
+        gids = group_ids(plan_of(v["cbor_hex"]))
+        check(strictly_ascending_unique(gids),
+              f"positive {v['id']} group IDs must be unique and strictly ascending, got {gids}")
+    for nid, what in (("N-40", "duplicate group_id"), ("N-41", "out of ascending order")):
+        v = by_id.get(nid)
+        check(v is not None, f"group-id negative {nid} ({what}) is missing")
+        if v is not None:
+            gids = group_ids(plan_of(v["cbor_hex"]))
+            check(not strictly_ascending_unique(gids),
+                  f"{nid} plan must violate unique-strictly-ascending group IDs, got {gids}")
+            print(f"   B6 {nid} rejected ({what}): group IDs {gids}")
+
+    # Thread B5 (cddl:115) — an authenticated request proof is credential-bound,
+    # so a null credential_hash (no key set) MUST deny structurally. N-15 is that
+    # shape and must be rejected by the authenticated request claims rule.
+    n15 = by_id.get("N-15")
+    check(n15 is not None, "N-15 (authenticated null credential_hash) is missing")
+    if n15 is not None:
+        try:
+            req_claims.validate_cbor(payload_of(n15["cbor_hex"]))
+            check(False, "N-15: authenticated null credential_hash is NOT rejected by the CDDL")
+        except ValidationError:
+            print("   B5 N-15 rejected by CDDL (authenticated request requires a 32-byte credential_hash)")
 
     # The relation/enum negatives MUST be rejected by the CDDL itself: the
     # machine proof that the closed map, the two enum axes, and the
@@ -925,9 +960,10 @@ def gate_unattributed_keyset(positives, negatives) -> None:
             print(f"   {v['id']} key set corresponds 1:1 to the plan ({len(emb)} embedded keys)")
 
     # Correspondence-failure negatives: surplus (N-18), duplicate (N-37),
-    # reordered (N-38) each break the 1:1 ordered correspondence.
+    # reordered (N-38), and over-the-1..2-ceiling (N-42, B8) each break the
+    # ordered/bounded correspondence.
     for nid, what in (("N-18", "surplus key"), ("N-37", "duplicate element"),
-                      ("N-38", "reordered elements")):
+                      ("N-38", "reordered elements"), ("N-42", "over the 1..2 ceiling")):
         v = by_id.get(nid)
         check(v is not None, f"unattributed-keyset negative {nid} ({what}) is missing")
         if v is None:
@@ -940,7 +976,7 @@ def gate_unattributed_keyset(positives, negatives) -> None:
 
     # Embedded-key verification failure: N-35 keeps a well-formed key set (right
     # kid/alg/crv) but a DIFFERENT public key, so its signature must not verify
-    # against the embedded key.
+    # against the embedded key. Embedded keys are keyed by (alg, kid) (B7).
     n35 = by_id.get("N-35")
     check(n35 is not None, "unattributed-keyset negative N-35 (mismatched key) is missing")
     if n35 is not None:
@@ -948,11 +984,11 @@ def gate_unattributed_keyset(positives, negatives) -> None:
         pm = decode(obj[0])
         emb, err = unattributed_keyset_correspondence(pm.get(H_KEYSET), components_of(pm.get(H_PLAN)))
         check(err is None, f"N-35 key set must be shape-valid (only the key bytes differ): {err}")
-        kid = pm.get(H_KID)
-        if emb is not None and emb.get(kid) is not None:
+        akid = (pm.get(H_ALG), pm.get(H_KID))
+        if emb is not None and emb.get(akid) is not None:
             tbs = _enc(["Signature1", obj[0], b"", obj[2]])
             try:
-                Ed25519PublicKey.from_public_bytes(emb[kid]).verify(obj[3], tbs)
+                Ed25519PublicKey.from_public_bytes(emb[akid]).verify(obj[3], tbs)
                 check(False, "N-35 signature must NOT verify against its (mismatched) embedded key")
             except InvalidSignature:
                 print("   B4 N-35 rejected: signature does not verify against the embedded key")

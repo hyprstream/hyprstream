@@ -171,6 +171,10 @@ def unattributed_keyset_correspondence(keyset, components):
     against."""
     if not isinstance(keyset, list):
         return None, "hs_unattributed_key_set is not an array"
+    # B8: the frozen cap is 1..2 key-set elements (the pycddl AKP workaround
+    # drops the CDDL `1*2` occurrence bound, so re-impose it here).
+    if not (1 <= len(keyset) <= 2):
+        return None, f"key set has {len(keyset)} elements, must be 1..2"
     if len(keyset) != len(components):
         return None, (f"key set has {len(keyset)} elements, plan has "
                       f"{len(components)} components")
@@ -201,7 +205,9 @@ def unattributed_keyset_correspondence(keyset, components):
                 return None, f"key set element {i} ML-DSA-65 pub must be {ML_DSA_65_PUB_BYTES} bytes"
         else:
             return None, f"key set element {i} uses algorithm {alg} outside the profile"
-        embedded[kid] = bytes(pub)
+        # B7: key by (alg, kid) — the normative uniqueness key — so a hybrid plan
+        # reusing one kid across algorithms does not overwrite (or crash).
+        embedded[(alg, kid)] = bytes(pub)
     return embedded, None
 
 
@@ -342,11 +348,15 @@ def main() -> None:
         plan_keys = [(alg, kid) for (_grp, alg, kid) in components]
         if len(plan_keys) != len(set(plan_keys)):
             fail(f"{vec['id']}: plan repeats an (alg, kid) across groups")
+        # B6: group IDs MUST be unique and strictly ascending across the plan.
+        group_ids = [grp[1] for grp in plan]
+        if group_ids != sorted(set(group_ids)) or len(group_ids) != len(set(group_ids)):
+            fail(f"{vec['id']}: group IDs must be unique and strictly ascending, got {group_ids}")
 
         # B4: an unattributed proof (embedded hs_unattributed_key_set) is verified
         # against its OWN key set, which must correspond 1:1 in order to the plan.
-        # `embedded` maps kid -> the embedded public key that each signature must
-        # verify against (None for authenticated proofs, which use enrolled keys).
+        # `embedded` maps (alg, kid) -> the embedded public key that each signature
+        # must verify against (None for authenticated proofs, which use enrolled keys).
         embedded = None
         if H_KEYSET in body_hdr:
             embedded, err = unattributed_keyset_correspondence(body_hdr[H_KEYSET], components)
@@ -369,7 +379,7 @@ def main() -> None:
             if (grp, alg, kid) not in components:
                 fail(f"{vec['id']}: signature does not match a plan component")
             verify_component(vec, alg, kid, tbs, tail,
-                             pub_override=(embedded.get(kid) if embedded else None))
+                             pub_override=(embedded.get((alg, kid)) if embedded else None))
         else:
             seen = []
             seen_keys = set()
@@ -391,7 +401,7 @@ def main() -> None:
                 seen_keys.add((alg, kid))
                 verify_component(
                     vec, alg, kid, enc(["Signature", body_protected, sprot, b"", payload]), sig,
-                    pub_override=(embedded.get(kid) if embedded else None),
+                    pub_override=(embedded.get((alg, kid)) if embedded else None),
                 )
             if len(seen) != len(components):
                 fail(f"{vec['id']}: signature entries do not cover the plan exactly")

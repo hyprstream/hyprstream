@@ -105,14 +105,19 @@ max-aud-bytes    = 128
 
 ; Authenticated (credential-bound) request proofs. The server challenge is
 ; OPTIONAL here (§4.7: for authenticated proofs the challenge is a deployment
-; option). Unattributed proofs use the stricter rule below, which REQUIRES it.
+; option). An authenticated proof is credential-bound, so `credential_hash` is
+; the REQUIRED 32-byte SHA-256 — never null: a null hash means "no credential",
+; which is the unattributed case (a key set is then REQUIRED). Reserving null to
+; the unattributed rule closes the shape where an authenticated object carries
+; neither a credential-bound key source nor an embedded key set (B5).
+; Unattributed proofs use the stricter rule below, which REQUIRES the challenge.
 hyprstream-proof-claims = {
   3  => canonical-service-domain,   ; aud   — intended recipient service
   4  => timestamp,                  ; exp   — proof expiry
   6  => timestamp,                  ; iat   — proof issuance
   7  => request-id,                 ; cti   — the request identifier
   ? 10 => server-challenge,         ; Nonce — RFC 9711; optional (authenticated)
-  -70001 => credential-hash / null,
+  -70001 => credential-hash,        ; REQUIRED 32-byte hash (never null; null is unattributed-only)
   -70002 => capnp-schema-id,
   -70003 => capnp-body-bytes,
   -70004 => response-binding / null,
@@ -369,15 +374,18 @@ logical-signer-group  = uint .le 255       ; frozen ceiling (Gate-2 value 6)
 ; groups that actually sign: no plan group may lack its complete signatures and
 ; no signature may sit outside the plan.
 ;
-; Groups are sorted by ascending group_id and group IDs are unique. Component
+; Group IDs are unique and STRICTLY ASCENDING across the plan (so two logical
+; groups can never collapse to one group_id, and order is canonical). Component
 ; order is the exact order declared by the versioned suite registry, and every
 ; (alg, kid) pair is unique across the complete plan — regardless of group ID:
 ; one key MUST NOT sign under two logical groups, or a single signer could
-; satisfy a multi-party (k-of-n / all) policy. CDDL cannot express uniqueness of
-; a computed (alg, kid) tuple across array elements, so this is a NORMATIVE rule
+; satisfy a multi-party (k-of-n / all) policy. CDDL cannot express either the
+; strictly-ascending-unique group_id ordering (B6) or uniqueness of a computed
+; (alg, kid) tuple (B2) across array elements, so both are NORMATIVE rules
 ; enforced mechanically by validate_profile.py and check_proof_vectors.py (whose
-; duplicate-component key is (alg, kid), NOT (group, alg, kid)); N-33 repeats one
-; (alg, kid) across two groups and denies by this rule.
+; duplicate-component key is (alg, kid), NOT (group, alg, kid)). N-33 repeats one
+; (alg, kid) across two groups; N-40 repeats a group_id and N-41 is out of
+; ascending order; each denies by these rules.
 
 signature-plan = [ 1*8 signer-group ]
 
