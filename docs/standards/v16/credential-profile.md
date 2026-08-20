@@ -34,6 +34,36 @@ request proof is signed by keys the credential's `cnf` resolves to (or, with no
 credential, by a self-asserted key set that grants nothing) and never by an
 issuer key.
 
+### 1.1 Confirmation-method encoding: hybrid credentials are JWT-only in v16
+
+The `cnf` must resolve to the primary signer group's **suite ID + exact ordered
+component keys** (§5). The two encodings express this differently:
+
+- **JWT** carries `cnf.hs_signer_suite` = base64url(SHA-256(RFC 8949
+  deterministic-CBOR `[suite_id, [ordered raw component public keys]]`)), a
+  profile-defined RFC 8747 confirmation method that binds a signer-suite record of
+  **any** component count — one key (classical) or two (hybrid Ed25519 + ML-DSA-65).
+- **CWT** carries the standard RFC 8747 `cnf` (claim 8) as a **single `COSE_Key`**
+  (member 1). One `COSE_Key` can pin exactly one key, so the CWT `cnf` binds a
+  **classical (single-key)** primary group only.
+
+**v16 defines no multi-key CWT confirmation method** — no label, no CBOR shape, is
+allocated or reserved for it (the same deferral discipline this profile applies to
+CWT `sid` in §3). Therefore, normatively:
+
+- a **hybrid** proof credential MUST be an `at+jwt` (JWT) token using
+  `cnf.hs_signer_suite`;
+- an issuer MUST NOT issue a CWT credential whose `cnf` purports to bind a hybrid
+  signer suite (a single `COSE_Key` cannot pin the hybrid group's two component
+  keys), and a verifier MUST reject such a presentation: the single-key `cnf`
+  resolves to a classical record that matches no group of the hybrid proof's plan,
+  so it denies (no primary group resolves);
+- a **classical** credential may be JWT **or** CWT; N-1's issuer-signed CWT with a
+  single RFC 8747 `COSE_Key` `cnf` remains valid.
+
+A future amendment may allocate and specify a multi-key CWT confirmation method
+with its own canonical vectors; until then, CWT hybrid `cnf` is unavailable.
+
 ## 2. Claims table
 
 Required semantic fields for authenticated dispatch:
@@ -46,7 +76,7 @@ Required semantic fields for authenticated dispatch:
 | Expiry | `exp` | `exp` (4) | REQUIRED | Credential expiry. Bounds the proof: a proof `exp` MUST NOT exceed credential or session expiry. |
 | Issued at | `iat` | `iat` (6) | REQUIRED | Issuance time. |
 | Credential ID | `jti` | `cti` (7) | REQUIRED | Unique credential instance identifier. JWT uses a text `jti`; CWT uses a byte-string `cti`. |
-| PoP binding | `cnf` | `cnf` (8) | REQUIRED for dispatch | RFC 7800 / RFC 8747 proof-of-possession key binding. Resolves to exactly one signer-suite record pinning the exact component keys, principal, and enrollment epoch. |
+| PoP binding | `cnf` | `cnf` (8) | REQUIRED for dispatch | RFC 7800 / RFC 8747 proof-of-possession key binding. Resolves to exactly one signer-suite record identified by suite ID + the exact ordered component keys of the primary signer group (the verifier additionally consistency-checks principal and enrollment epoch from its own enrollment record; §5). **CWT `cnf` is a single RFC 8747 `COSE_Key` and binds a classical (single-key) primary group only.** A **hybrid** (multi-key) primary group has no v16 CWT confirmation method, so hybrid credentials are **`at+jwt` (JWT) only** — see §1.1. |
 | Tenant | `tenant` | −70005 | REQUIRED | Verified tenant/Casbin domain. Missing, empty, or wildcard tenants deny. CWT uses the integer private-use key −70005 (Gate-2 §19 #10); the text name is JWT-only. |
 | Clearance | `clearance` | −70006 | REQUIRED for authenticated dispatch | Authority-issued MAC clearance (`Level`/`Compartments`; §8). Assurance is **not** carried here: it is derived from verified key material. A claim may restrict assurance but can never raise it. A clearance-less credential denies. CWT uses the integer private-use key −70006. |
 | Scope / capability | `scope` | `scope` (9) | Where applicable | Least-authority TE/capability ceiling. Consumers deriving authority from scopes fail closed when the claim is absent. |

@@ -64,14 +64,22 @@ def _decode(b: bytes, strict: bool):
         raise StrictError("indefinite length")
     if ai < 24:
         val = ai
-    elif ai == 24:
-        val, rest = rest[0], rest[1:]
-        if strict and val < 24:
-            raise StrictError("non-minimal integer encoding")
-    elif ai in (25, 26, 27):
-        n = {25: 2, 26: 4, 27: 8}[ai]
+    elif ai in (24, 25, 26, 27):
+        # Additional information 24/25/26/27 carry a 1/2/4/8-byte argument. The
+        # argument bytes MUST be present before slicing — a header that declares
+        # more bytes than remain is a truncated value and MUST fail closed, not
+        # silently read a short/zero value (G2). Applies to every major type.
+        n = {24: 1, 25: 2, 26: 4, 27: 8}[ai]
+        if len(rest) < n:
+            raise StrictError(
+                f"truncated additional-information argument: header declares {n} byte(s), "
+                f"{len(rest)} remain"
+            )
         val, rest = int.from_bytes(rest[:n], "big"), rest[n:]
-        if strict and val < {25: 24, 26: 0x10000, 27: 0x100000000}[ai]:
+        # Minimal-argument-length: a value MUST use the shortest argument that can
+        # hold it (24..255 -> ai 24; 256..65535 -> ai 25; etc.).
+        floor = {24: 24, 25: 0x100, 26: 0x10000, 27: 0x100000000}[ai]
+        if strict and val < floor:
             raise StrictError("non-minimal integer encoding")
     else:
         raise StrictError(f"unsupported additional information {ai}")

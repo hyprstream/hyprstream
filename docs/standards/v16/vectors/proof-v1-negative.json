@@ -618,6 +618,18 @@
       "deny_class": "cbor-truncation",
       "deny_rule": "a length-delimited value must have at least the declared number of bytes",
       "notes": "Header widened 58 40 -> 58 41, no byte added; strict decoder rejects (len(rest) < val)."
+    },
+    {
+      "id": "N-49",
+      "title": "Truncated CBOR integer: claims iat argument `19 00` declares 2 bytes with 1 present",
+      "expect": "deny",
+      "structure": "COSE_Sign1",
+      "size_bytes": 244,
+      "sha256": "64d00c5d9367cc79162f1e390e889e77050bee9eae1d68c9acb450a85b4f6f0e",
+      "cbor_hex": "8458a9a7013202833a000111d53a000111d43a000111d30450636c69656e742d656432353531392d311078246170706c69636174696f6e2f766e642e6879707273747265616d2e70726f6f662b6377743a000111d37768732d7270632d726571756573742d70726f6f662d76313a000111d481a30101027768732d636f73652d7369676e2d656432353531392d76310381a201320250636c69656e742d656432353531392d313a000111d501a044a1061900584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "deny_class": "integer-truncation",
+      "deny_rule": "a CBOR additional-information argument (ai 24/25/26/27) must carry its full 1/2/4/8-byte length",
+      "notes": "Outer array decodes; the payload integer argument is truncated (ai=25, 1 of 2 bytes)."
     }
   ]
 }

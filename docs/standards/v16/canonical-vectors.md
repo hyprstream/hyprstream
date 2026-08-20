@@ -13,7 +13,7 @@ Machine-readable files (the normative form — this page is the human index):
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 8 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 53 vectors that MUST deny |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 54 vectors that MUST deny |
 | [`vectors/proof-v1-thumbprints.json`](vectors/proof-v1-thumbprints.json) | Cross-implementation replay-namespace thumbprint vectors (C1) |
 | [`vectors/proof-v1-credentials.json`](vectors/proof-v1-credentials.json) | Frozen `verifier_now` clock (F1) and the issuer-signed at+jwt tokens the authenticated positives hash (F2) |
 
@@ -153,6 +153,19 @@ enrollment). The gate proves the full chain load-bearing with re-signed
 counter-proofs — a flipped/foreign issuer signature, wrong audience, missing
 claim, wrong `typ`, an expired window, a `cnf` resolving to no group, and a
 tampered proof hash each turn it red.
+
+**Encoding matrix (G1).** `cnf.hs_signer_suite` is a **JWT** confirmation method and
+binds a signer-suite record of any component count. A **CWT** `cnf` is a single
+RFC 8747 `COSE_Key` (claim 8) — it can pin exactly one key, so it binds a
+**classical** (single-key) primary group only (N-1 is that shape). v16 defines no
+multi-key CWT confirmation method (none is allocated or reserved), so a **hybrid**
+proof credential MUST be an `at+jwt` (JWT) token; a CWT credential whose `cnf`
+purports to confirm a hybrid suite is rejected — its single-key `cnf` resolves to
+a classical record that matches no group of the hybrid proof's plan. The gate pins
+this disposition (credential-profile §1.1), asserts the shipped hybrid credential
+is a compact JWT and the only shipped CWT credential (N-1) is single-key, and
+proves the causal reject: a single-`COSE_Key` `cnf` resolves the classical primary
+(P-4) but denies the hybrid suite (P-2). See credential-profile.md §1.1.
 
 ## Common fixtures
 
@@ -336,6 +349,7 @@ Ed25519 signature over the stripped object.
 | N-46 | nonce-length | Unattributed proof whose Nonce is 65 bytes, over the 64-byte ceiling | 520 |
 | N-47 | parser-cap | `kid` of 0 bytes, under the 1-byte floor | 1594 |
 | N-48 | cbor-truncation | Truncated CBOR: response signature bstr header declares 65 bytes with 64 present | 374 |
+| N-49 | integer-truncation | Truncated CBOR integer: claims `iat` argument `19 00` declares 2 bytes with 1 present | 244 |
 
 ### Notes on individual negatives
 
@@ -400,6 +414,19 @@ Ed25519 signature over the stripped object.
   parser; the causality inventory (§12) asserts N-48 fails to decode with a
   truncation error. A `tstr` truncation probe (`63 61 61` — three declared bytes,
   two present) exercises the same guard on the text-string branch.
+- **N-49 (strict CBOR integer-argument truncation, G2).** The same fail-closed
+  rule applies to the **additional-information argument** of an integer (ai
+  24/25/26/27 carry a 1/2/4/8-byte argument). N-49 is a proof whose claims payload
+  encodes `iat` as `19 00` — an `ai=25` header declaring a 2-byte argument with
+  only one byte present. The outer `COSE_Sign1` array decodes, but the payload's
+  integer argument is truncated, so the shared strict decoder raises
+  (`len(rest) < n`) instead of reading a short/zero value; the causality inventory
+  (§12) decodes the payload and asserts the truncation. This closes the sibling of
+  the length-delimited fix at the integer-argument level, and the same reader
+  restores the correct minimal-argument floor (a value in `24..255` must use the
+  1-byte `ai=24`, so `19 00 18` = 24-in-two-bytes is rejected as non-minimal). The
+  exact-length counterpart `19 01 00` (= 256, the smallest value that legitimately
+  needs `ai=25`) decodes.
 - **N-12 / N-28 (suite ↔ component-plan binding).** Each suite_id is bound to its
   exact ordered algorithms and component count: `hs-cose-sign-ed25519-v1` is
   exactly one Ed25519 component, `hs-cose-sign-ed25519-mldsa65-wns-v1` is exactly

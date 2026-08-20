@@ -1327,6 +1327,20 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
                 return False, "decoded without a truncation error"
             except StrictError as e:
                 return ("truncat" in str(e)), f"strict decoder: {e}"
+        # G2: a truncated integer ARGUMENT inside the claims payload (the outer
+        # array decodes, but the payload integer's declared bytes are not present).
+        if dc == "integer-truncation":
+            if obj is None:
+                try:
+                    decode(raw)
+                    return False, "decoded without a truncation error"
+                except StrictError as e:
+                    return ("truncat" in str(e)), f"outer strict decoder: {e}"
+            try:
+                decode(obj[2])
+                return False, "payload integer decoded without a truncation error"
+            except StrictError as e:
+                return ("truncat" in str(e)), f"payload strict decoder: {e}"
         if obj is None or pm is None:
             return False, "unexpectedly non-decodable"
         claims = claims_or_none(obj)
@@ -1671,6 +1685,41 @@ def gate_credential_context(positives, negatives) -> None:
         check(_suite_thumbprint(SUITE_CLASSICAL, [approver_pub]) != cnf_classical,
               "the approver group must NOT match the primary credential cnf")
     print(f"   F2 approver group bound to its own enrollment (cnf resolves to the primary only)")
+
+    # ---- G1: hybrid credentials are at+jwt-only; CWT cnf is single-key/classical.
+    prof = CREDENTIAL_PATH.read_text()
+    for pin in ("hybrid credentials are", "at+jwt", "no v16 CWT confirmation method",
+                "single RFC 8747 `COSE_Key`"):
+        check(pin in prof, f"credential-profile must state the hybrid-JWT-only disposition (missing: {pin!r})")
+    # The shipped hybrid credential MUST be a compact JWT with the exact cnf member.
+    hyb = creds["credentials"]["hybrid"]
+    check(hyb.get("encoding") == "at+jwt" and hyb["token"].count(".") == 2,
+          "the hybrid credential fixture must be a compact at+jwt (JWT)")
+    check("hs_signer_suite" in hyb["claims"]["cnf"],
+          "the hybrid credential cnf must use the hs_signer_suite confirmation method")
+    # The ONLY shipped CWT credential (N-1) is classical: its RFC 8747 cnf (claim 8)
+    # is a single COSE_Key (one key), which cannot pin a hybrid two-key group.
+    n1 = next((v for v in negatives["vectors"] if v["id"] == "N-1"), None)
+    check(n1 is not None, "N-1 (issuer-signed CWT credential) must exist")
+    if n1 is not None:
+        n1_claims = decode(decode(bytes.fromhex(n1["cbor_hex"]))[2])
+        n1_cnf = n1_claims.get(8)
+        check(isinstance(n1_cnf, dict) and set(n1_cnf) == {1} and isinstance(n1_cnf[1], dict),
+              "the only shipped CWT credential (N-1) must carry a single RFC 8747 COSE_Key cnf")
+    # Causal reject: a single-COSE_Key CWT-style cnf resolves to the CLASSICAL
+    # record, which matches a classical primary (P-4) but NOT the hybrid group of a
+    # hybrid proof (P-2) — so a CWT credential purporting to confirm the hybrid
+    # suite via one COSE_Key denies (no primary group resolves).
+    client_ed_pub = ed_by_kid.get(b"client-ed25519-1")
+    check(client_ed_pub is not None, "client Ed25519 key must resolve for the G1 counter-proof")
+    if client_ed_pub is not None:
+        single_key_cnf = _suite_thumbprint(SUITE_CLASSICAL, [client_ed_pub])
+        m_hyb, _ = primary_groups_matching("P-2", single_key_cnf)
+        m_cls, _ = primary_groups_matching("P-4", single_key_cnf)
+        check(m_hyb == [], f"a single-COSE_Key (CWT) cnf must NOT resolve P-2's hybrid group; matched {m_hyb}")
+        check(m_cls == [1], f"a single-COSE_Key cnf must resolve a classical primary (P-4); matched {m_cls}")
+        print(f"   G1 single-key CWT cnf resolves classical (P-4) but denies the hybrid suite (P-2): "
+              f"hybrid is at+jwt-only")
 
 
 # --------------------------------------------------------------------------

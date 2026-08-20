@@ -21,7 +21,7 @@ artifact. No value here is PROPOSED any longer.
 | [`hyprstream-proof-cwt.cddl`](hyprstream-proof-cwt.cddl) | Normative CDDL: proof CWT claims sets, response binding, signature plan, unattributed key set, private-use header parameters, exact `crit` sets, and the proof-v1 parser caps |
 | [`private-label-registry.md`](private-label-registry.md) | The checked private-use label registry (claims −70001…−70004, headers −70100…−70103) with presence/null rules and a collision review against the IANA COSE/CWT registries |
 | [`canonical-vectors.md`](canonical-vectors.md) | Human index of the positive and negative vectors, with the deny rule each negative exercises |
-| [`vectors/`](vectors) | Machine-readable vectors: 8 positive, 53 negative, the seeded test keys, the replay-namespace thumbprint vectors (`proof-v1-thumbprints.json`), and the authenticated credential context (`proof-v1-credentials.json`: the frozen `verifier_now` clock and the issuer-signed at+jwt tokens the authenticated positives hash) |
+| [`vectors/`](vectors) | Machine-readable vectors: 8 positive, 54 negative, the seeded test keys, the replay-namespace thumbprint vectors (`proof-v1-thumbprints.json`), and the authenticated credential context (`proof-v1-credentials.json`: the frozen `verifier_now` clock and the issuer-signed at+jwt tokens the authenticated positives hash) |
 | [`credential-profile.md`](credential-profile.md) | JWT/CWT credential claims table, credential/session identifier rules, Reusable-only credential use (OneShotTransaction deferred), revocation semantics |
 | [`tools/`](tools) | `validate_profile.py` (the mechanical validation gate), `gen_proof_vectors.py` (reproducible generator), `check_proof_vectors.py` (vector verifier), and `requirements.txt` (pinned deps) |
 

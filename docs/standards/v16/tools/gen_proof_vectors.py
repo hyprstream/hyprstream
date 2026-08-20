@@ -1982,6 +1982,24 @@ def main() -> None:
             notes="Header widened 58 40 -> 58 41, no byte added; strict decoder rejects (len(rest) < val).",
         )
 
+        # N-49 (G2): a proof whose claims payload carries a TRUNCATED integer
+        # argument — the `iat` value is `19 00` (ai=25 declares a 2-byte argument
+        # with only 1 byte present). The outer COSE_Sign1 array decodes, but the
+        # payload's integer argument is truncated, so a fail-closed strict decoder
+        # rejects it (len(rest) < n); a lenient decoder would read a short/zero
+        # value. `a1 06 19 00` = {6: <truncated int>}. The de-fanged exact-length
+        # counterpart `a1 06 19 01 00` = {6: 256} decodes cleanly.
+        n49_payload = b"\xa1\x06\x19\x00"
+        n49 = enc([p4_prot, {}, n49_payload, b"\x00" * 64])
+        record(
+            negatives, "N-49",
+            "Truncated CBOR integer: claims iat argument `19 00` declares 2 bytes with 1 present",
+            "deny", "COSE_Sign1", n49,
+            deny_class="integer-truncation",
+            deny_rule="a CBOR additional-information argument (ai 24/25/26/27) must carry its full 1/2/4/8-byte length",
+            notes="Outer array decodes; the payload integer argument is truncated (ai=25, 1 of 2 bytes).",
+        )
+
     meta = {
         "vector_set_version": 1,
         "profile": "hs-rpc-proof-v1",
@@ -2020,8 +2038,21 @@ def main() -> None:
                 "C1 replay thumbprint (no domain separator, no enrollment epoch)."
             ),
         },
+        "encoding_matrix": {
+            "note": (
+                "G1 (credential-profile §1.1): a HYBRID (multi-key) primary group has "
+                "no v16 CWT confirmation method, so hybrid credentials are at+jwt (JWT) "
+                "only via cnf.hs_signer_suite. The CWT cnf is a single RFC 8747 COSE_Key "
+                "and binds a CLASSICAL (single-key) primary only (N-1 is that shape). No "
+                "multi-key CWT confirmation label/shape is allocated or reserved."
+            ),
+            "hybrid_encoding": "at+jwt-only",
+            "cwt_cnf": "single RFC 8747 COSE_Key; classical (single-key) primary only",
+            "cwt_hybrid": "deferred (no v16 method)",
+        },
         "credentials": {
             "classical": {
+                "encoding": "at+jwt",
                 "token": cred_classical,
                 "header": hdr_classical,
                 "claims": claims_classical,
@@ -2031,6 +2062,7 @@ def main() -> None:
                 "token_sha256": CREDENTIAL_HASH.hex(),
             },
             "hybrid": {
+                "encoding": "at+jwt",
                 "token": cred_hybrid,
                 "header": hdr_hybrid,
                 "claims": claims_hybrid,
