@@ -80,20 +80,40 @@ pub(crate) fn dequantize_fp8_weights_at_load(weights: &mut HashMap<String, Tenso
         // lazy path in `LinearProjection::apply`): scale [r/128, c/128] is
         // broadcast across each 128-element block. Elementwise per block, so
         // the stored [out, in] orientation needs no special handling.
+        //
+        // Peak-memory discipline (P2 review): the scale is applied IN PLACE on
+        // the BF16 cast buffer — no second BF16 allocation — and the FP8
+        // source is dropped before the result is retained, so converting one
+        // tensor peaks at FP8 + 1x BF16 instead of the old FP8 + 2x BF16
+        // (out-of-place multiply held all three). With HashMap iteration order
+        // arbitrary, that spike could land on top of the already-converted
+        // bulk of the model and OOM a load whose final BF16 size would fit.
         let w_bf16 = weight.to_kind(tch::Kind::BFloat16);
-        let dequantized = match scale {
-            Some(scale) => {
-                let ws = w_bf16.size();
-                let ss = scale.size();
-                let block_r = ws[0] / ss[0];
-                let block_c = ws[1] / ss[1];
-                let w_4d = w_bf16.view([ss[0], block_r, ss[1], block_c]);
-                let s_4d = scale.to_kind(tch::Kind::BFloat16).view([ss[0], 1, ss[1], 1]);
-                (w_4d * s_4d).reshape([ws[0], ws[1]])
+        if let Some(scale) = scale {
+            let ws = w_bf16.size();
+            let ss = scale.size();
+            let block_r = ws[0] / ss[0];
+            let block_c = ws[1] / ss[1];
+            let s_4d = scale.to_kind(tch::Kind::BFloat16).view([ss[0], 1, ss[1], 1]);
+            // In-place broadcast multiply on a block view of the contiguous
+            // BF16 buffer; the buffer already IS the 2D result (the 4D view
+            // is zero-copy). On the (practically unreachable) kernel error,
+            // restore the untouched FP8 weight + scale for the lazy path
+            // rather than retaining an unscaled cast.
+            if let Err(e) = w_bf16.view([ss[0], block_r, ss[1], block_c]).f_mul_(&s_4d) {
+                warn!(
+                    "FP8 weight '{key}' in-place scale multiply failed ({e}); \
+                     leaving FP8 + scale untouched for the lazy dequant path"
+                );
+                drop(w_bf16);
+                weights.insert(scale_key, scale);
+                weights.insert(key, weight);
+                continue;
             }
-            None => w_bf16,
-        };
-        weights.insert(key, dequantized);
+            drop(scale);
+        }
+        drop(weight);
+        weights.insert(key, w_bf16);
         converted += 1;
     }
     converted
