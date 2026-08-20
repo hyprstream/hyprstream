@@ -161,11 +161,22 @@ backed by an idempotency/result ledger whose lookup binds the retrying principal
   token hash. Hash absence is permitted only when no credential is presented.
 - Both stripping directions deny: a presented credential with a null signed
   hash (vector N-15), and an absent credential with a non-null signed hash.
-- The proof's primary logical signer group MUST equal the suite and the exact
-  component keys of the `cnf`-resolved signer-suite record. A component
-  signature verifying under any key not pinned in that record denies — even a
-  key validly enrolled to the same principal. "Resolves to the same principal"
-  is an additional consistency check, never the binding mechanism.
+- **Primary-group selection (C3).** Plan `group_id`s are arbitrary ascending
+  integers and do not name the primary group, so the primary is selected by
+  content: the **primary logical signer group is the plan group whose suite ID
+  and exact component keys equal the `cnf`-resolved signer-suite record.** Exactly
+  one plan group matches; if none matches, or more than one does, the proof
+  denies.
+- **Scoped exact-key rule.** The exact-key denial applies to the **primary group
+  only**: a component signature in the primary group verifying under any key not
+  pinned in the `cnf`-resolved record denies — even a key validly enrolled to the
+  same principal ("resolves to the same principal" is a consistency check, never
+  the binding mechanism). Every **additional (approver) logical group is bound to
+  its own enrolled keys** from that group's enrollment record, NOT the client's
+  `cnf` record; approver signatures are not checked against the `cnf`-bound keys.
+  So a `TokenBoundAndApproved` proof (e.g. P-5) has one interoperable disposition:
+  the primary verifies against `cnf`, each approver against its own enrollment,
+  and none over-rejects the other.
 - Presenting a credential never leaves a proof in the unattributed branch: with
   a valid credential, the proof MUST be `cnf`-bound, and
   `hs_unattributed_key_set` is forbidden (vector N-10f).

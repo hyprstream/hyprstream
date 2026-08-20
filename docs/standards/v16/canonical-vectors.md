@@ -14,6 +14,7 @@ Machine-readable files (the normative form — this page is the human index):
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 8 vectors that MUST verify |
 | [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 47 vectors that MUST deny |
+| [`vectors/proof-v1-thumbprints.json`](vectors/proof-v1-thumbprints.json) | Cross-implementation replay-namespace thumbprint vectors (C1) |
 
 Each JSON vector carries `id`, `title`, `expect` (`accept` / `deny`),
 `structure`, `size_bytes`, `sha256`, full `cbor_hex`, and — for negatives — a
@@ -96,6 +97,16 @@ a byte-identical regeneration. It also proves the negatives deny by their rule:
 - **signer-group IDs are unique and strictly ascending** across the plan: the
   gate and checker reject a duplicate `group_id` (N-40) or an out-of-order plan
   (N-41), so two logical groups cannot collapse to one;
+- **every signature entry cites a group in the signed plan** (N-20) and a
+  **response proof's `cti` echoes its originating request's `request_id`** (N-22,
+  bound to P-4) — both asserted mechanically against the de-fanged mutations;
+- the **replay-namespace thumbprints are frozen to bytes** (CDDL §7.1, two
+  distinct domain separators): the gate and checker recompute the authenticated
+  and unattributed thumbprints from the frozen derivation and assert they match
+  the cross-implementation vectors in `proof-v1-thumbprints.json`;
+- **documented vector counts must match the manifests** — the gate asserts
+  README.md and canonical-vectors.md both read the actual positive/negative
+  counts;
 - the **size-cap** negatives N-12 (65-byte `suite_id`), N-13 (65-byte `kid`), and
   N-26 (129-byte `aud`) are each asserted over their numeric caps, and the CDDL
   cap text (`kid` = `1..64`, `aud` = `1..128` plus its `.regexp`) is pinned so a
@@ -265,7 +276,7 @@ Ed25519 signature over the stripped object.
 | N-19 | disposition-confusion | Response proof carrying `hs_unattributed_key_set` | 446 |
 | N-20 | plan-mismatch | Signature entry citing a group absent from the plan | 562 |
 | N-21 | non-deterministic-encoding | Tagged `COSE_Sign1` (CBOR tag 18) | 1627 |
-| N-22 | response-binding | Response proof whose `cti` is not the request ID | 374 |
+| N-22 | response-cti-binding | Response proof whose `cti` does not echo the originating request's request_id | 374 |
 | N-23 | response-binding | Encrypted binding (`protection_mode` 2) with a null KEM recipient | 411 |
 | N-24 | response-binding | Cleartext binding (`protection_mode` 1) carrying a KEM recipient | 1626 |
 | N-25 | response-binding | `response_kind` value 3 outside the closed enum {1,2} | 411 |
@@ -392,6 +403,37 @@ Ed25519 signature over the stripped object.
   vector checker enforce it. N-40 repeats a `group_id` (both groups id 1) and
   N-41 is out of ascending order (ids 2 then 1); both carry valid signatures and
   deny solely on the group-ID rule.
+- **N-20 (plan membership — C4).** Every signature entry MUST cite a group that
+  is in the signed plan. N-20 declares a signature entry whose `group_id` is
+  absent from the plan; the gate asserts that at least one entry's
+  `(group, alg, kid)` is not a plan component, so a verifier that ignores
+  signed-plan membership fails the suite (de-fanging N-20 to in-plan groups turns
+  the gate red).
+- **N-22 (response cti binding — C5).** A response proof's `cti` (claim 7) MUST
+  echo the originating request's `request_id`. N-22 carries the originating
+  request id (P-4) and a mutated `cti`, and the gate asserts the contextual
+  mismatch — mirroring N-31/N-32, not merely that the bytes differ from a positive
+  (de-fanging the `cti` to the request id turns the gate red).
+- **Replay-namespace thumbprints (C1).** The Reusable replay key is
+  `(authenticated primary signer-suite thumbprint, cti)` and the unattributed key
+  is `(unattributed proof-key-set thumbprint, cti)`. Both thumbprints are frozen
+  to bytes (CDDL §7.1): SHA-256 over the RFC 8949 core-deterministic encoding of a
+  CBOR array whose first element is one of two distinct domain-separator literals
+  (`hs-rpc-replay-primary-suite-v1` / `hs-rpc-replay-key-set-v1`). The
+  authenticated preimage is `[sep, suite_id, [ordered primary-group public keys],
+  enrollment_epoch]` (approver groups excluded); the unattributed preimage is
+  `[sep, signature_plan, unattributed_key_set]`. Cross-implementation
+  expected-thumbprint vectors are in `vectors/proof-v1-thumbprints.json`, and the
+  gate and checker recompute both from the frozen derivation and assert they
+  match — so two verifier implementations sharing replay state derive the same
+  namespace for one signer.
+- **P-5 (TokenBoundAndApproved disposition — C3).** The credential-bound primary
+  group is selected by content — the plan group whose suite ID and exact component
+  keys equal the `cnf`-resolved signer-suite record — and the exact-`cnf`-key
+  denial is scoped to that group; each additional approver group verifies against
+  its own enrolled keys, not the client's `cnf`. So P-5's two groups each verify
+  against their own enrolled test key (the checker does exactly this), and the
+  approver group is not over-rejected.
 - **N-17 (unprotected authority).** Algorithm identifiers and key material in
   unprotected headers establish no authority; authenticated signer keys are
   resolved from the credential `cnf` and anchored trust stores.

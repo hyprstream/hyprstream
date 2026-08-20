@@ -1382,23 +1382,29 @@ def main() -> None:
             deny_rule="this closed profile carries no tags; the typ header performs object typing",
         )
 
-        # N-22: request/response cti substitution.
+        # N-22 (C5): a response proof whose cti does NOT echo the originating
+        # request's request_id. It carries the originating-request id so the
+        # suite can assert the contextual cti mismatch (mirroring N-31/N-32),
+        # not merely that its bytes differ from a positive. The signature is
+        # valid over the mutated cti, so it denies solely on the request binding.
         n22_claims = request_claims(
             credential_hash=None,
             schema_id=SCHEMA_ID_RESPONSE,
             body=CAPNP_RESPONSE_BYTES,
-            cti=bytes.fromhex("00112233445566778899aabbccddeeff"),
+            cti=bytes.fromhex("00112233445566778899aabbccddeeff"),  # != P-4's request_id
         )
         n22, _, _ = sign1(p3_protected, n22_claims, sk_s_ed)
         record(
             negatives,
             "N-22",
-            "Response proof whose cti does not match the request_id",
+            "Response proof whose cti does not echo the originating request's request_id",
             "deny",
             "COSE_Sign1",
             n22,
-            deny_class="response-binding",
-            deny_rule="a response proof can never verify for another request ID",
+            deny_class="response-cti-binding",
+            deny_rule="a response proof's cti MUST equal the originating request's request_id",
+            originating_request="P-4",
+            notes="Signature valid over the mutated cti; denies on the contextual request-ID mismatch.",
         )
 
         # N-23: encrypted response binding with a null KEM recipient.
@@ -1820,6 +1826,49 @@ def main() -> None:
         "generator": "docs/standards/v16/tools/gen_proof_vectors.py",
     }
 
+    # ---- C1: frozen replay-namespace thumbprint vectors ----------------------
+    # SHA-256 over the RFC 8949 core-deterministic encoding of a CBOR array whose
+    # first element is the domain-separator text (see the CDDL §7.1).
+    replay_domain_authenticated = "hs-rpc-replay-primary-suite-v1"
+    replay_domain_key_set = "hs-rpc-replay-key-set-v1"
+    enrollment_epoch = 1
+    client_ed_pub = sk_c_ed.public_key().public_bytes_raw()
+    # Authenticated example: the hybrid primary group (P-2's suite + ordered
+    # public component keys), approver groups excluded.
+    auth_preimage = enc([
+        replay_domain_authenticated,
+        SUITE_HYBRID,
+        [client_ed_pub, ml_client.public],
+        enrollment_epoch,
+    ])
+    auth_thumbprint = hashlib.sha256(auth_preimage).digest()
+    # Unattributed example: P-1's plan and embedded key set, verbatim.
+    keyset_preimage = enc([replay_domain_key_set, plan_unattributed, keyset_unattributed])
+    keyset_thumbprint = hashlib.sha256(keyset_preimage).digest()
+    thumbprints = {
+        **meta,
+        "kind": "replay-thumbprints",
+        "domain_separators": {
+            "authenticated": replay_domain_authenticated,
+            "key_set": replay_domain_key_set,
+        },
+        "sha256_of": "the RFC 8949 core-deterministic encoding of a CBOR array; domain separator is element 0",
+        "authenticated": {
+            "note": "credential-bound primary signer-suite thumbprint (design §4.5/§4.6); approver groups excluded",
+            "suite_id": SUITE_HYBRID,
+            "component_public_keys_hex": [client_ed_pub.hex(), ml_client.public.hex()],
+            "enrollment_epoch": enrollment_epoch,
+            "preimage_hex": auth_preimage.hex(),
+            "thumbprint_sha256": auth_thumbprint.hex(),
+        },
+        "unattributed": {
+            "note": "unattributed proof-key-set thumbprint (design §4.7/§7) over (signature_plan, unattributed_key_set)",
+            "from_vector": "P-1",
+            "preimage_hex": keyset_preimage.hex(),
+            "thumbprint_sha256": keyset_thumbprint.hex(),
+        },
+    }
+
     (out_dir / "proof-v1-keys.json").write_text(
         json.dumps({**meta, "keys": keys_doc}, indent=2) + "\n"
     )
@@ -1828,6 +1877,9 @@ def main() -> None:
     )
     (out_dir / "proof-v1-negative.json").write_text(
         json.dumps({**meta, "kind": "negative", "vectors": negatives}, indent=2) + "\n"
+    )
+    (out_dir / "proof-v1-thumbprints.json").write_text(
+        json.dumps(thumbprints, indent=2) + "\n"
     )
     print(f"wrote {len(positives)} positive and {len(negatives)} negative vectors to {out_dir}")
 

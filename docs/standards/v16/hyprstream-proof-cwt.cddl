@@ -491,12 +491,65 @@ cose-key-akp-ml-dsa-65 = {
   -1 => bstr .size 1952,   ; pub: ML-DSA-65 public key (RFC 9964)
 }
 
-; The replay namespace for an unattributed proof is the SHA-256 thumbprint of
-; the canonical deterministic encoding of the tuple
-;   [ signature-plan, unattributed-key-set ]
-; under the proof-key-set domain separator, so every component key and its
-; suite/group interpretation binds the replay key and no single component
-; thumbprint can alias a hybrid signer.
+; See §7.1 for the unattributed replay-namespace thumbprint derivation.
+
+; ==========================================================================
+; 7.1 Replay-namespace thumbprints (frozen byte-level derivation)
+; ==========================================================================
+;
+; A verifier selects exactly one replay key per accepted proof (design §4.6):
+;   Reusable credential:  (authenticated primary signer-suite thumbprint, cti)
+;   Unattributed proof:   (unattributed proof-key-set thumbprint, cti)
+; The thumbprints below are frozen to bytes so replay state shared across
+; verifier instances derives the SAME namespace for one signer — otherwise two
+; nodes could admit a replay of one signer under different namespaces (C1).
+;
+; Both are a SHA-256 over the RFC 8949 core-deterministic encoding of a CBOR
+; array whose FIRST element is the domain-separator text (the "under the …
+; domain separator" binding), so no ambiguous byte concatenation is involved.
+; The two separators are distinct literal text strings:
+
+replay-domain-authenticated = "hs-rpc-replay-primary-suite-v1"
+replay-domain-key-set       = "hs-rpc-replay-key-set-v1"
+
+; Authenticated primary signer-suite thumbprint (design §4.5/§4.6):
+;   SHA-256( enc_cbor([
+;     replay-domain-authenticated,        ; tstr, domain separator (first)
+;     suite_id,                           ; tstr, the PRIMARY group's suite ID
+;     [ pub_component_1, pub_component_2 ],; ordered PUBLIC component keys of the
+;                                         ;   primary group (Ed25519 x = 32 bytes;
+;                                         ;   ML-DSA-65 pub = 1952 bytes), in the
+;                                         ;   suite's exact component order
+;     enrollment_epoch,                   ; uint, from the cnf-resolved record
+;   ]) )
+; Approver groups are EXCLUDED, so any allowed approver subset for the same
+; primary-signed request stays in one replay namespace.
+;
+; thumbprint-preimage-authenticated = [
+;   replay-domain-authenticated,
+;   suite-id,
+;   [ 1*2 bstr ],   ; ordered primary-group public component keys
+;   uint,           ; enrollment epoch
+; ]
+;
+; Unattributed proof-key-set thumbprint (design §4.7 / §7):
+;   SHA-256( enc_cbor([
+;     replay-domain-key-set,              ; tstr, domain separator (first)
+;     signature-plan,                     ; the plan array, verbatim
+;     unattributed-key-set,               ; the embedded key set, verbatim
+;   ]) )
+; so every component key and its suite/group interpretation binds the replay key
+; and no single component thumbprint can alias a hybrid signer.
+;
+; thumbprint-preimage-key-set = [
+;   replay-domain-key-set,
+;   signature-plan,
+;   unattributed-key-set,
+; ]
+;
+; Cross-implementation expected-thumbprint vectors are in
+; vectors/proof-v1-thumbprints.json (validate_profile.py and
+; check_proof_vectors.py recompute and assert them).
 
 ; ==========================================================================
 ; 8. Complete objects

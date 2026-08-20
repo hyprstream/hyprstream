@@ -332,14 +332,16 @@
     },
     {
       "id": "N-22",
-      "title": "Response proof whose cti does not match the request_id",
+      "title": "Response proof whose cti does not echo the originating request's request_id",
       "expect": "deny",
       "structure": "COSE_Sign1",
       "size_bytes": 374,
       "sha256": "db3a47a634404ece83b975200ba3e22983a8f1101ffb11521cf23123bb058a7b",
       "cbor_hex": "8458b6a7013202833a000111d53a000111d43a000111d30451736572766963652d656432353531392d3110782d6170706c69636174696f6e2f766e642e6879707273747265616d2e726573706f6e73652d70726f6f662b6377743a000111d3781868732d7270632d726573706f6e73652d70726f6f662d76313a000111d481a30101027768732d636f73652d7369676e2d656432353531392d76310381a201320251736572766963652d656432353531392d313a000111d501a05878a803781c72656769737472792e7376632e6879707273747265616d2e74657374041a6a74329e061a6a743280075000112233445566778899aabbccddeeff3a00011170f63a000111711b91b7c0e5a2f3d48a3a0001117258190000000000000000010000000f0000000200030000000000003a00011173f6584038758d2bcdc7108735d1c28372771852dfec416b33253d3fdc52629b6ee64a93bbe294c31763425267ffec27fdc355863db45dba9decbd5d3289c2d039258707",
-      "deny_class": "response-binding",
-      "deny_rule": "a response proof can never verify for another request ID"
+      "deny_class": "response-cti-binding",
+      "deny_rule": "a response proof's cti MUST equal the originating request's request_id",
+      "originating_request": "P-4",
+      "notes": "Signature valid over the mutated cti; denies on the contextual request-ID mismatch."
     },
     {
       "id": "N-23",

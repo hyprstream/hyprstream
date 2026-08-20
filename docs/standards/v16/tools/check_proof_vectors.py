@@ -414,6 +414,35 @@ def main() -> None:
         if vec["id"] != "N-2" and vec["cbor_hex"] in positive_bytes:
             fail(f"{vec['id']}: negative vector duplicates a positive vector")
 
+    # C1: recompute the frozen replay-namespace thumbprints and assert they match
+    # the shipped cross-implementation vectors — SHA-256 over the deterministic
+    # encoding of a CBOR array whose first element is the domain-separator text.
+    tp_path = vectors_dir / "proof-v1-thumbprints.json"
+    if tp_path.exists():
+        tp = json.loads(tp_path.read_text())
+        sep = tp["domain_separators"]
+        a = tp["authenticated"]
+        auth_pre = enc([sep["authenticated"], a["suite_id"],
+                        [bytes.fromhex(h) for h in a["component_public_keys_hex"]],
+                        a["enrollment_epoch"]])
+        if hashlib.sha256(auth_pre).hexdigest() != a["thumbprint_sha256"]:
+            fail("authenticated replay thumbprint does not match its inputs")
+        if auth_pre.hex() != a["preimage_hex"]:
+            fail("authenticated replay preimage encoding drifted")
+        # Unattributed: recompute from P-1's plan + embedded key set.
+        p1 = next((v for v in positive["vectors"] if v["id"] == tp["unattributed"]["from_vector"]), None)
+        if p1 is None:
+            fail("unattributed thumbprint source vector missing")
+        else:
+            hdr = decode(decode(bytes.fromhex(p1["cbor_hex"]))[0])
+            ks_pre = enc([sep["key_set"], hdr[H_PLAN], hdr[H_KEYSET]])
+            if hashlib.sha256(ks_pre).hexdigest() != tp["unattributed"]["thumbprint_sha256"]:
+                fail("unattributed replay thumbprint does not match P-1's plan/key set")
+            if ks_pre.hex() != tp["unattributed"]["preimage_hex"]:
+                fail("unattributed replay preimage encoding drifted")
+    else:
+        fail("proof-v1-thumbprints.json is missing (C1 replay thumbprint vector)")
+
     total = len(positive["vectors"]) + len(negative["vectors"])
     if FAILURES:
         for line in FAILURES:

@@ -53,6 +53,8 @@ V16 = HERE.parent
 CDDL_PATH = V16 / "hyprstream-proof-cwt.cddl"
 REGISTRY_PATH = V16 / "private-label-registry.md"
 CREDENTIAL_PATH = V16 / "credential-profile.md"
+README_PATH = V16 / "README.md"
+CANONICAL_VECTORS_PATH = V16 / "canonical-vectors.md"
 VECTORS_DIR = V16 / "vectors"
 # Repo root is three `.parent` hops up from V16 (docs/standards/v16 -> repo).
 REPO_ROOT = V16.parent.parent.parent
@@ -418,6 +420,30 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
             check(not strictly_ascending_unique(gids),
                   f"{nid} plan must violate unique-strictly-ascending group IDs, got {gids}")
             print(f"   B6 {nid} rejected ({what}): group IDs {gids}")
+
+    # Thread C4 (gen:1369) — every signature entry MUST cite a group that is in
+    # the signed plan. N-20 declares a signature entry whose group is absent from
+    # the plan; assert that membership violation mechanically (the checker's
+    # membership predicate runs on positives only).
+    n20 = by_id.get("N-20")
+    check(n20 is not None, "N-20 (signature entry citing a group absent from the plan) is missing")
+    if n20 is not None:
+        obj = decode(bytes.fromhex(n20["cbor_hex"]))
+        comps = set()
+        for g in (decode(obj[0]).get(H_PLAN) or []):
+            if isinstance(g, dict):
+                for c in (g.get(3) or []):
+                    if isinstance(c, dict):
+                        comps.add((g.get(1), c.get(1), c.get(2)))
+        entry_keys = []
+        for entry in (obj[3] or []):
+            sh = decode(entry[0])
+            entry_keys.append((sh.get(H_GROUP), sh.get(H_ALG), sh.get(H_KID)))
+        has_out_of_plan = any(ek not in comps for ek in entry_keys)
+        check(has_out_of_plan,
+              "N-20 must carry a signature entry whose (group, alg, kid) is absent from the plan")
+        if has_out_of_plan:
+            print("   C4 N-20: a signature entry cites a group absent from the plan (membership denies)")
 
     # Thread B5 (cddl:115) — an authenticated request proof is credential-bound,
     # so a null credential_hash (no key set) MUST deny structurally. N-15 is that
@@ -924,6 +950,23 @@ def gate_response_binding_equality(positives, negatives) -> None:
                   f"{mismatch['id']} response_binding must MISMATCH request {req} field-for-field")
             print(f"   #4 {mismatch['id']} binding != {req} binding (mismatch denies)")
 
+    # C5 (cddl:1390) — a response proof's cti (claim 7) MUST echo the originating
+    # request's request_id. N-22 carries the originating-request id and mutates
+    # cti, so it must contextually mismatch (mirroring N-31/N-32).
+    def cti_of(vid: str):
+        return claims_of(by_id[vid]["cbor_hex"]).get(C_CTI)
+    n22 = by_id.get("N-22")
+    check(n22 is not None, "N-22 (response cti mismatch) must exist")
+    if n22 is not None:
+        req = n22.get("originating_request")
+        check(req in by_id, f"N-22 originating_request {req!r} must be a known vector")
+        if req in by_id:
+            mism = (cti_of("N-22") is not None and cti_of(req) is not None
+                    and cti_of("N-22") != cti_of(req))
+            check(mism, f"N-22 cti must MISMATCH the originating request {req} request_id")
+            if mism:
+                print(f"   C5 N-22 cti != {req} request_id (contextual mismatch denies)")
+
 
 # --------------------------------------------------------------------------
 # 9. Unattributed key-set correspondence + embedded-key verification (B4)
@@ -995,6 +1038,77 @@ def gate_unattributed_keyset(positives, negatives) -> None:
 
 
 # --------------------------------------------------------------------------
+# C2. Documented vector counts agree with the manifests
+# --------------------------------------------------------------------------
+
+
+def gate_readme_counts(positives, negatives) -> None:
+    section("C2. Documented vector counts match the manifests")
+    npos, nneg = len(positives["vectors"]), len(negatives["vectors"])
+    for label, path in (("README.md", README_PATH), ("canonical-vectors.md", CANONICAL_VECTORS_PATH)):
+        text = path.read_text()
+        ok = False
+        # Accept either "N positive, M negative" or the two-row markdown table
+        # forms ("N vectors that MUST verify" / "M vectors that MUST deny").
+        m = re.search(r"(\d+)\s+positive,\s*(\d+)\s+negative", text)
+        if m and (int(m.group(1)), int(m.group(2))) == (npos, nneg):
+            ok = True
+        pmatch = re.search(r"(\d+)\s+vectors that MUST verify", text)
+        nmatch = re.search(r"(\d+)\s+vectors that MUST deny", text)
+        if pmatch and nmatch and (int(pmatch.group(1)), int(nmatch.group(1))) == (npos, nneg):
+            ok = True
+        check(ok, f"{label} vector counts must read {npos} positive / {nneg} negative")
+        if ok:
+            print(f"   {label} counts agree ({npos} positive / {nneg} negative)")
+
+
+# --------------------------------------------------------------------------
+# 10. Replay-namespace thumbprints frozen to bytes (C1)
+# --------------------------------------------------------------------------
+
+
+def gate_replay_thumbprints(cddl: str, positives) -> None:
+    section("10. Replay-namespace thumbprints (C1)")
+    import hashlib
+    from check_proof_vectors import enc as _enc
+
+    tp_path = VECTORS_DIR / "proof-v1-thumbprints.json"
+    check(tp_path.exists(), "proof-v1-thumbprints.json must exist (C1 replay thumbprint vector)")
+    if not tp_path.exists():
+        return
+    tp = json.loads(tp_path.read_text())
+    sep = tp["domain_separators"]
+
+    # The two domain separators are frozen literals in the normative CDDL.
+    check(f'replay-domain-authenticated = "{sep["authenticated"]}"' in cddl,
+          "CDDL must freeze the authenticated replay domain separator")
+    check(f'replay-domain-key-set       = "{sep["key_set"]}"' in cddl,
+          "CDDL must freeze the key-set replay domain separator")
+    check(sep["authenticated"] != sep["key_set"], "the two replay domain separators must be distinct")
+
+    # Authenticated primary thumbprint: recompute from the frozen inputs.
+    a = tp["authenticated"]
+    auth_pre = _enc([sep["authenticated"], a["suite_id"],
+                     [bytes.fromhex(h) for h in a["component_public_keys_hex"]],
+                     a["enrollment_epoch"]])
+    check(auth_pre.hex() == a["preimage_hex"], "authenticated preimage encoding drifted")
+    check(hashlib.sha256(auth_pre).hexdigest() == a["thumbprint_sha256"],
+          "authenticated replay thumbprint does not match its inputs")
+
+    # Unattributed thumbprint: recompute from P-1's plan + embedded key set.
+    p1 = next((v for v in positives["vectors"] if v["id"] == tp["unattributed"]["from_vector"]), None)
+    check(p1 is not None, "unattributed thumbprint source vector must exist")
+    if p1 is not None:
+        hdr = decode(decode(bytes.fromhex(p1["cbor_hex"]))[0])
+        ks_pre = _enc([sep["key_set"], hdr[H_PLAN], hdr[H_KEYSET]])
+        check(ks_pre.hex() == tp["unattributed"]["preimage_hex"], "unattributed preimage encoding drifted")
+        check(hashlib.sha256(ks_pre).hexdigest() == tp["unattributed"]["thumbprint_sha256"],
+              "unattributed replay thumbprint does not match P-1's plan/key set")
+    print(f"   authenticated thumbprint {a['thumbprint_sha256'][:16]}… and unattributed "
+          f"{tp['unattributed']['thumbprint_sha256'][:16]}… recompute exactly")
+
+
+# --------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -1017,6 +1131,8 @@ def main() -> None:
     gate_type_confusion(negatives)
     gate_response_binding_equality(positives, negatives)
     gate_unattributed_keyset(positives, negatives)
+    gate_replay_thumbprints(cddl, positives)
+    gate_readme_counts(positives, negatives)
     gate_canonical(positives, negatives)
 
     print()
