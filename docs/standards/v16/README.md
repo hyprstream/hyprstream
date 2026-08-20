@@ -63,6 +63,14 @@ production-closed. Remaining conditions:
 3. **Watch-item re-verification** at production-close time
    (`draft-ietf-jose-pq-composite-sigs`, `draft-ietf-cose-hpke`,
    `draft-ietf-cose-hpke-pq-pqt`). Nothing here depends on them.
+4. **`credential_use_profile` wire encoding — operator disposition required.**
+   The credential's `Reusable` / `OneShotTransaction` profile is normative and
+   issuer-signed but has no wire claim, and there is no correct existing
+   registered JWT/CWT claim for it. Gate-2 froze exactly the three credential
+   CWT keys `−70005..−70007`, so a new allocation must be operator-approved
+   before it (and the amendment-10 credential-CWT vectors) can be added. Options
+   and a recommended value/encoding/collision analysis are in
+   `.fleet-coord/handoffs/mac-v16-a-credential-use-profile-disposition.md`.
 
 Resolved by this freeze (previously open): operator disposition of every
 PROPOSED value (Gate-2 §19, 2026-08-19), and mechanical CDDL validation

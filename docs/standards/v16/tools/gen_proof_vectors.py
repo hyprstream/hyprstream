@@ -1361,6 +1361,32 @@ def main() -> None:
             deny_rule="aud is 1..128 bytes (Gate-2 §19 #7; shared MAX_SERVICE_DOMAIN_BYTES)",
         )
 
+        # N-27: cleartext-unary response_binding carried as a non-null map.
+        # response_binding is null exactly when the response is neither encrypted
+        # nor streamed; a cleartext unary response is neither, so the map form is
+        # forbidden — only stream_setup may be a cleartext (non-null) binding.
+        n27_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH,
+            response_binding={
+                1: SCHEMA_ID_RESPONSE,
+                2: KIND_UNARY,          # unary
+                3: PROTECTION_CLEARTEXT,  # cleartext
+                4: None,
+            },
+        )
+        n27, _, _ = sign1(p4_protected, n27_claims, sk_c_ed)
+        record(
+            negatives,
+            "N-27",
+            "Cleartext unary response_binding carried as a non-null map",
+            "deny",
+            "COSE_Sign1",
+            n27,
+            deny_class="response-binding",
+            deny_rule="cleartext unary uses a null response_binding; the map form is stream_setup only",
+            notes="Canonical single encoding: cleartext unary is null, never a map.",
+        )
+
     meta = {
         "vector_set_version": 1,
         "profile": "hs-rpc-proof-v1",

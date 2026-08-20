@@ -13,7 +13,7 @@ Machine-readable files (the normative form — this page is the human index):
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 6 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 34 vectors that MUST deny |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 35 vectors that MUST deny |
 
 Each JSON vector carries `id`, `title`, `expect` (`accept` / `deny`),
 `structure`, `size_bytes`, `sha256`, full `cbor_hex`, and — for negatives — a
@@ -56,7 +56,13 @@ a byte-identical regeneration. It also proves the negatives deny by their rule:
   `COSE_Sign` body — a request `typ` cannot pair with a response domain, or vice
   versa;
 - a **response proof** carrying a `Nonce` or a non-null `credential_hash` is
-  rejected by the distinct `hyprstream-response-proof-claims` rule; and
+  rejected by the distinct `hyprstream-response-proof-claims` rule;
+- an **unattributed proof** without the server challenge (N-16) is rejected by
+  the distinct `hyprstream-unattributed-proof-claims` rule, which makes `Nonce`
+  a mandatory key rather than relying on a separate verifier check;
+- a **cleartext unary `response_binding`** carried as a map (N-27) is rejected —
+  the cleartext map alternative is `stream_setup` only, so cleartext unary has
+  the single canonical null encoding; and
 - the **size-cap** negatives N-12 (65-byte `suite_id`), N-13 (65-byte `kid`),
   and N-26 (129-byte `aud`) are asserted over their numeric caps, and the CDDL
   cap text (`kid`/`suite-id-bounded` = `1..64`, `aud` = `1..128`) is pinned so a
@@ -220,6 +226,7 @@ signature over the stripped object.
 | N-24 | response-binding | Cleartext binding (`protection_mode` 1) carrying a KEM recipient | 1626 |
 | N-25 | response-binding | `response_kind` value 3 outside the closed enum {1,2} | 411 |
 | N-26 | parser-cap | `aud` of 129 bytes, over the 128-byte `MAX_SERVICE_DOMAIN_BYTES` cap | 496 |
+| N-27 | response-binding | Cleartext unary `response_binding` carried as a non-null map | 411 |
 
 ### Notes on individual negatives
 
@@ -278,6 +285,16 @@ signature over the stripped object.
   The cap is a byte-length range that the pinned CDDL validator does not
   enforce; `validate_profile.py` enforces it numerically and ties the value to
   the Rust `MAX_SERVICE_DOMAIN_BYTES` constant.
+- **N-16 (unattributed challenge).** An unattributed proof MUST carry the server
+  challenge (§4.7): the distinct `hyprstream-unattributed-proof-claims` rule
+  makes `Nonce` a mandatory key (and pins `credential_hash` to `null`), so the
+  N-16 no-`Nonce` shape fails structural CDDL validation rather than depending on
+  a separate verifier check.
+- **N-27 (cleartext-unary canonical encoding).** `response_binding` is null
+  exactly when the response is neither encrypted nor streamed. A cleartext unary
+  response is neither, so it uses the null encoding; the cleartext map
+  alternative is restricted to `stream_setup`, giving cleartext unary a single
+  canonical encoding. A cleartext-unary map (N-27) denies.
 
 ## Coverage gaps recorded for gate 2
 
@@ -295,9 +312,15 @@ therefore stated as verifier obligations rather than shipped here:
 5. Sign-then-encrypt wrapper vectors, pending the COSE HPKE profile
    (watch item; nothing in this profile depends on it).
 6. Credential-CWT vectors for the amendment-10 integer claim keys
-   (`-70005`/`-70006`/`-70007`) — these are the **credential** claims set, not
-   the proof wire surface, so a dedicated fixture belongs to the WS-B credential
-   generator, not this proof-vector set. The proof direction is already covered:
-   a proof carrying any of these keys denies via the same closed-claim-set rule
-   as N-8 (the proof claims map is closed at `-70001..-70004`). Recorded as a
-   WS-B follow-up, not a blocker for this freeze.
+   (`-70005`/`-70006`/`-70007`) and the **`credential_use_profile`** signed wire
+   claim. The proof direction is already covered — a proof carrying any credential
+   key denies via the same closed-claim-set rule as N-8 (the proof claims map is
+   closed at `-70001..-70004`). Adding credential-CWT vectors is **blocked on an
+   operator disposition**: Gate-2 froze exactly the three credential CWT keys
+   `-70005..-70007`, and `credential_use_profile` (Reusable / OneShotTransaction)
+   has no correct existing signed-claim encoding, so encoding it requires a new
+   allocation the operator must approve. See the operator-disposition handoff
+   `.fleet-coord/handoffs/mac-v16-a-credential-use-profile-disposition.md`. Until
+   then the credential claims set (cnf/clearance encoding included) is not frozen
+   here, so credential vectors are deferred rather than baking in unapproved
+   choices.

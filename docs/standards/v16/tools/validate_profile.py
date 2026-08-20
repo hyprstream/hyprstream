@@ -205,6 +205,7 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
 
     req_claims = S("hyprstream-proof-claims")
     resp_claims = S("hyprstream-response-proof-claims")
+    unatt_claims = S("hyprstream-unattributed-proof-claims")
     sign1_prot = S("proof-sign1-protected")
     sign_body_prot = S("proof-sign-body-protected")
     sig_entry_prot = S("proof-sign-signature-protected")
@@ -213,6 +214,9 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
         if H_KEYSET in pm:
             return "unattributed"
         return "response" if pm.get(H_TYP) == TYP_RESPONSE else "request"
+
+    def claims_schema_for(kind: str):
+        return {"response": resp_claims, "unattributed": unatt_claims}.get(kind, req_claims)
 
     # pycddl 0.3.0 cannot enforce a paired typ×domain choice through a
     # whole-object `bstr .cbor` (choices of `.cbor`-bearing arrays are not
@@ -230,7 +234,7 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
             pschema.validate_cbor(prot_bytes)
         except ValidationError as exc:
             check(False, f"positive {v['id']} protected bucket fails CDDL: {exc}")
-        cschema = resp_claims if kind == "response" else req_claims
+        cschema = claims_schema_for(kind)
         try:
             cschema.validate_cbor(payload)
         except ValidationError as exc:
@@ -287,6 +291,33 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
         except ValidationError:
             print(f"   F3 rejected by CDDL: {label}")
 
+    by_id = {v["id"]: v for v in negatives["vectors"]}
+
+    # Thread #1 (ary-f) — an unattributed proof REQUIRES the server challenge:
+    # the N-16 no-Nonce shape must be rejected by the unattributed claims rule
+    # (previously it validated against the generic claims set where Nonce is
+    # optional). Also prove the every unattributed positive requires it.
+    n16 = by_id.get("N-16")
+    check(n16 is not None, "N-16 (unattributed no-Nonce) is missing")
+    if n16 is not None:
+        try:
+            unatt_claims.validate_cbor(payload_of(n16["cbor_hex"]))
+            check(False, "N-16: unattributed no-Nonce is NOT rejected by the CDDL")
+        except ValidationError:
+            print("   #1 N-16 unattributed no-Nonce rejected by CDDL (Nonce REQUIRED)")
+
+    # Thread #2 (ary-i) — a cleartext UNARY response_binding carried as a map has
+    # no valid encoding (cleartext unary is null); only stream_setup may be a
+    # cleartext map. N-27 exercises this and must be CDDL-rejected.
+    n27 = by_id.get("N-27")
+    check(n27 is not None, "N-27 (cleartext-unary map) is missing")
+    if n27 is not None:
+        try:
+            req_claims.validate_cbor(payload_of(n27["cbor_hex"]))
+            check(False, "N-27: cleartext-unary response_binding map is NOT rejected by the CDDL")
+        except ValidationError:
+            print("   #2 N-27 cleartext-unary map rejected by CDDL (stream_setup only)")
+
     # The relation/enum negatives MUST be rejected by the CDDL itself: the
     # machine proof that the closed map, the two enum axes, and the
     # recipient/encryption relation are structural, not prose.
@@ -295,7 +326,6 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
         "N-24": "cleartext binding with a recipient",
         "N-25": "response_kind outside its closed enum",
     }
-    by_id = {v["id"]: v for v in negatives["vectors"]}
     for nid, what in relation_negs.items():
         v = by_id.get(nid)
         check(v is not None, f"expected negative {nid} ({what}) is missing")
@@ -492,6 +522,11 @@ def gate_response_binding(positives) -> None:
         else:  # cleartext
             check(recipient is None,
                   f"{v['id']} cleartext binding must carry a null recipient")
+            # A cleartext binding is streamed-but-not-encrypted; cleartext unary
+            # is the null encoding, so a cleartext map must be stream_setup.
+            check(kind == 2,
+                  f"{v['id']} cleartext response_binding must be stream_setup "
+                  "(cleartext unary is encoded as null, not a map)")
             seen_cleartext = True
         if kind == 2:
             seen_stream = True

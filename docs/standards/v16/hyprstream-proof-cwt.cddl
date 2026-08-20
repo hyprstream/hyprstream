@@ -101,13 +101,33 @@ max-aud-bytes    = 128
 ; an unknown claim key, denies. `Nonce` is the single exception: it is present
 ; exactly when the profile requires a challenge and absent otherwise.
 
+; Authenticated (credential-bound) request proofs. The server challenge is
+; OPTIONAL here (§4.7: for authenticated proofs the challenge is a deployment
+; option). Unattributed proofs use the stricter rule below, which REQUIRES it.
 hyprstream-proof-claims = {
   3  => canonical-service-domain,   ; aud   — intended recipient service
   4  => timestamp,                  ; exp   — proof expiry
   6  => timestamp,                  ; iat   — proof issuance
   7  => request-id,                 ; cti   — the request identifier
-  ? 10 => server-challenge,         ; Nonce — RFC 9711; REQUIRED unattributed
+  ? 10 => server-challenge,         ; Nonce — RFC 9711; optional (authenticated)
   -70001 => credential-hash / null,
+  -70002 => capnp-schema-id,
+  -70003 => capnp-body-bytes,
+  -70004 => response-binding / null,
+}
+
+; Unattributed request proofs (no credential). The server challenge (Nonce) is
+; REQUIRED (§4.7: it is denied before any replay-store insertion), so claim 10
+; is a MANDATORY key here — not optional as in the authenticated set — and the
+; N-16 no-Nonce shape fails structural validation. An unattributed proof has no
+; credential, so credential_hash is exactly null.
+hyprstream-unattributed-proof-claims = {
+  3  => canonical-service-domain,   ; aud
+  4  => timestamp,                  ; exp
+  6  => timestamp,                  ; iat
+  7  => request-id,                 ; cti
+  10 => server-challenge,           ; Nonce — REQUIRED for unattributed proofs
+  -70001 => null,                   ; never credential-bound
   -70002 => capnp-schema-id,
   -70003 => capnp-body-bytes,
   -70004 => response-binding / null,
@@ -173,16 +193,28 @@ capnp-body-bytes         = bstr .size (0..1048576)   ; 1 MiB body cap
 ; expressed structurally, not as prose, as the choice of two protection shapes:
 ; protection_mode 1 (cleartext) pairs with a null recipient, protection_mode 2
 ; (encrypted) pairs with a present kem-recipient.
+;
+; The presence rule is also structural (canonical single encoding): the
+; `response_binding` claim is null EXACTLY when the response is neither
+; encrypted nor streamed. A cleartext UNARY response is neither, so it uses the
+; null encoding, NOT a map — the cleartext map alternative is therefore
+; restricted to `response_kind = 2` (stream_setup). The encrypted alternative
+; carries either kind, since an encrypted response is non-null regardless of
+; shape.
 
 response-binding = response-binding-cleartext / response-binding-encrypted
 
+; Cleartext binding: streamed-but-not-encrypted only. response_kind is fixed to
+; stream_setup (2); cleartext unary is encoded as a null response_binding, so a
+; cleartext-unary map has no valid encoding here and denies.
 response-binding-cleartext = {
   1 => capnp-schema-id,   ; response root type ID (response schema domain)
-  2 => response-kind,
+  2 => 2,                 ; response_kind = stream_setup (cleartext unary is null)
   3 => 1,                 ; protection_mode = cleartext
   4 => null,              ; no KEM recipient in the clear
 }
 
+; Encrypted binding: unary or stream_setup, always non-null with a recipient.
 response-binding-encrypted = {
   1 => capnp-schema-id,   ; response root type ID (response schema domain)
   2 => response-kind,
@@ -451,7 +483,7 @@ response-proof-sign1 = [
 unattributed-proof-sign1 = [
   protected   : bstr .cbor proof-sign1-unattributed,
   unprotected : {},
-  payload     : bstr .cbor hyprstream-proof-claims,
+  payload     : bstr .cbor hyprstream-unattributed-proof-claims,
   signature   : bstr,
 ]
 
@@ -474,11 +506,12 @@ response-proof-sign = [
 ]
 
 ; A hybrid unattributed proof has two component signatures in its one logical
-; signer group, so it is a COSE_Sign with request claims.
+; signer group, so it is a COSE_Sign; it uses the unattributed claims rule
+; (server challenge REQUIRED).
 unattributed-proof-sign = [
   protected   : bstr .cbor proof-sign-body-unattributed,
   unprotected : {},
-  payload     : bstr .cbor hyprstream-proof-claims,
+  payload     : bstr .cbor hyprstream-unattributed-proof-claims,
   signatures  : [ 1*16 hyprstream-proof-signature ],
 ]
 
