@@ -63,7 +63,7 @@ ENVELOPE_RS = REPO_ROOT / "crates" / "hyprstream-rpc" / "src" / "envelope.rs"
 # Import the strict deterministic-CBOR decoder from the vector checker so the
 # gate and the checker share one decoder.
 sys.path.insert(0, str(HERE))
-from check_proof_vectors import decode, StrictError  # noqa: E402
+from check_proof_vectors import decode, StrictError, validate_tenant  # noqa: E402
 
 # ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
 
@@ -948,7 +948,9 @@ def gate_type_confusion(negatives) -> None:
             ck = cnf[1]
             check(ck.get(1) == 1 and ck.get(3) == -19 and isinstance(ck.get(-2), (bytes, bytearray)),
                   "N-1 cnf must be a valid OKP/Ed25519 COSE_Key (a PoP key)")
-        check(isinstance(n1c.get(-70005), str), "N-1 must carry tenant (-70005)")
+        # J1: the CWT tenant (-70005) obeys the same non-empty, non-wildcard rule.
+        check(not validate_tenant(n1c.get(-70005)),
+              f"N-1 CWT tenant (-70005) must be a valid tenant: {validate_tenant(n1c.get(-70005))}")
         check(-70006 in n1c, "N-1 must carry clearance (-70006)")
         # v16 credentials are Reusable-only: there is no use-profile field, and
         # -70008 is unallocated (OneShotTransaction deferred to a future
@@ -1564,6 +1566,8 @@ def _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=None):
     # RFC 9068 §2.2.1: at+jwt REQUIRES a non-empty string client_id.
     if not isinstance(claims.get("client_id"), str) or not claims.get("client_id"):
         errs.append("client_id must be a non-empty string (RFC 9068)")
+    # J1: tenant must be a non-empty, non-wildcard string (shared predicate).
+    errs += validate_tenant(claims.get("tenant"))
     if expected_aud is not None and claims.get("aud") != expected_aud:
         errs.append("audience mismatch")
     if not (claims.get("iat", 0) <= now < claims.get("exp", 0)):
@@ -1713,6 +1717,10 @@ def gate_credential_context(positives, negatives) -> None:
     # 4b. I1: RFC 9068 at+jwt requires client_id — a re-signed token without it denies.
     rejected("missing client_id (RFC 9068)", _make_jwt(hdr, {k: v for k, v in base_claims.items() if k != "client_id"}, sk_i))
     rejected("empty client_id", _make_jwt(hdr, {**base_claims, "client_id": ""}, sk_i))
+    # 4c. J1: tenant must be non-empty and not the wildcard '*'; the type is checked too.
+    rejected("empty tenant", _make_jwt(hdr, {**base_claims, "tenant": ""}, sk_i))
+    rejected("wildcard tenant", _make_jwt(hdr, {**base_claims, "tenant": "*"}, sk_i))
+    rejected("non-string tenant", _make_jwt(hdr, {**base_claims, "tenant": 123}, sk_i))
     # 5. wrong typ header (re-signed).
     rejected("wrong typ header", _make_jwt({**hdr, "typ": "JWT"}, base_claims, sk_i))
     # 6. clock outside validity (re-signed with an expired window).

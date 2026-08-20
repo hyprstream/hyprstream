@@ -165,6 +165,21 @@ def enc(obj) -> bytes:
     raise TypeError(type(obj))
 
 
+def validate_tenant(value):
+    """J1: the frozen credential tenant rule (credential-profile §2 tenant row):
+    a verified tenant/Casbin domain. Missing, empty, or wildcard tenants deny.
+    Shared by both the gate and the standalone checker for JWT `tenant` and the
+    CWT integer key -70005. Returns the list of failures ([] == valid). Does not
+    broaden tenant syntax beyond the frozen 'non-empty, not wildcard' rule."""
+    if not isinstance(value, str):
+        return [f"tenant must be a string, got {type(value).__name__}"]
+    if value == "":
+        return ["tenant must be non-empty (empty tenants deny)"]
+    if value == "*":
+        return ["tenant must not be the wildcard '*'"]
+    return []
+
+
 ALG_ED25519, ALG_ML_DSA_65 = -19, -49
 H_ALG, H_CRIT, H_KID, H_TYP = 1, 2, 4, 16
 H_DOMAIN, H_PLAN, H_GROUP, H_KEYSET = -70100, -70101, -70102, -70103
@@ -508,6 +523,8 @@ def main() -> None:
                 fail(f"{label}: empty issuer/subject")
             if not isinstance(claims.get("client_id"), str) or not claims.get("client_id"):
                 fail(f"{label}: client_id must be a non-empty string (RFC 9068)")
+            for te in validate_tenant(claims.get("tenant")):
+                fail(f"{label}: {te}")
             if not (claims.get("iat", 0) <= now < claims.get("exp", 0)):
                 fail(f"{label}: not temporally valid at verifier_now {now}")
             if "hs_signer_suite" not in (claims.get("cnf") or {}):
