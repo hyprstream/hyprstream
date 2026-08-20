@@ -1018,8 +1018,12 @@ def gate_response_binding_equality(positives, negatives) -> None:
     # request's map field-for-field. The bound positive (P-7) equals it; the
     # mismatch negative (N-32) differs. Both carry the originating request id, so
     # the suite tests equality against the actual request, not only map shape.
-    bound = next((v for v in positives["vectors"] if v.get("originating_request")), None)
-    check(bound is not None, "a bound response-proof positive (originating_request) must exist")
+    # This section tests NON-NULL field-for-field binding equality, so it selects
+    # the bound positive whose binding is a non-null map (P-7). The null-binding
+    # bound positive (P-3, L2) is covered by the response-context axes in §11.
+    bound = next((v for v in positives["vectors"]
+                  if v.get("originating_request") and rb_of(v["id"]) is not None), None)
+    check(bound is not None, "a non-null-binding bound response-proof positive must exist")
     if bound is not None:
         req = bound["originating_request"]
         check(req in by_id, f"{bound['id']} originating_request {req} must be a known vector")
@@ -1226,27 +1230,43 @@ def gate_response_context(positives, negatives) -> None:
     by_id.update({v["id"]: v for v in negatives["vectors"]})
 
     # The bound positive P-7 must satisfy ALL four bindings against P-4.
-    bound = next((v for v in positives["vectors"] if v.get("originating_request")), None)
-    check(bound is not None, "a bound response positive must exist")
-    if bound is not None:
-        b = response_context_bindings(bound["id"], by_id)
-        check(all(b.values()), f"{bound['id']} must bind aud/cti/response_binding/-70002 to its request: {b}")
-        print(f"   {bound['id']} binds all four request-derived response fields")
+    AXES = ("aud_eq", "cti_eq", "binding_eq", "schema_eq")
+    # L2: every RESPONSE-typ positive MUST carry an exact originating request so a
+    # full verifier runs all four comparisons — a response is never accepted
+    # through absent context.
+    for v in positives["vectors"]:
+        pm = decode(decode(bytes.fromhex(v["cbor_hex"]))[0])
+        if pm.get(H_TYP) == TYP_RESPONSE:
+            check(v.get("originating_request") in by_id,
+                  f"response positive {v['id']} must carry an exact originating_request (got "
+                  f"{v.get('originating_request')!r})")
+    # Positive controls: EVERY response positive carrying an originating request
+    # binds all four axes (P-7 with a non-null binding, P-3 with a null binding).
+    bound_positives = [v for v in positives["vectors"] if v.get("originating_request")]
+    check(bound_positives, "a bound response positive must exist")
+    for v in bound_positives:
+        b = response_context_bindings(v["id"], by_id)
+        check(all(b.values()),
+              f"{v['id']} must bind all four response axes to its request ({v['originating_request']}): {b}")
+        print(f"   {v['id']} binds all four request-derived response axes (orig {v['originating_request']})")
 
-    # Each response-context negative violates EXACTLY its named field.
+    # L1: each response-context negative flips EXACTLY its named axis and leaves the
+    # other three true (one-false / three-true).
     field_negs = {
         "N-43": "aud_eq", "N-22": "cti_eq", "N-32": "binding_eq", "N-31": "schema_eq",
     }
     for nid, field in field_negs.items():
         v = by_id.get(nid)
-        check(v is not None, f"response-context negative {nid} ({field}) missing")
+        check(v is not None and v.get("originating_request"),
+              f"response-context negative {nid} ({field}) must exist and carry originating_request")
         if v is None or not v.get("originating_request"):
-            check(bool(v and v.get("originating_request")), f"{nid} must carry originating_request")
             continue
         b = response_context_bindings(nid, by_id)
-        check(b[field] is False, f"{nid} must violate {field} vs its originating request; got {b}")
-        if b[field] is False:
-            print(f"   D2 {nid} violates {field} (contextual response binding denies)")
+        false_axes = [k for k in AXES if not b[k]]
+        check(false_axes == [field],
+              f"{nid} must flip EXACTLY {field} (one-false/three-true); false axes = {false_axes}")
+        if false_axes == [field]:
+            print(f"   L1 {nid} flips exactly {field}; the other three axes hold")
 
 
 # --------------------------------------------------------------------------
@@ -1891,6 +1911,10 @@ def gate_credential_context(positives, negatives) -> None:
     session_red("expired session", lambda cd: cd["sessions"][0].__setitem__("expiry", now))
     session_red("subject mismatch", lambda cd: cd["sessions"][0].__setitem__("sub", "user-2"))
     session_red("tenant mismatch", lambda cd: cd["sessions"][0].__setitem__("tenant", "tenant-beta"))
+    # L3: the authoritative session's clearance_epoch must be a non-negative int.
+    session_red("missing clearance_epoch", lambda cd: cd["sessions"][0].pop("clearance_epoch", None))
+    session_red("non-integer clearance_epoch", lambda cd: cd["sessions"][0].__setitem__("clearance_epoch", "3"))
+    session_red("negative clearance_epoch", lambda cd: cd["sessions"][0].__setitem__("clearance_epoch", -1))
     print(f"   K1 session-expiry bound enforced; {len(session_creds)} session credential(s) valid; "
           f"unknown/revoked/expired/mismatched sessions deny")
 

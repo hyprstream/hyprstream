@@ -193,6 +193,11 @@ def validate_session(creds_doc, cred_claims, now):
     for k in ("iss", "sub", "tenant"):
         if s.get(k) != cred_claims.get(k):
             errs.append(f"session {k} {s.get(k)!r} != credential {k} {cred_claims.get(k)!r}")
+    # L3 (§3.4): the authoritative session MUST carry a non-negative integer
+    # clearance_epoch. Missing or non-integer/negative denies.
+    ce = s.get("clearance_epoch")
+    if isinstance(ce, bool) or not isinstance(ce, int) or ce < 0:
+        errs.append(f"session clearance_epoch must be a non-negative integer, got {ce!r}")
     return s, errs
 
 

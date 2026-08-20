@@ -665,10 +665,13 @@ def main() -> None:
             p3,
             protected_hex=p3_prot.hex(),
             payload_hex=p3_payload.hex(),
+            originating_request="P-2",  # L2: an exact null-binding originating request
             notes=(
                 "cti echoes the request_id; capnp_schema_id/body carry the response "
                 "root type and exact response bytes; hs_unattributed_key_set is "
-                "forbidden in this profile."
+                "forbidden in this profile. Its originating request (P-2) carries a "
+                "null response_binding, so a full response verifier runs aud/cti/"
+                "schema/null-binding comparisons (all equal)."
             ),
         )
 
@@ -1492,6 +1495,7 @@ def main() -> None:
             schema_id=SCHEMA_ID_RESPONSE,
             body=CAPNP_RESPONSE_BYTES,
             cti=bytes.fromhex("00112233445566778899aabbccddeeff"),  # != P-4's request_id
+            response_binding=p4_response_binding,  # L1: keep binding == P-4's so ONLY cti_eq flips
         )
         n22, _, _ = sign1(p3_protected, n22_claims, sk_s_ed)
         record(
@@ -1675,12 +1679,13 @@ def main() -> None:
         )
 
         # N-32: a response proof whose response_binding does NOT match the
-        # originating request's (P-4) binding — the root_type_id differs. It is a
-        # structurally valid response proof (passes local map-shape checks), so it
+        # originating request's (P-4) binding. To flip ONLY binding_eq (L1), it
+        # differs in the response_kind/protection_mode axes while KEEPING
+        # root_type_id == SCHEMA_ID_RESPONSE == its own -70002, so schema_eq stays
+        # true; aud and cti still equal P-4's. It is a structurally valid response
+        # binding (stream_setup + cleartext + null recipient, like P-6), so it
         # denies only under field-for-field equality with the request it answers.
-        # Carries the originating-request id so the suite can compare the two.
-        n32_binding = dict(p4_response_binding)
-        n32_binding[1] = SCHEMA_ID_REQUEST  # root_type_id != the request's response schema id
+        n32_binding = response_binding(KIND_STREAM_SETUP, PROTECTION_CLEARTEXT, None)
         n32_claims = request_claims(
             credential_hash=None,
             schema_id=SCHEMA_ID_RESPONSE,
@@ -2164,7 +2169,10 @@ def main() -> None:
                 "AUTHORITATIVE session expiry is the authority's session state keyed "
                 "by (iss, sid) (§3.4) — NOT a credential/wire claim. A proof's exp MUST "
                 "NOT exceed BOTH the credential exp and the session exp; an unknown, "
-                "revoked, expired, or (iss/sub/tenant)-mismatched session denies."
+                "revoked, expired, or (iss/sub/tenant)-mismatched session denies. The "
+                "session state also carries a deterministic integer clearance_epoch "
+                "(§3.4, L3) — off-wire authority state, never a credential claim; a "
+                "missing/non-integer/negative clearance_epoch denies."
             ),
             "credential_kind_note": (
                 "sid presence is unambiguous by classification (metadata aligned with "
@@ -2186,6 +2194,9 @@ def main() -> None:
                 "created": IAT,
                 "expiry": SESSION_EXP,
                 "status": "active",
+                # L3 (§3.4): the authoritative session's clearance epoch — a
+                # deterministic off-wire integer, never a credential/wire claim.
+                "clearance_epoch": 3,
             },
         ],
         "positive_to_credential": {

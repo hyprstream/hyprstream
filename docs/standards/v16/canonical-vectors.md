@@ -476,6 +476,10 @@ Ed25519 signature over the stripped object.
   checker enforce `proof.exp <= session.exp` for a session-bound proof and validate
   the session as active, `(iss, sid)`-keyed, and `iss`/`sub`/`tenant`-coherent with
   the credential; an unknown, revoked, expired, or mismatched session denies. The
+  authoritative session state also carries a **deterministic integer
+  `clearance_epoch`** (§3.4, L3) — an off-wire authority field, never a credential
+  claim; the gate and checker require it present and a non-negative integer, and a
+  missing, non-integer, or negative `clearance_epoch` denies. The
   classical and hybrid credentials are typed `credential_kind = rfc8693` —
   **non-interactive** token-exchange / JWT-bearer tokens (a user subject with no
   interactive OIDC session) that carry no `sid`. The gate enforces this
@@ -509,11 +513,13 @@ Ed25519 signature over the stripped object.
 - **P-7 / N-32 (response-binding field-for-field equality).** A response proof's
   realized `response_binding` MUST equal the originating request's map
   field-for-field (§4). P-7 is a bound response proof whose binding equals P-4's
-  request binding; N-32 is a response proof whose binding differs (a different
-  `root_type_id`) yet is locally well-formed, so it denies only under equality
-  with the request it answers. Both carry the originating request id, and the
-  gate compares the two maps directly — testing equality, not just local map
-  shape.
+  request binding; N-32 is a response proof whose binding **differs from P-4's in
+  the `response_kind`/`protection_mode` axes** (a valid `stream_setup` + cleartext
+  binding) while **keeping `root_type_id` == `-70002`**, so it flips exactly
+  `binding_eq` and leaves `schema_eq` (and `aud_eq`/`cti_eq`) true (L1 isolation) —
+  it denies only under equality with the request it answers. Both carry the
+  originating request id, and the gate compares the two maps directly — testing
+  equality, not just local map shape.
 - **N-31 (response schema-ID binding).** For a bound response proof, claim
   `-70002` (response root type ID) and `response_binding[1]` (`root_type_id`)
   denote the same schema commitment, so `-70002` MUST equal the realized
@@ -528,13 +534,20 @@ Ed25519 signature over the stripped object.
   a different service domain (`other.svc.hyprstream.test`); its `response_binding`,
   `cti`, and `-70002` still equal P-4's and its signature is valid, so it denies
   only under the request↔response audience equality. The full request-derived
-  response-context set — `aud`, `cti`, `response_binding`, and `-70002` — is
-  compared in **one** place (`response_context_bindings`, gate §11): P-7 satisfies
-  all four against P-4, and each of N-43/N-22/N-32/N-31 violates exactly one. The
-  causality inventory (§12) additionally asserts every one of the 48 negatives
-  exhibits its advertised violation shape, with a meta-guard that the inventory
-  covers exactly the full negative-vector ID set — so a future negative cannot be
-  added without its own denial-shape check.
+  response-context set is four independent axes — `aud_eq`, `cti_eq`, `binding_eq`,
+  and `schema_eq` — compared in **one** place (`response_context_bindings`, gate
+  §11). **One-false / three-true isolation (L1):** each response negative flips
+  **exactly** its named axis and leaves the other three true — N-43 `aud_eq`, N-22
+  `cti_eq`, N-32 `binding_eq`, N-31 `schema_eq` — which the gate asserts vector by
+  vector (the false-axis set must equal `[named]`). Both positive controls bind
+  **all four**: P-7 with a non-null `response_binding` against P-4, and **P-3 with
+  a null binding against P-2 (L2)** — a response is never accepted through absent
+  context, so every response-typ positive MUST carry an exact originating request.
+  Allowing a second false axis, deleting an equality axis, or breaking a positive
+  control turns the gate red. The causality inventory (§12) additionally asserts
+  every one of the 56 negatives exhibits its advertised violation shape, with a
+  meta-guard that the inventory covers exactly the full negative-vector ID set — so
+  a future negative cannot be added without its own denial-shape check.
 - **N-33 (plan `(alg, kid)` uniqueness).** Every `(alg, kid)` pair MUST be unique
   across the whole `signature_plan`, regardless of group ID — one key must not
   sign under two logical groups, or a single signer could satisfy a two-group
@@ -587,7 +600,9 @@ Ed25519 signature over the stripped object.
   the gate red).
 - **N-22 (response cti binding — C5).** A response proof's `cti` (claim 7) MUST
   echo the originating request's `request_id`. N-22 carries the originating
-  request id (P-4) and a mutated `cti`, and the gate asserts the contextual
+  request id (P-4), keeps its `response_binding`, `aud`, and `-70002` **equal** to
+  P-4's, and mutates **only** `cti`, so it flips exactly `cti_eq` and leaves the
+  other three response axes true (L1 isolation); the gate asserts the contextual
   mismatch — mirroring N-31/N-32, not merely that the bytes differ from a positive
   (de-fanging the `cti` to the request id turns the gate red).
 - **Replay-namespace thumbprints (C1).** The Reusable replay key is
