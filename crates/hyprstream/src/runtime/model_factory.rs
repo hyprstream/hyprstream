@@ -529,6 +529,24 @@ impl ModelFactory {
             })
     }
 
+    /// Add the block-wise `<name>_scale_inv` companion of a top-level stage
+    /// tensor when the manifest has one. Layer-prefixed FP8 scales are
+    /// selected automatically by the layer-index filter, but top-level tensors
+    /// (embedding, lm_head) enter the plan by exact name — without this the
+    /// stage loads a scale-less FP8 tensor and `dequantize_fp8_weights_at_load`
+    /// casts raw FP8 codes straight to BF16 (#1519 review). No-op for
+    /// unquantized checkpoints, which have no such key.
+    fn insert_companion_scale(
+        weight_map: &BTreeMap<String, String>,
+        required: &mut BTreeSet<String>,
+        name: &str,
+    ) {
+        let scale = format!("{name}_scale_inv");
+        if weight_map.contains_key(&scale) {
+            required.insert(scale);
+        }
+    }
+
     /// Resolve one stage to exact manifest tensor names grouped by shard.
     ///
     /// The returned map is the complete I/O plan: callers must not open any
@@ -601,11 +619,13 @@ impl ModelFactory {
         let is_first = layer_range.start == 0;
         let is_last = layer_range.end == num_layers;
         if is_first {
-            required.insert(Self::resolve_required_alias(
+            let embed = Self::resolve_required_alias(
                 &index.weight_map,
                 &["model.embed_tokens.weight", "embed_tokens.weight"],
                 "embedding tensor",
-            )?);
+            )?;
+            Self::insert_companion_scale(&index.weight_map, &mut required, &embed);
+            required.insert(embed);
         }
         if is_last {
             required.insert(Self::resolve_required_alias(
@@ -618,6 +638,7 @@ impl ModelFactory {
                 .into_iter()
                 .find(|name| index.weight_map.contains_key(*name))
             {
+                Self::insert_companion_scale(&index.weight_map, &mut required, lm_head);
                 required.insert(lm_head.to_owned());
             } else if !is_first {
                 bail!("a non-first final stage requires an explicit lm_head tensor in weight_map");
@@ -2286,6 +2307,45 @@ mod stage_subset_tests {
             ),
             "valid complete-range stage forward diverged from ModelFactory::create"
         );
+    }
+
+    #[test]
+    fn stage_weight_plan_includes_top_level_fp8_companion_scales() {
+        // FP8 checkpoints carry block-wise `<name>_scale_inv` companions for
+        // quantized tensors. Layer-prefixed scales enter the stage plan via the
+        // layer-index filter; top-level embedding/lm_head scales must be added
+        // explicitly, or the stage loads a scale-less FP8 tensor and eager
+        // dequant casts raw FP8 codes to BF16 (#1519 Codex review).
+        let dir = tempfile::tempdir().unwrap();
+        let shard = "model-00001-of-00001.safetensors";
+        write_index(
+            dir.path(),
+            &[
+                ("model.embed_tokens.weight", shard),
+                ("model.embed_tokens.weight_scale_inv", shard),
+                ("model.norm.weight", shard),
+                ("lm_head.weight", shard),
+                ("lm_head.weight_scale_inv", shard),
+                ("model.layers.0.self_attn.q_proj.weight", shard),
+                ("model.layers.0.self_attn.q_proj.weight_scale_inv", shard),
+            ],
+        );
+
+        let plan = ModelFactory::stage_weight_plan(dir.path(), 1, 0..1).unwrap();
+        let names: Vec<&str> = plan.values().flatten().map(String::as_str).collect();
+        for expected in [
+            "model.embed_tokens.weight",
+            "model.embed_tokens.weight_scale_inv",
+            "model.norm.weight",
+            "lm_head.weight",
+            "lm_head.weight_scale_inv",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.weight_scale_inv",
+        ] {
+            assert!(names.contains(&expected), "stage plan missing {expected}");
+        }
+        // No phantom scale entries: the plan contains exactly these tensors.
+        assert_eq!(names.len(), 7, "unexpected extra tensors in stage plan");
     }
 
     #[tokio::test]
