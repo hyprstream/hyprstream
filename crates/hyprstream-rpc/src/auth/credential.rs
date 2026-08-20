@@ -284,6 +284,23 @@ impl std::fmt::Display for SessionKindMismatch {
 
 impl std::error::Error for SessionKindMismatch {}
 
+/// Error returned when a session registration record is malformed: an empty
+/// issuer or session identifier in the key, or an empty subject/tenant in the
+/// state (v16 §3.1 malformed-identifier denial, §3.3 record shape).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidSessionRecord;
+
+impl std::fmt::Display for InvalidSessionRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "malformed session record (empty issuer, identifier, subject, or tenant)"
+        )
+    }
+}
+
+impl std::error::Error for InvalidSessionRecord {}
+
 /// Error returned by [`SessionRegistry::register_session`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionRegisterError {
@@ -291,6 +308,8 @@ pub enum SessionRegisterError {
     Exists(SessionExists),
     /// The key's identifier variant disagrees with the state's kind.
     KindMismatch(SessionKindMismatch),
+    /// The key or state record is malformed (empty required field).
+    InvalidRecord(InvalidSessionRecord),
 }
 
 impl std::fmt::Display for SessionRegisterError {
@@ -298,6 +317,7 @@ impl std::fmt::Display for SessionRegisterError {
         match self {
             Self::Exists(e) => write!(f, "{e}"),
             Self::KindMismatch(e) => write!(f, "{e}"),
+            Self::InvalidRecord(e) => write!(f, "{e}"),
         }
     }
 }
@@ -313,6 +333,12 @@ impl From<SessionExists> for SessionRegisterError {
 impl From<SessionKindMismatch> for SessionRegisterError {
     fn from(e: SessionKindMismatch) -> Self {
         Self::KindMismatch(e)
+    }
+}
+
+impl From<InvalidSessionRecord> for SessionRegisterError {
+    fn from(e: InvalidSessionRecord) -> Self {
+        Self::InvalidRecord(e)
     }
 }
 
@@ -377,11 +403,11 @@ impl SessionRegistry for InMemorySessionRegistry {
     ) -> Result<(), SessionRegisterError> {
         // Reject malformed keys (empty issuer or session identifier).
         if !key.is_valid() {
-            return Err(SessionKindMismatch.into());
+            return Err(InvalidSessionRecord.into());
         }
         // Require nonempty subject and tenant (v16 §3.3 record shape).
         if state.subject.is_empty() || state.tenant.is_empty() {
-            return Err(SessionKindMismatch.into());
+            return Err(InvalidSessionRecord.into());
         }
         validate_key_kind_coherence(&key, &state)?;
         #[cfg(not(target_arch = "wasm32"))]
@@ -497,6 +523,44 @@ mod tests {
         let wl = SessionKey::workload("https://a.example", "ses-1");
         assert_ne!(oidc, wl, "OIDC sid and workload session must not collide");
         assert_ne!(hash_of(&oidc), hash_of(&wl));
+    }
+
+    /// Malformed registrations (empty issuer/identifier/subject/tenant) are
+    /// rejected as [`InvalidSessionRecord`], NOT as a kind mismatch — a
+    /// malformed record is not a kind disagreement.
+    #[test]
+    fn malformed_registration_is_invalid_record_not_kind_mismatch() {
+        let reg = InMemorySessionRegistry::new();
+        let state = SessionState {
+            subject: "alice".to_owned(),
+            tenant: "default".to_owned(),
+            kind: SessionKind::Interactive,
+            created_at: 0,
+            expires_at: 9_999_999_999,
+            status: ActiveOrRevoked::Active,
+            clearance_epoch: 0,
+        };
+
+        let bad_key = reg.register_session(SessionKey::oidc("", "ses-1"), state.clone());
+        assert!(
+            matches!(bad_key, Err(SessionRegisterError::InvalidRecord(_))),
+            "empty issuer key → InvalidRecord, got {bad_key:?}"
+        );
+
+        let mut empty_subject = state.clone();
+        empty_subject.subject = String::new();
+        let bad_state = reg.register_session(SessionKey::oidc("https://a.example", "ses-1"), empty_subject);
+        assert!(
+            matches!(bad_state, Err(SessionRegisterError::InvalidRecord(_))),
+            "empty subject → InvalidRecord, got {bad_state:?}"
+        );
+
+        // A genuine kind mismatch still reports KindMismatch.
+        let mismatch = reg.register_session(SessionKey::workload("https://a.example", "ses-2"), state);
+        assert!(
+            matches!(mismatch, Err(SessionRegisterError::KindMismatch(_))),
+            "workload key + interactive state → KindMismatch, got {mismatch:?}"
+        );
     }
 
     fn hash_of<T: std::hash::Hash>(v: &T) -> u64 {

@@ -49,7 +49,7 @@ fn load_config() -> HyprConfig {
 }
 
 /// Get the JWT bound to this service instance's exact signing key.
-fn service_token(signing_key: &SigningKey) -> Option<String> {
+pub(crate) fn service_token(signing_key: &SigningKey) -> Option<String> {
     let trust = hyprstream_service::global_trust_store();
     trust
         .get(&signing_key.verifying_key())
@@ -60,7 +60,6 @@ fn service_token(signing_key: &SigningKey) -> Option<String> {
 /// that needs it. Both PolicyService and RegistryService share this instance.
 static SHARED_GIT2DB: std::sync::OnceLock<Arc<RwLock<Git2DB>>> = std::sync::OnceLock::new();
 
-/// Shared JTI blocklist Arc — set by `create_policy_service`, read by
 /// Get or initialize the shared Git2DB registry for the given models directory.
 fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock<Git2DB>>> {
     if let Some(existing) = SHARED_GIT2DB.get() {
@@ -876,19 +875,9 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         policy_service = policy_service.with_ml_dsa_key_store(ml_dsa_store);
     }
 
-    // Publish the credential-revocation store both process-locally (for
-    // OAuthService/OAI created later) and globally (for all RequestService
-    // implementations via the default trait method). There is exactly one
-    // store — no per-service fallback. Both publications MUST succeed —
-    // a second store from a race is a startup error.
-    // Publish the credential-revocation store globally. PolicyService is
-    // the sole owner; all consumers (OAI, OAuth, MCP, RPC verify_claims)
-    // read the global. There is no separate store instance.
-    let store = std::sync::Arc::new(
-        hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
-    );
-    hyprstream_rpc::auth::set_global_credential_revocation_store(store)
-        .map_err(|_| anyhow::anyhow!("global credential-revocation store already set (publication race)"))?;
+    // The credential-revocation store is published once per process by
+    // `services::revocation::init_process_credential_revocation_store` from
+    // the main.rs startup block, before any factory runs — not here.
 
     Ok(ctx.into_spawnable_quic(policy_service, config.policy.quic_port))
 }
@@ -2145,7 +2134,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                             if let Some(ref jti) = claims.jti {
                                 let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
                                 let revoked_or_unavailable = match hyprstream_rpc::auth::global_credential_revocation_store() {
-                                    Some(bl) => bl.is_revoked(&cred_id),
+                                    Some(bl) => bl.is_revoked(&cred_id).await,
                                     None => {
                                         tracing::warn!(%method, %uri, %jti, "MCP: no revocation store configured — rejecting token with jti");
                                         true // fail-closed

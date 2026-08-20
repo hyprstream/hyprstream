@@ -25,9 +25,12 @@ pub struct RevocationRequest {
 /// POST /oauth/revoke (RFC 7009)
 ///
 /// Revokes a refresh token or access token. Access tokens with a `jti` claim
-/// are added to the blocklist (checked by `verify_claims` on every request).
-/// Per RFC 7009 Section 2.1, the server MUST respond with 200 OK even if the
-/// token is invalid or already revoked.
+/// are published to the credential-revocation store (checked by
+/// `verify_claims` on every request). Per RFC 7009 Section 2.1, the server
+/// responds with 200 OK even if the token is invalid or already revoked.
+/// Publication failure is different: an absent store or a publication the
+/// revocation authority did not durably accept is a 503 — a revocation that
+/// did not happen must never look like success.
 pub async fn revoke_token(
     State(state): State<Arc<OAuthState>>,
     Form(params): Form<RevocationRequest>,
@@ -43,38 +46,68 @@ pub async fn revoke_token(
     }
 
     if is_access_hint || params.token_type_hint.is_none() {
-        // Use the process-global credential-revocation store.
-        if let Some(store) = hyprstream_rpc::auth::global_credential_revocation_store() {
-            // Verify the token using the single verification stack
-            // (typ, signature, local-issuer) with the relaxed audience
-            // policy appropriate for revocation: any locally-issued
-            // resource-audience token may be revoked. An unverified
-            // token's iss/jti/exp are attacker-controlled; a forged
-            // token must not revoke another credential. If verification
-            // fails, return 200 per RFC 7009 but do not modify the store.
-            match super::auth::verify_access_token(
-                state.as_ref(),
-                &params.token,
-                super::auth::AudiencePolicy::AnyLocalIssuer,
-            )
-            .await
-            {
-                Ok(claims) => {
-                    if let Some(ref jti) = claims.jti {
-                        let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
-                        store.revoke_credential(cred_id, claims.exp);
-                        tracing::info!(sub = %claims.sub, "Revoked access token via credential revocation store");
-                    }
+        // Verify the token using the single verification stack
+        // (typ, signature, local-issuer) with the relaxed audience
+        // policy appropriate for revocation: any locally-issued
+        // resource-audience token may be revoked. An unverified
+        // token's iss/jti/exp are attacker-controlled; a forged
+        // token must not revoke another credential. If verification
+        // fails, return 200 per RFC 7009 but do not modify the store.
+        match super::auth::verify_access_token(
+            state.as_ref(),
+            &params.token,
+            super::auth::AudiencePolicy::AnyLocalIssuer,
+        )
+        .await
+        {
+            Ok(claims) => {
+                if let Err(response) = publish_access_token_revocation(&claims).await {
+                    return response;
                 }
-                Err(_) => {
-                    // Token verification failed — may be expired, wrong key,
-                    // or not a JWT. RFC 7009: still 200.
-                }
+            }
+            Err(_) => {
+                // Token verification failed — may be expired, wrong key,
+                // or not a JWT. RFC 7009: still 200.
             }
         }
     }
 
     StatusCode::OK.into_response()
+}
+
+/// Publish a verified access token's credential ID to the process-global
+/// revocation store. Fail-closed: an absent store or a rejected publication
+/// yields `503 Service Unavailable`.
+async fn publish_access_token_revocation(
+    claims: &hyprstream_rpc::auth::Claims,
+) -> Result<(), Response> {
+    let Some(ref jti) = claims.jti else {
+        return Ok(());
+    };
+    let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
+    let Some(store) = hyprstream_rpc::auth::global_credential_revocation_store() else {
+        tracing::error!(sub = %claims.sub, "Revocation store unavailable — cannot publish revocation");
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    };
+    publish_credential_revocation(store.as_ref(), cred_id, claims.exp).await?;
+    tracing::info!(sub = %claims.sub, "Revoked access token via credential revocation store");
+    Ok(())
+}
+
+/// Publish one credential revocation to `store`. A publication the authority
+/// did not durably accept is a 503, not a success.
+async fn publish_credential_revocation(
+    store: &dyn hyprstream_rpc::auth::CredentialRevocationStore,
+    cred_id: hyprstream_rpc::auth::CredentialId,
+    expires_at: i64,
+) -> Result<(), Response> {
+    store
+        .revoke_credential(cred_id.clone(), expires_at)
+        .await
+        .map_err(|e| {
+            tracing::error!(credential = %cred_id, error = %e, "Revocation publication failed");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        })
 }
 
 #[cfg(test)]
@@ -149,7 +182,7 @@ mod tests {
         let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&issuer, actual_jti);
         let store = hyprstream_rpc::auth::global_credential_revocation_store().unwrap();
         assert!(
-            !store.is_revoked(&cred_id),
+            !store.is_revoked(&cred_id).await,
             "precondition: credential not yet revoked"
         );
 
@@ -165,7 +198,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK, "RFC 7009: always 200");
         assert!(
-            store.is_revoked(&cred_id),
+            store.is_revoked(&cred_id).await,
             "resource-audience token must be revoked in the store"
         );
     }
@@ -193,7 +226,7 @@ mod tests {
 
         let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&issuer, actual_jti);
         let store = hyprstream_rpc::auth::global_credential_revocation_store().unwrap();
-        assert!(!store.is_revoked(&cred_id), "precondition: not revoked");
+        assert!(!store.is_revoked(&cred_id).await, "precondition: not revoked");
 
         let response = revoke_token(
             State(state),
@@ -206,8 +239,44 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK, "RFC 7009: always 200");
         assert!(
-            !store.is_revoked(&cred_id),
+            !store.is_revoked(&cred_id).await,
             "forged token must NOT publish a revocation"
         );
+    }
+
+    /// A revocation store whose authority rejects the publication surfaces as
+    /// 503 — a revocation that was not durably accepted must never look like
+    /// success.
+    #[tokio::test]
+    async fn publication_failure_is_service_unavailable() {
+        use hyprstream_rpc::auth::{
+            CredentialId, CredentialRevocationStore, RevocationPublishError,
+        };
+
+        struct FailingStore;
+
+        #[async_trait::async_trait]
+        impl CredentialRevocationStore for FailingStore {
+            async fn is_revoked_checked(&self, _id: &CredentialId) -> bool {
+                false
+            }
+
+            async fn revoke_credential(
+                &self,
+                _id: CredentialId,
+                _expires_at: i64,
+            ) -> Result<(), RevocationPublishError> {
+                Err(RevocationPublishError::new("stub: authority unavailable"))
+            }
+        }
+
+        let result = publish_credential_revocation(
+            &FailingStore,
+            CredentialId::jwt("https://a.example", "jti-1"),
+            9_999_999_999,
+        )
+        .await;
+        let response = result.expect_err("failed publication must surface as an error response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

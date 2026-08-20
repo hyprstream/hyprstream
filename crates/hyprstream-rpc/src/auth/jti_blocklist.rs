@@ -8,6 +8,18 @@
 //! CWT `cti` byte strings are kept as bytes (via [`CredentialValue::Cwt`])
 //! and never stringified into the JWT `jti` text namespace.
 //!
+//! # One canonical store, owned by the policy service
+//!
+//! There is exactly one canonical revocation store per deployment, owned by
+//! the policy service process and backed by a durable local file
+//! ([`FileBackedCredentialRevocationStore`]). Every other service process
+//! publishes the process-global handle below with a policy-authority RPC
+//! client store (see `services::revocation` in the `hyprstream` crate) that
+//! checks and publishes revocations through the policy service over the RPC
+//! bus. Startup, checks, and publication are all fail-closed: no reachable
+//! authority means no JTI-bearing token is admitted and no revocation
+//! silently no-ops.
+//!
 //! Renamed from `JtiBlocklist` / `InMemoryJtiBlocklist` (bare `jti` key) to
 //! `CredentialRevocationStore` / `InMemoryCredentialRevocationStore`
 //! (issuer-scoped `(iss, jti/cti)` key).
@@ -15,15 +27,15 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use super::credential::CredentialId;
+use super::credential::{CredentialId, CredentialValue};
 
 // ── Global store ──────────────────────────────────────────────────────────
 
-/// Process-global credential-revocation store. Set once at startup (by
-/// PolicyService or equivalent bootstrap) so every `RequestService`
-/// implementation shares exactly one store. Before it is set, verification
-/// fails closed — no token with a jti can be admitted until the store is
-/// published.
+/// Process-global credential-revocation store. Set once at startup so every
+/// `RequestService` implementation shares exactly one store: the durable
+/// authority store in the policy process, or a policy-authority RPC client
+/// store everywhere else. Before it is set, verification fails closed — no
+/// token with a jti can be admitted until the store is published.
 static GLOBAL_STORE: OnceLock<Arc<dyn CredentialRevocationStore>> = OnceLock::new();
 
 /// Publish the process-global credential-revocation store. Called once at
@@ -58,6 +70,33 @@ pub fn global_credential_revocation_store() -> Option<&'static Arc<dyn Credentia
     GLOBAL_STORE.get()
 }
 
+/// The revocation authority did not durably accept a revocation publication.
+///
+/// Publication failure must never look like success: callers (e.g. the RFC
+/// 7009 endpoint) surface this as an error response instead of proceeding as
+/// though the credential were revoked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevocationPublishError {
+    message: String,
+}
+
+impl RevocationPublishError {
+    /// Construct from a human-readable cause.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RevocationPublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "revocation publication failed: {}", self.message)
+    }
+}
+
+impl std::error::Error for RevocationPublishError {}
+
 /// Trait for a credential-revocation store keyed by issuer-scoped
 /// [`CredentialId`].
 ///
@@ -66,30 +105,44 @@ pub fn global_credential_revocation_store() -> Option<&'static Arc<dyn Credentia
 /// published to the blocklist FIRST, so new verifications fail, and only
 /// THEN are derived handles evicted. Callers cannot reverse this order
 /// because publication and eviction are a single method call.
+///
+/// The methods are async because the canonical store is remote for every
+/// process except the policy service: checks and publications cross the RPC
+/// bus to the revocation authority.
+#[async_trait::async_trait]
 pub trait CredentialRevocationStore: Send + Sync {
     /// Returns `true` if the given issuer-scoped credential has been revoked.
     ///
     /// An invalid credential ID (empty issuer or value) returns `true`
     /// (fail-closed): per v16 §3.1, malformed identifiers deny.
-    fn is_revoked(&self, id: &CredentialId) -> bool {
+    async fn is_revoked(&self, id: &CredentialId) -> bool {
         if !id.is_valid() {
             return true;
         }
-        self.is_revoked_checked(id)
+        self.is_revoked_checked(id).await
     }
 
     /// Revoke a credential. `expires_at` is the token's `exp` — the entry
     /// can be garbage-collected after this time.
     ///
-    /// Ordering: the credential is marked revoked in the blocklist BEFORE
-    /// derived handles are evicted. This ensures new verifications fail the
-    /// blocklist check while cached contexts derived from the revoked token
-    /// are being removed.
-    fn revoke_credential(&self, id: CredentialId, expires_at: i64);
+    /// Ordering: the credential is published (durable, for the authority
+    /// store) BEFORE derived handles are evicted. This ensures new
+    /// verifications fail the blocklist check while cached contexts derived
+    /// from the revoked token are being removed.
+    ///
+    /// Returns [`RevocationPublishError`] if the revocation authority did not
+    /// durably accept the publication; on error no in-memory state changes
+    /// and no handles are evicted.
+    async fn revoke_credential(
+        &self,
+        id: CredentialId,
+        expires_at: i64,
+    ) -> Result<(), RevocationPublishError>;
 
     /// The checked revocation lookup — called by `is_revoked` after
     /// validation. Implementations provide the actual store lookup.
-    fn is_revoked_checked(&self, id: &CredentialId) -> bool;
+    /// Implementations fail closed: any lookup error returns `true`.
+    async fn is_revoked_checked(&self, id: &CredentialId) -> bool;
 }
 
 /// In-memory credential-revocation store with periodic cleanup.
@@ -125,10 +178,18 @@ impl InMemoryCredentialRevocationStore {
             map.retain(|_, exp| *exp > now);
         }
     }
+
+    /// Insert an already-published entry (durable-store load at startup):
+    /// memory insert only — no eviction, no re-publication.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn insert_loaded(&self, id: CredentialId, expires_at: i64) {
+        self.revoked.write().insert(id, expires_at);
+    }
 }
 
+#[async_trait::async_trait]
 impl CredentialRevocationStore for InMemoryCredentialRevocationStore {
-    fn is_revoked_checked(&self, id: &CredentialId) -> bool {
+    async fn is_revoked_checked(&self, id: &CredentialId) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.revoked.read().contains_key(id)
@@ -142,11 +203,16 @@ impl CredentialRevocationStore for InMemoryCredentialRevocationStore {
         }
     }
 
-    fn revoke_credential(&self, id: CredentialId, expires_at: i64) {
+    async fn revoke_credential(
+        &self,
+        id: CredentialId,
+        expires_at: i64,
+    ) -> Result<(), RevocationPublishError> {
         let now = chrono::Utc::now().timestamp();
 
         // Phase 1 — PUBLISH: insert into the blocklist so that any new
         // verification encountering this credential ID rejects immediately.
+        // In-memory publication cannot fail, so this store always returns Ok.
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut map = self.revoked.write();
@@ -177,6 +243,154 @@ impl CredentialRevocationStore for InMemoryCredentialRevocationStore {
         {
             crate::auth::mac::revoke_verified_subject_credential(&id);
         }
+        Ok(())
+    }
+}
+
+// ── Durable (file-backed) store — the policy process's canonical store ────
+
+/// One JSONL record: `{"iss":…,"jwt":…,"exp":…}` for a JWT `jti`, or
+/// `{"iss":…,"cwt":"<base64>","exp":…}` for a CWT `cti`. The `jwt`/`cwt`
+/// split preserves the disjoint typed namespaces on disk.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RevocationRecord {
+    iss: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    jwt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cwt: Option<String>,
+    exp: i64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RevocationRecord {
+    fn new(id: &CredentialId, expires_at: i64) -> Self {
+        match &id.value {
+            CredentialValue::Jwt(jti) => Self {
+                iss: id.issuer.clone(),
+                jwt: Some(jti.clone()),
+                cwt: None,
+                exp: expires_at,
+            },
+            CredentialValue::Cwt(cti) => Self {
+                iss: id.issuer.clone(),
+                jwt: None,
+                cwt: Some(base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    cti,
+                )),
+                exp: expires_at,
+            },
+        }
+    }
+
+    /// Decode back to a validated [`CredentialId`]. `None` = corrupt record
+    /// (both/neither namespace present, bad base64, or empty issuer/value).
+    fn credential_id(&self) -> Option<CredentialId> {
+        let id = match (&self.jwt, &self.cwt) {
+            (Some(jti), None) => CredentialId::jwt(self.iss.clone(), jti.clone()),
+            (None, Some(cti)) => {
+                let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, cti)
+                    .ok()?;
+                CredentialId::cwt(self.iss.clone(), bytes)
+            }
+            _ => return None,
+        };
+        id.is_valid().then_some(id)
+    }
+}
+
+/// Durable credential-revocation store: an in-memory index in front of a
+/// JSONL append file. This is the canonical store form owned by the policy
+/// process — a revocation becomes visible to checks only after it has been
+/// appended AND fsync'd, so a crash never resurrects a revoked credential.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct FileBackedCredentialRevocationStore {
+    /// Live `(iss, jti/cti) → exp` index, loaded from the file at open.
+    inner: InMemoryCredentialRevocationStore,
+    /// Append handle for the JSONL log; the mutex serializes writers.
+    file: parking_lot::Mutex<std::fs::File>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl FileBackedCredentialRevocationStore {
+    /// Open (creating if absent) the durable store at `path` and load every
+    /// non-expired entry into memory. Expired entries are dropped on load —
+    /// natural token expiry rejects them anyway.
+    ///
+    /// Uses blocking file IO: called once at startup, before the process
+    /// serves traffic. Fail-closed: ANY unreadable/corrupt line or IO error
+    /// is returned as `Err` and MUST abort startup — a partially-read store
+    /// would silently un-revoke credentials.
+    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::{BufRead, BufReader};
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(path)?;
+        let now = chrono::Utc::now().timestamp();
+        let store = Self {
+            inner: InMemoryCredentialRevocationStore::new(),
+            file: parking_lot::Mutex::new(file.try_clone()?),
+        };
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: RevocationRecord = serde_json::from_str(&line).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("corrupt revocation record: {e}"),
+                )
+            })?;
+            let id = record.credential_id().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "corrupt revocation record: invalid credential id",
+                )
+            })?;
+            if record.exp > now {
+                store.inner.insert_loaded(id, record.exp);
+            }
+        }
+        Ok(store)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait::async_trait]
+impl CredentialRevocationStore for FileBackedCredentialRevocationStore {
+    async fn is_revoked_checked(&self, id: &CredentialId) -> bool {
+        self.inner.is_revoked_checked(id).await
+    }
+
+    async fn revoke_credential(
+        &self,
+        id: CredentialId,
+        expires_at: i64,
+    ) -> Result<(), RevocationPublishError> {
+        use std::io::Write as _;
+
+        // Phase 1 — PUBLISH (durable): append + fsync FIRST. On IO failure
+        // the in-memory index and the handle cache stay untouched — a
+        // revocation that is not durable must not pretend to exist.
+        let mut line = serde_json::to_string(&RevocationRecord::new(&id, expires_at))
+            .map_err(|e| RevocationPublishError::new(format!("record serialization failed: {e}")))?;
+        line.push('\n');
+        {
+            let mut file = self.file.lock();
+            file.write_all(line.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|e| RevocationPublishError::new(format!("durable append failed: {e}")))?;
+        }
+
+        // Phase 2 — publish to memory, then evict handles (same
+        // publication-before-eviction ordering as the in-memory store).
+        self.inner.revoke_credential(id, expires_at).await
     }
 }
 
@@ -197,25 +411,25 @@ mod tests {
     /// Revoking `(issuerA, "tok-1")` must not affect `(issuerB, "tok-1")`.
     /// The whole point of issuer scoping: two issuers can independently
     /// produce the same jti without cross-revoking each other's tokens.
-    #[test]
-    fn issuer_scoping_prevents_cross_revoke() {
+    #[tokio::test]
+    async fn issuer_scoping_prevents_cross_revoke() {
         let store = InMemoryCredentialRevocationStore::new();
         let id_a = CredentialId::jwt("https://a.example", "tok-1");
         let id_b = CredentialId::jwt("https://b.example", "tok-1");
 
-        store.revoke_credential(id_a.clone(), 9_999_999_999);
+        store.revoke_credential(id_a.clone(), 9_999_999_999).await.unwrap();
 
-        assert!(store.is_revoked(&id_a), "issuer A's token is revoked");
+        assert!(store.is_revoked(&id_a).await, "issuer A's token is revoked");
         assert!(
-            !store.is_revoked(&id_b),
+            !store.is_revoked(&id_b).await,
             "issuer B's same-jti token is NOT revoked"
         );
     }
 
     /// Revoking by CWT cti bytes does not collide with the same bytes as a
     /// JWT jti string. The two are disjoint namespaces by type.
-    #[test]
-    fn cwt_cti_does_not_collide_with_jwt_jti() {
+    #[tokio::test]
+    async fn cwt_cti_does_not_collide_with_jwt_jti() {
         let store = InMemoryCredentialRevocationStore::new();
         let bytes = b"same-identifier-bytes".to_vec();
 
@@ -224,16 +438,16 @@ mod tests {
             issuer: "https://issuer.example".to_owned(),
             value: CredentialValue::Cwt(bytes.clone()),
         };
-        store.revoke_credential(cwt_id.clone(), 9_999_999_999);
+        store.revoke_credential(cwt_id.clone(), 9_999_999_999).await.unwrap();
 
         // A JWT credential with the same bytes-as-UTF-8 as jti is NOT revoked.
         let jwt_id = CredentialId {
             issuer: "https://issuer.example".to_owned(),
             value: CredentialValue::Jwt(String::from_utf8(bytes).unwrap()),
         };
-        assert!(store.is_revoked(&cwt_id), "CWT cti credential is revoked");
+        assert!(store.is_revoked(&cwt_id).await, "CWT cti credential is revoked");
         assert!(
-            !store.is_revoked(&jwt_id),
+            !store.is_revoked(&jwt_id).await,
             "JWT jti credential with the same text is NOT revoked"
         );
     }
@@ -241,8 +455,8 @@ mod tests {
     /// Empty issuer and empty jti values are rejected as malformed (v16 §3.1).
     /// `is_revoked` returns `true` (fail-closed) for invalid IDs — they can
     /// never pass a revocation check.
-    #[test]
-    fn empty_issuer_and_jti_are_rejected() {
+    #[tokio::test]
+    async fn empty_issuer_and_jti_are_rejected() {
         let store = InMemoryCredentialRevocationStore::new();
         let empty_iss = CredentialId::jwt("", "tok-1");
         let empty_jti = CredentialId::jwt("https://a.example", "");
@@ -257,27 +471,30 @@ mod tests {
 
         // Fail-closed: invalid IDs report as revoked even though nothing was
         // explicitly revoked.
-        assert!(store.is_revoked(&empty_iss), "empty issuer → fail-closed");
-        assert!(store.is_revoked(&empty_jti), "empty jti → fail-closed");
-        assert!(store.is_revoked(&empty_cti), "empty cti → fail-closed");
+        assert!(store.is_revoked(&empty_iss).await, "empty issuer → fail-closed");
+        assert!(store.is_revoked(&empty_jti).await, "empty jti → fail-closed");
+        assert!(store.is_revoked(&empty_cti).await, "empty cti → fail-closed");
     }
 
     /// TTL cleanup evicts expired entries but keeps live ones.
-    #[test]
-    fn cleanup_evicts_expired_entries() {
+    #[tokio::test]
+    async fn cleanup_evicts_expired_entries() {
         let store = InMemoryCredentialRevocationStore::new();
         let live = CredentialId::jwt("https://a.example", "live");
         let expired = CredentialId::jwt("https://a.example", "expired");
 
-        store.revoke_credential(live.clone(), 9_999_999_999);
-        store.revoke_credential(expired.clone(), 1); // expired at time 1
+        store.revoke_credential(live.clone(), 9_999_999_999).await.unwrap();
+        store.revoke_credential(expired.clone(), 1).await.unwrap(); // expired at time 1
 
-        // Trigger cleanup by inserting enough entries (threshold is 10_000).
-        // Instead, verify the entries are present and the expired one has
-        // a past-expiry value — the cleanup behavior is inherited from the
-        // original implementation and unchanged.
-        assert!(store.is_revoked(&live));
-        assert!(store.is_revoked(&expired));
+        // Both entries are present before cleanup.
+        assert!(store.is_revoked(&live).await);
+        assert!(store.is_revoked(&expired).await);
+
+        // Clean at a point past `expired`'s exp but before `live`'s.
+        store.cleanup(1_000_000);
+
+        assert!(store.is_revoked(&live).await, "live entry kept");
+        assert!(!store.is_revoked(&expired).await, "expired entry evicted");
     }
 
     // ── Revocation-before-eviction ordering ───────────────────────────────
@@ -285,12 +502,15 @@ mod tests {
     /// `revoke_credential` publishes to the blocklist and evicts derived
     /// handles in one call. We verify both effects: the credential is
     /// published (blocklist reports revoked) AND the verified-subject cache
-    /// entry derived from that credential is evicted. Since the method is
-    /// synchronous, the caller cannot observe an intermediate state where
-    /// eviction happened but publication didn't.
+    /// entry derived from that credential is evicted. Publication and
+    /// eviction are a single method call, so a caller cannot observe an
+    /// intermediate state where eviction happened but publication didn't.
+    // await_holding_lock: CACHE_TEST_LOCK serializes cache-mutating tests; the
+    // in-memory store futures complete without ever suspending.
     #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn revoke_credential_publishes_then_evicts_subject() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revoke_credential_publishes_then_evicts_subject() {
         use crate::auth::mac::{
             flush_verified_subject_cache_generation, remember_verified_claims,
             revoke_verified_subject_credential, VerifiedKeyMaterial,
@@ -319,10 +539,10 @@ mod tests {
         // Revoke the credential: publish then evict.
         let store = InMemoryCredentialRevocationStore::new();
         let id = CredentialId::jwt(issuer, jti);
-        store.revoke_credential(id.clone(), now + 300);
+        store.revoke_credential(id.clone(), now + 300).await.unwrap();
 
         // Publication: the blocklist reports revoked.
-        assert!(store.is_revoked(&id), "credential must be published");
+        assert!(store.is_revoked(&id).await, "credential must be published");
 
         // Eviction: the verified-subject cache entry derived from this
         // credential is gone. We check the eviction function directly
@@ -370,9 +590,11 @@ mod tests {
     /// A CWT credential (cti bytes) inserted via the checked boundary is
     /// evicted when that exact `(iss, cti)` credential is revoked. JWT
     /// credentials with the same text value survive — disjoint namespaces.
+    // await_holding_lock: see revoke_credential_publishes_then_evicts_subject.
     #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn cwt_credential_is_evicted_by_typed_revoke() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn cwt_credential_is_evicted_by_typed_revoke() {
         use crate::auth::mac::{
             flush_verified_subject_cache_generation, remember_verified_claims_with_credential,
             revoke_verified_subject_credential, VerifiedKeyMaterial,
@@ -430,10 +652,10 @@ mod tests {
 
         // Revoke via the store's canonical API (publish then evict).
         let store = InMemoryCredentialRevocationStore::new();
-        store.revoke_credential(cwt_id.clone(), now + 300);
+        store.revoke_credential(cwt_id.clone(), now + 300).await.unwrap();
 
         // Publication: the store reports revoked.
-        assert!(store.is_revoked(&cwt_id), "CWT credential must be published");
+        assert!(store.is_revoked(&cwt_id).await, "CWT credential must be published");
 
         // Eviction probe: the CWT entry is gone (already evicted by
         // revoke_credential's internal hook). Returns 0 because the

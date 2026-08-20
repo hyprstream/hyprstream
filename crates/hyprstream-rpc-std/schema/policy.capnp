@@ -92,6 +92,14 @@ struct PolicyRequest {
     # Requires 'exchange' permission on 'policy:exchange-wit' in Casbin policy.
     exchangeWit @21 :ExchangeWit
       $scope(manage) $mcpDescription("Exchange the caller's envelope WIT for an OAuth at+jwt; identity from signed envelope");
+
+    # Publish a credential revocation to the canonical store owned by this service.
+    revokeCredential @22 :RevokeCredential
+      $scopeExempt("internal revocation-authority operation — publication is gated by verified-token revocation at the OAuth boundary (RFC 7009), not a Casbin scope");
+
+    # Ask the revocation authority whether a credential has been revoked.
+    checkCredentialRevocation @23 :CheckCredentialRevocation
+      $scopeExempt("revocation check is part of credential verification itself — a scope check would be circular");
   }
 }
 
@@ -256,6 +264,12 @@ struct PolicyResponse {
 
     # at+jwt from exchangeWit
     exchangeWitResult @22 :TokenInfo;
+
+    # Revocation publication acknowledged (durable)
+    revokeCredentialResult @23 :Void;
+
+    # Revocation check result (true = revoked or unknown — fail-closed)
+    checkCredentialRevocationResult @24 :Bool;
   }
 }
 
@@ -429,4 +443,31 @@ struct ExchangeWit {
 
   # TTL override in seconds. Server clamps to configured [min, max].
   ttl @2 :Opt.OptionUint32;
+}
+
+# Issuer-scoped credential identifier (iss, jti/cti). JWT jti text and CWT cti
+# bytes are disjoint typed namespaces — mirrors the verifier-side
+# CredentialValue type; a CWT cti is never stringified into the JWT namespace.
+struct CredentialIdRef {
+  # The token `iss` claim identifying the credential issuer.
+  issuer @0 :Text;
+  union {
+    # JWT `jti` claim (RFC 7519) — case-sensitive text.
+    jwtJti @1 :Text;
+    # CWT `cti` claim (RFC 8392) — raw bytes.
+    cwtCti @2 :Data;
+  }
+}
+
+# Publish a credential revocation. The entry may be garbage-collected once
+# `expiresAt` passes (natural token expiry rejects it anyway).
+struct RevokeCredential {
+  credential @0 :CredentialIdRef;
+  # The token's `exp` (Unix seconds) — GC hint for the durable store.
+  expiresAt @1 :Int64;
+}
+
+# Query the revocation authority for a credential's revocation state.
+struct CheckCredentialRevocation {
+  credential @0 :CredentialIdRef;
 }

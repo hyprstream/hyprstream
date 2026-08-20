@@ -18,6 +18,7 @@ use crate::services::generated::policy_client::{
     EventPrefixAccess, PendingSubscribers,
     ResolveServiceKey, RegisterServiceKey, ServiceKeyCandidate, ServiceKeyResponse,
     RefreshServiceTokenRequest, ExchangeWit,
+    RevokeCredential, CheckCredentialRevocation,
     dispatch_policy, serialize_response,
 };
 use anyhow::{anyhow, Result};
@@ -1939,6 +1940,61 @@ impl PolicyHandler for PolicyService {
             token,
             expires_at,
         }))
+    }
+
+    /// Publish a credential revocation into the canonical store this service
+    /// owns. Fail-closed: an uninitialized store or a failed durable write is
+    /// reported as an error, never as a silent success.
+    async fn handle_revoke_credential(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RevokeCredential,
+    ) -> Result<PolicyResponseVariant> {
+        let Some(id) = crate::services::revocation::credential_id_from_ref(&data.credential)
+        else {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "malformed credential id (empty issuer or value)".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        };
+        let Some(store) = hyprstream_rpc::auth::global_credential_revocation_store() else {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "revocation authority store is not initialized".to_owned(),
+                code: "UNAVAILABLE".to_owned(),
+                details: String::new(),
+            }));
+        };
+        if let Err(e) = store.revoke_credential(id.clone(), data.expires_at).await {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "revocation publication was not durably accepted".to_owned(),
+                code: "UNAVAILABLE".to_owned(),
+                details: e.to_string(),
+            }));
+        }
+        info!(credential = %id, "Credential revocation published");
+        Ok(PolicyResponseVariant::RevokeCredentialResult)
+    }
+
+    /// Answer a revocation check from the canonical store. Fail-closed twice
+    /// over: a malformed credential ID reports revoked, and an uninitialized
+    /// store reports revoked — a credential whose status cannot be checked is
+    /// never reported live.
+    async fn handle_check_credential_revocation(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &CheckCredentialRevocation,
+    ) -> Result<PolicyResponseVariant> {
+        let revoked = match crate::services::revocation::credential_id_from_ref(&data.credential) {
+            Some(id) => match hyprstream_rpc::auth::global_credential_revocation_store() {
+                Some(store) => store.is_revoked(&id).await,
+                None => true,
+            },
+            None => true,
+        };
+        Ok(PolicyResponseVariant::CheckCredentialRevocationResult(revoked))
     }
 }
 

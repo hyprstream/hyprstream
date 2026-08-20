@@ -246,7 +246,7 @@ pub(super) async fn validate_oauth_access_token(
         let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
         match hyprstream_rpc::auth::global_credential_revocation_store() {
             Some(store) => {
-                if store.is_revoked(&cred_id) {
+                if store.is_revoked(&cred_id).await {
                     return Err("JWT revoked");
                 }
             }

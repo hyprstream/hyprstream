@@ -802,9 +802,13 @@ pub trait RequestService: 'static {
 
     /// Credential revocation store for access token revocation.
     ///
-    /// Returns the process-global store published at startup. When `None`
-    /// (startup not yet complete), `verify_claims()` rejects tokens with a
-    /// jti (fail-closed). Override only for specialized testing.
+    /// Returns the process-global store published at startup: the durable
+    /// authority store in the policy process, or a policy-authority RPC
+    /// client store in every other process (checks cross the RPC bus to the
+    /// policy service, the one canonical revocation authority). When `None`
+    /// (startup not yet complete or authority initialization failed),
+    /// `verify_claims()` rejects tokens with a jti (fail-closed). Override
+    /// only for specialized testing.
     fn credential_revocation_store(&self) -> Option<&dyn crate::auth::CredentialRevocationStore> {
         crate::auth::global_credential_revocation_store().map(std::convert::AsRef::as_ref)
     }
@@ -1148,7 +1152,7 @@ pub trait RequestService: 'static {
             match self.credential_revocation_store() {
                 Some(store) => {
                     let cred_id = crate::auth::CredentialId::jwt(&verified.iss, jti);
-                    if store.is_revoked(&cred_id) {
+                    if store.is_revoked(&cred_id).await {
                         tracing::warn!(jti = %jti, iss = %verified.iss, sub = %verified.sub, "Revoked JWT rejected");
                         anyhow::bail!("JWT has been revoked");
                     }

@@ -2954,6 +2954,21 @@ fn main() -> Result<()> {
                                 // Compute dependency-aware startup stages.
                                 let stages = hyprstream_service::startup_stages(&service_names);
 
+                                // Publish the process-global credential-revocation
+                                // store BEFORE any factory runs. The policy process
+                                // owns the one canonical store (durable local file);
+                                // every other process publishes a policy-authority
+                                // RPC client store after probing the authority.
+                                // Fail-closed: an unreachable authority or an
+                                // unreadable durable file aborts startup.
+                                hyprstream_core::services::revocation::init_process_credential_revocation_store(
+                                    &ctx,
+                                    ctx.signing_key(),
+                                    service_names.iter().any(|n| n == "policy"),
+                                )
+                                .await
+                                .context("credential revocation authority initialization failed")?;
+
                                 // #275: in the systemd / --ipc deployment each service
                                 // runs in its OWN process. Only the `event` service's
                                 // process initializes the process-global moq event bus

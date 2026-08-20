@@ -83,6 +83,7 @@ pub mod oauth;
 pub mod oai;
 pub mod policy;
 pub mod registry;
+pub mod revocation;
 pub mod router;
 pub mod xet;
 pub mod xet_provenance;

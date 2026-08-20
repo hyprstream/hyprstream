@@ -680,7 +680,9 @@ mod tests {
         let cred_id = CredentialId::jwt(ISSUER, "revoked-xet");
         hyprstream_rpc::auth::global_credential_revocation_store()
             .expect("global store must be set")
-            .revoke_credential(cred_id, chrono::Utc::now().timestamp() + 3600);
+            .revoke_credential(cred_id, chrono::Utc::now().timestamp() + 3600)
+            .await
+            .expect("in-memory revocation publication cannot fail");
         let token = issuer.token(AUDIENCE, "revoked-xet");
 
         let resp = create_xet_router(state)
