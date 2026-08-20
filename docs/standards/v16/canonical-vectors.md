@@ -13,7 +13,7 @@ Machine-readable files (the normative form — this page is the human index):
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 6 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 35 vectors that MUST deny |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 38 vectors that MUST deny |
 
 Each JSON vector carries `id`, `title`, `expect` (`accept` / `deny`),
 `structure`, `size_bytes`, `sha256`, full `cbor_hex`, and — for negatives — a
@@ -62,12 +62,21 @@ a byte-identical regeneration. It also proves the negatives deny by their rule:
   a mandatory key rather than relying on a separate verifier check;
 - a **cleartext unary `response_binding`** carried as a map (N-27) is rejected —
   the cleartext map alternative is `stream_setup` only, so cleartext unary has
-  the single canonical null encoding; and
-- the **size-cap** negatives N-12 (65-byte `suite_id`), N-13 (65-byte `kid`),
-  and N-26 (129-byte `aud`) are asserted over their numeric caps, and the CDDL
-  cap text (`kid`/`suite-id-bounded` = `1..64`, `aud` = `1..128`) is pinned so a
-  widening drifts the gate to red — the pinned `pycddl` version cannot enforce
-  `.size` byte-length ranges, so these numeric checks are load-bearing.
+  the single canonical null encoding;
+- a **hybrid→classical downgrade** (N-28: the hybrid suite with only its Ed25519
+  component) and an **unknown suite_id** (N-12) are rejected at the
+  `signature-plan` level — each suite is bound to its exact ordered algorithms
+  and component count, and the checker additionally requires a `COSE_Sign1` plan
+  to have exactly one component;
+- an **`aud` violating the service-domain syntax** (N-29 uppercase, N-30 illegal
+  first byte) is rejected — the gate ports `validate_service_domain` and applies
+  it to every fixture, so the profile's audience namespace is no broader than the
+  transport's; and
+- the **size-cap** negatives N-13 (65-byte `kid`) and N-26 (129-byte `aud`) are
+  asserted over their numeric caps, and the CDDL cap text (`kid` = `1..64`,
+  `aud` = `1..128` plus its `.regexp`) is pinned so a widening drifts the gate to
+  red — the pinned `pycddl` version cannot enforce `.size` byte-length ranges or
+  `.regexp`, so these numeric/ported checks are load-bearing.
 
 See [`README.md`](README.md) for the one remaining tooling note.
 
@@ -186,14 +195,15 @@ recipient — the two together fix all four values of the orthogonal axes.
 Every negative vector is **cryptographically valid over its own mutated
 bytes** — each was signed after mutation with the correct test key — so a
 verifier that rejects it must do so for the stated profile rule, not because a
-signature failed to check. The two exceptions are stated in their notes: N-2 is
-P-2 verbatim presented in the wrong slot, and N-5 retains a genuine Ed25519
-signature over the stripped object.
+signature failed to check. The exceptions are stated in their notes: N-1 is a
+genuine issuer-signed credential presented in the wrong slot, N-2 is the P-2
+`COSE_Sign` proof verbatim presented in the wrong slot, and N-5 retains a genuine
+Ed25519 signature over the stripped object.
 
 | ID | Deny class | Vector | Bytes |
 |---|---|---|---|
-| N-1 | type-confusion | Credential (`at+jwt` typed) presented in the proof slot | 216 |
-| N-2 | type-confusion | Proof CWT presented in the credential/authorization slot | 3789 |
+| N-1 | type-confusion | Valid issuer-signed CWT credential (`application/cwt`) presented in the proof slot | 213 |
+| N-2 | type-confusion | Proof CWT (`COSE_Sign`) presented in the credential/authorization slot | 3789 |
 | N-3 | missing-typ | Protected `typ` (label 16) absent | 1587 |
 | N-4 | domain-separation | Correct `typ` with the response-proof `hs_domain` | 1628 |
 | N-5 | component-stripping | Hybrid proof with the ML-DSA-65 entry stripped | 438 |
@@ -211,7 +221,7 @@ signature over the stripped object.
 | N-10e | crit-set | `crit` in descending label order | 1626 |
 | N-10f | disposition-confusion | Credential-bound proof carrying `hs_unattributed_key_set` | 1697 |
 | N-11 | algorithm | Deprecated polymorphic `EdDSA` (−8) | 1626 |
-| N-12 | parser-cap | `suite_id` of 65 encoded bytes | 1669 |
+| N-12 | suite-plan | Unknown `suite_id` (65 bytes) outside the closed suite set | 1669 |
 | N-13 | parser-cap | `kid` of 65 bytes | 1727 |
 | N-14 | closed-claim-set | Required `credential_hash` absent rather than null | 356 |
 | N-15 | credential-binding | Credential presented with a null signed `credential_hash` | 362 |
@@ -227,13 +237,21 @@ signature over the stripped object.
 | N-25 | response-binding | `response_kind` value 3 outside the closed enum {1,2} | 411 |
 | N-26 | parser-cap | `aud` of 129 bytes, over the 128-byte `MAX_SERVICE_DOMAIN_BYTES` cap | 496 |
 | N-27 | response-binding | Cleartext unary `response_binding` carried as a non-null map | 411 |
+| N-28 | suite-plan | Hybrid suite plan with only one Ed25519 component (hybrid→classical downgrade) | 1639 |
+| N-29 | aud-syntax | `aud` with an uppercase byte (`Registry.svc`) | 378 |
+| N-30 | aud-syntax | `aud` with an illegal first byte (`-registry.svc`) | 379 |
 
 ### Notes on individual negatives
 
 - **N-1 / N-2 (type confusion, both directions).** A proof and a credential are
   disjoint by construction: different protected `typ`, different signing keys
   (issuer key versus `cnf`-bound proof key), different domain separator. Both
-  directions deny before any claim is interpreted.
+  directions deny before any claim is interpreted. N-1 is a **genuine**
+  issuer-signed CWT credential (`typ = application/cwt`, signed by the issuer
+  key — the gate re-verifies that signature) presented in the proof slot, so it
+  exercises rejection of a *well-formed* credential, not a malformed token. N-2
+  is the two-entry `COSE_Sign` P-2 verbatim in the credential slot, labelled
+  `COSE_Sign` to match its bytes.
 - **N-4 (domain confusion).** `typ` and `hs_domain` are **paired** in the
   normative CDDL, not independent choices: a request proof carries exactly
   (`proof-typ`, `request-proof-domain`) and a response proof exactly
@@ -246,12 +264,29 @@ signature over the stripped object.
   the standalone classical suite; the missing plan component denies
   independently. This is the vector that proves the weakly-non-separable
   property is enforced by both crypto and policy.
-- **N-6 / N-7 / N-12 / N-13 (parser caps).** The proof-v1 caps are exact:
-  1..8 signer groups, 1..2 components per group, 1..64 encoded bytes for
-  `suite_id` and `kid`. Raising a cap is an incompatible profile revision. The
-  `suite_id`/`kid` byte caps are pinned in the CDDL text and enforced
-  numerically by the gate over every fixture, and N-12/N-13 are asserted to
-  exceed the 64-byte cap — so a widening to 128 turns the gate red.
+- **N-6 / N-7 / N-13 (parser caps).** The proof-v1 caps are exact:
+  1..8 signer groups, exactly-per-suite components, and 1..64 bytes for `kid`.
+  Raising a cap is an incompatible profile revision. The `kid` byte cap is pinned
+  in the CDDL text and enforced numerically by the gate over every fixture, and
+  N-13 is asserted to exceed the 64-byte cap — so a widening to 128 turns the
+  gate red.
+- **N-12 / N-28 (suite ↔ component-plan binding).** Each suite_id is bound to its
+  exact ordered algorithms and component count: `hs-cose-sign-ed25519-v1` is
+  exactly one Ed25519 component, `hs-cose-sign-ed25519-mldsa65-wns-v1` is exactly
+  Ed25519 then ML-DSA-65. The suite set is closed. N-28 is a causal
+  **hybrid→classical downgrade** — the hybrid suite with only its Ed25519
+  component — and denies because the hybrid group requires both. N-12 is an
+  unknown suite_id (also over-long) and denies as an unrecognized suite. Both are
+  rejected by the normative CDDL at the `signature-plan` level, and the checker
+  additionally requires a `COSE_Sign1` plan to have exactly one component.
+- **N-29 / N-30 (aud lexical syntax).** `aud` reuses the shared
+  `validate_service_domain` syntax: lowercase ASCII only, first byte a lowercase
+  letter or digit, alphabet `[a-z0-9._/-]`. N-29 (`Registry.svc`, uppercase) and
+  N-30 (`-registry.svc`, illegal first byte) deny. The CDDL declares the
+  `.regexp` normatively; because the pinned pycddl does not enforce `.regexp`,
+  `validate_profile.py` ports the exact syntax and applies it to every fixture
+  and to these causal negatives, so the profile's audience namespace matches the
+  transport's.
 - **N-19 (response overlay).** A response proof uses the distinct
   `hyprstream-response-proof-claims` rule, which forbids the `Nonce` claim key
   and requires `credential_hash` to be exactly `null`; a response claims set

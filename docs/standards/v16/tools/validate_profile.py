@@ -137,6 +137,23 @@ def claims_of(cbor_hex: str) -> dict:
     return decode(payload_of(cbor_hex))
 
 
+def valid_service_domain(s: str) -> bool:
+    """Port of validate_service_domain (crates/hyprstream-rpc/src/envelope.rs):
+    1..MAX bytes; first byte a lowercase ASCII letter or digit; every byte a
+    lowercase ASCII letter, digit, '.', '_', '-', or '/'. The pinned pycddl does
+    not enforce the `.regexp` in the CDDL, so this is the mechanical enforcement
+    of the shared canonicalization syntax the profile reuses for `aud`."""
+    b = s.encode()
+    if not b or len(b) > MAX_SERVICE_DOMAIN_BYTES:
+        return False
+    lower = set(range(0x61, 0x7B))   # a-z
+    digit = set(range(0x30, 0x3A))   # 0-9
+    if b[0] not in (lower | digit):
+        return False
+    allowed = lower | digit | {ord(c) for c in "._-/"}
+    return all(x in allowed for x in b)
+
+
 def kids_and_suites(cbor_hex: str) -> tuple[list[bytes], list[str]]:
     """Every kid (bstr) and suite_id (tstr) that appears in one COSE object:
     the protected-header kid, the signature-plan components and their suites,
@@ -209,6 +226,10 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
     sign1_prot = S("proof-sign1-protected")
     sign_body_prot = S("proof-sign-body-protected")
     sig_entry_prot = S("proof-sign-signature-protected")
+    plan_schema = S("signature-plan")
+
+    def plan_of(cbor_hex: str):
+        return decode(decode(bytes.fromhex(cbor_hex))[0]).get(H_PLAN)
 
     def classify(pm: dict) -> str:
         if H_KEYSET in pm:
@@ -318,6 +339,34 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
         except ValidationError:
             print("   #2 N-27 cleartext-unary map rejected by CDDL (stream_setup only)")
 
+    # Thread suite-plan (ary-137X) — the suite_id is bound to its exact ordered
+    # component plan, so a hybrid group with one Ed25519 component (N-28, a
+    # hybrid→classical downgrade) and an unknown suite_id (N-12) both deny at the
+    # signature-plan level. First confirm every positive plan validates.
+    for v in positives["vectors"]:
+        pl = plan_of(v["cbor_hex"])
+        check(pl is not None, f"{v['id']} has no signature_plan")
+        if pl is not None:
+            try:
+                plan_schema.validate_cbor(enc(pl))
+            except ValidationError as exc:
+                check(False, f"positive {v['id']} signature_plan fails CDDL: {exc}")
+    suite_plan_negs = {
+        "N-28": "hybrid suite with a single Ed25519 component (downgrade)",
+        "N-12": "unknown suite_id outside the closed suite set",
+    }
+    for nid, what in suite_plan_negs.items():
+        v = by_id.get(nid)
+        check(v is not None, f"suite-plan negative {nid} ({what}) is missing")
+        if v is None:
+            continue
+        pl = plan_of(v["cbor_hex"])
+        try:
+            plan_schema.validate_cbor(enc(pl))
+            check(False, f"{nid} ({what}) plan is NOT rejected by the CDDL")
+        except ValidationError:
+            print(f"   #1 {nid} rejected by CDDL ({what})")
+
     # The relation/enum negatives MUST be rejected by the CDDL itself: the
     # machine proof that the closed map, the two enum axes, and the
     # recipient/encryption relation are structural, not prose.
@@ -417,13 +466,18 @@ def gate_caps(cddl: str, positives, negatives) -> None:
           "CDDL must state the 2 MiB total-object cap (2097152)")
     check(re.search(r"signature-plan\s*=\s*\[\s*1\*8", cddl) is not None,
           "signature-plan must cap at 1*8 groups")
-    check(re.search(r"1\*2 signature-component", cddl) is not None,
-          "signer-group must cap at 1*2 components")
-    # kid / suite_id 1..64 caps (F2): pin the CDDL text so a widening to 128 fails.
+    # Suite-bound component plans (finding ary-137X): each suite fixes its exact
+    # ordered component list, so the suite_id and component count are not
+    # independent. Pin the two suite-specific groups and their exact plans.
+    check(re.search(r"signer-group\s*=\s*signer-group-classical\s*/\s*signer-group-hybrid", cddl) is not None,
+          "signer-group must be the closed choice of the two suite-specific groups")
+    check("3 => [ signature-component-ed25519 ]," in cddl,
+          "classical group must bind exactly one Ed25519 component")
+    check("3 => [ signature-component-ed25519, signature-component-mldsa65 ]," in cddl,
+          "hybrid group must bind exactly two ordered components (Ed25519 then ML-DSA-65)")
+    # kid 1..64 cap (F2): pin the CDDL text so a widening to 128 fails.
     check(re.search(rf"kid\s*=\s*bstr\s*\.size\s*\(1\.\.{SUITE_KID_MAX}\)", cddl) is not None,
           f"CDDL kid must be bstr .size (1..{SUITE_KID_MAX})")
-    check(re.search(rf"suite-id-bounded\s*=\s*tstr\s*\.size\s*\(1\.\.{SUITE_KID_MAX}\)", cddl) is not None,
-          f"CDDL suite-id-bounded must be tstr .size (1..{SUITE_KID_MAX})")
 
     # 3b. The shared Rust constant the artifact points to.
     if ENVELOPE_RS.exists():
@@ -443,6 +497,10 @@ def gate_caps(cddl: str, positives, negatives) -> None:
         aud = claims[C_AUD]
         check(1 <= len(aud.encode()) <= MAX_SERVICE_DOMAIN_BYTES,
               f"{v['id']} aud length out of 1..128")
+        # Finding ary-137b: aud must satisfy the shared service-domain syntax,
+        # not merely the length cap.
+        check(valid_service_domain(aud),
+              f"{v['id']} aud {aud!r} violates the canonical service-domain syntax")
         check(len(claims[C_CTI]) == CTI_BYTES, f"{v['id']} cti must be 16 bytes")
         ch = claims[C_CREDENTIAL_HASH]
         check(ch is None or len(ch) == CREDENTIAL_HASH_BYTES,
@@ -484,12 +542,25 @@ def gate_caps(cddl: str, positives, negatives) -> None:
         check(val > cap, f"{nid} must exceed the {what} cap {cap} (got {val})")
         print(f"   {nid}: {what} = {val} bytes > cap {cap} (denies by numeric rule)")
 
-    over_cap("N-12", lambda h: max((len(s.encode()) for s in kids_and_suites(h)[1]), default=0),
-             SUITE_KID_MAX, "suite_id")
     over_cap("N-13", lambda h: max((len(k) for k in kids_and_suites(h)[0]), default=0),
              SUITE_KID_MAX, "kid")
     over_cap("N-26", lambda h: len(claims_of(h)[C_AUD].encode()),
              MAX_SERVICE_DOMAIN_BYTES, "aud")
+
+    # 3f. aud lexical syntax (finding ary-137b): the CDDL declares the shared
+    #     service-domain `.regexp`; the pinned pycddl does not enforce it, so pin
+    #     the CDDL text and assert the causal negatives fail the ported syntax.
+    check('.regexp "[a-z0-9][a-z0-9._/-]*"' in cddl,
+          "canonical-service-domain must carry the shared service-domain .regexp")
+    for nid, why in (("N-29", "uppercase byte"), ("N-30", "illegal first byte")):
+        v = by_id.get(nid)
+        check(v is not None, f"aud-syntax negative {nid} ({why}) is missing")
+        if v is None:
+            continue
+        aud = claims_of(v["cbor_hex"])[C_AUD]
+        check(not valid_service_domain(aud),
+              f"{nid} aud {aud!r} must violate the service-domain syntax ({why})")
+        print(f"   #2 {nid}: aud {aud!r} rejected by service-domain syntax ({why})")
 
 
 # --------------------------------------------------------------------------
@@ -612,6 +683,55 @@ def gate_canonical(positives, negatives) -> None:
 
 
 # --------------------------------------------------------------------------
+# 7. Type-confusion vector quality (N-1 valid credential, N-2 correct label)
+# --------------------------------------------------------------------------
+
+
+def gate_type_confusion(negatives) -> None:
+    section("7. Type-confusion vectors (N-1 valid credential, N-2 label)")
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from check_proof_vectors import enc
+
+    keys = load_json("proof-v1-keys.json")["keys"]
+    issuer = next((k for k in keys["ed25519"] if k["kid_ascii"] == "issuer-ed25519-1"), None)
+    check(issuer is not None, "issuer test key (issuer-ed25519-1) must exist in the key set")
+    by_id = {v["id"]: v for v in negatives["vectors"]}
+
+    # N-1 (ary-137e): a GENUINE credential — typed application/cwt (not a proof
+    # type) and its issuer signature actually verifies — presented in the proof
+    # slot. This proves the vector exercises credential-in-proof-slot rejection
+    # of a well-formed credential, not merely a malformed token.
+    n1 = by_id.get("N-1")
+    check(n1 is not None, "N-1 must exist")
+    if n1 is not None and issuer is not None:
+        obj = decode(bytes.fromhex(n1["cbor_hex"]))
+        pm = decode(obj[0])
+        check(pm.get(H_TYP) == "application/cwt",
+              "N-1 must be typed application/cwt (a credential encoding)")
+        check(pm.get(H_TYP) not in (TYP_REQUEST, TYP_RESPONSE),
+              "N-1 typ must not be a request/response proof type")
+        tbs = enc(["Signature1", obj[0], b"", obj[2]])
+        pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(issuer["public_hex"]))
+        try:
+            pub.verify(obj[3], tbs)
+            print("   #3 N-1 is a valid issuer-signed credential (typ application/cwt)")
+        except InvalidSignature:
+            check(False, "N-1 issuer signature does not verify — not a well-formed credential")
+
+    # N-2 (ary-137m): the two-entry COSE_Sign proof presented as a credential.
+    # Its structure label must be COSE_Sign and its bytes must be a COSE_Sign.
+    n2 = by_id.get("N-2")
+    check(n2 is not None, "N-2 must exist")
+    if n2 is not None:
+        check(n2["structure"] == "COSE_Sign", "N-2 structure label must be COSE_Sign")
+        obj = decode(bytes.fromhex(n2["cbor_hex"]))
+        check(isinstance(obj[3], list) and bool(obj[3]) and isinstance(obj[3][0], list),
+              "N-2 bytes must be a COSE_Sign (a signatures array), matching its label")
+        print("   #4 N-2 labelled COSE_Sign, matching its two-entry signature array")
+
+
+# --------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -631,6 +751,7 @@ def main() -> None:
     gate_caps(cddl, positives, negatives)
     gate_response_binding(positives)
     gate_collisions()
+    gate_type_confusion(negatives)
     gate_canonical(positives, negatives)
 
     print()

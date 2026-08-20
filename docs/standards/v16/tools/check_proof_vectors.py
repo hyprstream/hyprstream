@@ -270,6 +270,16 @@ def main() -> None:
             continue
         components = plan_components(plan)
         if vec["structure"] == "COSE_Sign1":
+            # A COSE_Sign1 carries exactly one signature, so it must cover the
+            # plan EXACTLY: the plan must have exactly one component. This
+            # rejects a hybrid plan (two components) carried in a Sign1, i.e. a
+            # hybrid-to-classical downgrade that a "signature occurs in the plan"
+            # test alone would miss.
+            if len(components) != 1:
+                fail(
+                    f"{vec['id']}: COSE_Sign1 plan has {len(components)} components; "
+                    "a single signature must cover a single-component plan exactly"
+                )
             tbs = enc(["Signature1", body_protected, b"", payload])
             alg, kid, grp = body_hdr[H_ALG], body_hdr[H_KID], body_hdr[H_GROUP]
             if (grp, alg, kid) not in components:

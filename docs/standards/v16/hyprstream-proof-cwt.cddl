@@ -63,9 +63,11 @@ alg-hs-kem-ml-kem-768-v1 = -70200
 ; larger value.
 ;
 ;   signer groups per plan .................. 1..8
-;   components per signer group ............. 1..2
+;   components per signer group ............. exactly per suite (classical 1,
+;                                             hybrid 2) — bound to the suite_id
 ;   signature entries per proof ............. 1..16 (groups x components)
-;   suite_id ................................ 1..64 encoded bytes
+;   suite_id ................................ closed set (§6): the two known
+;                                             suite literals only
 ;   kid ..................................... 1..64 bytes
 ;   cti (request_id) ........................ exactly 16 bytes
 ;   credential_hash ......................... exactly 32 bytes (SHA-256)
@@ -160,7 +162,13 @@ hyprstream-response-proof-claims = {
 
 ; aud reuses the shared canonical service-domain rule; the 1..128 cap is
 ; MAX_SERVICE_DOMAIN_BYTES (envelope.rs), not a second identity rule (§19 #7).
-canonical-service-domain = tstr .size (1..128)
+; The lexical syntax is the SAME as validate_service_domain (envelope.rs): the
+; first byte is a lowercase ASCII letter or digit, and every byte is a lowercase
+; ASCII letter, digit, '.', '_', '-', or '/'. The `.regexp` control encodes that
+; syntax normatively; because the pinned pycddl does not enforce `.regexp`,
+; validate_profile.py enforces the identical syntax over every fixture and via
+; causal negatives (N-29 uppercase, N-30 illegal first byte).
+canonical-service-domain = tstr .size (1..128) .regexp "[a-z0-9][a-z0-9._/-]*"
 timestamp                = uint                  ; integer Unix seconds
 request-id               = bstr .size 16         ; 128 bits of CSPRNG output
 server-challenge         = bstr .size (16..64)
@@ -360,20 +368,43 @@ logical-signer-group  = uint .le 255       ; frozen ceiling (Gate-2 value 6)
 
 signature-plan = [ 1*8 signer-group ]
 
-signer-group = {
-  1 => logical-signer-group,           ; group_id
-  2 => suite-id-bounded,               ; suite_id
-  3 => [ 1*2 signature-component ],
+; Each signer group binds its suite_id to that suite's EXACT ordered algorithms
+; and EXACT component count — the suite_id and the component list are NOT
+; independent fields. A hybrid group therefore cannot be downgraded to a single
+; Ed25519 component, and an unknown suite_id denies (the closed choice admits
+; only the two known suites). group_id is the shared logical-signer-group key.
+
+signer-group = signer-group-classical / signer-group-hybrid
+
+; hs-cose-sign-ed25519-v1: exactly one Ed25519 (-19) component.
+signer-group-classical = {
+  1 => logical-signer-group,               ; group_id
+  2 => suite-classical,                    ; "hs-cose-sign-ed25519-v1" (literal)
+  3 => [ signature-component-ed25519 ],    ; exactly one component
 }
 
-signature-component = {
-  1 => profile-alg,                    ; COSE alg, fully specified
+; hs-cose-sign-ed25519-mldsa65-wns-v1: exactly two components, Ed25519 (-19)
+; then ML-DSA-65 (-49), in this exact order.
+signer-group-hybrid = {
+  1 => logical-signer-group,               ; group_id
+  2 => suite-hybrid,                        ; "hs-cose-sign-ed25519-mldsa65-wns-v1"
+  3 => [ signature-component-ed25519, signature-component-mldsa65 ],   ; exactly two, ordered
+}
+
+signature-component-ed25519 = {
+  1 => alg-ed25519,                    ; -19, fully specified
   2 => kid,
 }
 
-; The suite registry is closed; the bounded form records the encoded-length cap
-; that a verifier enforces before consulting the registry.
-suite-id-bounded = tstr .size (1..64)
+signature-component-mldsa65 = {
+  1 => alg-ml-dsa-65,                  ; -49, fully specified
+  2 => kid,
+}
+
+; The suite registry is closed: `suite-id` (top of file) is the only accepted
+; set of suite identifiers, and each is bound to its exact component plan above.
+; An unknown suite_id, a wrong component count, a wrong component algorithm, or
+; wrong component order denies before signatures establish authority.
 
 ; Suite registry (versioned, checked in with this profile):
 ;

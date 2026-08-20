@@ -241,6 +241,7 @@ KID_APPROVER_ED = b"approver-ed25519-1"
 KID_SERVICE_ED = b"service-ed25519-1"
 KID_UNATTRIBUTED_ED = b"unattributed-ed25519-1"
 KID_UNATTRIBUTED_ML = b"unattributed-mldsa65-1"
+KID_ISSUER_ED = b"issuer-ed25519-1"  # credential issuer (type-confusion vectors)
 
 
 # --------------------------------------------------------------------------
@@ -334,6 +335,7 @@ def main() -> None:
         seed_a_ed, sk_a_ed = ed25519_key(0x40)
         seed_s_ed, sk_s_ed = ed25519_key(0x60)
         seed_u_ed, sk_u_ed = ed25519_key(0x80)
+        seed_i_ed, sk_i_ed = ed25519_key(0xC0)  # credential issuer
         ml_client = MlDsaKey(bytes((0x20 + i) & 0xFF for i in range(32)), work, "client")
         ml_unattributed = MlDsaKey(
             bytes((0xA0 + i) & 0xFF for i in range(32)), work, "unattributed"
@@ -372,6 +374,13 @@ def main() -> None:
                     "kid_ascii": KID_UNATTRIBUTED_ED.decode(),
                     "seed_hex": seed_u_ed.hex(),
                     "public_hex": sk_u_ed.public_key().public_bytes_raw().hex(),
+                },
+                {
+                    "role": "credential issuer (type-confusion vectors N-1/N-2)",
+                    "kid_hex": KID_ISSUER_ED.hex(),
+                    "kid_ascii": KID_ISSUER_ED.decode(),
+                    "seed_hex": seed_i_ed.hex(),
+                    "public_hex": sk_i_ed.public_key().public_bytes_raw().hex(),
                 },
             ],
             "ml_dsa_65": [
@@ -692,41 +701,63 @@ def main() -> None:
 
         # =================== NEGATIVE VECTORS ===============================
 
-        # N-1: credential presented in the proof slot.
+        # N-1: a genuinely VALID CWT credential presented in the proof slot.
+        # This is a real issuer-signed CWT access token (COSE_Sign1, typ
+        # application/cwt per RFC 8392, signed by the ISSUER key over registered
+        # claims) — not a proof-shaped object signed with a request-proof key.
+        # Only its presentation context is wrong: presented in the proof slot it
+        # denies because its typ is not the proof typ and it is issuer-signed
+        # rather than cnf-bound, so the vector exercises credential-in-proof-slot
+        # rejection of a well-formed credential (not merely a malformed token).
         n1_protected = {
             H_ALG: ALG_ED25519,
-            H_KID: KID_CLIENT_ED,
-            H_TYP: "application/at+jwt",
+            H_KID: KID_ISSUER_ED,
+            H_TYP: "application/cwt",
         }
-        n1_claims = {1: "https://issuer.hyprstream.test", 2: "user-1", C_AUD: SERVICE_DOMAIN, C_EXP: EXP, C_IAT: IAT, C_CTI: REQUEST_ID}
-        n1, _, _ = sign1(n1_protected, n1_claims, sk_c_ed)
+        n1_claims = {
+            1: "https://issuer.hyprstream.test",  # iss
+            2: "user-1",                          # sub
+            C_AUD: SERVICE_DOMAIN,                # aud
+            C_EXP: EXP,
+            C_IAT: IAT,
+            C_CTI: bytes.fromhex("a1b2c3d4e5f60718293a4b5c6d7e8f90"),  # cti
+        }
+        n1, _, _ = sign1(n1_protected, n1_claims, sk_i_ed)
         record(
             negatives,
             "N-1",
-            "Credential (access token) presented in the proof slot",
+            "Valid issuer-signed CWT credential (application/cwt) presented in the proof slot",
             "deny",
             "COSE_Sign1",
             n1,
             deny_class="type-confusion",
-            deny_rule="protected typ is not application/vnd.hyprstream.proof+cwt",
-            notes="Denies before any claim is interpreted.",
+            deny_rule=(
+                "a valid credential (typ application/cwt, issuer-signed) is not a "
+                "request proof: its typ is not application/vnd.hyprstream.proof+cwt "
+                "and it is not signed by a cnf-bound proof key"
+            ),
+            notes=(
+                "A well-formed credential; only its presentation slot is wrong. "
+                "Denies before any claim is interpreted."
+            ),
         )
 
-        # N-2: proof CWT presented as a credential.
+        # N-2: the proof CWT (the two-entry COSE_Sign P-2) presented in the
+        # credential/authorization slot. Labelled COSE_Sign to match its bytes.
         record(
             negatives,
             "N-2",
-            "Proof CWT presented in the credential/authorization slot",
+            "Proof CWT (COSE_Sign) presented in the credential/authorization slot",
             "deny",
-            "COSE_Sign1",
+            "COSE_Sign",
             p2,
             deny_class="type-confusion",
             deny_rule=(
-                "credential verification requires the at+jwt or CWT access-token "
-                "type and an issuer key; the proof carries the proof typ and is "
-                "signed by a cnf-bound request-proof key"
+                "credential verification requires the credential typ "
+                "(application/cwt or at+jwt) and an issuer key; the proof carries "
+                "the proof typ and is signed by a cnf-bound request-proof key"
             ),
-            notes="Same bytes as P-2, presented in the wrong slot.",
+            notes="Same bytes as P-2 (a COSE_Sign), presented in the wrong slot.",
         )
 
         # N-3: missing typ.
@@ -1052,7 +1083,9 @@ def main() -> None:
             deny_rule="RFC 9864 fully-specified algorithms: Ed25519 components use -19",
         )
 
-        # N-12: suite ID longer than 64 bytes.
+        # N-12: an unknown suite_id (65 bytes of "h") outside the closed suite
+        # set. The suite registry is closed, so this denies as an unknown suite;
+        # it also exceeds the 64-byte length the cap historically bounded.
         n12_protected = dict(p4_protected)
         n12_protected[H_PLAN] = [
             group(1, "h" * 65, [component(ALG_ED25519, KID_CLIENT_ED)])
@@ -1061,12 +1094,12 @@ def main() -> None:
         record(
             negatives,
             "N-12",
-            "suite_id of 65 encoded bytes",
+            "Unknown suite_id (65 bytes) outside the closed suite set",
             "deny",
             "COSE_Sign1",
             n12,
-            deny_class="parser-cap",
-            deny_rule="proof-v1 cap: suite_id 1..64 encoded bytes",
+            deny_class="suite-plan",
+            deny_rule="the suite registry is closed; an unknown suite_id denies (also > 64 bytes)",
         )
 
         # N-13: kid longer than 64 bytes.
@@ -1385,6 +1418,63 @@ def main() -> None:
             deny_class="response-binding",
             deny_rule="cleartext unary uses a null response_binding; the map form is stream_setup only",
             notes="Canonical single encoding: cleartext unary is null, never a map.",
+        )
+
+        # N-28: hybrid-to-classical downgrade. A COSE_Sign1 plan declares the
+        # hybrid suite but supplies only one Ed25519 component (dropping the
+        # ML-DSA-65 component). The suite is bound to its exact component plan,
+        # so a hybrid group with one component denies — the WNS hybrid cannot be
+        # silently downgraded to the standalone classical suite.
+        n28_protected = dict(p4_protected)
+        n28_protected[H_PLAN] = [
+            group(1, SUITE_HYBRID, [component(ALG_ED25519, KID_CLIENT_ED)])
+        ]
+        n28, _, _ = sign1(n28_protected, p4_claims, sk_c_ed)
+        record(
+            negatives,
+            "N-28",
+            "Hybrid suite plan with only one Ed25519 component (hybrid→classical downgrade)",
+            "deny",
+            "COSE_Sign1",
+            n28,
+            deny_class="suite-plan",
+            deny_rule=(
+                "hs-cose-sign-ed25519-mldsa65-wns-v1 requires exactly two ordered "
+                "components (Ed25519 then ML-DSA-65); a single-component hybrid group denies"
+            ),
+            notes="Causal hybrid-to-classical downgrade: the suite is bound to its exact plan.",
+        )
+
+        # N-29: aud with an uppercase byte ("Registry.svc"). The canonical
+        # service-domain syntax (validate_service_domain) is lowercase-only, so a
+        # CDDL/gate-driven verifier must reject it — its audience namespace must
+        # not be broader than the transport's.
+        n29_claims = request_claims(credential_hash=CREDENTIAL_HASH, aud="Registry.svc")
+        n29, _, _ = sign1(p4_protected, n29_claims, sk_c_ed)
+        record(
+            negatives,
+            "N-29",
+            "aud with an uppercase byte (Registry.svc), rejected by the service-domain syntax",
+            "deny",
+            "COSE_Sign1",
+            n29,
+            deny_class="aud-syntax",
+            deny_rule="canonical service domain is lowercase ASCII only (validate_service_domain)",
+        )
+
+        # N-30: aud whose first byte is illegal ("-registry.svc"). The first byte
+        # MUST be a lowercase ASCII letter or digit.
+        n30_claims = request_claims(credential_hash=CREDENTIAL_HASH, aud="-registry.svc")
+        n30, _, _ = sign1(p4_protected, n30_claims, sk_c_ed)
+        record(
+            negatives,
+            "N-30",
+            "aud with an illegal first byte ('-registry.svc')",
+            "deny",
+            "COSE_Sign1",
+            n30,
+            deny_class="aud-syntax",
+            deny_rule="the first byte must be a lowercase ASCII letter or digit (validate_service_domain)",
         )
 
     meta = {

@@ -35,6 +35,13 @@
         "kid_ascii": "unattributed-ed25519-1",
         "seed_hex": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
         "public_hex": "cd14b37f956e953194ff7fb73b3d81dcc561d61a7538094b7c3e1a643ee5f3aa"
+      },
+      {
+        "role": "credential issuer (type-confusion vectors N-1/N-2)",
+        "kid_hex": "6973737565722d656432353531392d31",
+        "kid_ascii": "issuer-ed25519-1",
+        "seed_hex": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+        "public_hex": "dde3bccec7f3a66a1115f45d720f4dc135c3ae7c4e22dca38fdb1efd6a495ff8"
       }
     ],
     "ml_dsa_65": [
