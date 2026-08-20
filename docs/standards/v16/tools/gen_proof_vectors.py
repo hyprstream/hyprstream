@@ -1817,6 +1817,29 @@ def main() -> None:
             notes="All signatures valid; denies solely on the over-ceiling key-set size.",
         )
 
+        # N-43 (D2): a response proof issued for a DIFFERENT service domain than
+        # the originating request. Everything else (cti, response_binding) still
+        # equals P-4's; only aud differs, and the signature is valid — so it
+        # denies solely on response-aud contextual binding (aud MUST equal the
+        # originating request's aud).
+        n43_claims = request_claims(
+            credential_hash=None,
+            aud="other.svc.hyprstream.test",   # != P-4's aud
+            schema_id=SCHEMA_ID_RESPONSE,
+            body=CAPNP_RESPONSE_BYTES,
+            response_binding=p4_response_binding,   # binding still equals P-4's
+        )
+        n43, _, _ = sign1(p3_protected, n43_claims, sk_s_ed)
+        record(
+            negatives, "N-43",
+            "Response proof whose aud differs from the originating request's service domain",
+            "deny", "COSE_Sign1", n43,
+            deny_class="response-aud-binding",
+            deny_rule="a response proof's aud MUST equal the originating request's aud",
+            originating_request="P-4",
+            notes="Only aud differs; cti and response_binding still equal P-4's; signature valid.",
+        )
+
     meta = {
         "vector_set_version": 1,
         "profile": "hs-rpc-proof-v1",

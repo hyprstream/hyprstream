@@ -13,7 +13,7 @@ Machine-readable files (the normative form — this page is the human index):
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 8 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 47 vectors that MUST deny |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 48 vectors that MUST deny |
 | [`vectors/proof-v1-thumbprints.json`](vectors/proof-v1-thumbprints.json) | Cross-implementation replay-namespace thumbprint vectors (C1) |
 
 Each JSON vector carries `id`, `title`, `expect` (`accept` / `deny`),
@@ -294,6 +294,7 @@ Ed25519 signature over the stripped object.
 | N-40 | group-id-order | `signature_plan` with two groups sharing one `group_id` | 562 |
 | N-41 | group-id-order | `signature_plan` with group IDs out of ascending order | 562 |
 | N-42 | unattributed-keyset | Unattributed key set with three elements, over the 1..2 ceiling | 944 |
+| N-43 | response-aud-binding | Bound response proof whose `aud` differs from the originating request (P-4) | 1602 |
 
 ### Notes on individual negatives
 
@@ -319,7 +320,13 @@ Ed25519 signature over the stripped object.
   still covers the hybrid `signature_plan`, so it cannot be reinterpreted under
   the standalone classical suite; the missing plan component denies
   independently. This is the vector that proves the weakly-non-separable
-  property is enforced by both crypto and policy.
+  property is enforced by both crypto and policy. The gate (causality inventory,
+  §12) asserts N-5's exact violation shape: the set of `(group, alg, kid)` triples
+  carried by its signature entries is a **proper subset** of its plan components —
+  a plan component has no signature entry. Restoring full coverage (a de-fanged
+  N-5 with the ML-DSA-65 entry re-added and a distinct payload) turns the gate red
+  because the negative no longer exhibits its claimed stripping, mirroring the
+  N-20 plan-mismatch treatment (§C4).
 - **N-6 / N-7 / N-13 (parser caps).** The proof-v1 caps are exact:
   1..8 signer groups, exactly-per-suite components, and 1..64 bytes for `kid`.
   Raising a cap is an incompatible profile revision. The `kid` byte cap is pinned
@@ -359,6 +366,19 @@ Ed25519 signature over the stripped object.
   every bound response fixture. N-31 changes **only** `-70002` (its binding still
   equals P-4's, and the signature is valid), so it denies by this rule, not by a
   signature or map-shape failure.
+- **N-43 (response `aud` binding — D2).** A bound response proof's `aud` (claim 3)
+  MUST be the same canonical service domain the originating request was bound to,
+  not merely a lexically valid domain. N-43 is P-7 with **only** `aud` mutated to
+  a different service domain (`other.svc.hyprstream.test`); its `response_binding`,
+  `cti`, and `-70002` still equal P-4's and its signature is valid, so it denies
+  only under the request↔response audience equality. The full request-derived
+  response-context set — `aud`, `cti`, `response_binding`, and `-70002` — is
+  compared in **one** place (`response_context_bindings`, gate §11): P-7 satisfies
+  all four against P-4, and each of N-43/N-22/N-32/N-31 violates exactly one. The
+  causality inventory (§12) additionally asserts every one of the 48 negatives
+  exhibits its advertised violation shape, with a meta-guard that the inventory
+  covers exactly the full negative-vector ID set — so a future negative cannot be
+  added without its own denial-shape check.
 - **N-33 (plan `(alg, kid)` uniqueness).** Every `(alg, kid)` pair MUST be unique
   across the whole `signature_plan`, regardless of group ID — one key must not
   sign under two logical groups, or a single signer could satisfy a two-group

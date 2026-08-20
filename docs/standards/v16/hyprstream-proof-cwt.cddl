@@ -145,7 +145,12 @@ hyprstream-unattributed-proof-claims = {
 ; but the response overlay is stricter than the request set and is expressed as
 ; its own closed rule, not an alias, so the invariants are structural:
 ;
-;   3  aud   — the same canonical service domain the request was bound to
+;   3  aud   — the same canonical service domain the request was bound to. This
+;              is a CONTEXTUAL binding to the originating request that CDDL cannot
+;              express (it only checks lexical validity), so validate_profile.py
+;              asserts response.aud == originating-request.aud alongside cti,
+;              response_binding, and -70002 (D2). A response for another service
+;              domain (N-43) denies.
 ;   7  cti   — the request_id of the request being answered (binding, not a
 ;              new identifier); a mismatched cti denies
 ;   10 Nonce — ALWAYS ABSENT: the Nonce claim key is not permitted in the closed

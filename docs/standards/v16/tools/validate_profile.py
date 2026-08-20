@@ -1109,6 +1109,245 @@ def gate_replay_thumbprints(cddl: str, positives) -> None:
 
 
 # --------------------------------------------------------------------------
+# 11. Centralized request->response contextual binding set (D2)
+# --------------------------------------------------------------------------
+
+
+def response_context_bindings(vid, by_id):
+    """The COMPLETE set of request-derived response fields, compared in one place:
+    a response proof's aud (3), cti (7), response_binding (-70004), and -70002
+    (root type, vs the binding's root_type_id) MUST bind to the originating
+    request. Returns {aud_eq, cti_eq, binding_eq, schema_eq}."""
+    v = by_id[vid]
+    req = by_id[v["originating_request"]]
+    c = claims_of(v["cbor_hex"])
+    rc = claims_of(req["cbor_hex"])
+    rb = c.get(C_RESPONSE_BINDING)
+    return {
+        "aud_eq": c.get(C_AUD) == rc.get(C_AUD),
+        "cti_eq": c.get(C_CTI) == rc.get(C_CTI),
+        "binding_eq": rb == rc.get(C_RESPONSE_BINDING),
+        "schema_eq": (not isinstance(rb, dict)) or (c.get(C_SCHEMA_ID) == rb.get(1)),
+    }
+
+
+def gate_response_context(positives, negatives) -> None:
+    section("11. Request->response contextual binding set (aud, cti, response_binding, -70002) — D2")
+    by_id = {v["id"]: v for v in positives["vectors"]}
+    by_id.update({v["id"]: v for v in negatives["vectors"]})
+
+    # The bound positive P-7 must satisfy ALL four bindings against P-4.
+    bound = next((v for v in positives["vectors"] if v.get("originating_request")), None)
+    check(bound is not None, "a bound response positive must exist")
+    if bound is not None:
+        b = response_context_bindings(bound["id"], by_id)
+        check(all(b.values()), f"{bound['id']} must bind aud/cti/response_binding/-70002 to its request: {b}")
+        print(f"   {bound['id']} binds all four request-derived response fields")
+
+    # Each response-context negative violates EXACTLY its named field.
+    field_negs = {
+        "N-43": "aud_eq", "N-22": "cti_eq", "N-32": "binding_eq", "N-31": "schema_eq",
+    }
+    for nid, field in field_negs.items():
+        v = by_id.get(nid)
+        check(v is not None, f"response-context negative {nid} ({field}) missing")
+        if v is None or not v.get("originating_request"):
+            check(bool(v and v.get("originating_request")), f"{nid} must carry originating_request")
+            continue
+        b = response_context_bindings(nid, by_id)
+        check(b[field] is False, f"{nid} must violate {field} vs its originating request; got {b}")
+        if b[field] is False:
+            print(f"   D2 {nid} violates {field} (contextual response binding denies)")
+
+
+# --------------------------------------------------------------------------
+# 12. Causality inventory — every negative asserts its advertised violation
+# --------------------------------------------------------------------------
+
+
+def gate_causality_inventory(cddl, positives, negatives) -> None:
+    section("12. Causality inventory (every negative's violation shape asserted)")
+    try:
+        from pycddl import Schema, ValidationError
+    except ImportError:
+        FAILURES.append("[12] pycddl required for the causality inventory")
+        return
+    from check_proof_vectors import enc as _enc, unattributed_keyset_correspondence
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    stripped, _ = strip_size_ranges(cddl)
+    stripped = stripped.replace("=> unattributed-key-set", "=> any")
+
+    def S(root):
+        return Schema(f"start = {root}\n" + stripped)
+    req_claims = S("hyprstream-proof-claims")
+    sign1_prot = S("proof-sign1-protected")
+    sign_body_prot = S("proof-sign-body-protected")
+    plan_schema = S("signature-plan")
+
+    by_id = {v["id"]: v for v in positives["vectors"]}
+    by_id.update({v["id"]: v for v in negatives["vectors"]})
+    PROOF_TYPS = (TYP_REQUEST, TYP_RESPONSE)
+    REQUIRED_CLAIMS = {C_AUD, C_EXP, C_IAT, C_CTI, C_CREDENTIAL_HASH, C_SCHEMA_ID, C_BODY_BYTES, C_RESPONSE_BINDING}
+    ALLOWED_CLAIMS = REQUIRED_CLAIMS | {C_NONCE}
+
+    def parts(vec):
+        raw = bytes.fromhex(vec["cbor_hex"])
+        try:
+            obj = decode(raw)
+            pm = decode(obj[0])
+        except StrictError:
+            obj, pm = None, None
+        return raw, obj, pm
+
+    def claims_or_none(obj):
+        try:
+            return decode(obj[2])
+        except (StrictError, Exception):  # noqa: BLE001
+            return None
+
+    def plan_components(plan):
+        return [(g.get(1), c.get(1), c.get(2)) for g in (plan or []) if isinstance(g, dict)
+                for c in (g.get(3) or []) if isinstance(c, dict)]
+
+    def rejected(schema, cbytes):
+        try:
+            schema.validate_cbor(cbytes)
+            return False
+        except ValidationError:
+            return True
+
+    def shape_present(vec):
+        """Return (present, detail) — is this negative's advertised violation
+        structurally in its bytes? Dispatches by deny_class (+ per-id where the
+        class covers several vectors)."""
+        dc = vec["deny_class"]
+        vid = vec["id"]
+        raw, obj, pm = parts(vec)
+        # Non-deterministic encoding: the object or its payload fails strict decode.
+        if dc == "non-deterministic-encoding":
+            if obj is None:
+                return True, "object not deterministic CBOR"
+            try:
+                decode(obj[2])
+                return False, "payload decoded deterministically"
+            except StrictError:
+                return True, "payload not deterministic CBOR"
+        if obj is None or pm is None:
+            return False, "unexpectedly non-decodable"
+        claims = claims_or_none(obj)
+        plan = pm.get(H_PLAN)
+        comps = plan_components(plan)
+        entries = obj[3] if isinstance(obj[3], list) and obj[3] and isinstance(obj[3][0], list) else None
+
+        if dc == "type-confusion":
+            if vid == "N-1":
+                return pm.get(H_TYP) not in PROOF_TYPS, "credential typ (not a proof typ) in the proof slot"
+            return pm.get(H_TYP) in PROOF_TYPS, "proof typ presented in the credential slot"
+        if dc == "missing-typ":
+            return H_TYP not in pm, "typ absent from the protected bucket"
+        if dc == "domain-separation":
+            pair = (pm.get(H_TYP), pm.get(H_DOMAIN))
+            good = {(TYP_REQUEST, DOMAIN_REQUEST), (TYP_RESPONSE, DOMAIN_RESPONSE)}
+            return pair not in good, f"typ/domain cross-product {pair}"
+        if dc == "component-stripping":  # D1 (N-5)
+            ek = set()
+            for e in (entries or []):
+                sh = decode(e[0]); ek.add((sh.get(H_GROUP), sh.get(H_ALG), sh.get(H_KID)))
+            return (set(comps) - ek) != set() and ek <= set(comps), \
+                "a plan component has no signature entry (coverage violation)"
+        if dc == "parser-cap":
+            if vid == "N-6":
+                return len(plan or []) > 8, "more than 8 signer groups"
+            if vid == "N-7":
+                return any(len(g.get(3, [])) > 2 for g in (plan or [])), "a group has >2 components"
+            if vid == "N-13":
+                kids = [k for k, _ in [((c[2]), 0) for c in comps]] + ([pm.get(H_KID)] if isinstance(pm.get(H_KID), (bytes, bytearray)) else [])
+                return any(isinstance(k, (bytes, bytearray)) and len(k) > SUITE_KID_MAX for k in kids), "kid over 64 bytes"
+            if vid == "N-26":
+                return claims and len(claims[C_AUD].encode()) > MAX_SERVICE_DOMAIN_BYTES, "aud over 128 bytes"
+        if dc == "closed-claim-set":
+            if vid == "N-8":
+                return claims is not None and bool(set(claims) - ALLOWED_CLAIMS), "unknown claim key present"
+            if vid == "N-14":
+                return claims is not None and bool(REQUIRED_CLAIMS - set(claims)), "a required claim is absent"
+        if dc == "crit-set":
+            return rejected(sign1_prot, obj[0]), "protected bucket fails the exact crit rule"
+        if dc == "disposition-confusion":
+            if H_KEYSET not in pm:
+                return False, "no key set present"
+            if vid == "N-10f":  # credential-bound proof (non-null hash) carrying a key set
+                return claims is not None and claims.get(C_CREDENTIAL_HASH) is not None, \
+                    "key set on a credential-bound (non-null credential_hash) proof"
+            if vid == "N-19":   # response proof carrying a key set
+                return pm.get(H_TYP) == TYP_RESPONSE, "key set on a response proof"
+            return rejected(sign1_prot, obj[0]), "key set in a non-unattributed disposition"
+        if dc == "algorithm":
+            algs = {a for _, a, _ in comps} | {pm.get(H_ALG)}
+            return -8 in algs, "deprecated EdDSA (-8) present"
+        if dc == "credential-binding":  # N-15 / B5
+            return claims is not None and claims.get(C_CREDENTIAL_HASH) is None and H_KEYSET not in pm, \
+                "authenticated proof with a null credential_hash"
+        if dc == "freshness":  # N-16
+            return H_KEYSET in pm and (claims is None or C_NONCE not in claims), "unattributed proof without Nonce"
+        if dc == "group-id-order":
+            gids = [g.get(1) for g in (plan or [])]
+            return gids != sorted(set(gids)) or len(gids) != len(set(gids)), "group IDs not unique+ascending"
+        if dc in ("key-set-strictness", "unattributed-keyset"):
+            emb, err = unattributed_keyset_correspondence(pm.get(H_KEYSET), comps)
+            if err is not None:
+                return True, f"key set correspondence fails: {err}"
+            # N-35: correspondence ok but the embedded key does not verify.
+            if vid == "N-35" and emb is not None:
+                akid = (pm.get(H_ALG), pm.get(H_KID))
+                tbs = _enc(["Signature1", obj[0], b"", obj[2]])
+                try:
+                    Ed25519PublicKey.from_public_bytes(emb[akid]).verify(obj[3], tbs)
+                    return False, "signature verified against the embedded key"
+                except InvalidSignature:
+                    return True, "signature does not verify against the embedded key"
+            return False, "key set corresponds (no violation)"
+        if dc == "plan-key-uniqueness":
+            keys = [(a, k) for _, a, k in comps]
+            return len(keys) != len(set(keys)), "plan repeats an (alg, kid)"
+        if dc == "plan-mismatch":  # N-20 (C4)
+            ek = []
+            for e in (entries or []):
+                sh = decode(e[0]); ek.append((sh.get(H_GROUP), sh.get(H_ALG), sh.get(H_KID)))
+            return any(x not in set(comps) for x in ek), "a signature entry cites a group absent from the plan"
+        if dc == "response-binding":
+            return rejected(req_claims, obj[2]), "response_binding structure rejected by the CDDL"
+        if dc == "suite-plan":
+            return rejected(plan_schema, _enc(plan)), "plan rejected (unknown suite / downgrade)"
+        if dc == "unprotected-authority":  # N-17
+            return H_ALG not in pm or H_KID not in pm, "alg/kid not in the protected bucket"
+        if dc == "aud-syntax":
+            return claims is not None and not valid_service_domain(claims[C_AUD]), "aud violates service-domain syntax"
+        if dc in ("response-cti-binding", "response-binding-equality",
+                  "response-schema-binding", "response-aud-binding"):
+            field = {"response-aud-binding": "aud_eq", "response-cti-binding": "cti_eq",
+                     "response-binding-equality": "binding_eq", "response-schema-binding": "schema_eq"}[dc]
+            if not vec.get("originating_request"):
+                return False, "no originating_request"
+            return response_context_bindings(vid, by_id)[field] is False, f"{field} violated vs request"
+        return None, f"UNHANDLED deny_class {dc!r}"
+
+    checked = set()
+    for vec in negatives["vectors"]:
+        present, detail = shape_present(vec)
+        check(present is not None, f"{vec['id']}: deny_class {vec['deny_class']!r} has no causality predicate")
+        if present is not None:
+            check(present, f"{vec['id']} ({vec['deny_class']}) does not exhibit its violation: {detail}")
+            checked.add(vec["id"])
+    # Meta-guard: exactly every negative vector ID is covered by a predicate.
+    all_ids = {v["id"] for v in negatives["vectors"]}
+    check(checked == all_ids,
+          f"causality inventory must cover every negative; missing {sorted(all_ids - checked)}")
+    print(f"   causality inventory covers all {len(all_ids)} negatives; each exhibits its violation shape")
+
+
+# --------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -1133,6 +1372,8 @@ def main() -> None:
     gate_unattributed_keyset(positives, negatives)
     gate_replay_thumbprints(cddl, positives)
     gate_readme_counts(positives, negatives)
+    gate_response_context(positives, negatives)
+    gate_causality_inventory(cddl, positives, negatives)
     gate_canonical(positives, negatives)
 
     print()
