@@ -248,6 +248,11 @@ fn parse_cgr(
     // their leaves do) are correctly exempt.
     validate_mandatory_scope(service_name, &request_variants, &scoped_clients)?;
 
+    // v16 §6 (WS-D, #1505): the dispatch-policy pair is MANDATORY on every
+    // leaf. Same structural walk as the scope gate: scoped dispatchers carry
+    // neither annotation; their leaves carry exactly one.
+    validate_mandatory_dispatch(service_name, &request_variants, &scoped_clients)?;
+
     Ok(ParsedSchema {
         request_variants,
         response_variants,
@@ -309,6 +314,117 @@ fn validate_mandatory_scope(
         if v.scope.is_empty() && !v.scope_exempt {
             return Err(err(service_name, "", &v.name));
         }
+    }
+    for sc in scoped_clients {
+        check_scoped(service_name, "", sc)?;
+    }
+    Ok(())
+}
+
+/// v16 §6 (WS-D, #1505): enforce the strict dispatch-policy pair on every leaf.
+///
+/// Structural rules checked here (the label GRAMMAR itself is parsed later, in
+/// codegen, against the checked-in `InitialLabelMap` — see
+/// `schema::dispatch_label`):
+///
+/// - every leaf carries **exactly one** of `$dispatchMac` / `$dispatchPublic`
+///   (neither is a build error; both are a build error);
+/// - a scoped dispatcher carries **neither** (its leaves do — an annotation on
+///   a dispatcher would be dead, misleading metadata);
+/// - `$dispatchPublic` never coexists with a `$scope` action (a leaf the
+///   control plane scopes cannot be dispatch-public);
+/// - `$dispatchPublic` requires a trimmed, nonempty reason.
+///
+/// This runs at schema-parse time (build.rs / proc-macro), so an unannotated
+/// or doubly-annotated leaf fails the build of the schema's own crate — the
+/// earliest possible gate. The leaf-tree walk in the derive macro re-derives
+/// the same facts and emits `compile_error!` for any leaf this walk cannot
+/// reach (hand-dispatched pure-union arms), so no annotation failure can ever
+/// produce an unlabeled runtime row.
+fn validate_mandatory_dispatch(
+    service_name: &str,
+    request_variants: &[UnionVariant],
+    scoped_clients: &[ScopedClient],
+) -> Result<(), String> {
+    fn check_leaf(service_name: &str, path: &str, v: &UnionVariant) -> Result<(), String> {
+        let has_mac = !v.dispatch_mac.is_empty();
+        let has_public = !v.dispatch_public.is_empty();
+        match (has_mac, has_public) {
+            (false, false) => {
+                return Err(format!(
+                    "service `{service_name}`: method `{path}{}` has neither a `$dispatchMac` nor a \
+                     `$dispatchPublic` annotation — the dispatch-policy pair is mandatory on every \
+                     leaf (v16 §6). Add e.g. `$dispatchMac(\"internal:pq-hybrid\")`, or \
+                     `$dispatchPublic(\"<reason>\")` only for a genuinely unauthenticated leaf.",
+                    v.name
+                ));
+            }
+            (true, true) => {
+                return Err(format!(
+                    "service `{service_name}`: method `{path}{}` carries BOTH `$dispatchMac` and \
+                     `$dispatchPublic` — exactly one dispatch annotation per leaf (v16 §6).",
+                    v.name
+                ));
+            }
+            _ => {}
+        }
+        if has_public {
+            if !v.scope.is_empty() {
+                return Err(format!(
+                    "service `{service_name}`: method `{path}{}` is `$dispatchPublic` but also \
+                     declares the `$scope({})` action — a control-plane-scoped method cannot be \
+                     dispatch-public.",
+                    v.name, v.scope
+                ));
+            }
+            if v.dispatch_public.trim().is_empty() {
+                return Err(format!(
+                    "service `{service_name}`: method `{path}{}` has an empty `$dispatchPublic` \
+                     reason — a public leaf carries a mandatory, reviewable reason.",
+                    v.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_dispatcher(service_name: &str, path: &str, v: &UnionVariant) -> Result<(), String> {
+        if !v.dispatch_mac.is_empty() || !v.dispatch_public.is_empty() {
+            return Err(format!(
+                "service `{service_name}`: dispatcher `{path}{}` carries a dispatch annotation — \
+                 scoped dispatcher nodes have neither; their leaves do (v16 §6).",
+                v.name
+            ));
+        }
+        Ok(())
+    }
+
+    // Recurse into a scoped client's leaves + nested dispatchers.
+    fn check_scoped(service_name: &str, path: &str, sc: &ScopedClient) -> Result<(), String> {
+        let here = format!("{path}{} ", sc.factory_name);
+        let nested_names: Vec<&str> =
+            sc.nested_clients.iter().map(|n| n.factory_name.as_str()).collect();
+        for v in &sc.inner_request_variants {
+            if nested_names.contains(&v.name.as_str()) {
+                check_dispatcher(service_name, &here, v)?;
+                continue;
+            }
+            check_leaf(service_name, &here, v)?;
+        }
+        for n in &sc.nested_clients {
+            check_scoped(service_name, &here, n)?;
+        }
+        Ok(())
+    }
+
+    let dispatcher_names: Vec<&str> =
+        scoped_clients.iter().map(|sc| sc.factory_name.as_str()).collect();
+    for v in request_variants {
+        if dispatcher_names.contains(&v.name.as_str()) {
+            check_dispatcher(service_name, "", v)?;
+            continue;
+        }
+        check_leaf(service_name, "", v)?;
     }
     for sc in scoped_clients {
         check_scoped(service_name, "", sc)?;
@@ -752,6 +868,19 @@ fn extract_union_variants(
             field.get_annotations().map_err(|e| format!("{e}"))?,
             vfs_mac_id,
         );
+        // Dispatch-policy annotations (v16 §6, WS-D): the strict label /
+        // public-reason pair that generates the method-policy inventory rows.
+        // Ids resolved inline by node short-name, same as the VFS set above.
+        let dispatch_mac_id = annotation_id_by_short_name(node_map, "dispatchMac");
+        let dispatch_public_id = annotation_id_by_short_name(node_map, "dispatchPublic");
+        let dispatch_mac = extract_annotation_text(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            dispatch_mac_id,
+        );
+        let dispatch_public = extract_annotation_text(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            dispatch_public_id,
+        );
 
         variants.push(UnionVariant {
             name,
@@ -766,6 +895,8 @@ fn extract_union_variants(
             vfs_bulk,
             vfs_hidden,
             vfs_mac,
+            dispatch_mac,
+            dispatch_public,
         });
     }
 
@@ -1665,6 +1796,8 @@ mod mandatory_scope_tests {
             vfs_bulk: false,
             vfs_hidden: false,
             vfs_mac: String::new(),
+            dispatch_mac: String::new(),
+            dispatch_public: String::new(),
         }
     }
 
@@ -1725,5 +1858,104 @@ mod mandatory_scope_tests {
         );
         let err = validate_mandatory_scope("registry", &reqs, &[worktree]).unwrap_err();
         assert!(err.contains("log"), "{err}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod mandatory_dispatch_tests {
+    use super::*;
+
+    /// `scope`/`exempt` feed the cross-plane rule (`$dispatchPublic` must not
+    /// carry a scope); `mac`/`public` are the dispatch pair under test.
+    fn variant(name: &str, scope: &str, mac: &str, public: &str) -> UnionVariant {
+        UnionVariant {
+            name: name.to_owned(),
+            type_name: "Void".to_owned(),
+            description: String::new(),
+            scope: scope.to_owned(),
+            scope_exempt: false,
+            cli_hidden: false,
+            doc_example: String::new(),
+            vfs_path: String::new(),
+            vfs_kind: String::new(),
+            vfs_bulk: false,
+            vfs_hidden: false,
+            vfs_mac: String::new(),
+            dispatch_mac: mac.to_owned(),
+            dispatch_public: public.to_owned(),
+        }
+    }
+
+    fn scoped(factory: &str, inner: Vec<UnionVariant>, nested: Vec<ScopedClient>) -> ScopedClient {
+        ScopedClient {
+            factory_name: factory.to_owned(),
+            client_name: format!("{factory}Client"),
+            scope_fields: vec![],
+            inner_request_variants: inner,
+            inner_response_variants: vec![],
+            capnp_inner_response: String::new(),
+            nested_clients: nested,
+        }
+    }
+
+    const MAC: &str = "internal:pq-hybrid";
+
+    #[test]
+    fn a_fully_annotated_leaf_set_passes() {
+        let reqs = vec![
+            variant("load", "write", MAC, ""),
+            variant("status", "query", MAC, ""),
+            variant("check", "", "", "the authz check itself cannot require authz"),
+        ];
+        assert!(validate_mandatory_dispatch("model", &reqs, &[]).is_ok());
+    }
+
+    #[test]
+    fn an_unannotated_leaf_is_a_build_error() {
+        let reqs = vec![variant("load", "write", MAC, ""), variant("oops", "query", "", "")];
+        let err = validate_mandatory_dispatch("model", &reqs, &[]).unwrap_err();
+        assert!(err.contains("oops"), "{err}");
+        assert!(err.contains("neither"), "{err}");
+    }
+
+    #[test]
+    fn both_annotations_on_one_leaf_is_a_build_error() {
+        let reqs = vec![variant("x", "query", MAC, "reason")];
+        let err = validate_mandatory_dispatch("model", &reqs, &[]).unwrap_err();
+        assert!(err.contains("BOTH"), "{err}");
+    }
+
+    #[test]
+    fn a_scoped_dispatcher_carries_neither_and_its_leaves_are_checked() {
+        let reqs = vec![variant("ttt", "", "", "")];
+        let good = scoped("ttt", vec![variant("train", "train", MAC, "")], vec![]);
+        assert!(validate_mandatory_dispatch("model", &reqs, &[good]).is_ok());
+
+        // An annotated dispatcher is itself a build error, even with good leaves.
+        let annotated_dispatcher = vec![variant("ttt", "", MAC, "")];
+        let leaves = scoped("ttt", vec![variant("train", "train", MAC, "")], vec![]);
+        let err =
+            validate_mandatory_dispatch("model", &annotated_dispatcher, &[leaves]).unwrap_err();
+        assert!(err.contains("dispatcher"), "{err}");
+
+        // And the unannotated deep leaf still fails.
+        let bad = scoped("ttt", vec![variant("train", "train", "", "")], vec![]);
+        let err = validate_mandatory_dispatch("model", &reqs, &[bad]).unwrap_err();
+        assert!(err.contains("ttt train"), "{err}");
+    }
+
+    #[test]
+    fn public_never_coexists_with_a_scope_action() {
+        let reqs = vec![variant("p", "query", "", "genuinely public")];
+        let err = validate_mandatory_dispatch("model", &reqs, &[]).unwrap_err();
+        assert!(err.contains("cannot be dispatch-public"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_public_reason_is_a_build_error() {
+        let reqs = vec![variant("p", "", "", "   ")];
+        let err = validate_mandatory_dispatch("model", &reqs, &[]).unwrap_err();
+        assert!(err.contains("reason"), "{err}");
     }
 }

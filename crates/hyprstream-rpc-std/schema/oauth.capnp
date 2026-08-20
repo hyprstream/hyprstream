@@ -7,6 +7,7 @@
 
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
+using import "/annotations.capnp".dispatchMac;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
 using import "/annotations.capnp".vfsPath;
@@ -16,25 +17,25 @@ struct OauthRequest {
 
   union {
     registerUser @1 :RegisterUser
-      $scope(manage) $mcpDescription("Register a new user");
+      $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Register a new user");
     getUser @2 :Text
-      $scope(query) $mcpDescription("Get user profile by username");
+      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Get user profile by username");
     listUsers @3 :ListUsers
-      $scope(query) $mcpDescription("List/search users with optional filter");
+      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("List/search users with optional filter");
     updateUser @4 :UpdateUser
-      $scope(manage) $mcpDescription("Update user profile fields");
+      $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Update user profile fields");
     suspendUser @5 :Text
-      $scope(manage) $mcpDescription("Suspend user (set active=false)");
+      $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Suspend user (set active=false)");
     resumeUser @6 :Text
-      $scope(manage) $mcpDescription("Resume suspended user (set active=true)");
+      $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Resume suspended user (set active=true)");
     removeUser @7 :Text
-      $scope(manage) $mcpDescription("Permanently remove user");
+      $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Permanently remove user");
     addPubkey @8 :AddPubkey
-      $scope(manage) $mcpDescription("Add an Ed25519 public key to a user");
+      $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Add an Ed25519 public key to a user");
     removePubkey @9 :RemovePubkey
-      $scope(manage) $mcpDescription("Remove a public key by fingerprint");
+      $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Remove a public key by fingerprint");
     listPubkeys @10 :Text
-      $scope(query) $mcpDescription("List all public keys for a user")
+      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("List all public keys for a user")
       $vfsPath("{arg}/pubkeys");
   }
 }

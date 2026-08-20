@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "comment": [
+    "InitialLabelMap (v16 §6, WS-D): the checked-in compartment vocabulary that",
+    "$dispatchMac compartment names resolve through at code generation. Bits are",
+    "STABLE assignments: the map is append-only, retired names/bits are moved to",
+    "'retired' and tombstoned forever, never reused. Version bumps are deliberate",
+    "policy generations (a new lattice version), not routine edits.",
+    "",
+    "The initial live set is intentionally EMPTY, matching production lattice v1",
+    "(Lattice::new(LatticeVersion(1), []) in crates/hyprstream/src/mac/bootload.rs):",
+    "no dispatch label carries compartments today, and inventing compartment",
+    "policy ahead of the WS-G operator review of the target inventory would be a",
+    "silent policy decision. Adding the first live compartment is an append-only",
+    "edit to 'compartments' with the next free bit."
+  ],
+  "compartments": [],
+  "retired": []
+}
