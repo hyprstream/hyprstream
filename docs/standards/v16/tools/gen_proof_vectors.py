@@ -178,6 +178,9 @@ CAPNP_RESPONSE_BYTES = bytes.fromhex(
 # runner instead of wall clock. iat=1786000000 <= verifier_now < exp=1786000030.
 VERIFIER_NOW = 1786000015
 ISSUER_ISS = "https://issuer.hyprstream.test"
+# RFC 9068 §2.2.1 requires `client_id` in an at+jwt access token: the OAuth client
+# the token was issued to. JWT-only (the CWT credential N-1 is not an RFC 9068 JWT).
+CREDENTIAL_CLIENT_ID = "hyprstream-oauth-client-1"
 CREDENTIAL_SUBJECT = "user-1"
 CREDENTIAL_TENANT = "tenant-alpha"           # JWT text name for the -70005 tenant claim
 CREDENTIAL_CLEARANCE = [2, [5, 7]]           # [level, compartments]; -70006 (JWT text: clearance)
@@ -385,6 +388,7 @@ def main() -> None:
                 "iat": IAT,
                 "exp": EXP,
                 "jti": jti,
+                "client_id": CREDENTIAL_CLIENT_ID,
                 "tenant": CREDENTIAL_TENANT,
                 "clearance": CREDENTIAL_CLEARANCE,
                 "cnf": {"hs_signer_suite": b64u(cnf_thumbprint)},

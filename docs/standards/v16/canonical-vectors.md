@@ -134,7 +134,8 @@ profile-valid **at+jwt** access token — not a placeholder. Each token is a com
 JWS with the exact protected header `{"typ":"at+jwt","alg":"EdDSA","kid":"issuer-ed25519-1"}`,
 signed by the seeded credential-issuer Ed25519 key over the required v16
 authenticated-dispatch claims (`iss`, `sub`, service `aud`, `iat`/`exp`, unique
-`jti`, Reusable-only `tenant` and `clearance`, and `cnf`). Two per-suite tokens are
+`jti`, the RFC 9068 `client_id` (`hyprstream-oauth-client-1`), Reusable-only
+`tenant` and `clearance`, and `cnf`). Two per-suite tokens are
 shipped in [`proof-v1-credentials.json`](vectors/proof-v1-credentials.json) with
 the positive→credential map: a **classical** token (P-4/P-5/P-6, primary group
 `[client Ed25519]`) and a **hybrid** token (P-2, primary group `[client Ed25519,

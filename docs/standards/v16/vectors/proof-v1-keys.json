@@ -76,8 +76,8 @@
       "capnp_request_bytes_hex": "0000000000000000010000001700000001000500000000000000",
       "capnp_response_bytes_hex": "0000000000000000010000000f000000020003000000000000",
       "verifier_now": 1786000015,
-      "credential_hash_classical_hex": "dc922286dc82617535d32a643cc9ed0dc639ce6da65914db9bced7b0f3395b03",
-      "credential_hash_hybrid_hex": "bfbb3d00f187e1c8bceb32d1fed9cc16cb561c77393f16a6299aab1b64da52e7",
+      "credential_hash_classical_hex": "21a30adf2150bfb47232d9b87c273b549c17d424b9a359e44458772b3bc5bd23",
+      "credential_hash_hybrid_hex": "d07c6fd0e934d551cfa76022325bfc46f4689de8f46e33e7f62b7cd8cabc14a6",
       "external_aad": "zero-length"
     }
   }

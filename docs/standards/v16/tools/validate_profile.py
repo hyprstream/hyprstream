@@ -1556,11 +1556,14 @@ def _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=None):
             _b64u_dec(sp), f"{hp}.{pp}".encode("ascii"))
     except InvalidSignature:
         errs.append("issuer signature invalid")
-    for r in ("iss", "sub", "aud", "iat", "exp", "jti", "tenant", "clearance", "cnf"):
+    for r in ("iss", "sub", "aud", "iat", "exp", "jti", "client_id", "tenant", "clearance", "cnf"):
         if r not in claims:
             errs.append(f"missing claim {r}")
     if not claims.get("iss") or not claims.get("sub"):
         errs.append("empty issuer/subject")
+    # RFC 9068 §2.2.1: at+jwt REQUIRES a non-empty string client_id.
+    if not isinstance(claims.get("client_id"), str) or not claims.get("client_id"):
+        errs.append("client_id must be a non-empty string (RFC 9068)")
     if expected_aud is not None and claims.get("aud") != expected_aud:
         errs.append("audience mismatch")
     if not (claims.get("iat", 0) <= now < claims.get("exp", 0)):
@@ -1707,6 +1710,9 @@ def gate_credential_context(positives, negatives) -> None:
     rejected("wrong audience", _make_jwt(hdr, {**base_claims, "aud": "evil.svc.hyprstream.test"}, sk_i))
     # 4. missing required claim (re-signed).
     rejected("missing tenant claim", _make_jwt(hdr, {k: v for k, v in base_claims.items() if k != "tenant"}, sk_i))
+    # 4b. I1: RFC 9068 at+jwt requires client_id — a re-signed token without it denies.
+    rejected("missing client_id (RFC 9068)", _make_jwt(hdr, {k: v for k, v in base_claims.items() if k != "client_id"}, sk_i))
+    rejected("empty client_id", _make_jwt(hdr, {**base_claims, "client_id": ""}, sk_i))
     # 5. wrong typ header (re-signed).
     rejected("wrong typ header", _make_jwt({**hdr, "typ": "JWT"}, base_claims, sk_i))
     # 6. clock outside validity (re-signed with an expired window).

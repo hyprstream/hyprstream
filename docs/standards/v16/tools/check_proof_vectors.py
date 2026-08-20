@@ -501,11 +501,13 @@ def main() -> None:
                     b64u_dec(sp), f"{hp}.{pp}".encode("ascii"))
             except InvalidSignature:
                 fail(f"{label}: issuer Ed25519 signature does not verify")
-            for req in ("iss", "sub", "aud", "iat", "exp", "jti", "tenant", "clearance", "cnf"):
+            for req in ("iss", "sub", "aud", "iat", "exp", "jti", "client_id", "tenant", "clearance", "cnf"):
                 if req not in claims:
                     fail(f"{label}: missing required claim {req!r}")
             if not claims.get("iss") or not claims.get("sub"):
                 fail(f"{label}: empty issuer/subject")
+            if not isinstance(claims.get("client_id"), str) or not claims.get("client_id"):
+                fail(f"{label}: client_id must be a non-empty string (RFC 9068)")
             if not (claims.get("iat", 0) <= now < claims.get("exp", 0)):
                 fail(f"{label}: not temporally valid at verifier_now {now}")
             if "hs_signer_suite" not in (claims.get("cnf") or {}):
