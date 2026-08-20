@@ -732,6 +732,51 @@ def main() -> None:
             ),
         )
 
+        # ---------------- P-8: hybrid UNATTRIBUTED COSE_Sign ----------------
+        # A hybrid unattributed proof: one logical signer group, two components
+        # (Ed25519 + ML-DSA-65). Its self-asserted key set carries both public
+        # keys in the plan's component order; each signature is verified against
+        # its EMBEDDED key, so this exercises multi-key keyset correspondence.
+        plan_unatt_hybrid = [
+            group(1, SUITE_HYBRID, [
+                component(ALG_ED25519, KID_UNATTRIBUTED_ED),
+                component(ALG_ML_DSA_65, KID_UNATTRIBUTED_ML),
+            ])
+        ]
+        keyset_unatt_hybrid = [
+            cose_key_okp_ed25519(KID_UNATTRIBUTED_ED, sk_u_ed.public_key().public_bytes_raw()),
+            cose_key_akp_mldsa65(KID_UNATTRIBUTED_ML, ml_unattributed.public),
+        ]
+        p8_body = {
+            H_CRIT: CRIT_SIGN_BODY_UNATTRIBUTED,
+            H_TYP: TYP_REQUEST,
+            H_DOMAIN: DOMAIN_REQUEST,
+            H_PLAN: plan_unatt_hybrid,
+            H_KEYSET: keyset_unatt_hybrid,
+        }
+        p8_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_UNATTRIBUTED_ED, H_GROUP: 1}, sk_u_ed),
+            ({H_ALG: ALG_ML_DSA_65, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_UNATTRIBUTED_ML, H_GROUP: 1}, ml_unattributed),
+        ]
+        p8, p8_body_prot, p8_payload = sign_multi(
+            p8_body, request_claims(credential_hash=None, nonce=CHALLENGE), p8_entries
+        )
+        record(
+            positives,
+            "P-8",
+            "Hybrid unattributed COSE_Sign; two embedded keys in plan order, verified 1:1",
+            "accept",
+            "COSE_Sign",
+            p8,
+            protected_hex=p8_body_prot.hex(),
+            payload_hex=p8_payload.hex(),
+            notes=(
+                "hs_unattributed_key_set carries the Ed25519 then ML-DSA-65 public "
+                "keys in the plan's component order; each signature verifies against "
+                "its embedded key."
+            ),
+        )
+
         # =================== NEGATIVE VECTORS ===============================
 
         # N-1: a genuinely VALID CWT credential presented in the proof slot.
@@ -1614,6 +1659,80 @@ def main() -> None:
             deny_class="plan-key-uniqueness",
             deny_rule="every (alg, kid) pair MUST be unique across the whole plan, regardless of group ID",
             notes="Both signatures are valid; a single signer must not satisfy a two-group policy.",
+        )
+
+        # N-35 (B4): unattributed proof whose EMBEDDED public key does not match
+        # the signing key. The key set element keeps the correct kid/alg/crv but
+        # carries a DIFFERENT public key (the approver's); the proof is re-signed
+        # with the real unattributed key over the mutated protected bucket. It
+        # denies because each unattributed signature MUST verify against its
+        # embedded key — not a key resolved out of band.
+        n35_protected = dict(p1_protected)
+        n35_protected[H_KEYSET] = [
+            cose_key_okp_ed25519(
+                KID_UNATTRIBUTED_ED, sk_a_ed.public_key().public_bytes_raw()  # wrong key
+            )
+        ]
+        n35, _, _ = sign1(n35_protected, p1_claims, sk_u_ed)  # signed by the REAL key
+        record(
+            negatives,
+            "N-35",
+            "Unattributed proof whose embedded key set does not match the signing key",
+            "deny",
+            "COSE_Sign1",
+            n35,
+            deny_class="unattributed-keyset",
+            deny_rule="each unattributed signature MUST verify against its embedded key set key",
+            notes=(
+                "Correct kid/alg/crv but a different public key; re-signed with the "
+                "real key over the mutated bucket, so it denies at embedded-key "
+                "verification, not by a plan-shape or self-signature failure."
+            ),
+        )
+
+        # N-37 (B4): hybrid unattributed key set whose second element duplicates
+        # the first (Ed25519) instead of the ML-DSA-65 key — element 1 does not
+        # correspond to the plan's ML-DSA-65 component.
+        n37_body = dict(p8_body)
+        n37_body[H_KEYSET] = [
+            cose_key_okp_ed25519(KID_UNATTRIBUTED_ED, sk_u_ed.public_key().public_bytes_raw()),
+            cose_key_okp_ed25519(KID_UNATTRIBUTED_ED, sk_u_ed.public_key().public_bytes_raw()),
+        ]
+        n37, _, _ = sign_multi(
+            n37_body, request_claims(credential_hash=None, nonce=CHALLENGE), p8_entries
+        )
+        record(
+            negatives,
+            "N-37",
+            "Hybrid unattributed key set duplicating the Ed25519 element (no ML-DSA-65 key)",
+            "deny",
+            "COSE_Sign",
+            n37,
+            deny_class="unattributed-keyset",
+            deny_rule="key set element i MUST correspond to plan component i by kid/alg/kty",
+            notes="Element 1 is Ed25519 where the plan's component 1 is ML-DSA-65.",
+        )
+
+        # N-38 (B4): hybrid unattributed key set with the two elements REORDERED
+        # (ML-DSA-65 first, Ed25519 second) — out of the plan's component order.
+        n38_body = dict(p8_body)
+        n38_body[H_KEYSET] = [
+            cose_key_akp_mldsa65(KID_UNATTRIBUTED_ML, ml_unattributed.public),
+            cose_key_okp_ed25519(KID_UNATTRIBUTED_ED, sk_u_ed.public_key().public_bytes_raw()),
+        ]
+        n38, _, _ = sign_multi(
+            n38_body, request_claims(credential_hash=None, nonce=CHALLENGE), p8_entries
+        )
+        record(
+            negatives,
+            "N-38",
+            "Hybrid unattributed key set with elements reordered out of plan component order",
+            "deny",
+            "COSE_Sign",
+            n38,
+            deny_class="unattributed-keyset",
+            deny_rule="key set elements MUST be in the plan's exact component order",
+            notes="Element 0 is ML-DSA-65 where component 0 is Ed25519.",
         )
 
     meta = {

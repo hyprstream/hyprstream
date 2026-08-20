@@ -38,9 +38,14 @@ The gate uses a **real CDDL validator** — `pycddl` (the Rust `cddl` crate behi
 a pinned prebuilt wheel) — to validate every fixture against the normative CDDL,
 alongside the exact private values, the frozen caps, the closed response map,
 the orthogonal enum axes, the recipient/encryption relation, the collision
-review, and a byte-identical regeneration of the fixtures. One pinned-version
-limitation (byte-length `.size` **ranges** are re-checked in Python, not by the
-validator) is documented in `validate_profile.py`.
+review, and a byte-identical regeneration of the fixtures. Two pinned-version
+limitations are documented in `validate_profile.py` and worked around by
+stronger Python-side checks: byte-length `.size` **ranges** are re-checked in
+Python, and the validator **panics** on the AKP/ML-DSA-65 `COSE_Key` in the
+unattributed key set, so that key set is validated by the gate's B4
+correspondence + embedded-key verification (exact 1:1 plan correspondence,
+closed key shape, and per-signature verification against the embedded key)
+rather than by the pycddl pass. The normative CDDL is unchanged.
 
 ## Relationship to the sibling profiles
 

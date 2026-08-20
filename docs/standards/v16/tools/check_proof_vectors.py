@@ -149,6 +149,60 @@ H_ALG, H_CRIT, H_KID, H_TYP = 1, 2, 4, 16
 H_DOMAIN, H_PLAN, H_GROUP, H_KEYSET = -70100, -70101, -70102, -70103
 TYP_RESPONSE = "application/vnd.hyprstream.response-proof+cwt"
 C_SCHEMA_ID, C_RESPONSE_BINDING = -70002, -70004
+KTY_OKP, KTY_AKP = 1, 7
+CRV_ED25519 = 6
+ED25519_PUB_BYTES = 32       # OKP/Ed25519 x
+ML_DSA_65_PUB_BYTES = 1952   # AKP/ML-DSA-65 pub (RFC 9964)
+# Exact COSE_Key map key sets (closed, per the CDDL): OKP/Ed25519 and
+# AKP/ML-DSA-65. Surplus or missing fields deny.
+OKP_KEY_FIELDS = {1, 2, 3, -1, -2}
+AKP_KEY_FIELDS = {1, 2, 3, -1}
+
+
+def unattributed_keyset_correspondence(keyset, components):
+    """For an unattributed proof, the embedded `hs_unattributed_key_set` is the
+    ONLY key material. This fully validates the key shape (the pycddl AKP panic
+    means the gate cannot lean on the CDDL for it): require exact ordered 1:1
+    correspondence with the plan components — keyset[i] matches component i by
+    kid, alg, key type / curve (OKP/Ed25519) or parameter set (AKP/ML-DSA-65),
+    the closed COSE_Key field set, and the exact public-key byte length. Return
+    ({kid: public_bytes}, None) on success, or (None, reason) on failure. The
+    returned public keys are what each unattributed signature MUST verify
+    against."""
+    if not isinstance(keyset, list):
+        return None, "hs_unattributed_key_set is not an array"
+    if len(keyset) != len(components):
+        return None, (f"key set has {len(keyset)} elements, plan has "
+                      f"{len(components)} components")
+    embedded = {}
+    for i, (_grp, alg, kid) in enumerate(components):
+        key = keyset[i]
+        if not isinstance(key, dict):
+            return None, f"key set element {i} is not a COSE_Key map"
+        if key.get(2) != kid:
+            return None, f"key set element {i} kid does not match plan component {i}"
+        if key.get(3) != alg:
+            return None, f"key set element {i} alg does not match plan component {i}"
+        if alg == ALG_ED25519:
+            if set(key.keys()) != OKP_KEY_FIELDS:
+                return None, f"key set element {i} is not a closed OKP COSE_Key"
+            if key.get(1) != KTY_OKP or key.get(-1) != CRV_ED25519:
+                return None, f"key set element {i} is not OKP/Ed25519"
+            pub = key.get(-2)
+            if not isinstance(pub, (bytes, bytearray)) or len(pub) != ED25519_PUB_BYTES:
+                return None, f"key set element {i} Ed25519 x must be {ED25519_PUB_BYTES} bytes"
+        elif alg == ALG_ML_DSA_65:
+            if set(key.keys()) != AKP_KEY_FIELDS:
+                return None, f"key set element {i} is not a closed AKP COSE_Key"
+            if key.get(1) != KTY_AKP:
+                return None, f"key set element {i} is not AKP/ML-DSA-65"
+            pub = key.get(-1)
+            if not isinstance(pub, (bytes, bytearray)) or len(pub) != ML_DSA_65_PUB_BYTES:
+                return None, f"key set element {i} ML-DSA-65 pub must be {ML_DSA_65_PUB_BYTES} bytes"
+        else:
+            return None, f"key set element {i} uses algorithm {alg} outside the profile"
+        embedded[kid] = bytes(pub)
+    return embedded, None
 
 
 def ml_dsa_verify(public: bytes, message: bytes, signature: bytes) -> bool:
@@ -227,9 +281,11 @@ def main() -> None:
                 out.append((grp[1], comp[1], comp[2]))
         return out
 
-    def verify_component(vec, alg, kid, tbs, sig):
+    def verify_component(vec, alg, kid, tbs, sig, pub_override=None):
+        # pub_override forces the embedded unattributed key (self-asserted key
+        # set); otherwise the enrolled/anchored test key is resolved by kid.
         if alg == ALG_ED25519:
-            pub = ed_by_kid.get(kid)
+            pub = pub_override if pub_override is not None else ed_by_kid.get(kid)
             if pub is None:
                 fail(f"{vec['id']}: unknown Ed25519 kid {kid!r}")
                 return
@@ -238,7 +294,7 @@ def main() -> None:
             except InvalidSignature:
                 fail(f"{vec['id']}: Ed25519 signature does not verify")
         elif alg == ALG_ML_DSA_65:
-            pub = ml_by_kid.get(kid)
+            pub = pub_override if pub_override is not None else ml_by_kid.get(kid)
             if pub is None:
                 fail(f"{vec['id']}: unknown ML-DSA-65 kid {kid!r}")
                 return
@@ -286,6 +342,17 @@ def main() -> None:
         plan_keys = [(alg, kid) for (_grp, alg, kid) in components]
         if len(plan_keys) != len(set(plan_keys)):
             fail(f"{vec['id']}: plan repeats an (alg, kid) across groups")
+
+        # B4: an unattributed proof (embedded hs_unattributed_key_set) is verified
+        # against its OWN key set, which must correspond 1:1 in order to the plan.
+        # `embedded` maps kid -> the embedded public key that each signature must
+        # verify against (None for authenticated proofs, which use enrolled keys).
+        embedded = None
+        if H_KEYSET in body_hdr:
+            embedded, err = unattributed_keyset_correspondence(body_hdr[H_KEYSET], components)
+            if err is not None:
+                fail(f"{vec['id']}: unattributed key set {err}")
+
         if vec["structure"] == "COSE_Sign1":
             # A COSE_Sign1 carries exactly one signature, so it must cover the
             # plan EXACTLY: the plan must have exactly one component. This
@@ -301,7 +368,8 @@ def main() -> None:
             alg, kid, grp = body_hdr[H_ALG], body_hdr[H_KID], body_hdr[H_GROUP]
             if (grp, alg, kid) not in components:
                 fail(f"{vec['id']}: signature does not match a plan component")
-            verify_component(vec, alg, kid, tbs, tail)
+            verify_component(vec, alg, kid, tbs, tail,
+                             pub_override=(embedded.get(kid) if embedded else None))
         else:
             seen = []
             seen_keys = set()
@@ -322,7 +390,8 @@ def main() -> None:
                 seen.append((grp, alg, kid))
                 seen_keys.add((alg, kid))
                 verify_component(
-                    vec, alg, kid, enc(["Signature", body_protected, sprot, b"", payload]), sig
+                    vec, alg, kid, enc(["Signature", body_protected, sprot, b"", payload]), sig,
+                    pub_override=(embedded.get(kid) if embedded else None),
                 )
             if len(seen) != len(components):
                 fail(f"{vec['id']}: signature entries do not cover the plan exactly")

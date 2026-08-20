@@ -12,8 +12,8 @@ Machine-readable files (the normative form — this page is the human index):
 | File | Contents |
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
-| [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 7 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 41 vectors that MUST deny |
+| [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 8 vectors that MUST verify |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 44 vectors that MUST deny |
 
 Each JSON vector carries `id`, `title`, `expect` (`accept` / `deny`),
 `structure`, `size_bytes`, `sha256`, full `cbor_hex`, and — for negatives — a
@@ -83,6 +83,11 @@ a byte-identical regeneration. It also proves the negatives deny by their rule:
 - a **`signature_plan` repeating one `(alg, kid)` across two groups** (N-33) is
   rejected — the gate and checker enforce whole-plan `(alg, kid)` uniqueness
   regardless of group ID, so a single signer cannot satisfy a two-group policy;
+- an **unattributed proof is verified against its embedded key set** (not any
+  out-of-band table): the gate and checker require exact ordered 1:1
+  correspondence with the plan and verify each signature against the embedded
+  key, so a mismatched embedded key (N-35), surplus (N-18), duplicate (N-37), or
+  reordered (N-38) key set is rejected;
 - the **size-cap** negatives N-12 (65-byte `suite_id`), N-13 (65-byte `kid`), and
   N-26 (129-byte `aud`) are each asserted over their numeric caps, and the CDDL
   cap text (`kid` = `1..64`, `aud` = `1..128` plus its `.regexp`) is pinned so a
@@ -121,6 +126,7 @@ Object encoding is untagged: typing is performed by the protected `typ` header
 | P-5 | `COSE_Sign` | 562 | `TokenBoundAndApproved`: two distinct logical signer groups, two principals, one approval each — signature entries, not countersignatures | `ca76143118078498920a862de7b084af8e4f264a49a8bf25c1d89c7b8213a723` |
 | P-6 | `COSE_Sign1` | 411 | Authenticated classical proof with a cleartext stream-setup `response_binding` (`response_kind` stream_setup, `protection_mode` cleartext, null recipient) — exercises the orthogonal axes | `86f50e9862a45d0805786ae207fc310693e75f60dc50d44682b9ae1846030201` |
 | P-7 | `COSE_Sign1` | 1605 | Bound response proof whose `response_binding` equals the originating request (P-4) field-for-field | `ab0b26bd2956ad31dcd047869a76e663171e2c57f0414d9d91d7795ba99aa5ab` |
+| P-8 | `COSE_Sign` | 5862 | Hybrid unattributed proof; two embedded keys in plan order, each signature verified against its embedded key | `4f8fdbf677f7b28cf16b45af61067602f7f4082be2ced79b251ede6ecf82e6df` |
 
 ### P-1 — unattributed `COSE_Sign1` (complete CBOR)
 
@@ -192,7 +198,7 @@ e77e1443512ed80f27693a98d646c00290658b4b33050f
 response root type ID, `-70003` is the exact response bytes, and `-70001` is
 null. N-19 and N-22 are its negatives.
 
-### P-2, P-4, P-5, P-6, P-7
+### P-2, P-4, P-5, P-6, P-7, P-8
 
 Their complete `cbor_hex`, protected buckets, and payloads are in
 [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) (P-2 carries
@@ -247,7 +253,7 @@ Ed25519 signature over the stripped object.
 | N-15 | credential-binding | Credential presented with a null signed `credential_hash` | 362 |
 | N-16 | freshness | Unattributed proof with no `Nonce` | 452 |
 | N-17 | unprotected-authority | `alg`/`kid` only in the unprotected header | 1626 |
-| N-18 | key-set-strictness | Key-set element with no matching plan component | 2456 |
+| N-18 | key-set-strictness | Unattributed key set with a surplus element (no matching plan component) | 2456 |
 | N-19 | disposition-confusion | Response proof carrying `hs_unattributed_key_set` | 446 |
 | N-20 | plan-mismatch | Signature entry citing a group absent from the plan | 562 |
 | N-21 | non-deterministic-encoding | Tagged `COSE_Sign1` (CBOR tag 18) | 1627 |
@@ -263,6 +269,9 @@ Ed25519 signature over the stripped object.
 | N-31 | response-schema-binding | Bound response proof whose `-70002` mismatches the realized `response_binding` root_type_id | 1601 |
 | N-32 | response-binding-equality | Response proof whose `response_binding` mismatches the originating request (P-4) | 1605 |
 | N-33 | plan-key-uniqueness | `COSE_Sign` plan repeating one `(alg, kid)` across two logical groups | 558 |
+| N-35 | unattributed-keyset | Unattributed proof whose embedded key set does not match the signing key | 470 |
+| N-37 | unattributed-keyset | Hybrid unattributed key set duplicating the Ed25519 element (no ML-DSA-65 key) | 3942 |
+| N-38 | unattributed-keyset | Hybrid unattributed key set with elements reordered out of plan component order | 5862 |
 
 ### Notes on individual negatives
 
@@ -363,6 +372,22 @@ Ed25519 signature over the stripped object.
 - **N-17 (unprotected authority).** Algorithm identifiers and key material in
   unprotected headers establish no authority; authenticated signer keys are
   resolved from the credential `cnf` and anchored trust stores.
+- **P-8 / N-18 / N-35 / N-37 / N-38 (unattributed key-set correspondence).** An
+  unattributed proof's embedded `hs_unattributed_key_set` is the **only** key
+  material it has, so verification MUST use the embedded keys — not any
+  out-of-band table. The gate and the vector checker require exact ordered 1:1
+  correspondence with the plan (kid, alg, closed COSE_Key field set, key type /
+  curve or parameter set, and exact public-key byte length) and verify each
+  unattributed signature against its embedded key. P-8 is a valid hybrid
+  unattributed proof (Ed25519 + ML-DSA-65 embedded, in plan order). The causal
+  failures: **N-35** keeps a well-formed key set with a *different* public key
+  (correct kid/alg/crv, re-signed with the real key) and denies at embedded-key
+  verification; **N-18** carries a surplus element; **N-37** duplicates the
+  Ed25519 element (so element 1 is not the ML-DSA-65 key); **N-38** reorders the
+  two elements out of plan order. The pinned `pycddl` (0.9.1) panics validating
+  the AKP/ML-DSA-65 `COSE_Key`, so the key set is passed to it opaquely for the
+  protected-bucket pass only; its full validation is the stronger gate/checker
+  correspondence above, and the normative CDDL is unchanged.
 - **N-23 / N-24 (recipient/encryption relation).** The frozen 4-key
   `response_binding` (Gate-2 §19 #3/#4) makes the recipient non-null iff
   `protection_mode` is encrypted. N-23 is the encrypted shape with a null

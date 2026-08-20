@@ -209,6 +209,16 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
           f"structural pass (re-checked numerically in section 3):")
     for s in strips:
         print(f"     - {s}")
+    # pycddl 0.9.1 PANICS (Rust unwrap-on-None) validating the AKP/ML-DSA-65
+    # COSE_Key inside the unattributed key set, so the key set is passed opaquely
+    # to pycddl for the protected-bucket pass ONLY. It is NOT left unvalidated:
+    # section 9 (B4) enforces the full key shape (closed COSE_Key field set,
+    # kty/crv or parameter set, exact public-key byte length), exact ordered 1:1
+    # correspondence with the plan, and embedded-key signature verification —
+    # strictly stronger than the CDDL key-shape rule. The normative CDDL is
+    # unchanged.
+    stripped = stripped.replace("=> unattributed-key-set", "=> any")
+    print("   embedded key set validated by section 9 / B4 (pycddl AKP panic worked around)")
 
     # Whole CDDL must compile under a real parser.
     try:
@@ -878,6 +888,74 @@ def gate_response_binding_equality(positives, negatives) -> None:
 
 
 # --------------------------------------------------------------------------
+# 9. Unattributed key-set correspondence + embedded-key verification (B4)
+# --------------------------------------------------------------------------
+
+
+def gate_unattributed_keyset(positives, negatives) -> None:
+    section("9. Unattributed key-set correspondence + embedded-key verification (B4)")
+    from check_proof_vectors import unattributed_keyset_correspondence
+    from check_proof_vectors import enc as _enc
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    def components_of(plan):
+        return [(g.get(1), c.get(1), c.get(2)) for g in (plan or []) if isinstance(g, dict)
+                for c in (g.get(3) or []) if isinstance(c, dict)]
+
+    by_id = {v["id"]: v for v in positives["vectors"]}
+    by_id.update({v["id"]: v for v in negatives["vectors"]})
+
+    # Unattributed positives: the embedded key set MUST correspond 1:1 in order
+    # to the plan. (Signature verification against the embedded keys is done by
+    # check_proof_vectors in section 6.)
+    for v in positives["vectors"]:
+        pm = decode(decode(bytes.fromhex(v["cbor_hex"]))[0])
+        if H_KEYSET not in pm:
+            continue
+        comps = components_of(pm.get(H_PLAN))
+        emb, err = unattributed_keyset_correspondence(pm[H_KEYSET], comps)
+        check(err is None, f"{v['id']} unattributed key set fails correspondence: {err}")
+        check(emb is not None and len(emb) == len(comps),
+              f"{v['id']} embedded key set must resolve one key per plan component")
+        if emb is not None:
+            print(f"   {v['id']} key set corresponds 1:1 to the plan ({len(emb)} embedded keys)")
+
+    # Correspondence-failure negatives: surplus (N-18), duplicate (N-37),
+    # reordered (N-38) each break the 1:1 ordered correspondence.
+    for nid, what in (("N-18", "surplus key"), ("N-37", "duplicate element"),
+                      ("N-38", "reordered elements")):
+        v = by_id.get(nid)
+        check(v is not None, f"unattributed-keyset negative {nid} ({what}) is missing")
+        if v is None:
+            continue
+        pm = decode(decode(bytes.fromhex(v["cbor_hex"]))[0])
+        _emb, err = unattributed_keyset_correspondence(pm.get(H_KEYSET), components_of(pm.get(H_PLAN)))
+        check(err is not None, f"{nid} ({what}) must FAIL key-set correspondence")
+        if err is not None:
+            print(f"   B4 {nid} rejected by correspondence ({what}): {err}")
+
+    # Embedded-key verification failure: N-35 keeps a well-formed key set (right
+    # kid/alg/crv) but a DIFFERENT public key, so its signature must not verify
+    # against the embedded key.
+    n35 = by_id.get("N-35")
+    check(n35 is not None, "unattributed-keyset negative N-35 (mismatched key) is missing")
+    if n35 is not None:
+        obj = decode(bytes.fromhex(n35["cbor_hex"]))
+        pm = decode(obj[0])
+        emb, err = unattributed_keyset_correspondence(pm.get(H_KEYSET), components_of(pm.get(H_PLAN)))
+        check(err is None, f"N-35 key set must be shape-valid (only the key bytes differ): {err}")
+        kid = pm.get(H_KID)
+        if emb is not None and emb.get(kid) is not None:
+            tbs = _enc(["Signature1", obj[0], b"", obj[2]])
+            try:
+                Ed25519PublicKey.from_public_bytes(emb[kid]).verify(obj[3], tbs)
+                check(False, "N-35 signature must NOT verify against its (mismatched) embedded key")
+            except InvalidSignature:
+                print("   B4 N-35 rejected: signature does not verify against the embedded key")
+
+
+# --------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -899,6 +977,7 @@ def main() -> None:
     gate_collisions()
     gate_type_confusion(negatives)
     gate_response_binding_equality(positives, negatives)
+    gate_unattributed_keyset(positives, negatives)
     gate_canonical(positives, negatives)
 
     print()
