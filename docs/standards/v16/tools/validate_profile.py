@@ -54,7 +54,7 @@ CDDL_PATH = V16 / "hyprstream-proof-cwt.cddl"
 REGISTRY_PATH = V16 / "private-label-registry.md"
 CREDENTIAL_PATH = V16 / "credential-profile.md"
 VECTORS_DIR = V16 / "vectors"
-# Repo root is five parents up: .../<repo>/docs/standards/v16/tools
+# Repo root is three `.parent` hops up from V16 (docs/standards/v16 -> repo).
 REPO_ROOT = V16.parent.parent.parent
 ENVELOPE_RS = REPO_ROOT / "crates" / "hyprstream-rpc" / "src" / "envelope.rs"
 
@@ -91,6 +91,12 @@ C_CREDENTIAL_HASH, C_SCHEMA_ID, C_BODY_BYTES, C_RESPONSE_BINDING = (
     -70003,
     -70004,
 )
+
+# Protected typ / hs_domain literals (paired: request vs response).
+TYP_REQUEST = "application/vnd.hyprstream.proof+cwt"
+TYP_RESPONSE = "application/vnd.hyprstream.response-proof+cwt"
+DOMAIN_REQUEST = "hs-rpc-request-proof-v1"
+DOMAIN_RESPONSE = "hs-rpc-response-proof-v1"
 
 FAILURES: list[str] = []
 SECTION = ""
@@ -131,6 +137,38 @@ def claims_of(cbor_hex: str) -> dict:
     return decode(payload_of(cbor_hex))
 
 
+def kids_and_suites(cbor_hex: str) -> tuple[list[bytes], list[str]]:
+    """Every kid (bstr) and suite_id (tstr) that appears in one COSE object:
+    the protected-header kid, the signature-plan components and their suites,
+    the unattributed key-set kids, and the per-signature buckets (COSE_Sign)."""
+    obj = decode(bytes.fromhex(cbor_hex))
+    prot = decode(obj[0])
+    kids: list[bytes] = []
+    suites: list[str] = []
+    if isinstance(prot.get(H_KID), (bytes, bytearray)):
+        kids.append(prot[H_KID])
+    for grp in prot.get(H_PLAN, []) or []:
+        if isinstance(grp, dict):
+            if isinstance(grp.get(2), str):
+                suites.append(grp[2])
+            for comp in grp.get(3, []) or []:
+                if isinstance(comp, dict) and isinstance(comp.get(2), (bytes, bytearray)):
+                    kids.append(comp[2])
+    for key in prot.get(H_KEYSET, []) or []:
+        if isinstance(key, dict) and isinstance(key.get(2), (bytes, bytearray)):
+            kids.append(key[2])
+    # COSE_Sign per-signature protected buckets.
+    if isinstance(obj[3], list) and obj[3] and isinstance(obj[3][0], list):
+        for entry in obj[3]:
+            try:
+                sp = decode(entry[0])
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(sp, dict) and isinstance(sp.get(H_KID), (bytes, bytearray)):
+                kids.append(sp[H_KID])
+    return kids, suites
+
+
 # --------------------------------------------------------------------------
 # 1. CDDL structural validation with a real validator
 # --------------------------------------------------------------------------
@@ -147,6 +185,7 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
             "docs/standards/v16/tools/requirements.txt"
         )
         return
+    from check_proof_vectors import enc  # deterministic re-encoder for mutants
 
     stripped, strips = strip_size_ranges(cddl)
     print(f"   stripped {len(strips)} bstr .size range control(s) for the "
@@ -156,30 +195,100 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
 
     # Whole CDDL must compile under a real parser.
     try:
-        Schema(cddl if False else "start = hyprstream-proof-claims\n" + stripped)
+        Schema("start = hyprstream-proof-claims\n" + stripped)
     except Exception as exc:  # noqa: BLE001
         FAILURES.append(f"[1. CDDL] normative CDDL does not compile: {exc}")
         return
 
-    claims_schema = Schema("start = hyprstream-proof-claims\n" + stripped)
-    sign1_schema = Schema("start = hyprstream-proof-sign1\n" + stripped)
+    def S(root: str):
+        return Schema(f"start = {root}\n" + stripped)
 
+    req_claims = S("hyprstream-proof-claims")
+    resp_claims = S("hyprstream-response-proof-claims")
+    sign1_prot = S("proof-sign1-protected")
+    sign_body_prot = S("proof-sign-body-protected")
+    sig_entry_prot = S("proof-sign-signature-protected")
+
+    def classify(pm: dict) -> str:
+        if H_KEYSET in pm:
+            return "unattributed"
+        return "response" if pm.get(H_TYP) == TYP_RESPONSE else "request"
+
+    # pycddl 0.3.0 cannot enforce a paired typ×domain choice through a
+    # whole-object `bstr .cbor` (choices of `.cbor`-bearing arrays are not
+    # descended). The gate therefore decodes each object and validates the
+    # PROTECTED BUCKET and the PAYLOAD directly against the paired rules — a
+    # strictly stronger check that does enforce the pairing (F1) and the
+    # response-only claim invariants (F3).
     for v in positives["vectors"]:
+        obj = decode(bytes.fromhex(v["cbor_hex"]))
+        prot_bytes, payload = obj[0], obj[2]
+        pm = decode(prot_bytes)
+        kind = classify(pm)
+        pschema = sign1_prot if v["structure"] == "COSE_Sign1" else sign_body_prot
         try:
-            claims_schema.validate_cbor(payload_of(v["cbor_hex"]))
+            pschema.validate_cbor(prot_bytes)
         except ValidationError as exc:
-            check(False, f"positive {v['id']} claims payload fails CDDL: {exc}")
-        if v["structure"] == "COSE_Sign1":
-            try:
-                sign1_schema.validate_cbor(bytes.fromhex(v["cbor_hex"]))
-            except ValidationError as exc:
-                check(False, f"positive {v['id']} object fails CDDL: {exc}")
-    # COSE_Sign (multi-sig) full-object validation is covered by the signature
-    # + plan-component checks in check_proof_vectors (pycddl 0.3.0 does not
-    # descend nested `.cbor` inside signature arrays); claims payloads above do.
+            check(False, f"positive {v['id']} protected bucket fails CDDL: {exc}")
+        cschema = resp_claims if kind == "response" else req_claims
+        try:
+            cschema.validate_cbor(payload)
+        except ValidationError as exc:
+            check(False, f"positive {v['id']} claims payload ({kind}) fails CDDL: {exc}")
+        if v["structure"] == "COSE_Sign":
+            for entry in obj[3]:
+                try:
+                    sig_entry_prot.validate_cbor(entry[0])
+                except ValidationError as exc:
+                    check(False, f"positive {v['id']} signature bucket fails CDDL: {exc}")
 
-    # The relation/enum negatives MUST be rejected by the CDDL itself: this is
-    # the machine proof that the closed map, the two enum axes, and the
+    by_id_pos = {v["id"]: v for v in positives["vectors"]}
+
+    def mutate_prot(pid: str, *, dom=None, typ=None) -> bytes:
+        pm = decode(decode(bytes.fromhex(by_id_pos[pid]["cbor_hex"]))[0])
+        if dom is not None:
+            pm[H_DOMAIN] = dom
+        if typ is not None:
+            pm[H_TYP] = typ
+        return enc(pm)
+
+    # F1 — the typ×hs_domain cross-product (N-4 domain-confusion shape) MUST be
+    # rejected by the paired protected rules, for both COSE_Sign1 and the
+    # COSE_Sign body bucket.
+    f1_cases = [
+        ("Sign1 request-typ + response-domain", sign1_prot,
+         mutate_prot("P-4", dom=DOMAIN_RESPONSE)),
+        ("Sign1 response-typ + request-domain", sign1_prot,
+         mutate_prot("P-3", dom=DOMAIN_REQUEST)),
+        ("Sign1 response-typ marker on a request domain", sign1_prot,
+         mutate_prot("P-4", typ=TYP_RESPONSE)),
+        ("Sign body request-typ + response-domain", sign_body_prot,
+         mutate_prot("P-5", dom=DOMAIN_RESPONSE)),
+    ]
+    for label, schema, mbytes in f1_cases:
+        try:
+            schema.validate_cbor(mbytes)
+            check(False, f"F1: {label} is NOT rejected by the CDDL")
+        except ValidationError:
+            print(f"   F1 rejected by CDDL: {label}")
+
+    # F3 — the response claims rule MUST reject a present Nonce and a non-null
+    # credential_hash (the invariants the old alias left unenforced).
+    p3_claims = decode(decode(bytes.fromhex(by_id_pos["P-3"]["cbor_hex"]))[2])
+    f3_cases = [
+        ("response proof carrying a Nonce", {**p3_claims, C_NONCE: bytes(16)}),
+        ("response proof with a non-null credential_hash",
+         {**p3_claims, C_CREDENTIAL_HASH: bytes(32)}),
+    ]
+    for label, claims in f3_cases:
+        try:
+            resp_claims.validate_cbor(enc(claims))
+            check(False, f"F3: {label} is NOT rejected by the CDDL")
+        except ValidationError:
+            print(f"   F3 rejected by CDDL: {label}")
+
+    # The relation/enum negatives MUST be rejected by the CDDL itself: the
+    # machine proof that the closed map, the two enum axes, and the
     # recipient/encryption relation are structural, not prose.
     relation_negs = {
         "N-23": "encrypted binding with null recipient",
@@ -193,7 +302,7 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
         if v is None:
             continue
         try:
-            claims_schema.validate_cbor(payload_of(v["cbor_hex"]))
+            req_claims.validate_cbor(payload_of(v["cbor_hex"]))
             check(False, f"{nid} ({what}) is NOT rejected by the CDDL")
         except ValidationError:
             print(f"   {nid} correctly rejected by the CDDL ({what})")
@@ -255,10 +364,13 @@ def const_from_cddl(cddl: str, name: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def gate_caps(cddl: str, positives) -> None:
+def gate_caps(cddl: str, positives, negatives) -> None:
     section("3. Frozen caps")
 
-    # 3a. CDDL-declared constants.
+    # 3a. CDDL-declared constants. Each cap is regex-pinned so that drift in the
+    #     normative CDDL (e.g. a 64 -> 128 kid/suite widening) fails the gate —
+    #     the pinned pycddl version cannot enforce byte-length `.size` ranges, so
+    #     these text pins plus the numeric fixture checks in 3d are load-bearing.
     check(const_from_cddl(cddl, "max-aud-bytes") == MAX_SERVICE_DOMAIN_BYTES,
           f"CDDL max-aud-bytes must be {MAX_SERVICE_DOMAIN_BYTES}")
     check(const_from_cddl(cddl, "max-body-bytes") == MAX_BODY_BYTES,
@@ -277,6 +389,11 @@ def gate_caps(cddl: str, positives) -> None:
           "signature-plan must cap at 1*8 groups")
     check(re.search(r"1\*2 signature-component", cddl) is not None,
           "signer-group must cap at 1*2 components")
+    # kid / suite_id 1..64 caps (F2): pin the CDDL text so a widening to 128 fails.
+    check(re.search(rf"kid\s*=\s*bstr\s*\.size\s*\(1\.\.{SUITE_KID_MAX}\)", cddl) is not None,
+          f"CDDL kid must be bstr .size (1..{SUITE_KID_MAX})")
+    check(re.search(rf"suite-id-bounded\s*=\s*tstr\s*\.size\s*\(1\.\.{SUITE_KID_MAX}\)", cddl) is not None,
+          f"CDDL suite-id-bounded must be tstr .size (1..{SUITE_KID_MAX})")
 
     # 3b. The shared Rust constant the artifact points to.
     if ENVELOPE_RS.exists():
@@ -305,6 +422,44 @@ def gate_caps(cddl: str, positives) -> None:
         if C_NONCE in claims:
             check(NONCE_MIN <= len(claims[C_NONCE]) <= NONCE_MAX,
                   f"{v['id']} Nonce length out of 16..64")
+
+    # 3d. Numeric kid / suite_id caps over every positive fixture (F2: the pinned
+    #     pycddl version strips these size ranges, so they are enforced here).
+    for v in positives["vectors"]:
+        kids, suites = kids_and_suites(v["cbor_hex"])
+        for kid in kids:
+            check(1 <= len(kid) <= SUITE_KID_MAX,
+                  f"{v['id']} kid length {len(kid)} out of 1..{SUITE_KID_MAX}")
+        for suite in suites:
+            check(1 <= len(suite.encode()) <= SUITE_KID_MAX,
+                  f"{v['id']} suite_id length {len(suite.encode())} out of 1..{SUITE_KID_MAX}")
+
+    # 3e. The size-cap boundary negatives deny by their numeric rule: prove each
+    #     over-limit fixture actually exceeds the cap it exercises (F2). This is
+    #     what makes N-12/N-13/N-26 mechanically load-bearing rather than merely
+    #     labelled — cap drift to 128 would let these become in-range and the
+    #     matching CDDL-text pin in 3a would fail.
+    by_id = {v["id"]: v for v in negatives["vectors"]}
+
+    def over_cap(nid, extract, cap, what):
+        v = by_id.get(nid)
+        check(v is not None, f"boundary negative {nid} ({what}) is missing")
+        if v is None:
+            return
+        try:
+            val = extract(v["cbor_hex"])
+        except Exception as exc:  # noqa: BLE001
+            check(False, f"{nid}: could not extract {what}: {exc}")
+            return
+        check(val > cap, f"{nid} must exceed the {what} cap {cap} (got {val})")
+        print(f"   {nid}: {what} = {val} bytes > cap {cap} (denies by numeric rule)")
+
+    over_cap("N-12", lambda h: max((len(s.encode()) for s in kids_and_suites(h)[1]), default=0),
+             SUITE_KID_MAX, "suite_id")
+    over_cap("N-13", lambda h: max((len(k) for k in kids_and_suites(h)[0]), default=0),
+             SUITE_KID_MAX, "kid")
+    over_cap("N-26", lambda h: len(claims_of(h)[C_AUD].encode()),
+             MAX_SERVICE_DOMAIN_BYTES, "aud")
 
 
 # --------------------------------------------------------------------------
@@ -438,7 +593,7 @@ def main() -> None:
 
     gate_cddl(cddl, positives, negatives)
     gate_values(cddl, registry, credential, positives, negatives)
-    gate_caps(cddl, positives)
+    gate_caps(cddl, positives, negatives)
     gate_response_binding(positives)
     gate_collisions()
     gate_canonical(positives, negatives)

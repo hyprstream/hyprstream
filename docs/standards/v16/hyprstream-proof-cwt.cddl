@@ -113,20 +113,30 @@ hyprstream-proof-claims = {
   -70004 => response-binding / null,
 }
 
-; The response proof reuses the identical claim structure; the protected `typ`
-; and `hs_domain` separate the two profiles, and the claim semantics below are
-; the response overlay (Gate-2 value 2, PASSED as written): the same four
-; private-use claim keys are reused rather than allocating a second block.
+; The response proof reuses the same four private-use claim keys (Gate-2 value 2,
+; PASSED as written) — the protected `typ` and `hs_domain` separate the profiles —
+; but the response overlay is stricter than the request set and is expressed as
+; its own closed rule, not an alias, so the invariants are structural:
 ;
 ;   3  aud   — the same canonical service domain the request was bound to
 ;   7  cti   — the request_id of the request being answered (binding, not a
 ;              new identifier); a mismatched cti denies
-;   10 Nonce — always absent
-;   -70001   — always null; a response proof is never credential-bound
+;   10 Nonce — ALWAYS ABSENT: the Nonce claim key is not permitted in the closed
+;              response claims map, so a response proof carrying one denies
+;   -70001   — ALWAYS null: a response proof is never credential-bound
 ;   -70002   — the Cap'n Proto 64-bit type ID of the response root type
 ;   -70003   — the exact Cap'n Proto response body bytes
 ;   -70004   — the realized response binding, or null for an unbound response
-hyprstream-response-proof-claims = hyprstream-proof-claims
+hyprstream-response-proof-claims = {
+  3  => canonical-service-domain,   ; aud
+  4  => timestamp,                  ; exp
+  6  => timestamp,                  ; iat
+  7  => request-id,                 ; cti — echoes the request_id
+  -70001 => null,                   ; never credential-bound (not bstr/null: exactly null)
+  -70002 => capnp-schema-id,
+  -70003 => capnp-body-bytes,
+  -70004 => response-binding / null,
+}
 
 ; aud reuses the shared canonical service-domain rule; the 1..128 cap is
 ; MAX_SERVICE_DOMAIN_BYTES (envelope.rs), not a second identity rule (§19 #7).
@@ -208,17 +218,33 @@ kem-recipient = {
 ; Placement is normative and differs by structure. `typ` and `hs_domain` are
 ; deliberately redundant: `typ` types the complete COSE object and rejects
 ; object-type confusion, `hs_domain` is the application cryptographic domain
-; separator inside every Sig_structure. Both are protected; both must match.
+; separator inside every Sig_structure. Both are protected; both must match —
+; and they are PAIRED, not independent choices: `typ` and `hs_domain` are
+; bound together so the request-typ × response-domain cross-product (the N-4
+; domain-confusion shape) cannot validate. A request proof carries exactly
+; (proof-typ, request-proof-domain); a response proof exactly
+; (response-proof-typ, response-proof-domain).
 
 ; ---- COSE_Sign body protected headers -------------------------------------
 
 proof-sign-body-protected = proof-sign-body-authenticated
                           / proof-sign-body-unattributed
 
-proof-sign-body-authenticated = {
+; Authenticated body bucket: request and response are separate paired shapes.
+proof-sign-body-authenticated = proof-sign-body-request
+                              / proof-sign-body-response
+
+proof-sign-body-request = {
   2  => [-70101, -70100],            ; crit, exact
-  16 => proof-typ / response-proof-typ,
-  -70100 => request-proof-domain / response-proof-domain,
+  16 => proof-typ,                   ; paired with the request domain below
+  -70100 => request-proof-domain,
+  -70101 => signature-plan,
+}
+
+proof-sign-body-response = {
+  2  => [-70101, -70100],            ; crit, exact
+  16 => response-proof-typ,          ; paired with the response domain below
+  -70100 => response-proof-domain,
   -70101 => signature-plan,
 }
 
@@ -243,12 +269,26 @@ proof-sign-signature-protected = {
 
 proof-sign1-protected = proof-sign1-authenticated / proof-sign1-unattributed
 
-proof-sign1-authenticated = {
+; Authenticated merged bucket: request and response are separate paired shapes
+; (typ bound to its matching domain), so the N-4 cross-product cannot validate.
+proof-sign1-authenticated = proof-sign1-request / proof-sign1-response
+
+proof-sign1-request = {
   1  => profile-alg,
   2  => [-70102, -70101, -70100],    ; crit, exact
   4  => kid,
-  16 => proof-typ / response-proof-typ,
-  -70100 => request-proof-domain / response-proof-domain,
+  16 => proof-typ,                   ; paired with the request domain below
+  -70100 => request-proof-domain,
+  -70101 => signature-plan,
+  -70102 => logical-signer-group,
+}
+
+proof-sign1-response = {
+  1  => profile-alg,
+  2  => [-70102, -70101, -70100],    ; crit, exact
+  4  => kid,
+  16 => response-proof-typ,          ; paired with the response domain below
+  -70100 => response-proof-domain,
   -70101 => signature-plan,
   -70102 => logical-signer-group,
 }
@@ -381,16 +421,62 @@ cose-key-akp-ml-dsa-65 = {
 ; Untagged COSE structures per RFC 9052; object typing is performed by the
 ; protected `typ` header, not by a CBOR tag. The payload is embedded (never
 ; detached) and is the deterministic encoding of the claims set.
+;
+; Each complete object binds its header profile to the matching claims rule:
+; a response object pairs the response header profile (response-proof-typ +
+; response-proof-domain) with the strict `hyprstream-response-proof-claims`
+; (Nonce forbidden, credential_hash null); request and unattributed objects use
+; the request claims set. This closes both the typ×domain cross-product (F1) and
+; the vacuous response alias (F3) at the object level: a response header cannot
+; carry request claims and vice versa.
 
-hyprstream-proof-sign1 = [
-  protected   : bstr .cbor proof-sign1-protected,
+hyprstream-proof-sign1 = request-proof-sign1
+                       / response-proof-sign1
+                       / unattributed-proof-sign1
+
+request-proof-sign1 = [
+  protected   : bstr .cbor proof-sign1-request,
   unprotected : {},
   payload     : bstr .cbor hyprstream-proof-claims,
   signature   : bstr,
 ]
 
-hyprstream-proof-sign = [
-  protected   : bstr .cbor proof-sign-body-protected,
+response-proof-sign1 = [
+  protected   : bstr .cbor proof-sign1-response,
+  unprotected : {},
+  payload     : bstr .cbor hyprstream-response-proof-claims,
+  signature   : bstr,
+]
+
+unattributed-proof-sign1 = [
+  protected   : bstr .cbor proof-sign1-unattributed,
+  unprotected : {},
+  payload     : bstr .cbor hyprstream-proof-claims,
+  signature   : bstr,
+]
+
+hyprstream-proof-sign = request-proof-sign
+                      / response-proof-sign
+                      / unattributed-proof-sign
+
+request-proof-sign = [
+  protected   : bstr .cbor proof-sign-body-request,
+  unprotected : {},
+  payload     : bstr .cbor hyprstream-proof-claims,
+  signatures  : [ 1*16 hyprstream-proof-signature ],
+]
+
+response-proof-sign = [
+  protected   : bstr .cbor proof-sign-body-response,
+  unprotected : {},
+  payload     : bstr .cbor hyprstream-response-proof-claims,
+  signatures  : [ 1*16 hyprstream-proof-signature ],
+]
+
+; A hybrid unattributed proof has two component signatures in its one logical
+; signer group, so it is a COSE_Sign with request claims.
+unattributed-proof-sign = [
+  protected   : bstr .cbor proof-sign-body-unattributed,
   unprotected : {},
   payload     : bstr .cbor hyprstream-proof-claims,
   signatures  : [ 1*16 hyprstream-proof-signature ],

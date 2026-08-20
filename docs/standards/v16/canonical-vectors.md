@@ -46,10 +46,24 @@ artifacts, and a verifier under test is expected to enforce considerably more.
 The CDDL is now mechanically validated: `tools/validate_profile.py` compiles it
 with a real CDDL validator (`pycddl`, the Rust `cddl` crate; pinned in
 [`tools/requirements.txt`](tools/requirements.txt)) and validates every positive
-fixture — and the relation/enum negatives — against it, alongside the exact
-private values, caps, closed response map, orthogonal enum axes,
-recipient/encryption relation, collision review, and a byte-identical
-regeneration. See [`README.md`](README.md) for the one remaining tooling note.
+fixture — its **protected bucket** and its **claims payload** directly against
+the paired rules — alongside the exact private values, caps, closed response
+map, orthogonal enum axes, recipient/encryption relation, collision review, and
+a byte-identical regeneration. It also proves the negatives deny by their rule:
+
+- the **typ × hs_domain** cross-product (the N-4 domain-confusion shape) is
+  rejected by the paired protected rules for both `COSE_Sign1` and the
+  `COSE_Sign` body — a request `typ` cannot pair with a response domain, or vice
+  versa;
+- a **response proof** carrying a `Nonce` or a non-null `credential_hash` is
+  rejected by the distinct `hyprstream-response-proof-claims` rule; and
+- the **size-cap** negatives N-12 (65-byte `suite_id`), N-13 (65-byte `kid`),
+  and N-26 (129-byte `aud`) are asserted over their numeric caps, and the CDDL
+  cap text (`kid`/`suite-id-bounded` = `1..64`, `aud` = `1..128`) is pinned so a
+  widening drifts the gate to red — the pinned `pycddl` version cannot enforce
+  `.size` byte-length ranges, so these numeric checks are load-bearing.
+
+See [`README.md`](README.md) for the one remaining tooling note.
 
 ## Common fixtures
 
@@ -213,6 +227,13 @@ signature over the stripped object.
   disjoint by construction: different protected `typ`, different signing keys
   (issuer key versus `cnf`-bound proof key), different domain separator. Both
   directions deny before any claim is interpreted.
+- **N-4 (domain confusion).** `typ` and `hs_domain` are **paired** in the
+  normative CDDL, not independent choices: a request proof carries exactly
+  (`proof-typ`, `request-proof-domain`) and a response proof exactly
+  (`response-proof-typ`, `response-proof-domain`). The request-`typ` ×
+  response-domain cross-product (and its reverse) fails structural CDDL
+  validation, for both `COSE_Sign1` and the `COSE_Sign` body bucket — the gate
+  submits the cross-product mutants and asserts the CDDL rejects them.
 - **N-5 (component stripping).** The retained Ed25519 entry's `Sig_structure`
   still covers the hybrid `signature_plan`, so it cannot be reinterpreted under
   the standalone classical suite; the missing plan component denies
@@ -220,7 +241,14 @@ signature over the stripped object.
   property is enforced by both crypto and policy.
 - **N-6 / N-7 / N-12 / N-13 (parser caps).** The proof-v1 caps are exact:
   1..8 signer groups, 1..2 components per group, 1..64 encoded bytes for
-  `suite_id` and `kid`. Raising a cap is an incompatible profile revision.
+  `suite_id` and `kid`. Raising a cap is an incompatible profile revision. The
+  `suite_id`/`kid` byte caps are pinned in the CDDL text and enforced
+  numerically by the gate over every fixture, and N-12/N-13 are asserted to
+  exceed the 64-byte cap — so a widening to 128 turns the gate red.
+- **N-19 (response overlay).** A response proof uses the distinct
+  `hyprstream-response-proof-claims` rule, which forbids the `Nonce` claim key
+  and requires `credential_hash` to be exactly `null`; a response claims set
+  carrying either fails structural CDDL validation.
 - **N-9a…N-9d (deterministic encoding).** The profile's encoding rules are
   themselves acceptance criteria, not hygiene: unsorted keys, indefinite
   lengths, floating-point timestamps, duplicate keys, and (N-21) tags all deny.
@@ -266,3 +294,10 @@ therefore stated as verifier obligations rather than shipped here:
    enrollment check, not a wire vector.
 5. Sign-then-encrypt wrapper vectors, pending the COSE HPKE profile
    (watch item; nothing in this profile depends on it).
+6. Credential-CWT vectors for the amendment-10 integer claim keys
+   (`-70005`/`-70006`/`-70007`) — these are the **credential** claims set, not
+   the proof wire surface, so a dedicated fixture belongs to the WS-B credential
+   generator, not this proof-vector set. The proof direction is already covered:
+   a proof carrying any of these keys denies via the same closed-claim-set rule
+   as N-8 (the proof claims map is closed at `-70001..-70004`). Recorded as a
+   WS-B follow-up, not a blocker for this freeze.
