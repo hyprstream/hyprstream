@@ -150,8 +150,9 @@ pub use moq_resolve::{
     MAX_TRACK_SEGMENT_BYTES, SUPPORTED_TRACK_POLICY_REVISION,
 };
 pub use pep::{
-    ClearanceSource, DenyAllClearanceSource, MoqEventAction, MoqEventPep, MoqMacAuditReason,
-    MoqMacAuditRecord, MoqMacAuditSink,
+    bounded_audit_coordinate, BOUNDED_AUDIT_COORDINATE_MAX_BYTES, ClearanceSource,
+    DenyAllClearanceSource, MAX_AUDIT_COORDINATE_PREFIX_BYTES, MoqEventAction, MoqEventPep,
+    MoqMacAuditReason, MoqMacAuditRecord, MoqMacAuditSink,
 };
 // `RpcObjectLabelResolver` stays exported for the RPC/VFS/9P planes. The
 // MoQ/event plane deliberately consumes only `MoqEventLabelResolver`

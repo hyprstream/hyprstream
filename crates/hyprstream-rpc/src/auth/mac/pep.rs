@@ -105,9 +105,11 @@ pub enum MoqMacAuditReason {
 pub struct MoqMacAuditRecord {
     /// Independently verified subject, or `None` for anonymous.
     pub subject: Option<String>,
-    /// Track or event prefix whose access was denied (the raw boundary
-    /// coordinate as received — an audit trail, never an authorization
-    /// input).
+    /// Track or event prefix whose access was denied — an audit trail, never
+    /// an authorization input. Accepted typed objects audit their full
+    /// coordinate; a coordinate that failed to parse audits only its
+    /// bounded representation (see [`bounded_audit_coordinate`]), so the
+    /// durable record is bounded independently of attacker input.
     pub object: String,
     /// Operation that was denied.
     pub action: MoqEventAction,
@@ -126,6 +128,50 @@ pub struct MoqMacAuditRecord {
 /// attempt a durable audit write for every denial.
 pub trait MoqMacAuditSink: Send + Sync {
     fn record_deny(&self, record: &MoqMacAuditRecord) -> Result<(), String>;
+}
+
+/// Verbatim prefix of a malformed coordinate kept in a deny audit record.
+/// Anything beyond it is represented by the digest/length marker of
+/// [`bounded_audit_coordinate`].
+pub const MAX_AUDIT_COORDINATE_PREFIX_BYTES: usize = 64;
+
+/// Hard upper bound on the audit object text produced for one malformed
+/// coordinate: the fixed prefix cap plus the widest marker the format emits
+/// (`"~b3:" + 16 hex digest chars + "~len:" + u64 decimal`).
+pub const BOUNDED_AUDIT_COORDINATE_MAX_BYTES: usize =
+    MAX_AUDIT_COORDINATE_PREFIX_BYTES + "~b3:0000000000000000~len:18446744073709551615".len();
+
+/// Deterministic bounded audit identity for a coordinate that failed to parse
+/// into a typed object (`PRRT_kwDONmv2Pc6a2ZGv`, v16 §14: audit is a trail,
+/// never an authorization input).
+///
+/// A malformed name can be attacker-sized, and the deny path would otherwise
+/// clone and durably persist it in full — input-sized allocation and disk
+/// amplification per denial. This representation keeps at most a
+/// [`MAX_AUDIT_COORDINATE_PREFIX_BYTES`] prefix (truncated on a UTF-8 char
+/// boundary, deterministically) plus a BLAKE3-8 digest and byte length of
+/// the *complete* raw input, so distinct oversized inputs remain
+/// distinguishable while the persisted text is bounded independently of the
+/// input. Inputs already within the prefix cap are recorded verbatim.
+///
+/// This is audit-only: it never feeds an authorization decision, and the
+/// accepted-parse deny paths keep auditing the full decoded
+/// [`MoqEventObjectRef::audit_coordinate`] (already parser-bounded).
+#[must_use]
+pub fn bounded_audit_coordinate(raw: &str) -> String {
+    if raw.len() <= MAX_AUDIT_COORDINATE_PREFIX_BYTES {
+        return raw.to_owned();
+    }
+    let mut cut = MAX_AUDIT_COORDINATE_PREFIX_BYTES;
+    while !raw.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let digest = blake3::hash(raw.as_bytes());
+    let digest_hex: String = digest.as_bytes()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{}~b3:{digest_hex}~len:{}", &raw[..cut], raw.len())
 }
 
 /// The installed MoQ/event MAC floor.
@@ -246,7 +292,9 @@ impl MoqEventPep {
     /// Parses the dot grammar exactly once; a coordinate that does not
     /// decode into a typed identity (including the tenant-qualified
     /// internal map keys the confidential path uses, which are not object
-    /// identities) denies and is audited as such.
+    /// identities) denies and is audited as such — with only its bounded
+    /// representation in the audit record, so a malformed attacker-sized
+    /// name cannot amplify allocation or the durable WAL.
     #[must_use]
     #[cfg(not(target_arch = "wasm32"))]
     pub fn check_event_prefix(
@@ -260,7 +308,7 @@ impl MoqEventPep {
             None => {
                 self.audit_deny(
                     subject,
-                    prefix,
+                    &bounded_audit_coordinate(prefix),
                     action,
                     None,
                     None,
@@ -274,7 +322,9 @@ impl MoqEventPep {
     /// Boundary check for a stream-plane track / broadcast name.
     ///
     /// Parses the slash grammar exactly once; malformed or noncanonical
-    /// names deny and are audited as unknown identities.
+    /// names deny and are audited as unknown identities — bounded, as
+    /// above, so an oversized malformed track cannot amplify the audit
+    /// trail.
     #[must_use]
     #[cfg(not(target_arch = "wasm32"))]
     pub fn check_stream_track(
@@ -288,7 +338,7 @@ impl MoqEventPep {
             None => {
                 self.audit_deny(
                     subject,
-                    track,
+                    &bounded_audit_coordinate(track),
                     action,
                     None,
                     None,
@@ -597,5 +647,126 @@ mod tests {
             ),
             MacDecision::Deny(MacDenyReason::UnlabeledObject)
         );
+    }
+
+    // ── bounded malformed-coordinate audit (PRRT_kwDONmv2Pc6a2ZGv) ────
+
+    fn oversized_event_coordinate() -> String {
+        // Second segment far beyond MAX_TRACK_SEGMENT_BYTES: parse fails at
+        // the segment cap, so this is the malformed-path deny.
+        format!("worker.{}", "x".repeat(4 * 1024 * 1024))
+    }
+
+    fn oversized_stream_coordinate() -> String {
+        // A ninth tail after eight valid segments: parse fails at the
+        // on-observation segment-count bound.
+        format!("{}/{}", ["a"; 8].join("/"), "y".repeat(4 * 1024 * 1024))
+    }
+
+    #[test]
+    fn malformed_event_coordinate_denies_with_bounded_audited_object() {
+        let audit = Arc::new(RecordingAudit::default());
+        let pep = pep(Arc::new(declared_resolver()), &audit);
+        let subject = Subject::new("did:web:cleared");
+
+        // Fail-closed decision preserved.
+        assert_eq!(
+            pep.check_event_prefix(
+                &subject,
+                &oversized_event_coordinate(),
+                MoqEventAction::Publish,
+            ),
+            MacDecision::Deny(MacDenyReason::UnlabeledObject)
+        );
+
+        let records = audit.records.lock();
+        assert_eq!(records.len(), 1);
+        let object = &records[0].object;
+        // Persisted audit text is bounded independently of the 4 MiB input.
+        assert!(
+            object.len() <= BOUNDED_AUDIT_COORDINATE_MAX_BYTES,
+            "audited object {object:?} exceeds the explicit cap"
+        );
+        // Carries the digest and length markers of the complete raw input.
+        let marker_start = object.rfind("~b3:").unwrap();
+        let (prefix, marker) = object.split_at(marker_start);
+        assert!(prefix.len() <= MAX_AUDIT_COORDINATE_PREFIX_BYTES);
+        let raw_len = oversized_event_coordinate().len();
+        assert_eq!(
+            marker.len(),
+            "~b3:".len() + 16 + "~len:".len() + raw_len.to_string().len(),
+            "marker is the fixed-shape 16-hex digest plus the exact raw length"
+        );
+        assert!(marker.ends_with(&format!("~len:{raw_len}")));
+    }
+
+    #[test]
+    fn malformed_stream_coordinate_denies_with_bounded_audited_object() {
+        let audit = Arc::new(RecordingAudit::default());
+        let pep = pep(Arc::new(declared_resolver()), &audit);
+        let subject = Subject::new("did:web:cleared");
+
+        assert_eq!(
+            pep.check_stream_track(
+                &subject,
+                &oversized_stream_coordinate(),
+                MoqEventAction::Subscribe,
+            ),
+            MacDecision::Deny(MacDenyReason::UnlabeledObject)
+        );
+
+        let records = audit.records.lock();
+        assert_eq!(records.len(), 1);
+        let object = &records[0].object;
+        assert!(object.len() <= BOUNDED_AUDIT_COORDINATE_MAX_BYTES);
+        let raw_len = oversized_stream_coordinate().len();
+        assert!(object.ends_with(&format!("~len:{raw_len}")));
+        assert!(object.contains("~b3:"));
+    }
+
+    #[test]
+    fn differing_oversized_malformed_tails_do_not_collide_in_audit() {
+        let a = format!("worker.{}", "x".repeat(4 * 1024 * 1024));
+        let b = format!("worker.{}", "z".repeat(4 * 1024 * 1024));
+        // Same bounded prefix shape, different oversized tails.
+        let bounded_a = bounded_audit_coordinate(&a);
+        let bounded_b = bounded_audit_coordinate(&b);
+        assert_ne!(bounded_a, bounded_b, "digest must distinguish the tails");
+
+        // Through the PEP boundary too: two denies, two distinct audited
+        // objects, both under the cap.
+        let audit = Arc::new(RecordingAudit::default());
+        let pep = pep(Arc::new(declared_resolver()), &audit);
+        let subject = Subject::new("did:web:cleared");
+        for input in [&a, &b] {
+            assert_eq!(
+                pep.check_event_prefix(&subject, input, MoqEventAction::Publish),
+                MacDecision::Deny(MacDenyReason::UnlabeledObject)
+            );
+        }
+        let records = audit.records.lock();
+        assert_eq!(records.len(), 2);
+        assert_ne!(records[0].object, records[1].object);
+        assert!(records[0].object.len() <= BOUNDED_AUDIT_COORDINATE_MAX_BYTES);
+        assert!(records[1].object.len() <= BOUNDED_AUDIT_COORDINATE_MAX_BYTES);
+        // And each matches the standalone helper's deterministic output.
+        assert_eq!(records[0].object, bounded_a);
+        assert_eq!(records[1].object, bounded_b);
+    }
+
+    #[test]
+    fn bounded_audit_coordinate_is_small_input_verbatim_and_utf8_safe() {
+        // Small malformed inputs (the tenant map-key form) record verbatim.
+        assert_eq!(bounded_audit_coordinate("5:tenantworker"), "5:tenantworker");
+
+        // A multibyte char straddling the prefix cut truncates on a char
+        // boundary: deterministic across calls, within the prefix cap, and
+        // never panics.
+        let straddling = format!("{}é{}", "a".repeat(63), "z".repeat(256));
+        let bounded = bounded_audit_coordinate(&straddling);
+        assert!(bounded.len() <= BOUNDED_AUDIT_COORDINATE_MAX_BYTES);
+        let prefix_end = bounded.find("~b3:").unwrap();
+        assert!(prefix_end <= MAX_AUDIT_COORDINATE_PREFIX_BYTES);
+        assert_eq!(bounded, bounded_audit_coordinate(&straddling));
     }
 }
