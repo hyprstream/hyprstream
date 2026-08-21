@@ -11,8 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use ed25519_dalek::SigningKey;
 use hyprstream_rpc::auth::mac::{
-    ClearanceSource, MacDenyReason, MoqEventAction, MoqEventPep, MoqMacAuditReason,
-    MoqMacAuditRecord, MoqMacAuditSink, RpcObjectLabelResolver, SecurityLabel,
+    ClearanceSource, DeclaredTrackPolicyResolver, MacDenyReason, MoqEventAction,
+    MoqEventLabelResolver, MoqEventPep, MoqEventPolicyTable, MoqMacAuditReason, MoqMacAuditRecord,
+    MoqMacAuditSink, SecurityLabel,
 };
 use hyprstream_rpc::envelope::Subject;
 
@@ -71,7 +72,7 @@ impl MoqMacAuditSink for MoqAuditSinkAdapter {
 /// Construct an active MoQ/event PEP whose denials flow to the canonical MAC
 /// audit sink. Production passes a signed [`crate::mac::WalAuditStore`].
 pub fn audited_moq_event_pep(
-    resolver: Arc<dyn RpcObjectLabelResolver>,
+    resolver: Arc<dyn MoqEventLabelResolver>,
     clearance: Arc<dyn ClearanceSource>,
     sink: Arc<dyn AuditSink>,
 ) -> MoqEventPep {
@@ -82,12 +83,21 @@ pub fn audited_moq_event_pep(
     )
 }
 
-/// Assemble the production MoQ/event PEP from the genesis resolver, verified
-/// subject contexts, and the mandatory signed audit WAL.
+/// Assemble the production MoQ/event PEP from the declared track-policy
+/// table, verified subject contexts, and the mandatory signed audit WAL.
+///
+/// v16 §10 / #1510: the MoQ/event plane resolves labels from **declared
+/// track policy metadata**, never from the VFS/genesis resolver — a
+/// track/prefix must not occupy the RPC/VFS service-domain coordinate. The
+/// `track_policy` table is the reviewed seam onto the generated dispatch
+/// inventory (WS-D / #1505): until that inventory lands, callers pass the
+/// empty table and every unlisted track/prefix denies. This assembly has no
+/// bootstrap exception and no legacy-resolver path.
 pub async fn production_moq_event_pep(
     signing_key: SigningKey,
     oauth: &crate::config::OAuthConfig,
     audit_stream: &str,
+    track_policy: MoqEventPolicyTable,
 ) -> anyhow::Result<MoqEventPep> {
     anyhow::ensure!(
         !audit_stream.is_empty()
@@ -112,9 +122,8 @@ pub async fn production_moq_event_pep(
         signer,
     )
     .context("open MoQ MAC audit store")?;
-    let resolver = crate::mac::GenesisGate::production().into_resolver();
     Ok(audited_moq_event_pep(
-        Arc::new(resolver),
+        Arc::new(DeclaredTrackPolicyResolver::new(track_policy)),
         Arc::new(VerifiedClaimsMoqClearanceSource),
         Arc::new(audit_store),
     ))
@@ -147,6 +156,7 @@ const fn audit_reason(reason: MoqMacAuditReason) -> DecisionReason {
         MoqMacAuditReason::Mac(MacDenyReason::UnlabeledObject) => DecisionReason::UnlabeledObject,
         MoqMacAuditReason::Mac(MacDenyReason::FloorDeny) => DecisionReason::FloorDeny,
         MoqMacAuditReason::Mac(MacDenyReason::StaleAuthority) => DecisionReason::MoqStaleAuthority,
+        MoqMacAuditReason::UnknownObjectIdentity => DecisionReason::MoqUnknownObjectIdentity,
         MoqMacAuditReason::TrackAdmissionHookUnavailable => {
             DecisionReason::MoqTrackAdmissionHookUnavailable
         }
@@ -159,8 +169,8 @@ mod tests {
     use super::*;
     use crate::mac::{AuditError, AuditSigner, AuditVerifier, WalAuditStore};
     use hyprstream_rpc::auth::mac::{
-        Assurance, CompartmentSet, DenyAllObjectResolver, Level, SecurityContext,
-        VerifiedKeyMaterial,
+        Assurance, CompartmentSet, DeclaredTrackPolicyResolver, DenyAllMoqEventResolver, Level,
+        MoqEventPolicyRow, MoqEventPolicyTable, SecurityContext, VerifiedKeyMaterial,
     };
     use hyprstream_rpc::envelope::Subject;
     use tempfile::tempdir;
@@ -195,20 +205,36 @@ mod tests {
         }
     }
 
+    /// Declared table: `registry` events are public; nothing else is listed.
+    fn declared_table() -> MoqEventPolicyTable {
+        MoqEventPolicyTable::build(
+            1,
+            [MoqEventPolicyRow::new(
+                hyprstream_rpc::auth::mac::MoqEventPlane::Event,
+                "registry",
+                SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY),
+            )
+            .unwrap()],
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn cross_tenant_moq_deny_is_durable_in_signed_wal() {
+    fn unlisted_moq_prefix_deny_is_durable_in_signed_wal() {
         let dir = tempdir().unwrap();
         let wal = Arc::new(WalAuditStore::open(dir.path(), StubSigner).unwrap());
         let pep = audited_moq_event_pep(
-            Arc::new(DenyAllObjectResolver),
+            Arc::new(DeclaredTrackPolicyResolver::new(declared_table())),
             Arc::new(PublicClearance),
             wal.clone(),
         );
 
+        // `worker` parses as a typed identity but is not in the declared
+        // table — an unlisted service denies.
         assert_eq!(
-            pep.check(
+            pep.check_event_prefix(
                 &Subject::new("did:web:tenant-a"),
-                "tenant-b/events/private",
+                "worker.sandbox123.started",
                 MoqEventAction::Subscribe,
             ),
             hyprstream_rpc::auth::mac::MacDecision::Deny(
@@ -225,11 +251,84 @@ mod tests {
         assert_eq!(records[0].subject_id.as_deref(), Some("did:web:tenant-a"));
         assert_eq!(
             records[0].object_id.as_deref(),
-            Some("tenant-b/events/private")
+            Some("worker.sandbox123.started")
         );
         assert_eq!(
             records[0].action,
             Action::from_scope_action(ScopeAction::Subscribe)
+        );
+    }
+
+    #[test]
+    fn unknown_identity_deny_is_durable_with_its_own_reason() {
+        let dir = tempdir().unwrap();
+        let wal = Arc::new(WalAuditStore::open(dir.path(), StubSigner).unwrap());
+        let pep = audited_moq_event_pep(
+            Arc::new(DeclaredTrackPolicyResolver::new(declared_table())),
+            Arc::new(PublicClearance),
+            wal.clone(),
+        );
+
+        // The confidential path's tenant-qualified map key is not an object
+        // identity: it denies as an unknown identity, not as an unlisted one.
+        assert_eq!(
+            pep.check_event_prefix(
+                &Subject::new("did:web:tenant-a"),
+                "5:tenantworker",
+                MoqEventAction::Publish,
+            ),
+            hyprstream_rpc::auth::mac::MacDecision::Deny(
+                hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject
+            )
+        );
+
+        let records = wal.verify_journal(&StubSigner).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].reason, DecisionReason::MoqUnknownObjectIdentity);
+        assert_eq!(records[0].object_id.as_deref(), Some("5:tenantworker"));
+    }
+
+    #[test]
+    fn declared_public_prefix_permits_and_audits_nothing() {
+        let dir = tempdir().unwrap();
+        let wal = Arc::new(WalAuditStore::open(dir.path(), StubSigner).unwrap());
+        let pep = audited_moq_event_pep(
+            Arc::new(DeclaredTrackPolicyResolver::new(declared_table())),
+            Arc::new(PublicClearance),
+            wal.clone(),
+        );
+
+        assert_eq!(
+            pep.check_event_prefix(
+                &Subject::new("did:web:tenant-a"),
+                "registry.repo789.push",
+                MoqEventAction::Subscribe,
+            ),
+            hyprstream_rpc::auth::mac::MacDecision::Permit
+        );
+        // Only denials flow to the deny sink today (the permit-side WAL is
+        // WS-F's class-reserved record).
+        assert!(wal.verify_journal(&StubSigner).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fail_closed_missing_artifact_deny_all_resolver() {
+        let dir = tempdir().unwrap();
+        let wal = Arc::new(WalAuditStore::open(dir.path(), StubSigner).unwrap());
+        let pep = audited_moq_event_pep(
+            Arc::new(DenyAllMoqEventResolver),
+            Arc::new(PublicClearance),
+            wal.clone(),
+        );
+        assert_eq!(
+            pep.check_event_prefix(
+                &Subject::new("did:web:tenant-a"),
+                "registry.repo789.push",
+                MoqEventAction::Subscribe,
+            ),
+            hyprstream_rpc::auth::mac::MacDecision::Deny(
+                hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject
+            )
         );
     }
 }

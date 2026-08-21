@@ -2930,11 +2930,20 @@ fn main() -> Result<()> {
                                 if !hyprstream_rpc::events::event_authz_installed() {
                                     let audit_stream =
                                         format!("moq-event-{}", service_names.join("-"));
+                                    // Declared MoQ/event track policy (v16 §10 /
+                                    // #1510). The generated dispatch inventory
+                                    // (WS-D / #1505) is the end-state producer of
+                                    // these rows; until it lands the empty table
+                                    // is the honest state and every unlisted
+                                    // track/prefix denies.
+                                    let track_policy =
+                                        hyprstream_rpc::auth::mac::MoqEventPolicyTable::empty();
                                     let pep =
                                         hyprstream_core::mac::production_moq_event_pep(
                                             signing_key.clone(),
                                             &config.oauth,
                                             &audit_stream,
+                                            track_policy,
                                         )
                                         .await
                                         .context(
