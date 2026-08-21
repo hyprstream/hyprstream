@@ -189,6 +189,13 @@ CREDENTIAL_TENANT = "tenant-alpha"           # JWT text name for the -70005 tena
 # (1786000015), so the session is active yet a longer-lived proof outlives it.
 SESSION_ID = "sess-6b1e0a7c9d2f4a08"
 SESSION_EXP = 1786000020
+# Y1: a workload credential family (§3.3) carries a `workload_session_id` in a
+# DISJOINT namespace keyed by (iss, workload_session_id) — never OIDC `sid`. Its
+# authoritative session has session_kind == "workload". Distinct subject from the
+# user-session fixture so subject-binding is exercised.
+WORKLOAD_SESSION_ID = "ws-family-3d90c1a7"
+WORKLOAD_SESSION_EXP = 1786000022
+WORKLOAD_SUBJECT = "workload-1"
 # W1: proof freshness at the frozen verifier clock (mac-1499-design-v16.md §4.5;
 # matches the landed C dispatch constants). All three bounds are VERIFIER-CLOCK
 # bounds, NOT issued-lifetime (`exp - iat`). A proof is fresh iff
@@ -432,17 +439,18 @@ def main() -> None:
         primary_enrollment_classical = primary_enrollment(SUITE_CLASSICAL, [client_ed_pub])
         primary_enrollment_hybrid = primary_enrollment(SUITE_HYBRID, [client_ed_hy_pub, ml_client.public])
 
-        def build_at_jwt(jti: str, cnf_thumbprint: bytes, *, sid: str = None, exp: int = EXP):
+        def build_at_jwt(jti: str, cnf_thumbprint: bytes, *, sid: str = None, exp: int = EXP,
+                         sub: str = CREDENTIAL_SUBJECT, workload_session_id: str = None):
             """A compact JWS (RFC 7519/8725) access token: exact at+jwt header,
             EdDSA over the seeded issuer key, and every required v16
             authenticated-dispatch claim. Ed25519 + canonical JSON => byte-stable.
-            A user-session credential also carries the OIDC `sid` (§3.2). `exp`
-            overrides the credential expiry (used by the W1 long-lived freshness
-            fixture credential)."""
+            A user-session credential carries the OIDC `sid` (§3.2); a workload-family
+            credential carries `workload_session_id` (§3.3) in a disjoint namespace.
+            `exp`/`sub` override the credential expiry/subject."""
             header = {"alg": "EdDSA", "kid": KID_ISSUER_ED.decode(), "typ": "at+jwt"}
             claims = {
                 "iss": ISSUER_ISS,
-                "sub": CREDENTIAL_SUBJECT,
+                "sub": sub,
                 "aud": SERVICE_DOMAIN,
                 "iat": IAT,
                 "exp": exp,
@@ -454,6 +462,8 @@ def main() -> None:
             }
             if sid is not None:
                 claims["sid"] = sid
+            if workload_session_id is not None:
+                claims["workload_session_id"] = workload_session_id
             hp = b64u(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
             pp = b64u(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
             signing_input = f"{hp}.{pp}".encode("ascii")
@@ -475,10 +485,16 @@ def main() -> None:
         CREDENTIAL_LONGLIVED_EXP = 1786000415
         cred_longlived, hdr_longlived, claims_longlived = build_at_jwt(
             "cred-longlived-1", cnf_classical, exp=CREDENTIAL_LONGLIVED_EXP)
+        # Y1: a workload-family credential carrying `workload_session_id` (no `sid`),
+        # bound to an authoritative workload session (session_kind == "workload").
+        cred_workload, hdr_workload, claims_workload = build_at_jwt(
+            "cred-workload-1", cnf_classical, sub=WORKLOAD_SUBJECT,
+            workload_session_id=WORKLOAD_SESSION_ID)
         CREDENTIAL_HASH = hashlib.sha256(cred_classical.encode("ascii")).digest()
         CREDENTIAL_HASH_HYBRID = hashlib.sha256(cred_hybrid.encode("ascii")).digest()
         CREDENTIAL_HASH_SESSION = hashlib.sha256(cred_session.encode("ascii")).digest()
         CREDENTIAL_HASH_LONGLIVED = hashlib.sha256(cred_longlived.encode("ascii")).digest()
+        CREDENTIAL_HASH_WORKLOAD = hashlib.sha256(cred_workload.encode("ascii")).digest()
 
         keys_doc = {
             "warning": (
@@ -2423,6 +2439,21 @@ def main() -> None:
                 "cnf_thumbprint_b64": b64u(cnf_classical),
                 "token_sha256": CREDENTIAL_HASH_LONGLIVED.hex(),
             },
+            "workload": {
+                # Y1: a workload-family credential (§3.3). Carries `workload_session_id`
+                # in a DISJOINT namespace keyed by (iss, workload_session_id); no OIDC
+                # `sid`. Its authoritative session has session_kind == "workload".
+                "encoding": "at+jwt",
+                "credential_kind": "workload",
+                "token": cred_workload,
+                "header": hdr_workload,
+                "claims": claims_workload,
+                "primary_suite": SUITE_CLASSICAL,
+                "cnf_preimage_hex": enc([SUITE_CLASSICAL, [client_ed_pub]]).hex(),
+                "cnf_thumbprint_b64": b64u(cnf_classical),
+                "token_sha256": CREDENTIAL_HASH_WORKLOAD.hex(),
+                "workload_session_id": WORKLOAD_SESSION_ID,
+            },
         },
         "session_model": {
             "note": (
@@ -2460,6 +2491,19 @@ def main() -> None:
                 # L3 (§3.4): the authoritative session's clearance epoch — a
                 # deterministic off-wire integer, never a credential/wire claim.
                 "clearance_epoch": 3,
+            },
+            {
+                # Y1: the authoritative WORKLOAD session, keyed by
+                # (iss, workload_session_id) — a namespace DISJOINT from user `sid`.
+                "iss": ISSUER_ISS,
+                "workload_session_id": WORKLOAD_SESSION_ID,
+                "sub": WORKLOAD_SUBJECT,
+                "tenant": CREDENTIAL_TENANT,
+                "session_kind": "workload",
+                "created": IAT,
+                "expiry": WORKLOAD_SESSION_EXP,
+                "status": "active",
+                "clearance_epoch": 4,
             },
         ],
         "approver_enrollment_model": {

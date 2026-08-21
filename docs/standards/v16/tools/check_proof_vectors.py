@@ -464,34 +464,60 @@ def authenticated_replay_thumbprint(domain, suite_id, pubs, enrollment_epoch):
     return hashlib.sha256(enc([domain, suite_id, list(pubs), enrollment_epoch])).digest()
 
 
-def resolve_session(creds_doc, iss, sid):
-    """K1: the authoritative session record keyed by exact (iss, sid) (§3.4),
-    held in the credential context OUTSIDE the credential wire. None if absent."""
+def resolve_session(creds_doc, iss, session_id, id_field="sid"):
+    """K1/Y1: the authoritative session record keyed by the EXACT (iss, <id_field>)
+    (§3.4), held in the credential context OUTSIDE the credential wire. `id_field` is
+    `sid` for a user session or `workload_session_id` for a workload session — the two
+    are DISJOINT namespaces (no fallback between them). None if absent."""
     for s in creds_doc.get("sessions", []):
-        if s.get("iss") == iss and s.get("sid") == sid:
+        if s.get("iss") == iss and s.get(id_field) == session_id:
             return s
     return None
 
 
 def validate_session(creds_doc, cred_claims, now):
-    """K1: for a `sid`-bearing credential, resolve and validate its authoritative
-    session. Returns (session_record_or_None, failure_list). A non-session
-    credential returns (None, []). An unknown, revoked (non-active), expired
-    (expiry <= now), or (iss/sub/tenant)-mismatched session denies."""
-    sid = cred_claims.get("sid")
-    if sid is None:
-        return None, []
-    s = resolve_session(creds_doc, cred_claims.get("iss"), sid)
+    """K1/Y1/Y2: resolve and validate a credential's authoritative session in the
+    correct DISJOINT namespace. A user session is keyed by `sid` (session_kind
+    'interactive'); a workload-family session by `workload_session_id` (session_kind
+    'workload'). Returns (session_record_or_None, failure_list).
+
+    Y2 — claim ABSENCE vs present-null/wrong-type is distinguished: a truly sessionless
+    credential (neither key present) returns (None, []); a PRESENT session identifier
+    (even JSON null) must be a non-empty opaque string or it fails closed. Carrying
+    BOTH identifiers denies (the namespaces never mix; no fallback). Y1 — the resolved
+    session must be active, non-expired, `created`-coherent (T2), (iss/sub/tenant)-bound,
+    carry a non-negative-integer clearance_epoch (L3), and have the session_kind that
+    matches its namespace; unknown/revoked/expired/wrong-kind/cross-subject/tenant/
+    epoch-mismatch all deny."""
+    if not isinstance(cred_claims, dict):
+        return None, ["credential claims are not an object"]
+    has_sid = "sid" in cred_claims
+    has_wsid = "workload_session_id" in cred_claims
+    if has_sid and has_wsid:
+        return None, ["credential carries both sid and workload_session_id (disjoint session namespaces)"]
+    if not has_sid and not has_wsid:
+        return None, []  # sessionless (non-interactive / standalone service credential)
+    if has_sid:
+        id_field, sess_id, expected_kind = "sid", cred_claims.get("sid"), "interactive"
+    else:
+        id_field, sess_id, expected_kind = "workload_session_id", cred_claims.get("workload_session_id"), "workload"
+    # Y2: a PRESENT session identifier must be a non-empty opaque string (reject
+    # JSON null / empty / whitespace-only / wrong type) — present-null is NOT absent.
+    if not isinstance(sess_id, str) or sess_id.strip() == "":
+        return None, [f"{id_field} must be a non-empty opaque string, got {sess_id!r}"]
+    s = resolve_session(creds_doc, cred_claims.get("iss"), sess_id, id_field)
     if s is None:
-        return None, [f"no authoritative session for (iss={cred_claims.get('iss')!r}, sid={sid!r})"]
+        return None, [f"no authoritative session for (iss={cred_claims.get('iss')!r}, {id_field}={sess_id!r})"]
     errs = []
+    # The resolved session's kind MUST match its namespace (no cross-kind/fallback).
+    if s.get("session_kind") != expected_kind:
+        errs.append(f"session_kind must be {expected_kind!r} for a {id_field} credential, got {s.get('session_kind')!r}")
     if s.get("status") != "active":
         errs.append(f"session status {s.get('status')!r} is not active (revoked)")
     if not isinstance(s.get("expiry"), int) or s.get("expiry") <= now:
         errs.append(f"session is not active at verifier_now {now} (expiry {s.get('expiry')!r})")
     # T2 (§3.4): the session's creation time must be an integer and coherently
-    # ordered — created <= verifier_now < expiry. A missing, non-integer,
-    # future-dated, or after-expiry `created` denies.
+    # ordered — created <= verifier_now < expiry.
     created = s.get("created")
     if isinstance(created, bool) or not isinstance(created, int):
         errs.append(f"session created must be an integer, got {created!r}")
@@ -508,10 +534,6 @@ def validate_session(creds_doc, cred_claims, now):
     ce = s.get("clearance_epoch")
     if isinstance(ce, bool) or not isinstance(ce, int) or ce < 0:
         errs.append(f"session clearance_epoch must be a non-negative integer, got {ce!r}")
-    # M2 (§3.4): a sid-keyed session is a user session; its session_kind MUST be the
-    # exact interactive kind. Missing, wrong type, empty, or workload/service denies.
-    if s.get("session_kind") != "interactive":
-        errs.append(f"session_kind must be 'interactive' for a user-session credential, got {s.get('session_kind')!r}")
     return s, errs
 
 

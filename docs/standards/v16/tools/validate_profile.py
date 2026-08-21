@@ -2528,24 +2528,36 @@ def gate_credential_context(positives, negatives) -> None:
     #   user-session  -> MUST carry sid;
     #   rfc8693/rfc7523 (non-interactive) -> MUST NOT carry sid (user subject);
     #   service -> subject prefixed `service:` and MUST NOT carry sid.
-    KINDS = {"service", "user-session", "rfc8693", "rfc7523"}
+    # Y2: sid / workload_session_id presence is unambiguous by credential kind, and the
+    # two session namespaces are DISJOINT — a credential carries at most one.
+    KINDS = {"service", "user-session", "rfc8693", "rfc7523", "workload"}
     NONINTERACTIVE = {"rfc8693", "rfc7523"}
     for name, cred in creds["credentials"].items():
         kind = cred.get("credential_kind")
         sub = cred["claims"].get("sub", "")
         has_sid = "sid" in cred["claims"]
+        has_wsid = "workload_session_id" in cred["claims"]
         check(kind in KINDS, f"credential {name} credential_kind must be one of {sorted(KINDS)}, got {kind!r}")
         if kind == "user-session":
-            check(has_sid, f"user-session credential {name} MUST carry sid")
+            check(has_sid and not has_wsid,
+                  f"user-session credential {name} MUST carry sid and no workload_session_id")
+        elif kind == "workload":
+            check(has_wsid and not has_sid,
+                  f"workload credential {name} MUST carry workload_session_id and no sid")
         elif kind == "service":
             check(isinstance(sub, str) and sub.startswith("service:"),
                   f"service credential {name} subject must be 'service:'-prefixed, got {sub!r}")
-            check(not has_sid, f"service credential {name} MUST NOT carry sid")
+            check(not has_sid and not has_wsid, f"service credential {name} MUST NOT carry a session id")
         elif kind in NONINTERACTIVE:
-            check(not has_sid, f"non-interactive {kind} credential {name} MUST NOT carry sid")
-    # Every shipped session-bearing credential resolves a valid authoritative session.
-    session_creds = [(n, c) for n, c in creds["credentials"].items() if "sid" in c["claims"]]
-    check(session_creds, "a session-bearing (sid) credential fixture must exist for K1")
+            check(not has_sid and not has_wsid, f"non-interactive {kind} credential {name} MUST NOT carry a session id")
+    # Y1: every shipped session-bearing credential (user OR workload) resolves a valid
+    # authoritative session in its own namespace.
+    session_creds = [(n, c) for n, c in creds["credentials"].items()
+                     if "sid" in c["claims"] or "workload_session_id" in c["claims"]]
+    check(any("sid" in c["claims"] for _, c in session_creds),
+          "a user-session (sid) credential fixture must exist for K1")
+    check(any("workload_session_id" in c["claims"] for _, c in session_creds),
+          "a workload-session (workload_session_id) credential fixture must exist for Y1")
     for name, cred in session_creds:
         s, serrs = validate_session(creds, cred["claims"], now)
         check(s is not None and not serrs, f"session credential {name} must resolve a valid session: {serrs}")
@@ -2588,6 +2600,66 @@ def gate_credential_context(positives, negatives) -> None:
     session_red("created after expiry", _created_after_expiry)
     print(f"   K1 session-expiry bound enforced; {len(session_creds)} session credential(s) valid; "
           f"unknown/revoked/expired/mismatched sessions deny")
+
+    # ---- Y1: authoritative WORKLOAD-session resolution in the disjoint namespace ----
+    wl_cred = creds["credentials"]["workload"]["claims"]
+    s_wl, e_wl = validate_session(creds, wl_cred, now)
+    check(s_wl is not None and not e_wl and s_wl.get("session_kind") == "workload",
+          f"the workload credential must resolve a valid workload session: {e_wl}")
+    # Disjoint namespaces, no fallback: a workload id does not resolve as a user sid,
+    # and a user sid does not resolve as a workload id.
+    check(resolve_session(creds, wl_cred["iss"], wl_cred["workload_session_id"], "sid") is None,
+          "a workload_session_id must not resolve in the user sid namespace")
+    check(resolve_session(creds, sc["iss"], sc["sid"], "workload_session_id") is None,
+          "a user sid must not resolve in the workload namespace")
+    # A workload-bound proof is also bounded by the workload session expiry (same
+    # rule the F2 loop applies to sid sessions): a proof exp beyond it is out of bound.
+    check(isinstance(s_wl.get("expiry"), int) and not (s_wl["expiry"] + 1 <= s_wl["expiry"]),
+          "the workload session must expose an integer expiry that bounds a workload-bound proof")
+
+    def workload_red(label, mutate):
+        cd = _copy.deepcopy(creds)
+        mutate(cd)
+        _s, e = validate_session(cd, cd["credentials"]["workload"]["claims"], now)
+        check(bool(e), f"Y1 workload counter '{label}' must deny but validated clean")
+        if e:
+            print(f"   Y1 workload counter '{label}' denies: {e[0]}")
+
+    def _wl_set(cd, k, v):
+        for s in cd["sessions"]:
+            if "workload_session_id" in s:
+                s[k] = v
+
+    workload_red("unknown workload session",
+                 lambda cd: cd.__setitem__("sessions", [s for s in cd["sessions"] if "workload_session_id" not in s]))
+    workload_red("revoked workload session", lambda cd: _wl_set(cd, "status", "revoked"))
+    workload_red("expired workload session", lambda cd: _wl_set(cd, "expiry", now))
+    workload_red("wrong kind (interactive) for workload id", lambda cd: _wl_set(cd, "session_kind", "interactive"))
+    workload_red("cross-subject workload session", lambda cd: _wl_set(cd, "sub", "workload-2"))
+    workload_red("cross-tenant workload session", lambda cd: _wl_set(cd, "tenant", "tenant-beta"))
+    workload_red("epoch-mismatch (non-int clearance_epoch)", lambda cd: _wl_set(cd, "clearance_epoch", "4"))
+
+    # ---- Y2: present-null / type-safe session claim coherence (both layers) ----
+    def sess_claim_red(label, claims):
+        _s, e = validate_session(creds, claims, now)
+        check(bool(e), f"Y2 counter '{label}' must deny but validated clean")
+        if e:
+            print(f"   Y2 counter '{label}' denies: {e[0]}")
+
+    # A user-session credential's sid, when PRESENT, must be a non-empty opaque string;
+    # present-null is NOT absence.
+    sess_claim_red("sid:null (present, not absent)", {**sc, "sid": None})
+    sess_claim_red("empty sid", {**sc, "sid": ""})
+    sess_claim_red("whitespace-only sid", {**sc, "sid": "   "})
+    sess_claim_red("non-string sid", {**sc, "sid": 123})
+    # The two session namespaces never mix (no fallback).
+    sess_claim_red("both sid and workload_session_id", {**sc, "workload_session_id": "ws-x"})
+    sess_claim_red("workload_session_id:null (present, not absent)", {**wl_cred, "workload_session_id": None})
+    # A truly sessionless (non-interactive) credential carries neither and is not a session.
+    _s_none, e_none = validate_session(creds, creds["credentials"]["classical"]["claims"], now)
+    check(_s_none is None and not e_none,
+          "a non-session credential (no sid/workload_session_id) must be sessionless, not an error")
+    print("   Y1 workload-session namespace resolved + disjoint; Y2 present-null/mistyped session ids deny")
 
 
 # --------------------------------------------------------------------------

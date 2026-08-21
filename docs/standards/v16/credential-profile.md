@@ -165,6 +165,16 @@ Every session identifier is random, opaque, never reassigned, not derived from
 a username, tenant, device identifier, network address, or credential ID, and
 never exposed on a public error surface.
 
+**Authoritative workload-session resolution (Y1).** A `workload_session_id`
+credential is **never** treated as sessionless: the verifier resolves the
+authoritative session in the **`(iss, workload_session_id)`** namespace — exactly,
+with **no fallback** to (and no collapse with) the user `(iss, sid)` namespace — and
+requires an active, non-expired, `created`-coherent record whose `sub`/`tenant`/`iss`
+bind the credential, whose `clearance_epoch` is a non-negative integer, and whose
+**`session_kind` is exactly `workload`**. A proof bound to it is additionally bounded
+by the workload session expiry. An unknown, revoked, expired, wrong-kind,
+cross-subject, cross-tenant, or epoch-mismatched workload session **denies**.
+
 ### 3.4 Session state
 
 The authority stores at least: subject, tenant, session kind (interactive or
@@ -182,18 +192,25 @@ state, `created` is authoritative off-wire state, never a credential/wire claim.
 `sid` presence is unambiguous by credential kind (a classification aligned with
 the issuer's `IssueTokenProfile` enum, not a new wire claim):
 
-- **`user-session`** — an interactive OIDC session token; **MUST** carry `sid`
-  (§3.2), and a proof bound to it is additionally bounded by the authoritative
-  session expiry (§3.4).
+- **`user-session`** — an interactive OIDC session token; **MUST** carry a
+  non-empty opaque string `sid` and **no** `workload_session_id` (§3.2), and a proof
+  bound to it is additionally bounded by the authoritative session expiry (§3.4).
+- **`workload`** — a workload-family token; **MUST** carry a non-empty opaque string
+  `workload_session_id` and **no** `sid` (§3.3), bound to a `workload`-kind session.
 - **`rfc8693` / `rfc7523`** — a **non-interactive** token-exchange or JWT-bearer
-  token with a user subject and no interactive session; **MUST NOT** carry `sid`.
+  token with a user subject and no session; **MUST NOT** carry `sid` or
+  `workload_session_id`.
 - **`service`** — a standalone service identity with a `service:`-prefixed subject
-  and **no** `sid`.
+  and **no** session identifier.
 
-A user credential is therefore never left with an ambiguous session profile: it is
-either a `user-session` credential with `sid`, or an explicitly non-interactive
-`rfc8693`/`rfc7523` credential without it. The gate enforces this coherence over
-every credential fixture.
+**Presence vs present-null (Y2).** Claim ABSENCE is distinguished from a claim
+present with JSON `null`/empty/whitespace/wrong type. A credential carries **at most
+one** session identifier — never both. When a session identifier is **present** it
+MUST be a non-empty opaque string: a present `sid: null`, empty, whitespace-only, or
+wrong-typed identifier **fails closed directly** (in both the gate and the standalone
+checker), never decoded as "absent". A non-session credential carries **neither**
+identifier and is sessionless. The gate enforces this coherence over every credential
+fixture.
 
 ## 4. Credential use: Reusable-only (v16)
 
@@ -337,7 +354,17 @@ A conforming verifier is checked against at least:
     identifier denies; and**
 11. **(X3) the entire RFC 8693 `act` delegation chain is validated recursively — every
     hop an object with a non-empty string `sub`, every hop's clearance composed into
-    the effective meet (§2 `act` row); a malformed hop at any depth denies.**
+    the effective meet (§2 `act` row); a malformed hop at any depth denies;**
+12. **(Y1) both authoritative session namespaces resolve exactly and disjointly —
+    `(iss, sid)` for `user-session` (`session_kind == interactive`) and
+    `(iss, workload_session_id)` for `workload` (`session_kind == workload`) — with no
+    fallback or collapse between them; a `workload_session_id` credential is never
+    sessionless, and unknown/revoked/expired/wrong-kind/cross-subject/tenant/
+    epoch-mismatched sessions deny; and**
+13. **(Y2) claim absence is distinguished from a present `null`/empty/whitespace/
+    wrong-typed session identifier: a present `sid`/`workload_session_id` must be a
+    non-empty opaque string or it fails closed directly in both layers, and a
+    credential never carries both identifiers.**
 
 ## 8. Frozen Gate-2 dispositions
 
