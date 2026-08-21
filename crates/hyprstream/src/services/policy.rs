@@ -332,6 +332,104 @@ impl PolicyService {
         self
     }
 
+    /// Resolve the workload-session disposition for a service-credential renewal
+    /// (v16 §3.3), as a pure function of the canonical session registry and the
+    /// authoritative family policy. The renewal handler applies the result to
+    /// the renewed claims; extracting it keeps the security-critical
+    /// check-BEFORE-narrowing ordering testable without the signing/persistence
+    /// boundary.
+    ///
+    /// - A carried session (`old_wsid = Some`) is checked for revocation FIRST,
+    ///   independent of `family_policy` — a revoked/expired/unresolvable session
+    ///   DENIES, so removing the family policy can never launder a revoked family
+    ///   into an unsessioned renewal. A live session is re-stamped only while the
+    ///   family remains enrolled; a narrowed (policy-removed) family drops it.
+    /// - No carried session (`old_wsid = None`) creates one only for a family
+    ///   EXPLICITLY enrolled (`family_policy == Some(true)`); a legacy-default or
+    ///   disabled family carries none.
+    async fn resolve_renewal_workload_session(
+        &self,
+        issuer: &str,
+        subject: &str,
+        tenant: &str,
+        now: i64,
+        family_policy: Option<bool>,
+        old_wsid: Option<&str>,
+    ) -> RenewalWorkloadSession {
+        // No manifest at all: legacy continuity (an unenrolled deployment keeps
+        // renewing). An enrolled family with `workload_session = false` is a
+        // deliberate policy, NOT legacy — `family_policy` distinguishes them.
+        let family_allowed = family_policy.unwrap_or(true);
+        match (old_wsid, family_allowed) {
+            (Some(wsid), allowed) => {
+                // A carried workload session must be ACTIVE before renewal,
+                // regardless of current enrollment policy — the revocation
+                // check runs BEFORE the narrowing branch below.
+                let session_key =
+                    hyprstream_rpc::auth::SessionKey::workload(issuer.to_owned(), wsid.to_owned());
+                let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+                    return RenewalWorkloadSession::Deny {
+                        code: "UNAVAILABLE",
+                        message: "session registry is not initialized".to_owned(),
+                    };
+                };
+                if registry.is_revoked(&session_key).await {
+                    return RenewalWorkloadSession::Deny {
+                        code: "SESSION_REVOKED",
+                        message: "workload session is revoked or expired; re-bootstrap the service credential".to_owned(),
+                    };
+                }
+                // Only a still-enrolled family carries the session forward;
+                // `!allowed` is deliberate narrowing of a LIVE family — the
+                // session ID does not survive this renewal (the session itself
+                // expires naturally; no credential carries it forward).
+                RenewalWorkloadSession::Stamp(allowed.then(|| wsid.to_owned()))
+            }
+            (None, true) => {
+                // First online renewal of an ENROLLED family creates the
+                // workload session with the canonical registry; a legacy-default
+                // family (`family_policy == None`) manufactures no session.
+                if family_policy != Some(true) {
+                    return RenewalWorkloadSession::Stamp(None);
+                }
+                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                use rand::RngCore;
+                let mut id_bytes = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut id_bytes);
+                let wsid = URL_SAFE_NO_PAD.encode(id_bytes);
+                let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+                    return RenewalWorkloadSession::Deny {
+                        code: "UNAVAILABLE",
+                        message: "session registry is not initialized".to_owned(),
+                    };
+                };
+                let session_state = hyprstream_rpc::auth::SessionState {
+                    subject: subject.to_owned(),
+                    tenant: tenant.to_owned(),
+                    kind: hyprstream_rpc::auth::SessionKind::Workload,
+                    created_at: now,
+                    expires_at: now + self.revocation_max_ttl_secs,
+                    status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                    clearance_epoch: 0,
+                };
+                if let Err(e) = registry
+                    .register_session(
+                        hyprstream_rpc::auth::SessionKey::workload(issuer.to_owned(), wsid.clone()),
+                        session_state,
+                    )
+                    .await
+                {
+                    return RenewalWorkloadSession::Deny {
+                        code: "UNAVAILABLE",
+                        message: format!("workload session registration failed: {e}"),
+                    };
+                }
+                RenewalWorkloadSession::Stamp(Some(wsid))
+            }
+            (None, false) => RenewalWorkloadSession::Stamp(None),
+        }
+    }
+
     /// Attach the ES256 (P-256) key rotation store.
     pub fn with_es256_key_store(mut self, store: Arc<crate::auth::Es256SigningKeyStore>) -> Self {
         self.es256_key_store = Some(store);
@@ -946,6 +1044,25 @@ fn enrolled_service_signer_suite(
         &enrolled_ed,
         pq.as_deref(),
     ))
+}
+
+/// Outcome of the workload-session narrowing decision on a service-credential
+/// renewal (v16 §3.3). Extracted from the renewal handler so the check-BEFORE-
+/// narrowing invariant is unit-testable WITHOUT provisioning the signing /
+/// disk-persistence boundary: the decision is a pure function of the session
+/// registry state and the authoritative family policy.
+#[derive(Debug)]
+enum RenewalWorkloadSession {
+    /// Deny the renewal with this error code + message (fail-closed: a revoked,
+    /// expired, or unresolvable session never renews).
+    Deny {
+        code: &'static str,
+        message: String,
+    },
+    /// The `workload_session_id` to stamp into the renewed credential, or `None`
+    /// to OMIT it — either a deliberate family narrowing (the policy was removed
+    /// from a live family) or a standalone service that carries no session.
+    Stamp(Option<String>),
 }
 
 /// A v16 dispatch credential MUST carry a `cnf.hs_signer_suite` that equals the
@@ -2626,8 +2743,13 @@ impl PolicyHandler for PolicyService {
 
         // ServiceEnrollmentManifest (v16 §11): renewal re-derives clearance
         // from the manifest — authority removed from enrollment never
-        // survives a renewal, and renewal never gains authority.
-        if let Some(manifest) = crate::auth::service_enrollment::global_service_enrollment() {
+        // survives a renewal, and renewal never gains authority. Resolve the
+        // manifest ONCE through the injected-or-global authority (`enrollment`)
+        // so clearance, signer-suite, and the workload-family policy below all
+        // read the SAME authoritative source (and an isolated test can inject a
+        // `workload_session=false` family without mutating process globals).
+        let enrollment_manifest = self.enrollment();
+        if let Some(manifest) = enrollment_manifest.as_ref() {
             let Some(clearance) = manifest.clearance_for_service(svc_name) else {
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
                     message: format!("service '{svc_name}' has no enrollment entry"),
@@ -2653,92 +2775,41 @@ impl PolicyHandler for PolicyService {
         }
 
         // Workload credential family (v16 §3.3): only an enrolled workload
-        // family carries `workload_session_id`. Renewal chains the family
-        // session: an existing ACTIVE session ID is re-stamped; a revoked or
-        // expired family session DENIES the renewal (session revocation
-        // prevents refresh); a family with no session yet is created here
-        // (bootstrap mints offline, before the authority exists).
+        // family carries `workload_session_id`. The disposition — deny, stamp,
+        // or omit — is resolved by `resolve_renewal_workload_session` (pure over
+        // the canonical session registry + the authoritative family policy),
+        // which enforces the check-BEFORE-narrowing ordering: a revoked/expired
+        // carried session denies regardless of whether the family policy would
+        // otherwise narrow it away.
         let old_wsid = ctx
             .claims()
             .and_then(|c| c.workload_session_id.as_deref())
             .map(str::to_owned);
-        let family_policy = crate::auth::service_enrollment::global_service_enrollment()
+        let family_policy = enrollment_manifest
+            .as_ref()
             .map(|m| m.workload_session_policy(svc_name));
-        let family_allowed = family_policy.unwrap_or(true); // no manifest: legacy continuity
-        match (old_wsid, family_allowed) {
-            (Some(wsid), allowed) => {
-                // A carried workload session must be ACTIVE before renewal,
-                // regardless of current enrollment policy — otherwise
-                // removing the family policy would let a revoked family
-                // renew into an unsessioned credential.
-                let session_key =
-                    hyprstream_rpc::auth::SessionKey::workload(issuer.clone(), wsid.clone());
-                let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
-                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                        message: "session registry is not initialized".to_owned(),
-                        code: "UNAVAILABLE".to_owned(),
-                        details: String::new(),
-                    }));
-                };
-                if registry.is_revoked(&session_key).await {
-                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                        message: "workload session is revoked or expired; re-bootstrap the service credential".to_owned(),
-                        code: "SESSION_REVOKED".to_owned(),
-                        details: String::new(),
-                    }));
-                }
-                if allowed {
-                    claims = claims.with_workload_session_id(wsid);
-                }
-                // !allowed: deliberate narrowing of a LIVE family — the
-                // session ID does not survive this renewal (the session
-                // itself expires naturally; no credential carries it forward).
+        match self
+            .resolve_renewal_workload_session(
+                &issuer,
+                &subject,
+                &tenant,
+                now,
+                family_policy,
+                old_wsid.as_deref(),
+            )
+            .await
+        {
+            RenewalWorkloadSession::Deny { code, message } => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message,
+                    code: code.to_owned(),
+                    details: String::new(),
+                }));
             }
-            (None, true) => {
-                // First online renewal of an enrolled family: create the
-                // workload session with the canonical registry.
-                if family_policy == Some(true) {
-                    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-                    use rand::RngCore;
-                    let mut id_bytes = [0u8; 32];
-                    rand::rngs::OsRng.fill_bytes(&mut id_bytes);
-                    let wsid = URL_SAFE_NO_PAD.encode(id_bytes);
-                    let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
-                        return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                            message: "session registry is not initialized".to_owned(),
-                            code: "UNAVAILABLE".to_owned(),
-                            details: String::new(),
-                        }));
-                    };
-                    let session_state = hyprstream_rpc::auth::SessionState {
-                        subject: subject.clone(),
-                        tenant,
-                        kind: hyprstream_rpc::auth::SessionKind::Workload,
-                        created_at: now,
-                        expires_at: now + self.revocation_max_ttl_secs,
-                        status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
-                        clearance_epoch: 0,
-                    };
-                    if let Err(e) = registry
-                        .register_session(
-                            hyprstream_rpc::auth::SessionKey::workload(
-                                issuer.clone(),
-                                wsid.clone(),
-                            ),
-                            session_state,
-                        )
-                        .await
-                    {
-                        return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                            message: "workload session registration failed".to_owned(),
-                            code: "UNAVAILABLE".to_owned(),
-                            details: e.to_string(),
-                        }));
-                    }
-                    claims = claims.with_workload_session_id(wsid);
-                }
+            RenewalWorkloadSession::Stamp(Some(wsid)) => {
+                claims = claims.with_workload_session_id(wsid);
             }
-            (None, false) => {}
+            RenewalWorkloadSession::Stamp(None) => {}
         }
 
         let token = match self.sign_token(&claims, true).await {
@@ -5037,6 +5108,286 @@ mod tests {
                 PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "SESSION_REVOKED"
             ),
             "a carried revoked workload session must deny renewal: {response:?}"
+        );
+    }
+
+    /// Gate 2 check-BEFORE-narrowing (v16 §3.3): the sibling of the test above,
+    /// closing the case that one could not reach. Here an authoritative manifest
+    /// enrolls the family with `workload_session = false` (policy REMOVED), so
+    /// `family_allowed` is `false` and renewal takes the deliberate-narrowing
+    /// branch `(Some(wsid), false)` — the session ID is dropped, not re-stamped.
+    /// A revoked family session must STILL deny the renewal: the revocation is
+    /// checked before the narrowing branch, so removing the family policy can
+    /// never launder a revoked family into an unsessioned credential. The prior
+    /// test only reaches `(Some(wsid), true)` because, with no manifest,
+    /// `family_allowed` defaults to `true`.
+    #[tokio::test]
+    async fn revoked_session_with_removed_family_policy_still_denies_renewal() {
+        // The caller/enrolled key is shared: the renewal path resolves the
+        // signer suite against the injected manifest (the block above the
+        // workload branch), which requires the verified `cnf` key to equal the
+        // enrolled ed25519 key. Match them so renewal reaches the workload gate.
+        let caller_sk = SigningKey::from_bytes(&[0x2b; 32]);
+        let caller = caller_sk.verifying_key();
+
+        let (service, _root) = test_service().await;
+        let service = service
+            .with_default_audience("https://issuer.gate2.test".to_owned())
+            // Authoritative family policy REMOVED: `v16_service_manifest` enrolls
+            // "model" with `workload_session = false`. Injected (not global) so
+            // the process-global manifest is untouched — the renewal path now
+            // reads this same injected authority for clearance, signer-suite,
+            // AND the workload-family policy.
+            .with_enrollment_manifest(v16_service_manifest("model", caller.to_bytes()));
+        let issuer = "https://issuer.gate2.test";
+        let reg = interactive_test_session_registry();
+        let now = chrono::Utc::now().timestamp();
+        let wsid = "wl-gate2-narrowed-revoked";
+
+        // Register then revoke the workload family session.
+        let workload_key = hyprstream_rpc::auth::SessionKey::workload(issuer, wsid);
+        reg.register_session(
+            workload_key.clone(),
+            hyprstream_rpc::auth::SessionState {
+                subject: "service:model".to_owned(),
+                tenant: "tenant-a".to_owned(),
+                kind: hyprstream_rpc::auth::SessionKind::Workload,
+                created_at: now,
+                expires_at: now + 3600,
+                status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                clearance_epoch: 0,
+            },
+        )
+        .await
+        .unwrap();
+        reg.revoke_session(&workload_key).await.unwrap();
+
+        // The renewing caller's key must be trust-registered for the service.
+        let trust = hyprstream_service::global_trust_store();
+        trust.insert(
+            caller,
+            hyprstream_service::Attestation {
+                scopes: std::iter::once("model".to_owned()).collect(),
+                subject: None,
+                jwt: Some("gate2-narrow-renew".to_owned()),
+                expires_at: now + 300,
+                attested_by: None,
+            },
+        );
+
+        // The presented credential carries the now-revoked workload session.
+        let carried =
+            hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 3600)
+                .with_workload_session_id(wsid);
+        let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+            Subject::new("service:model"),
+            "tenant-a",
+            caller,
+            carried,
+        );
+
+        let response = service
+            .handle_refresh_service_token(
+                &ctx,
+                1,
+                &RefreshServiceTokenRequest { ttl_seconds: 3600 },
+            )
+            .await
+            .expect("refresh is a policy response");
+        trust.remove(&caller);
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "SESSION_REVOKED"
+            ),
+            "removing the family policy must not launder a revoked session into an \
+             unsessioned renewal — revocation is checked before narrowing: {response:?}"
+        );
+    }
+
+    /// Testability guard for the two tests above: proves the renewal path reads
+    /// the INJECTED (`self.enrollment()`) manifest, not `global_service_enrollment()`
+    /// alone. Without this routing, an injected `workload_session = false` family
+    /// could never take effect in an isolated test (the process-global manifest
+    /// is unset), so `family_allowed` would silently default to `true` and the
+    /// narrowing branch above would be unreachable — a false green.
+    ///
+    /// The observable: an injected manifest enrolls "model" with an ed25519 key
+    /// that DIFFERS from the renewing caller's verified `cnf` key. The renewal
+    /// signer-suite block (which reads the same injected binding) then denies
+    /// with `SIGNER_SUITE_UNAVAILABLE`. The pre-routing code read only the unset
+    /// global manifest, skipped that block entirely, and would have reached the
+    /// signing boundary (`SIGNING_NOT_CONFIGURED`) instead — so this exact code
+    /// distinguishes "injected manifest consulted" from "not consulted".
+    #[tokio::test]
+    async fn service_renewal_consults_injected_enrollment_manifest() {
+        let caller = SigningKey::from_bytes(&[0x2b; 32]).verifying_key();
+        // Enroll "model" under a DIFFERENT key than the caller's verified cnf.
+        let enrolled_other = SigningKey::from_bytes(&[0x5c; 32]).verifying_key();
+
+        let (service, _root) = test_service().await;
+        let service = service
+            .with_default_audience("https://issuer.gate2.test".to_owned())
+            .with_enrollment_manifest(v16_service_manifest("model", enrolled_other.to_bytes()));
+        let now = chrono::Utc::now().timestamp();
+
+        let trust = hyprstream_service::global_trust_store();
+        trust.insert(
+            caller,
+            hyprstream_service::Attestation {
+                scopes: std::iter::once("model".to_owned()).collect(),
+                subject: None,
+                jwt: Some("gate2-inject-renew".to_owned()),
+                expires_at: now + 300,
+                attested_by: None,
+            },
+        );
+
+        let ctx = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("service:model"),
+            "tenant-a",
+            caller,
+        );
+        let response = service
+            .handle_refresh_service_token(
+                &ctx,
+                1,
+                &RefreshServiceTokenRequest { ttl_seconds: 3600 },
+            )
+            .await
+            .expect("refresh is a policy response");
+        trust.remove(&caller);
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "SIGNER_SUITE_UNAVAILABLE"
+            ),
+            "renewal must consult the injected manifest and reject a caller key that \
+             disagrees with the enrolled key: {response:?}"
+        );
+    }
+
+    /// The DEFINITIVE causal coverage the two handler-level tests above cannot
+    /// observe (`test_service` provisions no signing authority, so a cleared
+    /// renewal stops at `SIGNING_NOT_CONFIGURED` before any token is minted).
+    /// This exercises `resolve_renewal_workload_session` directly and inspects
+    /// the exact disposition, proving the `(Some(wsid), false)` narrowing branch
+    /// genuinely OMITS the session — and that the revocation check runs BEFORE
+    /// narrowing, with revoked/expired/unknown all failing closed.
+    #[tokio::test]
+    async fn renewal_workload_decision_narrows_and_fails_closed() {
+        let (service, _root) = test_service().await;
+        let reg = interactive_test_session_registry();
+        let now = chrono::Utc::now().timestamp();
+        // A per-test issuer keeps these session keys off any other test's keys
+        // in the shared global registry.
+        let issuer = "https://issuer.narrow-decision.test";
+        let active_state = |exp: i64| hyprstream_rpc::auth::SessionState {
+            subject: "service:model".to_owned(),
+            tenant: "tenant-a".to_owned(),
+            kind: hyprstream_rpc::auth::SessionKind::Workload,
+            created_at: now,
+            expires_at: exp,
+            status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+            clearance_epoch: 0,
+        };
+        let decide = |fp: Option<bool>, wsid: Option<&'static str>| {
+            service.resolve_renewal_workload_session(issuer, "service:model", "tenant-a", now, fp, wsid)
+        };
+
+        // Register one ACTIVE session used by the two contrasting live cases.
+        let active = "wl-active-narrow";
+        reg.register_session(
+            hyprstream_rpc::auth::SessionKey::workload(issuer, active),
+            active_state(now + 3600),
+        )
+        .await
+        .unwrap();
+
+        // (1) OMISSION CONTROL — ACTIVE session, family policy REMOVED
+        // (`Some(false)`): the LIVE session is dropped from the renewed
+        // credential. This is the positive proof that `family_allowed = false`
+        // actually narrows (not a vacuous always-None).
+        assert!(
+            matches!(decide(Some(false), Some(active)).await, RenewalWorkloadSession::Stamp(None)),
+            "active session + removed family policy must OMIT the workload_session_id"
+        );
+
+        // (2) CONTRAST — the SAME active session, family still ENROLLED
+        // (`Some(true)`): the session is re-stamped. Proves the false branch in
+        // (1) is a real divergence, not a constant.
+        assert!(
+            matches!(
+                decide(Some(true), Some(active)).await,
+                RenewalWorkloadSession::Stamp(Some(ref w)) if w == active
+            ),
+            "active session + enrolled family must RE-STAMP the workload_session_id"
+        );
+
+        // (3) CHECK-BEFORE-NARROWING — a REVOKED session denies for EVERY family
+        // policy, including the narrowing `Some(false)`: removing the policy can
+        // never launder a revoked family into an unsessioned renewal.
+        let revoked = "wl-revoked-narrow";
+        let rk = hyprstream_rpc::auth::SessionKey::workload(issuer, revoked);
+        reg.register_session(rk.clone(), active_state(now + 3600)).await.unwrap();
+        reg.revoke_session(&rk).await.unwrap();
+        for fp in [Some(false), Some(true), None] {
+            assert!(
+                matches!(
+                    decide(fp, Some(revoked)).await,
+                    RenewalWorkloadSession::Deny { code, .. } if code == "SESSION_REVOKED"
+                ),
+                "a revoked carried session must deny renewal for family policy {fp:?}"
+            );
+        }
+
+        // (4) FAIL-CLOSED, unknown — a session that was never registered denies.
+        assert!(
+            matches!(
+                decide(Some(true), Some("wl-never-registered-narrow")).await,
+                RenewalWorkloadSession::Deny { code, .. } if code == "SESSION_REVOKED"
+            ),
+            "an unknown carried session must fail closed"
+        );
+
+        // (5) FAIL-CLOSED, expired — an expired-but-Active session denies.
+        let expired = "wl-expired-narrow";
+        reg.register_session(
+            hyprstream_rpc::auth::SessionKey::workload(issuer, expired),
+            active_state(now - 1),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                decide(Some(true), Some(expired)).await,
+                RenewalWorkloadSession::Deny { code, .. } if code == "SESSION_REVOKED"
+            ),
+            "an expired carried session must fail closed"
+        );
+
+        // (6) No carried session: a disabled (`Some(false)`) or legacy (`None`)
+        // family manufactures none.
+        assert!(
+            matches!(decide(Some(false), None).await, RenewalWorkloadSession::Stamp(None)),
+            "no session + disabled family stays unsessioned"
+        );
+        assert!(
+            matches!(decide(None, None).await, RenewalWorkloadSession::Stamp(None)),
+            "no session + legacy family stays unsessioned"
+        );
+
+        // (7) No carried session, family ENROLLED (`Some(true)`): a fresh session
+        // is created, registered ACTIVE, and stamped.
+        let created = decide(Some(true), None).await;
+        let RenewalWorkloadSession::Stamp(Some(new_wsid)) = created else {
+            panic!("an enrolled family with no carried session must create one: {created:?}");
+        };
+        assert!(
+            !reg
+                .is_revoked(&hyprstream_rpc::auth::SessionKey::workload(issuer, &new_wsid))
+                .await,
+            "the freshly created workload session must be registered ACTIVE"
         );
     }
 
