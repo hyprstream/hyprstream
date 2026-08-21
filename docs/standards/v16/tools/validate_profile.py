@@ -69,6 +69,7 @@ from check_proof_vectors import (  # noqa: E402
     resolve_primary_enrollment, validate_primary_enrollment, authenticated_replay_thumbprint,
     configured_issuer, is_credential_revoked, terminal_signer_principal,
     cross_record_component_key_conflicts,
+    validate_jwt_header, validate_required_scalars, validate_act_chain, clearance_meet,
 )
 
 # ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
@@ -1917,9 +1918,8 @@ def _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=None, ex
         claims = json.loads(_b64u_dec(pp))
     except Exception as e:  # noqa: BLE001
         return [f"undecodable JWS: {e}"]
-    if (header.get("typ") != "at+jwt" or header.get("alg") != "EdDSA"
-            or header.get("kid") != issuer_kid):
-        errs.append(f"header not exact at+jwt/EdDSA/{issuer_kid}")
+    # X1: closed understood header set + reject unsupported `crit` extensions.
+    errs += validate_jwt_header(header, issuer_kid)
     try:
         Ed25519PublicKey.from_public_bytes(issuer_pub).verify(
             _b64u_dec(sp), f"{hp}.{pp}".encode("ascii"))
@@ -1928,15 +1928,15 @@ def _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=None, ex
     for r in ("iss", "sub", "aud", "iat", "exp", "jti", "client_id", "tenant", "clearance", "cnf"):
         if r not in claims:
             errs.append(f"missing claim {r}")
-    if not claims.get("iss") or not claims.get("sub"):
-        errs.append("empty issuer/subject")
+    # X2: required scalar identifiers/claims are non-empty strings of the profile
+    # shape, enforced directly (never inferred from enrollment/session coherence).
+    errs += validate_required_scalars(claims)
+    # X3: the entire RFC 8693 act delegation chain must be well-formed.
+    errs += validate_act_chain(claims)[1]
     # U2: the signed `iss` MUST equal the configured trusted issuer exactly — being
     # non-empty is not enough (trust is never inferred from the signing key).
     if expected_iss is not None and claims.get("iss") != expected_iss:
         errs.append(f"iss {claims.get('iss')!r} != configured trusted issuer {expected_iss!r}")
-    # RFC 9068 §2.2.1: at+jwt REQUIRES a non-empty string client_id.
-    if not isinstance(claims.get("client_id"), str) or not claims.get("client_id"):
-        errs.append("client_id must be a non-empty string (RFC 9068)")
     # J1: tenant must be a non-empty, non-wildcard string (shared predicate).
     errs += validate_tenant(claims.get("tenant"))
     if expected_aud is not None and claims.get("aud") != expected_aud:
@@ -2210,6 +2210,16 @@ def gate_credential_context(positives, negatives) -> None:
         if errs:
             print(f"   F2 counter '{label}' rejected: {errs[0]}")
 
+    def rejected_single(label, token, needle):
+        # A single-cause counter-case: the token denies AND every reported failure is
+        # about the intended axis (nothing else trips), proving causal isolation.
+        errs = _verify_credential(token, issuer_pub, issuer_kid, now,
+                                  expected_aud=aud, expected_iss=issuer_iss)
+        check(bool(errs) and all(needle in e for e in errs),
+              f"counter-proof '{label}' must deny SOLELY on {needle!r}, got {errs}")
+        if errs:
+            print(f"   counter '{label}' rejected (single-cause {needle}): {errs[0]}")
+
     # 1. flipped signature byte.
     tok = good["token"]
     hp, pp, sp = tok.split(".")
@@ -2230,6 +2240,35 @@ def gate_credential_context(positives, negatives) -> None:
     rejected("non-string tenant", _make_jwt(hdr, {**base_claims, "tenant": 123}, sk_i))
     # 5. wrong typ header (re-signed).
     rejected("wrong typ header", _make_jwt({**hdr, "typ": "JWT"}, base_claims, sk_i))
+    # X1: an unsupported CRITICAL header extension (RFC 7515 §4.1.11) — otherwise the
+    # header is exact — must fail closed (single cause: crit).
+    rejected_single("X1 unsupported crit header",
+                    _make_jwt({**hdr, "crit": ["future-policy"]}, base_claims, sk_i), "crit")
+    # X2: required scalar identifiers/claims enforced directly (not via enrollment
+    # coherence) — empty jti, non-string sub, and a whitespace-only jti each deny
+    # solely on that scalar.
+    rejected_single("X2 empty jti", _make_jwt(hdr, {**base_claims, "jti": ""}, sk_i), "jti")
+    rejected_single("X2 whitespace jti", _make_jwt(hdr, {**base_claims, "jti": "   "}, sk_i), "jti")
+    rejected_single("X2 non-string sub", _make_jwt(hdr, {**base_claims, "sub": 123}, sk_i), "sub")
+    # X3: the ENTIRE RFC 8693 act chain is recursively validated — a malformed INNER
+    # hop (a nested actor with a non-string sub) denies solely on the act chain, even
+    # though the outermost hop and every other claim are valid.
+    rejected_single("X3 malformed inner act hop",
+                    _make_jwt(hdr, {**base_claims, "act": {"sub": "svc-1", "act": {"sub": 123}}}, sk_i), "act")
+    rejected_single("X3 inner act hop bad clearance",
+                    _make_jwt(hdr, {**base_claims, "act": {"sub": "svc-1", "act": {"sub": "svc-0", "clearance": "garbage"}}}, sk_i), "act")
+    # X3: a well-formed delegated chain is ACCEPTED and its clearance MEET narrows
+    # (min level, intersected compartments); a higher-clearance inner hop cannot widen it.
+    meet1, e1 = validate_act_chain({**base_claims, "act": {"sub": "svc-1", "clearance": [1, [5]]}})
+    check(not e1 and meet1 == [1, [5]],
+          f"X3 clearance meet must narrow base [2,[5,7]] with hop [1,[5]] to [1,[5]], got {meet1} {e1}")
+    meet2, e2 = validate_act_chain({**base_claims,
+                                    "act": {"sub": "svc-1", "clearance": [1, [5]],
+                                            "act": {"sub": "svc-0", "clearance": [3, [5, 7, 9]]}}})
+    check(not e2 and meet2 == [1, [5]],
+          f"X3 a higher-clearance inner hop must not widen the meet, got {meet2} {e2}")
+    print("   X3 delegated-chain clearance meet narrows (min level, intersect compartments); "
+          "inner hops cannot widen")
     # 6. clock outside validity (re-signed with an expired window).
     rejected("expired at verifier_now",
              _make_jwt(hdr, {**base_claims, "iat": now - 100, "exp": now - 1}, sk_i))

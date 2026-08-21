@@ -20,7 +20,11 @@ The authorization server may issue a **JWT** access token or a **CWT** access
 token. They are two encodings of one credential profile, not two authorization
 models:
 
-- JWT access tokens carry the RFC 9068 `at+jwt` header type.
+- JWT access tokens carry the RFC 9068 `at+jwt` header type. The protected header
+  is a **closed understood set** — `alg` (EdDSA), `kid`, `typ` (`at+jwt`), and an
+  optional `crit` — and any `crit` member naming a critical extension the verifier
+  does not process is rejected (RFC 7515 §4.1.11, X1). v16 processes no critical
+  header extension, so a non-empty/ill-formed `crit` fails closed.
 - CWT access tokens carry the standard CWT content typing.
 - Neither may carry the request-proof types
   (`application/vnd.hyprstream.proof+cwt`,
@@ -83,7 +87,7 @@ Required semantic fields for authenticated dispatch:
 | Scope / capability | `scope` | `scope` (9) | Where applicable | Least-authority TE/capability ceiling. Consumers deriving authority from scopes fail closed when the claim is absent. |
 | User session | `sid` | — | REQUIRED for OIDC/user session credentials; otherwise absent | See §3. CWT has no `sid` mapping; user-session credentials are JWT-only. |
 | Workload session | `workload_session_id` | −70007 | Only for an issuer-managed workload credential family | See §3. CWT uses the integer private-use key −70007; the text name is JWT-only. |
-| Actor chain | `act` | `act` | Where applicable | RFC 8693 delegation chain; each hop composes into the clearance meet. |
+| Actor chain | `act` | `act` | Where applicable | RFC 8693 delegation chain. The verifier validates the **entire** chain recursively (X3), not just the outermost hop: every hop (the top-level `act` is the terminal/current actor; each nested `act` is a prior actor, RFC 8693 §4.1) MUST be an object with a **non-empty string** `sub`, and each hop's `clearance` is composed into the **effective clearance meet** (level = min, compartments = intersection — delegation never widens). A malformed hop at any depth denies. v16 is multi-hop; single-hop validation is NOT sufficient. A present `act` whose value is not an object denies. |
 
 Unknown critical claims, malformed identifiers, empty issuer, empty subject,
 wildcard tenant, unacceptable algorithm, and wrong audience deny. No error
@@ -320,8 +324,20 @@ A conforming verifier is checked against at least:
    `sid`;
 6. expired, revoked, wrong-audience, wrong-tenant, wrong-sender,
    clearance-less, or malformed tokens deny with no unauthenticated fallback;
-7. credential bytes substituted after proof signing fail hash binding; and
-8. a token whose primary signer suite does not match `cnf` denies.
+7. credential bytes substituted after proof signing fail hash binding;
+8. a token whose primary signer suite does not match `cnf` denies;
+9. **(X1) the protected header draws only from the closed understood parameter set
+   (`alg`/`kid`/`typ`/`crit`), and any `crit` member naming an extension the verifier
+   does not process is rejected (RFC 7515 §4.1.11). v16 defines no critical
+   extension, so a non-empty `crit` fails closed;**
+10. **(X2) the required scalar identifiers/claims `iss`, `sub`, `jti`, `aud`, and
+    `client_id` are each a non-empty string of the profile shape (the four
+    identifiers additionally reject whitespace-only values), checked directly — never
+    inferred from enrollment or session coherence; an empty `jti` or a wrong-typed
+    identifier denies; and**
+11. **(X3) the entire RFC 8693 `act` delegation chain is validated recursively — every
+    hop an object with a non-empty string `sub`, every hop's clearance composed into
+    the effective meet (§2 `act` row); a malformed hop at any depth denies.**
 
 ## 8. Frozen Gate-2 dispositions
 

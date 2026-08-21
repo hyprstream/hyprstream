@@ -354,33 +354,107 @@ def cross_record_component_key_conflicts(creds_doc):
     return problems + conflicts
 
 
+def validate_clearance_shape(cl):
+    """H2: the frozen two-axis clearance grammar `[level, compartments]` — level a
+    uint 0..3, compartments an array of bit indices (uint 0..63), strictly ascending
+    and unique (empty allowed), assurance structurally absent. Returns the failures.
+    Shared by the gate's `_validate_clearance` and the X3 act-chain validator."""
+    errs = []
+    if not (isinstance(cl, list) and len(cl) == 2):
+        return [f"clearance must be a 2-element [level, compartments] array (assurance absent), got {cl!r}"]
+    level, comps = cl
+    if isinstance(level, bool) or not isinstance(level, int) or not (0 <= level <= 3):
+        errs.append(f"level must be a uint 0..3 (Public/Internal/Confidential/Secret), got {level!r}")
+    if not isinstance(comps, list):
+        errs.append(f"compartments must be an array of bit indices (not a bitmask or name), got {comps!r}")
+    else:
+        prev = -1
+        for c in comps:
+            if isinstance(c, bool) or not isinstance(c, int):
+                errs.append(f"compartment {c!r} must be a uint bit index (not a name)")
+                continue
+            if not (0 <= c <= 63):
+                errs.append(f"compartment {c} out of range 0..63")
+            if c <= prev:
+                errs.append(f"compartments must be strictly ascending and unique; {c} follows {prev}")
+            prev = c
+    return errs
+
+
+def clearance_meet(a, b):
+    """The clearance lattice MEET (greatest lower bound) used to compose a delegation
+    chain: level = min (never raised), compartments = the intersection (never widened).
+    Both operands must be valid `[level, [compartments]]`."""
+    return [min(a[0], b[0]), sorted(set(a[1]) & set(b[1]))]
+
+
+def validate_act_chain(claims):
+    """X3: recursively validate the RFC 8693 `act` delegation chain and compose its
+    effective clearance meet (credential-profile.md: "each hop composes into the
+    clearance meet"). The top-level `act` is the terminal/current actor; each nested
+    `act` inside it is a prior actor (RFC 8693 §4.1). EVERY hop MUST be an object with
+    a non-empty (non-whitespace) string `sub`; every hop's `clearance`, when present,
+    MUST be a valid clearance and is composed by meet into the effective clearance,
+    starting from the credential's own clearance. Returns (effective_clearance_or_None,
+    errors); any malformed hop fails closed. v16 validates EVERY hop (not single-hop)."""
+    errs = []
+    base = claims.get("clearance") if isinstance(claims, dict) else None
+    eff = base if isinstance(base, list) else None
+    if base is not None:
+        for e in validate_clearance_shape(base):
+            errs.append(f"credential clearance: {e}")
+            eff = None
+    # Walk while an `act` key is PRESENT at the current level. A present `act` whose
+    # value is not an object (None / non-dict) is a malformed hop (fail closed) — this
+    # is distinct from `act` being absent (no delegation), which ends the walk.
+    node = claims
+    depth = 0
+    while isinstance(node, dict) and "act" in node:
+        depth += 1
+        hop = node.get("act")
+        if not isinstance(hop, dict):
+            errs.append(f"act hop {depth} is not an object (got {type(hop).__name__})")
+            break
+        s = hop.get("sub")
+        if not isinstance(s, str) or not s or s.strip() == "":
+            errs.append(f"act hop {depth} sub must be a non-empty string, got {s!r}")
+        hc = hop.get("clearance")
+        if hc is not None:
+            hce = validate_clearance_shape(hc)
+            if hce:
+                errs.extend(f"act hop {depth} clearance: {e}" for e in hce)
+                eff = None
+            elif eff is not None:
+                eff = clearance_meet(eff, hc)
+        node = hop
+    return (None if errs else eff), errs
+
+
 def terminal_signer_principal(claims):
-    """T1: the credential's EFFECTIVE (terminal) signer principal — the party whose
+    """T1/X3: the credential's EFFECTIVE (terminal) signer principal — the party whose
     key the cnf primary group binds and who signs the downstream request — as a
     (principal, errors) pair. For an ordinary credential (no `act`) this is the
     credential `sub`. For an `act`-bearing AsOriginator delegated credential (design
     §8.1), `sub` stays the ORIGINATOR while the cnf binds the TERMINAL actor, so the
     primary principal is the outermost `act.sub` — the current/terminal actor per RFC
     8693 §4.1 (never `sub`, never an inner/earlier actor). The `act` claim is already
-    in profile scope (credential-profile.md claims table); this introduces no new wire
-    field.
+    in profile scope; this introduces no new wire field.
 
-    Fail closed: the mere PRESENCE of `act` requires an object carrying a non-empty
-    outermost `act.sub`. A present-but-malformed `act` (not an object, or missing/
-    empty/non-string outermost `sub`) returns (None, [error]) so a malformed delegated
-    credential is never silently demoted to the ordinary (`principal == sub`) path and
-    thus never evades the delegated-primary rule."""
+    Fail closed: the presence of `act` requires the ENTIRE chain to be well-formed
+    (X3) — every hop an object with a non-empty string `sub`, every hop's clearance
+    valid — validated recursively via validate_act_chain, not just the outermost hop.
+    A malformed chain (any hop) returns (None, [errors]) so a malformed delegated
+    credential is never silently demoted to the ordinary (`principal == sub`) path."""
     if not isinstance(claims, dict):
         return None, ["credential claims are not an object"]
     if "act" not in claims:
         return claims.get("sub"), []
+    _eff, cerrs = validate_act_chain(claims)
+    if cerrs:
+        return None, cerrs
     act = claims.get("act")
-    if not isinstance(act, dict):
-        return None, [f"act present but is not an object (got {type(act).__name__})"]
-    asub = act.get("sub")
-    if not isinstance(asub, str) or not asub:
-        return None, [f"act present but its outermost act.sub is missing/empty/non-string, got {asub!r}"]
-    return asub, []
+    # cerrs empty guarantees a well-formed outermost hop; guard defensively anyway.
+    return (act.get("sub") if isinstance(act, dict) else None), []
 
 
 def authenticated_replay_thumbprint(domain, suite_id, pubs, enrollment_epoch):
@@ -477,6 +551,58 @@ def validate_proof_freshness(claims, now, max_clock_skew_secs, max_remaining_lif
         errs.append(f"expired: verifier_now {now} >= exp {exp}")
     if exp - now > max_life:
         errs.append(f"over-lifetime: exp-verifier_now {exp - now}s > {disposition} max {max_life}s")
+    return errs
+
+
+# X1: the closed set of at+jwt header parameters this profile understands, and the
+# (empty) set of critical header extensions it processes. v16 defines no critical
+# extension, so any `crit` member fails closed (RFC 7515 §4.1.11).
+UNDERSTOOD_HEADER_PARAMS = frozenset({"alg", "kid", "typ", "crit"})
+UNDERSTOOD_CRIT_EXTENSIONS = frozenset()
+
+
+def validate_jwt_header(header, issuer_kid):
+    """X1: the credential's protected header must be exactly at+jwt/EdDSA/<issuer kid>,
+    draw only from the closed understood parameter set, and — per RFC 7515 §4.1.11 —
+    any `crit` member must name an understood, processed critical extension present in
+    the header. Because v16 processes no critical extension, a non-empty/ill-formed
+    `crit` (or one naming an unrecognized extension) fails closed. Returns failures."""
+    if not isinstance(header, dict):
+        return ["JWT header is not an object"]
+    errs = []
+    if (header.get("typ") != "at+jwt" or header.get("alg") != "EdDSA"
+            or header.get("kid") != issuer_kid):
+        errs.append(f"header not exact at+jwt/EdDSA/{issuer_kid}")
+    extra = set(header) - UNDERSTOOD_HEADER_PARAMS
+    if extra:
+        errs.append(f"unrecognized JWT header parameter(s) {sorted(extra)} outside the closed set")
+    crit = header.get("crit")
+    if crit is not None:
+        if not isinstance(crit, list) or not crit or not all(isinstance(c, str) and c for c in crit):
+            errs.append(f"crit must be a non-empty array of non-empty strings, got {crit!r}")
+        else:
+            for name in crit:
+                if name not in header:
+                    errs.append(f"crit names header parameter {name!r} absent from the header")
+                if name not in UNDERSTOOD_CRIT_EXTENSIONS:
+                    errs.append(f"crit names unsupported critical extension {name!r} (fail closed)")
+    return errs
+
+
+def validate_required_scalars(claims):
+    """X2: the required at+jwt scalar identifier/claim grammar, enforced directly
+    (never inferred from enrollment/session coherence). `iss`, `sub`, `jti`, `aud`,
+    and `client_id` MUST each be a non-empty string; the four identifiers
+    (`iss`/`sub`/`jti`/`client_id`) MUST NOT be whitespace-only. Returns failures."""
+    errs = []
+    for name in ("iss", "sub", "jti", "aud", "client_id"):
+        v = claims.get(name)
+        if not isinstance(v, str):
+            errs.append(f"{name} must be a string, got {type(v).__name__}")
+        elif v == "":
+            errs.append(f"{name} must be a non-empty string")
+        elif name != "aud" and v.strip() == "":
+            errs.append(f"{name} must not be a whitespace-only identifier")
     return errs
 
 
@@ -960,9 +1086,9 @@ def main() -> None:
             hp, pp, sp = parts
             header = json.loads(b64u_dec(hp))
             claims = json.loads(b64u_dec(pp))
-            if (header.get("typ") != "at+jwt" or header.get("alg") != "EdDSA"
-                    or header.get("kid") != issuer_kid):
-                fail(f"{label}: protected header not exact at+jwt/EdDSA/{issuer_kid}: {header}")
+            # X1: closed understood header set + reject unsupported `crit` extensions.
+            for he in validate_jwt_header(header, issuer_kid):
+                fail(f"{label}: {he}")
             try:
                 Ed25519PublicKey.from_public_bytes(issuer_pub).verify(
                     b64u_dec(sp), f"{hp}.{pp}".encode("ascii"))
@@ -971,8 +1097,13 @@ def main() -> None:
             for req in ("iss", "sub", "aud", "iat", "exp", "jti", "client_id", "tenant", "clearance", "cnf"):
                 if req not in claims:
                     fail(f"{label}: missing required claim {req!r}")
-            if not claims.get("iss") or not claims.get("sub"):
-                fail(f"{label}: empty issuer/subject")
+            # X2: required scalar identifiers/claims must be non-empty strings of the
+            # profile shape (never inferred from enrollment/session coherence).
+            for se in validate_required_scalars(claims):
+                fail(f"{label}: {se}")
+            # X3: the entire RFC 8693 act delegation chain must be well-formed.
+            for ae in validate_act_chain(claims)[1]:
+                fail(f"{label}: {ae}")
             # U2: the signed `iss` MUST equal the configured trusted issuer exactly,
             # not merely be non-empty (trust is never inferred from the signing key).
             expected_iss = configured_issuer(cd)
