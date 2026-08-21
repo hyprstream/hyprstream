@@ -222,11 +222,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Install the CPU torch wheel (aarch64) and expose its bundled libtorch as
+# Install the CPU-only torch wheel (aarch64) and expose its bundled libtorch as
 # /opt/libtorch so the shared `builder` stage's LIBTORCH=/opt/libtorch just works.
+# The default PyPI torch artifact is CUDA-enabled on arm64 and pulls hundreds of
+# megabytes of CUDA .so files into this layer.  Use PyTorch's CPU index and
+# --no-cache-dir so the OCI publisher does not exhaust its small arm64 root disk
+# while committing the builder layer (the runtime smoke still runs below).
 # --break-system-packages: bookworm marks the system python PEP-668 externally-managed.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install --break-system-packages "torch==${LIBTORCH_VERSION}" \
+    pip3 install --break-system-packages --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu \
+        "torch==${LIBTORCH_VERSION}+cpu" \
     && TORCH_DIR="$(python3 -c 'import torch, os; print(os.path.dirname(torch.__file__))')" \
     && ln -s "$TORCH_DIR" /opt/libtorch \
     && ls -la /opt/libtorch/lib/libtorch_cpu.so /opt/libtorch/include >/dev/null
