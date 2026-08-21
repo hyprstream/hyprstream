@@ -13,7 +13,7 @@ Machine-readable files (the normative form — this page is the human index):
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 9 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 62 vectors that MUST deny |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 64 vectors that MUST deny |
 | [`vectors/proof-v1-thumbprints.json`](vectors/proof-v1-thumbprints.json) | Cross-implementation replay-namespace thumbprint vectors (C1) |
 | [`vectors/proof-v1-credentials.json`](vectors/proof-v1-credentials.json) | Frozen `verifier_now` clock (F1) and the issuer-signed at+jwt tokens the authenticated positives hash (F2) |
 
@@ -412,6 +412,8 @@ Ed25519 signature over the stripped object.
 | N-55 | proof-freshness | Future-issued proof: `iat` (1786000046) more than 30s after `verifier_now` | 395 |
 | N-56 | proof-freshness | Over-limit authenticated proof: `exp − verifier_now` (301s) exceeds the Authenticated maximum (300s) | 395 |
 | N-57 | proof-freshness | Over-limit unattributed proof: `exp − verifier_now` (45s) exceeds the Unattributed maximum (30s) | 470 |
+| N-58 | response-signer | Response proof signed by the client key (not the enrolled response-service signer) | 372 |
+| N-59 | response-signer | Service-signed response proof for an unenrolled audience (`other.svc.hyprstream.test`) | 371 |
 
 ### Notes on individual negatives
 
@@ -571,6 +573,30 @@ Ed25519 signature over the stripped object.
   at `verifier_now` per disposition, and the causality inventory asserts each denies
   on its single axis. (The unattributed-`Nonce` rule that N-16 exercises is a distinct
   class, `unattributed-nonce-required`, not proof freshness.)
+- **N-58 / N-59 (audience-bound response-signer authorization, Z1).** A response
+  proof's signer is authorized **only** through authoritative off-wire service trust
+  state bound to the response **audience** — never a generic known-`kid` lookup or the
+  prose `role` string in the key fixture. `proof-v1-credentials.json`
+  `response_signer_enrollments` holds a record keyed by the exact response `aud` + the
+  signer-suite content (`suite_id` + ordered public keys, recomputed thumbprint), with
+  an explicit **`response-service`** role, active status, and expiry. The gate and
+  checker require every response positive's (P-3/P-7) **realized** signer plan to
+  resolve **exactly one** active such record for its audience; **N-58** is a
+  self-consistent response proof signed **entirely by the client key** (plan
+  component, `kid`, and signature all the client) — the exact shape accepted before
+  the resolver existed — and denies because the client is not an authorized response
+  signer; **N-59** is correctly **service-signed** but carries an **unenrolled
+  audience**, and denies solely on the audience-bound resolution. Unknown, wrong-role,
+  wrong-audience, inactive/expired, key/suite-mismatched, or ambiguous records deny;
+  neutralizing the resolver turns the gate red.
+- **Credential `iat`/`exp` NumericDate (Z2).** A credential's `iat` and `exp` are
+  validated as integer Unix-second NumericDate values, **explicitly excluding Python
+  `bool`** (`True`/`False` are not timestamps), **before** any temporal comparison in
+  both the gate and the checker. A boolean, string, `null`, float, or missing `iat`/
+  `exp` produces a **clean profile denial** — never an exception or an incidental
+  time-window failure — while `iat <= verifier_now < exp` and all proof/credential/
+  session expiry bounds are preserved. Re-signed boolean and string `iat`/`exp`
+  counter-cases deny single-cause.
 - **N-12 / N-28 (suite ↔ component-plan binding).** Each suite_id is bound to its
   exact ordered algorithms and component count: `hs-cose-sign-ed25519-v1` is
   exactly one Ed25519 component, `hs-cose-sign-ed25519-mldsa65-wns-v1` is exactly

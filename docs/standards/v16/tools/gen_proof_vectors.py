@@ -408,6 +408,7 @@ def main() -> None:
         client_ed_pub = sk_c_ed.public_key().public_bytes_raw()
         client_ed_hy_pub = sk_c_ed_hy.public_key().public_bytes_raw()  # V1: hybrid Ed25519 component
         approver_ed_pub = sk_a_ed.public_key().public_bytes_raw()  # Q1 approver enrollment
+        service_ed_pub = sk_s_ed.public_key().public_bytes_raw()   # Z1 response-signer enrollment
         # cnf-resolved signer-suite records for the authenticated positives'
         # PRIMARY groups: classical = [client Ed25519]; hybrid = [client Ed25519 (hy),
         # client ML-DSA-65] (approver groups bind their own enrollment, never cnf).
@@ -2328,6 +2329,44 @@ def main() -> None:
             notes="Unattributed (Nonce present), iat within skew, unexpired; denies solely on the over-long remaining lifetime for its disposition.",
         )
 
+        # ---- Z1: response-signer authorization negatives. A RESPONSE proof's signer
+        # must resolve to an authoritative `response-service` enrollment bound to the
+        # response audience; a generic known-key/known-kid lookup is insufficient.
+        # N-58 (wrong role): a self-consistent response proof signed ENTIRELY by the
+        # CLIENT key (plan component, protected kid, and signature all the client key).
+        # Its realized signer is not an authorized response signer for the audience, so
+        # it denies — the exact shape that was accepted before the resolver existed.
+        n58_plan = [group(1, SUITE_CLASSICAL, [component(ALG_ED25519, KID_CLIENT_ED)])]
+        n58_protected = {
+            H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN1_AUTH, H_KID: KID_CLIENT_ED,
+            H_TYP: TYP_RESPONSE, H_DOMAIN: DOMAIN_RESPONSE, H_PLAN: n58_plan, H_GROUP: 1,
+        }
+        n58_claims = request_claims(credential_hash=None, schema_id=SCHEMA_ID_RESPONSE, body=CAPNP_RESPONSE_BYTES)
+        n58, _, _ = sign1(n58_protected, n58_claims, sk_c_ed)
+        record(
+            negatives, "N-58",
+            "Response proof signed by the client key (not the enrolled response service signer)",
+            "deny", "COSE_Sign1", n58,
+            deny_class="response-signer",
+            deny_rule="a response proof's realized signer must resolve to an authoritative response-service enrollment for its audience",
+            notes="Self-consistent client-key response (plan/kid/signature all the client key); denies solely because the client is not an authorized response signer for the audience.",
+        )
+        # N-59 (wrong audience): a correctly SERVICE-signed response proof whose `aud`
+        # is a valid but UNENROLLED service domain. The realized signer matches the
+        # service suite/keys, but no response-signer enrollment exists for that
+        # audience, so it denies solely on the audience binding.
+        n59_claims = request_claims(credential_hash=None, schema_id=SCHEMA_ID_RESPONSE,
+                                    body=CAPNP_RESPONSE_BYTES, aud="other.svc.hyprstream.test")
+        n59, _, _ = sign1(p3_protected, n59_claims, sk_s_ed)
+        record(
+            negatives, "N-59",
+            "Service-signed response proof for an unenrolled audience (other.svc.hyprstream.test)",
+            "deny", "COSE_Sign1", n59,
+            deny_class="response-signer",
+            deny_rule="a response proof's realized signer must resolve to an authoritative response-service enrollment for its EXACT audience",
+            notes="Correctly service-signed, but no response-signer enrollment exists for this audience; denies solely on the audience-bound resolution.",
+        )
+
     meta = {
         "vector_set_version": 1,
         "profile": "hs-rpc-proof-v1",
@@ -2547,6 +2586,32 @@ def main() -> None:
                 # verifier_now (1786000015); active and unexpired.
                 "expires_at": 1786000060,
                 "enrollment_epoch": 2,
+            },
+        ],
+        "response_signer_model": {
+            "note": (
+                "Z1: a RESPONSE proof's signer is authorized ONLY through authoritative "
+                "off-wire service trust state bound to the response AUDIENCE — never a "
+                "generic known-kid lookup or the prose `role` string in the key fixture. "
+                "Each record is keyed by the exact response `aud` + the signer-suite "
+                "content (suite_id + ordered public keys, recomputed thumbprint), with an "
+                "explicit `response-service` role, active status, expiry, and tenant "
+                "binding. The response proof's realized signer plan MUST match EXACTLY "
+                "ONE active record for its audience; unknown, wrong-role, wrong-audience, "
+                "inactive/expired, key/suite-mismatched, or ambiguous records deny. Not a "
+                "wire/proof field; no registry/IANA allocation."
+            ),
+        },
+        "response_signer_enrollments": [
+            {
+                "aud": SERVICE_DOMAIN,
+                "suite_id": SUITE_CLASSICAL,
+                "component_public_keys_hex": [service_ed_pub.hex()],
+                "thumbprint_b64": b64u(signer_suite_thumbprint(SUITE_CLASSICAL, [service_ed_pub])),
+                "role": "response-service",
+                "tenant": CREDENTIAL_TENANT,
+                "status": "active",
+                "expires_at": 1786000060,
             },
         ],
         "credential_revocation_model": {

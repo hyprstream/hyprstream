@@ -70,6 +70,8 @@ from check_proof_vectors import (  # noqa: E402
     configured_issuer, is_credential_revoked, terminal_signer_principal,
     cross_record_component_key_conflicts,
     validate_jwt_header, validate_required_scalars, validate_act_chain, clearance_meet,
+    validate_numericdate_claims,
+    resolve_response_signer_enrollments, validate_response_signer_enrollment,
 )
 
 # ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
@@ -1625,6 +1627,29 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
                 "authenticated proof with a null credential_hash"
         if dc == "unattributed-nonce-required":  # N-16
             return H_KEYSET in pm and (claims is None or C_NONCE not in claims), "unattributed proof without Nonce"
+        if dc == "response-signer":  # Z1: N-58/N-59
+            if pm.get(H_TYP) != TYP_RESPONSE:
+                return False, "not a response proof"
+            _creds2 = _load_credentials()
+            ed_by_kid, ml_by_kid = _keymaps()
+            aud = claims.get(C_AUD) if isinstance(claims, dict) else None
+            denied = False
+            for grp in (plan or []):
+                pubs, ok = [], True
+                for comp in grp[3]:
+                    a, k = comp[1], comp[2]
+                    p = ed_by_kid.get(k) if a == ALG_ED25519 else ml_by_kid.get(k)
+                    if p is None:
+                        ok = False
+                        break
+                    pubs.append(p)
+                if not ok:
+                    continue
+                tp = _b64u(_suite_thumbprint(grp[2], pubs))
+                m = resolve_response_signer_enrollments(_creds2, aud, tp)
+                if validate_response_signer_enrollment(m, tp, aud, _creds2["verifier_now"]):
+                    denied = True
+            return denied, "response signer resolves no authoritative response-service enrollment for its audience"
         if dc == "proof-freshness":  # W1: N-54/N-55/N-56/N-57 — temporal freshness at verifier_now
             from check_proof_vectors import validate_proof_freshness as _vpf, proof_disposition as _pd
             fnow = negatives.get("verifier_now")
@@ -1941,7 +1966,11 @@ def _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=None, ex
     errs += validate_tenant(claims.get("tenant"))
     if expected_aud is not None and claims.get("aud") != expected_aud:
         errs.append("audience mismatch")
-    if not (claims.get("iat", 0) <= now < claims.get("exp", 0)):
+    # Z2: iat/exp are integer NumericDate values (bool excluded), validated BEFORE the
+    # temporal comparison so a wrong type is a clean denial, never a TypeError.
+    nd_errs = validate_numericdate_claims(claims)
+    errs += nd_errs
+    if not nd_errs and not (claims["iat"] <= now < claims["exp"]):
         errs.append("not temporally valid at verifier_now")
     if "hs_signer_suite" not in (claims.get("cnf") or {}):
         errs.append("cnf lacks hs_signer_suite")
@@ -2046,6 +2075,85 @@ def gate_verifier_clock(positives, negatives) -> None:
     check(not (iat <= 4102444800 < exp), "a wall-clock-style instant (2100) must be outside validity")
     print(f"   verifier_now {now} agrees across artifacts; all positives/credentials valid; "
           f"pre-iat/at-exp/wall-clock rejected")
+
+
+def gate_response_signer(positives, negatives) -> None:
+    section("Z1. Audience-bound response-signer authorization")
+    creds = _load_credentials()
+    now = creds["verifier_now"]
+    ed_by_kid, ml_by_kid = _keymaps()
+
+    def realized(vec):
+        """(aud, [signer-suite thumbprint_b64 per plan group]) for a response proof."""
+        obj = decode(bytes.fromhex(vec["cbor_hex"]))
+        bh = decode(obj[0])
+        aud = decode(obj[2]).get(C_AUD)
+        tps = []
+        for grp in (bh.get(H_PLAN) or []):
+            pubs, ok = [], True
+            for comp in grp[3]:
+                a, k = comp[1], comp[2]
+                p = ed_by_kid.get(k) if a == ALG_ED25519 else ml_by_kid.get(k)
+                if p is None:
+                    ok = False
+                    break
+                pubs.append(p)
+            if ok:
+                tps.append(_b64u(_suite_thumbprint(grp[2], pubs)))
+        return aud, tps
+
+    # Every RESPONSE positive resolves exactly one active response-service enrollment.
+    resp_pos = [v for v in positives["vectors"]
+                if decode(decode(bytes.fromhex(v["cbor_hex"]))[0]).get(H_TYP) == TYP_RESPONSE]
+    check(resp_pos, "at least one response positive (P-3/P-7) must exist")
+    for v in resp_pos:
+        aud, tps = realized(v)
+        for tp in tps:
+            m = resolve_response_signer_enrollments(creds, aud, tp)
+            errs = validate_response_signer_enrollment(m, tp, aud, now)
+            check(not errs, f"{v['id']} response signer must resolve a valid enrollment: {errs}")
+
+    # The two shipped negatives (N-58 client-signed, N-59 wrong-audience) deny.
+    by_id = {v["id"]: v for v in negatives["vectors"]}
+    for nid in ("N-58", "N-59"):
+        v = by_id.get(nid)
+        check(v is not None, f"response-signer negative {nid} must exist")
+        if v is None:
+            continue
+        aud, tps = realized(v)
+        denied = any(validate_response_signer_enrollment(
+            resolve_response_signer_enrollments(creds, aud, tp), tp, aud, now) for tp in tps)
+        check(denied, f"{nid} must deny at the response-signer resolver")
+
+    # Record-level counter-proofs: mutating the shipped enrollment must deny a proof
+    # that otherwise resolves it (the resolver is load-bearing on every field).
+    good_aud, good_tps = realized(resp_pos[0])
+    good_tp = good_tps[0]
+    base = creds["response_signer_enrollments"][0]
+    import copy
+
+    def rec_red(label, mut):
+        r = copy.deepcopy(base)
+        mut(r)
+        e = validate_response_signer_enrollment([r], good_tp, good_aud, now)
+        check(bool(e), f"Z1 response-signer counter '{label}' must deny but validated clean")
+        if e:
+            print(f"   Z1 response-signer counter '{label}' denies: {e[0]}")
+
+    rec_red("wrong role", lambda r: r.__setitem__("role", "primary"))
+    rec_red("inactive", lambda r: r.__setitem__("status", "revoked"))
+    rec_red("expired", lambda r: r.__setitem__("expires_at", now))
+    rec_red("wrong audience", lambda r: r.__setitem__("aud", "other.svc.hyprstream.test"))
+    rec_red("tampered thumbprint_b64", lambda r: r.__setitem__("thumbprint_b64", _b64u(b"\x00" * 32)))
+    rec_red("key/suite mismatch", lambda r: r.__setitem__("component_public_keys_hex", [(b"\x11" * 32).hex()]))
+    # Unknown (empty store) and ambiguous (two matching records) both deny.
+    check(bool(validate_response_signer_enrollment(
+        resolve_response_signer_enrollments({"response_signer_enrollments": []}, good_aud, good_tp),
+        good_tp, good_aud, now)), "an empty response-signer store must deny (unknown)")
+    check(bool(validate_response_signer_enrollment([base, base], good_tp, good_aud, now)),
+          "two matching response-signer records must deny (ambiguous)")
+    print(f"   {len(resp_pos)} response positive(s) resolve the enrolled response-service signer; "
+          f"client-signed (N-58) and wrong-audience (N-59) deny; record mutations deny")
 
 
 def gate_proof_freshness(positives, negatives) -> None:
@@ -2269,6 +2377,15 @@ def gate_credential_context(positives, negatives) -> None:
           f"X3 a higher-clearance inner hop must not widen the meet, got {meet2} {e2}")
     print("   X3 delegated-chain clearance meet narrows (min level, intersect compartments); "
           "inner hops cannot widen")
+    # Z2: iat/exp must be integer NumericDate (Unix seconds; bool excluded). A boolean,
+    # string, null, or float timestamp denies CLEANLY (no exception, no incidental
+    # time-window failure) — each single-cause on that claim.
+    rejected_single("Z2 boolean iat", _make_jwt(hdr, {**base_claims, "iat": True}, sk_i), "iat")
+    rejected_single("Z2 string iat", _make_jwt(hdr, {**base_claims, "iat": "1786000000"}, sk_i), "iat")
+    rejected_single("Z2 null iat", _make_jwt(hdr, {**base_claims, "iat": None}, sk_i), "iat")
+    rejected_single("Z2 float iat", _make_jwt(hdr, {**base_claims, "iat": 1786000000.5}, sk_i), "iat")
+    rejected_single("Z2 boolean exp", _make_jwt(hdr, {**base_claims, "exp": True}, sk_i), "exp")
+    rejected_single("Z2 string exp", _make_jwt(hdr, {**base_claims, "exp": "1786000030"}, sk_i), "exp")
     # 6. clock outside validity (re-signed with an expired window).
     rejected("expired at verifier_now",
              _make_jwt(hdr, {**base_claims, "iat": now - 100, "exp": now - 1}, sk_i))
@@ -2693,6 +2810,7 @@ def main() -> None:
     gate_group_cap_isolation(cddl, negatives)
     gate_verifier_clock(positives, negatives)
     gate_proof_freshness(positives, negatives)
+    gate_response_signer(positives, negatives)
     gate_credential_context(positives, negatives)
     gate_enrollment_key_uniqueness()
     gate_canonical(positives, negatives)

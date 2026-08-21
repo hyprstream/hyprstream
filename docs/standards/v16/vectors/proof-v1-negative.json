@@ -733,6 +733,30 @@
       "deny_class": "proof-freshness",
       "deny_rule": "a proof's exp - verifier_now MUST NOT exceed its disposition's max remaining lifetime (Unattributed 30s)",
       "notes": "Unattributed (Nonce present), iat within skew, unexpired; denies solely on the over-long remaining lifetime for its disposition."
+    },
+    {
+      "id": "N-58",
+      "title": "Response proof signed by the client key (not the enrolled response service signer)",
+      "expect": "deny",
+      "structure": "COSE_Sign1",
+      "size_bytes": 372,
+      "sha256": "d9fadcb55c42a444afb13c92c8cf5c6a0783d1911891f1e942b06acb43a2be14",
+      "cbor_hex": "8458b4a7013202833a000111d53a000111d43a000111d30450636c69656e742d656432353531392d3110782d6170706c69636174696f6e2f766e642e6879707273747265616d2e726573706f6e73652d70726f6f662b6377743a000111d3781868732d7270632d726573706f6e73652d70726f6f662d76313a000111d481a30101027768732d636f73652d7369676e2d656432353531392d76310381a201320250636c69656e742d656432353531392d313a000111d501a05878a803781c72656769737472792e7376632e6879707273747265616d2e74657374041a6a74329e061a6a74328007503f1c9a04b7d2416e8c05a9137b6e2d803a00011170f63a000111711b91b7c0e5a2f3d48a3a0001117258190000000000000000010000000f0000000200030000000000003a00011173f658402297d3b0dc257815492a3e1bd837b1fb67675b06393e2b9531af61fc316fb9189dec3bca14ae6b77fa311e634465a1e726f5d816b45eacc7b33baabcbe7f010d",
+      "deny_class": "response-signer",
+      "deny_rule": "a response proof's realized signer must resolve to an authoritative response-service enrollment for its audience",
+      "notes": "Self-consistent client-key response (plan/kid/signature all the client key); denies solely because the client is not an authorized response signer for the audience."
+    },
+    {
+      "id": "N-59",
+      "title": "Service-signed response proof for an unenrolled audience (other.svc.hyprstream.test)",
+      "expect": "deny",
+      "structure": "COSE_Sign1",
+      "size_bytes": 371,
+      "sha256": "fd3de7d54f234917dd323cb6171a4ecf1351b50032137bed67642139a8190adb",
+      "cbor_hex": "8458b6a7013202833a000111d53a000111d43a000111d30451736572766963652d656432353531392d3110782d6170706c69636174696f6e2f766e642e6879707273747265616d2e726573706f6e73652d70726f6f662b6377743a000111d3781868732d7270632d726573706f6e73652d70726f6f662d76313a000111d481a30101027768732d636f73652d7369676e2d656432353531392d76310381a201320251736572766963652d656432353531392d313a000111d501a05875a80378196f746865722e7376632e6879707273747265616d2e74657374041a6a74329e061a6a74328007503f1c9a04b7d2416e8c05a9137b6e2d803a00011170f63a000111711b91b7c0e5a2f3d48a3a0001117258190000000000000000010000000f0000000200030000000000003a00011173f658400b4908fe285df33d66f439692433b3090d7d91d43196d0d6fd8662249b7e05822b821476a08740efc40e8b70c6024b56d873d564250be007f76857e03451f002",
+      "deny_class": "response-signer",
+      "deny_rule": "a response proof's realized signer must resolve to an authoritative response-service enrollment for its EXACT audience",
+      "notes": "Correctly service-signed, but no response-signer enrollment exists for this audience; denies solely on the audience-bound resolution."
     }
   ]
 }

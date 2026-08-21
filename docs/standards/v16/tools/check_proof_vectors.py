@@ -323,6 +323,51 @@ def validate_primary_enrollment(rec, requested_thumbprint_b64, expected_tenant, 
     return errs
 
 
+def resolve_response_signer_enrollments(creds_doc, aud, requested_thumbprint_b64):
+    """Z1: the authoritative response-signer enrollment(s) for a RESPONSE proof, keyed
+    by the EXACT response audience AND the signer-suite CONTENT (recomputed thumbprint
+    over suite_id + ordered public keys) — never a generic known-kid lookup or a prose
+    `role` string in the key fixture. Returns the list of matching records (0, exactly
+    1, or — a distinct fault — more than 1)."""
+    out = []
+    for e in creds_doc.get("response_signer_enrollments", []):
+        if e.get("aud") == aud and _enrollment_thumbprint(e) == requested_thumbprint_b64:
+            out.append(e)
+    return out
+
+
+def validate_response_signer_enrollment(matches, requested_thumbprint_b64, aud, now):
+    """Z1: a RESPONSE proof's realized signer plan MUST resolve to EXACTLY ONE active,
+    unexpired, `response-service`-role enrollment for its audience. Unknown, ambiguous,
+    tampered, key/suite-mismatched, wrong-audience, wrong-role, inactive, or expired
+    records deny (fail closed). `matches` is the resolver's result list."""
+    if not matches:
+        return ["no authoritative response-signer enrollment for this audience + realized signer"]
+    if len(matches) > 1:
+        return ["ambiguous: more than one response-signer enrollment matches this audience + signer suite"]
+    rec = matches[0]
+    errs = []
+    recomputed = _enrollment_thumbprint(rec)
+    if recomputed is None:
+        return ["response-signer enrollment record has a malformed suite_id / public keys"]
+    if rec.get("thumbprint_b64") != recomputed:
+        errs.append("response-signer enrollment thumbprint_b64 disagrees with its own suite/keys (tampered record)")
+    if requested_thumbprint_b64 is not None and recomputed != requested_thumbprint_b64:
+        errs.append("response-signer enrollment key/suite does not bind the response proof's realized signer")
+    if rec.get("aud") != aud:
+        errs.append(f"response-signer enrollment audience {rec.get('aud')!r} != response audience {aud!r}")
+    if rec.get("role") != "response-service":
+        errs.append(f"response-signer enrollment role {rec.get('role')!r} is not 'response-service'")
+    if rec.get("status") != "active":
+        errs.append(f"response-signer enrollment status {rec.get('status')!r} is not active")
+    ea = rec.get("expires_at")
+    if isinstance(ea, bool) or not isinstance(ea, int):
+        errs.append(f"response-signer enrollment expires_at must be an integer, got {ea!r}")
+    elif ea <= now:
+        errs.append(f"response-signer enrollment expired at verifier_now {now} (expires_at {ea})")
+    return errs
+
+
 def cross_record_component_key_conflicts(creds_doc):
     """V1 (CDDL §6, cross-suite component-key non-reuse): a component key enrolled
     for one suite MUST NOT be simultaneously enrolled for another suite/record. Sweep
@@ -608,6 +653,25 @@ def validate_jwt_header(header, issuer_kid):
                     errs.append(f"crit names header parameter {name!r} absent from the header")
                 if name not in UNDERSTOOD_CRIT_EXTENSIONS:
                     errs.append(f"crit names unsupported critical extension {name!r} (fail closed)")
+    return errs
+
+
+def is_numericdate(v):
+    """Z2: a JWT NumericDate is an integer count of Unix seconds. Python `bool` is an
+    `int` subclass, so it is explicitly EXCLUDED (True/False are not timestamps)."""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def validate_numericdate_claims(claims):
+    """Z2: `iat` and `exp` MUST each be an integer NumericDate (Unix seconds), never a
+    bool, string, null, or float. Returns the failures; the caller must run this BEFORE
+    any temporal comparison so a wrong type is a clean profile denial, never a TypeError
+    or an incidental time-window failure."""
+    errs = []
+    for name in ("iat", "exp"):
+        if not is_numericdate(claims.get(name)):
+            errs.append(f"{name} must be an integer NumericDate (Unix seconds; not bool/string/null/float), "
+                        f"got {type(claims.get(name)).__name__}")
     return errs
 
 
@@ -1101,6 +1165,37 @@ def main() -> None:
         def signer_suite_tp(suite, pubs) -> bytes:
             return hashlib.sha256(enc([suite, list(pubs)])).digest()
 
+        # Z1: every authenticated RESPONSE positive's realized signer plan MUST resolve
+        # to exactly one active response-service enrollment bound to its audience.
+        for v in positive["vectors"]:
+            try:
+                o = decode(bytes.fromhex(v["cbor_hex"]))
+                bh = decode(o[0])
+            except Exception:  # noqa: BLE001
+                continue
+            if bh.get(H_TYP) != TYP_RESPONSE or H_KEYSET in bh:
+                continue
+            try:
+                pcl = decode(o[2])
+            except Exception:  # noqa: BLE001
+                pcl = None
+            aud = pcl.get(3) if isinstance(pcl, dict) else None
+            for grp in (bh.get(H_PLAN) or []):
+                pubs, ok = [], True
+                for comp in grp[3]:
+                    a, k = comp[1], comp[2]
+                    p = ed_by_kid.get(k) if a == ALG_ED25519 else ml_by_kid.get(k)
+                    if p is None:
+                        ok = False
+                        break
+                    pubs.append(p)
+                if not ok:
+                    continue
+                rtp = base64.urlsafe_b64encode(signer_suite_tp(grp[2], pubs)).rstrip(b"=").decode()
+                m = resolve_response_signer_enrollments(cd, aud, rtp)
+                for e in validate_response_signer_enrollment(m, rtp, aud, now):
+                    fail(f"{v['id']} response signer: {e}")
+
         def verify_at_jwt(token: str, label: str):
             parts = token.split(".")
             if len(parts) != 3:
@@ -1137,7 +1232,12 @@ def main() -> None:
                 fail(f"{label}: client_id must be a non-empty string (RFC 9068)")
             for te in validate_tenant(claims.get("tenant")):
                 fail(f"{label}: {te}")
-            if not (claims.get("iat", 0) <= now < claims.get("exp", 0)):
+            # Z2: iat/exp are integer NumericDate values (bool excluded) — validated
+            # BEFORE any comparison so a wrong type is a clean denial, not a TypeError.
+            nd_errs = validate_numericdate_claims(claims)
+            for e in nd_errs:
+                fail(f"{label}: {e}")
+            if not nd_errs and not (claims["iat"] <= now < claims["exp"]):
                 fail(f"{label}: not temporally valid at verifier_now {now}")
             if "hs_signer_suite" not in (claims.get("cnf") or {}):
                 fail(f"{label}: cnf lacks the hs_signer_suite confirmation")

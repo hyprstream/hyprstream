@@ -364,7 +364,16 @@ A conforming verifier is checked against at least:
 13. **(Y2) claim absence is distinguished from a present `null`/empty/whitespace/
     wrong-typed session identifier: a present `sid`/`workload_session_id` must be a
     non-empty opaque string or it fails closed directly in both layers, and a
-    credential never carries both identifiers.**
+    credential never carries both identifiers;**
+14. **(Z1) a response proof's signer is authorized only through authoritative off-wire
+    service trust state bound to the response audience (a `response-service`
+    enrollment keyed by the exact `aud` + signer-suite content), never a generic
+    known-`kid` lookup or a prose `role` string; the realized signer plan must resolve
+    exactly one active record for its audience, and unknown/wrong-role/wrong-audience/
+    inactive/expired/key-suite-mismatched/ambiguous records deny; and**
+15. **(Z2) `iat` and `exp` are integer Unix-second NumericDate values (Python `bool`
+    excluded), validated before any temporal comparison in both layers; a boolean,
+    string, `null`, float, or missing timestamp denies cleanly, never by exception.**
 
 ## 8. Frozen Gate-2 dispositions
 
