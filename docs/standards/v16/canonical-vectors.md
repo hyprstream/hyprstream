@@ -698,14 +698,32 @@ Ed25519 signature over the stripped object.
   signer-suite thumbprint over the record's own `suite_id` + ordered public keys
   and matching it to the `cnf`-bound signer suite (labels are never trusted). The
   gate and checker require an active, **unexpired**, `primary`-role record whose
-  `tenant`/`principal` equal the credential's, then **derive** the published
-  authenticated thumbprint from that record's `enrollment_epoch` and assert it
-  reproduces the frozen bytes for P-2/P-4/P-5/P-6/P-9. An **unknown**, tampered,
-  key/suite-mismatched, **inactive**, **expired**, **cross-tenant**,
-  **wrong-principal**, or **wrong-role** primary record denies, and an
-  `enrollment_epoch` change de-fangs the thumbprint (turning the gate red); primary
-  and approver records stay distinct while the S1 primary/approver resolved-key
-  alias denial is preserved. The unattributed preimage is
+  `tenant` equals the credential's and whose `principal` equals the credential's
+  **terminal signer principal**, then **derive** the published authenticated
+  thumbprint from that record's `enrollment_epoch` and assert it reproduces the
+  frozen bytes for P-2/P-4/P-5/P-6/P-9. The **terminal signer principal** (the party
+  `cnf` binds and who signs the downstream request) is the credential `sub` for an
+  ordinary credential (no `act`), and the **outermost `act.sub`** — the
+  current/terminal actor per RFC 8693 §4.1 — for an `act`-bearing `AsOriginator`
+  delegated credential (design §8.1), where `sub` stays the **originator** while
+  `cnf` binds the terminal actor. `cnf` is never re-bound to the originator (exact-key
+  binding still pins the terminal actor's ordered keys). Presence of `act` **fails
+  closed** unless it is an object with a non-empty outermost `act.sub`. An
+  **unknown**, tampered, key/suite-mismatched, **inactive**, **expired**,
+  **cross-tenant**, **wrong-(terminal-)principal**, **malformed-`act`**, or
+  **wrong-role** primary record denies, and an `enrollment_epoch` change de-fangs the
+  thumbprint (turning the gate red); primary and approver records stay distinct while
+  the S1 primary/approver resolved-key alias denial is preserved. **No `act`-bearing
+  credential ships as a fixture:** every frozen credential is ordinary
+  (`principal == sub`), so the delegated rule is byte-identical for the shipped
+  vectors and adding a delegated fixture would be non-bounded — it would require a
+  new credential, a distinct terminal-actor enrollment record, an `act` chain, and a
+  new positive→credential mapping, changing frozen fixture bytes and the Gate-2 fixture
+  contract. The delegated rule is therefore proven by a **synthetic in-tool guard**
+  over the shared resolver (ordinary→`sub`, `act`-bearing→outermost `act.sub`,
+  originator-named primary record rejected, malformed `act` fails closed; reverting
+  the resolver to the naive `sub`-fallback turns the gate red), with the normative
+  delta kept to the single §5/T1 clarification. The unattributed preimage is
   **content-bound (M1)**: `[sep, [ [suite_id, [ordered public keys]] per signer
   group ]]` — it binds each group's suite and its public keys in component order
   and **normalizes the attacker-chosen `group_id`/`kid` labels out**, exactly as

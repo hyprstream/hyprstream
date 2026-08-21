@@ -67,7 +67,7 @@ from check_proof_vectors import (  # noqa: E402
     decode, StrictError, validate_tenant, validate_session, resolve_session,
     resolve_approver_enrollment, validate_approver_enrollment,
     resolve_primary_enrollment, validate_primary_enrollment, authenticated_replay_thumbprint,
-    configured_issuer, is_credential_revoked,
+    configured_issuer, is_credential_revoked, terminal_signer_principal,
 )
 
 # ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
@@ -1224,7 +1224,10 @@ def gate_replay_thumbprints(cddl: str, positives) -> None:
     a_tp_b64 = _b64u(_suite_thumbprint(a_suite, a_pubs))
     prec = resolve_primary_enrollment(creds, a_tp_b64)
     hcred = creds["credentials"]["hybrid"]["claims"]
-    perrs = validate_primary_enrollment(prec, a_tp_b64, hcred["tenant"], hcred["sub"], creds["verifier_now"])
+    h_princ, h_perrs = terminal_signer_principal(hcred)
+    check(not h_perrs, f"the hybrid credential's terminal signer principal must be well-formed: {h_perrs}")
+    perrs = validate_primary_enrollment(prec, a_tp_b64, hcred["tenant"],
+                                        h_princ, creds["verifier_now"])
     check(not perrs, f"the authenticated thumbprint's primary enrollment must be valid: {perrs}")
     if prec is not None:
         derived = authenticated_replay_thumbprint(sep["authenticated"], a_suite, a_pubs,
@@ -2028,8 +2031,10 @@ def gate_credential_context(positives, negatives) -> None:
         # unexpired), recomputed by content — not merely resolve a cnf thumbprint.
         cnf_b64 = cred["claims"]["cnf"]["hs_signer_suite"]
         prec = resolve_primary_enrollment(creds, cnf_b64)
+        tprinc, tperrs = terminal_signer_principal(cred["claims"])
+        check(not tperrs, f"{pid}: credential terminal signer principal must be well-formed: {tperrs}")
         perrs = validate_primary_enrollment(prec, cnf_b64, cred["claims"]["tenant"],
-                                            cred["claims"]["sub"], now)
+                                            tprinc, now)
         check(not perrs, f"{pid}: cnf primary group must resolve a valid primary enrollment: {perrs}")
         pclaims = decode(obj[2])
         ch = pclaims.get(C_CREDENTIAL_HASH)
@@ -2201,9 +2206,13 @@ def gate_credential_context(positives, negatives) -> None:
     #      to a valid primary record; unknown/tampered/mismatched/wrong-role/tenant/
     #      principal/inactive/expired records each deny. Primary and approver records
     #      stay DISTINCT (a primary thumbprint resolves no approver, and vice versa).
-    cnf_hyb_b64 = creds["credentials"]["hybrid"]["claims"]["cnf"]["hs_signer_suite"]
-    p_tenant = creds["credentials"]["hybrid"]["claims"]["tenant"]
-    p_princ = creds["credentials"]["hybrid"]["claims"]["sub"]
+    hyb_claims = creds["credentials"]["hybrid"]["claims"]
+    cnf_hyb_b64 = hyb_claims["cnf"]["hs_signer_suite"]
+    p_tenant = hyb_claims["tenant"]
+    # T1: the Primary record principal is the credential's TERMINAL signer principal
+    # (sub for this ordinary, act-less credential — unchanged and byte-identical).
+    p_princ, p_princ_errs = terminal_signer_principal(hyb_claims)
+    check(not p_princ_errs, f"the hybrid credential terminal signer principal must be well-formed: {p_princ_errs}")
     prec_base = resolve_primary_enrollment(creds, cnf_hyb_b64)
     check(prec_base is not None, "the hybrid credential cnf must resolve a primary enrollment")
 
@@ -2229,6 +2238,45 @@ def gate_credential_context(positives, negatives) -> None:
           "the hybrid primary signer-suite record must not resolve an approver enrollment")
     print(f"   T1 cnf primary enrollment validated (content-recomputed; role/tenant/principal/"
           f"status/expiry); primary and approver records are distinct")
+
+    # ---- T1 delegated (AsOriginator, design §8.1): the Primary record principal is
+    #      the credential's TERMINAL signer principal, NOT unconditionally `sub`. For
+    #      an ordinary credential (no `act`) that is `sub` (unchanged, byte-identical);
+    #      for an `act`-bearing delegated credential `sub` stays the ORIGINATOR while
+    #      cnf binds the TERMINAL actor, so the principal is the outermost `act.sub`.
+    #      No A fixture carries `act`, so nothing regenerates — this is an in-tool
+    #      synthetic guard over the shared resolver (no new wire field / vector).
+    ordinary_princ, ordinary_errs = terminal_signer_principal(hyb_claims)
+    check(not ordinary_errs and ordinary_princ == hyb_claims["sub"],
+          "T1 delegated: an act-less credential's terminal principal must equal sub (unchanged)")
+    ORIGINATOR, TERMINAL = hyb_claims["sub"], "service-actor-1"
+    deleg_claims = {**hyb_claims, "act": {"sub": TERMINAL}}
+    deleg_princ, deleg_errs = terminal_signer_principal(deleg_claims)
+    check(not deleg_errs and deleg_princ == TERMINAL and deleg_princ != ORIGINATOR,
+          f"T1 delegated: an act-bearing credential's terminal principal must be the outermost "
+          f"act.sub ({TERMINAL!r}), not sub ({ORIGINATOR!r}); got {deleg_princ!r} {deleg_errs}")
+    # The cnf-bound primary record names the TERMINAL actor; it validates for the
+    # delegated credential, and a record naming the ORIGINATOR (== sub) is REJECTED —
+    # i.e. binding the primary principal to `sub` would over-reject B's valid §8.1
+    # output (the exact P1 this round closes).
+    deleg_rec_terminal = {**prec_base, "principal": TERMINAL}
+    deleg_rec_originator = {**prec_base, "principal": ORIGINATOR}
+    check(not validate_primary_enrollment(deleg_rec_terminal, cnf_hyb_b64, p_tenant, deleg_princ, now),
+          "T1 delegated: a primary record naming the TERMINAL actor must validate for the delegated credential")
+    check(bool(validate_primary_enrollment(deleg_rec_originator, cnf_hyb_b64, p_tenant, deleg_princ, now)),
+          "T1 delegated: a primary record naming the ORIGINATOR (== sub) must be REJECTED for the delegated credential")
+    # Fail closed on a malformed `act`: its mere PRESENCE requires an object carrying a
+    # non-empty outermost act.sub. A blanked/missing/non-string outer sub, or a
+    # non-object act, must NOT silently demote to the ordinary (principal == sub) path.
+    for label, bad_act in (("blank outer act.sub", {"sub": ""}),
+                           ("missing outer act.sub", {}),
+                           ("non-string outer act.sub", {"sub": 123}),
+                           ("act not an object", ["service-actor-1"])):
+        bp, berrs = terminal_signer_principal({**hyb_claims, "act": bad_act})
+        check(bp is None and bool(berrs),
+              f"T1 delegated: malformed act ({label}) must fail closed, not resolve to sub; got {bp!r} {berrs}")
+    print(f"   T1 delegated (§8.1): terminal signer principal = sub (no act) / outermost act.sub "
+          f"(act-bearing); originator-named primary record rejected; malformed act fails closed")
 
     # ---- G1: hybrid credentials are at+jwt-only; CWT cnf is single-key/classical.
     prof = CREDENTIAL_PATH.read_text()

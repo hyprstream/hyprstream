@@ -289,8 +289,10 @@ def validate_primary_enrollment(rec, requested_thumbprint_b64, expected_tenant, 
     """T1: a credential's cnf primary group MUST resolve to an authoritative PRIMARY
     enrollment whose OWN suite/keys recompute to the requested content thumbprint
     (record integrity + key/suite binding), that is an active, unexpired `primary`
-    role coherent with the credential tenant and principal. Returns the failure list;
-    an unknown, tampered, key/suite-mismatched, wrong-role, cross-tenant/principal,
+    role coherent with the credential tenant and TERMINAL signer principal (`sub` for
+    an ordinary credential, outermost `act.sub` for an act-bearing delegated one —
+    see terminal_signer_principal). Returns the failure list; an unknown, tampered,
+    key/suite-mismatched, wrong-role, cross-tenant, wrong-(terminal-)principal,
     inactive, or expired record denies."""
     if rec is None:
         return ["no authoritative primary enrollment for this signer-suite record"]
@@ -314,11 +316,40 @@ def validate_primary_enrollment(rec, requested_thumbprint_b64, expected_tenant, 
     if expected_tenant is not None and rec.get("tenant") != expected_tenant:
         errs.append(f"primary enrollment tenant {rec.get('tenant')!r} != credential tenant {expected_tenant!r}")
     if expected_principal is not None and rec.get("principal") != expected_principal:
-        errs.append(f"primary enrollment principal {rec.get('principal')!r} != credential subject {expected_principal!r}")
+        errs.append(f"primary enrollment principal {rec.get('principal')!r} != credential terminal signer principal {expected_principal!r}")
     ee = rec.get("enrollment_epoch")
     if isinstance(ee, bool) or not isinstance(ee, int) or ee < 0:
         errs.append(f"enrollment_epoch must be a non-negative integer, got {ee!r}")
     return errs
+
+
+def terminal_signer_principal(claims):
+    """T1: the credential's EFFECTIVE (terminal) signer principal — the party whose
+    key the cnf primary group binds and who signs the downstream request — as a
+    (principal, errors) pair. For an ordinary credential (no `act`) this is the
+    credential `sub`. For an `act`-bearing AsOriginator delegated credential (design
+    §8.1), `sub` stays the ORIGINATOR while the cnf binds the TERMINAL actor, so the
+    primary principal is the outermost `act.sub` — the current/terminal actor per RFC
+    8693 §4.1 (never `sub`, never an inner/earlier actor). The `act` claim is already
+    in profile scope (credential-profile.md claims table); this introduces no new wire
+    field.
+
+    Fail closed: the mere PRESENCE of `act` requires an object carrying a non-empty
+    outermost `act.sub`. A present-but-malformed `act` (not an object, or missing/
+    empty/non-string outermost `sub`) returns (None, [error]) so a malformed delegated
+    credential is never silently demoted to the ordinary (`principal == sub`) path and
+    thus never evades the delegated-primary rule."""
+    if not isinstance(claims, dict):
+        return None, ["credential claims are not an object"]
+    if "act" not in claims:
+        return claims.get("sub"), []
+    act = claims.get("act")
+    if not isinstance(act, dict):
+        return None, [f"act present but is not an object (got {type(act).__name__})"]
+    asub = act.get("sub")
+    if not isinstance(asub, str) or not asub:
+        return None, [f"act present but its outermost act.sub is missing/empty/non-string, got {asub!r}"]
+    return asub, []
 
 
 def authenticated_replay_thumbprint(domain, suite_id, pubs, enrollment_epoch):
@@ -743,8 +774,11 @@ def main() -> None:
                 hashlib.sha256(enc([a["suite_id"], a_pubs])).digest()).rstrip(b"=").decode()
             prec = resolve_primary_enrollment(cdoc, a_tp)
             hcl = cdoc["credentials"]["hybrid"]["claims"]
-            for e in validate_primary_enrollment(prec, a_tp, hcl.get("tenant"), hcl.get("sub"),
-                                                 cdoc.get("verifier_now")):
+            h_princ, h_perrs = terminal_signer_principal(hcl)
+            for e in h_perrs:
+                fail(f"authenticated primary enrollment terminal principal: {e}")
+            for e in validate_primary_enrollment(prec, a_tp, hcl.get("tenant"),
+                                                 h_princ, cdoc.get("verifier_now")):
                 fail(f"authenticated primary enrollment: {e}")
             if prec is not None and authenticated_replay_thumbprint(
                     sep["authenticated"], a["suite_id"], a_pubs,
@@ -930,8 +964,11 @@ def main() -> None:
             # enrollment record (active, role=primary, tenant/principal-coherent).
             cnf_b64 = cred_claims["cnf"]["hs_signer_suite"]
             prec = resolve_primary_enrollment(cd, cnf_b64)
+            c_princ, c_perrs = terminal_signer_principal(cred_claims)
+            for e in c_perrs:
+                fail(f"{pid} primary enrollment terminal principal: {e}")
             for e in validate_primary_enrollment(prec, cnf_b64, cred_claims.get("tenant"),
-                                                 cred_claims.get("sub"), now):
+                                                 c_princ, now):
                 fail(f"{pid} primary enrollment: {e}")
             # Q1: every ADDITIONAL (approver) signer group — content-resolved, not the
             # primary cnf group — must validate against an authoritative approver

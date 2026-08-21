@@ -263,13 +263,24 @@ backed by an idempotency/result ledger whose lookup binds the retrying principal
   thumbprint over its own `suite_id` + ordered public keys and matching it to the
   `cnf`-resolved signer suite — labels are never trusted. A conforming verifier
   requires an **active, unexpired** record with the **`primary` role** whose
-  `tenant` and `principal` equal the credential's `tenant` and subject, and a
-  non-negative integer enrollment epoch. The **authenticated replay-namespace
-  `enrollment_epoch` (§7.1) is taken from this resolved record, not from any wire
-  or vector value**, so the published authenticated thumbprint is reproducible only
-  from authoritative primary state; an unknown, tampered, key/suite-mismatched,
-  inactive, expired, cross-tenant, wrong-principal, or wrong-role primary record
-  denies. Primary and approver records are distinct, and the same resolved public
+  `tenant` equals the credential's `tenant` and whose `principal` equals the
+  credential's **terminal signer principal**, and a non-negative integer enrollment
+  epoch. The **terminal signer principal** is the party whose key `cnf` binds and
+  who signs the downstream request: it is the credential `sub` for an ordinary
+  credential (no `act`), and the **outermost `act.sub`** — the current/terminal
+  actor per RFC 8693 §4.1 — for an `act`-bearing `AsOriginator` delegated credential
+  (design §8.1), where `sub` stays the **originator** while `cnf` binds the terminal
+  actor (never `sub`, never an inner/earlier actor). Presence of `act` requires an
+  object carrying a non-empty outermost `act.sub`; a present-but-malformed `act`
+  **fails closed** (it is never demoted to the ordinary `principal == sub` path).
+  `cnf` is **never** re-bound to the originator — the exact-key binding still pins
+  the terminal actor's ordered keys — so this closes the delegated carve-out without
+  weakening any control or adding a wire field (`act` is already in the claims table
+  above). The **authenticated replay-namespace `enrollment_epoch` (§7.1) is taken
+  from this resolved record, not from any wire or vector value**, so the published
+  authenticated thumbprint is reproducible only from authoritative primary state; an
+  unknown, tampered, key/suite-mismatched, inactive, expired, cross-tenant,
+  wrong-(terminal-)principal, malformed-`act`, or wrong-role primary record denies. Primary and approver records are distinct, and the same resolved public
   key presented as both a `cnf` primary and an approver under different labels is
   denied (§7.1, content-identity uniqueness).
 - Presenting a credential never leaves a proof in the unattributed branch: with
