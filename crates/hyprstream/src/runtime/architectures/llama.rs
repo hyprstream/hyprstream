@@ -1074,7 +1074,11 @@ impl LlamaAttention {
             } else if q_len > 1 {
                 // Causal mask only when processing multiple query tokens (prompt
                 // phase); for q_len == 1 (decode) all past positions are valid.
-                let mask = Tensor::ones([q_len, k_len], (tch::Kind::Float, device)).tril(0);
+                // Offset by the cached history length: query row i sits at
+                // absolute position (k_len - q_len) + i, so it may attend keys
+                // 0..=(k_len - q_len + i). tril(0) would mask out all history
+                // whenever start_pos > 0 (e.g. partial prefill on a prefix hit).
+                let mask = Tensor::ones([q_len, k_len], (tch::Kind::Float, device)).tril(k_len - q_len);
                 let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
                 scores = scores.masked_fill(&mask.eq(0.0), -10000.0f64);
             }
@@ -1088,8 +1092,9 @@ impl LlamaAttention {
 
             scores.softmax(-1, tch::Kind::Float).matmul(&v)
         } else {
-            // Chunk over the query axis. Per-chunk causal mask `tril(start)` is the
-            // exact restriction of the full `tril(0)` mask to rows [start, start+cur),
+            // Chunk over the query axis. Per-chunk causal mask
+            // `tril(k_len - q_len + start)` is the exact restriction of the full
+            // causal mask (history offset + row index) to rows [start, start+cur),
             // so masking is identical to the single-shot path.
             let mut outputs: Vec<Tensor> = Vec::new();
             let mut start = 0i64;
@@ -1097,7 +1102,7 @@ impl LlamaAttention {
                 let cur = (q_len - start).min(CHUNK);
                 let q_chunk = q.narrow(2, start, cur); // [batch, heads, cur, dim]
                 let mut scores = q_chunk.matmul(&k_t) * (scale as f64); // [batch, heads, cur, k_len]
-                let mask = Tensor::ones([cur, k_len], (tch::Kind::Float, device)).tril(start);
+                let mask = Tensor::ones([cur, k_len], (tch::Kind::Float, device)).tril(k_len - q_len + start);
                 let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
                 scores = scores.masked_fill(&mask.eq(0.0), -10000.0f64);
                 outputs.push(scores.softmax(-1, tch::Kind::Float).matmul(&v)); // [batch, heads, cur, dim]
@@ -3729,6 +3734,54 @@ mod pipeline_tests {
             r_c.allclose(&b_c, 1e-4, 1e-4, false),
             "single-row batched decode diverged from serial (max_diff={max_diff})"
         );
+    }
+
+    /// Regression guard for the causal-mask offset in cached multi-token
+    /// forwards: with `q_len > 1` and `start_pos > 0` the mask must be
+    /// `tril(k_len - q_len)`, not `tril(0)` — otherwise every cached row attends
+    /// only to the first `i+1` keys and all prompt history is masked out. This
+    /// is exactly the serial partial-prefill shape taken on a session
+    /// prefix-cache hit with a >=2-token suffix. Compares LOGITS (not just
+    /// argmax) at fp tolerance.
+    #[test]
+    fn cached_two_token_forward_matches_serial_decode_steps() {
+        let prompt: [i64; 4] = [1, 5, 9, 2];
+
+        // Serial reference: prefill, then two one-token decode steps.
+        let serial = whole_model();
+        let prompt_t = Tensor::from_slice(&prompt).reshape([1, 4]);
+        let _ = serial.forward_with_cache(&prompt_t, 0).unwrap();
+        let ref1 = serial
+            .forward_with_cache(&Tensor::from_slice(&[11i64]).reshape([1, 1]), 4)
+            .unwrap();
+        let ref2 = serial
+            .forward_with_cache(&Tensor::from_slice(&[13i64]).reshape([1, 1]), 5)
+            .unwrap();
+
+        // Cached two-token forward at start_pos=4 (partial-prefill shape).
+        let cached = whole_model();
+        let _ = cached.forward_with_cache(&prompt_t, 0).unwrap();
+        let logits2 = cached
+            .forward_with_cache(&Tensor::from_slice(&[11i64, 13]).reshape([1, 2]), 4)
+            .unwrap();
+
+        let orig = serial.config.original_vocab_size as i64;
+        for (row, ref_l) in [(0i64, &ref1), (1, &ref2)] {
+            let got = logits2.select(1, row).select(0, 0).narrow(0, 0, orig);
+            let want = ref_l.select(0, 0).select(0, 0).narrow(0, 0, orig);
+            let max_diff = (&got - &want).abs().max().double_value(&[]);
+            assert!(
+                got.allclose(&want, 1e-4, 1e-4, false),
+                "cached 2-token forward row {row} diverged from the serial decode step \
+                 (max_diff={max_diff}); the causal mask must keep k_len - q_len history, \
+                 not tril(0)"
+            );
+            assert_eq!(
+                got.argmax(-1, false).int64_value(&[]),
+                want.argmax(-1, false).int64_value(&[]),
+                "row {row} argmax differs",
+            );
+        }
     }
 
     /// `forward_layers_train` must reject ranges outside the stage's owned window
