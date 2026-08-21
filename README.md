@@ -124,7 +124,9 @@ nix build github:hyprstream/hyprstream#cpu     # or #cuda / #rocm
 The canonical dual-architecture RPM is maintained and built in the
 [FerruleOS RPM repository](https://gitlab.com/cyberdione/ferruleos/rpms/-/tree/main/rpms/hyprstream).
 See [RPM packaging and installation](docs/rpm-packaging.md) for the package
-URL, provenance contract, and compatibility boundary.
+generation and channel contract, an exact checksum-pinned installation
+example, and the compatibility boundary. Rolling channel URLs are discovery
+pointers, not provenance pins.
 
 ### Building from source
 
