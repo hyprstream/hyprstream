@@ -145,8 +145,10 @@ authenticated-dispatch claims (`iss`, `sub`, service `aud`, `iat`/`exp`, unique
 shipped in [`proof-v1-credentials.json`](vectors/proof-v1-credentials.json) with
 the positive→credential map: a **classical** token (P-4/P-5/P-6, primary group
 `[client Ed25519]`) and a **hybrid** token (P-2, primary group `[client Ed25519,
-client ML-DSA-65]`). Each proof's `credential_hash` (−70001) is SHA-256 over the
-exact token bytes.
+client ML-DSA-65]`). Per the cross-suite component-key non-reuse rule (CDDL §6,
+gate §V1), the hybrid primary's Ed25519 component is a **distinct enrolled key**
+from the classical primary's key — the two enrollments share no component key. Each
+proof's `credential_hash` (−70001) is SHA-256 over the exact token bytes.
 
 The `cnf` uses a profile-defined confirmation method, `cnf.hs_signer_suite` =
 base64url(SHA-256(RFC 8949 det-CBOR `[suite_id, [ordered raw component public
@@ -830,8 +832,17 @@ therefore stated as verifier obligations rather than shipped here:
    `exp − verifier_now ≤` the per-disposition maximum lifetime) — needs a
    controlled clock.
 3. `challenge_accept_until` semantics and the single bounded retry.
-4. Component-key non-reuse across suites, profiles, and logical groups — a CI
-   enrollment check, not a wire vector.
+4. Component-key non-reuse across suites, profiles, and logical groups
+   (CDDL §6). The **cross-record enrollment** case — no component public key may be
+   enrolled in more than one enrollment record — is now mechanically enforced (gate
+   §V1 + checker) over the shipped `primary_enrollments`/`approver_enrollments`, with
+   canonical-bytes key identity (an uppercase/lowercase re-encoding of a key still
+   collides) and malformed component keys failing closed; a re-shared key across
+   records turns the gate red. The classical primary enrollment (`[client Ed25519]`)
+   and the hybrid primary enrollment (`[client Ed25519 (distinct hy key), client
+   ML-DSA-65]`) therefore share **no** component key. The remaining cross-*proof*
+   /cross-profile reuse (a live proof-plan key that also appears elsewhere at
+   authority-provisioning time) stays a CI enrollment-provisioning check.
 5. Sign-then-encrypt wrapper vectors, pending the COSE HPKE profile
    (watch item; nothing in this profile depends on it).
 6. A dedicated credential-plane positive vector set for the amendment-10 integer

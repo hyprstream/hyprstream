@@ -268,6 +268,10 @@ class MlDsaKey:
 
 
 KID_CLIENT_ED = b"client-ed25519-1"
+# V1 (CDDL §6, cross-suite component-key non-reuse): the hybrid suite's Ed25519
+# component is a DISTINCT enrolled key from the standalone classical enrollment's
+# key, so no component public key is enrolled for two suites at once.
+KID_CLIENT_ED_HY = b"client-ed25519-hy-1"
 KID_CLIENT_ML = b"client-mldsa65-1"
 KID_APPROVER_ED = b"approver-ed25519-1"
 KID_SERVICE_ED = b"service-ed25519-1"
@@ -364,6 +368,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         seed_c_ed, sk_c_ed = ed25519_key(0x00)
+        seed_c_ed_hy, sk_c_ed_hy = ed25519_key(0x01)  # V1: distinct hybrid-suite Ed25519 component
         seed_a_ed, sk_a_ed = ed25519_key(0x40)
         seed_s_ed, sk_s_ed = ed25519_key(0x60)
         seed_u_ed, sk_u_ed = ed25519_key(0x80)
@@ -379,12 +384,15 @@ def main() -> None:
         # ---- F2: deterministic profile-valid at+jwt credential context --------
         issuer_pub = sk_i_ed.public_key().public_bytes_raw()
         client_ed_pub = sk_c_ed.public_key().public_bytes_raw()
+        client_ed_hy_pub = sk_c_ed_hy.public_key().public_bytes_raw()  # V1: hybrid Ed25519 component
         approver_ed_pub = sk_a_ed.public_key().public_bytes_raw()  # Q1 approver enrollment
         # cnf-resolved signer-suite records for the authenticated positives'
-        # PRIMARY groups: classical = [client Ed25519]; hybrid = [client Ed25519,
+        # PRIMARY groups: classical = [client Ed25519]; hybrid = [client Ed25519 (hy),
         # client ML-DSA-65] (approver groups bind their own enrollment, never cnf).
+        # V1 (CDDL §6): the hybrid Ed25519 component is a DISTINCT enrolled key from
+        # the standalone classical enrollment — no component key is enrolled twice.
         cnf_classical = signer_suite_thumbprint(SUITE_CLASSICAL, [client_ed_pub])
-        cnf_hybrid = signer_suite_thumbprint(SUITE_HYBRID, [client_ed_pub, ml_client.public])
+        cnf_hybrid = signer_suite_thumbprint(SUITE_HYBRID, [client_ed_hy_pub, ml_client.public])
 
         # T1: authoritative off-wire PRIMARY enrollment records for the authenticated
         # credential path, keyed by cryptographic content (suite + ordered public
@@ -407,7 +415,7 @@ def main() -> None:
             }
 
         primary_enrollment_classical = primary_enrollment(SUITE_CLASSICAL, [client_ed_pub])
-        primary_enrollment_hybrid = primary_enrollment(SUITE_HYBRID, [client_ed_pub, ml_client.public])
+        primary_enrollment_hybrid = primary_enrollment(SUITE_HYBRID, [client_ed_hy_pub, ml_client.public])
 
         def build_at_jwt(jti: str, cnf_thumbprint: bytes, *, sid: str = None):
             """A compact JWS (RFC 7519/8725) access token: exact at+jwt header,
@@ -454,11 +462,18 @@ def main() -> None:
             ),
             "ed25519": [
                 {
-                    "role": "authenticated primary signer (credential cnf-bound)",
+                    "role": "authenticated primary signer (classical credential cnf-bound)",
                     "kid_hex": KID_CLIENT_ED.hex(),
                     "kid_ascii": KID_CLIENT_ED.decode(),
                     "seed_hex": seed_c_ed.hex(),
                     "public_hex": sk_c_ed.public_key().public_bytes_raw().hex(),
+                },
+                {
+                    "role": "authenticated primary signer (HYBRID credential cnf-bound, V1 distinct Ed25519 component)",
+                    "kid_hex": KID_CLIENT_ED_HY.hex(),
+                    "kid_ascii": KID_CLIENT_ED_HY.decode(),
+                    "seed_hex": seed_c_ed_hy.hex(),
+                    "public_hex": sk_c_ed_hy.public_key().public_bytes_raw().hex(),
                 },
                 {
                     "role": "approver signer group 2",
@@ -621,12 +636,14 @@ def main() -> None:
         )
 
         # ---------------- P-2: authenticated hybrid COSE_Sign ---------------
+        # V1: the Ed25519 component is the DISTINCT hybrid-suite key (KID_CLIENT_ED_HY),
+        # matching the hybrid primary enrollment / cnf — never the classical key.
         plan_hybrid = [
             group(
                 1,
                 SUITE_HYBRID,
                 [
-                    component(ALG_ED25519, KID_CLIENT_ED),
+                    component(ALG_ED25519, KID_CLIENT_ED_HY),
                     component(ALG_ML_DSA_65, KID_CLIENT_ML),
                 ],
             )
@@ -643,10 +660,10 @@ def main() -> None:
                 {
                     H_ALG: ALG_ED25519,
                     H_CRIT: CRIT_SIGN_SIGNATURE,
-                    H_KID: KID_CLIENT_ED,
+                    H_KID: KID_CLIENT_ED_HY,
                     H_GROUP: 1,
                 },
-                sk_c_ed,
+                sk_c_ed_hy,
             ),
             (
                 {
@@ -1021,19 +1038,21 @@ def main() -> None:
             deny_rule="typ and hs_domain must both match the request-proof profile",
         )
 
-        # N-5: stripped ML-DSA component.
+        # N-5: stripped ML-DSA component. The retained Ed25519 entry matches the
+        # hybrid plan's Ed25519 component (V1 distinct hybrid key), so only the ML
+        # component is left uncovered.
         n5_body = enc(p2_body)
         n5_first_prot = enc(
             {
                 H_ALG: ALG_ED25519,
                 H_CRIT: CRIT_SIGN_SIGNATURE,
-                H_KID: KID_CLIENT_ED,
+                H_KID: KID_CLIENT_ED_HY,
                 H_GROUP: 1,
             }
         )
         n5_tbs = sig_structure_sign(n5_body, n5_first_prot, p2_payload)
         n5 = enc(
-            [n5_body, {}, p2_payload, [[n5_first_prot, {}, sk_c_ed.sign(n5_tbs)]]]
+            [n5_body, {}, p2_payload, [[n5_first_prot, {}, sk_c_ed_hy.sign(n5_tbs)]]]
         )
         record(
             negatives,
@@ -2257,7 +2276,7 @@ def main() -> None:
                 "header": hdr_hybrid,
                 "claims": claims_hybrid,
                 "primary_suite": SUITE_HYBRID,
-                "cnf_preimage_hex": enc([SUITE_HYBRID, [client_ed_pub, ml_client.public]]).hex(),
+                "cnf_preimage_hex": enc([SUITE_HYBRID, [client_ed_hy_pub, ml_client.public]]).hex(),
                 "cnf_thumbprint_b64": b64u(cnf_hybrid),
                 "token_sha256": CREDENTIAL_HASH_HYBRID.hex(),
             },
@@ -2395,12 +2414,14 @@ def main() -> None:
     # enrollment record (the hybrid primary example here), not a fixture literal.
     enrollment_epoch = primary_enrollment_hybrid["enrollment_epoch"]
     client_ed_pub = sk_c_ed.public_key().public_bytes_raw()
+    client_ed_hy_pub = sk_c_ed_hy.public_key().public_bytes_raw()
     # Authenticated example: the hybrid primary group (P-2's suite + ordered
-    # public component keys), approver groups excluded.
+    # public component keys), approver groups excluded. V1: the Ed25519 component
+    # is the DISTINCT hybrid-suite key.
     auth_preimage = enc([
         replay_domain_authenticated,
         SUITE_HYBRID,
-        [client_ed_pub, ml_client.public],
+        [client_ed_hy_pub, ml_client.public],
         enrollment_epoch,
     ])
     auth_thumbprint = hashlib.sha256(auth_preimage).digest()
@@ -2451,7 +2472,7 @@ def main() -> None:
         "authenticated": {
             "note": "credential-bound primary signer-suite thumbprint (design §4.5/§4.6); approver groups excluded",
             "suite_id": SUITE_HYBRID,
-            "component_public_keys_hex": [client_ed_pub.hex(), ml_client.public.hex()],
+            "component_public_keys_hex": [client_ed_hy_pub.hex(), ml_client.public.hex()],
             "enrollment_epoch": enrollment_epoch,
             "preimage_hex": auth_preimage.hex(),
             "thumbprint_sha256": auth_thumbprint.hex(),

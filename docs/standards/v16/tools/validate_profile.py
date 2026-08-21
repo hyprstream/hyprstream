@@ -68,6 +68,7 @@ from check_proof_vectors import (  # noqa: E402
     resolve_approver_enrollment, validate_approver_enrollment,
     resolve_primary_enrollment, validate_primary_enrollment, authenticated_replay_thumbprint,
     configured_issuer, is_credential_revoked, terminal_signer_principal,
+    cross_record_component_key_conflicts,
 )
 
 # ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
@@ -1938,6 +1939,55 @@ def _suite_thumbprint(suite, pubs):
     return hashlib.sha256(_enc([suite, list(pubs)])).digest()
 
 
+def gate_enrollment_key_uniqueness() -> None:
+    section("V1. Cross-record enrollment component-key uniqueness (CDDL §6)")
+    creds = _load_credentials()
+    # CDDL §6: a component key enrolled for one suite MUST NOT be simultaneously
+    # enrolled for another suite/record. The shipped enrollment context must obey it.
+    conflicts = cross_record_component_key_conflicts(creds)
+    check(not conflicts,
+          f"no component public key may be enrolled in two enrollment records: {conflicts}")
+    total = sum(len(creds.get(k, [])) for k in ("primary_enrollments", "approver_enrollments"))
+    keys = sum(len(e.get("component_public_keys_hex", []))
+               for k in ("primary_enrollments", "approver_enrollments") for e in creds.get(k, []))
+    # Causal counter-case: re-sharing a component key across two records MUST be
+    # detected. If the check were neutralized (always "no conflict"), this assertion
+    # fails and the gate turns red — so the guard is load-bearing.
+    import copy
+    mutated = copy.deepcopy(creds)
+    prims = mutated.get("primary_enrollments", [])
+    classical = next((e for e in prims if e["suite_id"] == SUITE_CLASSICAL), None)
+    hybrid = next((e for e in prims if e["suite_id"] == SUITE_HYBRID), None)
+    check(classical is not None and hybrid is not None,
+          "expected a classical and a hybrid primary enrollment to build the counter-case")
+    if classical is not None and hybrid is not None:
+        classical_key = classical["component_public_keys_hex"][0]
+        # (a) reintroduce the exact V1 defect: the hybrid Ed25519 component re-uses
+        # the classical enrollment's key (verbatim spelling).
+        hybrid["component_public_keys_hex"][0] = classical_key
+        reshared = cross_record_component_key_conflicts(mutated)
+        check(bool(reshared),
+              "the cross-record uniqueness check MUST flag a re-shared component key "
+              "(else it is not load-bearing)")
+        check(any(k == classical_key for k, _ in reshared),
+              "the flagged conflict must be the re-shared classical Ed25519 component")
+        # (b) canonical-bytes identity, not hex spelling: the SAME key re-encoded in
+        # UPPERCASE hex must still collide (a raw-string check would miss it).
+        mutated_up = copy.deepcopy(creds)
+        hyb_up = next(e for e in mutated_up["primary_enrollments"] if e["suite_id"] == SUITE_HYBRID)
+        hyb_up["component_public_keys_hex"][0] = classical_key.upper()
+        check(bool(cross_record_component_key_conflicts(mutated_up)),
+              "an uppercase re-encoding of a shared key MUST still be flagged (canonical-bytes identity)")
+        # (c) malformed component key fails closed (always reported).
+        mutated_bad = copy.deepcopy(creds)
+        hyb_bad = next(e for e in mutated_bad["primary_enrollments"] if e["suite_id"] == SUITE_HYBRID)
+        hyb_bad["component_public_keys_hex"][0] = "zz-not-hex"
+        check(bool(cross_record_component_key_conflicts(mutated_bad)),
+              "a malformed (non-hex) component key MUST fail closed as a problem")
+    print(f"   {keys} component keys across {total} enrollment records are pairwise distinct "
+          f"(canonical bytes); re-share / uppercase-alias / malformed-key each detected")
+
+
 def gate_verifier_clock(positives, negatives) -> None:
     section("F1. Deterministic verifier clock (verifier_now)")
     creds = _load_credentials()
@@ -2446,6 +2496,7 @@ def main() -> None:
     gate_group_cap_isolation(cddl, negatives)
     gate_verifier_clock(positives, negatives)
     gate_credential_context(positives, negatives)
+    gate_enrollment_key_uniqueness()
     gate_canonical(positives, negatives)
 
     print()

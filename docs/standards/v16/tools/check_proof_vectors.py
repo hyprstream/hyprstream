@@ -323,6 +323,37 @@ def validate_primary_enrollment(rec, requested_thumbprint_b64, expected_tenant, 
     return errs
 
 
+def cross_record_component_key_conflicts(creds_doc):
+    """V1 (CDDL §6, cross-suite component-key non-reuse): a component key enrolled
+    for one suite MUST NOT be simultaneously enrolled for another suite/record. Sweep
+    every authoritative enrollment record (primary_enrollments + approver_enrollments)
+    and return the problems — a list of `(identity, [record descriptors])`.
+
+    Key identity is the CANONICAL raw bytes (`bytes.fromhex`), NOT the hex spelling, so
+    an uppercase/lowercase re-encoding of the same key collides and cannot evade the
+    check. A malformed (non-string or non-hex) component key **fails closed** — it is
+    always reported as a problem. Empty == every well-formed component key is enrolled
+    in at most one record. A raw Ed25519 key cannot collide with a raw ML-DSA key
+    (distinct byte lengths), so the raw bytes are a sound identity."""
+    seen = {}       # canonical raw bytes -> [descriptors]
+    problems = []   # malformed component keys, always reported (fail closed)
+    for kind in ("primary_enrollments", "approver_enrollments"):
+        for i, e in enumerate(creds_doc.get(kind, [])):
+            desc = f"{kind}[{i}] suite={e.get('suite_id')!r} role={e.get('role')!r}"
+            for h in e.get("component_public_keys_hex", []):
+                if not isinstance(h, str):
+                    problems.append((f"<non-string component key {h!r}>", [desc]))
+                    continue
+                try:
+                    raw = bytes.fromhex(h)
+                except ValueError:
+                    problems.append((f"<malformed hex component key {h!r}>", [desc]))
+                    continue
+                seen.setdefault(raw, []).append(desc)
+    conflicts = [(raw.hex(), recs) for raw, recs in seen.items() if len(recs) > 1]
+    return problems + conflicts
+
+
 def terminal_signer_principal(claims):
     """T1: the credential's EFFECTIVE (terminal) signer principal — the party whose
     key the cnf primary group binds and who signs the downstream request — as a
@@ -869,6 +900,10 @@ def main() -> None:
         now = cd.get("verifier_now")
         if not isinstance(now, int):
             fail("verifier_now must be a declared integer")
+        # V1 (CDDL §6): no component public key may be enrolled in two enrollment
+        # records (cross-suite component-key non-reuse; identity is canonical bytes).
+        for ident, recs in cross_record_component_key_conflicts(cd):
+            fail(f"enrollment component-key uniqueness violation ({ident[:32]}…): {recs}")
         issuer_pub = bytes.fromhex(cd["issuer"]["public_hex"])
         issuer_kid = cd["issuer"]["kid"]
         pos_by_id = {v["id"]: v for v in positive["vectors"]}
