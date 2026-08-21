@@ -1931,6 +1931,16 @@ pub struct KVCacheManager {
     access_count: AtomicU64,
     /// Token IDs this cache was computed for (for prefix matching across turns)
     cached_token_ids: Vec<i64>,
+    /// Recurrent-state (SSM conv/rec) snapshot for hybrid models (Qwen3.5 GDN),
+    /// captured at the end of the prefill that produced `cached_token_ids`.
+    ///
+    /// Unlike KV, recurrent state is Markovian and cannot be truncated to an
+    /// arbitrary prefix position — a prefix hit is only exact when the FULL
+    /// cached token sequence matched and this snapshot is restored alongside
+    /// the KV truncation. One snapshot per cache, overwritten each turn;
+    /// `None` for pure-attention models. Tensors are deep copies, independent
+    /// of subsequent forward-pass mutations of the live model state.
+    ssm_snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>,
     /// Where this cache's tensors currently reside
     location: CacheLocation,
     /// Compatibility fingerprint under which this cache's KV was produced
@@ -1963,6 +1973,7 @@ impl KVCacheManager {
             last_access_ms: AtomicU64::new(current_timestamp_ms()),
             access_count: AtomicU64::new(0),
             cached_token_ids: Vec::new(),
+            ssm_snapshot: None,
             location: CacheLocation::Gpu,
             compat_fingerprint: None,
         }
@@ -1998,6 +2009,7 @@ impl KVCacheManager {
             last_access_ms: AtomicU64::new(current_timestamp_ms()),
             access_count: AtomicU64::new(0),
             cached_token_ids: Vec::new(),
+            ssm_snapshot: None,
             location: CacheLocation::Gpu,
             compat_fingerprint: None,
         }
@@ -2129,7 +2141,22 @@ impl KVCacheManager {
             return 0;
         }
 
-        self.layer_caches.iter().map(|c| c.memory_usage()).sum()
+        // Include the SSM snapshot (Qwen3.5 GDN conv/rec state): it holds
+        // device tensors and must count toward the eviction budget, or
+        // `evict_to_budget` undercounts and skips offloading.
+        let ssm_bytes: usize = self
+            .ssm_snapshot
+            .as_ref()
+            .map(|(conv, rec)| {
+                conv.iter()
+                    .chain(rec.iter())
+                    .flatten()
+                    .map(|t| t.numel() * dtype_element_size(t.kind()))
+                    .sum()
+            })
+            .unwrap_or(0);
+
+        self.layer_caches.iter().map(|c| c.memory_usage()).sum::<usize>() + ssm_bytes
     }
 
     /// Get the quantization type
@@ -2168,8 +2195,40 @@ impl KVCacheManager {
     /// Record which tokens this cache was computed for.
     ///
     /// Called after generation completes so the next turn can detect prefix overlap.
+    /// Any prior SSM snapshot is dropped: tokens recorded without a known
+    /// recurrent state must not resurrect a stale one.
     pub fn set_cached_tokens(&mut self, tokens: Vec<i64>) {
+        self.set_cached_tokens_with_ssm(tokens, None);
+    }
+
+    /// Record which tokens this cache was computed for, together with the
+    /// recurrent-state (SSM conv/rec) snapshot as of the end of the prefill
+    /// that produced them (hybrid models only; `None` for pure attention).
+    ///
+    /// The snapshot is what makes a later prefix hit rewindable for recurrent
+    /// layers: KV truncates to the matched prefix, the snapshot restores the
+    /// GDN conv/rec state to the end of the cached sequence.
+    pub fn set_cached_tokens_with_ssm(
+        &mut self,
+        tokens: Vec<i64>,
+        ssm_snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>,
+    ) {
         self.cached_token_ids = tokens;
+        self.ssm_snapshot = ssm_snapshot;
+    }
+
+    /// Deep-copied SSM snapshot for restore on a prefix hit.
+    ///
+    /// Returns deep copies (same `.copy()` discipline as
+    /// `Qwen3_5Model::snapshot_ssm_states`) so that restoring into the live
+    /// model state never aliases — and cannot mutate — the stored snapshot.
+    pub fn ssm_snapshot(&self) -> Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)> {
+        self.ssm_snapshot.as_ref().map(|(conv, rec)| {
+            (
+                conv.iter().map(|opt| opt.as_ref().map(Tensor::copy)).collect(),
+                rec.iter().map(|opt| opt.as_ref().map(Tensor::copy)).collect(),
+            )
+        })
     }
 
     /// Get the cached token IDs (for debugging/metrics).
@@ -2205,6 +2264,13 @@ impl KVCacheManager {
         for mut cache_ref in self.layer_caches.iter_mut() {
             cache_ref.to_device(tch::Device::Cpu);
         }
+        // Carry the SSM snapshot with the cache so a later restore + prefix
+        // hit still finds matching-device state.
+        if let Some((conv, rec)) = &mut self.ssm_snapshot {
+            for t in conv.iter_mut().chain(rec.iter_mut()).flatten() {
+                *t = t.to_device(tch::Device::Cpu);
+            }
+        }
         self.location = CacheLocation::Cpu;
         tracing::debug!(
             "Offloaded KV cache to CPU ({} tokens, {} layers)",
@@ -2222,6 +2288,11 @@ impl KVCacheManager {
         }
         for mut cache_ref in self.layer_caches.iter_mut() {
             cache_ref.to_device(device);
+        }
+        if let Some((conv, rec)) = &mut self.ssm_snapshot {
+            for t in conv.iter_mut().chain(rec.iter_mut()).flatten() {
+                *t = t.to_device(device);
+            }
         }
         self.location = CacheLocation::Gpu;
         tracing::debug!(
@@ -2355,6 +2426,28 @@ mod tests {
         let manager = KVCacheManager::new(num_layers, max_seq_len, KVQuantType::Nf4);
 
         assert_eq!(manager.quant_type(), KVQuantType::Nf4);
+    }
+
+    /// The SSM snapshot (Qwen3.5 GDN conv/rec state) holds device tensors and
+    /// must count toward the eviction budget: `memory_usage` grows when a
+    /// snapshot is recorded and shrinks back when it is dropped.
+    #[test]
+    fn test_memory_usage_includes_ssm_snapshot() {
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+        let baseline = manager.memory_usage();
+
+        let opt = (DType::Float, Device::Cpu);
+        let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
+        let rec = vec![Some(Tensor::zeros([4], opt)), None];
+        let expected = (2 * 3 + 4) * dtype_element_size(DType::Float);
+
+        manager.set_cached_tokens_with_ssm(vec![1, 2, 3], Some((conv, rec)));
+        assert_eq!(manager.memory_usage(), baseline + expected);
+
+        // Recording tokens without a snapshot drops it (no stale state) and
+        // the budget accounting shrinks back.
+        manager.set_cached_tokens(vec![1, 2, 3, 4]);
+        assert_eq!(manager.memory_usage(), baseline);
     }
 
     #[test]

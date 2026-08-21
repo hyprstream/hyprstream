@@ -2901,4 +2901,275 @@ mod pipeline_tests {
         assert!(stage.forward_layers_train(&emb, 0..2, None).is_err(), "range below window");
         assert!(stage.forward_layers_train(&emb, 2..LAYERS, None).is_ok(), "owned range ok");
     }
+
+    // ========================================================================
+    // Session prefix-cache rewind: GDN conv/rec state must be rewound alongside
+    // the KV cache on a prefix hit, or multi-turn sessions decode with the
+    // previous turn's recurrent state.
+    // ========================================================================
+
+    use parking_lot::Mutex;
+
+    fn session_cache() -> Arc<Mutex<KVCacheManager>> {
+        Arc::new(Mutex::new(KVCacheManager::new(LAYERS, 64, KVQuantType::None)))
+    }
+
+    /// Greedy argmax of a `[1, 1, vocab]` logits tensor.
+    fn greedy_next(logits: &Tensor) -> i64 {
+        logits
+            .select(0, 0)
+            .select(0, 0)
+            .argmax(0, false)
+            .int64_value(&[])
+    }
+
+    /// Drive one session turn the way `TextStream` does: prefill
+    /// `prompt[prefill_start..]` at `prefill_start`, then greedily decode
+    /// `n_decode` tokens. Returns the generated token IDs, the per-step decode
+    /// logits (`[vocab]` each), and the SSM (conv/rec) snapshot as of
+    /// end-of-prefill.
+    fn run_turn(
+        model: &Qwen3_5Model,
+        prompt: &[i64],
+        prefill_start: usize,
+        n_decode: usize,
+    ) -> (
+        Vec<i64>,
+        Vec<Tensor>,
+        (Vec<Option<Tensor>>, Vec<Option<Tensor>>),
+    ) {
+        let _g = tch::no_grad_guard();
+        let prefill = Tensor::from_slice(&prompt[prefill_start..])
+            .reshape([1, (prompt.len() - prefill_start) as i64]);
+        let logits = model.forward_with_cache(&prefill, prefill_start).unwrap();
+        // Engine captures the SSM snapshot here (TextStream::sample_next_token),
+        // before decode advances the recurrent state.
+        let ssm = model.snapshot_ssm_states();
+
+        let mut out = Vec::with_capacity(n_decode);
+        let mut step_logits = Vec::with_capacity(n_decode);
+        let mut next = greedy_next(&logits);
+        out.push(next);
+        step_logits.push(logits.select(0, 0).select(0, 0));
+        for pos in prompt.len()..prompt.len() + n_decode - 1 {
+            let step = Tensor::from_slice(&[next]).reshape([1, 1]);
+            let logits = model.forward_with_cache(&step, pos).unwrap();
+            next = greedy_next(&logits);
+            out.push(next);
+            step_logits.push(logits.select(0, 0).select(0, 0));
+        }
+        (out, step_logits, ssm)
+    }
+
+    /// Assert two per-step logit traces match step-for-step.
+    fn assert_logits_match(actual: &[Tensor], expected: &[Tensor], context: &str) {
+        assert_eq!(actual.len(), expected.len(), "{context}: step count");
+        for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+            let max_diff = (a - e).abs().max().double_value(&[]);
+            assert!(
+                a.allclose(e, 1e-5, 1e-5, false),
+                "{context}: decode step {i} logits diverged (max_diff={max_diff})"
+            );
+        }
+    }
+
+    /// Bug characterization (non-vacuity guard for the regression test below):
+    /// the pre-fix hit path — `truncate_to` only, no SSM rewind — leaves the
+    /// GDN conv/rec state reflecting turn 1's generation, and turn 2's decode
+    /// MUST diverge from a fresh-cache reference. If this ever stops
+    /// diverging, the fixture no longer exercises the bug and
+    /// `session_prefix_hit_restores_ssm_state_matches_fresh_cache` is vacuous.
+    /// (Logits are compared directly: with tiny random weights the argmax can
+    /// coincide even when the state is wrong.)
+    #[test]
+    fn session_prefix_hit_without_ssm_rewind_diverges_from_fresh_cache() {
+        let prompt1 = [1i64, 5, 9, 2, 7, 3];
+        let suffix = [8i64, 4];
+        let prompt2: Vec<i64> = prompt1.iter().chain(&suffix).copied().collect();
+
+        // Session model: turn 1, then turn 2 with the old truncate-only hit path.
+        let model = whole_model();
+        let cache = session_cache();
+        let mut m = model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, cache.clone());
+        let model = m;
+
+        let (_gen1, _logits1, _ssm1) = run_turn(&model, &prompt1, 0, 3);
+        cache.lock().set_cached_tokens(prompt1.to_vec());
+
+        let prefix_len = cache.lock().prefix_match_len(&prompt2);
+        assert_eq!(prefix_len, prompt1.len());
+        cache.lock().truncate_to(prefix_len);
+        let (_gen2_stale, logits2_stale, _ssm2) = run_turn(&model, &prompt2, prefix_len, 4);
+
+        // Reference: fresh model + fresh cache, full prefill of turn 2's prompt.
+        let ref_model = whole_model();
+        let ref_cache = session_cache();
+        let mut m = ref_model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, ref_cache);
+        let ref_model = m;
+        let (_gen2_ref, logits2_ref, _ssm_ref) = run_turn(&ref_model, &prompt2, 0, 4);
+
+        let max_diff: f64 = logits2_stale
+            .iter()
+            .zip(&logits2_ref)
+            .map(|(a, e)| (a - e).abs().max().double_value(&[]))
+            .fold(0.0, f64::max);
+        assert!(
+            max_diff > 1e-5,
+            "stale-state fixture must diverge from fresh cache (max_diff={max_diff}); \
+             otherwise the rewind regression test proves nothing"
+        );
+    }
+
+    /// Regression test: a session prefix-cache hit must rewind the GDN conv/rec
+    /// state (via the end-of-prefill snapshot saved with the cached tokens)
+    /// alongside the KV truncation. The rewound run must reproduce, to
+    /// bit-exact tolerance, the oracle computation "prefill the cached prompt,
+    /// then continue with the new suffix" (split-prefill ground truth), and
+    /// its greedy tokens must match a monolithic fresh-cache prefill
+    /// token-for-token. Exercises the production rewind seam
+    /// `torch_engine::rewind_session_state`.
+    #[test]
+    fn session_prefix_hit_restores_ssm_state_matches_fresh_cache() {
+        let prompt1 = [1i64, 5, 9, 2, 7, 3];
+        let suffix = [8i64, 4];
+        let prompt2: Vec<i64> = prompt1.iter().chain(&suffix).copied().collect();
+
+        // Session model: turn 1, save tokens + end-of-prefill SSM snapshot.
+        let model = whole_model();
+        let cache = session_cache();
+        let mut m = model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, cache.clone());
+        let model = m;
+
+        let (_gen1, _logits1, ssm1) = run_turn(&model, &prompt1, 0, 3);
+        cache
+            .lock()
+            .set_cached_tokens_with_ssm(prompt1.to_vec(), Some(ssm1));
+
+        // Turn 2: full cached prefix matches — the production rewind must
+        // restore the snapshot and reuse the prefix.
+        let prefix_len = cache.lock().prefix_match_len(&prompt2);
+        assert_eq!(prefix_len, prompt1.len());
+        let start = crate::runtime::torch_engine::rewind_session_state(&model, prefix_len);
+        assert_eq!(start, prompt1.len(), "full cached prefix must be reusable");
+        let (gen2, logits2, _ssm2) = run_turn(&model, &prompt2, start, 4);
+
+        // Oracle: fresh model, genuinely prefill prompt1 (no decode), then
+        // continue with the suffix — the exact computation the rewind is
+        // supposed to reproduce.
+        let oracle_model = whole_model();
+        let oracle_cache = session_cache();
+        let mut m = oracle_model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, oracle_cache);
+        let oracle_model = m;
+        {
+            let _g = tch::no_grad_guard();
+            let prefill1 = Tensor::from_slice(&prompt1).reshape([1, prompt1.len() as i64]);
+            let _ = oracle_model.forward_with_cache(&prefill1, 0).unwrap();
+        }
+        let (gen2_oracle, logits2_oracle, _ssm_o) =
+            run_turn(&oracle_model, &prompt2, prompt1.len(), 4);
+
+        assert_eq!(gen2, gen2_oracle, "rewound run must match split-prefill oracle");
+        assert_logits_match(&logits2, &logits2_oracle, "rewound run vs split-prefill oracle");
+
+        // Contract-level check: greedy tokens must also match a monolithic
+        // fresh-cache prefill of turn 2's full prompt. (Logits are NOT
+        // compared here: split vs monolithic prefill legitimately differ by
+        // float reassociation, exactly as for pure-attention KV prefix reuse.)
+        let ref_model = whole_model();
+        let ref_cache = session_cache();
+        let mut m = ref_model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, ref_cache);
+        let ref_model = m;
+        let (gen2_ref, _logits2_ref, _ssm_ref) = run_turn(&ref_model, &prompt2, 0, 4);
+        assert_eq!(
+            gen2, gen2_ref,
+            "prefix-hit decode must match a fresh-cache run token-for-token"
+        );
+    }
+
+    /// A PARTIAL prefix match (divergence inside the cached sequence) cannot
+    /// rewind the Markovian recurrent state to an intermediate position, so
+    /// the production rewind must discard the cache and force a full recompute
+    /// — which must then match a fresh-cache reference exactly.
+    #[test]
+    fn session_partial_prefix_match_forces_full_recompute() {
+        let prompt1 = [1i64, 5, 9, 2, 7, 3];
+        // Shares only the first 3 tokens with prompt1.
+        let prompt2 = [1i64, 5, 9, 4, 8, 6, 2];
+
+        let model = whole_model();
+        let cache = session_cache();
+        let mut m = model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, cache.clone());
+        let model = m;
+
+        let (_gen1, _logits1, ssm1) = run_turn(&model, &prompt1, 0, 3);
+        cache
+            .lock()
+            .set_cached_tokens_with_ssm(prompt1.to_vec(), Some(ssm1));
+
+        let prefix_len = cache.lock().prefix_match_len(&prompt2);
+        assert!(0 < prefix_len && prefix_len < prompt1.len());
+        let start = crate::runtime::torch_engine::rewind_session_state(&model, prefix_len);
+        assert_eq!(start, 0, "partial prefix match must force full recompute");
+        // The rewind must also have reset the live SSM state (no leakage of
+        // turn 1's recurrent state into the recomputed prefill).
+        assert!(model.conv_states.lock().iter().all(Option::is_none));
+        assert!(model.rec_states.lock().iter().all(Option::is_none));
+
+        let (gen2, logits2, _ssm2) = run_turn(&model, &prompt2, 0, 4);
+
+        let ref_model = whole_model();
+        let ref_cache = session_cache();
+        let mut m = ref_model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, ref_cache);
+        let ref_model = m;
+        let (gen2_ref, logits2_ref, _ssm_ref) = run_turn(&ref_model, &prompt2, 0, 4);
+
+        assert_eq!(gen2, gen2_ref);
+        assert_logits_match(&logits2, &logits2_ref, "recomputed prefill vs fresh cache");
+    }
+
+    /// Prefix MISS / stateless reset guard: `clear_kv_cache` (what the engine
+    /// calls on a miss and for non-session requests) must fully reset the GDN
+    /// conv/rec state, so no recurrent state leaks across requests.
+    #[test]
+    fn clear_kv_cache_fully_resets_ssm_state() {
+        let prompt = [1i64, 5, 9, 2, 7, 3];
+
+        let model = whole_model();
+        let cache = session_cache();
+        let mut m = model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, cache);
+        let model = m;
+
+        let _ = run_turn(&model, &prompt, 0, 2);
+        assert!(model.conv_states.lock().iter().any(Option::is_some));
+        assert!(model.rec_states.lock().iter().any(Option::is_some));
+
+        <Qwen3_5Model as ModelOperations>::clear_kv_cache(&model);
+        assert!(
+            model.conv_states.lock().iter().all(Option::is_none),
+            "conv state must be reset on cache clear"
+        );
+        assert!(
+            model.rec_states.lock().iter().all(Option::is_none),
+            "rec state must be reset on cache clear"
+        );
+
+        // And a post-clear run must match a fresh-model run exactly.
+        let (gen, logits, _ssm) = run_turn(&model, &prompt, 0, 3);
+        let ref_model = whole_model();
+        let ref_cache = session_cache();
+        let mut m = ref_model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, ref_cache);
+        let ref_model = m;
+        let (gen_ref, logits_ref, _ssm_ref) = run_turn(&ref_model, &prompt, 0, 3);
+        assert_eq!(gen, gen_ref);
+        assert_logits_match(&logits, &logits_ref, "post-clear run vs fresh model");
+    }
 }
