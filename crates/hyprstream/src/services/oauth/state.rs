@@ -1036,6 +1036,13 @@ pub struct RefreshTokenEntry {
     /// keeps the generic OAuth 2.1 rotation path unchanged.
     #[serde(default)]
     pub ucan_grant: Option<UcanGrantRefresh>,
+    /// OIDC session ID (`sid`) of the interactive session this refresh token
+    /// belongs to. The same session spans every rotation (distinct credential
+    /// IDs, one stable sid — v16 §3.3); the refresh path checks it against
+    /// the session authority before consuming the single-use token, so a
+    /// revoked session cannot refresh. `None` only on pre-session records.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Re-evaluation context persisted alongside a UCAN-grant refresh token so the

@@ -21,7 +21,7 @@ use subtle::ConstantTimeEq as _;
 
 use super::state::{DpopJtiAdmission, OAuthState};
 use crate::mac::exchange::{GrantDecision, GrantError, GrantRequest, GrantedAccess};
-use crate::services::generated::policy_client::IssueToken;
+use crate::services::generated::policy_client::{IssueToken, IssueTokenProfile};
 use hyprstream_pds::repo_authority::is_path_form_did_web;
 // #1425: the browser RFC 8693 sender-bound contract. The public client_id is
 // the single source of truth shared with the WASM client (`hyprstream-rpc`),
@@ -67,6 +67,7 @@ pub async fn exchange_token_exchange(
     output_dpop_jkt: Option<String>,
     requested_token_type: Option<&str>,
     tenant: Option<&str>,
+    client_id: &str,
 ) -> Response {
     // Actor token (delegation) is deferred — RFC 8693 §4.
     if actor_token.is_some() {
@@ -177,6 +178,15 @@ pub async fn exchange_token_exchange(
             issuer: Some(output_issuer),
             tenant,
             require_clearance: verified.require_clearance,
+            session_id: None,
+            issuance_profile: if verified.sub.starts_with("service:") {
+                IssueTokenProfile::Service
+            } else {
+                IssueTokenProfile::Rfc8693
+            },
+            // RFC 9068 §2.2.1: the exchanging OAuth client on the user
+            // `at+jwt`; the service (`wit+jwt`) form carries none.
+            client_id: (!verified.sub.starts_with("service:")).then(|| client_id.to_owned()),
         })
         .await;
 
@@ -529,6 +539,15 @@ pub(super) async fn exchange_browser_token_exchange(
             issuer: Some(output_issuer),
             tenant,
             require_clearance: verified.require_clearance,
+            session_id: None,
+            issuance_profile: if verified.sub.starts_with("service:") {
+                IssueTokenProfile::Service
+            } else {
+                IssueTokenProfile::Rfc8693
+            },
+            // RFC 9068 §2.2.1: the exchanging OAuth client on the user
+            // `at+jwt`; the service (`wit+jwt`) form carries none.
+            client_id: (!verified.sub.starts_with("service:")).then(|| client_id.to_owned()),
         })
         .await;
 
@@ -992,6 +1011,10 @@ pub async fn exchange_atproto_ucan(
         output_dpop_jkt,
         Some(ISSUED_TOKEN_TYPE),
         Some(&request.tenant),
+        // The atproto XRPC exchange is a public-client (UCAN-authenticated)
+        // flow; the public client identifier is the RFC 9068 `client_id` for a
+        // user `at+jwt` output (unused for a service `wit+jwt` output).
+        BROWSER_PUBLIC_CLIENT_ID,
     ).await;
     if response.status().is_success() {
         return response;
@@ -1292,7 +1315,8 @@ fn resolve_grant_subject(
             // reader can re-take the meet off the one verified token. `None` if
             // the actor is unresolved — in which case `ctx` above is already
             // `None` and the grant fails closed before minting.
-            clearance: actor_ctx.map(|c| *c.clearance()),
+            clearance: actor_ctx
+                .map(|c| hyprstream_rpc::auth::mac::CredentialClearance::from_label(*c.clearance())),
             act: None,
         }),
     };
@@ -1787,10 +1811,7 @@ async fn mint_grant_token(
 
     // DPoP sender-binding via cnf.jkt (RFC 9449 §6). ZSP: no cnf ⇒ bearer ⇒
     // rejected. We set jkt directly from the verified proof.
-    claims.cnf = Some(hyprstream_rpc::auth::Cnf {
-        jwk: None,
-        jkt: Some(dpop_jkt.to_owned()),
-    });
+    claims = claims.with_cnf_jkt_thumbprint(dpop_jkt.to_owned());
 
     // S8 (#574) + Fu3/#677: sign via the mandatory hybrid composite (EdDSA +
     // ML-DSA-65). If no ML-DSA-65 signing key is provisioned, refuse to mint
@@ -1892,6 +1913,7 @@ async fn issue_grant_refresh_token(
         dpop_jkt: None,
         client_assertion_jkt: None,
         ucan_grant: grant_refresh,
+        session_id: None,
     };
 
     if let Some(db) = &state.token_db {
@@ -2343,6 +2365,7 @@ mod tests {
                 requested_scope: Some("read:model:llama".to_owned()),
                 audience: Some("https://api.example".to_owned()),
             }),
+            session_id: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: super::super::state::RefreshTokenEntry = serde_json::from_str(&json).unwrap();

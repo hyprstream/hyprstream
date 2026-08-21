@@ -105,6 +105,36 @@ struct PolicyRequest {
     # anonymous/end-user callers have no legitimate read.
     checkCredentialRevocation @23 :CheckCredentialRevocation
       $scope(query);
+
+    # Register a new session with the canonical session registry. Restricted
+    # to the OAuth authority (service:oauth), which owns user-session
+    # lifecycle at issuance. Session identifiers are never reassigned.
+    registerSession @24 :RegisterSession
+      $scope(manage);
+
+    # Revoke a session: every credential carrying it is then rejected.
+    # Restricted to the OAuth authority (service:oauth).
+    revokeSession @25 :RevokeSession
+      $scope(manage);
+
+    # Ask the session authority whether a session is active.
+    # Service-identities only (service:*); the result Bool is true = ACTIVE
+    # and known — revoked, expired, unknown, or malformed all read false
+    # (fail-closed; note the opposite polarity from
+    # checkCredentialRevocationResult, which reports revoked=true).
+    checkSession @26 :CheckSession
+      $scope(query);
+
+    # RFC 8693 §4 on-behalf-of delegated mint (v16 §8.1 AsOriginator). The
+    # AUTHENTICATED RPC caller is the terminal actor: the authority derives the
+    # actor subject and cnf from the verified envelope — never from a request
+    # field — verifies the presented originator source credential, and mints a
+    # NEW delegated credential (fresh jti, originator `sub`, nested terminal
+    # `act`, terminal-actor `cnf`, fail-closed `meet(originator, every actor)`
+    # clearance, attenuated scope, conditional `sid`). Reusable (no
+    # consume-once). WS-E calls this for a derived AsOriginator dispatch.
+    exchangeDelegated @27 :ExchangeDelegated
+      $scope(manage);
   }
 }
 
@@ -121,6 +151,16 @@ struct PolicyCheck {
 
   # Operation being performed (e.g., "infer", "query", "write")
   operation @3 :Text;
+}
+
+# Issuance profile selected by the authority-owned caller. The default is the
+# session-bound interactive profile so an older or malformed caller cannot turn
+# a missing profile into an unsessioned user credential.
+enum IssueTokenProfile {
+  interactiveSession @0;
+  rfc8693 @1;
+  rfc7523 @2;
+  service @3;
 }
 
 # JWT token issuance parameters
@@ -163,6 +203,25 @@ struct IssueToken {
   # clearance for the subject before minting. The resolved clearance is
   # clamped to Classical assurance and stamped into the signed claims.
   requireClearance @8 :Bool;
+
+  # OIDC session ID (`sid` claim) to stamp on the minted token. Set by the
+  # OAuth authority for interactive user sessions only; the caller owns the
+  # session lifecycle (registration is a separate authority operation —
+  # issuance never registers). Empty/absent = no session (standalone service
+  # credentials carry no session — v16 §3.3).
+  sessionId @9 :Text $optional;
+
+  # Credential issuance profile. Interactive user/OIDC issuance MUST carry
+  # `sessionId`; RFC 8693 and RFC 7523 are deliberate non-interactive
+  # profiles; service issuance is limited to `service:*` subjects.
+  issuanceProfile @10 :IssueTokenProfile;
+
+  # RFC 9068 §2.2.1 `client_id`: the OAuth client the access token is issued to.
+  # REQUIRED (non-empty) for the user `at+jwt` profiles (interactive/RFC 8693/
+  # RFC 7523); the authority stamps it into the signed `client_id` claim. The
+  # service profile mints a `wit+jwt` and carries no `client_id`. Empty/absent =
+  # not supplied.
+  clientId @11 :Text $optional;
 }
 
 # Apply a built-in policy template
@@ -275,6 +334,19 @@ struct PolicyResponse {
 
     # Revocation check result (true = revoked or unknown — fail-closed)
     checkCredentialRevocationResult @24 :Bool;
+
+    # Session registration acknowledged (durable)
+    registerSessionResult @25 :Void;
+
+    # Session revocation acknowledged (durable)
+    revokeSessionResult @26 :Void;
+
+    # Session check result (true = ACTIVE and known; false = revoked,
+    # expired, unknown, or malformed — fail-closed)
+    checkSessionResult @27 :Bool;
+
+    # Minted delegated at+jwt/wit from exchangeDelegated (fresh jti).
+    exchangeDelegatedResult @28 :TokenInfo;
   }
 }
 
@@ -450,6 +522,60 @@ struct ExchangeWit {
   ttl @2 :Opt.OptionUint32;
 }
 
+# RFC 8693 §4 delegated on-behalf-of mint (v16 §8.1 AsOriginator).
+#
+# The terminal actor is NEVER a field here: it is the authenticated RPC caller,
+# derived from the verified policy envelope (subject + cnf), so E cannot supply
+# an arbitrary actor identity, clearance, or key. Only the ORIGINATOR authority
+# (the presented source credential) and the requested attenuation subset cross
+# the wire. The authority derives originator/session/scope/clearance from the
+# verified source credential and actor/cnf/tenant from the verified envelope,
+# computes the fail-closed meet, and mints a fresh delegated credential.
+struct ExchangeDelegated {
+  # The originator's already-issued source credential (at+jwt / wit+jwt) whose
+  # authority is being delegated. The authority verifies its signature, expiry,
+  # revocation, and issuer/tenant/subject coherence — it is never trusted as
+  # plaintext. `sub` becomes the delegated credential's originator.
+  sourceCredential @0 :Text;
+
+  # The derived-call OAuth scope subset (space-delimited). v16 §8.1 requires
+  # EXPLICIT attenuation at every hop: a scope-bearing source requires an
+  # explicit non-empty subset here (equality is allowed only when explicitly
+  # requested) — an empty/absent value against a scope-bearing source DENIES (no
+  # silent full inheritance). A source with no scope grants none: any requested
+  # scope denies. Every requested scope MUST be held by the source; broadening
+  # is rejected.
+  requestedScopes @1 :Text $optional;
+
+  # The derived-call MAC/UCAN capability subset (`ability@resource` tokens,
+  # space-delimited). v16 derived authority is BOTH OAuth scope AND capability;
+  # this attenuates the capability axis via the reviewed `Capability` cover
+  # relation. Same explicit-attenuation rule as requestedScopes: a cap-bearing
+  # source requires an explicit non-empty subset (equality allowed only if
+  # explicitly requested); empty/absent against a cap-bearing source DENIES; a
+  # source with no `cap` grants none. Any capability not covered by the source
+  # is rejected as broadening.
+  requestedCapabilities @4 :Text $optional;
+
+  # RFC 8707 resource indicator for the derived call's target. REQUIRED and
+  # non-empty: the authority binds it to the reviewed derived-call contract via
+  # the fail-closed DelegationEdgeAuthorizer, never an arbitrary string, and
+  # never defaulted to the issuer.
+  audience @2 :Text $optional;
+
+  # The generated method identifier of the derived call (e.g. "model.Infer").
+  # REQUIRED and non-empty: the authority passes it to the
+  # DelegationEdgeAuthorizer so the exact reviewed DispatchCallManifest method
+  # edge is enforced. It is a request descriptor of the outbound call, not an
+  # identity or clearance; an absent/empty value denies (no wildcard).
+  targetMethodId @5 :Text $optional;
+
+  # TTL override in seconds. Clamped to the configured [min, max] AND never
+  # beyond the source credential's own remaining lifetime, the terminal actor's
+  # authority, or a retained session bound.
+  ttl @3 :Opt.OptionUint32;
+}
+
 # Issuer-scoped credential identifier (iss, jti/cti). JWT jti text and CWT cti
 # bytes are disjoint typed namespaces — mirrors the verifier-side
 # CredentialValue type; a CWT cti is never stringified into the JWT namespace.
@@ -475,4 +601,41 @@ struct RevokeCredential {
 # Query the revocation authority for a credential's revocation state.
 struct CheckCredentialRevocation {
   credential @0 :CredentialIdRef;
+}
+
+# Issuer-scoped session identifier (iss, sid/workload_session_id). The two
+# variants are disjoint typed namespaces — mirrors SessionIdentifier.
+struct SessionKeyRef {
+  # The token `iss` claim identifying the session's issuer.
+  issuer @0 :Text;
+  union {
+    # OIDC user-session ID (the registered `sid` claim).
+    oidcSid @1 :Text;
+    # Workload credential family session ID.
+    workloadSessionId @2 :Text;
+  }
+}
+
+# Register a new session. `expiresAt` bounds the session's lifetime (checked
+# against the authority's configured horizon, same as revocation entries).
+struct RegisterSession {
+  session @0 :SessionKeyRef;
+  # Subject identifier (`sub`) the session belongs to.
+  subject @1 :Text;
+  # Verified tenant/domain the session is bound to.
+  tenant @2 :Text;
+  # Session expiry (Unix seconds).
+  expiresAt @3 :Int64;
+  # Clearance epoch at registration.
+  clearanceEpoch @4 :UInt64;
+}
+
+# Revoke a session: every credential carrying it is then rejected.
+struct RevokeSession {
+  session @0 :SessionKeyRef;
+}
+
+# Query the session authority for a session's active state.
+struct CheckSession {
+  session @0 :SessionKeyRef;
 }

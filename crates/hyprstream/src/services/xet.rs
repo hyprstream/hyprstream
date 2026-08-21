@@ -486,7 +486,8 @@ mod tests {
             let mut claims = crate::auth::jwt::Claims::new("alice".to_owned(), now, now + 3600)
                 .with_issuer(ISSUER.to_owned())
                 .with_tenant("tenant-a.example".to_owned())
-                .with_audience(Some(audience.to_owned()));
+                .with_audience(Some(audience.to_owned()))
+                .with_client_id("hyprstream-oauth-client-1");
             claims.jti = Some(jti.to_owned());
             crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
                 &claims,

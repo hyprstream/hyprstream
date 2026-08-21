@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, OnceLock};
 
 // ── Credential identity ───────────────────────────────────────────────────
 
@@ -224,18 +225,22 @@ pub struct SessionState {
 /// Session registry: tracks active sessions and their revocation state.
 ///
 /// Per v16 §3.3: revoking a `SessionKey` rejects every credential and handle
-/// carrying that session ID. The trait is designed so a Valkey/Redis backend
-/// (the identity-storage substrate) can drop in later with the same interface.
+/// carrying that session ID. The canonical registry is owned by the policy
+/// service and reached over the RPC bus by every other process (mirroring
+/// the credential-revocation authority), so the methods are async.
+#[async_trait::async_trait]
 pub trait SessionRegistry: Send + Sync {
-    /// Look up the state of a session, if known.
-    fn session_state(&self, key: &SessionKey) -> Option<SessionState>;
+    /// Look up the state of a session, if known. Fail-closed consumers treat
+    /// `None` (unknown, or authority unreachable for a remote registry) as
+    /// revoked.
+    async fn session_state(&self, key: &SessionKey) -> Option<SessionState>;
 
     /// Register a new session. Returns `Err` if a session already exists at
     /// the given key — session identifiers are never reassigned (v16 §3.3).
     /// A revoked session CANNOT be reactivated by re-registration. Also
     /// rejects a key/state kind mismatch (OIDC sid must pair with Interactive,
     /// workload must pair with Workload).
-    fn register_session(
+    async fn register_session(
         &self,
         key: SessionKey,
         state: SessionState,
@@ -248,12 +253,78 @@ pub trait SessionRegistry: Send + Sync {
     /// BEFORE credential/handle eviction runs, so a concurrent verification
     /// checking session state fails the revocation check while cached
     /// authority is being flushed.
-    fn revoke_session(&self, key: &SessionKey);
+    ///
+    /// Returns [`SessionRevokeError`] if the revocation authority did not
+    /// durably accept the publication; on error no state changes and no
+    /// handles are evicted (never a best-effort write).
+    async fn revoke_session(&self, key: &SessionKey) -> Result<(), SessionRevokeError>;
 
     /// Whether a session is currently revoked, expired, or unknown. Returns
     /// `true` if the session is revoked, expired, OR not found (fail-closed
     /// for unknown sessions).
-    fn is_revoked(&self, key: &SessionKey) -> bool;
+    async fn is_revoked(&self, key: &SessionKey) -> bool;
+}
+
+/// The session authority did not durably accept a session revocation.
+///
+/// Publication failure must never look like success: callers surface this
+/// as an error instead of proceeding as though the session were revoked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRevokeError {
+    message: String,
+}
+
+impl SessionRevokeError {
+    /// Construct from a human-readable cause.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SessionRevokeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "session revocation failed: {}", self.message)
+    }
+}
+
+impl std::error::Error for SessionRevokeError {}
+
+// ── Global registry ───────────────────────────────────────────────────────
+
+/// Process-global session registry. Set once at startup: the durable
+/// authority registry in the policy process, or a policy-authority RPC
+/// client registry everywhere else. Before it is set, consumers fail
+/// closed — a credential carrying a session ID cannot be admitted until
+/// the registry is published.
+static GLOBAL_SESSION_REGISTRY: OnceLock<Arc<dyn SessionRegistry>> = OnceLock::new();
+
+/// Publish the process-global session registry. Called once at startup; a
+/// second call returns an error so the caller can detect a publication race.
+pub fn set_global_session_registry(
+    registry: Arc<dyn SessionRegistry>,
+) -> Result<(), GlobalSessionRegistryAlreadySet> {
+    GLOBAL_SESSION_REGISTRY
+        .set(registry)
+        .map_err(|_| GlobalSessionRegistryAlreadySet)
+}
+
+/// Error returned when the global session registry was already published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalSessionRegistryAlreadySet;
+
+impl std::fmt::Display for GlobalSessionRegistryAlreadySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "global session registry already published")
+    }
+}
+
+impl std::error::Error for GlobalSessionRegistryAlreadySet {}
+
+/// Access the process-global session registry, if published.
+pub fn global_session_registry() -> Option<&'static Arc<dyn SessionRegistry>> {
+    GLOBAL_SESSION_REGISTRY.get()
 }
 
 /// Error returned when a session already exists at the given key.
@@ -301,6 +372,21 @@ impl std::fmt::Display for InvalidSessionRecord {
 
 impl std::error::Error for InvalidSessionRecord {}
 
+/// Error returned when the session authority could not durably accept a
+/// registration (durable write / transport failure) — the session was NOT
+/// registered and callers must surface the failure, never proceed as though
+/// it succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPublicationFailed;
+
+impl std::fmt::Display for SessionPublicationFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "session registration was not durably accepted")
+    }
+}
+
+impl std::error::Error for SessionPublicationFailed {}
+
 /// Error returned by [`SessionRegistry::register_session`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionRegisterError {
@@ -310,6 +396,8 @@ pub enum SessionRegisterError {
     KindMismatch(SessionKindMismatch),
     /// The key or state record is malformed (empty required field).
     InvalidRecord(InvalidSessionRecord),
+    /// The authority did not durably accept the registration.
+    PublicationFailed(SessionPublicationFailed),
 }
 
 impl std::fmt::Display for SessionRegisterError {
@@ -318,6 +406,7 @@ impl std::fmt::Display for SessionRegisterError {
             Self::Exists(e) => write!(f, "{e}"),
             Self::KindMismatch(e) => write!(f, "{e}"),
             Self::InvalidRecord(e) => write!(f, "{e}"),
+            Self::PublicationFailed(e) => write!(f, "{e}"),
         }
     }
 }
@@ -342,9 +431,15 @@ impl From<InvalidSessionRecord> for SessionRegisterError {
     }
 }
 
+impl From<SessionPublicationFailed> for SessionRegisterError {
+    fn from(e: SessionPublicationFailed) -> Self {
+        Self::PublicationFailed(e)
+    }
+}
+
 /// Validate that a session key's identifier variant matches the session state
 /// kind (OIDC sid → Interactive, workload → Workload).
-fn validate_key_kind_coherence(
+pub(crate) fn validate_key_kind_coherence(
     key: &SessionKey,
     state: &SessionState,
 ) -> Result<(), SessionKindMismatch> {
@@ -378,10 +473,35 @@ impl InMemorySessionRegistry {
             sessions: Default::default(),
         }
     }
+
+    /// Whether any record (active, expired, or revoked) exists at the key.
+    /// Sync read-only probe for the durable registry's writer-lock paths.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn has_key(&self, key: &SessionKey) -> bool {
+        self.sessions.read().contains_key(key)
+    }
+
+    /// Insert an already-published record (durable load at startup, or the
+    /// durable registry's post-append memory publish): memory insert only —
+    /// no validation, no log write.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn insert_loaded(&self, key: SessionKey, state: SessionState) {
+        self.sessions.write().insert(key, state);
+    }
+
+    /// Flip a loaded record to revoked (durable load/revoke path): memory
+    /// update only — no log write, no cache-generation flush.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn mark_revoked_loaded(&self, key: &SessionKey) {
+        if let Some(state) = self.sessions.write().get_mut(key) {
+            state.status = ActiveOrRevoked::Revoked;
+        }
+    }
 }
 
+#[async_trait::async_trait]
 impl SessionRegistry for InMemorySessionRegistry {
-    fn session_state(&self, key: &SessionKey) -> Option<SessionState> {
+    async fn session_state(&self, key: &SessionKey) -> Option<SessionState> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.sessions.read().get(key).cloned()
@@ -396,7 +516,7 @@ impl SessionRegistry for InMemorySessionRegistry {
         }
     }
 
-    fn register_session(
+    async fn register_session(
         &self,
         key: SessionKey,
         state: SessionState,
@@ -433,8 +553,9 @@ impl SessionRegistry for InMemorySessionRegistry {
         }
     }
 
-    fn revoke_session(&self, key: &SessionKey) {
-        // Phase 1 — PUBLISH: mark the session as revoked.
+    async fn revoke_session(&self, key: &SessionKey) -> Result<(), SessionRevokeError> {
+        // Phase 1 — PUBLISH: mark the session as revoked. In-memory
+        // publication cannot fail, so this registry always returns Ok.
         #[cfg(not(target_arch = "wasm32"))]
         {
             if let Some(state) = self.sessions.write().get_mut(key) {
@@ -463,10 +584,11 @@ impl SessionRegistry for InMemorySessionRegistry {
         {
             crate::auth::mac::flush_verified_subject_cache_generation();
         }
+        Ok(())
     }
 
-    fn is_revoked(&self, key: &SessionKey) -> bool {
-        match self.session_state(key) {
+    async fn is_revoked(&self, key: &SessionKey) -> bool {
+        match self.session_state(key).await {
             Some(state) => {
                 state.status == ActiveOrRevoked::Revoked
                     || state.expires_at <= chrono::Utc::now().timestamp()
@@ -528,8 +650,8 @@ mod tests {
     /// Malformed registrations (empty issuer/identifier/subject/tenant) are
     /// rejected as [`InvalidSessionRecord`], NOT as a kind mismatch — a
     /// malformed record is not a kind disagreement.
-    #[test]
-    fn malformed_registration_is_invalid_record_not_kind_mismatch() {
+    #[tokio::test]
+    async fn malformed_registration_is_invalid_record_not_kind_mismatch() {
         let reg = InMemorySessionRegistry::new();
         let state = SessionState {
             subject: "alice".to_owned(),
@@ -541,7 +663,9 @@ mod tests {
             clearance_epoch: 0,
         };
 
-        let bad_key = reg.register_session(SessionKey::oidc("", "ses-1"), state.clone());
+        let bad_key = reg
+            .register_session(SessionKey::oidc("", "ses-1"), state.clone())
+            .await;
         assert!(
             matches!(bad_key, Err(SessionRegisterError::InvalidRecord(_))),
             "empty issuer key → InvalidRecord, got {bad_key:?}"
@@ -549,14 +673,18 @@ mod tests {
 
         let mut empty_subject = state.clone();
         empty_subject.subject = String::new();
-        let bad_state = reg.register_session(SessionKey::oidc("https://a.example", "ses-1"), empty_subject);
+        let bad_state = reg
+            .register_session(SessionKey::oidc("https://a.example", "ses-1"), empty_subject)
+            .await;
         assert!(
             matches!(bad_state, Err(SessionRegisterError::InvalidRecord(_))),
             "empty subject → InvalidRecord, got {bad_state:?}"
         );
 
         // A genuine kind mismatch still reports KindMismatch.
-        let mismatch = reg.register_session(SessionKey::workload("https://a.example", "ses-2"), state);
+        let mismatch = reg
+            .register_session(SessionKey::workload("https://a.example", "ses-2"), state)
+            .await;
         assert!(
             matches!(mismatch, Err(SessionRegisterError::KindMismatch(_))),
             "workload key + interactive state → KindMismatch, got {mismatch:?}"

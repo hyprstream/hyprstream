@@ -137,7 +137,10 @@ pub use dispatch_pep::{
     RpcObjectLabelResolver,
 };
 pub use genesis::{GenesisMap, GenesisReport};
-pub use label::{Assurance, Compartment, CompartmentSet, Level, SecurityLabel, MAX_COMPARTMENTS};
+pub use label::{
+    Assurance, Compartment, CompartmentSet, CredentialClearance, Level, SecurityLabel,
+    MAX_COMPARTMENTS,
+};
 pub use lattice::{LabelError, Lattice, LatticeCodecError, LatticeDecodeError, LatticeVersion};
 pub use manifest::{
     bind_time_label, import_label, ContentBoundLabel, LabeledObject, ObjectLabelResolver,
@@ -156,9 +159,9 @@ mod integration_tests {
     //! `SubjectContextClaims`, floor via `can_access`).
     use super::*;
 
-    struct StubClaims(Option<SecurityLabel>);
+    struct StubClaims(Option<CredentialClearance>);
     impl SubjectContextClaims for StubClaims {
-        fn clearance_label(&self) -> Option<SecurityLabel> {
+        fn credential_clearance(&self) -> Option<CredentialClearance> {
             self.0
         }
     }
@@ -193,18 +196,23 @@ mod integration_tests {
             Assurance::Classical,
             comps(&[0]), // pii
         ));
-        let claims = StubClaims(Some(SecurityLabel::new(
-            Level::Secret,
-            Assurance::PqHybrid,
-            comps(&[0, 1]), // pii, finance
-        )));
+        // The wire clearance carries level + compartments only; assurance is
+        // derived from the verified key material at admission.
+        let claims = StubClaims(Some(
+            SecurityLabel::new(
+                Level::Secret,
+                Assurance::PqHybrid,
+                comps(&[0, 1]), // pii, finance
+            )
+            .into(),
+        ));
         assert!(mac_floor(&object, &claims, VerifiedKeyMaterial::PqHybrid));
     }
 
     #[test]
     fn deny_unlabeled_object() {
         let object = StaticNodeLabel::unlabeled();
-        let claims = StubClaims(Some(Lattice::new(LatticeVersion(1), []).top()));
+        let claims = StubClaims(Some(Lattice::new(LatticeVersion(1), []).top().into()));
         assert!(!mac_floor(&object, &claims, VerifiedKeyMaterial::PqHybrid));
     }
 
@@ -228,12 +236,15 @@ mod integration_tests {
             Assurance::PqHybrid,
             CompartmentSet::EMPTY,
         ));
-        let claims = StubClaims(Some(SecurityLabel::new(
-            Level::Secret,
-            Assurance::PqHybrid, // policy assigned high, but...
-            CompartmentSet::EMPTY,
-        )));
-        // ...the verified key material is only Classical → clamped → denied.
+        let claims = StubClaims(Some(
+            SecurityLabel::new(
+                Level::Secret,
+                Assurance::PqHybrid, // dropped on the wire; assurance is key-derived
+                CompartmentSet::EMPTY,
+            )
+            .into(),
+        ));
+        // ...the verified key material is only Classical → derived → denied.
         assert!(!mac_floor(&object, &claims, VerifiedKeyMaterial::Classical));
         // a PQC-bound key passes.
         assert!(mac_floor(&object, &claims, VerifiedKeyMaterial::PqHybrid));
@@ -249,11 +260,9 @@ mod integration_tests {
         let derived = SecurityLabel::join_all([&secret_in, &public_in]);
         let object = StaticNodeLabel::labeled(derived);
 
-        let low = StubClaims(Some(SecurityLabel::new(
-            Level::Internal,
-            Assurance::Classical,
-            CompartmentSet::EMPTY,
-        )));
+        let low = StubClaims(Some(
+            SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY).into(),
+        ));
         assert!(!mac_floor(&object, &low, VerifiedKeyMaterial::Classical));
     }
 }

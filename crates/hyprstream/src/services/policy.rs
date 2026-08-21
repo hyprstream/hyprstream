@@ -9,7 +9,7 @@ use crate::auth::policy_templates;
 use crate::services::{EnvelopeContext, RequestService};
 use crate::services::generated::policy_client::{
     ErrorInfo, PolicyHandler, PolicyResponseVariant, TokenInfo, ScopeList,
-    PolicyCheck, IssueToken,
+    PolicyCheck, IssueToken, IssueTokenProfile,
     ApplyTemplate, ApplyDraft, RollbackPolicy, GetHistory, GetDiff,
     PolicyInfo, PolicyRule, Grouping,
     PolicyHistory, PolicyHistoryEntry, DraftStatus,
@@ -17,8 +17,9 @@ use crate::services::generated::policy_client::{
     RegisterEventPrefix, SubscribeEventPrefix, GetPendingSubscribers, DepositWrappedKeys,
     EventPrefixAccess, PendingSubscribers,
     ResolveServiceKey, RegisterServiceKey, ServiceKeyCandidate, ServiceKeyResponse,
-    RefreshServiceTokenRequest, ExchangeWit,
+    RefreshServiceTokenRequest, ExchangeWit, ExchangeDelegated,
     RevokeCredential, CheckCredentialRevocation,
+    RegisterSession, RevokeSession, CheckSession,
     dispatch_policy, serialize_response,
 };
 use anyhow::{anyhow, Result};
@@ -106,6 +107,12 @@ fn validate_event_prefix_registration(
     Ok(())
 }
 
+/// Default revocation-publication horizon: covers the hard 30-day
+/// service-JWT renewal clamp with margin. Production construction derives
+/// the horizon from the configured issuance maxima instead — see
+/// `PolicyService::with_revocation_max_ttl_secs`.
+const DEFAULT_REVOCATION_MAX_TTL_SECS: i64 = 45 * 24 * 3600;
+
 pub struct PolicyService {
     // Business logic
     policy_manager: Arc<PolicyManager>,
@@ -137,6 +144,26 @@ pub struct PolicyService {
     token_clearance_resolver: Arc<
         dyn Fn(&str) -> Option<hyprstream_rpc::auth::mac::SecurityLabel> + Send + Sync,
     >,
+    /// Maximum retention horizon the revocation authority accepts for a
+    /// published entry (`expires_at - now`). Derived at construction from the
+    /// configured issuance maxima so no issuable credential can outlive its
+    /// revocability — see `with_revocation_max_ttl_secs`.
+    revocation_max_ttl_secs: i64,
+    /// Fail-closed authority for derived `AsOriginator` delegation edges
+    /// (`exchangeDelegated`). `None` (uninstalled) ⇒ every delegation DENIES;
+    /// WS-E installs the reviewed `DispatchCallManifest` implementation. See
+    /// [`DelegationEdgeAuthorizer`].
+    delegation_edge_authorizer: Option<Arc<dyn DelegationEdgeAuthorizer>>,
+    /// Optional injected service-enrollment manifest override. `None` uses the
+    /// process-global manifest (`global_service_enrollment`). Set in isolated
+    /// fixtures so a test can supply its own enrollment without touching the
+    /// set-once process global. See [`Self::enrollment`].
+    enrollment_manifest: Option<Arc<crate::auth::service_enrollment::ServiceEnrollmentManifest>>,
+    /// Fail-closed authoritative primary-enrollment resolver for user/classical
+    /// source credentials (frozen A §5/T1). `None` (uninstalled) ⇒ a user
+    /// primary confirmation DENIES; WS-C installs the real resolver. See
+    /// [`PrimaryEnrollmentResolver`].
+    primary_enrollment_resolver: Option<Arc<dyn PrimaryEnrollmentResolver>>,
 }
 
 impl PolicyService {
@@ -168,7 +195,66 @@ impl PolicyService {
                 let policy = crate::mac::compiled_policy()?;
                 policy.clearance_for(subject)
             }),
+            revocation_max_ttl_secs: DEFAULT_REVOCATION_MAX_TTL_SECS,
+            delegation_edge_authorizer: None,
+            enrollment_manifest: None,
+            primary_enrollment_resolver: None,
         }
+    }
+
+    /// Install the fail-closed authoritative primary-enrollment resolver (WS-C's
+    /// enrollment store) used to confirm a user/classical source credential's
+    /// `cnf`. Without it, user primaries deny.
+    pub fn with_primary_enrollment_resolver(
+        mut self,
+        resolver: Arc<dyn PrimaryEnrollmentResolver>,
+    ) -> Self {
+        self.primary_enrollment_resolver = Some(resolver);
+        self
+    }
+
+    /// Install the fail-closed delegation-edge authorizer (WS-E's reviewed
+    /// `DispatchCallManifest`). Without it, `exchangeDelegated` denies every
+    /// edge — the end-state default, never a bypass.
+    pub fn with_delegation_edge_authorizer(
+        mut self,
+        authorizer: Arc<dyn DelegationEdgeAuthorizer>,
+    ) -> Self {
+        self.delegation_edge_authorizer = Some(authorizer);
+        self
+    }
+
+    /// Override the service-enrollment manifest for an isolated fixture (avoids
+    /// the set-once process global). **Test-only** — production is single
+    /// authority (the process global); there is no production manifest-injection
+    /// path, so this setter is compiled only under `cfg(test)`.
+    #[cfg(test)]
+    pub fn with_enrollment_manifest(
+        mut self,
+        manifest: Arc<crate::auth::service_enrollment::ServiceEnrollmentManifest>,
+    ) -> Self {
+        self.enrollment_manifest = Some(manifest);
+        self
+    }
+
+    /// The effective service-enrollment manifest: the injected override if set,
+    /// else the process-global manifest.
+    fn enrollment(
+        &self,
+    ) -> Option<Arc<crate::auth::service_enrollment::ServiceEnrollmentManifest>> {
+        self.enrollment_manifest.clone().or_else(|| {
+            crate::auth::service_enrollment::global_service_enrollment().cloned()
+        })
+    }
+
+    /// Set the revocation-publication horizon. The service factory computes
+    /// this as max(every configured issuance maximum) plus a clock-skew
+    /// margin, so an operator raising token TTLs automatically raises the
+    /// authority's retention horizon — issuance and revocation horizons are
+    /// bound by construction rather than by a shared default.
+    pub fn with_revocation_max_ttl_secs(mut self, secs: i64) -> Self {
+        self.revocation_max_ttl_secs = secs;
+        self
     }
 
     /// Set the default audience for issued tokens (typically the OAuth issuer URL).
@@ -202,7 +288,21 @@ impl PolicyService {
         claims: &hyprstream_rpc::auth::Claims,
         is_service: bool,
     ) -> Result<String> {
-        let snapshot = hyprstream_rpc::auth::global_composite_key_set()
+        // Sign against the SAME configured local authority the source
+        // verification path resolves keys from: the policy service's own
+        // `jwt_key_source` composite ledger. In production the factory always
+        // installs a `ClusterKeySource` (whose ledger defaults to the
+        // process-global authority, so behaviour is identical); an isolated
+        // fixture supplies its own via `with_composite_key_set`, keeping
+        // verification and mint on ONE exact issuer-scoped ledger. Fail closed
+        // if no key source is configured — never fall back to the global
+        // authority, which would reopen cross-issuer ambiguity.
+        let key_source = self
+            .jwt_key_source
+            .as_ref()
+            .ok_or_else(|| anyhow!("no configured key source for token signing"))?;
+        let snapshot = key_source
+            .composite_key_set()
             .mint_snapshot()
             .map_err(|error| anyhow!("composite authority unavailable: {error}"))?;
         let signing = snapshot
@@ -230,6 +330,104 @@ impl PolicyService {
     ) -> Self {
         self.jwt_key_source = Some(src);
         self
+    }
+
+    /// Resolve the workload-session disposition for a service-credential renewal
+    /// (v16 §3.3), as a pure function of the canonical session registry and the
+    /// authoritative family policy. The renewal handler applies the result to
+    /// the renewed claims; extracting it keeps the security-critical
+    /// check-BEFORE-narrowing ordering testable without the signing/persistence
+    /// boundary.
+    ///
+    /// - A carried session (`old_wsid = Some`) is checked for revocation FIRST,
+    ///   independent of `family_policy` — a revoked/expired/unresolvable session
+    ///   DENIES, so removing the family policy can never launder a revoked family
+    ///   into an unsessioned renewal. A live session is re-stamped only while the
+    ///   family remains enrolled; a narrowed (policy-removed) family drops it.
+    /// - No carried session (`old_wsid = None`) creates one only for a family
+    ///   EXPLICITLY enrolled (`family_policy == Some(true)`); a legacy-default or
+    ///   disabled family carries none.
+    async fn resolve_renewal_workload_session(
+        &self,
+        issuer: &str,
+        subject: &str,
+        tenant: &str,
+        now: i64,
+        family_policy: Option<bool>,
+        old_wsid: Option<&str>,
+    ) -> RenewalWorkloadSession {
+        // No manifest at all: legacy continuity (an unenrolled deployment keeps
+        // renewing). An enrolled family with `workload_session = false` is a
+        // deliberate policy, NOT legacy — `family_policy` distinguishes them.
+        let family_allowed = family_policy.unwrap_or(true);
+        match (old_wsid, family_allowed) {
+            (Some(wsid), allowed) => {
+                // A carried workload session must be ACTIVE before renewal,
+                // regardless of current enrollment policy — the revocation
+                // check runs BEFORE the narrowing branch below.
+                let session_key =
+                    hyprstream_rpc::auth::SessionKey::workload(issuer.to_owned(), wsid.to_owned());
+                let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+                    return RenewalWorkloadSession::Deny {
+                        code: "UNAVAILABLE",
+                        message: "session registry is not initialized".to_owned(),
+                    };
+                };
+                if registry.is_revoked(&session_key).await {
+                    return RenewalWorkloadSession::Deny {
+                        code: "SESSION_REVOKED",
+                        message: "workload session is revoked or expired; re-bootstrap the service credential".to_owned(),
+                    };
+                }
+                // Only a still-enrolled family carries the session forward;
+                // `!allowed` is deliberate narrowing of a LIVE family — the
+                // session ID does not survive this renewal (the session itself
+                // expires naturally; no credential carries it forward).
+                RenewalWorkloadSession::Stamp(allowed.then(|| wsid.to_owned()))
+            }
+            (None, true) => {
+                // First online renewal of an ENROLLED family creates the
+                // workload session with the canonical registry; a legacy-default
+                // family (`family_policy == None`) manufactures no session.
+                if family_policy != Some(true) {
+                    return RenewalWorkloadSession::Stamp(None);
+                }
+                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                use rand::RngCore;
+                let mut id_bytes = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut id_bytes);
+                let wsid = URL_SAFE_NO_PAD.encode(id_bytes);
+                let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+                    return RenewalWorkloadSession::Deny {
+                        code: "UNAVAILABLE",
+                        message: "session registry is not initialized".to_owned(),
+                    };
+                };
+                let session_state = hyprstream_rpc::auth::SessionState {
+                    subject: subject.to_owned(),
+                    tenant: tenant.to_owned(),
+                    kind: hyprstream_rpc::auth::SessionKind::Workload,
+                    created_at: now,
+                    expires_at: now + self.revocation_max_ttl_secs,
+                    status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                    clearance_epoch: 0,
+                };
+                if let Err(e) = registry
+                    .register_session(
+                        hyprstream_rpc::auth::SessionKey::workload(issuer.to_owned(), wsid.clone()),
+                        session_state,
+                    )
+                    .await
+                {
+                    return RenewalWorkloadSession::Deny {
+                        code: "UNAVAILABLE",
+                        message: format!("workload session registration failed: {e}"),
+                    };
+                }
+                RenewalWorkloadSession::Stamp(Some(wsid))
+            }
+            (None, false) => RenewalWorkloadSession::Stamp(None),
+        }
     }
 
     /// Attach the ES256 (P-256) key rotation store.
@@ -492,6 +690,474 @@ fn validate_service_key_registration(
     Ok(())
 }
 
+/// The credential profile of a verified source credential (v16 typ contract).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceProfile {
+    /// User access token (`at+jwt`).
+    AtJwt,
+    /// Service credential (`wit+jwt`).
+    WitJwt,
+}
+
+/// A verified source credential and the provenance the derived mint requires:
+/// the profile (typ) and the crypto assurance derived from the ACTUAL verified
+/// algorithm (never fabricated).
+struct VerifiedSourceCredential {
+    claims: hyprstream_rpc::auth::Claims,
+    profile: SourceProfile,
+    key_material: hyprstream_rpc::auth::mac::VerifiedKeyMaterial,
+}
+
+/// Verify a presented source credential for the delegated-exchange authority
+/// path (RFC 8693 §4 on-behalf-of). **JWT-only:** this Text seam carries a JWT
+/// `at+jwt`/`wit+jwt`; a CWT source is out of scope and is not handled here (it
+/// would be a separate typed seam). Both the hybrid (composite) and classical
+/// (Ed25519) credential profiles the frozen A profile permits are accepted; the
+/// derived Classical/PqHybrid assurance is taken from the ACTUAL verified
+/// algorithm and the clearance meet/target dominance decides authority.
+///
+/// Trust rule (frozen A profile: trust the issuer key, NOT an internal
+/// typ→role mapping — production signs both `at+jwt` and `wit+jwt` with the
+/// Policy role): the exact `kid` must resolve to an issuer-authorized composite
+/// pair in the trusted key source / ledger and that pair must be within its
+/// validity window; for the classical path the verifying key(s) resolve
+/// strictly from the trusted key source keyed by `expected_issuer` and the
+/// exact `kid`. An untrusted issuer or an unknown/wrong `kid`/key denies. The
+/// JOSE `typ` selects the profile exactly. Issuer-claim equality, revocation,
+/// session, tenant, subject↔profile coherence, and clearance are enforced by
+/// the caller.
+async fn verify_presented_credential(
+    token: &str,
+    key_source: Option<&dyn hyprstream_rpc::auth::JwtKeySource>,
+    expected_issuer: &str,
+) -> Result<VerifiedSourceCredential> {
+    use hyprstream_rpc::auth::mac::VerifiedKeyMaterial;
+
+    let header = hyprstream_rpc::auth::jwt::parse_protected_header(token)
+        .map_err(|e| anyhow!("invalid source credential header: {e}"))?;
+    let profile = match header.typ.as_str() {
+        "at+jwt" => SourceProfile::AtJwt,
+        "wit+jwt" => SourceProfile::WitJwt,
+        other => anyhow::bail!(
+            "invalid source credential typ '{other}' (expected at+jwt or wit+jwt)"
+        ),
+    };
+
+    match header.alg.as_str() {
+        "ML-DSA-65-Ed25519" => {
+            // Re-parse for dispatch with the EXACT typ, so the signed header typ
+            // must equal what gated the profile above.
+            let dispatch = hyprstream_rpc::auth::jwt::parse_composite_dispatch(
+                token,
+                &[header.typ.as_str()],
+            )
+            .map_err(|e| anyhow!("invalid source credential: {e}"))?;
+            // Resolve the exact kid to an issuer-AUTHORIZED composite pair via
+            // the configured key source. `ClusterKeySource::composite_pair`
+            // resolves this node's exact-pair ledger AND its out-of-ledger
+            // CA-derived composite pair (which the bootstrap/service-WIT path
+            // signs with, and which is NOT in the global ledger — a global-only
+            // lookup would wrongly reject a legitimate local service WIT).
+            // `FederatedKeySource::composite_pair` delegates only to its local
+            // source, so it never exposes a foreign issuer's pair. The key
+            // source is bound to `expected_issuer`, so a resolved pair is
+            // authorized for it; a kid outside that authority denies.
+            let ks = key_source.ok_or_else(|| {
+                anyhow!("composite source credential requires a trusted key source")
+            })?;
+            anyhow::ensure!(
+                ks.is_trusted(expected_issuer),
+                "source credential issuer is not trusted by this authority"
+            );
+            let pair = ks.composite_pair(dispatch.kid()).ok_or_else(|| {
+                anyhow!("invalid source credential: composite kid is not an issuer-authorized pair")
+            })?;
+            // Pair lifecycle: the signing pair must be within its validity
+            // window AND in a verify-valid state. Active and Drain are both
+            // verify-valid (a Drain pair is rotating out, but tokens it signed
+            // remain valid until expiry); the explicit match fails closed if the
+            // ledger ever grows a non-verifying state.
+            let now = chrono::Utc::now().timestamp();
+            anyhow::ensure!(
+                pair.not_before() <= now && now < pair.expires_at(),
+                "source credential signing pair is outside its validity window"
+            );
+            match pair.state() {
+                hyprstream_rpc::auth::CompositePairState::Active
+                | hyprstream_rpc::auth::CompositePairState::Drain => {}
+            }
+            let claims = hyprstream_rpc::auth::jwt::decode_composite(
+                token,
+                pair.ml_dsa(),
+                pair.ed25519(),
+                None,
+                &dispatch,
+            )
+            .map_err(|e| anyhow!("invalid source credential: {e}"))?;
+            Ok(VerifiedSourceCredential {
+                claims,
+                profile,
+                key_material: VerifiedKeyMaterial::PqHybrid,
+            })
+        }
+        "EdDSA" => {
+            // Classical profile: resolve the verifying key(s) STRICTLY from the
+            // trusted key source keyed by the expected issuer and the exact kid.
+            let ks = key_source.ok_or_else(|| {
+                anyhow!("classical source credential requires a trusted key source")
+            })?;
+            anyhow::ensure!(
+                ks.is_trusted(expected_issuer),
+                "source credential issuer is not trusted by this authority"
+            );
+            // `kid` is a strict selector (present and non-empty per the parsed
+            // header); an unknown/wrong kid resolves to no key and denies.
+            let candidates = ks
+                .get_keys(expected_issuer, Some(&header.kid))
+                .await
+                .map_err(|e| anyhow!("no verifying key for source credential: {e}"))?;
+            anyhow::ensure!(
+                !candidates.is_empty(),
+                "no verifying key resolved for the source credential kid"
+            );
+            let claims = hyprstream_rpc::auth::jwt::decode_with_any_key(token, &candidates, None)
+                .map_err(|e| anyhow!("invalid source credential: {e}"))?;
+            Ok(VerifiedSourceCredential {
+                claims,
+                profile,
+                key_material: VerifiedKeyMaterial::Classical,
+            })
+        }
+        other => anyhow::bail!("unsupported source credential alg '{other}'"),
+    }
+}
+
+/// Parse a canonical `ability@resource` capability token into the reviewed
+/// typed [`hyprstream_rpc::auth::ucan::Capability`]. `None` for a malformed
+/// token (empty ability/resource, or no `@`).
+fn parse_capability(token: &str) -> Option<hyprstream_rpc::auth::ucan::Capability> {
+    use hyprstream_rpc::auth::ucan::{Ability, Capability, Resource};
+    let (ability, resource) = token.split_once('@')?;
+    if ability.is_empty() || resource.is_empty() {
+        return None;
+    }
+    Some(Capability::new(Resource::new(resource), Ability::new(ability)))
+}
+
+/// Attenuate an OAuth scope axis for a delegated hop. v16 §8.1 requires an
+/// EXPLICIT attenuation at every hop: a scope-bearing source never silently
+/// inherits its full scope into the derived credential. Equality is allowed
+/// only when the full subset is explicitly requested. A source with no scope
+/// cannot grant any — a non-empty request against it denies.
+fn attenuate_delegated_scope(
+    source_scope: Option<&str>,
+    requested: Option<&str>,
+) -> std::result::Result<Option<String>, String> {
+    let source_set: std::collections::BTreeSet<&str> =
+        source_scope.unwrap_or("").split_whitespace().collect();
+    let requested_scopes: Vec<&str> = requested.unwrap_or("").split_whitespace().collect();
+    if source_set.is_empty() {
+        if !requested_scopes.is_empty() {
+            return Err(
+                "source credential carries no scope; requested scope cannot be granted".to_owned(),
+            );
+        }
+        return Ok(None);
+    }
+    if requested_scopes.is_empty() {
+        return Err(
+            "scope-bearing source requires an explicit requested scope subset (no silent inheritance)"
+                .to_owned(),
+        );
+    }
+    for scope in &requested_scopes {
+        if !source_set.contains(scope) {
+            return Err(format!(
+                "requested scope '{scope}' is not held by the source credential (broadening denied)"
+            ));
+        }
+    }
+    Ok(Some(requested_scopes.join(" ")))
+}
+
+/// Attenuate the MAC/UCAN capability axis for a delegated hop using the reviewed
+/// [`hyprstream_rpc::auth::ucan::set_attenuates`] relation — never a second,
+/// ad-hoc capability algebra. v16 §8.1 requires explicit attenuation: a
+/// cap-bearing source never silently inherits its full `cap`; a source with no
+/// `cap` cannot grant any (a non-empty request denies, output stays `None`).
+/// Malformed tokens and any capability the source does not `cover` are rejected.
+fn attenuate_delegated_capabilities(
+    source_cap: Option<&str>,
+    requested: Option<&str>,
+) -> std::result::Result<Option<String>, String> {
+    let parse_set = |s: &str| -> std::result::Result<
+        Vec<hyprstream_rpc::auth::ucan::Capability>,
+        String,
+    > {
+        s.split_whitespace()
+            .map(|tok| {
+                parse_capability(tok).ok_or_else(|| {
+                    format!("malformed capability '{tok}' (expected ability@resource)")
+                })
+            })
+            .collect()
+    };
+    let held = parse_set(source_cap.unwrap_or(""))?;
+    let requested_str = requested.unwrap_or("").trim();
+    if held.is_empty() {
+        if !requested_str.is_empty() {
+            return Err(
+                "source credential carries no capability; requested capability cannot be granted"
+                    .to_owned(),
+            );
+        }
+        return Ok(None);
+    }
+    if requested_str.is_empty() {
+        return Err(
+            "capability-bearing source requires an explicit requested capability subset (no silent inheritance)"
+                .to_owned(),
+        );
+    }
+    let claimed = parse_set(requested_str)?;
+    if !hyprstream_rpc::auth::ucan::set_attenuates(&held, &claimed) {
+        return Err(
+            "requested capability broadens the source authority (not covered by the source cap)"
+                .to_owned(),
+        );
+    }
+    // Stamp the requested canonical `ability@resource` form.
+    Ok(Some(
+        claimed
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" "),
+    ))
+}
+
+/// The authenticated delegation edge presented to a [`DelegationEdgeAuthorizer`].
+/// Every field is AUTHORITY-DERIVED, never caller-asserted: the actor is the
+/// verified RPC envelope subject/tenant, the source audience is the verified
+/// source credential's `aud`, and the target is the validated requested
+/// audience. It carries no clearance, scope, or key — only the identity edge.
+pub struct DelegationEdge<'a> {
+    /// Bare terminal-actor service name (e.g. `"mcp"`), from the verified envelope.
+    pub actor_service: &'a str,
+    /// The terminal actor's verified tenant/Casbin domain.
+    pub actor_tenant: &'a str,
+    /// The verified source credential's `aud` — the resource the source was
+    /// minted FOR. The authorizer proves this names the CURRENT terminal actor
+    /// (the confused-deputy control): a source credential minted for service A
+    /// cannot be rebound to service B, even with B's valid enrollment/scope.
+    pub source_audience: Option<&'a str>,
+    /// The verified originator subject (the source credential's `sub`).
+    pub originator: &'a str,
+    /// The requested derived-call target audience (validated non-empty).
+    pub target_audience: &'a str,
+    /// The generated target method id, when the typed dispatch call carries one
+    /// (WS-E populates it from the reviewed inventory). `None` until then.
+    pub target_method_id: Option<&'a str>,
+}
+
+/// Fail-closed authority deciding whether a derived `AsOriginator` delegation
+/// edge is a declared/allowed call edge (v16 §8.1). WS-E installs the generated,
+/// reviewed `DispatchCallManifest` implementation before E-ready / F activation;
+/// **an uninstalled authorizer DENIES every edge** — the exchange cannot mint.
+///
+/// It proves BOTH that the source credential was valid for the current terminal
+/// actor (source audience ↔ actor binding — NOT the outbound
+/// `allowed_audiences` ceiling, which is a distinct control) AND that the
+/// requested target is a declared edge. It is never a caller boolean and never
+/// defaults to allow: a generic `manage`-scoped service credential is not, by
+/// itself, the confused-deputy control.
+pub trait DelegationEdgeAuthorizer: Send + Sync {
+    /// `true` iff this exact edge is an authorized derived call.
+    fn authorize(&self, edge: &DelegationEdge<'_>) -> bool;
+}
+
+/// A principal's ACTIVE primary signer-suite record (frozen A §5): the EXPLICIT
+/// suite ID owned by the authoritative record plus its ordered raw component
+/// public keys, in suite-plan order. B recomputes the confirmation thumbprint
+/// over exactly `[suite_id, ordered_component_keys]` — it never infers the suite
+/// ID from the key count, so a wrong-suite enrollment B would accept but C would
+/// reject is caught here. Component 0 is the Ed25519 key (the `cnf.jwk` key).
+pub struct PrimaryGroup {
+    /// The record's explicit suite ID (validated against the frozen registry).
+    pub suite_id: String,
+    /// Ordered raw component public keys (Ed25519 = 32 bytes; ML-DSA-65 = 1952).
+    pub ordered_component_keys: Vec<Vec<u8>>,
+}
+
+/// Fail-closed resolver of a principal's AUTHORITATIVE, off-wire PRIMARY signer
+/// enrollment (frozen A §5/T1: principal/tenant/role/keys/epoch — never the wire
+/// `cnf`). A **user/classical** source credential's `cnf`/`hs_signer_suite` is
+/// confirmed against THIS resolver, never self-derived from the same wire key it
+/// claims to bind. **Uninstalled ⇒ every user primary denies** (WS-C installs
+/// the real resolver over its enrollment store). Service primaries resolve
+/// against the enrollment manifest instead, so this seam governs only the
+/// user/classical case.
+pub trait PrimaryEnrollmentResolver: Send + Sync {
+    /// The ACTIVE primary signer group of `principal` in `tenant`, or `None`
+    /// when unknown, inactive, or tenant-mismatched (all deny).
+    fn primary_group(&self, principal: &str, tenant: &str) -> Option<PrimaryGroup>;
+}
+
+/// Resolve the authoritative v16 `cnf.hs_signer_suite` thumbprint (base64url,
+/// unpadded) for an enrolled SERVICE from the enrollment manifest, binding it to
+/// the verified envelope signer key. The suite is chosen by the exact enrolled
+/// key material — classical (Ed25519 only) or hybrid (Ed25519 + ML-DSA-65) — and
+/// never fabricated. Fail closed on an absent manifest/enrollment, a signer key
+/// that does not equal the enrolled Ed25519 key, or a malformed PQ half.
+fn enrolled_service_signer_suite(
+    manifest: Option<&crate::auth::service_enrollment::ServiceEnrollmentManifest>,
+    service_name: &str,
+    verified_ed_key: &[u8; 32],
+) -> Result<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let manifest =
+        manifest.ok_or_else(|| anyhow!("service-enrollment manifest is not installed"))?;
+    let entry = manifest
+        .services
+        .get(service_name)
+        .ok_or_else(|| anyhow!("service '{service_name}' has no enrollment entry"))?;
+    let enrolled_ed: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(&entry.ed25519_pubkey)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .ok_or_else(|| anyhow!("service '{service_name}' has a malformed enrolled ed25519 key"))?;
+    anyhow::ensure!(
+        &enrolled_ed == verified_ed_key,
+        "verified signer key does not match the enrolled ed25519 key for '{service_name}'"
+    );
+    let pq = match &entry.ml_dsa_pubkey {
+        Some(pq_b64) => Some(
+            URL_SAFE_NO_PAD
+                .decode(pq_b64)
+                .ok()
+                .filter(|b| b.len() == 1952)
+                .ok_or_else(|| anyhow!("service '{service_name}' has a malformed ml_dsa key"))?,
+        ),
+        None => None,
+    };
+    Ok(hyprstream_rpc::auth::service_signer_suite_b64(
+        &enrolled_ed,
+        pq.as_deref(),
+    ))
+}
+
+/// Outcome of the workload-session narrowing decision on a service-credential
+/// renewal (v16 §3.3). Extracted from the renewal handler so the check-BEFORE-
+/// narrowing invariant is unit-testable WITHOUT provisioning the signing /
+/// disk-persistence boundary: the decision is a pure function of the session
+/// registry state and the authoritative family policy.
+#[derive(Debug)]
+enum RenewalWorkloadSession {
+    /// Deny the renewal with this error code + message (fail-closed: a revoked,
+    /// expired, or unresolvable session never renews).
+    Deny {
+        code: &'static str,
+        message: String,
+    },
+    /// The `workload_session_id` to stamp into the renewed credential, or `None`
+    /// to OMIT it — either a deliberate family narrowing (the policy was removed
+    /// from a live family) or a standalone service that carries no session.
+    Stamp(Option<String>),
+}
+
+/// A v16 dispatch credential MUST carry a `cnf.hs_signer_suite` that equals the
+/// AUTHORITATIVE signer suite of its PRIMARY signer group — signature
+/// verification alone never checks the confirmation claim (frozen WS-A §5/T1),
+/// and the suite is NEVER self-derived from the same wire `cnf.jwk` it claims to
+/// bind.
+///
+/// **Primary selection (multi-hop §8.1):** for a source that carries an `act`
+/// chain, `sub` stays the originator but the `cnf` belongs to the OUTERMOST
+/// (current) terminal actor — so the primary principal is `act.sub` when an
+/// `act` is present, else `sub`. A correct first-hop delegated token is thus a
+/// valid second-hop source (its `cnf` resolves to its terminal actor).
+///
+/// **Resolution:** a SERVICE primary resolves against the enrollment manifest
+/// (key-bound); a USER/classical primary resolves against the fail-closed
+/// authoritative [`PrimaryEnrollmentResolver`] (never the wire key) — an
+/// uninstalled resolver or an unknown/mismatched primary denies. The presented
+/// `cnf.jwk` key MUST equal the resolved primary's Ed25519 component, and the
+/// `hs_signer_suite` MUST equal the suite over the resolved ordered keys.
+fn validate_credential_hs_suite(
+    manifest: Option<&crate::auth::service_enrollment::ServiceEnrollmentManifest>,
+    primary_resolver: Option<&dyn PrimaryEnrollmentResolver>,
+    claims: &hyprstream_rpc::auth::Claims,
+) -> Result<()> {
+    let cnf = claims
+        .cnf
+        .as_ref()
+        .ok_or_else(|| anyhow!("credential has no cnf confirmation"))?;
+    let present = cnf
+        .hs_signer_suite
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("credential cnf lacks hs_signer_suite (not a v16 credential)"))?;
+    let cnf_ed = claims
+        .cnf_key_bytes()
+        .ok_or_else(|| anyhow!("credential cnf lacks a well-formed ed25519 primary key"))?;
+
+    // §8.1: the primary is the OUTERMOST/current terminal actor when delegated.
+    let primary_principal = claims
+        .act
+        .as_ref()
+        .map_or(claims.sub.as_str(), |a| a.sub.as_str());
+
+    let expected = if let Some(svc) = primary_principal.strip_prefix("service:") {
+        // Service primary: the enrollment manifest is authoritative; the helper
+        // key-binds the presented Ed key to the enrolled Ed key and computes the
+        // suite over the enrolled ordered keys.
+        enrolled_service_signer_suite(manifest, svc, &cnf_ed)?
+    } else {
+        // User/classical primary: the AUTHORITATIVE off-wire resolver is the
+        // only source of truth — never the wire `cnf.jwk`.
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let resolver = primary_resolver.ok_or_else(|| {
+            anyhow!("primary-enrollment resolver is not installed; user primary denied")
+        })?;
+        let tenant = claims.tenant.as_deref().unwrap_or_default();
+        let group = resolver
+            .primary_group(primary_principal, tenant)
+            .ok_or_else(|| anyhow!("no active primary enrollment for the credential principal"))?;
+        // Validate the record's EXPLICIT suite ID + component shape against the
+        // frozen registry — never infer the suite from the key count, so a
+        // wrong-suite enrollment cannot be blessed here and rejected by C.
+        let keys = &group.ordered_component_keys;
+        let shape_ok = if group.suite_id == hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519 {
+            keys.len() == 1 && keys[0].len() == 32
+        } else if group.suite_id == hyprstream_rpc::auth::SUITE_HYBRID_ED25519_MLDSA65 {
+            keys.len() == 2 && keys[0].len() == 32 && keys[1].len() == 1952
+        } else {
+            false
+        };
+        anyhow::ensure!(
+            shape_ok,
+            "primary enrollment suite id/shape is not a frozen-registry signer suite"
+        );
+        // The presented `cnf.jwk` MUST equal the enrolled Ed25519 component 0.
+        anyhow::ensure!(
+            keys[0].as_slice() == cnf_ed,
+            "credential cnf.jwk does not equal the enrolled primary Ed25519 key"
+        );
+        // Recompute the thumbprint over the EXACT record value.
+        let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        URL_SAFE_NO_PAD.encode(hyprstream_rpc::auth::signer_suite_thumbprint(
+            &group.suite_id,
+            &refs,
+        ))
+    };
+    anyhow::ensure!(
+        present == expected,
+        "credential cnf.hs_signer_suite does not equal its authoritative primary signer suite"
+    );
+    Ok(())
+}
+
 #[async_trait::async_trait(?Send)]
 impl PolicyHandler for PolicyService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
@@ -584,8 +1250,6 @@ impl PolicyHandler for PolicyService {
     ) -> Result<PolicyResponseVariant> {
         trace!("Issuing JWT token");
 
-        let is_service_token = data.subject.as_ref().is_some_and(|s| s.starts_with("service:"));
-
         // Determine subject: explicit subject (if provided and authorized) or envelope identity.
         // JWT sub must contain a bare username (e.g. "randy", "birdetta") — the identity
         // system adds the namespace prefix ("token:randy") when the JWT is decoded.
@@ -636,8 +1300,93 @@ impl PolicyHandler for PolicyService {
             // Use bare username from the envelope identity.
             ctx.user().to_owned()
         };
+        let is_service_token = subject.starts_with("service:");
 
-        let subject_clearance = if data.require_clearance {
+        // `IssueToken` is the shared signing boundary. Its zero/default wire
+        // value is deliberately `InteractiveSession`, so a caller that omits
+        // the profile cannot silently mint an unsessioned user credential.
+        // The only sid-less user profiles are the separately typed RFC 8693
+        // and RFC 7523 exchanges; service credentials have their own profile
+        // and are never allowed to carry an interactive sid.
+        match data.issuance_profile {
+            IssueTokenProfile::InteractiveSession => {
+                if is_service_token {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "service credentials must use the service issuance profile".to_owned(),
+                        code: "INVALID_ISSUANCE_PROFILE".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+                if data.session_id.as_deref().is_none_or(str::is_empty) {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "interactive user/OIDC issuance requires a session id".to_owned(),
+                        code: "MISSING_SESSION".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+            }
+            IssueTokenProfile::Rfc8693 | IssueTokenProfile::Rfc7523 => {
+                if is_service_token {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "service credentials must use the service issuance profile".to_owned(),
+                        code: "INVALID_ISSUANCE_PROFILE".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+                if data.session_id.is_some() {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "non-interactive RFC issuance cannot carry an OIDC session id".to_owned(),
+                        code: "INVALID_SESSION".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+            }
+            IssueTokenProfile::Service => {
+                if !is_service_token || data.session_id.is_some() {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "service issuance requires a service subject and no OIDC session id".to_owned(),
+                        code: "INVALID_ISSUANCE_PROFILE".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+            }
+        }
+
+        // RFC 9068 §2.2.1 `client_id` (v16 credential profile): the user
+        // `at+jwt` profiles (interactive / RFC 8693 / RFC 7523) MUST carry a
+        // non-empty `client_id`; the service profile mints a `wit+jwt` and MUST
+        // NOT carry one. Stamped into the signed claims below so the emitted
+        // credential is profile-compliant by construction.
+        let client_id = data
+            .client_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match data.issuance_profile {
+            IssueTokenProfile::InteractiveSession
+            | IssueTokenProfile::Rfc8693
+            | IssueTokenProfile::Rfc7523 => {
+                if client_id.is_none() {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "at+jwt issuance requires a non-empty client_id (RFC 9068 §2.2.1)"
+                            .to_owned(),
+                        code: "MISSING_CLIENT_ID".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+            }
+            IssueTokenProfile::Service => {
+                if client_id.is_some() {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "service (wit+jwt) issuance cannot carry a client_id".to_owned(),
+                        code: "INVALID_CLIENT_ID".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+            }
+        }
+
+        let mut subject_clearance = if data.require_clearance {
             (self.token_clearance_resolver)(&subject).map(|clearance| {
                 let context = hyprstream_rpc::auth::mac::SecurityContext::from_clearance(
                     clearance,
@@ -700,6 +1449,42 @@ impl PolicyHandler for PolicyService {
         let now = chrono::Utc::now().timestamp();
         let audience = data.audience.as_ref().filter(|s| !s.is_empty()).cloned()
             .or_else(|| self.default_audience.clone());
+
+        // ServiceEnrollmentManifest (v16 §11): for service subjects the
+        // manifest is the authoritative target-clearance and audience source.
+        // Clearance is stamped from the manifest for every enrolled service
+        // (issuance cannot gain, and renewal cannot preserve, authority the
+        // manifest does not grant); a declared audience list is enforced
+        // fail-closed.
+        if let Some(service_name) = subject.strip_prefix("service:") {
+            if let Some(manifest) = crate::auth::service_enrollment::global_service_enrollment()
+            {
+                let Some(clearance) = manifest.clearance_for_service(service_name) else {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: format!(
+                            "service '{service_name}' has no enrollment entry"
+                        ),
+                        code: "UNENROLLED_SERVICE".to_owned(),
+                        details: String::new(),
+                    }));
+                };
+                subject_clearance = Some(clearance);
+                // A declared audience list requires the effective audience to
+                // be present AND a member — an enrolled service cannot mint
+                // without an exact allowed audience.
+                if !manifest.allows_audience(service_name, audience.as_deref()) {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: format!(
+                            "audience '{}' is not enrolled for service '{service_name}'",
+                            audience.as_deref().unwrap_or("<none>")
+                        ),
+                        code: "AUDIENCE_NOT_ENROLLED".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+            }
+        }
+
         let granted_scope = data.requested_scopes.as_ref().map(|scopes| {
             scopes.iter()
                 .map(String::as_str)
@@ -783,28 +1568,167 @@ impl PolicyHandler for PolicyService {
             .or_else(|| self.default_audience.clone())
             .unwrap_or_default();
         let mut claims = hyprstream_rpc::auth::Claims::new(
-            subject,
+            subject.clone(),
             now,
             now + requested_ttl as i64,
-        ).with_issuer(issuer)
+        ).with_issuer(issuer.clone())
          .with_audience(audience)
          .with_scope(granted_scope);
         if target_domain != "*" {
-            claims = claims.with_tenant(target_domain);
+            claims = claims.with_tenant(target_domain.clone());
         }
         if let Some(clearance) = subject_clearance {
             claims = claims.with_clearance(clearance);
         }
+        // RFC 9068 §2.2.1: stamp the OAuth `client_id` on the user `at+jwt`
+        // credential (validated non-empty above for those profiles; the service
+        // profile carries none).
+        if let Some(cid) = client_id {
+            claims = claims.with_client_id(cid);
+        }
+        // Session binding (v16 §3.3): the OIDC `sid` profile is enforced at
+        // the authority boundary. Service credentials NEVER carry an
+        // interactive session (workload IDs enter only through the enrolled
+        // renewal family, not this field). A user session ID is stamped only
+        // when the canonical registry holds an ACTIVE record bound to this
+        // exact subject and tenant — unknown, revoked, expired, cross-subject,
+        // or cross-tenant sessions are rejected (no session fixation).
+        if let Some(sid) = data.session_id.as_deref().filter(|s| !s.is_empty()) {
+            if sid.len() > 1024 {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "session id exceeds 1024 bytes".to_owned(),
+                    code: "INVALID_ARGUMENT".to_owned(),
+                    details: String::new(),
+                }));
+            }
+            if subject.starts_with("service:") {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "service credentials cannot carry an OIDC session id".to_owned(),
+                    code: "INVALID_ARGUMENT".to_owned(),
+                    details: String::new(),
+                }));
+            }
+            let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "session registry is not initialized".to_owned(),
+                    code: "UNAVAILABLE".to_owned(),
+                    details: String::new(),
+                }));
+            };
+            let session_key = hyprstream_rpc::auth::SessionKey::oidc(&issuer, sid);
+            let bindable = match registry.session_state(&session_key).await {
+                Some(state) => {
+                    state.status == hyprstream_rpc::auth::ActiveOrRevoked::Active
+                        && state.expires_at > now
+                        && state.subject == subject
+                        && state.tenant == target_domain
+                }
+                None => false,
+            };
+            if !bindable {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "session is unknown, inactive, expired, or bound to a different subject/tenant".to_owned(),
+                    code: "INVALID_SESSION".to_owned(),
+                    details: String::new(),
+                }));
+            }
+            claims = claims.with_sid(sid);
+        }
 
         // DPoP jkt takes priority over userPubKey (RFC 9449 § 6).
         if let Some(ref jkt) = data.dpop_jkt {
-            claims.cnf = Some(hyprstream_rpc::auth::Cnf {
-                jwk: None,
-                jkt: Some(jkt.clone()),
-            });
+            claims = claims.with_cnf_jkt_thumbprint(jkt.clone());
         } else if let Some(key_bytes) = service_key_bytes {
             claims = claims.with_cnf_jwk(&key_bytes);
         }
+
+        // v16 confirmation (frozen A §5), by STRUCTURAL classification:
+        //  - DISPATCH-CAPABLE credentials — a service `wit+jwt`, or a user
+        //    `at+jwt` carrying a proof-of-possession `cnf.jwk` — MUST bind their
+        //    AUTHORITATIVE Primary signer group's `cnf.hs_signer_suite`, or FAIL
+        //    CLOSED (never mint a non-conformant dispatch credential C rejects).
+        //  - NON-DISPATCH OAuth tokens — a no-cnf bearer, or a DPoP `cnf.jkt`-
+        //    only token — are standards-valid access tokens with no proof key to
+        //    bind a signer suite: issuance stays valid and no suite is stamped.
+        //    Delegation SOURCE validation and C proof admission independently
+        //    reject any hs-less credential presented for MAC dispatch.
+        let issue_err = |code: &str, message: String| {
+            PolicyResponseVariant::Error(ErrorInfo {
+                message,
+                code: code.to_owned(),
+                details: String::new(),
+            })
+        };
+        if is_service_token {
+            // Service (`wit+jwt`): the enrolled suite (manifest-authoritative,
+            // key-bound to the assertion key resolved above).
+            let svc = &subject["service:".len()..];
+            let Some(key) = service_key_bytes else {
+                return Ok(issue_err(
+                    "SIGNER_SUITE_UNAVAILABLE",
+                    format!("service '{svc}' issuance has no assertion key to bind a signer suite"),
+                ));
+            };
+            match enrolled_service_signer_suite(self.enrollment().as_deref(), svc, &key) {
+                Ok(suite) => claims = claims.with_cnf_hs_signer_suite(suite),
+                Err(e) => {
+                    return Ok(issue_err(
+                        "SIGNER_SUITE_UNAVAILABLE",
+                        format!("v16 signer suite for service '{svc}': {e}"),
+                    ))
+                }
+            }
+        } else if data.dpop_jkt.is_none() {
+            // A user `at+jwt` carrying a proof-of-possession `cnf.jwk` is
+            // DISPATCH-CAPABLE — resolve the AUTHORITATIVE Primary record for the
+            // subject/tenant, require the verified cnf key to equal its Ed
+            // component, and stamp the record's suite; no resolver / no active
+            // record / key mismatch all FAIL CLOSED (frozen A §5). A no-cnf
+            // bearer (no `service_key_bytes`) is non-dispatch and stamps none.
+            if let Some(key) = service_key_bytes {
+            let Some(resolver) = self.primary_enrollment_resolver.as_deref() else {
+                return Ok(issue_err(
+                    "PRIMARY_RESOLVER_UNAVAILABLE",
+                    "primary-enrollment resolver is not installed; user issuance is fail-closed \
+                     until the authoritative primary enrollment is available"
+                        .to_owned(),
+                ));
+            };
+            let Some(group) = resolver.primary_group(&subject, &target_domain) else {
+                return Ok(issue_err(
+                    "PRIMARY_UNRESOLVABLE",
+                    format!("no active authoritative primary enrollment for '{subject}'"),
+                ));
+            };
+            // Frozen-registry suite/shape + exact key binding.
+            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+            let keys = &group.ordered_component_keys;
+            let shape_ok = if group.suite_id == hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519 {
+                keys.len() == 1 && keys[0].len() == 32
+            } else if group.suite_id == hyprstream_rpc::auth::SUITE_HYBRID_ED25519_MLDSA65 {
+                keys.len() == 2 && keys[0].len() == 32 && keys[1].len() == 1952
+            } else {
+                false
+            };
+            if !shape_ok || keys[0].as_slice() != key {
+                return Ok(issue_err(
+                    "PRIMARY_UNRESOLVABLE",
+                    "user cnf key does not match the authoritative primary enrollment, or the \
+                     enrolled suite/shape is not a frozen-registry signer suite"
+                        .to_owned(),
+                ));
+            }
+            let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+            claims = claims.with_cnf_hs_signer_suite(
+                URL_SAFE_NO_PAD.encode(hyprstream_rpc::auth::signer_suite_thumbprint(
+                    &group.suite_id,
+                    &refs,
+                )),
+            );
+            }
+            // else: no-cnf bearer → non-dispatch OAuth token; no suite stamped.
+        }
+        // else: DPoP `cnf.jkt`-only → non-dispatch OAuth token; no suite stamped.
 
         let token = match self.sign_token(&claims, is_service_token).await {
             Ok(t) => t,
@@ -1814,8 +2738,79 @@ impl PolicyHandler for PolicyService {
 
         let issuer = self.default_audience.clone().unwrap_or_default();
         let tenant = ctx.domain()?;
-        let claims =
-            renewed_service_claims(subject.clone(), now, expires_at, &issuer, tenant, &ctx.cnf);
+        let mut claims =
+            renewed_service_claims(subject.clone(), now, expires_at, &issuer, tenant.clone(), &ctx.cnf);
+
+        // ServiceEnrollmentManifest (v16 §11): renewal re-derives clearance
+        // from the manifest — authority removed from enrollment never
+        // survives a renewal, and renewal never gains authority. Resolve the
+        // manifest ONCE through the injected-or-global authority (`enrollment`)
+        // so clearance, signer-suite, and the workload-family policy below all
+        // read the SAME authoritative source (and an isolated test can inject a
+        // `workload_session=false` family without mutating process globals).
+        let enrollment_manifest = self.enrollment();
+        if let Some(manifest) = enrollment_manifest.as_ref() {
+            let Some(clearance) = manifest.clearance_for_service(svc_name) else {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("service '{svc_name}' has no enrollment entry"),
+                    code: "UNENROLLED_SERVICE".to_owned(),
+                    details: String::new(),
+                }));
+            };
+            claims = claims.with_clearance(clearance);
+            // v16 confirmation: the renewed service WIT stamps the SAME
+            // authoritative signer suite (enrolled Ed + optional ML-DSA), so a
+            // renewed credential stays a v16 dispatch credential (never drops to
+            // legacy `cnf.jwk`-only). Fail closed if it cannot be resolved.
+            match enrolled_service_signer_suite(Some(&**manifest), svc_name, &ctx.cnf) {
+                Ok(suite) => claims = claims.with_cnf_hs_signer_suite(suite),
+                Err(e) => {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: format!("v16 signer suite unavailable for '{svc_name}': {e}"),
+                        code: "SIGNER_SUITE_UNAVAILABLE".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+            }
+        }
+
+        // Workload credential family (v16 §3.3): only an enrolled workload
+        // family carries `workload_session_id`. The disposition — deny, stamp,
+        // or omit — is resolved by `resolve_renewal_workload_session` (pure over
+        // the canonical session registry + the authoritative family policy),
+        // which enforces the check-BEFORE-narrowing ordering: a revoked/expired
+        // carried session denies regardless of whether the family policy would
+        // otherwise narrow it away.
+        let old_wsid = ctx
+            .claims()
+            .and_then(|c| c.workload_session_id.as_deref())
+            .map(str::to_owned);
+        let family_policy = enrollment_manifest
+            .as_ref()
+            .map(|m| m.workload_session_policy(svc_name));
+        match self
+            .resolve_renewal_workload_session(
+                &issuer,
+                &subject,
+                &tenant,
+                now,
+                family_policy,
+                old_wsid.as_deref(),
+            )
+            .await
+        {
+            RenewalWorkloadSession::Deny { code, message } => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message,
+                    code: code.to_owned(),
+                    details: String::new(),
+                }));
+            }
+            RenewalWorkloadSession::Stamp(Some(wsid)) => {
+                claims = claims.with_workload_session_id(wsid);
+            }
+            RenewalWorkloadSession::Stamp(None) => {}
+        }
 
         let token = match self.sign_token(&claims, true).await {
             Ok(t) => t,
@@ -1904,41 +2899,604 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
-        let ttl = data.ttl.unwrap_or(self.token_config.default_ttl_seconds);
-        let ttl = ttl.clamp(60, self.token_config.max_ttl_seconds);
+        let _ = data;
+        // v16 disposition (frozen A): this path minted an `at+jwt` with NO
+        // RFC 9068 `client_id`, NO authoritative interactive/non-interactive
+        // session classification, and NO authoritative primary-suite
+        // `cnf.hs_signer_suite` — a non-conformant v16 dispatch credential that
+        // every current admission boundary (svc.rs client_id gate, C's §5
+        // confirmation) would reject downstream. Rather than mint an invalid
+        // shape and rely on a later reject, this dormant path now fails CLOSED:
+        // a conformant user access token is minted only through the typed OAuth
+        // issuance profiles (`handle_issue_token`), never a WIT→at+jwt bridge
+        // that cannot supply an OAuth client identity. Retype through those
+        // authoritative profiles if this bridge is ever revived.
+        Ok(PolicyResponseVariant::Error(ErrorInfo {
+            message: "WIT→at+jwt exchange cannot produce a v16-conformant access token \
+                      (no OAuth client_id / session classification / authoritative \
+                      signer-suite confirmation); use the typed OAuth issuance profiles"
+                .to_owned(),
+            code: "V16_PROFILE_UNAVAILABLE".to_owned(),
+            details: String::new(),
+        }))
+    }
 
-        let now = chrono::Utc::now().timestamp();
-        let expires_at = now + ttl as i64;
+    /// RFC 8693 §4 on-behalf-of delegated mint (v16 §8.1 `AsOriginator`).
+    ///
+    /// The authenticated RPC caller IS the terminal actor: actor subject, cnf,
+    /// and tenant are derived from the verified policy envelope (never from a
+    /// request field), and originator/scope/capability/session/clearance are
+    /// derived from the authority-verified source credential. The authority
+    /// mints a NEW delegated credential — fresh `jti`, originator `sub`, nested
+    /// terminal `act`, terminal-actor `cnf`, fail-closed `meet(originator,
+    /// terminal actor)` clearance (the source's own clearance is already the
+    /// prior-hop meet), explicitly-attenuated scope AND capability, a
+    /// manifest-bound audience, and conditional `sid`/`workload_session_id`
+    /// retention — never a bearer relay. The source credential is reusable.
+    async fn handle_exchange_delegated(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &ExchangeDelegated,
+    ) -> Result<PolicyResponseVariant> {
+        use hyprstream_rpc::auth::mac::{SecurityContext, SubjectContextClaims as _};
 
-        let audience = data.audience.as_ref().filter(|s| !s.is_empty()).cloned()
-            .or_else(|| self.default_audience.clone());
+        let deny = |code: &str, message: &str| {
+            PolicyResponseVariant::Error(ErrorInfo {
+                message: message.to_owned(),
+                code: code.to_owned(),
+                details: String::new(),
+            })
+        };
+        // The effective enrollment manifest (injected override or process
+        // global) — the authoritative source of the actor's signer suite,
+        // outbound audience ceiling, and workload-family policy.
+        let manifest = self.enrollment();
+        let manifest = manifest.as_deref();
 
-        let issuer = self.default_audience.clone().unwrap_or_default();
-        let mut claims = hyprstream_rpc::auth::Claims::new(sub.clone(), now, expires_at)
-            .with_issuer(issuer)
-            .with_tenant(domain)
-            .with_audience(audience);
-
-        // Key binding: carry cnf.jwk from WIT into the at+jwt.
-        if let Some(key_bytes) = cnf_key_bytes {
-            claims = claims.with_cnf_jwk(&key_bytes);
+        // ── 1. Terminal actor = the AUTHENTICATED RPC caller (never a field) ──
+        let Some(actor_sub) = ctx.subject().name().map(str::to_owned) else {
+            return Ok(deny(
+                "ANONYMOUS",
+                "delegated exchange requires an authenticated terminal actor",
+            ));
+        };
+        // AsOriginator derived dispatch is service→service: only a service
+        // identity holds standing authority to act on another principal's
+        // behalf. A caller that cannot become a terminal actor is rejected.
+        let Some(actor_svc) = actor_sub.strip_prefix("service:") else {
+            return Ok(deny(
+                "NOT_A_TERMINAL_ACTOR",
+                "only a service identity can become a delegated terminal actor",
+            ));
+        };
+        let actor_domain = ctx.domain()?;
+        // The terminal actor's cnf = the verified Ed25519 key that signed THIS
+        // request. Binding the new credential to it forces the downstream
+        // envelope signer to equal the terminal actor (#680 confused-deputy).
+        let actor_cnf = ctx.cnf;
+        if actor_cnf == [0u8; 32] {
+            return Ok(deny(
+                "NO_TERMINAL_CNF",
+                "terminal actor request carried no verified signing key",
+            ));
         }
+        // The terminal actor's OWN verified context: authority-asserted
+        // clearance clamped to its verified crypto assurance. Never wire-supplied.
+        let Some(actor_ctx) = ctx.security_context() else {
+            return Ok(deny(
+                "UNLABELED_ACTOR",
+                "terminal actor has no resolvable clearance",
+            ));
+        };
 
-        let token = match self.sign_token(&claims, false).await {
-            Ok(t) => t,
-            Err(e) => {
-                return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                    message: "Failed to issue WIT".to_owned(),
-                    code: "SIGNING_NOT_CONFIGURED".to_owned(),
-                    details: e.to_string(),
-                }));
+        // ── 2. This authority's configured issuer is the trust anchor for the
+        // source credential (key possession alone is not issuer trust). It is
+        // resolved BEFORE verification so the classical key lookup is keyed by
+        // the trusted issuer; the requested `aud` is a separate validated
+        // target and never sets `iss`. ──
+        let expected_issuer = match self.default_audience.as_deref() {
+            Some(i) if !i.is_empty() => i.to_owned(),
+            _ => {
+                return Ok(deny(
+                    "ISSUER_NOT_CONFIGURED",
+                    "delegated exchange requires a configured authorization-server issuer",
+                ))
             }
         };
 
-        info!(sub = %sub, expires_at, "ExchangeWit: issued at+jwt");
-        Ok(PolicyResponseVariant::ExchangeWitResult(TokenInfo {
+        // ── 3. Verify the presented source credential (originator authority) ──
+        let VerifiedSourceCredential {
+            claims: source,
+            profile,
+            key_material: source_key_material,
+        } = match verify_presented_credential(
+            &data.source_credential,
+            self.jwt_key_source.as_deref(),
+            &expected_issuer,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(deny("INVALID_SOURCE", &format!("source credential rejected: {e}")))
+            }
+        };
+        let now = chrono::Utc::now().timestamp();
+        if source.exp <= now {
+            return Ok(deny("SOURCE_EXPIRED", "source credential has expired"));
+        }
+        // Issuer-claim exact-equality (again) after decode: the verified `iss`
+        // MUST equal the trusted issuer the keys were resolved under.
+        if source.iss != expected_issuer {
+            return Ok(deny(
+                "UNTRUSTED_ISSUER",
+                "source credential issuer is not this authority's trusted issuer",
+            ));
+        }
+        let originator = source.sub.clone();
+        if originator.is_empty() {
+            return Ok(deny("INVALID_SOURCE", "source credential has no subject"));
+        }
+        if is_path_form_did_web(&originator) {
+            return Ok(deny(
+                "FROZEN_PATH_FORM_SUBJECT",
+                "path-form did:web account subjects are frozen (#1159)",
+            ));
+        }
+        // Profile ↔ subject coherence: at+jwt is a user credential, wit+jwt a
+        // service one. A typ that disagrees with the subject spelling is rejected.
+        let originator_is_service = originator.starts_with("service:");
+        match profile {
+            SourceProfile::AtJwt if originator_is_service => {
+                return Ok(deny(
+                    "PROFILE_MISMATCH",
+                    "at+jwt source credential carries a service subject",
+                ))
+            }
+            SourceProfile::WitJwt if !originator_is_service => {
+                return Ok(deny(
+                    "PROFILE_MISMATCH",
+                    "wit+jwt source credential carries a non-service subject",
+                ))
+            }
+            _ => {}
+        }
+
+        // Frozen-A profile coherence on the SOURCE (rejected before mint):
+        //  - a user `at+jwt` MUST carry a non-empty client_id AND a non-empty
+        //    OIDC `sid`, and MUST NOT carry a `workload_session_id`;
+        //  - a service `wit+jwt` MUST NOT carry `sid` or `client_id`; a
+        //    `workload_session_id` is permitted ONLY for a service the
+        //    enrollment manifest marks as an authoritative workload family.
+        let source_client_id = source
+            .client_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let source_sid = source.sid.as_deref().filter(|s| !s.is_empty());
+        let source_wsid = source.workload_session_id.as_deref().filter(|s| !s.is_empty());
+        match profile {
+            SourceProfile::AtJwt => {
+                // Malformations of a user at+jwt (frozen A): client_id is always
+                // required; a user credential never carries a workload id.
+                if source_client_id.is_none() {
+                    return Ok(deny(
+                        "MALFORMED_SOURCE_PROFILE",
+                        "user at+jwt source requires a non-empty client_id",
+                    ));
+                }
+                if source_wsid.is_some() {
+                    return Ok(deny(
+                        "MALFORMED_SOURCE_PROFILE",
+                        "user at+jwt source must not carry a workload_session_id",
+                    ));
+                }
+                // JOSE typ alone cannot distinguish an interactive session
+                // at+jwt (sid REQUIRED) from a separately-typed non-interactive
+                // RFC 8693/7523 at+jwt (sid ABSENT), and the credential carries
+                // no off-wire discriminator for that split. Rather than guess or
+                // invent a claim, the supported unambiguous delegation-source
+                // subset is the interactive session credential: an at+jwt source
+                // MUST present a non-empty OIDC sid (validated active below). A
+                // sid-less at+jwt is a valid credential but an UNSUPPORTED
+                // delegation source here (fail closed), not a malformed one.
+                if source_sid.is_none() {
+                    return Ok(deny(
+                        "UNSUPPORTED_SOURCE",
+                        "a delegatable at+jwt source must be an interactive session credential (active sid); a non-interactive/sid-less at+jwt is not a supported delegation source",
+                    ));
+                }
+            }
+            SourceProfile::WitJwt => {
+                if source_sid.is_some() {
+                    return Ok(deny(
+                        "MALFORMED_SOURCE_PROFILE",
+                        "service wit+jwt source must not carry an OIDC sid",
+                    ));
+                }
+                if source_client_id.is_some() {
+                    return Ok(deny(
+                        "MALFORMED_SOURCE_PROFILE",
+                        "service wit+jwt source must not carry a client_id",
+                    ));
+                }
+                if source_wsid.is_some() {
+                    let svc = &originator["service:".len()..];
+                    let enrolled_family = manifest
+                        .map(|m| m.workload_session_policy(svc))
+                        .unwrap_or(false);
+                    if !enrolled_family {
+                        return Ok(deny(
+                            "MALFORMED_SOURCE_PROFILE",
+                            "service source carries a workload_session_id but is not an enrolled workload family",
+                        ));
+                    }
+                }
+            }
+        }
+
+        // The source MUST be a v16 credential: its `cnf.hs_signer_suite` present
+        // and equal to its own subject's authoritative signer suite. Signature
+        // verification alone does not check the confirmation claim.
+        if let Err(e) = validate_credential_hs_suite(
+            manifest,
+            self.primary_enrollment_resolver.as_deref(),
+            &source,
+        ) {
+            return Ok(deny(
+                "INVALID_SOURCE_CNF",
+                &format!("source credential confirmation rejected: {e}"),
+            ));
+        }
+
+        // Issuer-scoped source credentials must be revocable and not revoked.
+        let Some(jti) = source.jti.as_deref().filter(|s| !s.is_empty()) else {
+            return Ok(deny(
+                "SOURCE_NOT_REVOCABLE",
+                "source credential carries no jti (not revocable)",
+            ));
+        };
+        let id = hyprstream_rpc::auth::CredentialId::jwt(expected_issuer.clone(), jti.to_owned());
+        let revoked = match hyprstream_rpc::auth::global_credential_revocation_store() {
+            Some(store) => store.is_revoked(&id).await,
+            None => true, // fail closed: liveness cannot be proven
+        };
+        if revoked {
+            return Ok(deny(
+                "SOURCE_REVOKED",
+                "source credential is revoked or its liveness cannot be proven",
+            ));
+        }
+
+        // ── 4. Coherence: originator and terminal actor MUST share a tenant ──
+        // Tenant comes from the verified envelope (the actor's); the source's
+        // tenant must equal it — no cross-tenant delegation.
+        match source.tenant.as_deref() {
+            Some(t) if t == actor_domain => {}
+            _ => {
+                return Ok(deny(
+                    "TENANT_MISMATCH",
+                    "source credential tenant does not match the terminal actor's verified tenant",
+                ))
+            }
+        }
+
+        // ── 5. Existing delegation chain must be bounded and fully labeled ──
+        // (well-formedness only — the source's top-level clearance is already
+        // the prior-hop meet, so intermediate act clearances are NOT re-folded).
+        const MAX_DELEGATION_HOPS: usize = 8;
+        {
+            let mut hop = source.act.as_ref();
+            let mut depth = 0usize;
+            while let Some(actor) = hop {
+                if actor.clearance.is_none() {
+                    return Ok(deny(
+                        "MALFORMED_ACTOR_CHAIN",
+                        "an actor in the source delegation chain carries no clearance",
+                    ));
+                }
+                depth += 1;
+                if depth > MAX_DELEGATION_HOPS {
+                    return Ok(deny(
+                        "MALFORMED_ACTOR_CHAIN",
+                        "source delegation chain exceeds the maximum hop depth",
+                    ));
+                }
+                hop = actor.act.as_deref();
+            }
+        }
+
+        // ── 6. Clearance = fail-closed meet(originator, EVERY intermediate
+        // actor, terminal actor). We do NOT assume the source's top-level
+        // clearance already folds its prior act-chain hops — that induction is
+        // unsafe for a foreign/older accepted source — so every intermediate
+        // `act.clearance` is folded in explicitly (the meet only ever lowers the
+        // level and shrinks compartments, so folding is always safe). The
+        // originator's assurance is the ACTUAL verified source algorithm; the
+        // effective assurance is the terminal signer's (the final fold). ──
+        let Some(mut met) = source.security_context(source_key_material) else {
+            return Ok(deny(
+                "UNLABELED_ORIGINATOR",
+                "source credential has no resolvable clearance",
+            ));
+        };
+        {
+            let mut hop = source.act.as_ref();
+            while let Some(actor) = hop {
+                let Some(cc) = actor.clearance else {
+                    // Already rejected by the well-formedness walk above, but
+                    // fail closed here too rather than silently skipping a hop.
+                    return Ok(deny(
+                        "UNLABELED_ORIGINATOR",
+                        "a source delegation-chain actor is unlabeled",
+                    ));
+                };
+                // Assurance here is transient (overwritten by the terminal fold);
+                // only the level/compartments of this hop enter the meet.
+                let hop_ctx = SecurityContext::new(
+                    cc.level,
+                    cc.compartments,
+                    hyprstream_rpc::auth::mac::VerifiedKeyMaterial::Classical,
+                );
+                met = SecurityContext::delegated_meet(&met, &hop_ctx);
+                hop = actor.act.as_deref();
+            }
+        }
+        // Terminal actor folds last, so the effective assurance is its verified
+        // signer's crypto floor.
+        let met = SecurityContext::delegated_meet(&met, &actor_ctx);
+
+        // ── 7. Explicit attenuation of BOTH authority axes (v16 §8.1) ──
+        let granted_scope = match attenuate_delegated_scope(
+            source.scope.as_deref(),
+            data.requested_scopes.as_deref(),
+        ) {
+            Ok(s) => s,
+            Err(msg) => return Ok(deny("SCOPE_ATTENUATION", &msg)),
+        };
+        let granted_cap = match attenuate_delegated_capabilities(
+            source.cap.as_deref(),
+            data.requested_capabilities.as_deref(),
+        ) {
+            Ok(c) => c,
+            Err(msg) => return Ok(deny("CAPABILITY_ATTENUATION", &msg)),
+        };
+
+        // ── 8. Audience: REQUIRED, non-empty, and bound to the reviewed
+        // derived-call contract — the terminal actor's enrollment-manifest
+        // allowed audiences, or (no manifest) the source credential's own
+        // audience. Never an arbitrary string; never defaulted to the issuer. ──
+        let Some(audience) = data
+            .audience
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(deny(
+                "AUDIENCE_REQUIRED",
+                "delegated exchange requires an explicit non-empty audience",
+            ));
+        };
+        // Outbound target ceiling (manifest `allowed_audiences`) — a DISTINCT
+        // control from the edge authority: it bounds what a service may mint
+        // for, never proof that the source named this actor. Kept as
+        // defense-in-depth for an enrolled actor.
+        if let Some(m) = manifest {
+            if !m.allows_audience(actor_svc, Some(audience)) {
+                return Ok(deny(
+                    "AUDIENCE_NOT_ENROLLED",
+                    "requested audience exceeds the terminal actor's outbound audience ceiling",
+                ));
+            }
+        }
+        // The derived-call target method is REQUIRED and non-empty: the
+        // authorizer enforces the exact reviewed DispatchCallManifest method
+        // edge, and no authorizer may treat an absent method as a wildcard.
+        let Some(target_method_id) = data
+            .target_method_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(deny(
+                "TARGET_METHOD_REQUIRED",
+                "delegated exchange requires a non-empty target method id",
+            ));
+        };
+        // Authoritative confused-deputy control: an edge authorizer must prove
+        // BOTH that the source credential was valid FOR this terminal actor
+        // (source `aud` ↔ actor) AND that the requested (target audience, target
+        // method) is a declared call edge. An UNINSTALLED authorizer denies — a
+        // generic manage-scoped service credential is never, by itself, the
+        // delegation control.
+        let Some(authorizer) = self.delegation_edge_authorizer.as_deref() else {
+            return Ok(deny(
+                "EDGE_AUTHORIZER_UNAVAILABLE",
+                "delegation-edge authorizer is not installed; derived dispatch denied",
+            ));
+        };
+        let edge = DelegationEdge {
+            actor_service: actor_svc,
+            actor_tenant: &actor_domain,
+            source_audience: source.aud.as_deref(),
+            originator: &originator,
+            target_audience: audience,
+            target_method_id: Some(target_method_id),
+        };
+        if !authorizer.authorize(&edge) {
+            return Ok(deny(
+                "EDGE_DENIED",
+                "the delegation edge is not an authorized derived call (source audience / actor / target / method)",
+            ));
+        }
+
+        // ── 9. Lifetime: never outlives the source, the terminal actor's
+        // authority, a retained session, or the configured issuance maximum ──
+        let mut expires_at = source.exp;
+        if let Some(actor_claims) = ctx.claims() {
+            expires_at = expires_at.min(actor_claims.exp);
+        }
+        let ttl_override = data
+            .ttl
+            .map(i64::from)
+            .unwrap_or(self.token_config.default_ttl_seconds as i64);
+        expires_at = expires_at.min(now + ttl_override);
+        expires_at = expires_at.min(now + self.token_config.max_ttl_seconds as i64);
+
+        // ── 10. Session retention. A source's OIDC `sid` and workload
+        // `workload_session_id` are DISJOINT namespaces (never cross-mapped);
+        // each, when present, must be ACTIVE and exact before the mint, else the
+        // whole exchange denies. A credential carrying both is malformed. ──
+        if source.sid.is_some() && source.workload_session_id.is_some() {
+            return Ok(deny(
+                "MALFORMED_SESSION",
+                "source credential carries both an OIDC sid and a workload session id",
+            ));
+        }
+        let mut retained_sid: Option<String> = None;
+        let mut retained_wsid: Option<String> = None;
+        if let Some(sid) = source.sid.as_deref().filter(|s| !s.is_empty()) {
+            let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+                return Ok(deny("UNAVAILABLE", "session registry is not initialized"));
+            };
+            let key = hyprstream_rpc::auth::SessionKey::oidc(&expected_issuer, sid);
+            let state = registry.session_state(&key).await;
+            let bindable = matches!(&state, Some(s)
+                if s.status == hyprstream_rpc::auth::ActiveOrRevoked::Active
+                    && s.expires_at > now
+                    && s.subject == originator
+                    && s.tenant == actor_domain);
+            if !bindable {
+                return Ok(deny(
+                    "SESSION_INVALID",
+                    "source OIDC session is revoked, expired, unknown, or mismatched",
+                ));
+            }
+            if let Some(s) = state {
+                expires_at = expires_at.min(s.expires_at);
+            }
+            retained_sid = Some(sid.to_owned());
+        }
+        if let Some(wsid) = source.workload_session_id.as_deref().filter(|s| !s.is_empty()) {
+            let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+                return Ok(deny("UNAVAILABLE", "session registry is not initialized"));
+            };
+            let key = hyprstream_rpc::auth::SessionKey::workload(&expected_issuer, wsid);
+            let state = registry.session_state(&key).await;
+            let bindable = matches!(&state, Some(s)
+                if s.status == hyprstream_rpc::auth::ActiveOrRevoked::Active
+                    && s.expires_at > now
+                    && s.subject == originator
+                    && s.tenant == actor_domain);
+            if !bindable {
+                return Ok(deny(
+                    "SESSION_INVALID",
+                    "source workload session is revoked, expired, unknown, or mismatched",
+                ));
+            }
+            if let Some(s) = state {
+                expires_at = expires_at.min(s.expires_at);
+            }
+            retained_wsid = Some(wsid.to_owned());
+        }
+
+        // The derived credential must retain a usable lifetime after every clamp.
+        const MIN_TTL_SECONDS: i64 = 60;
+        if expires_at - now < MIN_TTL_SECONDS {
+            return Ok(deny(
+                "SOURCE_TOO_SHORT",
+                "source/actor/session lifetime leaves no usable delegated TTL",
+            ));
+        }
+
+        // ── 11. RFC 9068 client_id provenance. A user-originator delegated
+        // credential is an `at+jwt` and inherits the originator's OAuth
+        // client_id (validated present by the profile-coherence gate above); a
+        // service-originator mints a `wit+jwt` and carries NO client_id (a
+        // service source's client_id was already rejected). Never stamp a
+        // client_id onto a service output. ──
+        let client_id = if originator_is_service {
+            None
+        } else {
+            source_client_id
+        };
+
+        // ── 12. Resolve the TERMINAL ACTOR's authoritative v16 signer suite from
+        // its enrollment (classical or hybrid by exact enrolled key material),
+        // key-bound to the verified envelope signer. The delegated credential's
+        // `cnf` binds the terminal actor (it signs the downstream envelope), so
+        // its confirmation is the actor's suite — a bare Ed25519 `cnf.jwk`
+        // cannot represent a hybrid actor. Fail closed if unresolvable. ──
+        let actor_suite = match enrolled_service_signer_suite(manifest, actor_svc, &actor_cnf) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(deny(
+                    "ACTOR_SUITE_UNRESOLVABLE",
+                    &format!("terminal actor v16 signer suite could not be resolved: {e}"),
+                ))
+            }
+        };
+
+        // ── 13. Build and sign the fresh delegated credential ──
+        let met_label = *met.clearance();
+        let terminal_actor = hyprstream_rpc::auth::ActClaim {
+            sub: actor_sub.clone(),
+            clearance: Some(hyprstream_rpc::auth::mac::CredentialClearance::from_label(
+                *actor_ctx.clearance(),
+            )),
+            // Nest the source's existing delegation chain beneath the new
+            // terminal actor (RFC 8693 §4.1 outermost-is-current ordering).
+            act: source.act.clone().map(Box::new),
+        };
+        let mut claims = hyprstream_rpc::auth::Claims::new(originator.clone(), now, expires_at)
+            .with_issuer(expected_issuer)
+            .with_tenant(actor_domain)
+            .with_audience(Some(audience.to_owned()))
+            .with_scope(granted_scope)
+            // Stamp the already-met clearance so even a reader that ignores the
+            // `act` chain sees the lowest (meet) authority; a downstream
+            // delegated_meet re-take is idempotent (meet ≤ every input).
+            .with_clearance(met_label)
+            .with_act(terminal_actor)
+            // v16 confirmation = the terminal actor's authoritative signer suite;
+            // the legacy `cnf.jwk` (actor Ed key) is preserved alongside it.
+            .with_cnf_jwk(&actor_cnf)
+            .with_cnf_hs_signer_suite(actor_suite);
+        if let Some(cap) = granted_cap {
+            claims = claims.with_cap(cap);
+        }
+        if let Some(cid) = client_id {
+            claims = claims.with_client_id(cid);
+        }
+        if let Some(sid) = retained_sid {
+            claims = claims.with_sid(sid);
+        }
+        if let Some(wsid) = retained_wsid {
+            claims = claims.with_workload_session_id(wsid);
+        }
+
+        // `sign_token` injects a fresh `jti` (the encoder mints one when absent),
+        // so the delegated credential's id is always distinct from the source.
+        let token = match self.sign_token(&claims, originator_is_service).await {
+            Ok(t) => t,
+            Err(e) => {
+                return Ok(deny(
+                    "SIGNING_NOT_CONFIGURED",
+                    &format!("failed to mint delegated credential: {e}"),
+                ))
+            }
+        };
+
+        info!(
+            originator = %originator,
+            actor = %actor_sub,
+            expires_at = claims.exp,
+            "ExchangeDelegated: minted delegated credential"
+        );
+        Ok(PolicyResponseVariant::ExchangeDelegatedResult(TokenInfo {
             token,
-            expires_at,
+            expires_at: claims.exp,
         }))
     }
 
@@ -1959,19 +3517,23 @@ impl PolicyHandler for PolicyService {
                 details: String::new(),
             }));
         };
-        // Server-side publication bounds. Legitimate lifetimes: service JWTs
-        // clamp to 30 days, access tokens far shorter — 45 days covers every
-        // issuer with margin. A caller-controlled far-future exp would make an
-        // entry effectively permanent (never GC'd, never dropped on load), and
-        // unbounded issuer/value sizes would fill the authority's durable log.
-        // Reject, never clamp: a clamped exp would silently un-revoke a
+        // Server-side publication bounds. The retention horizon is derived
+        // from the configured issuance maxima at construction (default 45
+        // days covers the hard 30-day service-JWT clamp with margin), so no
+        // issuable credential can outlive its revocability. A
+        // caller-controlled far-future exp would otherwise make an entry
+        // effectively permanent (never GC'd, never dropped on load), and
+        // unbounded issuer/value sizes would fill the authority's durable
+        // log. Reject, never clamp: a clamped exp would silently un-revoke a
         // still-live token after reload.
-        const MAX_REVOCATION_TTL_SECS: i64 = 45 * 24 * 3600;
         const MAX_ID_FIELD_BYTES: usize = 1024;
         let now = chrono::Utc::now().timestamp();
-        if data.expires_at <= 0 || data.expires_at > now + MAX_REVOCATION_TTL_SECS {
+        if data.expires_at <= 0 || data.expires_at > now + self.revocation_max_ttl_secs {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: "expires_at out of bounds (must be 0 < exp <= now + 45d)".to_owned(),
+                message: format!(
+                    "expires_at out of bounds (must be 0 < exp <= now + {}s)",
+                    self.revocation_max_ttl_secs
+                ),
                 code: "INVALID_ARGUMENT".to_owned(),
                 details: String::new(),
             }));
@@ -2023,6 +3585,142 @@ impl PolicyHandler for PolicyService {
             None => true,
         };
         Ok(PolicyResponseVariant::CheckCredentialRevocationResult(revoked))
+    }
+
+    /// Register a session with the canonical registry this service owns.
+    /// Fail-closed: a malformed record, an out-of-horizon expiry, an
+    /// uninitialized registry, or a failed durable write is an error, never
+    /// a silent success. Issuance callers own the session lifecycle; the
+    /// registry never mints session IDs.
+    async fn handle_register_session(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RegisterSession,
+    ) -> Result<PolicyResponseVariant> {
+        const MAX_FIELD_BYTES: usize = 1024;
+        let invalid = |message: &str| {
+            Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: message.to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }))
+        };
+        let Some(key) = crate::services::revocation::session_key_from_ref(&data.session) else {
+            return invalid("malformed session key (empty issuer or identifier)");
+        };
+        let now = chrono::Utc::now().timestamp();
+        if data.subject.is_empty()
+            || data.tenant.is_empty()
+            || data.subject.len() > MAX_FIELD_BYTES
+            || data.tenant.len() > MAX_FIELD_BYTES
+        {
+            return invalid("session subject/tenant empty or over 1024 bytes");
+        }
+        if data.expires_at <= 0 || data.expires_at > now + self.revocation_max_ttl_secs {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!(
+                    "expires_at out of bounds (must be 0 < exp <= now + {}s)",
+                    self.revocation_max_ttl_secs
+                ),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+        let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "session registry is not initialized".to_owned(),
+                code: "UNAVAILABLE".to_owned(),
+                details: String::new(),
+            }));
+        };
+        let kind = match &key.id {
+            hyprstream_rpc::auth::SessionIdentifier::OidcSid(_) => {
+                hyprstream_rpc::auth::SessionKind::Interactive
+            }
+            hyprstream_rpc::auth::SessionIdentifier::WorkloadSessionId(_) => {
+                hyprstream_rpc::auth::SessionKind::Workload
+            }
+        };
+        let state = hyprstream_rpc::auth::SessionState {
+            subject: data.subject.clone(),
+            tenant: data.tenant.clone(),
+            kind,
+            created_at: now,
+            expires_at: data.expires_at,
+            status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+            clearance_epoch: data.clearance_epoch,
+        };
+        match registry.register_session(key, state).await {
+            Ok(()) => Ok(PolicyResponseVariant::RegisterSessionResult),
+            Err(e) => {
+                let code = match &e {
+                    hyprstream_rpc::auth::SessionRegisterError::Exists(_) => "ALREADY_EXISTS",
+                    hyprstream_rpc::auth::SessionRegisterError::PublicationFailed(_) => {
+                        "UNAVAILABLE"
+                    }
+                    _ => "INVALID_ARGUMENT",
+                };
+                Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: e.to_string(),
+                    code: code.to_owned(),
+                    details: String::new(),
+                }))
+            }
+        }
+    }
+
+    /// Revoke a session: every credential carrying it is then rejected.
+    /// Fail-closed: an uninitialized registry or a failed durable write is an
+    /// error, never a silent success.
+    async fn handle_revoke_session(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RevokeSession,
+    ) -> Result<PolicyResponseVariant> {
+        let Some(key) = crate::services::revocation::session_key_from_ref(&data.session) else {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "malformed session key (empty issuer or identifier)".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        };
+        let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "session registry is not initialized".to_owned(),
+                code: "UNAVAILABLE".to_owned(),
+                details: String::new(),
+            }));
+        };
+        if let Err(e) = registry.revoke_session(&key).await {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "session revocation was not durably accepted".to_owned(),
+                code: "UNAVAILABLE".to_owned(),
+                details: e.to_string(),
+            }));
+        }
+        Ok(PolicyResponseVariant::RevokeSessionResult)
+    }
+
+    /// Answer a session check from the canonical registry. True means ACTIVE
+    /// and known; revoked, expired, unknown, malformed, or an uninitialized
+    /// registry all read false — a session whose state cannot be checked is
+    /// never reported active.
+    async fn handle_check_session(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &CheckSession,
+    ) -> Result<PolicyResponseVariant> {
+        let active = match crate::services::revocation::session_key_from_ref(&data.session) {
+            Some(key) => match hyprstream_rpc::auth::global_session_registry() {
+                Some(registry) => !registry.is_revoked(&key).await,
+                None => false,
+            },
+            None => false,
+        };
+        Ok(PolicyResponseVariant::CheckSessionResult(active))
     }
 }
 
@@ -2425,7 +4123,65 @@ mod tests {
             issuer: None,
             tenant: None,
             require_clearance: false,
+            session_id: None,
+            issuance_profile: IssueTokenProfile::Rfc8693,
+            // The user at+jwt profiles require a non-empty RFC 9068 client_id.
+            client_id: Some("hyprstream-oauth-client-1".to_owned()),
         }
+    }
+
+    /// A classical single-Ed authoritative Primary resolver for `subject` bound
+    /// to `ed_key` — the isolated fixture equivalent of WS-C's enrollment store,
+    /// so v16 user-issuance can stamp `cnf.hs_signer_suite`.
+    fn v16_primary_resolver(subject: &str, ed_key: [u8; 32]) -> Arc<dyn PrimaryEnrollmentResolver> {
+        struct R {
+            subject: String,
+            key: [u8; 32],
+        }
+        impl PrimaryEnrollmentResolver for R {
+            fn primary_group(&self, principal: &str, _tenant: &str) -> Option<PrimaryGroup> {
+                (principal == self.subject).then(|| PrimaryGroup {
+                    suite_id: hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519.to_owned(),
+                    ordered_component_keys: vec![self.key.to_vec()],
+                })
+            }
+        }
+        Arc::new(R {
+            subject: subject.to_owned(),
+            key: ed_key,
+        })
+    }
+
+    /// A single-service classical enrollment manifest for `service` bound to
+    /// `ed_key`, so v16 service-issuance can stamp the enrolled signer suite.
+    fn v16_service_manifest(
+        service: &str,
+        ed_key: [u8; 32],
+    ) -> Arc<crate::auth::service_enrollment::ServiceEnrollmentManifest> {
+        use crate::auth::service_enrollment::{
+            ServiceEnrollment, ServiceEnrollmentManifest, SERVICE_ENROLLMENT_VERSION,
+        };
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Level, SecurityLabel};
+        let mut services = std::collections::BTreeMap::new();
+        services.insert(
+            service.to_owned(),
+            ServiceEnrollment {
+                ed25519_pubkey: URL_SAFE_NO_PAD.encode(ed_key),
+                ml_dsa_pubkey: None,
+                clearance: SecurityLabel::new(
+                    Level::Internal,
+                    Assurance::Classical,
+                    CompartmentSet::EMPTY,
+                ),
+                allowed_audiences: None,
+                workload_session: false,
+            },
+        );
+        Arc::new(ServiceEnrollmentManifest {
+            version: SERVICE_ENROLLMENT_VERSION,
+            services,
+        })
     }
 
     #[tokio::test]
@@ -2607,6 +4363,16 @@ mod tests {
                 pq_store: None,
             },
         );
+        // Independently runnable: RPC-path token verification fails closed
+        // without a process-global revocation store. Publish an isolated empty
+        // store when none exists (guarded, matching the convention in
+        // middleware/oauth::revocation tests) so this security test does not
+        // depend on a sibling publishing the store first.
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
 
         let manager = Arc::new(
             PolicyManager::new_in_memory()
@@ -2696,14 +4462,16 @@ mod tests {
             &hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 300)
                 .with_issuer(issuer.to_owned())
                 .with_tenant("did:web:tenant-a.example".to_owned())
-                .with_cnf_jwk(user_key.verifying_key().as_bytes()),
+                .with_cnf_jwk(user_key.verifying_key().as_bytes())
+                .with_client_id("hyprstream-oauth-client-1"),
             &policy_key,
         );
         let other_tenant_token = hyprstream_rpc::auth::jwt::encode(
             &hyprstream_rpc::auth::Claims::new("bob".to_owned(), now, now + 300)
                 .with_issuer(issuer.to_owned())
                 .with_tenant("did:web:tenant-b.example".to_owned())
-                .with_cnf_jwk(other_user_key.verifying_key().as_bytes()),
+                .with_cnf_jwk(other_user_key.verifying_key().as_bytes())
+                .with_client_id("hyprstream-oauth-client-1"),
             &policy_key,
         );
         let client = crate::services::PolicyClient::for_local_endpoint_bootstrap(
@@ -2903,6 +4671,847 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn interactive_issue_token_rejects_missing_session_id() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+        let mut request = issue("alice");
+        request.issuance_profile = IssueTokenProfile::InteractiveSession;
+        request.session_id = None;
+
+        let response = service
+            .handle_issue_token(&ctx, 1, &request)
+            .await
+            .expect("missing-session denial is a policy response");
+        assert!(matches!(
+            response,
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "MISSING_SESSION"
+        ));
+    }
+
+    #[tokio::test]
+    async fn deliberate_noninteractive_rfc_profiles_mint_without_session_id() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let (service, _root) = test_service().await;
+        let user_ed = SigningKey::from_bytes(&[0x8a; 32]);
+        let service = service.with_primary_enrollment_resolver(v16_primary_resolver(
+            "alice",
+            user_ed.verifying_key().to_bytes(),
+        ));
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+
+        for profile in [IssueTokenProfile::Rfc8693, IssueTokenProfile::Rfc7523] {
+            let mut request = issue("alice");
+            request.issuance_profile = profile;
+            request.session_id = None;
+            request.user_pub_key = Some(URL_SAFE_NO_PAD.encode(user_ed.verifying_key().to_bytes()));
+            let response = service
+                .handle_issue_token(&ctx, 1, &request)
+                .await
+                .expect("non-interactive issuance is a policy response");
+            // The RFC profiles require no session id: reaching the mint proves
+            // the profile gate accepted without one. test_service provisions no
+            // composite signing authority, so a cleared gate surfaces as
+            // SIGNING_NOT_CONFIGURED rather than a session/profile rejection.
+            match response {
+                PolicyResponseVariant::IssueTokenResult(_) => {}
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. })
+                    if code == "SIGNING_NOT_CONFIGURED" => {}
+                other => panic!("RFC profile must pass the gate without a session: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn service_subject_rejects_noninteractive_user_profile() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+        let mut request = issue("service:model");
+        request.issuance_profile = IssueTokenProfile::Rfc8693;
+
+        let response = service
+            .handle_issue_token(&ctx, 1, &request)
+            .await
+            .expect("profile-mismatch denial is a policy response");
+        assert!(matches!(
+            response,
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. })
+                if code == "INVALID_ISSUANCE_PROFILE"
+        ));
+    }
+
+    /// Process-global in-memory session registry for the issuance-profile
+    /// tests (guarded/idempotent). `handle_issue_token` binds a supplied `sid`
+    /// against the PROCESS-GLOBAL registry, so the interactive contracts are
+    /// proven against that exact handle. `register_session`/`revoke_session`
+    /// are trait methods, so registering through the returned `dyn` handle
+    /// works regardless of which sibling test published the global first (both
+    /// publish an InMemory registry and use distinct keys).
+    fn interactive_test_session_registry(
+    ) -> &'static std::sync::Arc<dyn hyprstream_rpc::auth::SessionRegistry> {
+        if hyprstream_rpc::auth::global_session_registry().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_session_registry(std::sync::Arc::new(
+                hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+            ));
+        }
+        hyprstream_rpc::auth::global_session_registry()
+            .expect("session registry is published above")
+    }
+
+    fn active_oidc_session(
+        subject: &str,
+        tenant: &str,
+        now: i64,
+    ) -> hyprstream_rpc::auth::SessionState {
+        hyprstream_rpc::auth::SessionState {
+            subject: subject.to_owned(),
+            tenant: tenant.to_owned(),
+            kind: hyprstream_rpc::auth::SessionKind::Interactive,
+            created_at: now,
+            expires_at: now + 3600,
+            status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+            clearance_epoch: 0,
+        }
+    }
+
+    /// Contract 1 (empty sid): the interactive profile treats an empty-string
+    /// `sid` exactly like a missing one — both deny before minting.
+    #[tokio::test]
+    async fn interactive_issue_token_rejects_empty_session_id() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+        let mut request = issue("alice");
+        request.issuance_profile = IssueTokenProfile::InteractiveSession;
+        request.session_id = Some(String::new());
+        let response = service
+            .handle_issue_token(&ctx, 1, &request)
+            .await
+            .expect("empty-session denial is a policy response");
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "MISSING_SESSION"
+            ),
+            "an empty sid must deny like a missing one: {response:?}"
+        );
+    }
+
+    /// Contract 3: an interactive credential whose `sid` names a registered,
+    /// ACTIVE session bound to this exact subject and tenant mints, and the
+    /// registered `sid` is stamped into the signed claims.
+    #[tokio::test]
+    async fn interactive_issue_token_with_registered_session_succeeds() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let (service, _root) = test_service().await;
+        let user_ed = SigningKey::from_bytes(&[0x89; 32]);
+        let service = service.with_primary_enrollment_resolver(v16_primary_resolver(
+            "alice",
+            user_ed.verifying_key().to_bytes(),
+        ));
+        let reg = interactive_test_session_registry();
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+        let issuer = "https://issuer.interactive-ok.test";
+        let tenant = "tenant-interactive-ok";
+        let sid = "sid-interactive-ok";
+        let now = chrono::Utc::now().timestamp();
+        reg.register_session(
+            hyprstream_rpc::auth::SessionKey::oidc(issuer, sid),
+            active_oidc_session("alice", tenant, now),
+        )
+        .await
+        .expect("register active session");
+
+        let mut request = issue("alice");
+        request.issuance_profile = IssueTokenProfile::InteractiveSession;
+        request.issuer = Some(issuer.to_owned());
+        request.tenant = Some(tenant.to_owned());
+        request.session_id = Some(sid.to_owned());
+        request.user_pub_key = Some(URL_SAFE_NO_PAD.encode(user_ed.verifying_key().to_bytes()));
+        let response = service
+            .handle_issue_token(&ctx, 1, &request)
+            .await
+            .expect("interactive issuance is a policy response");
+        match response {
+            PolicyResponseVariant::IssueTokenResult(info) => {
+                let claims = hyprstream_rpc::auth::decode_unverified(&info.token)
+                    .expect("issued token decodes");
+                assert_eq!(
+                    claims.sid.as_deref(),
+                    Some(sid),
+                    "the registered sid is stamped into the minted claims"
+                );
+            }
+            // test_service provisions no global composite signing authority, so
+            // a mint that clears the session gate fails at the signing boundary
+            // instead. Reaching it proves the correctly-registered session was
+            // ACCEPTED (the contract here); the sid-stamping assertion above is
+            // exercised whenever the full-suite run provisions signing.
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. })
+                if code == "SIGNING_NOT_CONFIGURED" => {}
+            other => panic!("a correctly-registered interactive session was rejected: {other:?}"),
+        }
+    }
+
+    /// Contract 2: an interactive `sid` that is unknown, revoked, or bound to a
+    /// different subject/tenant is rejected — the registry is the authority and
+    /// there is no session fixation.
+    #[tokio::test]
+    async fn interactive_issue_token_denies_unknown_revoked_or_mismatched_session() {
+        let (service, _root) = test_service().await;
+        let reg = interactive_test_session_registry();
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+        let issuer = "https://issuer.interactive-deny.test";
+        let tenant = "tenant-interactive-deny";
+        let now = chrono::Utc::now().timestamp();
+
+        let request_for = |sid: &str| {
+            let mut r = issue("alice");
+            r.issuance_profile = IssueTokenProfile::InteractiveSession;
+            r.issuer = Some(issuer.to_owned());
+            r.tenant = Some(tenant.to_owned());
+            r.session_id = Some(sid.to_owned());
+            r
+        };
+        let assert_denied = |response: PolicyResponseVariant, label: &str| {
+            assert!(
+                matches!(
+                    response,
+                    PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "INVALID_SESSION"
+                ),
+                "{label} must deny with INVALID_SESSION: {response:?}"
+            );
+        };
+
+        // Unknown: never registered.
+        assert_denied(
+            service
+                .handle_issue_token(&ctx, 1, &request_for("never-registered"))
+                .await
+                .unwrap(),
+            "an unknown sid",
+        );
+
+        // Revoked: registered then revoked.
+        let revoked = "sid-revoked";
+        reg.register_session(
+            hyprstream_rpc::auth::SessionKey::oidc(issuer, revoked),
+            active_oidc_session("alice", tenant, now),
+        )
+        .await
+        .unwrap();
+        reg.revoke_session(&hyprstream_rpc::auth::SessionKey::oidc(issuer, revoked))
+            .await
+            .unwrap();
+        assert_denied(
+            service
+                .handle_issue_token(&ctx, 2, &request_for(revoked))
+                .await
+                .unwrap(),
+            "a revoked sid",
+        );
+
+        // Mismatched subject: session bound to a different user.
+        let cross_subject = "sid-cross-subject";
+        reg.register_session(
+            hyprstream_rpc::auth::SessionKey::oidc(issuer, cross_subject),
+            active_oidc_session("bob", tenant, now),
+        )
+        .await
+        .unwrap();
+        assert_denied(
+            service
+                .handle_issue_token(&ctx, 3, &request_for(cross_subject))
+                .await
+                .unwrap(),
+            "a cross-subject sid",
+        );
+
+        // Mismatched tenant: session bound to a different tenant.
+        let cross_tenant = "sid-cross-tenant";
+        reg.register_session(
+            hyprstream_rpc::auth::SessionKey::oidc(issuer, cross_tenant),
+            active_oidc_session("alice", "some-other-tenant", now),
+        )
+        .await
+        .unwrap();
+        assert_denied(
+            service
+                .handle_issue_token(&ctx, 4, &request_for(cross_tenant))
+                .await
+                .unwrap(),
+            "a cross-tenant sid",
+        );
+    }
+
+    /// Contract 4: a service subject can never acquire a user session — neither
+    /// under the service profile carrying a `sid`, nor by relabeling itself
+    /// interactive. Both deny at the profile gate before any registry lookup.
+    #[tokio::test]
+    async fn service_subject_with_user_session_is_denied() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+
+        let mut service_profile = issue("service:model");
+        service_profile.issuance_profile = IssueTokenProfile::Service;
+        service_profile.session_id = Some("sid-illegal".to_owned());
+        let response = service
+            .handle_issue_token(&ctx, 1, &service_profile)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "INVALID_ISSUANCE_PROFILE"
+            ),
+            "service profile + sid must deny: {response:?}"
+        );
+
+        let mut relabeled = issue("service:model");
+        relabeled.issuance_profile = IssueTokenProfile::InteractiveSession;
+        relabeled.session_id = Some("sid-illegal".to_owned());
+        let response = service.handle_issue_token(&ctx, 2, &relabeled).await.unwrap();
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "INVALID_ISSUANCE_PROFILE"
+            ),
+            "a service subject relabeled interactive must deny: {response:?}"
+        );
+    }
+
+    /// Contract 5 (negative): the non-interactive RFC profiles cannot smuggle a
+    /// session, and a non-interactive exchange cannot relabel itself
+    /// interactive to bypass session verification — a fabricated (unregistered)
+    /// sid denies, and an absent sid denies for want of a registered session.
+    #[tokio::test]
+    async fn noninteractive_profiles_cannot_smuggle_or_relabel_a_session() {
+        let (service, _root) = test_service().await;
+        // Ensure the registry is initialized so the relabel case reaches
+        // INVALID_SESSION rather than an UNAVAILABLE registry error.
+        let _ = interactive_test_session_registry();
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+
+        for profile in [IssueTokenProfile::Rfc8693, IssueTokenProfile::Rfc7523] {
+            let mut smuggle = issue("alice");
+            smuggle.issuance_profile = profile;
+            smuggle.session_id = Some("smuggled-sid".to_owned());
+            let response = service.handle_issue_token(&ctx, 1, &smuggle).await.unwrap();
+            assert!(
+                matches!(
+                    response,
+                    PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "INVALID_SESSION"
+                ),
+                "an RFC profile carrying a sid must deny: {response:?}"
+            );
+        }
+
+        // Relabel to interactive with a fabricated, unregistered sid → denied.
+        let mut fabricated = issue("alice");
+        fabricated.issuance_profile = IssueTokenProfile::InteractiveSession;
+        fabricated.issuer = Some("https://issuer.relabel.test".to_owned());
+        fabricated.session_id = Some("fabricated-unregistered".to_owned());
+        let response = service
+            .handle_issue_token(&ctx, 2, &fabricated)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "INVALID_SESSION"
+            ),
+            "relabel with a fabricated sid must deny: {response:?}"
+        );
+
+        // Relabel to interactive with no sid → denied for want of a session.
+        let mut no_sid = issue("alice");
+        no_sid.issuance_profile = IssueTokenProfile::InteractiveSession;
+        no_sid.session_id = None;
+        let response = service.handle_issue_token(&ctx, 3, &no_sid).await.unwrap();
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "MISSING_SESSION"
+            ),
+            "relabel without a sid must deny: {response:?}"
+        );
+    }
+
+    /// Gate 2 (v16 §3.3): a carried `workload_session_id` must be ACTIVE before
+    /// a service credential may renew. A revoked family session DENIES the
+    /// renewal — the revocation is checked BEFORE the enrollment-policy branch,
+    /// so removing the workload-family policy (family narrowing) can never let
+    /// a revoked family renew into an unsessioned credential.
+    #[tokio::test]
+    async fn revoked_workload_session_denies_service_renewal() {
+        let (service, _root) = test_service().await;
+        let service = service.with_default_audience("https://issuer.gate2.test".to_owned());
+        let issuer = "https://issuer.gate2.test";
+        let reg = interactive_test_session_registry();
+        let now = chrono::Utc::now().timestamp();
+        let wsid = "wl-gate2-revoked";
+
+        // Register then revoke the workload family session.
+        let workload_key = hyprstream_rpc::auth::SessionKey::workload(issuer, wsid);
+        reg.register_session(
+            workload_key.clone(),
+            hyprstream_rpc::auth::SessionState {
+                subject: "service:model".to_owned(),
+                tenant: "tenant-a".to_owned(),
+                kind: hyprstream_rpc::auth::SessionKind::Workload,
+                created_at: now,
+                expires_at: now + 3600,
+                status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                clearance_epoch: 0,
+            },
+        )
+        .await
+        .unwrap();
+        reg.revoke_session(&workload_key).await.unwrap();
+
+        // The renewing caller's key must be trust-registered for the service.
+        let caller = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        let trust = hyprstream_service::global_trust_store();
+        trust.insert(
+            caller,
+            hyprstream_service::Attestation {
+                scopes: std::iter::once("model".to_owned()).collect(),
+                subject: None,
+                jwt: Some("gate2-renew".to_owned()),
+                expires_at: now + 300,
+                attested_by: None,
+            },
+        );
+
+        // The presented credential carries the now-revoked workload session.
+        let carried =
+            hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 3600)
+                .with_workload_session_id(wsid);
+        let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+            Subject::new("service:model"),
+            "tenant-a",
+            caller,
+            carried,
+        );
+
+        let response = service
+            .handle_refresh_service_token(
+                &ctx,
+                1,
+                &RefreshServiceTokenRequest { ttl_seconds: 3600 },
+            )
+            .await
+            .expect("refresh is a policy response");
+        trust.remove(&caller);
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "SESSION_REVOKED"
+            ),
+            "a carried revoked workload session must deny renewal: {response:?}"
+        );
+    }
+
+    /// Gate 2 check-BEFORE-narrowing (v16 §3.3): the sibling of the test above,
+    /// closing the case that one could not reach. Here an authoritative manifest
+    /// enrolls the family with `workload_session = false` (policy REMOVED), so
+    /// `family_allowed` is `false` and renewal takes the deliberate-narrowing
+    /// branch `(Some(wsid), false)` — the session ID is dropped, not re-stamped.
+    /// A revoked family session must STILL deny the renewal: the revocation is
+    /// checked before the narrowing branch, so removing the family policy can
+    /// never launder a revoked family into an unsessioned credential. The prior
+    /// test only reaches `(Some(wsid), true)` because, with no manifest,
+    /// `family_allowed` defaults to `true`.
+    #[tokio::test]
+    async fn revoked_session_with_removed_family_policy_still_denies_renewal() {
+        // The caller/enrolled key is shared: the renewal path resolves the
+        // signer suite against the injected manifest (the block above the
+        // workload branch), which requires the verified `cnf` key to equal the
+        // enrolled ed25519 key. Match them so renewal reaches the workload gate.
+        let caller_sk = SigningKey::from_bytes(&[0x2b; 32]);
+        let caller = caller_sk.verifying_key();
+
+        let (service, _root) = test_service().await;
+        let service = service
+            .with_default_audience("https://issuer.gate2.test".to_owned())
+            // Authoritative family policy REMOVED: `v16_service_manifest` enrolls
+            // "model" with `workload_session = false`. Injected (not global) so
+            // the process-global manifest is untouched — the renewal path now
+            // reads this same injected authority for clearance, signer-suite,
+            // AND the workload-family policy.
+            .with_enrollment_manifest(v16_service_manifest("model", caller.to_bytes()));
+        let issuer = "https://issuer.gate2.test";
+        let reg = interactive_test_session_registry();
+        let now = chrono::Utc::now().timestamp();
+        let wsid = "wl-gate2-narrowed-revoked";
+
+        // Register then revoke the workload family session.
+        let workload_key = hyprstream_rpc::auth::SessionKey::workload(issuer, wsid);
+        reg.register_session(
+            workload_key.clone(),
+            hyprstream_rpc::auth::SessionState {
+                subject: "service:model".to_owned(),
+                tenant: "tenant-a".to_owned(),
+                kind: hyprstream_rpc::auth::SessionKind::Workload,
+                created_at: now,
+                expires_at: now + 3600,
+                status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                clearance_epoch: 0,
+            },
+        )
+        .await
+        .unwrap();
+        reg.revoke_session(&workload_key).await.unwrap();
+
+        // The renewing caller's key must be trust-registered for the service.
+        let trust = hyprstream_service::global_trust_store();
+        trust.insert(
+            caller,
+            hyprstream_service::Attestation {
+                scopes: std::iter::once("model".to_owned()).collect(),
+                subject: None,
+                jwt: Some("gate2-narrow-renew".to_owned()),
+                expires_at: now + 300,
+                attested_by: None,
+            },
+        );
+
+        // The presented credential carries the now-revoked workload session.
+        let carried =
+            hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 3600)
+                .with_workload_session_id(wsid);
+        let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+            Subject::new("service:model"),
+            "tenant-a",
+            caller,
+            carried,
+        );
+
+        let response = service
+            .handle_refresh_service_token(
+                &ctx,
+                1,
+                &RefreshServiceTokenRequest { ttl_seconds: 3600 },
+            )
+            .await
+            .expect("refresh is a policy response");
+        trust.remove(&caller);
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "SESSION_REVOKED"
+            ),
+            "removing the family policy must not launder a revoked session into an \
+             unsessioned renewal — revocation is checked before narrowing: {response:?}"
+        );
+    }
+
+    /// Testability guard for the two tests above: proves the renewal path reads
+    /// the INJECTED (`self.enrollment()`) manifest, not `global_service_enrollment()`
+    /// alone. Without this routing, an injected `workload_session = false` family
+    /// could never take effect in an isolated test (the process-global manifest
+    /// is unset), so `family_allowed` would silently default to `true` and the
+    /// narrowing branch above would be unreachable — a false green.
+    ///
+    /// The observable: an injected manifest enrolls "model" with an ed25519 key
+    /// that DIFFERS from the renewing caller's verified `cnf` key. The renewal
+    /// signer-suite block (which reads the same injected binding) then denies
+    /// with `SIGNER_SUITE_UNAVAILABLE`. The pre-routing code read only the unset
+    /// global manifest, skipped that block entirely, and would have reached the
+    /// signing boundary (`SIGNING_NOT_CONFIGURED`) instead — so this exact code
+    /// distinguishes "injected manifest consulted" from "not consulted".
+    #[tokio::test]
+    async fn service_renewal_consults_injected_enrollment_manifest() {
+        let caller = SigningKey::from_bytes(&[0x2b; 32]).verifying_key();
+        // Enroll "model" under a DIFFERENT key than the caller's verified cnf.
+        let enrolled_other = SigningKey::from_bytes(&[0x5c; 32]).verifying_key();
+
+        let (service, _root) = test_service().await;
+        let service = service
+            .with_default_audience("https://issuer.gate2.test".to_owned())
+            .with_enrollment_manifest(v16_service_manifest("model", enrolled_other.to_bytes()));
+        let now = chrono::Utc::now().timestamp();
+
+        let trust = hyprstream_service::global_trust_store();
+        trust.insert(
+            caller,
+            hyprstream_service::Attestation {
+                scopes: std::iter::once("model".to_owned()).collect(),
+                subject: None,
+                jwt: Some("gate2-inject-renew".to_owned()),
+                expires_at: now + 300,
+                attested_by: None,
+            },
+        );
+
+        let ctx = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("service:model"),
+            "tenant-a",
+            caller,
+        );
+        let response = service
+            .handle_refresh_service_token(
+                &ctx,
+                1,
+                &RefreshServiceTokenRequest { ttl_seconds: 3600 },
+            )
+            .await
+            .expect("refresh is a policy response");
+        trust.remove(&caller);
+        assert!(
+            matches!(
+                response,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "SIGNER_SUITE_UNAVAILABLE"
+            ),
+            "renewal must consult the injected manifest and reject a caller key that \
+             disagrees with the enrolled key: {response:?}"
+        );
+    }
+
+    /// The DEFINITIVE causal coverage the two handler-level tests above cannot
+    /// observe (`test_service` provisions no signing authority, so a cleared
+    /// renewal stops at `SIGNING_NOT_CONFIGURED` before any token is minted).
+    /// This exercises `resolve_renewal_workload_session` directly and inspects
+    /// the exact disposition, proving the `(Some(wsid), false)` narrowing branch
+    /// genuinely OMITS the session — and that the revocation check runs BEFORE
+    /// narrowing, with revoked/expired/unknown all failing closed.
+    #[tokio::test]
+    async fn renewal_workload_decision_narrows_and_fails_closed() {
+        let (service, _root) = test_service().await;
+        let reg = interactive_test_session_registry();
+        let now = chrono::Utc::now().timestamp();
+        // A per-test issuer keeps these session keys off any other test's keys
+        // in the shared global registry.
+        let issuer = "https://issuer.narrow-decision.test";
+        let active_state = |exp: i64| hyprstream_rpc::auth::SessionState {
+            subject: "service:model".to_owned(),
+            tenant: "tenant-a".to_owned(),
+            kind: hyprstream_rpc::auth::SessionKind::Workload,
+            created_at: now,
+            expires_at: exp,
+            status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+            clearance_epoch: 0,
+        };
+        let decide = |fp: Option<bool>, wsid: Option<&'static str>| {
+            service.resolve_renewal_workload_session(issuer, "service:model", "tenant-a", now, fp, wsid)
+        };
+
+        // Register one ACTIVE session used by the two contrasting live cases.
+        let active = "wl-active-narrow";
+        reg.register_session(
+            hyprstream_rpc::auth::SessionKey::workload(issuer, active),
+            active_state(now + 3600),
+        )
+        .await
+        .unwrap();
+
+        // (1) OMISSION CONTROL — ACTIVE session, family policy REMOVED
+        // (`Some(false)`): the LIVE session is dropped from the renewed
+        // credential. This is the positive proof that `family_allowed = false`
+        // actually narrows (not a vacuous always-None).
+        assert!(
+            matches!(decide(Some(false), Some(active)).await, RenewalWorkloadSession::Stamp(None)),
+            "active session + removed family policy must OMIT the workload_session_id"
+        );
+
+        // (2) CONTRAST — the SAME active session, family still ENROLLED
+        // (`Some(true)`): the session is re-stamped. Proves the false branch in
+        // (1) is a real divergence, not a constant.
+        assert!(
+            matches!(
+                decide(Some(true), Some(active)).await,
+                RenewalWorkloadSession::Stamp(Some(ref w)) if w == active
+            ),
+            "active session + enrolled family must RE-STAMP the workload_session_id"
+        );
+
+        // (3) CHECK-BEFORE-NARROWING — a REVOKED session denies for EVERY family
+        // policy, including the narrowing `Some(false)`: removing the policy can
+        // never launder a revoked family into an unsessioned renewal.
+        let revoked = "wl-revoked-narrow";
+        let rk = hyprstream_rpc::auth::SessionKey::workload(issuer, revoked);
+        reg.register_session(rk.clone(), active_state(now + 3600)).await.unwrap();
+        reg.revoke_session(&rk).await.unwrap();
+        for fp in [Some(false), Some(true), None] {
+            assert!(
+                matches!(
+                    decide(fp, Some(revoked)).await,
+                    RenewalWorkloadSession::Deny { code, .. } if code == "SESSION_REVOKED"
+                ),
+                "a revoked carried session must deny renewal for family policy {fp:?}"
+            );
+        }
+
+        // (4) FAIL-CLOSED, unknown — a session that was never registered denies.
+        assert!(
+            matches!(
+                decide(Some(true), Some("wl-never-registered-narrow")).await,
+                RenewalWorkloadSession::Deny { code, .. } if code == "SESSION_REVOKED"
+            ),
+            "an unknown carried session must fail closed"
+        );
+
+        // (5) FAIL-CLOSED, expired — an expired-but-Active session denies.
+        let expired = "wl-expired-narrow";
+        reg.register_session(
+            hyprstream_rpc::auth::SessionKey::workload(issuer, expired),
+            active_state(now - 1),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                decide(Some(true), Some(expired)).await,
+                RenewalWorkloadSession::Deny { code, .. } if code == "SESSION_REVOKED"
+            ),
+            "an expired carried session must fail closed"
+        );
+
+        // (6) No carried session: a disabled (`Some(false)`) or legacy (`None`)
+        // family manufactures none.
+        assert!(
+            matches!(decide(Some(false), None).await, RenewalWorkloadSession::Stamp(None)),
+            "no session + disabled family stays unsessioned"
+        );
+        assert!(
+            matches!(decide(None, None).await, RenewalWorkloadSession::Stamp(None)),
+            "no session + legacy family stays unsessioned"
+        );
+
+        // (7) No carried session, family ENROLLED (`Some(true)`): a fresh session
+        // is created, registered ACTIVE, and stamped.
+        let created = decide(Some(true), None).await;
+        let RenewalWorkloadSession::Stamp(Some(new_wsid)) = created else {
+            panic!("an enrolled family with no carried session must create one: {created:?}");
+        };
+        assert!(
+            !reg
+                .is_revoked(&hyprstream_rpc::auth::SessionKey::workload(issuer, &new_wsid))
+                .await,
+            "the freshly created workload session must be registered ACTIVE"
+        );
+    }
+
+    /// RFC 9068 §2.2.1 issuance (v16 credential profile): a user `at+jwt`
+    /// profile without a non-empty `client_id` is denied; a service profile
+    /// carrying a `client_id` is denied; and a supplied `client_id` is stamped
+    /// into the minted `at+jwt` claims (the emitter positive).
+    #[tokio::test]
+    async fn issuance_enforces_and_stamps_client_id() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let (service, _root) = test_service().await;
+        // v16: a user at+jwt binds its authoritative Primary suite. Install the
+        // resolver + a matching cnf key so the positive reaches the signing
+        // boundary rather than the fail-closed Primary gate.
+        let user_ed = SigningKey::from_bytes(&[0x88; 32]);
+        let service = service
+            .with_primary_enrollment_resolver(v16_primary_resolver(
+                "alice",
+                user_ed.verifying_key().to_bytes(),
+            ));
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+
+        // User profile (RFC 8693) with a MISSING client_id → denied.
+        let mut missing = issue("alice");
+        missing.issuance_profile = IssueTokenProfile::Rfc8693;
+        missing.client_id = None;
+        let resp = service.handle_issue_token(&ctx, 1, &missing).await.unwrap();
+        assert!(
+            matches!(resp, PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "MISSING_CLIENT_ID"),
+            "missing client_id: {resp:?}"
+        );
+
+        // Empty/whitespace client_id → denied.
+        let mut empty = issue("alice");
+        empty.issuance_profile = IssueTokenProfile::Rfc8693;
+        empty.client_id = Some("   ".to_owned());
+        let resp = service.handle_issue_token(&ctx, 2, &empty).await.unwrap();
+        assert!(
+            matches!(resp, PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "MISSING_CLIENT_ID"),
+            "empty client_id: {resp:?}"
+        );
+
+        // Service (`wit+jwt`) profile carrying a client_id → denied.
+        let mut svc_cid = issue("service:model");
+        svc_cid.issuance_profile = IssueTokenProfile::Service;
+        svc_cid.client_id = Some("hyprstream-oauth-client-1".to_owned());
+        let resp = service.handle_issue_token(&ctx, 3, &svc_cid).await.unwrap();
+        assert!(
+            matches!(resp, PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "INVALID_CLIENT_ID"),
+            "service + client_id: {resp:?}"
+        );
+
+        // Emitter positive: a supplied client_id is stamped into the minted
+        // at+jwt (test_service may stop at the signing boundary; assert the
+        // stamped value only when a token is actually produced).
+        let mut ok = issue("alice");
+        ok.issuance_profile = IssueTokenProfile::Rfc8693;
+        ok.client_id = Some("hyprstream-oauth-client-1".to_owned());
+        ok.user_pub_key = Some(URL_SAFE_NO_PAD.encode(user_ed.verifying_key().to_bytes()));
+        match service.handle_issue_token(&ctx, 4, &ok).await.unwrap() {
+            PolicyResponseVariant::IssueTokenResult(info) => {
+                let claims = hyprstream_rpc::auth::decode_unverified(&info.token)
+                    .expect("issued token decodes");
+                assert_eq!(
+                    claims.client_id.as_deref(),
+                    Some("hyprstream-oauth-client-1"),
+                    "the supplied client_id is stamped into the minted claims"
+                );
+            }
+            // test_service configures no signing pair, so the flow stops at the
+            // signing boundary AFTER passing the v16 Primary/client_id gates.
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. })
+                if code == "SIGNING_NOT_CONFIGURED" => {}
+            other => panic!("unexpected issuance response: {other:?}"),
+        }
+    }
+
+    /// v16 fail-closed: a DISPATCH-CAPABLE user `at+jwt` (recoverable cnf.jwk)
+    /// whose authoritative Primary cannot be resolved is denied before signing —
+    /// no resolver installed, or a resolver whose key does not match the cnf.
+    #[tokio::test]
+    async fn dispatch_capable_user_issuance_without_primary_fails_closed() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let user_ed = SigningKey::from_bytes(&[0x91; 32]);
+        let user_pk = URL_SAFE_NO_PAD.encode(user_ed.verifying_key().to_bytes());
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+
+        // No resolver installed → fail closed.
+        let (service, _root) = test_service().await;
+        let mut req = issue("alice");
+        req.issuance_profile = IssueTokenProfile::Rfc8693;
+        req.user_pub_key = Some(user_pk.clone());
+        let resp = service.handle_issue_token(&ctx, 1, &req).await.unwrap();
+        assert_eq!(
+            err_code_of(&resp),
+            Some("PRIMARY_RESOLVER_UNAVAILABLE"),
+            "no resolver must fail closed: {resp:?}"
+        );
+
+        // Resolver returns a DIFFERENT key than the presented cnf → fail closed.
+        let (service, _root) = test_service().await;
+        let other = SigningKey::from_bytes(&[0x92; 32]);
+        let service = service.with_primary_enrollment_resolver(v16_primary_resolver(
+            "alice",
+            other.verifying_key().to_bytes(),
+        ));
+        let mut req = issue("alice");
+        req.issuance_profile = IssueTokenProfile::Rfc8693;
+        req.user_pub_key = Some(user_pk);
+        let resp = service.handle_issue_token(&ctx, 2, &req).await.unwrap();
+        assert_eq!(
+            err_code_of(&resp),
+            Some("PRIMARY_UNRESOLVABLE"),
+            "cnf/primary key mismatch must fail closed: {resp:?}"
+        );
+    }
+
+    fn err_code_of(resp: &PolicyResponseVariant) -> Option<&str> {
+        match resp {
+            PolicyResponseVariant::Error(ErrorInfo { code, .. }) => Some(code.as_str()),
+            _ => None,
+        }
+    }
+
     #[test]
     fn resolve_service_key_publishes_every_overlap_candidate() {
         let trust = hyprstream_service::TrustStore::new();
@@ -2962,6 +5571,8 @@ mod tests {
             .to_bytes();
 
         let mut request = issue("service:rotation-error-test");
+        request.issuance_profile = IssueTokenProfile::Service;
+        request.client_id = None;
         request.user_pub_key = Some("not-base64url!".to_owned());
         let malformed = service
             .handle_issue_token(&ctx, 1, &request)
@@ -2991,6 +5602,12 @@ mod tests {
         let (service, _root) = test_service().await;
         let caller = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
         let requested = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        // v16: the service credential binds its enrolled signer suite; enroll
+        // the service to the attested assertion key so the suite resolves.
+        let service = service.with_enrollment_manifest(v16_service_manifest(
+            "rotation-sibling-test",
+            requested.to_bytes(),
+        ));
         let trust = hyprstream_service::global_trust_store();
         trust.insert(caller, hyprstream_service::Attestation {
             scopes: std::iter::once("rotation-sibling-test".to_owned()).collect(),
@@ -3003,6 +5620,8 @@ mod tests {
         let mut ctx = EnvelopeContext::from_callback_service(1, "rotation-sibling-test");
         ctx.cnf = caller.to_bytes();
         let mut request = issue("service:rotation-sibling-test");
+        request.issuance_profile = IssueTokenProfile::Service;
+        request.client_id = None;
         request.user_pub_key = Some(URL_SAFE_NO_PAD.encode(requested.as_bytes()));
         let response = service.handle_issue_token(&ctx, 1, &request).await;
         trust.remove(&caller);
@@ -3044,4 +5663,858 @@ mod event_prefix_registry_tests {
         assert_eq!(validate_event_prefix_registration(&prefixes, &shadow, "subject-b"), Err(EventPrefixRegistrationError::CrossTenantShadow));
         assert_eq!(validate_event_prefix_registration(&prefixes, &a, "subject-b"), Err(EventPrefixRegistrationError::OwnedByAnotherSubject));
     }
+}
+
+// ── ExchangeDelegated (AsOriginator delegated mint) causal proofs ──
+//
+// Fully parallel-safe: source verification AND the output mint both resolve
+// keys from the PolicyService's OWN injected `ClusterKeySource` composite
+// ledger (never the process global), the enrollment manifest is injected via
+// the cfg(test) setter, and the primary-enrollment resolver + edge authorizer
+// are per-service mocks. No process-global state is published or mutated.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod exchange_delegated_tests {
+        use super::*;
+        use hyprstream_rpc::auth::{
+            ClusterKeySource, CompositeKeyPair, CompositeKeySet, CompositePairRole,
+            CompositePairState,
+        };
+        use hyprstream_rpc::auth::mac::{
+            Assurance, CompartmentSet, CredentialClearance, Level, SecurityLabel,
+        };
+        use crate::auth::service_enrollment::{
+            ServiceEnrollment, ServiceEnrollmentManifest, SERVICE_ENROLLMENT_VERSION,
+        };
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        const ISSUER: &str = "https://deleg.test";
+        const TENANT: &str = "did:web:acme.example";
+        const CLIENT_ID: &str = "hyprstream-oauth-client-1";
+
+        struct Fixture {
+            service: PolicyService,
+            ml_dsa: Arc<hyprstream_rpc::crypto::pq::MlDsaSigningKey>,
+            ed: Arc<SigningKey>,
+            actor_ed: SigningKey,
+            user_ed: SigningKey,
+            // Owned so per-path RAII removes exactly this fixture's scratch tree.
+            _root: tempfile::TempDir,
+        }
+
+        struct MockAuthorizer {
+            allow: bool,
+            require_source_aud: Option<String>,
+            require_method: Option<String>,
+        }
+        impl DelegationEdgeAuthorizer for MockAuthorizer {
+            fn authorize(&self, edge: &DelegationEdge<'_>) -> bool {
+                self.allow
+                    && self
+                        .require_source_aud
+                        .as_deref()
+                        .is_none_or(|w| edge.source_audience == Some(w))
+                    && self
+                        .require_method
+                        .as_deref()
+                        .is_none_or(|w| edge.target_method_id == Some(w))
+                    && edge.target_method_id.is_some()
+            }
+        }
+
+        /// Authoritative primary resolver mock: returns the configured Ed key for
+        /// `subject`, or `None` for anyone else (unknown ⇒ deny).
+        struct MockPrimaryResolver {
+            subject: String,
+            ed25519: [u8; 32],
+        }
+        impl PrimaryEnrollmentResolver for MockPrimaryResolver {
+            fn primary_group(&self, principal: &str, _tenant: &str) -> Option<PrimaryGroup> {
+                (principal == self.subject).then(|| PrimaryGroup {
+                    suite_id: hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519.to_owned(),
+                    ordered_component_keys: vec![self.ed25519.to_vec()],
+                })
+            }
+        }
+
+        fn label() -> SecurityLabel {
+            SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY)
+        }
+
+        async fn fixture(
+            authorizer: Option<Arc<dyn DelegationEdgeAuthorizer>>,
+            resolver: Option<Arc<dyn PrimaryEnrollmentResolver>>,
+        ) -> Fixture {
+            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+            let ca = SigningKey::from_bytes(&[0x40; 32]);
+            let ed = Arc::new(SigningKey::from_bytes(&[0x41; 32]));
+            let (ml_dsa_sk, ml_dsa_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+            let ml_dsa = Arc::new(ml_dsa_sk);
+            let kid = hyprstream_rpc::auth::composite_kid(&ml_dsa_vk, &ed.verifying_key());
+            let pair = CompositeKeyPair::signing(
+                kid,
+                ml_dsa.clone(),
+                ed.clone(),
+                CompositePairRole::Policy,
+                CompositePairState::Active,
+                0,
+                i64::MAX,
+            );
+            // The service's OWN isolated authority: source verification AND the
+            // output mint both resolve from this exact ledger.
+            let root = tempfile::tempdir().unwrap();
+            let key_set = Arc::new(CompositeKeySet::default());
+            key_set.publish(1, "deleg-fixture".to_owned(), vec![pair]).unwrap();
+            // Configure the isolated ledger as a disk-backed minting authority
+            // (per-fixture, never the process global) so `sign_token` can mint
+            // the output on the SAME ledger it verifies sources against.
+            let auth = root.path().join("composite-authority");
+            std::fs::create_dir_all(&auth).unwrap();
+            let marker =
+                serde_json::json!({ "version": 1, "component_digest": "deleg-fixture" });
+            let ledger_path = auth.join("ledger.json");
+            let committed_path = auth.join("committed.json");
+            std::fs::write(&ledger_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+            std::fs::write(&committed_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+            key_set.configure_authority(
+                ledger_path,
+                committed_path,
+                auth.join("ledger-prefix"),
+                auth.join("ledger.lock"),
+            );
+            let key_source = ClusterKeySource::new(ca.verifying_key(), ISSUER.to_owned())
+                .with_composite_key_set(key_set);
+
+            let actor_ed = SigningKey::from_bytes(&[0x42; 32]);
+            let user_ed = SigningKey::from_bytes(&[0x43; 32]);
+
+            let mut services = BTreeMap::new();
+            services.insert(
+                "mcp".to_owned(),
+                ServiceEnrollment {
+                    ed25519_pubkey: URL_SAFE_NO_PAD.encode(actor_ed.verifying_key().to_bytes()),
+                    ml_dsa_pubkey: None,
+                    clearance: label(),
+                    allowed_audiences: Some(vec!["res-b".to_owned()]),
+                    workload_session: false,
+                },
+            );
+            let manifest = Arc::new(ServiceEnrollmentManifest {
+                version: SERVICE_ENROLLMENT_VERSION,
+                services,
+            });
+
+            let git2db = Arc::new(RwLock::new(Git2DB::open(root.path()).await.unwrap()));
+            let manager = Arc::new(PolicyManager::permissive().await.unwrap());
+            let mut service = PolicyService::new(
+                manager,
+                Arc::new(ca),
+                crate::config::TokenConfig::default(),
+                git2db,
+                TransportConfig::inproc("deleg-test"),
+            )
+            .with_default_audience(ISSUER.to_owned())
+            .with_jwt_key_source(Arc::new(key_source))
+            .with_enrollment_manifest(manifest);
+            if let Some(a) = authorizer {
+                service = service.with_delegation_edge_authorizer(a);
+            }
+            if let Some(r) = resolver {
+                service = service.with_primary_enrollment_resolver(r);
+            }
+            Fixture { service, ml_dsa, ed, actor_ed, user_ed, _root: root }
+        }
+
+        fn allow_authorizer() -> Arc<dyn DelegationEdgeAuthorizer> {
+            Arc::new(MockAuthorizer { allow: true, require_source_aud: None, require_method: None })
+        }
+
+        fn user_resolver(user_ed: &SigningKey) -> Arc<dyn PrimaryEnrollmentResolver> {
+            Arc::new(MockPrimaryResolver {
+                subject: "alice".to_owned(),
+                ed25519: user_ed.verifying_key().to_bytes(),
+            })
+        }
+
+        fn sign_source(fx: &Fixture, claims: &hyprstream_rpc::auth::Claims) -> String {
+            crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(claims, &fx.ml_dsa, &fx.ed)
+        }
+
+        /// A valid interactive user `at+jwt` source. Its `cnf.hs_signer_suite` is
+        /// the suite over the AUTHORITATIVE primary key (the resolver's key), not
+        /// a value the handler re-derives from the wire.
+        fn user_source_claims(fx: &Fixture, now: i64) -> hyprstream_rpc::auth::Claims {
+            let hs = hyprstream_rpc::auth::service_signer_suite_b64(
+                &fx.user_ed.verifying_key().to_bytes(),
+                None,
+            );
+            hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
+                .with_issuer(ISSUER.to_owned())
+                .with_tenant(TENANT.to_owned())
+                .with_sid("sess-1")
+                .with_client_id(CLIENT_ID)
+                .with_scope(Some("read write".to_owned()))
+                .with_clearance(label())
+                .with_audience(Some("res-a".to_owned()))
+                .with_cnf_jwk(&fx.user_ed.verifying_key().to_bytes())
+                .with_cnf_hs_signer_suite(hs)
+        }
+
+        fn actor_ctx(fx: &Fixture, now: i64) -> EnvelopeContext {
+            let actor_claims =
+                hyprstream_rpc::auth::Claims::new("service:mcp".to_owned(), now, now + 3600)
+                    .with_clearance(label());
+            EnvelopeContext::for_test_authenticated_subject_with_claims(
+                Subject::new("service:mcp"),
+                TENANT,
+                fx.actor_ed.verifying_key(),
+                actor_claims,
+            )
+        }
+
+        fn session_registry() -> &'static Arc<dyn hyprstream_rpc::auth::SessionRegistry> {
+            if hyprstream_rpc::auth::global_session_registry().is_none() {
+                let _ = hyprstream_rpc::auth::set_global_session_registry(Arc::new(
+                    hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+                ));
+            }
+            hyprstream_rpc::auth::global_session_registry().expect("session registry published")
+        }
+
+        async fn register_active_sid(now: i64) {
+            let reg = session_registry();
+            let key = hyprstream_rpc::auth::SessionKey::oidc(ISSUER, "sess-1");
+            let _ = reg
+                .register_session(
+                    key,
+                    hyprstream_rpc::auth::SessionState {
+                        subject: "alice".to_owned(),
+                        tenant: TENANT.to_owned(),
+                        kind: hyprstream_rpc::auth::SessionKind::Interactive,
+                        created_at: now,
+                        expires_at: now + 3600,
+                        status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                        clearance_epoch: 0,
+                    },
+                )
+                .await;
+        }
+
+        fn ensure_revocation_store() {
+            if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+                let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                    hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+                ));
+            }
+        }
+
+        fn request(source: String) -> ExchangeDelegated {
+            ExchangeDelegated {
+                source_credential: source,
+                requested_scopes: Some("read".to_owned()),
+                requested_capabilities: None,
+                audience: Some("res-b".to_owned()),
+                target_method_id: Some("model.Infer".to_owned()),
+                ttl: Some(300),
+            }
+        }
+
+        fn err_code(resp: &PolicyResponseVariant) -> Option<&str> {
+            match resp {
+                PolicyResponseVariant::Error(ErrorInfo { code, .. }) => Some(code.as_str()),
+                _ => None,
+            }
+        }
+
+        /// Happy path: a valid interactive user source + enrolled actor + allowing
+        /// edge + authoritative primary resolver mints a delegated `at+jwt` whose
+        /// `jti` is fresh (≠ source), `sub` is the originator, `act` nests the
+        /// terminal actor, `cnf.hs_signer_suite` equals the ACTOR's authoritative
+        /// suite (jwk preserved), clearance is the meet, scope is attenuated,
+        /// client_id is inherited, and the active sid is retained.
+        #[tokio::test]
+        async fn delegated_mint_happy_path_stamps_expected_output() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), None).await;
+            let resolver = user_resolver(&fx.user_ed);
+            let fx = Fixture {
+                service: fx.service.with_primary_enrollment_resolver(resolver),
+                ..fx
+            };
+
+            let source = sign_source(&fx, &user_source_claims(&fx, now));
+            let source_jti = hyprstream_rpc::auth::decode_unverified(&source).unwrap().jti;
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx
+                .service
+                .handle_exchange_delegated(&ctx, 1, &request(source))
+                .await
+                .unwrap();
+
+            let token = match resp {
+                PolicyResponseVariant::ExchangeDelegatedResult(info) => info.token,
+                other => panic!("expected a minted delegated token, got {other:?}"),
+            };
+            let minted = hyprstream_rpc::auth::decode_unverified(&token).unwrap();
+            assert_eq!(minted.sub, "alice", "originator sub preserved");
+            assert_ne!(minted.jti, source_jti, "fresh jti distinct from the source");
+            assert!(minted.jti.is_some());
+            let act = minted.act.expect("act chain present");
+            assert_eq!(act.sub, "service:mcp", "terminal actor nested in act");
+            let cnf = minted.cnf.expect("cnf present");
+            let expected_actor_hs = hyprstream_rpc::auth::service_signer_suite_b64(
+                &fx.actor_ed.verifying_key().to_bytes(),
+                None,
+            );
+            assert_eq!(
+                cnf.hs_signer_suite.as_deref(),
+                Some(expected_actor_hs.as_str()),
+                "cnf binds the terminal actor's authoritative signer suite"
+            );
+            assert!(cnf.jwk.is_some(), "legacy cnf.jwk preserved");
+            assert_eq!(
+                minted.clearance,
+                Some(CredentialClearance::from_label(label())),
+                "clearance is the meet"
+            );
+            assert_eq!(minted.scope.as_deref(), Some("read"), "scope attenuated to subset");
+            assert_eq!(minted.client_id.as_deref(), Some(CLIENT_ID), "client_id inherited");
+            assert_eq!(minted.sid.as_deref(), Some("sess-1"), "active sid retained");
+            assert_eq!(minted.iss, ISSUER, "minted under the authority issuer");
+        }
+
+        /// A first-hop delegated token (its `cnf` bound to the first terminal
+        /// actor `service:worker`) is a valid SECOND-hop source: its `cnf`
+        /// resolves against `act.sub` (the terminal actor enrollment), not `sub`.
+        #[tokio::test]
+        async fn two_hop_delegated_source_resolves_cnf_against_terminal_actor() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+
+            // The first-hop terminal actor is `service:worker`, enrolled with the
+            // fixture's actor Ed key (reuse `mcp`'s key is fine — we add worker).
+            // Build a source: sub = alice (originator), act = service:mcp (the
+            // enrolled terminal actor), cnf bound to service:mcp's enrolled key.
+            let actor_hs = hyprstream_rpc::auth::service_signer_suite_b64(
+                &fx.actor_ed.verifying_key().to_bytes(),
+                None,
+            );
+            let src_claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
+                .with_issuer(ISSUER.to_owned())
+                .with_tenant(TENANT.to_owned())
+                .with_sid("sess-1")
+                .with_client_id(CLIENT_ID)
+                .with_scope(Some("read".to_owned()))
+                .with_clearance(label())
+                .with_audience(Some("res-a".to_owned()))
+                .with_act(hyprstream_rpc::auth::ActClaim {
+                    sub: "service:mcp".to_owned(),
+                    clearance: Some(CredentialClearance::from_label(label())),
+                    act: None,
+                })
+                .with_cnf_jwk(&fx.actor_ed.verifying_key().to_bytes())
+                .with_cnf_hs_signer_suite(actor_hs);
+            let source = sign_source(&fx, &src_claims);
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            // The source cnf validates against the terminal actor enrollment, so
+            // the delegated mint proceeds to a token (not INVALID_SOURCE_CNF).
+            assert!(
+                matches!(resp, PolicyResponseVariant::ExchangeDelegatedResult(_)),
+                "two-hop source cnf must resolve against act.sub, got {resp:?}"
+            );
+        }
+
+        /// A user source whose primary is UNKNOWN to the resolver denies.
+        #[tokio::test]
+        async fn user_primary_unknown_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            // Resolver only knows "someone-else", not "alice".
+            let resolver: Arc<dyn PrimaryEnrollmentResolver> = Arc::new(MockPrimaryResolver {
+                subject: "someone-else".to_owned(),
+                ed25519: [0u8; 32],
+            });
+            let fx = fixture(Some(allow_authorizer()), Some(resolver)).await;
+            let source = sign_source(&fx, &user_source_claims(&fx, now));
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("INVALID_SOURCE_CNF"));
+        }
+
+        /// A user source whose presented `cnf.jwk` mismatches the resolved primary
+        /// Ed key denies (the wire key never self-confirms).
+        #[tokio::test]
+        async fn user_primary_key_mismatch_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            // Resolver returns a DIFFERENT key than the source's cnf.jwk.
+            let resolver: Arc<dyn PrimaryEnrollmentResolver> = Arc::new(MockPrimaryResolver {
+                subject: "alice".to_owned(),
+                ed25519: SigningKey::from_bytes(&[0x55; 32]).verifying_key().to_bytes(),
+            });
+            let fx = fixture(Some(allow_authorizer()), Some(resolver)).await;
+            let source = sign_source(&fx, &user_source_claims(&fx, now));
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("INVALID_SOURCE_CNF"));
+        }
+
+        /// An uninstalled primary resolver denies a user source (fail closed).
+        #[tokio::test]
+        async fn uninstalled_primary_resolver_denies_user_source() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), None).await; // no resolver
+            let source = sign_source(&fx, &user_source_claims(&fx, now));
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("INVALID_SOURCE_CNF"));
+        }
+
+        /// An uninstalled edge authorizer denies every delegation (fail closed).
+        #[tokio::test]
+        async fn uninstalled_edge_authorizer_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(None, Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let source = sign_source(&fx, &user_source_claims(&fx, now));
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("EDGE_AUTHORIZER_UNAVAILABLE"));
+        }
+
+        /// A cross-service source (source `aud` names another resource) is denied
+        /// by the edge authorizer despite the actor's valid enrollment.
+        #[tokio::test]
+        async fn cross_service_source_audience_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let authz: Arc<dyn DelegationEdgeAuthorizer> = Arc::new(MockAuthorizer {
+                allow: true,
+                require_source_aud: Some("res-for-A".to_owned()),
+                require_method: None,
+            });
+            let fx = fixture(Some(authz), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let source = sign_source(&fx, &user_source_claims(&fx, now));
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("EDGE_DENIED"));
+        }
+
+        /// A missing/empty target method id denies (no wildcard).
+        #[tokio::test]
+        async fn missing_target_method_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let source = sign_source(&fx, &user_source_claims(&fx, now));
+            let mut req = request(source);
+            req.target_method_id = Some("   ".to_owned());
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &req).await.unwrap();
+            assert_eq!(err_code(&resp), Some("TARGET_METHOD_REQUIRED"));
+        }
+
+        /// Requested scope that broadens the source scope is denied.
+        #[tokio::test]
+        async fn scope_broadening_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let source = sign_source(&fx, &user_source_claims(&fx, now));
+            let mut req = request(source);
+            req.requested_scopes = Some("read admin".to_owned());
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &req).await.unwrap();
+            assert_eq!(err_code(&resp), Some("SCOPE_ATTENUATION"));
+        }
+
+        /// A non-service caller cannot be a terminal actor.
+        #[tokio::test]
+        async fn non_service_actor_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let source = sign_source(&fx, &user_source_claims(&fx, now));
+            let user_claims =
+                hyprstream_rpc::auth::Claims::new("bob".to_owned(), now, now + 3600).with_clearance(label());
+            let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+                Subject::new("bob"), TENANT, fx.actor_ed.verifying_key(), user_claims,
+            );
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("NOT_A_TERMINAL_ACTOR"));
+        }
+
+        /// A source `at+jwt` with no sid (ambiguous non-interactive) is unsupported.
+        #[tokio::test]
+        async fn user_source_without_sid_is_unsupported() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let mut claims = user_source_claims(&fx, now);
+            claims.sid = None;
+            let source = sign_source(&fx, &claims);
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("UNSUPPORTED_SOURCE"));
+        }
+
+        /// A revoked source credential is denied.
+        #[tokio::test]
+        async fn revoked_source_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let source = sign_source(&fx, &user_source_claims(&fx, now));
+            let jti = hyprstream_rpc::auth::decode_unverified(&source).unwrap().jti.unwrap();
+            let store = hyprstream_rpc::auth::global_credential_revocation_store().unwrap();
+            store
+                .revoke_credential(hyprstream_rpc::auth::CredentialId::jwt(ISSUER, jti), now + 3600)
+                .await
+                .unwrap();
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("SOURCE_REVOKED"));
+        }
+
+        /// A source tenant that differs from the actor's verified tenant denies.
+        #[tokio::test]
+        async fn tenant_mismatch_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let mut claims = user_source_claims(&fx, now);
+            claims.tenant = Some("did:web:other.example".to_owned());
+            let source = sign_source(&fx, &claims);
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("TENANT_MISMATCH"));
+        }
+
+        /// A source signed by a FOREIGN composite pair (not in the authority's
+        /// ledger) is denied — key possession is not issuer trust.
+        #[tokio::test]
+        async fn foreign_pair_source_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let foreign_ed = Arc::new(SigningKey::from_bytes(&[0x77; 32]));
+            let (foreign_ml, _) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+            let foreign_ml = Arc::new(foreign_ml);
+            let source = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+                &user_source_claims(&fx, now), &foreign_ml, &foreign_ed,
+            );
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("INVALID_SOURCE"));
+        }
+
+        /// An edge whose target method is not the exact reviewed method denies.
+        #[tokio::test]
+        async fn wrong_target_method_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let authz: Arc<dyn DelegationEdgeAuthorizer> = Arc::new(MockAuthorizer {
+                allow: true,
+                require_source_aud: None,
+                require_method: Some("only.Allowed".to_owned()),
+            });
+            let fx = fixture(Some(authz), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let source = sign_source(&fx, &user_source_claims(&fx, now));
+            let ctx = actor_ctx(&fx, now);
+            // request() uses "model.Infer" ≠ "only.Allowed".
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("EDGE_DENIED"));
+        }
+
+        /// A capability that broadens the source `cap` is denied (monotonic
+        /// attenuation on the capability axis).
+        #[tokio::test]
+        async fn capability_broadening_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let claims = user_source_claims(&fx, now).with_cap("read@mac://model/x".to_owned());
+            let source = sign_source(&fx, &claims);
+            let mut req = request(source);
+            req.requested_capabilities = Some("write@mac://model/x".to_owned()); // not covered by read
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &req).await.unwrap();
+            assert_eq!(err_code(&resp), Some("CAPABILITY_ATTENUATION"));
+        }
+
+        /// An expired source credential is denied. The signed-credential decoder
+        /// enforces `exp` first (fail-closed at verification), so the stable deny
+        /// is `INVALID_SOURCE` — the decoder never admits an expired token to the
+        /// later `SOURCE_EXPIRED` re-check.
+        #[tokio::test]
+        async fn expired_source_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let mut claims = user_source_claims(&fx, now);
+            claims.exp = now - 10; // already expired
+            let source = sign_source(&fx, &claims);
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("INVALID_SOURCE"));
+        }
+
+        /// A source whose `iss` is not this authority's configured issuer denies
+        /// (key possession is not issuer trust).
+        #[tokio::test]
+        async fn untrusted_issuer_source_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let mut claims = user_source_claims(&fx, now);
+            claims.iss = "https://evil.example".to_owned();
+            let source = sign_source(&fx, &claims);
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("UNTRUSTED_ISSUER"));
+        }
+
+        /// A terminal actor whose verified signer key does NOT match its enrolled
+        /// key cannot resolve a v16 signer suite for the output (fail closed).
+        #[tokio::test]
+        async fn actor_cnf_not_enrolled_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let source = sign_source(&fx, &user_source_claims(&fx, now));
+            // Actor authenticates with a key that is NOT the enrolled `mcp` key.
+            let wrong = SigningKey::from_bytes(&[0x99; 32]);
+            let actor_claims =
+                hyprstream_rpc::auth::Claims::new("service:mcp".to_owned(), now, now + 3600).with_clearance(label());
+            let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+                Subject::new("service:mcp"), TENANT, wrong.verifying_key(), actor_claims,
+            );
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("ACTOR_SUITE_UNRESOLVABLE"));
+        }
+
+        /// An unlabeled terminal actor (no clearance) denies.
+        #[tokio::test]
+        async fn unlabeled_actor_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let source = sign_source(&fx, &user_source_claims(&fx, now));
+            let actor_claims =
+                hyprstream_rpc::auth::Claims::new("service:mcp".to_owned(), now, now + 3600); // no clearance
+            let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+                Subject::new("service:mcp"), TENANT, fx.actor_ed.verifying_key(), actor_claims,
+            );
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("UNLABELED_ACTOR"));
+        }
+
+        /// A source OIDC session that is REVOKED denies (unique sid, no shared
+        /// session-registry contamination).
+        #[tokio::test]
+        async fn revoked_session_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            let sid = "sess-revoked-unique-1";
+            let reg = session_registry();
+            let key = hyprstream_rpc::auth::SessionKey::oidc(ISSUER, sid);
+            reg.register_session(
+                key.clone(),
+                hyprstream_rpc::auth::SessionState {
+                    subject: "alice".to_owned(),
+                    tenant: TENANT.to_owned(),
+                    kind: hyprstream_rpc::auth::SessionKind::Interactive,
+                    created_at: now,
+                    expires_at: now + 3600,
+                    status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                    clearance_epoch: 0,
+                },
+            )
+            .await
+            .unwrap();
+            reg.revoke_session(&key).await.unwrap();
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let mut claims = user_source_claims(&fx, now);
+            claims.sid = Some(sid.to_owned());
+            let source = sign_source(&fx, &claims);
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("SESSION_INVALID"));
+        }
+
+        /// A source OIDC session bound to a DIFFERENT subject denies (mismatch).
+        #[tokio::test]
+        async fn mismatched_session_subject_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            let sid = "sess-mismatch-unique-1";
+            let reg = session_registry();
+            let key = hyprstream_rpc::auth::SessionKey::oidc(ISSUER, sid);
+            reg.register_session(
+                key,
+                hyprstream_rpc::auth::SessionState {
+                    subject: "carol".to_owned(), // NOT alice
+                    tenant: TENANT.to_owned(),
+                    kind: hyprstream_rpc::auth::SessionKind::Interactive,
+                    created_at: now,
+                    expires_at: now + 3600,
+                    status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                    clearance_epoch: 0,
+                },
+            )
+            .await
+            .unwrap();
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let mut claims = user_source_claims(&fx, now);
+            claims.sid = Some(sid.to_owned());
+            let source = sign_source(&fx, &claims);
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("SESSION_INVALID"));
+        }
+
+        /// A source whose sid is UNKNOWN to the registry denies.
+        #[tokio::test]
+        async fn unknown_session_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            let _ = session_registry(); // ensure the registry exists (empty for this sid)
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let mut claims = user_source_claims(&fx, now);
+            claims.sid = Some("sess-never-registered-unique-1".to_owned());
+            let source = sign_source(&fx, &claims);
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("SESSION_INVALID"));
+        }
+
+        /// A source whose sid is registered but EXPIRED denies.
+        #[tokio::test]
+        async fn expired_session_denies() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            let sid = "sess-expired-unique-1";
+            let reg = session_registry();
+            reg.register_session(
+                hyprstream_rpc::auth::SessionKey::oidc(ISSUER, sid),
+                hyprstream_rpc::auth::SessionState {
+                    subject: "alice".to_owned(),
+                    tenant: TENANT.to_owned(),
+                    kind: hyprstream_rpc::auth::SessionKind::Interactive,
+                    created_at: now - 7200,
+                    expires_at: now - 3600, // already expired
+                    status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                    clearance_epoch: 0,
+                },
+            )
+            .await
+            .unwrap();
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let mut claims = user_source_claims(&fx, now);
+            claims.sid = Some(sid.to_owned());
+            let source = sign_source(&fx, &claims);
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("SESSION_INVALID"));
+        }
+
+        /// A low-clearance INTERMEDIATE actor in the source's delegation chain
+        /// lowers the effective meet: the minted credential's clearance is the
+        /// intersection/min across originator, every actor, and the terminal
+        /// actor — never above any input.
+        #[tokio::test]
+        async fn low_clearance_intermediate_lowers_the_meet() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            let public = SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY);
+            let actor_hs = hyprstream_rpc::auth::service_signer_suite_b64(
+                &fx.actor_ed.verifying_key().to_bytes(), None,
+            );
+            // Source: originator alice (Internal), act = terminal service:mcp
+            // (Internal) nesting an intermediate service:low (Public). The cnf
+            // resolves against the OUTERMOST act (service:mcp).
+            let claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
+                .with_issuer(ISSUER.to_owned())
+                .with_tenant(TENANT.to_owned())
+                .with_sid("sess-1")
+                .with_client_id(CLIENT_ID)
+                .with_scope(Some("read".to_owned()))
+                .with_clearance(label())
+                .with_audience(Some("res-a".to_owned()))
+                .with_act(hyprstream_rpc::auth::ActClaim {
+                    sub: "service:mcp".to_owned(),
+                    clearance: Some(CredentialClearance::from_label(label())),
+                    act: Some(Box::new(hyprstream_rpc::auth::ActClaim {
+                        sub: "service:low".to_owned(),
+                        clearance: Some(CredentialClearance::from_label(public)),
+                        act: None,
+                    })),
+                })
+                .with_cnf_jwk(&fx.actor_ed.verifying_key().to_bytes())
+                .with_cnf_hs_signer_suite(actor_hs);
+            let source = sign_source(&fx, &claims);
+            let ctx = actor_ctx(&fx, now);
+            let token = match fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap() {
+                PolicyResponseVariant::ExchangeDelegatedResult(info) => info.token,
+                other => panic!("expected a minted token, got {other:?}"),
+            };
+            let minted = hyprstream_rpc::auth::decode_unverified(&token).unwrap();
+            assert_eq!(
+                minted.clearance,
+                Some(CredentialClearance::from_label(public)),
+                "the low-clearance intermediate must lower the effective meet to Public"
+            );
+        }
+
+        /// A NON-DISPATCH OAuth token (valid signature/profile but NO
+        /// `cnf.hs_signer_suite`) presented as a delegation SOURCE is denied —
+        /// issuance may accept such a bearer, but delegation admission rejects it
+        /// for the missing authoritative confirmation.
+        #[tokio::test]
+        async fn non_dispatch_source_without_hs_is_denied() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
+            // The same valid interactive user source, but WITHOUT the v16 cnf
+            // signer-suite confirmation (a bearer/non-dispatch shape).
+            let claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
+                .with_issuer(ISSUER.to_owned())
+                .with_tenant(TENANT.to_owned())
+                .with_sid("sess-1")
+                .with_client_id(CLIENT_ID)
+                .with_scope(Some("read write".to_owned()))
+                .with_clearance(label())
+                .with_audience(Some("res-a".to_owned()))
+                .with_cnf_jwk(&fx.user_ed.verifying_key().to_bytes());
+            let source = sign_source(&fx, &claims);
+            let ctx = actor_ctx(&fx, now);
+            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
+            assert_eq!(err_code(&resp), Some("INVALID_SOURCE_CNF"));
+        }
 }

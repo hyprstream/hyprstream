@@ -793,6 +793,7 @@ mod tests {
                 hyprstream_rpc::auth::mac::Assurance::Classical,
                 hyprstream_rpc::auth::mac::CompartmentSet::EMPTY,
             ))
+            .with_client_id("hyprstream-oauth-client-1")
             .with_jti()
     }
 

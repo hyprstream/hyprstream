@@ -2065,7 +2065,8 @@ mod tests {
             now + 60,
         )
         .with_issuer("https://pds.example.test".to_owned())
-        .with_audience(Some("https://pds.example.test".to_owned()));
+        .with_audience(Some("https://pds.example.test".to_owned()))
+        .with_client_id("hyprstream-oauth-client-1");
         let token = hyprstream_rpc::auth::jwt::encode(&claims, &fixture.signing_key);
         let response = super::super::create_app(Arc::clone(&fixture.state), &fixture.cors)
             .oneshot(post(
