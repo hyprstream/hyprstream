@@ -13,7 +13,7 @@ Machine-readable files (the normative form — this page is the human index):
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 9 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 58 vectors that MUST deny |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 62 vectors that MUST deny |
 | [`vectors/proof-v1-thumbprints.json`](vectors/proof-v1-thumbprints.json) | Cross-implementation replay-namespace thumbprint vectors (C1) |
 | [`vectors/proof-v1-credentials.json`](vectors/proof-v1-credentials.json) | Frozen `verifier_now` clock (F1) and the issuer-signed at+jwt tokens the authenticated positives hash (F2) |
 
@@ -356,7 +356,7 @@ Ed25519 signature over the stripped object.
 | N-4 | domain-separation | Correct `typ` with the response-proof `hs_domain` | 1628 |
 | N-5 | component-stripping | Hybrid proof with the ML-DSA-65 entry stripped | 438 |
 | N-6 | parser-cap | Otherwise-valid nine signer-group `COSE_Sign`, over the 1\*8 group cap (cap is the sole denial) | 2803 |
-| N-7 | parser-cap | Signer group with three components | 1684 |
+| N-7 | parser-cap | Fully-signed three-component signer group, over the 1\*2 component cap (cap is the sole denial) | 5149 |
 | N-8 | closed-claim-set | Unknown claim key −70050 (unallocated) | 413 |
 | N-9a | non-deterministic-encoding | Claims map keys not in deterministic order | 395 |
 | N-9b | non-deterministic-encoding | Indefinite-length claims map | 396 |
@@ -375,7 +375,7 @@ Ed25519 signature over the stripped object.
 | N-13 | parser-cap | `kid` of 65 bytes | 1727 |
 | N-14 | closed-claim-set | Required `credential_hash` absent rather than null | 356 |
 | N-15 | credential-binding | Credential presented with a null signed `credential_hash` | 362 |
-| N-16 | freshness | Unattributed proof with no `Nonce` | 452 |
+| N-16 | unattributed-nonce-required | Unattributed proof with no `Nonce` | 452 |
 | N-17 | unprotected-authority | `alg`/`kid` only in the unprotected header | 1626 |
 | N-18 | key-set-strictness | Unattributed key set with a surplus element (no matching plan component) | 2456 |
 | N-19 | disposition-confusion | Response proof carrying `hs_unattributed_key_set` | 446 |
@@ -408,6 +408,10 @@ Ed25519 signature over the stripped object.
 | N-49 | integer-truncation | Truncated CBOR integer: claims `iat` argument `19 00` declares 2 bytes with 1 present | 244 |
 | N-50 | proof-credential-expiry | Authenticated proof whose `exp` (1786000060) exceeds its mapped credential's `exp` (1786000030) | 244 |
 | N-51 | proof-session-expiry | Session-bound proof whose `exp` (1786000025) is within the credential expiry but exceeds the authoritative session expiry (1786000020) | 395 |
+| N-54 | proof-freshness | Expired proof: `exp` (1786000010) at/before `verifier_now` (1786000015) | 395 |
+| N-55 | proof-freshness | Future-issued proof: `iat` (1786000046) more than 30s after `verifier_now` | 395 |
+| N-56 | proof-freshness | Over-limit authenticated proof: `exp − verifier_now` (301s) exceeds the Authenticated maximum (300s) | 395 |
+| N-57 | proof-freshness | Over-limit unattributed proof: `exp − verifier_now` (45s) exceeds the Unattributed maximum (30s) | 470 |
 
 ### Notes on individual negatives
 
@@ -453,6 +457,15 @@ Ed25519 signature over the stripped object.
   `1*8` group cap is its **sole** denial. The gate verifies all nine signatures and
   proves the isolation by showing an **eight-group truncation validates** the plan
   (a de-fang to eight groups, or a verifier omitting the cap, turns the suite red).
+  **N-7 (W2)** is the component-count analog and is isolated the same way: a
+  **fully-signed** `COSE_Sign` whose single group carries **three** components
+  (client Ed25519 + client ML-DSA-65 + approver Ed25519), each with a matching
+  **valid** signature and a unique `(alg, kid)`, so **coverage is complete** and the
+  **`1*2`-components-per-group cap is its sole denial** (truncating the group to two
+  components validates). The causality inventory asserts both the `>2` count **and**
+  complete coverage, so reverting N-7 to a single signature over the three-component
+  plan (the earlier multi-causal shape — it also failed exact coverage) turns the
+  gate red.
 - **Byte-range boundary coverage (E1) — N-44 / N-45 / N-46 / N-47.** The pinned
   pycddl 0.3.0 strips **every** `.size (LO..HI)` byte-length range (it mis-evaluates
   them as integer-value bounds), so each stripped range needs a causal boundary
@@ -539,6 +552,25 @@ Ed25519 signature over the stripped object.
   sid-presence is never ambiguous: a `user-session` credential MUST carry `sid`, a
   `rfc8693`/`rfc7523` credential MUST NOT, and a `service` credential has a
   `service:`-prefixed subject and no `sid` (§3.2/§3.3).
+- **N-54 / N-55 / N-56 / N-57 (proof freshness at the verifier clock, W1).** A
+  bearer proof is time-bounded at the injected `verifier_now` (1786000015) by three
+  **verifier-clock** bounds (design §4.5, matching the landed C dispatch constants;
+  never the issued `exp − iat`): `|iat − verifier_now| ≤ 30s` (clock skew, **both
+  sides**), `verifier_now < exp` (not expired), and `exp − verifier_now ≤` the proof's
+  **per-disposition** maximum remaining lifetime — **Authenticated 300s, Unattributed
+  30s** — all pinned in every artifact's metadata (`max_clock_skew_secs`,
+  `proof_max_remaining_lifetime_secs`). Every positive is fresh. The four negatives
+  each deny on **exactly one** axis, correcting which alone makes the proof fresh:
+  **N-54** is expired (`exp = 1786000010 ≤ verifier_now`); **N-55** is future-issued
+  beyond skew (`iat = 1786000046`, 31s ahead); **N-56** is over the **Authenticated**
+  maximum (`exp − verifier_now = 301s`); **N-57** is over the **Unattributed** maximum
+  (`exp − verifier_now = 45s`). N-54/N-55/N-56 are authenticated proofs bound to a
+  **long-lived** fixture credential (`cred-longlived-1`, `exp = 1786000415`) so their
+  `exp` can reach past 300s without also tripping the credential-expiry bound; N-57 is
+  unattributed (no credential cap). The gate (§W1) and checker enforce all four bounds
+  at `verifier_now` per disposition, and the causality inventory asserts each denies
+  on its single axis. (The unattributed-`Nonce` rule that N-16 exercises is a distinct
+  class, `unattributed-nonce-required`, not proof freshness.)
 - **N-12 / N-28 (suite ↔ component-plan binding).** Each suite_id is bound to its
   exact ordered algorithms and component count: `hs-cose-sign-ed25519-v1` is
   exactly one Ed25519 component, `hs-cose-sign-ed25519-mldsa65-wns-v1` is exactly
@@ -808,11 +840,13 @@ Ed25519 signature over the stripped object.
   The cap is a byte-length range that the pinned CDDL validator does not
   enforce; `validate_profile.py` enforces it numerically and ties the value to
   the Rust `MAX_SERVICE_DOMAIN_BYTES` constant.
-- **N-16 (unattributed challenge).** An unattributed proof MUST carry the server
-  challenge (§4.7): the distinct `hyprstream-unattributed-proof-claims` rule
-  makes `Nonce` a mandatory key (and pins `credential_hash` to `null`), so the
-  N-16 no-`Nonce` shape fails structural CDDL validation rather than depending on
-  a separate verifier check.
+- **N-16 (unattributed challenge; class `unattributed-nonce-required`).** An
+  unattributed proof MUST carry the server challenge (§4.7): the distinct
+  `hyprstream-unattributed-proof-claims` rule makes `Nonce` a mandatory key (and
+  pins `credential_hash` to `null`), so the N-16 no-`Nonce` shape fails structural
+  CDDL validation rather than depending on a separate verifier check. This is a
+  distinct rule from temporal proof freshness (W1, N-54..N-57) — the deny class was
+  renamed from the earlier misleading `freshness` to `unattributed-nonce-required`.
 - **N-27 (cleartext-unary canonical encoding).** `response_binding` is null
   exactly when the response is neither encrypted nor streamed. A cleartext unary
   response is neither, so it uses the null encoding; the cleartext map
@@ -828,9 +862,18 @@ therefore stated as verifier obligations rather than shipped here:
    verifier harness. v16 credentials are Reusable, so the credential ID is never
    a replay key; the credential-ID consume path returns only with the deferred
    `OneShotTransaction` amendment.
-2. Freshness bounds (`iat` within clock-skew tolerance,
-   `exp − verifier_now ≤` the per-disposition maximum lifetime) — needs a
-   controlled clock.
+2. Proof freshness — **now mechanically enforced (gate §W1 + checker), no longer
+   a gap.** The frozen `verifier_now` (F1) makes the freshness bounds byte-encodable,
+   so they are pinned as constants and enforced at the injected clock rather than
+   left as an obligation. All three are **verifier-clock** bounds (design §4.5, the
+   landed C dispatch values), never the issued `exp − iat`:
+   `|iat − verifier_now| ≤ 30s` (skew, both sides), `verifier_now < exp` (not
+   expired), and `exp − verifier_now ≤` the per-disposition maximum remaining
+   lifetime (**Authenticated 300s, Unattributed 30s**). Every positive is fresh;
+   the four negatives N-54 (expired), N-55 (future-issued beyond skew), N-56
+   (over the Authenticated maximum), and N-57 (over the Unattributed maximum) each
+   deny on exactly one axis, and correcting that one field makes the proof fresh
+   (so the freshness rule is the sole denial).
 3. `challenge_accept_until` semantics and the single bounded retry.
 4. Component-key non-reuse across suites, profiles, and logical groups
    (CDDL §6). The **cross-record enrollment** case — no component public key may be

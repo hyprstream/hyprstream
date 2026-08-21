@@ -189,6 +189,21 @@ CREDENTIAL_TENANT = "tenant-alpha"           # JWT text name for the -70005 tena
 # (1786000015), so the session is active yet a longer-lived proof outlives it.
 SESSION_ID = "sess-6b1e0a7c9d2f4a08"
 SESSION_EXP = 1786000020
+# W1: proof freshness at the frozen verifier clock (mac-1499-design-v16.md §4.5;
+# matches the landed C dispatch constants). All three bounds are VERIFIER-CLOCK
+# bounds, NOT issued-lifetime (`exp - iat`). A proof is fresh iff
+#   |iat - verifier_now| <= MAX_CLOCK_SKEW_SECS   (iat within skew, BOTH sides),
+#   verifier_now < exp                            (not expired), and
+#   exp - verifier_now <= the disposition maximum (remaining lifetime within bound).
+# The remaining-lifetime maximum is pinned EXPLICITLY per proof disposition
+# (Authenticated 300s, Unattributed 30s), matching C. Every shipped positive has
+# iat=1786000000 (|iat-now|=15 <= 30) and exp in {1786000020, 1786000030}: unexpired
+# at verifier_now=1786000015 with exp-now in {5, 15} — within both disposition bounds.
+MAX_CLOCK_SKEW_SECS = 30
+PROOF_MAX_REMAINING_LIFETIME_SECS = {
+    "authenticated": 300,
+    "unattributed": 30,
+}
 CREDENTIAL_CLEARANCE = [2, [5, 7]]           # [level, compartments]; -70006 (JWT text: clearance)
 ML_KEM_768_RECIPIENT = bytes(range(256)) * 4 + bytes(range(160))  # 1184 bytes
 
@@ -417,18 +432,20 @@ def main() -> None:
         primary_enrollment_classical = primary_enrollment(SUITE_CLASSICAL, [client_ed_pub])
         primary_enrollment_hybrid = primary_enrollment(SUITE_HYBRID, [client_ed_hy_pub, ml_client.public])
 
-        def build_at_jwt(jti: str, cnf_thumbprint: bytes, *, sid: str = None):
+        def build_at_jwt(jti: str, cnf_thumbprint: bytes, *, sid: str = None, exp: int = EXP):
             """A compact JWS (RFC 7519/8725) access token: exact at+jwt header,
             EdDSA over the seeded issuer key, and every required v16
             authenticated-dispatch claim. Ed25519 + canonical JSON => byte-stable.
-            A user-session credential also carries the OIDC `sid` (§3.2)."""
+            A user-session credential also carries the OIDC `sid` (§3.2). `exp`
+            overrides the credential expiry (used by the W1 long-lived freshness
+            fixture credential)."""
             header = {"alg": "EdDSA", "kid": KID_ISSUER_ED.decode(), "typ": "at+jwt"}
             claims = {
                 "iss": ISSUER_ISS,
                 "sub": CREDENTIAL_SUBJECT,
                 "aud": SERVICE_DOMAIN,
                 "iat": IAT,
-                "exp": EXP,
+                "exp": exp,
                 "jti": jti,
                 "client_id": CREDENTIAL_CLIENT_ID,
                 "tenant": CREDENTIAL_TENANT,
@@ -451,9 +468,17 @@ def main() -> None:
         # can be within the credential bound yet outlive the session.
         cred_session, hdr_session, claims_session = build_at_jwt(
             "cred-session-1", cnf_classical, sid=SESSION_ID)
+        # W1: a long-lived, otherwise-valid classical credential (exp = 1786000415,
+        # i.e. verifier_now + 400) that hosts the authenticated freshness negatives
+        # whose exp must reach beyond verifier_now + 300 (the Authenticated maximum)
+        # without tripping the credential-expiry bound. Not mapped to any positive.
+        CREDENTIAL_LONGLIVED_EXP = 1786000415
+        cred_longlived, hdr_longlived, claims_longlived = build_at_jwt(
+            "cred-longlived-1", cnf_classical, exp=CREDENTIAL_LONGLIVED_EXP)
         CREDENTIAL_HASH = hashlib.sha256(cred_classical.encode("ascii")).digest()
         CREDENTIAL_HASH_HYBRID = hashlib.sha256(cred_hybrid.encode("ascii")).digest()
         CREDENTIAL_HASH_SESSION = hashlib.sha256(cred_session.encode("ascii")).digest()
+        CREDENTIAL_HASH_LONGLIVED = hashlib.sha256(cred_longlived.encode("ascii")).digest()
 
         keys_doc = {
             "warning": (
@@ -1105,8 +1130,15 @@ def main() -> None:
             notes="Every group is a known suite with a matching valid signature; only the >8-group cap denies.",
         )
 
-        # N-7: third component in one group.
-        plan_three = [
+        # N-7 (W2, isolated like N-6): a fully otherwise-valid COSE_Sign whose single
+        # signer group has THREE components, each carrying a matching valid signature
+        # (client Ed25519 + client ML-DSA-65 + approver Ed25519). Coverage is complete
+        # and every (alg,kid) is unique, so a coverage-enforcing verifier still admits
+        # it — the SOLE denial is the frozen 1*2-components-per-group cap (truncating
+        # the group to its first two components validates). This mirrors N-6's group-cap
+        # isolation and removes the earlier multi-causality (a single Ed25519 signature
+        # over a three-component plan also failed exact coverage).
+        n7_plan = [
             group(
                 1,
                 SUITE_HYBRID,
@@ -1117,18 +1149,32 @@ def main() -> None:
                 ],
             )
         ]
-        n7_protected = dict(p4_protected)
-        n7_protected[H_PLAN] = plan_three
-        n7, _, _ = sign1(n7_protected, p4_claims, sk_c_ed)
+        n7_body = {
+            H_CRIT: CRIT_SIGN_BODY_AUTH,
+            H_TYP: TYP_REQUEST,
+            H_DOMAIN: DOMAIN_REQUEST,
+            H_PLAN: n7_plan,
+        }
+        n7_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_CLIENT_ED, H_GROUP: 1}, sk_c_ed),
+            ({H_ALG: ALG_ML_DSA_65, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_CLIENT_ML, H_GROUP: 1}, ml_client),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_APPROVER_ED, H_GROUP: 1}, sk_a_ed),
+        ]
+        n7, _, _ = sign_multi(n7_body, p4_claims, n7_entries)
         record(
             negatives,
             "N-7",
-            "signer group with three components",
+            "Fully-signed three-component signer group, over the 1*2 component cap",
             "deny",
-            "COSE_Sign1",
+            "COSE_Sign",
             n7,
             deny_class="parser-cap",
             deny_rule="proof-v1 cap: 1*2 components per signer group",
+            notes=(
+                "Every component carries a matching valid signature (coverage complete) "
+                "and every (alg,kid) is unique; only the >2-component cap denies "
+                "(truncating the group to two components validates)."
+            ),
         )
 
         # N-8: unknown claim key. -70050 is in no allocated block; the proof
@@ -1480,8 +1526,8 @@ def main() -> None:
             "deny",
             "COSE_Sign1",
             n16,
-            deny_class="freshness",
-            deny_rule="the challenge is REQUIRED for unattributed proofs, before any replay-store insertion",
+            deny_class="unattributed-nonce-required",
+            deny_rule="the challenge Nonce is REQUIRED for unattributed proofs, before any replay-store insertion",
         )
 
         # N-17: alg and kid only in the unprotected header.
@@ -2201,6 +2247,71 @@ def main() -> None:
             notes="proof exp <= credential exp but > session exp; the credential bound is satisfied, only the session bound denies.",
         )
 
+        # ---- W1: proof-freshness negatives at the frozen verifier clock (design
+        # §4.5). Each is a correctly-signed, context-valid proof that denies SOLELY on
+        # one freshness axis under the verifier-clock rule (|iat-now| <= 30 both sides;
+        # now < exp; exp - now <= the disposition maximum, Authenticated 300 /
+        # Unattributed 30). N-54/N-55/N-56 are authenticated proofs bound to the
+        # long-lived credential (exp 1786000415) so their exp can reach past the
+        # Authenticated maximum without also tripping the credential-expiry bound; N-57
+        # is unattributed. All four are single-cause signed bytes — no synthetic probe.
+        #
+        # N-54: expired — exp (1786000010) <= verifier_now (1786000015).
+        n54_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH_LONGLIVED, extra={C_IAT: 1786000000, C_EXP: 1786000010})
+        n54, _, _ = sign1(p4_protected, n54_claims, sk_c_ed)
+        record(
+            negatives, "N-54",
+            "Expired proof: exp (1786000010) is at/before verifier_now (1786000015)",
+            "deny", "COSE_Sign1", n54,
+            deny_class="proof-freshness",
+            deny_rule="a proof is fresh only while verifier_now < exp; an expired proof denies",
+            notes="Authenticated, iat within skew, remaining lifetime in bound; denies solely on expiry at verifier_now.",
+        )
+        # N-55: future-issued beyond skew — iat (1786000046) > verifier_now + 30
+        # (1786000045). exp is unexpired and remaining lifetime (85s) is within the
+        # Authenticated maximum (300s), so only the skew rule denies.
+        n55_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH_LONGLIVED, extra={C_IAT: 1786000046, C_EXP: 1786000100})
+        n55, _, _ = sign1(p4_protected, n55_claims, sk_c_ed)
+        record(
+            negatives, "N-55",
+            "Future-issued proof: iat (1786000046) is more than 30s after verifier_now (1786000015)",
+            "deny", "COSE_Sign1", n55,
+            deny_class="proof-freshness",
+            deny_rule="a proof is fresh only while |iat - verifier_now| <= max_clock_skew; a future iat beyond skew denies",
+            notes="Authenticated, unexpired, remaining lifetime 85s (<= 300s auth), exp within the long-lived credential; denies solely on the future iat (31s > 30s skew).",
+        )
+        # N-56: over-limit AUTHENTICATED remaining lifetime — exp - verifier_now (301s)
+        # exceeds the Authenticated maximum (300s). iat is in skew, exp is unexpired and
+        # within the long-lived credential (1786000415), so only the lifetime rule denies.
+        n56_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH_LONGLIVED, extra={C_IAT: 1786000000, C_EXP: 1786000316})
+        n56, _, _ = sign1(p4_protected, n56_claims, sk_c_ed)
+        record(
+            negatives, "N-56",
+            "Over-limit authenticated proof: exp - verifier_now (301s) exceeds the Authenticated maximum (300s)",
+            "deny", "COSE_Sign1", n56,
+            deny_class="proof-freshness",
+            deny_rule="a proof's exp - verifier_now MUST NOT exceed its disposition's max remaining lifetime (Authenticated 300s)",
+            notes="Authenticated, iat within skew, unexpired, exp within the long-lived credential; denies solely on the over-long remaining lifetime for its disposition.",
+        )
+        # N-57: over-limit UNATTRIBUTED remaining lifetime — exp - verifier_now (45s)
+        # exceeds the Unattributed maximum (30s). Unattributed proofs carry no
+        # credential expiry cap, so this maximum is isolable directly. iat in skew,
+        # exp unexpired, Nonce present, so only the lifetime rule denies.
+        n57_claims = request_claims(
+            credential_hash=None, nonce=CHALLENGE, extra={C_IAT: 1786000000, C_EXP: 1786000060})
+        n57, _, _ = sign1(p1_protected, n57_claims, sk_u_ed)
+        record(
+            negatives, "N-57",
+            "Over-limit unattributed proof: exp - verifier_now (45s) exceeds the Unattributed maximum (30s)",
+            "deny", "COSE_Sign1", n57,
+            deny_class="proof-freshness",
+            deny_rule="a proof's exp - verifier_now MUST NOT exceed its disposition's max remaining lifetime (Unattributed 30s)",
+            notes="Unattributed (Nonce present), iat within skew, unexpired; denies solely on the over-long remaining lifetime for its disposition.",
+        )
+
     meta = {
         "vector_set_version": 1,
         "profile": "hs-rpc-proof-v1",
@@ -2208,6 +2319,10 @@ def main() -> None:
         "encoding": "RFC 8949 core deterministic encoding; untagged COSE structures",
         "external_aad": "zero-length for every Sig_structure in this profile",
         "verifier_now": VERIFIER_NOW,
+        # W1: pinned proof-freshness parameters, evaluated at verifier_now
+        # (verifier-clock bounds per design §4.5; exp - verifier_now, NOT exp - iat).
+        "max_clock_skew_secs": MAX_CLOCK_SKEW_SECS,
+        "proof_max_remaining_lifetime_secs": PROOF_MAX_REMAINING_LIFETIME_SECS,
         "generator": "docs/standards/v16/tools/gen_proof_vectors.py",
     }
 
@@ -2291,6 +2406,22 @@ def main() -> None:
                 "cnf_thumbprint_b64": b64u(cnf_classical),
                 "token_sha256": CREDENTIAL_HASH_SESSION.hex(),
                 "session_id": SESSION_ID,
+            },
+            "longlived": {
+                # W1: a long-lived, otherwise-valid classical credential (exp beyond
+                # verifier_now + 300) that hosts the authenticated freshness negatives
+                # N-54/N-55/N-56. Not mapped to any positive; exists so an authenticated
+                # freshness proof can reach past the Authenticated maximum without also
+                # tripping the credential-expiry bound.
+                "encoding": "at+jwt",
+                "credential_kind": "rfc8693",
+                "token": cred_longlived,
+                "header": hdr_longlived,
+                "claims": claims_longlived,
+                "primary_suite": SUITE_CLASSICAL,
+                "cnf_preimage_hex": enc([SUITE_CLASSICAL, [client_ed_pub]]).hex(),
+                "cnf_thumbprint_b64": b64u(cnf_classical),
+                "token_sha256": CREDENTIAL_HASH_LONGLIVED.hex(),
             },
         },
         "session_model": {

@@ -123,6 +123,20 @@ hyprstream-proof-claims = {
   -70004 => response-binding / null,
 }
 
+; Proof freshness (W1; mac-1499-design-v16.md §4.5). CDDL cannot express clock-
+; relative bounds, so `exp`/`iat` are typed as timestamps here and the verifier
+; enforces freshness at the injected verifier clock. All three bounds are
+; VERIFIER-CLOCK bounds, never the issued lifetime `exp - iat`:
+;   * |iat - verifier_now| <= max_clock_skew_secs   (clock skew, BOTH sides),
+;   * verifier_now < exp                            (not expired), and
+;   * exp - verifier_now <= the disposition maximum (remaining lifetime),
+; with the landed C dispatch constants: max_clock_skew_secs = 30, and the
+; per-disposition maximum remaining lifetime = Authenticated 300s / Unattributed
+; 30s. The constants are pinned in every fixture's metadata
+; (max_clock_skew_secs, proof_max_remaining_lifetime_secs) and enforced by
+; validate_profile.py (gate W1) and check_proof_vectors.py; negatives
+; N-54..N-57 exercise the four axes.
+
 ; Unattributed request proofs (no credential). The server challenge (Nonce) is
 ; REQUIRED (§4.7: it is denied before any replay-store insertion), so claim 10
 ; is a MANDATORY key here — not optional as in the authenticated set — and the

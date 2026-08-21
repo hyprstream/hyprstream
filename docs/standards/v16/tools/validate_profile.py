@@ -1533,7 +1533,21 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
             if vid == "N-6":
                 return len(plan or []) > 8, "more than 8 signer groups"
             if vid == "N-7":
-                return any(len(g.get(3, [])) > 2 for g in (plan or [])), "a group has >2 components"
+                # W2 isolation: a group has >2 components AND coverage is COMPLETE
+                # (every plan component carries a matching signature entry), so the
+                # >2-component cap is the SOLE defect. Reverting N-7 to a single
+                # signature (incomplete coverage) makes this predicate fail -> gate red.
+                over_cap = any(len(g.get(3, [])) > 2 for g in (plan or []))
+                sig_keys = set()
+                for e in (entries or []):
+                    try:
+                        ep = decode(e[0])
+                        sig_keys.add((ep.get(H_GROUP), ep.get(H_ALG), ep.get(H_KID)))
+                    except Exception:  # noqa: BLE001
+                        pass
+                covered = bool(comps) and set(comps) == sig_keys and len(comps) == len(sig_keys)
+                return (over_cap and covered), \
+                    "a group has >2 components with every component signed (the cap is the sole defect)"
             if vid == "N-13":
                 kids = [k for k, _ in [((c[2]), 0) for c in comps]] + ([pm.get(H_KID)] if isinstance(pm.get(H_KID), (bytes, bytearray)) else [])
                 return any(isinstance(k, (bytes, bytearray)) and len(k) > SUITE_KID_MAX for k in kids), "kid over 64 bytes"
@@ -1608,8 +1622,21 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
         if dc == "credential-binding":  # N-15 / B5
             return claims is not None and claims.get(C_CREDENTIAL_HASH) is None and H_KEYSET not in pm, \
                 "authenticated proof with a null credential_hash"
-        if dc == "freshness":  # N-16
+        if dc == "unattributed-nonce-required":  # N-16
             return H_KEYSET in pm and (claims is None or C_NONCE not in claims), "unattributed proof without Nonce"
+        if dc == "proof-freshness":  # W1: N-54/N-55/N-56/N-57 — temporal freshness at verifier_now
+            from check_proof_vectors import validate_proof_freshness as _vpf, proof_disposition as _pd
+            fnow = negatives.get("verifier_now")
+            fskew = negatives.get("max_clock_skew_secs")
+            fmax = negatives.get("proof_max_remaining_lifetime_secs")
+            if claims is None:
+                return False, "claims did not decode"
+            disp = _pd(pm)
+            ferrs = _vpf(claims, fnow, fskew, fmax, disp)
+            axis = {"N-54": "expired", "N-55": "out of skew",
+                    "N-56": "over-lifetime", "N-57": "over-lifetime"}.get(vid, "")
+            return (len(ferrs) == 1 and any(axis in e for e in ferrs)), \
+                f"denies solely on '{axis}' at verifier_now ({disp}); got {ferrs}"
         if dc == "group-id-order":
             gids = [g.get(1) for g in (plan or [])]
             return gids != sorted(set(gids)) or len(gids) != len(set(gids)), "group IDs not unique+ascending"
@@ -2019,6 +2046,65 @@ def gate_verifier_clock(positives, negatives) -> None:
     check(not (iat <= 4102444800 < exp), "a wall-clock-style instant (2100) must be outside validity")
     print(f"   verifier_now {now} agrees across artifacts; all positives/credentials valid; "
           f"pre-iat/at-exp/wall-clock rejected")
+
+
+def gate_proof_freshness(positives, negatives) -> None:
+    section("W1. Proof freshness at the verifier clock (design §4.5)")
+    from check_proof_vectors import validate_proof_freshness as vpf, proof_disposition as pdisp
+    now = negatives.get("verifier_now")
+    skew = negatives.get("max_clock_skew_secs")
+    maxmap = negatives.get("proof_max_remaining_lifetime_secs")
+    check(isinstance(now, int) and isinstance(skew, int) and isinstance(maxmap, dict),
+          "verifier_now/max_clock_skew_secs (int) + proof_max_remaining_lifetime_secs (map) must be declared")
+    if not (isinstance(now, int) and isinstance(skew, int) and isinstance(maxmap, dict)):
+        return
+    # Constants pinned to the landed C dispatch values (verifier-clock bounds).
+    check(skew == 30, f"max_clock_skew_secs must be 30 (C dispatch), got {skew}")
+    check(maxmap.get("authenticated") == 300 and maxmap.get("unattributed") == 30,
+          f"per-disposition maxima must be authenticated=300 / unattributed=30 (C dispatch), got {maxmap}")
+    # Cross-artifact agreement (like verifier_now).
+    for fn in ("proof-v1-positive.json", "proof-v1-negative.json", "proof-v1-credentials.json",
+               "proof-v1-thumbprints.json", "proof-v1-keys.json"):
+        d = json.loads((VECTORS_DIR / fn).read_text())
+        check(d.get("max_clock_skew_secs") == skew and d.get("proof_max_remaining_lifetime_secs") == maxmap,
+              f"{fn} must declare the same freshness constants")
+
+    def claimsof(v):
+        return decode(decode(bytes.fromhex(v["cbor_hex"]))[2])
+
+    def dispof(v):
+        return pdisp(decode(decode(bytes.fromhex(v["cbor_hex"]))[0]))
+
+    # Every advertised positive proof is fresh at verifier_now (per disposition).
+    for v in positives["vectors"]:
+        c = claimsof(v)
+        if not (isinstance(c.get(6), int) and isinstance(c.get(4), int)):
+            continue
+        ferrs = vpf(c, now, skew, maxmap, dispof(v))
+        check(not ferrs, f"{v['id']} positive proof must be fresh at verifier_now: {ferrs}")
+    # The four freshness negatives each deny on EXACTLY one axis; correcting that one
+    # field alone makes the proof fresh — so the freshness rule is the SOLE denial
+    # (load-bearing: neutralizing the offending check would admit the proof).
+    by_id = {v["id"]: v for v in negatives["vectors"]}
+    cases = {
+        "N-54": ("expired", lambda c: {**c, 4: now + 15}),
+        "N-55": ("out of skew", lambda c: {**c, 6: now}),
+        "N-56": ("over-lifetime", lambda c: {**c, 4: now + 15}),
+        "N-57": ("over-lifetime", lambda c: {**c, 4: now + 15}),
+    }
+    for nid, (axis, fix) in cases.items():
+        v = by_id.get(nid)
+        check(v is not None, f"W1 freshness negative {nid} is missing")
+        if v is None:
+            continue
+        c, disp = claimsof(v), dispof(v)
+        errs = vpf(c, now, skew, maxmap, disp)
+        check(len(errs) == 1 and any(axis in e for e in errs),
+              f"{nid} must deny solely on '{axis}' at verifier_now ({disp}), got {errs}")
+        check(not vpf(fix(c), now, skew, maxmap, disp),
+              f"{nid} corrected on its '{axis}' axis must be fresh (isolation / de-fang)")
+    print("   skew=30, authenticated=300, unattributed=30; all positives fresh; "
+          "N-54/55/56/57 each deny on one axis (corrected clone is fresh)")
 
 
 def gate_credential_context(positives, negatives) -> None:
@@ -2495,6 +2581,7 @@ def main() -> None:
     gate_content_identity(positives, negatives)
     gate_group_cap_isolation(cddl, negatives)
     gate_verifier_clock(positives, negatives)
+    gate_proof_freshness(positives, negatives)
     gate_credential_context(positives, negatives)
     gate_enrollment_key_uniqueness()
     gate_canonical(positives, negatives)

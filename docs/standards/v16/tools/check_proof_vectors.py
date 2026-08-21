@@ -441,6 +441,45 @@ def validate_session(creds_doc, cred_claims, now):
     return s, errs
 
 
+def proof_disposition(protected_map):
+    """W1: classify a proof by its freshness disposition (design §4.5) — 'unattributed'
+    when it carries an embedded key set (header -70103), else 'authenticated'. The
+    disposition selects the maximum remaining-lifetime bound."""
+    return "unattributed" if (isinstance(protected_map, dict) and protected_map.get(-70103) is not None) else "authenticated"
+
+
+def validate_proof_freshness(claims, now, max_clock_skew_secs, max_remaining_lifetime_secs, disposition="authenticated"):
+    """W1: a proof is fresh at the injected verifier clock `now` iff (design §4.5, the
+    landed C dispatch bounds — all VERIFIER-CLOCK, never issued `exp - iat`):
+      * |iat - now| <= max_clock_skew_secs   (iat within skew, BOTH sides), and
+      * now < exp                            (not expired), and
+      * exp - now <= the disposition maximum (remaining lifetime within bound).
+    `max_remaining_lifetime_secs` may be the per-disposition map {disposition: secs} or
+    a scalar; `disposition` selects the applicable maximum. Returns the freshness
+    failures (empty == fresh). Proof claim keys: iat = 6, exp = 4."""
+    errs = []
+    iat, exp = claims.get(6), claims.get(4)
+    if isinstance(iat, bool) or not isinstance(iat, int):
+        errs.append(f"proof iat must be an integer, got {iat!r}")
+    if isinstance(exp, bool) or not isinstance(exp, int):
+        errs.append(f"proof exp must be an integer, got {exp!r}")
+    if errs:
+        return errs
+    if isinstance(max_remaining_lifetime_secs, dict):
+        max_life = max_remaining_lifetime_secs.get(disposition)
+        if max_life is None:
+            return [f"no maximum remaining lifetime pinned for disposition {disposition!r}"]
+    else:
+        max_life = max_remaining_lifetime_secs
+    if abs(iat - now) > max_clock_skew_secs:
+        errs.append(f"iat out of skew: |iat {iat} - verifier_now {now}| > skew {max_clock_skew_secs}")
+    if now >= exp:
+        errs.append(f"expired: verifier_now {now} >= exp {exp}")
+    if exp - now > max_life:
+        errs.append(f"over-lifetime: exp-verifier_now {exp - now}s > {disposition} max {max_life}s")
+    return errs
+
+
 def configured_issuer(creds_doc):
     """U2: the configured trusted issuer identifier from the off-wire verifier
     context. This is the authoritative `iss` a credential's signed `iss` claim
@@ -1033,6 +1072,41 @@ def main() -> None:
             sess, _ = validate_session(cd, cred_claims, now)
             if sess is not None and isinstance(pexp, int) and pexp > sess.get("expiry", 0):
                 fail(f"{pid}: proof exp {pexp} exceeds session exp {sess.get('expiry')}")
+
+    # ---- W1: proof freshness at the frozen verifier clock (design §4.5) ------
+    fnow = positive.get("verifier_now")
+    skew = positive.get("max_clock_skew_secs")
+    max_life = positive.get("proof_max_remaining_lifetime_secs")
+    if not (isinstance(fnow, int) and isinstance(skew, int) and isinstance(max_life, dict)):
+        fail("W1: verifier_now / max_clock_skew_secs (int) and proof_max_remaining_lifetime_secs (map) must be declared")
+    else:
+        def _disp(v):
+            return proof_disposition(decode(decode(bytes.fromhex(v["cbor_hex"]))[0]))
+        # Every advertised positive proof MUST be fresh at verifier_now.
+        for v in positive["vectors"]:
+            try:
+                pc = decode(decode(bytes.fromhex(v["cbor_hex"]))[2])
+            except Exception:  # noqa: BLE001
+                continue
+            if not (isinstance(pc, dict) and isinstance(pc.get(6), int) and isinstance(pc.get(4), int)):
+                continue
+            for e in validate_proof_freshness(pc, fnow, skew, max_life, _disp(v)):
+                fail(f"{v['id']}: advertised positive must be fresh at verifier_now: {e}")
+        # The four W1 freshness negatives MUST each deny on exactly one axis.
+        neg_by_id = {v["id"]: v for v in negative["vectors"]}
+        for nid, axis in (("N-54", "expired"), ("N-55", "out of skew"),
+                          ("N-56", "over-lifetime"), ("N-57", "over-lifetime")):
+            v = neg_by_id.get(nid)
+            if v is None:
+                fail(f"W1: freshness negative {nid} is missing"); continue
+            pc = decode(decode(bytes.fromhex(v["cbor_hex"]))[2])
+            errs = validate_proof_freshness(pc, fnow, skew, max_life, _disp(v))
+            if not errs:
+                fail(f"{nid}: a freshness negative must be rejected at verifier_now but is fresh")
+            elif not any(axis in e for e in errs):
+                fail(f"{nid}: must deny on '{axis}' alone, got {errs}")
+            elif len(errs) != 1:
+                fail(f"{nid}: must deny on exactly one freshness axis, got {errs}")
 
     total = len(positive["vectors"]) + len(negative["vectors"])
     if FAILURES:
