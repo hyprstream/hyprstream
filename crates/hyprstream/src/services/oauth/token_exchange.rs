@@ -1811,10 +1811,7 @@ async fn mint_grant_token(
 
     // DPoP sender-binding via cnf.jkt (RFC 9449 §6). ZSP: no cnf ⇒ bearer ⇒
     // rejected. We set jkt directly from the verified proof.
-    claims.cnf = Some(hyprstream_rpc::auth::Cnf {
-        jwk: None,
-        jkt: Some(dpop_jkt.to_owned()),
-    });
+    claims = claims.with_cnf_jkt_thumbprint(dpop_jkt.to_owned());
 
     // S8 (#574) + Fu3/#677: sign via the mandatory hybrid composite (EdDSA +
     // ML-DSA-65). If no ML-DSA-65 signing key is provisioned, refuse to mint

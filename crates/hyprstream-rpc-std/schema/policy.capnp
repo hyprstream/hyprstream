@@ -124,6 +124,17 @@ struct PolicyRequest {
     # checkCredentialRevocationResult, which reports revoked=true).
     checkSession @26 :CheckSession
       $scope(query);
+
+    # RFC 8693 §4 on-behalf-of delegated mint (v16 §8.1 AsOriginator). The
+    # AUTHENTICATED RPC caller is the terminal actor: the authority derives the
+    # actor subject and cnf from the verified envelope — never from a request
+    # field — verifies the presented originator source credential, and mints a
+    # NEW delegated credential (fresh jti, originator `sub`, nested terminal
+    # `act`, terminal-actor `cnf`, fail-closed `meet(originator, every actor)`
+    # clearance, attenuated scope, conditional `sid`). Reusable (no
+    # consume-once). WS-E calls this for a derived AsOriginator dispatch.
+    exchangeDelegated @27 :ExchangeDelegated
+      $scope(manage);
   }
 }
 
@@ -333,6 +344,9 @@ struct PolicyResponse {
     # Session check result (true = ACTIVE and known; false = revoked,
     # expired, unknown, or malformed — fail-closed)
     checkSessionResult @27 :Bool;
+
+    # Minted delegated at+jwt/wit from exchangeDelegated (fresh jti).
+    exchangeDelegatedResult @28 :TokenInfo;
   }
 }
 
@@ -506,6 +520,60 @@ struct ExchangeWit {
 
   # TTL override in seconds. Server clamps to configured [min, max].
   ttl @2 :Opt.OptionUint32;
+}
+
+# RFC 8693 §4 delegated on-behalf-of mint (v16 §8.1 AsOriginator).
+#
+# The terminal actor is NEVER a field here: it is the authenticated RPC caller,
+# derived from the verified policy envelope (subject + cnf), so E cannot supply
+# an arbitrary actor identity, clearance, or key. Only the ORIGINATOR authority
+# (the presented source credential) and the requested attenuation subset cross
+# the wire. The authority derives originator/session/scope/clearance from the
+# verified source credential and actor/cnf/tenant from the verified envelope,
+# computes the fail-closed meet, and mints a fresh delegated credential.
+struct ExchangeDelegated {
+  # The originator's already-issued source credential (at+jwt / wit+jwt) whose
+  # authority is being delegated. The authority verifies its signature, expiry,
+  # revocation, and issuer/tenant/subject coherence — it is never trusted as
+  # plaintext. `sub` becomes the delegated credential's originator.
+  sourceCredential @0 :Text;
+
+  # The derived-call OAuth scope subset (space-delimited). v16 §8.1 requires
+  # EXPLICIT attenuation at every hop: a scope-bearing source requires an
+  # explicit non-empty subset here (equality is allowed only when explicitly
+  # requested) — an empty/absent value against a scope-bearing source DENIES (no
+  # silent full inheritance). A source with no scope grants none: any requested
+  # scope denies. Every requested scope MUST be held by the source; broadening
+  # is rejected.
+  requestedScopes @1 :Text $optional;
+
+  # The derived-call MAC/UCAN capability subset (`ability@resource` tokens,
+  # space-delimited). v16 derived authority is BOTH OAuth scope AND capability;
+  # this attenuates the capability axis via the reviewed `Capability` cover
+  # relation. Same explicit-attenuation rule as requestedScopes: a cap-bearing
+  # source requires an explicit non-empty subset (equality allowed only if
+  # explicitly requested); empty/absent against a cap-bearing source DENIES; a
+  # source with no `cap` grants none. Any capability not covered by the source
+  # is rejected as broadening.
+  requestedCapabilities @4 :Text $optional;
+
+  # RFC 8707 resource indicator for the derived call's target. REQUIRED and
+  # non-empty: the authority binds it to the reviewed derived-call contract via
+  # the fail-closed DelegationEdgeAuthorizer, never an arbitrary string, and
+  # never defaulted to the issuer.
+  audience @2 :Text $optional;
+
+  # The generated method identifier of the derived call (e.g. "model.Infer").
+  # REQUIRED and non-empty: the authority passes it to the
+  # DelegationEdgeAuthorizer so the exact reviewed DispatchCallManifest method
+  # edge is enforced. It is a request descriptor of the outbound call, not an
+  # identity or clearance; an absent/empty value denies (no wildcard).
+  targetMethodId @5 :Text $optional;
+
+  # TTL override in seconds. Clamped to the configured [min, max] AND never
+  # beyond the source credential's own remaining lifetime, the terminal actor's
+  # authority, or a retained session bound.
+  ttl @3 :Opt.OptionUint32;
 }
 
 # Issuer-scoped credential identifier (iss, jti/cti). JWT jti text and CWT cti

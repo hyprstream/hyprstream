@@ -843,7 +843,7 @@ fn provision_service_identities(
             credentials_dir,
             service_name,
             ca_jwt_key,
-            &entry.ed25519,
+            entry,
             local_issuer_url,
             now,
             enrollment.clearance_for_service(service_name).as_ref(),

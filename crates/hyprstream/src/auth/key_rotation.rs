@@ -2583,6 +2583,37 @@ mod tests {
         }
     }
 
+    /// Fixed classical primary key + base64url for the multiprocess issuance
+    /// requests (they mint user at+jwt, which v16 binds to an authoritative
+    /// primary suite).
+    fn test_primary_key() -> [u8; 32] {
+        [0x66; 32]
+    }
+    fn test_user_pub_key_b64() -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        URL_SAFE_NO_PAD.encode(test_primary_key())
+    }
+    /// A permissive isolated primary resolver (any subject → the fixed classical
+    /// key) — the fixture equivalent of WS-C's enrollment store for these
+    /// multiprocess authority tests.
+    fn test_permissive_primary_resolver(
+    ) -> Arc<dyn crate::services::policy::PrimaryEnrollmentResolver> {
+        struct R;
+        impl crate::services::policy::PrimaryEnrollmentResolver for R {
+            fn primary_group(
+                &self,
+                _principal: &str,
+                _tenant: &str,
+            ) -> Option<crate::services::policy::PrimaryGroup> {
+                Some(crate::services::policy::PrimaryGroup {
+                    suite_id: hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519.to_owned(),
+                    ordered_component_keys: vec![test_primary_key().to_vec()],
+                })
+            }
+        }
+        Arc::new(R)
+    }
+
     #[test]
     fn composite_oauth_production_process() {
         let Some(dir) = authority_process_dir() else {
@@ -2757,7 +2788,16 @@ mod tests {
                         dir.join("authority-policy.sock"),
                     ),
                 )
-                .with_default_audience("multiprocess".to_owned());
+                .with_default_audience("multiprocess".to_owned())
+                // Production-equivalent key source: signing resolves the
+                // composite authority through the configured JwtKeySource (the
+                // `ClusterKeySource` ledger defaults to the process-global
+                // authority this subprocess configures).
+                .with_jwt_key_source(Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+                    SigningKey::from_bytes(&[0x73; 32]).verifying_key(),
+                    "multiprocess".to_owned(),
+                )))
+                .with_primary_enrollment_resolver(test_permissive_primary_resolver());
                 let shutdown = Arc::new(tokio::sync::Notify::new());
                 let shutdown_server = Arc::clone(&shutdown);
                 std::thread::spawn(move || {
@@ -2774,7 +2814,7 @@ mod tests {
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("multiprocess-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
@@ -2891,7 +2931,12 @@ mod tests {
                     git2db,
                     hyprstream_rpc::transport::TransportConfig::ipc(dir.join("stale-policy.sock")),
                 )
-                .with_default_audience("multiprocess".to_owned());
+                .with_default_audience("multiprocess".to_owned())
+                .with_jwt_key_source(Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+                    SigningKey::from_bytes(&[0x73; 32]).verifying_key(),
+                    "multiprocess".to_owned(),
+                )))
+                .with_primary_enrollment_resolver(test_permissive_primary_resolver());
                 let shutdown = Arc::new(tokio::sync::Notify::new());
                 let shutdown_server = Arc::clone(&shutdown);
                 std::thread::spawn(move || {
@@ -2905,7 +2950,7 @@ mod tests {
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("stale-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
@@ -3055,7 +3100,12 @@ mod tests {
                     git2db,
                     hyprstream_rpc::transport::TransportConfig::ipc(dir.join(socket)),
                 )
-                .with_default_audience("multiprocess".to_owned());
+                .with_default_audience("multiprocess".to_owned())
+                .with_jwt_key_source(Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+                    SigningKey::from_bytes(&[0x73; 32]).verifying_key(),
+                    "multiprocess".to_owned(),
+                )))
+                .with_primary_enrollment_resolver(test_permissive_primary_resolver());
                 let shutdown = Arc::new(tokio::sync::Notify::new());
                 let shutdown_server = Arc::clone(&shutdown);
                 std::thread::spawn(move || {
@@ -3069,7 +3119,7 @@ mod tests {
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("restart-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
@@ -3208,7 +3258,7 @@ mod tests {
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("pre-rotation-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
@@ -3442,7 +3492,7 @@ mod tests {
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("timeout-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,

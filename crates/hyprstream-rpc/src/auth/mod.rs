@@ -26,7 +26,9 @@ pub mod key_subject_resolver;
 /// Native MAC: security labels, lattice, subject contexts, genesis labeling
 /// (S1, #567). Platform-independent (no std-only deps) so it compiles for wasm.
 pub mod mac;
+pub mod det_cbor;
 pub mod scope;
+pub mod signer_suite;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod scope_registry;
 #[cfg(not(target_arch = "wasm32"))]
@@ -90,7 +92,12 @@ pub use mac::{
     Level, MAX_COMPARTMENTS, ObjectLabelResolver, ObjectRef, SecurityContext, SecurityLabel,
     StaticNodeLabel, SubjectContextClaims, VerifiedKeyMaterial, bind_time_label, import_label,
 };
+pub use det_cbor::{det_cbor, DetCborValue};
 pub use scope::Scope;
+pub use signer_suite::{
+    service_signer_suite_b64, signer_suite_thumbprint, SUITE_CLASSICAL_ED25519,
+    SUITE_HYBRID_ED25519_MLDSA65,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use scope_registry::ScopeDefinition;
 pub use ucan::{

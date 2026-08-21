@@ -53,20 +53,31 @@ pub struct CnfJwk {
     pub x: String,
 }
 
-/// RFC 8705 Proof-of-Possession `cnf` claim.
+/// RFC 8705 / RFC 8747 Proof-of-Possession `cnf` claim.
 ///
-/// Two key-binding modes:
-/// - `jwk`: Full OKP JWK object — used for WIMSE service WITs (`cnf.jwk`).
-/// - `jkt`: JWK Thumbprint (RFC 7638 SHA-256, base64url) — used for DPoP user
-///   tokens (`cnf.jkt`, per RFC 9449 § 6).
+/// Key-binding modes:
+/// - `jwk`: Full OKP JWK object — legacy single-Ed25519 binding (`cnf.jwk`).
+/// - `jkt`: JWK Thumbprint (RFC 7638 SHA-256, base64url) — DPoP user tokens
+///   (`cnf.jkt`, per RFC 9449 § 6).
+/// - `hs_signer_suite`: the v16 signer-suite content thumbprint (frozen WS-A
+///   credential-profile §1.1/§5) — base64url(SHA-256(det-CBOR `[suite_id,
+///   [ordered raw component public keys]]`)). This is the ONLY confirmation
+///   method that can bind a **hybrid** (multi-key) primary signer group, and it
+///   also covers a classical (single-key) group; a v16 dispatch credential MUST
+///   carry it. Computed via [`crate::auth::signer_suite_thumbprint`] — the one
+///   shared helper mint (WS-B) and verify (WS-C) both use. Legacy `jwk`/`jkt`
+///   are preserved ALONGSIDE it where those protocols still require them; adding
+///   `hs_signer_suite` never overwrites them.
 ///
-/// Both fields are optional so the struct serialises correctly for each mode.
+/// All fields are optional so the struct serialises correctly for each mode.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Cnf {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jwk: Option<CnfJwk>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jkt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_signer_suite: Option<String>,
 }
 
 /// RFC 8693 §4.1 actor claim — the two-principal carrier for delegated calls
@@ -325,6 +336,7 @@ impl FromCapnp for Claims {
                     x: x.to_owned(),
                 }),
                 jkt: None,
+                hs_signer_suite: None,
             });
 
         Ok(Self {
@@ -526,14 +538,26 @@ impl Claims {
     /// OKP JWK object with `kty: "OKP"`, `crv: "Ed25519"`, `x: <base64url>`.
     pub fn with_cnf_jwk(mut self, key_bytes: &[u8; 32]) -> Self {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        self.cnf = Some(Cnf {
-            jwk: Some(CnfJwk {
-                kty: "OKP".to_owned(),
-                crv: "Ed25519".to_owned(),
-                x: URL_SAFE_NO_PAD.encode(key_bytes),
-            }),
-            jkt: None,
+        // Merge, never replace: a previously-stamped `hs_signer_suite` (or
+        // `jkt`) survives adding the legacy `jwk` binding, and vice versa.
+        let mut cnf = self.cnf.take().unwrap_or_default();
+        cnf.jwk = Some(CnfJwk {
+            kty: "OKP".to_owned(),
+            crv: "Ed25519".to_owned(),
+            x: URL_SAFE_NO_PAD.encode(key_bytes),
         });
+        self.cnf = Some(cnf);
+        self
+    }
+
+    /// Set the v16 `cnf.hs_signer_suite` confirmation (frozen WS-A profile
+    /// §1.1/§5): the base64url signer-suite content thumbprint. Merged into any
+    /// existing `cnf` so a legacy `jwk`/`jkt` binding is preserved alongside it.
+    /// Compute `thumbprint_b64url` from [`crate::auth::signer_suite_thumbprint`].
+    pub fn with_cnf_hs_signer_suite(mut self, thumbprint_b64url: String) -> Self {
+        let mut cnf = self.cnf.take().unwrap_or_default();
+        cnf.hs_signer_suite = Some(thumbprint_b64url);
+        self.cnf = Some(cnf);
         self
     }
 
@@ -543,10 +567,18 @@ impl Claims {
     /// computed per RFC 7638: SHA-256 of the lexicographic canonical JWK JSON,
     /// base64url-encoded.
     pub fn with_cnf_jkt(mut self, key_bytes: &[u8; 32]) -> Self {
-        self.cnf = Some(Cnf {
-            jwk: None,
-            jkt: Some(compute_jkt(key_bytes)),
-        });
+        let mut cnf = self.cnf.take().unwrap_or_default();
+        cnf.jkt = Some(compute_jkt(key_bytes));
+        self.cnf = Some(cnf);
+        self
+    }
+
+    /// Set the RFC 9449 `cnf.jkt` from a PRE-COMPUTED thumbprint string (e.g. a
+    /// verified DPoP proof's `jkt`). Merged into any existing `cnf`.
+    pub fn with_cnf_jkt_thumbprint(mut self, jkt: String) -> Self {
+        let mut cnf = self.cnf.take().unwrap_or_default();
+        cnf.jkt = Some(jkt);
+        self.cnf = Some(cnf);
         self
     }
 

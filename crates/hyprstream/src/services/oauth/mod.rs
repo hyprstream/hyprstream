@@ -1484,6 +1484,38 @@ mod tests {
             TransportConfig::inproc(&policy_tag),
         )
         .with_default_audience(GENERIC_ISSUER.to_owned())
+        // Production-equivalent key source: token signing resolves the composite
+        // authority through the configured JwtKeySource (a `ClusterKeySource`
+        // defaults its ledger to the process-global authority configured above).
+        .with_jwt_key_source(Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+            service_key.verifying_key(),
+            GENERIC_ISSUER.to_owned(),
+        )))
+        // v16: a dispatch-capable user `at+jwt` (cnf.jwk) binds its authoritative
+        // Primary suite. Production installs WS-C's enrollment resolver; this
+        // fixture stands in for it, resolving `alice` to the exact verified
+        // OAuth challenge key (`user_key`, [0x63; 32]) the flows bind as `cnf`.
+        .with_primary_enrollment_resolver({
+            struct AliceResolver;
+            impl crate::services::policy::PrimaryEnrollmentResolver for AliceResolver {
+                fn primary_group(
+                    &self,
+                    principal: &str,
+                    _tenant: &str,
+                ) -> Option<crate::services::policy::PrimaryGroup> {
+                    (principal == "alice").then(|| crate::services::policy::PrimaryGroup {
+                        suite_id: hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519.to_owned(),
+                        ordered_component_keys: vec![
+                            ed25519_dalek::SigningKey::from_bytes(&[0x63; 32])
+                                .verifying_key()
+                                .to_bytes()
+                                .to_vec(),
+                        ],
+                    })
+                }
+            }
+            Arc::new(AliceResolver)
+        })
         .with_token_clearance_resolver(Arc::new(|subject| {
             use hyprstream_rpc::auth::mac::{
                 Assurance, CompartmentSet, Level, SecurityLabel,
