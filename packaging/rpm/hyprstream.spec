@@ -7,7 +7,7 @@
 # Notes:
 #   * Uses the existing Cargo build system (build.rs handles codegen).
 #   * libtorch is fetched at build time via the `download-libtorch` feature
-#     (PyTorch 2.10.0 CPU). The hyprstream binary links it as a hard DT_NEEDED
+#     (PyTorch 2.11.0 CPU). The hyprstream binary links it as a hard DT_NEEDED
 #     dependency (libtorch_cpu.so, libc10.so), so the .so files are bundled into
 #     a private libdir and the binary's RUNPATH is set to find them. Without this
 #     the binary cannot even exec.
@@ -135,7 +135,7 @@ export OPENSSL_DIR=%{_prefix}
 export OPENSSL_LIB_DIR=%{_libdir}
 export OPENSSL_INCLUDE_DIR=%{_includedir}
 
-# CPU build. libtorch (PyTorch 2.10.0 CPU) is fetched at build time via the
+# CPU build. libtorch (PyTorch 2.11.0 CPU) is fetched at build time via the
 # download-libtorch feature and extracted under target/.../torch-sys-*/out.
 # bindgen (aws-lc-sys) needs libclang; set explicitly so the in-rpmbuild
 # compile finds it even if the environment is scrubbed.

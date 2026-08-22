@@ -167,7 +167,7 @@ enum ScaledMmRecipe {
     /// v2: 1x128 activation × 128x128 weight blocks (Hopper SM90 only).
     BlockwiseV2,
     /// v1: per-token × per-output-channel scales (SM89+; SM120 needs
-    /// torch ≥ 2.11 — the 2.10 gate routes SM120 rowwise to cuBLASLt,
+    /// torch ≥ 2.11 — the earlier gate routes SM120 rowwise to cuBLASLt,
     /// which rejects it, so this latches off there until #1524).
     RowwiseV1,
 }
@@ -225,7 +225,7 @@ fn pack_scale_b_v2(scale: &Tensor) -> Tensor {
 impl LinearProjection {
     /// FP8 GEMM via torch `_scaled_mm`. Returns `None` when this projection
     /// can't use any FP8 path: weight not e4m3, no block scale, not on CUDA
-    /// (torch 2.10 has no CPU kernel — the CPU `_scaled_mm` v1 kernel is
+    /// (the CPU `_scaled_mm` v1 kernel has no rowwise kernel — it is
     /// per-tensor-scale only, which cannot express the checkpoint's scales),
     /// K not a multiple of 128, or every recipe latched off on the weight's
     /// device (see [`SCALED_MM_FAILED`]).
@@ -236,7 +236,7 @@ impl LinearProjection {
     /// forward moves activations to the layer's device), which is correct
     /// under a multi-GPU `LayerDeviceMap`.
     ///
-    /// Recipe selection (verified against release/2.10 + release/2.11
+    /// Recipe selection (verified against the current 2.11 release
     /// ScaledBlas.cpp / RowwiseScaledMM.cu):
     ///
     ///  1. v2 blockwise: 1x128 activation × 128x128 weight blocks — Hopper
@@ -244,13 +244,13 @@ impl LinearProjection {
     ///     hard-errors elsewhere, incl. SM120).
     ///  2. v1 rowwise: per-token × per-output-channel scales — SM89+ via the
     ///     CUTLASS `f8f8bf16_rowwise` kernel, EXCEPT on SM120 under shipped
-    ///     torch 2.10: `_scaled_rowwise_rowwise`'s CUTLASS gate is
+    ///     Before torch 2.11, `_scaled_rowwise_rowwise`'s CUTLASS gate was
     ///     `dprops->major == 10` (exactly SM100), so SM120 (major 12) with
     ///     cuBLAS ≥ 12.9 is routed to cuBLASLt rowwise instead — which has no
     ///     FP8 rowwise kernel for SM120 and fails with
     ///     `CUBLAS_STATUS_NOT_SUPPORTED` out of `cublasLtMatmulAlgoGetHeuristic`
     ///     even with the required TN layout (column-major B). The arm therefore
-    ///     latches off on SM120 under 2.10 and lazy dequant serves; release/2.11
+    ///     latches off on SM120 and lazy dequant serves; release/2.11
     ///     widens the gate to `major >= 10`, so the SM120 CUTLASS kernel lights
     ///     up with the libtorch upgrade tracked in #1524 — no code change
     ///     needed here. Uses the load-time requantized `rowwise` weight pair.
@@ -331,7 +331,7 @@ impl LinearProjection {
 
     /// v1 rowwise arm (per-token activation scale × per-output-channel weight
     /// scale) — SM89+ via the CUTLASS `f8f8bf16_rowwise` kernel. On SM120 this
-    /// requires torch ≥ 2.11: release/2.10's `_scaled_rowwise_rowwise` gate
+    /// requires torch ≥ 2.11: the prior `_scaled_rowwise_rowwise` gate
     /// (`dprops->major == 10`, ScaledBlas.cpp) sends SM120 to the cuBLASLt
     /// rowwise path, which rejects the problem
     /// (`CUBLAS_STATUS_NOT_SUPPORTED` from `cublasLtMatmulAlgoGetHeuristic`)
@@ -341,7 +341,7 @@ impl LinearProjection {
     /// it wasn't built (flag off at load) or the recipe is latched off on
     /// this device.
     ///
-    /// Layout (RowwiseScaledMM.cu `check_inputs`, identical in 2.10/2.11): A
+    /// Layout (RowwiseScaledMM.cu `check_inputs`): A
     /// `[M, K]` row-major, `scale_a` `[M, 1]` f32 contiguous, `scale_b`
     /// `[1, N]` f32 contiguous, and `mat2` `[K, N]` COLUMN-major
     /// (stride(0) == 1) — the requantized weight is stored row-major
@@ -4104,6 +4104,7 @@ mod pipeline_tests {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout, clippy::print_stderr)]
 mod fp8_gemm_tests {
     use super::*;
+    use std::process::Command;
     use tch::Kind;
 
     const FP8: Kind = Kind::Float8e4m3fn;
@@ -4134,6 +4135,49 @@ mod fp8_gemm_tests {
         num / den
     }
 
+    fn mean_cuda_us(iterations: u32, mut op: impl FnMut()) -> f64 {
+        tch::Cuda::synchronize(0);
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            op();
+            tch::Cuda::synchronize(0);
+        }
+        started.elapsed().as_micros() as f64 / f64::from(iterations)
+    }
+
+    /// Compute capability of a CUDA-visible logical device. `tch` does not
+    /// expose this CUDA-runtime query; `nvidia-smi` is available anywhere the
+    /// CUDA test can use an NVIDIA device. Respect a numeric
+    /// `CUDA_VISIBLE_DEVICES` mapping so CUDA device 0 is queried correctly.
+    fn cuda_compute_capability(device: usize) -> (u32, u32) {
+        let gpu = std::env::var("CUDA_VISIBLE_DEVICES")
+            .ok()
+            .and_then(|visible| visible.split(',').nth(device).map(str::trim).map(str::to_owned))
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| device.to_string());
+        let output = Command::new("nvidia-smi")
+            .arg(format!("--id={gpu}"))
+            .arg("--query-gpu=compute_cap")
+            .arg("--format=csv,noheader,nounits")
+            .output()
+            .expect("nvidia-smi must be available to gate CUDA FP8 kernel expectations");
+        assert!(
+            output.status.success(),
+            "nvidia-smi compute-cap query failed for CUDA device {device}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let capability = String::from_utf8(output.stdout)
+            .expect("nvidia-smi compute capability output must be UTF-8");
+        let capability = capability.trim();
+        let (major, minor) = capability
+            .split_once('.')
+            .expect("nvidia-smi must return compute capability as major.minor");
+        (
+            major.parse().expect("CUDA compute capability major must be numeric"),
+            minor.parse().expect("CUDA compute capability minor must be numeric"),
+        )
+    }
+
     /// Deterministic pseudo-random in [-1, 1]: frac(sin(i·12.9898)·43758.5453),
     /// computed in f64 for argument precision. RNG-free like `det()`, but
     /// without `sin(flat_index)`'s catastrophic dot-product cancellation
@@ -4145,7 +4189,7 @@ mod fp8_gemm_tests {
         ((&h - h.floor()) * 2.0 - 1.0).to_kind(Kind::Float).reshape(dims)
     }
 
-    /// Asserted CPU capability contract for torch 2.10 `_scaled_mm` with e4m3
+    /// Asserted CPU capability contract for the shipped libtorch `_scaled_mm` with e4m3
     /// (measured by this spike; update if a future libtorch widens it):
     ///  - v1 CPU: per-TENSOR scales only ("_scaled_mm only supports per-tensor
     ///    scaling for CPU backend", ATen/native/Blas.cpp). Row/col/blockwise
@@ -4163,7 +4207,7 @@ mod fp8_gemm_tests {
         // v1 tensorwise: works, BF16 out.
         let out = a
             .f_internal_scaled_mm(&b, &one, &one, None::<&Tensor>, None::<&Tensor>, Kind::BFloat16, false)
-            .expect("v1 tensorwise e4m3 must work on CPU (torch 2.10)");
+            .expect("v1 tensorwise e4m3 must work on CPU");
         assert_eq!(out.size(), [m, n]);
         assert_eq!(out.kind(), Kind::BFloat16);
         // Sanity: scale == 1 so out == dequant(a) @ dequant(b) in bf16 tolerance.
@@ -4370,19 +4414,17 @@ mod fp8_gemm_tests {
         assert!(latch.is_failed(1, BlockwiseV2));
     }
 
-    /// Sticky-latch / warn-once contract for a FAILING recipe — the SM120 +
-    /// torch 2.10 case, where every rowwise call errors with
-    /// `CUBLAS_STATUS_NOT_SUPPORTED` (2.10 gates the CUTLASS rowwise kernel to
-    /// `major == 10`, so SM120 goes to cuBLASLt, which rejects it; #1524).
+    /// Sticky-latch / warn-once contract for a FAILING recipe. On the SM120
+    /// validation host this is the blockwise v2 arm: it is Hopper-only, so it
+    /// must latch before the rowwise arm is attempted.
     /// Drives a `DeviceLatch` through exactly the guard sequence the
     /// `try_blockwise_v2`/`try_rowwise_v1` arms use — `is_failed` check before
     /// touching the kernel, `mark_failed` on error with the warning emitted
     /// only on first failure — with a stub kernel that always errors. Asserts
     /// the kernel is attempted exactly once, the warning decision fires
     /// exactly once, and every later call short-circuits to the lazy fallback
-    /// without re-attempting or re-warning. CPU-testable: the hardware tester
-    /// couldn't reach this assertion on the 5090 because no recipe ever ran,
-    /// but the latch state machine itself needs no GPU.
+    /// without re-attempting or re-warning. CPU-testable, while the real CUDA
+    /// test below proves the blockwise-to-rowwise fallback on SM120.
     #[test]
     fn failing_recipe_latches_off_without_warning_spam() {
         let latch = DeviceLatch::default();
@@ -4392,13 +4434,13 @@ mod fp8_gemm_tests {
         // (here always-failing) kernel errors; the caller then falls back to
         // lazy dequant.
         let arm = |latch: &DeviceLatch| -> Option<()> {
-            if latch.is_failed(0, ScaledMmRecipe::RowwiseV1) {
+            if latch.is_failed(0, ScaledMmRecipe::BlockwiseV2) {
                 return None; // latched: straight to lazy, no kernel, no warning
             }
             attempts.set(attempts.get() + 1);
-            let res: Result<(), &str> = Err("CUBLAS_STATUS_NOT_SUPPORTED");
+            let res: Result<(), &str> = Err("SM120 does not support blockwise v2");
             res.inspect_err(|_| {
-                if latch.mark_failed(0, ScaledMmRecipe::RowwiseV1) {
+                if latch.mark_failed(0, ScaledMmRecipe::BlockwiseV2) {
                     warnings.set(warnings.get() + 1); // the tracing::warn! site
                 }
             })
@@ -4409,9 +4451,9 @@ mod fp8_gemm_tests {
         }
         assert_eq!(attempts.get(), 1, "kernel must only be attempted before the latch trips");
         assert_eq!(warnings.get(), 1, "warn-once per (device, recipe)");
-        assert!(latch.is_failed(0, ScaledMmRecipe::RowwiseV1));
+        assert!(latch.is_failed(0, ScaledMmRecipe::BlockwiseV2));
         // The other recipe on the same device is unaffected.
-        assert!(!latch.is_failed(0, ScaledMmRecipe::BlockwiseV2));
+        assert!(!latch.is_failed(0, ScaledMmRecipe::RowwiseV1));
     }
 
     /// On CPU the gated path must decline (no CUDA) and `apply` must fall back
@@ -4428,27 +4470,12 @@ mod fp8_gemm_tests {
         assert_eq!(out.size(), [3, 256]);
     }
 
-    /// Real-kernel test on CUDA: when a recipe runs it must match the
-    /// lazy-dequant baseline. Not ignored — self-skips without CUDA. Hopper
-    /// (SM90, cuBLASLt ≥ 12.9) exercises the v2 blockwise arm (tight 0.10
-    /// bound, matching the blockwise CPU envelope); SM89/SM100 and — after the
-    /// libtorch 2.11 upgrade tracked in #1524 — SM120/Blackwell exercise the
-    /// v1 rowwise arm with per-column weight scales (looser 0.30 bound,
-    /// matching the rowwise CPU envelope — coarser scales by design). K=256 →
-    /// K/128=2 blocks, so the L4=4 zero-padding in `pack_scale_b_v2` is
-    /// exercised.
-    ///
-    /// SM120 under shipped torch 2.10 is the expected-failure case:
-    /// release/2.10 `_scaled_rowwise_rowwise` gates the CUTLASS path on
-    /// `dprops->major == 10` (ScaledBlas.cpp), so SM120 (major 12) rowwise is
-    /// routed to cuBLASLt, which has no FP8 rowwise kernel for SM120 and fails
-    /// with `CUBLAS_STATUS_NOT_SUPPORTED` from `cublasLtMatmulAlgoGetHeuristic`
-    /// regardless of layout (the TN layout below is the only one its
-    /// TORCH_CHECK admits). There both recipes must latch off — proving the
-    /// arms were attempted and failed rather than silently skipped — and lazy
-    /// dequant must keep serving. release/2.11 widens the gate to
-    /// `major >= 10`, so this branch becomes unreachable once #1524 lands and
-    /// the rowwise numerics assert below lights up instead.
+    /// Real-kernel test on CUDA: rowwise must match the lazy-dequant baseline.
+    /// Not ignored — self-skips without CUDA. On SM120, blockwise v2 is
+    /// expected to reject and latch exactly once; libtorch 2.11's widened
+    /// CUTLASS gate must then execute rowwise rather than latching it to lazy
+    /// fallback. K=256 → K/128=2 blocks, so the L4=4 zero-padding in
+    /// `pack_scale_b_v2` is exercised.
     #[test]
     fn fp8_scaled_mm_kernel_cuda() {
         if !tch::Cuda::is_available() {
@@ -4471,37 +4498,89 @@ mod fp8_gemm_tests {
         let x = det_rand(&[m, k], 5).to_kind(Kind::BFloat16).to_device(dev);
 
         let out_lazy = proj.apply(&x); // flag off in tests → lazy dequant
-        if let Some(out) = proj.try_blockwise_v2(0, &x, m, k) {
-            let rel = rel_frob_err(&out, &out_lazy);
-            println!("blockwise v2 (Hopper) vs lazy-dequant frob rel err: {rel:.4}");
-            assert!(rel < 0.10, "blockwise v2 diverged: {rel}");
-        } else if let Some(out) = proj.try_rowwise_v1(0, &x, m, k) {
-            let rel = rel_frob_err(&out, &out_lazy);
-            println!("rowwise v1 (SM120-capable) vs lazy-dequant frob rel err: {rel:.4}");
-            assert!(rel < 0.30, "rowwise v1 diverged: {rel}");
-        } else {
-            // SM120 + torch 2.10 (see doc comment): both recipes attempted,
-            // failed, and latched off. A failure to latch would mean an arm
-            // silently skipped its kernel instead of erroring — a regression.
-            assert!(
-                scaled_mm_latch().is_failed(0, ScaledMmRecipe::BlockwiseV2),
-                "blockwise v2 neither ran nor latched off on this CUDA device"
+        let (cc_major, cc_minor) = cuda_compute_capability(0);
+        println!("CUDA device 0 compute capability: {cc_major}.{cc_minor}");
+
+        if cc_major == 9 {
+            // Hopper's supported path is blockwise v2. Its success must not
+            // be mistaken for the Blackwell fallback/latch contract below.
+            let out = proj.try_blockwise_v2(0, &x, m, k).expect(
+                "SM90/Hopper must execute the blockwise v2 FP8 kernel",
             );
             assert!(
-                scaled_mm_latch().is_failed(0, ScaledMmRecipe::RowwiseV1),
-                "rowwise v1 neither ran nor latched off on this CUDA device \
-                 (unexpected on SM120 + torch 2.10; on torch >= 2.11 the \
-                 rowwise arm above must run — issue #1524)"
+                !scaled_mm_latch().is_failed(0, ScaledMmRecipe::BlockwiseV2),
+                "blockwise v2 latched despite a successful SM90 kernel call"
             );
-            // Sticky latch: repeat calls decline both arms without retrying,
-            // and lazy dequant still serves.
-            assert!(proj.try_blockwise_v2(0, &x, m, k).is_none());
-            assert!(proj.try_rowwise_v1(0, &x, m, k).is_none());
-            assert!(proj.apply_fp8_scaled_mm(&x).is_none());
-            let out = proj.apply(&x);
-            assert_eq!(out.size(), [m, n]);
-            assert!(out.allclose(&out_lazy, 0.0, 0.0, false), "lazy fallback diverged");
+            let rel = rel_frob_err(&out, &out_lazy);
+            println!("blockwise v2 (SM90) vs lazy-dequant frob rel err: {rel:.4}");
+            assert!(rel < 0.30, "blockwise v2 diverged on SM90: {rel}");
+            return;
         }
+        if cc_major < 10 {
+            // SM89 and older have a different PyTorch FP8 support matrix. The
+            // exact SM90 and SM100+ contracts are tested above/below; do not
+            // impose either one on another CUDA architecture.
+            eprintln!(
+                "skipping architecture-specific FP8 recipe assertion on SM{cc_major}{cc_minor}"
+            );
+            return;
+        }
+
+        // SM100+ uses the widened 2.11 CUTLASS rowwise gate. Blockwise v2 is
+        // Hopper-only, so its first failure is expected to latch while the
+        // rowwise kernel must remain live.
+        assert!(
+            proj.try_blockwise_v2(0, &x, m, k).is_none(),
+            "blockwise v2 must reject on SM100+ before rowwise runs"
+        );
+        assert!(
+            scaled_mm_latch().is_failed(0, ScaledMmRecipe::BlockwiseV2),
+            "blockwise v2 neither ran nor latched off on this CUDA device"
+        );
+        // A second call must short-circuit: the kernel and warning are not retried.
+        assert!(proj.try_blockwise_v2(0, &x, m, k).is_none());
+
+        let out = proj.try_rowwise_v1(0, &x, m, k).expect(
+            "libtorch 2.11 must execute the SM100+ rowwise kernel instead of latching to lazy fallback",
+        );
+        assert!(
+            !scaled_mm_latch().is_failed(0, ScaledMmRecipe::RowwiseV1),
+            "rowwise v1 latched despite a successful SM100+ kernel call"
+        );
+        let rel = rel_frob_err(&out, &out_lazy);
+        println!("rowwise v1 (SM{cc_major}{cc_minor}) vs lazy-dequant frob rel err: {rel:.4}");
+        assert!(rel < 0.30, "rowwise v1 diverged: {rel}");
+
+        // Benchmark a realistic projection after the correctness check. `apply`
+        // is deliberately lazy here because HYPRSTREAM_FP8_GEMM is off by default.
+        let (bench_m, bench_k, bench_n) = (1, 5120, 5120);
+        let bench_w = det_rand(&[bench_k, bench_n], 14) * 0.05;
+        let bench_w4 = bench_w.view([bench_k / 128, 128, bench_n / 128, 128]);
+        let bench_scale = bench_w4.abs().amax(-1, false).amax(1, false).clamp_min(1e-12) / 448.0;
+        let bench_wq = (bench_w4 / bench_scale.view([bench_k / 128, 1, bench_n / 128, 1]))
+            .clamp(-448.0, 448.0)
+            .to_kind(FP8)
+            .view([bench_k, bench_n]);
+        let mut bench_proj = LinearProjection::with_scale(bench_wq, bench_scale);
+        bench_proj.rowwise = Some(Box::new(build_rowwise_requant(&bench_proj.weight, bench_proj.scale.as_ref().unwrap())));
+        let bench_proj = bench_proj.into_device(dev);
+        let bench_x = det_rand(&[bench_m, bench_k], 15).to_kind(Kind::BFloat16).to_device(dev);
+        let iters = 20;
+        let lazy_us = mean_cuda_us(iters, || {
+            let _ = std::hint::black_box(bench_proj.apply(&bench_x));
+        });
+        let rowwise_us = mean_cuda_us(iters, || {
+            let _ = std::hint::black_box(
+                bench_proj.try_rowwise_v1(0, &bench_x, bench_m, bench_k).expect("rowwise benchmark kernel must run"),
+            );
+        });
+        println!(
+            "SM120 FP8 projection [{bench_m},{bench_k}]x[{bench_k},{bench_n}]: \
+             lazy_dequant={lazy_us:.0}us ({:.2} iter/s), rowwise={rowwise_us:.0}us ({:.2} iter/s), ratio={:.3}x",
+            1_000_000.0 / lazy_us,
+            1_000_000.0 / rowwise_us,
+            lazy_us / rowwise_us,
+        );
     }
 
     /// Microbenchmark: lazy-dequant matmul vs the scaled_mm path composition

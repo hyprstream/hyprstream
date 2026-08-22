@@ -2156,8 +2156,8 @@ pub struct RuntimeConfig {
     ///
     /// When enabled, `LinearProjection::apply` computes FP8-weight matmuls
     /// with `at::_scaled_mm` instead of the lazy BF16 dequant-then-matmul,
-    /// picking the first recipe the device supports (torch 2.10, verified
-    /// against release/2.10 ScaledBlas.cpp / RowwiseScaledMM.cu):
+    /// picking the first recipe the device supports (torch 2.11, verified
+    /// against release/2.11 ScaledBlas.cpp / RowwiseScaledMM.cu):
     ///
     ///  1. v2 blockwise (1x128 activation × 128x128 weight blocks, the
     ///     checkpoint's native scales): **NVIDIA Hopper (SM90) + cuBLASLt ≥
@@ -2204,7 +2204,7 @@ fn default_continuous_batch_max() -> usize {
 /// Default for [`RuntimeConfig::fp8_gemm`]: off unless `HYPRSTREAM_FP8_GEMM`
 /// is set truthy. Off is the safe default — the lazy BF16 dequant matmul is
 /// the verified reference, and the `_scaled_mm_v2` blockwise path requires
-/// NVIDIA Hopper (SM90) + cuBLASLt ≥ 12.9 (no CPU/ROCm kernel in torch 2.10).
+/// NVIDIA Hopper (SM90) + cuBLASLt ≥ 12.9 (no CPU/ROCm kernel in torch 2.11).
 pub(crate) fn default_fp8_gemm() -> bool {
     std::env::var("HYPRSTREAM_FP8_GEMM")
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
