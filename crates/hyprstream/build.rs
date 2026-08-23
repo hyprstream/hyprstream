@@ -6,7 +6,11 @@ use std::env;
 use std::path::Path;
 use std::process::Command;
 
+#[path = "src/build_info.rs"]
+mod build_info;
+
 fn main() {
+    println!("cargo:rerun-if-env-changed=HYPRSTREAM_SOURCE_COMMIT");
     if std::env::var("DOCS_RS").is_ok() {
         return;
     }
@@ -111,8 +115,7 @@ fn compile_capnp_schemas() {
 /// - GIT_BRANCH: sanitized branch name (e.g., "main", "feature-auth")
 /// - GIT_DIRTY: "true" or "false"
 fn capture_git_info() {
-    // Get commit SHA (short)
-    let sha = Command::new("git")
+    let git_sha = Command::new("git")
         .args(["rev-parse", "--short=7", "HEAD"])
         .output()
         .ok()
@@ -121,17 +124,17 @@ fn capture_git_info() {
         .unwrap_or_default();
 
     // Get branch name
-    let branch = Command::new("git")
+    let git_branch = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .map(|b| if b == "HEAD" { String::new() } else { b }) // Detached HEAD
+        .map(|b| if b == "HEAD" { String::new() } else { b })
         .unwrap_or_default();
 
     // Check if worktree is dirty
-    let dirty = Command::new("git")
+    let git_dirty = Command::new("git")
         .args(["status", "--porcelain"])
         .output()
         .ok()
@@ -139,31 +142,30 @@ fn capture_git_info() {
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false);
 
+    let fallback = build_info::GitInfo {
+        sha: git_sha,
+        branch: git_branch,
+        dirty: git_dirty,
+    };
+    let source_commit = env::var_os("HYPRSTREAM_SOURCE_COMMIT").map(|value| {
+        value
+            .into_string()
+            .unwrap_or_else(|_| panic!("HYPRSTREAM_SOURCE_COMMIT must be valid UTF-8"))
+    });
+    let info = build_info::resolve(source_commit.as_deref(), fallback)
+        .unwrap_or_else(|error| panic!("invalid HYPRSTREAM_SOURCE_COMMIT: {error}"));
+
     // Sanitize branch name for filesystem safety
-    let sanitized_branch = sanitize_git_ref(&branch);
+    let sanitized_branch = sanitize_git_ref(&info.branch);
 
     // Export individual components as environment variables
-    println!("cargo:rustc-env=GIT_SHA={}", sha);
+    println!("cargo:rustc-env=GIT_SHA={}", info.sha);
     println!("cargo:rustc-env=GIT_BRANCH={}", sanitized_branch);
-    println!("cargo:rustc-env=GIT_DIRTY={}", dirty);
+    println!("cargo:rustc-env=GIT_DIRTY={}", info.dirty);
 
     // Build complete version string
     let cargo_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_owned());
-    let build_version = if sha.is_empty() {
-        cargo_version
-    } else {
-        let mut v = format!("{}+", cargo_version);
-        if !sanitized_branch.is_empty() {
-            v.push_str(&sanitized_branch);
-            v.push('.');
-        }
-        v.push('g');
-        v.push_str(&sha);
-        if dirty {
-            v.push_str(".dirty");
-        }
-        v
-    };
+    let build_version = build_info::build_version(&cargo_version, &info, &sanitized_branch);
     println!("cargo:rustc-env=BUILD_VERSION={}", build_version);
 }
 
