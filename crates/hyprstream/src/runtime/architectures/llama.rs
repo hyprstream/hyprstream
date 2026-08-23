@@ -83,6 +83,13 @@ fn fp8_gemm_enabled() -> bool {
     *ENABLED.get_or_init(crate::config::default_fp8_gemm)
 }
 
+/// Test-only path witness. The causal gate probes run in fresh subprocesses so
+/// the process-cached env gate cannot leak between scenarios. `1` means
+/// `apply()` returned a scaled-mm result; `2` means it took lazy dequant.
+#[cfg(test)]
+static FP8_APPLY_PATH: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 /// Quantize activations to FP8 e4m3 with per-token 1x128 block scales.
 ///
 /// Input: `[M, K]` float tensor (any float kind; K must be a multiple of 128).
@@ -443,8 +450,12 @@ impl LinearProjection {
             None
         };
         if let Some(out) = fp8_out {
+            #[cfg(test)]
+            FP8_APPLY_PATH.store(1, std::sync::atomic::Ordering::SeqCst);
             return out;
         }
+        #[cfg(test)]
+        FP8_APPLY_PATH.store(2, std::sync::atomic::Ordering::SeqCst);
         let w = match self.weight.kind() {
             tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2 => {
                 // Cast FP8 → BF16 on GPU (ROCm 7.1+ dispatches on-device, no CPU fallback).
@@ -4363,52 +4374,65 @@ mod fp8_gemm_tests {
 
     /// Error envelope for the v1 rowwise arm (per-token activation scale ×
     /// per-output-channel weight scale — the SM120/Blackwell path), simulating
-    /// exactly the math the rowwise kernel computes: quantize activations
-    /// rowwise, requantize the block-quantized weight per column, dequantize
-    /// both, matmul. Compared vs (a) the lazy-dequant BF16 baseline and (b) a
-    /// full-precision reference. The measured bound justifies the tolerance in
-    /// `fp8_scaled_mm_kernel_cuda` for the rowwise arm.
+    /// exactly the math the rowwise kernel computes. Multiple deterministic
+    /// seeds and within-column dynamic ranges exercise both ordinary and
+    /// difficult-but-valid FP8 inputs. The tight 0.12 bound is deliberately
+    /// sensitive: it leaves architecture/rounding margin while rejecting a
+    /// several-fold regression from the observed 0.0251 real-SM120 and
+    /// 0.0253–0.0363 simulation errors. The per-case and worst-case assertions
+    /// are the negative-control evidence: broken scale orientation or a lost
+    /// requantization path must exceed this envelope rather than being hidden
+    /// by the former 0.30 bound.
     #[test]
     fn fp8_rowwise_requant_error_envelope() {
         let (m, k, n) = (8, 256, 256);
-        let w = det_rand(&[k, n], 4) * 0.05; // weight-scale values
-        let x = det_rand(&[m, k], 5);
+        let mut worst_lazy = 0.0f64;
+        let mut worst_ref = 0.0f64;
+        for &(seed, spread) in &[(4i64, 1.0f64), (17, 8.0), (101, 64.0)] {
+            // The second half of K has a smaller magnitude within each output
+            // channel. This is a representative dynamic range for the
+            // rowwise requantization's coarser per-column scale.
+            let row_factors = Tensor::ones([k, 1], OPT);
+            let small = Tensor::full([k / 2, 1], 1.0 / spread, OPT);
+            row_factors.narrow(0, k / 2, k / 2).copy_(&small);
+            let w = det_rand(&[k, n], seed) * 0.05 * row_factors;
+            let x = det_rand(&[m, k], seed + 1);
 
-        // Quantize weight per 128x128 block (what the checkpoint stores).
-        let w4 = w.view([k / 128, 128, n / 128, 128]);
-        let ws = w4.abs().amax(-1, false).amax(1, false).clamp_min(1e-12) / 448.0; // [k/128, n/128]
-        let wq = (w4 / ws.view([k / 128, 1, n / 128, 1])).clamp(-448.0, 448.0).to_kind(FP8);
-        let w_deq_block = (wq.to_kind(Kind::Float) * ws.view([k / 128, 1, n / 128, 1])).view([k, n]);
+            // Quantize weight per 128x128 block (what the checkpoint stores).
+            let w4 = w.view([k / 128, 128, n / 128, 128]);
+            let ws = w4.abs().amax(-1, false).amax(1, false).clamp_min(1e-12) / 448.0;
+            let wq = (w4 / ws.view([k / 128, 1, n / 128, 1]))
+                .clamp(-448.0, 448.0).to_kind(FP8);
+            let w_deq_block = (wq.to_kind(Kind::Float)
+                * ws.view([k / 128, 1, n / 128, 1])).view([k, n]);
 
-        // Load-time rowwise requant from the FP8 checkpoint tensors.
-        let (w_rq, s_b) = build_rowwise_requant(&wq.view([k, n]), &ws);
-        assert_eq!(s_b.size(), [1, n]);
+            // Load-time rowwise requant from the FP8 checkpoint tensors.
+            let (w_rq, s_b) = build_rowwise_requant(&wq.view([k, n]), &ws);
+            assert_eq!(s_b.size(), [1, n]);
 
-        // Simulated v1 rowwise scaled_mm.
-        let (q, s_a) = quantize_activations_rowwise(&x);
-        assert_eq!(s_a.size(), [m, 1]);
-        let x_deq = q.to_kind(Kind::Float) * s_a;
-        let w_deq = w_rq.to_kind(Kind::Float) * s_b; // [K, N] * [1, N] broadcast
-        let out_sim = x_deq.matmul(&w_deq);
+            // Simulated v1 rowwise scaled_mm.
+            let (q, s_a) = quantize_activations_rowwise(&x);
+            assert_eq!(s_a.size(), [m, 1]);
+            let x_deq = q.to_kind(Kind::Float) * s_a;
+            let w_deq = w_rq.to_kind(Kind::Float) * s_b;
+            let out_sim = x_deq.matmul(&w_deq);
 
-        // (a) vs lazy-dequant baseline (block scales, BF16 matmul).
-        let out_lazy = x.to_kind(Kind::BFloat16).matmul(&w_deq_block.to_kind(Kind::BFloat16)).to_kind(Kind::Float);
-        let rel_vs_lazy = rel_frob_err(&out_sim, &out_lazy);
-        // (b) vs full-precision reference.
-        let out_ref = x.matmul(&w);
-        let rel_vs_ref = rel_frob_err(&out_sim, &out_ref);
-        // Rowwise is coarser than 128x128 blocks (one scale per output channel
-        // over all K) — measured envelope printed; assert generous-but-real
-        // bounds (see spike report for observed values).
-        assert!(rel_vs_ref < 0.30, "rowwise sim vs full-precision rel err {rel_vs_ref}");
-        assert!(rel_vs_lazy < 0.30, "rowwise sim vs lazy-dequant rel err {rel_vs_lazy}");
-        println!(
-            "rowwise error envelope (frob rel): x_deq={:.4} w_deq={:.4} sim_vs_lazy={:.4} sim_vs_ref={:.4}",
-            rel_frob_err(&x_deq, &x),
-            rel_frob_err(&w_deq, &w_deq_block),
-            rel_vs_lazy,
-            rel_vs_ref
-        );
+            let out_lazy = x.to_kind(Kind::BFloat16)
+                .matmul(&w_deq_block.to_kind(Kind::BFloat16)).to_kind(Kind::Float);
+            let rel_vs_lazy = rel_frob_err(&out_sim, &out_lazy);
+            let out_ref = x.matmul(&w);
+            let rel_vs_ref = rel_frob_err(&out_sim, &out_ref);
+            worst_lazy = worst_lazy.max(rel_vs_lazy);
+            worst_ref = worst_ref.max(rel_vs_ref);
+            assert!(rel_vs_lazy < 0.12,
+                "rowwise seed={seed} spread={spread} vs lazy err {rel_vs_lazy}");
+            assert!(rel_vs_ref < 0.12,
+                "rowwise seed={seed} spread={spread} vs reference err {rel_vs_ref}");
+            println!(
+                "rowwise envelope seed={seed} spread={spread}: sim_vs_lazy={rel_vs_lazy:.4} sim_vs_ref={rel_vs_ref:.4}"
+            );
+        }
+        println!("rowwise envelope worst: sim_vs_lazy={worst_lazy:.4} sim_vs_ref={worst_ref:.4}");
     }
 
     /// Load-time `scale_b` packing: `[K/128, N/128]` → `[N/128, L4]`
@@ -4523,6 +4547,95 @@ mod fp8_gemm_tests {
         assert_eq!(out.size(), [3, 256]);
     }
 
+    /// Probe body for [`fp8_gate_causal_subprocesses`]. It intentionally runs
+    /// in a fresh process: `fp8_gemm_enabled()` is process-cached, so toggling
+    /// env vars in one test process would make gate tests order-dependent.
+    #[test]
+    fn fp8_gate_probe() {
+        let Ok(mode) = std::env::var("HYPRSTREAM_FP8_GATE_PROBE") else {
+            return;
+        };
+        let gate_on = std::env::var("HYPRSTREAM_FP8_GEMM").as_deref() == Ok("1");
+        let dequant_on = std::env::var("HYPRSTREAM_FP8_DEQUANT_LOAD").as_deref() == Ok("1");
+        assert_eq!(fp8_gemm_enabled(), gate_on, "FP8 gate env was not read independently");
+        assert_eq!(crate::config::default_fp8_dequant_load(), dequant_on,
+            "load-time dequant gate changed independently of its own env");
+
+        let w = det(&[256, 256], 31).clamp(-2.0, 2.0).to_kind(FP8);
+        let p = LinearProjection::with_scale(w, Tensor::ones([2, 2], OPT));
+        assert_eq!(p.rowwise.is_some(), gate_on,
+            "rowwise metadata must follow FP8 GEMM only, not load-time dequant");
+        let x_cpu = det(&[2, 256], 32).to_kind(Kind::BFloat16);
+        let _ = p.apply(&x_cpu);
+        if mode == "cpu" {
+            // Negative control: with no CUDA device involved, production apply
+            // must stay on lazy dequant even when the FP8 gate is enabled.
+            assert_eq!(FP8_APPLY_PATH.load(std::sync::atomic::Ordering::SeqCst), 2,
+                "CPU probe unexpectedly selected a scaled-mm path");
+            return;
+        }
+
+        assert_eq!(mode, "sm120", "unknown FP8 gate probe mode");
+        assert!(gate_on && !dequant_on, "SM120 probe must be FP8-on/dequant-off");
+        assert!(tch::Cuda::is_available(), "SM120 probe requires CUDA");
+        let dev = Device::Cuda(0);
+        let p = p.into_device(dev);
+        let x = x_cpu.to_device(dev);
+        let out = p.apply(&x);
+        assert_eq!(out.size(), [2, 256]);
+        assert_eq!(FP8_APPLY_PATH.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "production apply did not return the gated scaled-mm result");
+        assert!(scaled_mm_latch().is_failed(0, ScaledMmRecipe::BlockwiseV2),
+            "SM120 blockwise recipe did not latch off");
+        assert!(!scaled_mm_latch().is_failed(0, ScaledMmRecipe::RowwiseV1),
+            "SM120 rowwise recipe latched despite libtorch 2.11");
+        println!("causal gate probe: FP8 on selected rowwise after blockwise latch; dequant gate off");
+    }
+
+    /// Causal gate test with negative controls. Each child asserts the
+    /// production `apply()` path, metadata construction, and independent
+    /// dequant default; a broken gate, fallback, or env coupling fails here.
+    /// The GPU child additionally proves real SM120 rowwise selection without
+    /// manually injecting `rowwise` metadata.
+    #[test]
+    fn fp8_gate_causal_subprocesses() {
+        fn run_probe(name: &str, fp8: &str, dequant: &str, probe: &str) {
+            let exe = std::env::current_exe().expect("test executable path");
+            let status = Command::new(exe)
+                .arg("--exact")
+                .arg(format!("runtime::architectures::llama::fp8_gemm_tests::{name}"))
+                .arg("--nocapture")
+                .env("HYPRSTREAM_FP8_GEMM", fp8)
+                .env("HYPRSTREAM_FP8_DEQUANT_LOAD", dequant)
+                .env("HYPRSTREAM_FP8_GATE_PROBE", probe)
+                .status()
+                .expect("spawn FP8 gate probe");
+            assert!(status.success(), "FP8 gate probe {probe} failed: {status}");
+        }
+
+        run_probe("fp8_gate_probe", "0", "0", "cpu");
+        run_probe("fp8_gate_probe", "1", "0", "cpu");
+        run_probe("fp8_gate_probe", "0", "1", "cpu");
+        if tch::Cuda::is_available() {
+            run_probe("fp8_gate_probe", "1", "0", "sm120");
+        }
+
+        // Fused Qwen projections run in their own exact child so their
+        // `with_scale` reconstruction is checked with FP8 GEMM enabled from
+        // process start, rather than inheriting this test's cached env state.
+        let exe = std::env::current_exe().expect("test executable path");
+        let status = Command::new(exe)
+            .arg("--exact")
+            .arg("runtime::architectures::qwen3_5::pipeline_tests::fp8_fused_projection_metadata_probe")
+            .arg("--nocapture")
+            .env("HYPRSTREAM_FP8_GEMM", "1")
+            .env("HYPRSTREAM_FP8_DEQUANT_LOAD", "0")
+            .env("HYPRSTREAM_QWEN_FP8_PROBE", "1")
+            .status()
+            .expect("spawn Qwen FP8 metadata probe");
+        assert!(status.success(), "Qwen fused metadata probe failed: {status}");
+    }
+
     /// Real-kernel test on CUDA: rowwise must match the lazy-dequant baseline.
     /// Not ignored — self-skips without CUDA. On SM120, blockwise v2 is
     /// expected to reject and latch exactly once; libtorch 2.11's widened
@@ -4602,7 +4715,9 @@ mod fp8_gemm_tests {
         );
         let rel = rel_frob_err(&out, &out_lazy);
         println!("rowwise v1 (SM{cc_major}{cc_minor}) vs lazy-dequant frob rel err: {rel:.4}");
-        assert!(rel < 0.30, "rowwise v1 diverged: {rel}");
+        // The deterministic multi-seed envelope test above observes <=0.0373;
+        // retain headroom while rejecting a several-fold regression here.
+        assert!(rel < 0.12, "rowwise v1 diverged: {rel}");
 
         // Benchmark a realistic projection after the correctness check. `apply`
         // is deliberately lazy here because HYPRSTREAM_FP8_GEMM is off by default.

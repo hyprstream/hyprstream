@@ -2225,7 +2225,7 @@ pub(crate) fn default_fp8_gemm() -> bool {
 /// Default for [`RuntimeConfig::fp8_dequant_load`]: off unless
 /// `HYPRSTREAM_FP8_DEQUANT_LOAD` is set truthy. Off is the safe default — it
 /// keeps FP8 weights at FP8 size in VRAM with lazy per-matmul dequantization.
-fn default_fp8_dequant_load() -> bool {
+pub(crate) fn default_fp8_dequant_load() -> bool {
     std::env::var("HYPRSTREAM_FP8_DEQUANT_LOAD")
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)

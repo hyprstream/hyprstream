@@ -2494,6 +2494,33 @@ mod pipeline_tests {
     const LIN_V_DIM: usize = 4;
     const CONV_KERNEL: usize = 4;
 
+    /// Child-process probe for the FP8 causal gate test. Starting with
+    /// `HYPRSTREAM_FP8_GEMM=1` is essential because `with_scale` caches that
+    /// env decision for the process; the assertions are deliberately about
+    /// derived metadata, so a regression in `cat_projs` cannot hide behind a
+    /// numerically plausible fused weight.
+    #[test]
+    #[allow(clippy::print_stderr)]
+    fn fp8_fused_projection_metadata_probe() {
+        if std::env::var_os("HYPRSTREAM_QWEN_FP8_PROBE").is_none() {
+            return;
+        }
+        assert!(crate::config::default_fp8_gemm());
+        let w1 = Tensor::zeros([256, 256], (Kind::Float, Device::Cpu)).to_kind(Kind::Float8e4m3fn);
+        let w2 = Tensor::zeros([256, 256], (Kind::Float, Device::Cpu)).to_kind(Kind::Float8e4m3fn);
+        let s1 = Tensor::ones([2, 2], (Kind::Float, Device::Cpu));
+        let s2 = Tensor::ones([2, 2], (Kind::Float, Device::Cpu));
+        let fused = cat_projs(vec![
+            LinearProjection::with_scale(w1, s1),
+            LinearProjection::with_scale(w2, s2),
+        ]);
+        assert_eq!(fused.weight.size(), [256, 512]);
+        assert_eq!(fused.scale.as_ref().expect("fused FP8 scale").size(), [2, 4]);
+        assert_eq!(fused.scale_v2.as_ref().expect("fused packed scale").size(), [4, 4]);
+        assert!(fused.rowwise.is_some(), "fused Qwen projection lost rowwise metadata");
+        eprintln!("Qwen fused FP8 metadata probe: scale, scale_v2, and rowwise present");
+    }
+
     fn tiny_config() -> Qwen3_5TextConfig {
         // Default hybrid pattern: layer (i+1)%4==0 is full attention, rest GDN.
         // With LAYERS=4 → [GDN, GDN, GDN, FullAttn]; a split at 2 puts the full-
