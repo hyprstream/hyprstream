@@ -371,8 +371,9 @@ def validate_response_signer_enrollment(matches, requested_thumbprint_b64, aud, 
 def cross_record_component_key_conflicts(creds_doc):
     """V1 (CDDL §6, cross-suite component-key non-reuse): a component key enrolled
     for one suite MUST NOT be simultaneously enrolled for another suite/record. Sweep
-    every authoritative enrollment record (primary_enrollments + approver_enrollments)
-    and return the problems — a list of `(identity, [record descriptors])`.
+    every authoritative enrollment record — ONE global domain: primary_enrollments +
+    approver_enrollments + response_signer_enrollments (A2) — and return the problems,
+    a list of `(identity, [record descriptors])`.
 
     Key identity is the CANONICAL raw bytes (`bytes.fromhex`), NOT the hex spelling, so
     an uppercase/lowercase re-encoding of the same key collides and cannot evade the
@@ -382,7 +383,7 @@ def cross_record_component_key_conflicts(creds_doc):
     (distinct byte lengths), so the raw bytes are a sound identity."""
     seen = {}       # canonical raw bytes -> [descriptors]
     problems = []   # malformed component keys, always reported (fail closed)
-    for kind in ("primary_enrollments", "approver_enrollments"):
+    for kind in ("primary_enrollments", "approver_enrollments", "response_signer_enrollments"):
         for i, e in enumerate(creds_doc.get(kind, [])):
             desc = f"{kind}[{i}] suite={e.get('suite_id')!r} role={e.get('role')!r}"
             for h in e.get("component_public_keys_hex", []):
@@ -1165,22 +1166,15 @@ def main() -> None:
         def signer_suite_tp(suite, pubs) -> bytes:
             return hashlib.sha256(enc([suite, list(pubs)])).digest()
 
-        # Z1: every authenticated RESPONSE positive's realized signer plan MUST resolve
-        # to exactly one active response-service enrollment bound to its audience.
-        for v in positive["vectors"]:
-            try:
-                o = decode(bytes.fromhex(v["cbor_hex"]))
-                bh = decode(o[0])
-            except Exception:  # noqa: BLE001
-                continue
-            if bh.get(H_TYP) != TYP_RESPONSE or H_KEYSET in bh:
-                continue
-            try:
-                pcl = decode(o[2])
-            except Exception:  # noqa: BLE001
-                pcl = None
-            aud = pcl.get(3) if isinstance(pcl, dict) else None
-            for grp in (bh.get(H_PLAN) or []):
+        # Z1/A3: a RESPONSE proof's realized plan MUST contain EXACTLY ONE signer group
+        # that resolves EXACTLY ONE active audience-bound response-service enrollment.
+        def _resp_signer_errors(o, bh):
+            aud = decode(o[2]).get(3) if isinstance(decode(o[2]), dict) else None
+            plan = bh.get(H_PLAN) or []
+            if len(plan) != 1:
+                return [f"a response proof must have exactly one signer group, got {len(plan)}"]
+            tps = []
+            for grp in plan:
                 pubs, ok = [], True
                 for comp in grp[3]:
                     a, k = comp[1], comp[2]
@@ -1189,12 +1183,36 @@ def main() -> None:
                         ok = False
                         break
                     pubs.append(p)
-                if not ok:
-                    continue
-                rtp = base64.urlsafe_b64encode(signer_suite_tp(grp[2], pubs)).rstrip(b"=").decode()
-                m = resolve_response_signer_enrollments(cd, aud, rtp)
-                for e in validate_response_signer_enrollment(m, rtp, aud, now):
-                    fail(f"{v['id']} response signer: {e}")
+                if ok:
+                    tps.append(base64.urlsafe_b64encode(signer_suite_tp(grp[2], pubs)).rstrip(b"=").decode())
+            if len(tps) != 1:
+                return [f"a response proof must resolve exactly one signer group, got {len(tps)}"]
+            return validate_response_signer_enrollment(
+                resolve_response_signer_enrollments(cd, aud, tps[0]), tps[0], aud, now)
+
+        for v in positive["vectors"]:
+            try:
+                o = decode(bytes.fromhex(v["cbor_hex"]))
+                bh = decode(o[0])
+            except Exception:  # noqa: BLE001
+                continue
+            if bh.get(H_TYP) != TYP_RESPONSE or H_KEYSET in bh:
+                continue
+            for e in _resp_signer_errors(o, bh):
+                fail(f"{v['id']} response signer: {e}")
+        # The response-signer negatives (N-58/N-59/N-60) MUST deny under the same rule.
+        for v in negative["vectors"]:
+            if v.get("deny_class") != "response-signer":
+                continue
+            try:
+                o = decode(bytes.fromhex(v["cbor_hex"]))
+                bh = decode(o[0])
+            except Exception:  # noqa: BLE001
+                continue
+            if bh.get(H_TYP) != TYP_RESPONSE:
+                continue
+            if not _resp_signer_errors(o, bh):
+                fail(f"{v['id']}: a response-signer negative must deny under the exactly-one response-signer rule")
 
         def verify_at_jwt(token: str, label: str):
             parts = token.split(".")

@@ -29,6 +29,13 @@
         "public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664"
       },
       {
+        "role": "authenticated primary signer (WORKLOAD credential cnf-bound, A1 workload-1 principal)",
+        "kid_hex": "636c69656e742d656432353531392d776c2d31",
+        "kid_ascii": "client-ed25519-wl-1",
+        "seed_hex": "02030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021",
+        "public_hex": "43cdc023d22d5f9e107d1a0693457d35d1d10eb7d21c721192f56f5de40665d3"
+      },
+      {
         "role": "approver signer group 2",
         "kid_hex": "617070726f7665722d656432353531392d31",
         "kid_ascii": "approver-ed25519-1",
@@ -41,6 +48,13 @@
         "kid_ascii": "service-ed25519-1",
         "seed_hex": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
         "public_hex": "174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd5"
+      },
+      {
+        "role": "second enrolled service response signer (A3 exactly-one negative)",
+        "kid_hex": "736572766963652d656432353531392d32",
+        "kid_ascii": "service-ed25519-2",
+        "seed_hex": "6162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80",
+        "public_hex": "882d0ea3b2864e7a587f3e698cea4459998312e655e05fa5e8b5119d8baac8cd"
       },
       {
         "role": "unattributed self-asserted signer",

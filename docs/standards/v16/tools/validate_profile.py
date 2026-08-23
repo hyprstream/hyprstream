@@ -1627,9 +1627,11 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
                 "authenticated proof with a null credential_hash"
         if dc == "unattributed-nonce-required":  # N-16
             return H_KEYSET in pm and (claims is None or C_NONCE not in claims), "unattributed proof without Nonce"
-        if dc == "response-signer":  # Z1: N-58/N-59
+        if dc == "response-signer":  # Z1/A3: N-58/N-59 (resolution) + N-60 (exactly-one)
             if pm.get(H_TYP) != TYP_RESPONSE:
                 return False, "not a response proof"
+            if len(plan or []) != 1:
+                return True, f"response proof has {len(plan or [])} signer groups (exactly one required)"
             _creds2 = _load_credentials()
             ed_by_kid, ml_by_kid = _keymaps()
             aud = claims.get(C_AUD) if isinstance(claims, dict) else None
@@ -2003,9 +2005,10 @@ def gate_enrollment_key_uniqueness() -> None:
     conflicts = cross_record_component_key_conflicts(creds)
     check(not conflicts,
           f"no component public key may be enrolled in two enrollment records: {conflicts}")
-    total = sum(len(creds.get(k, [])) for k in ("primary_enrollments", "approver_enrollments"))
+    _ENROLL_KINDS = ("primary_enrollments", "approver_enrollments", "response_signer_enrollments")
+    total = sum(len(creds.get(k, [])) for k in _ENROLL_KINDS)
     keys = sum(len(e.get("component_public_keys_hex", []))
-               for k in ("primary_enrollments", "approver_enrollments") for e in creds.get(k, []))
+               for k in _ENROLL_KINDS for e in creds.get(k, []))
     # Causal counter-case: re-sharing a component key across two records MUST be
     # detected. If the check were neutralized (always "no conflict"), this assertion
     # fails and the gate turns red — so the guard is load-bearing.
@@ -2040,8 +2043,15 @@ def gate_enrollment_key_uniqueness() -> None:
         hyb_bad["component_public_keys_hex"][0] = "zz-not-hex"
         check(bool(cross_record_component_key_conflicts(mutated_bad)),
               "a malformed (non-hex) component key MUST fail closed as a problem")
-    print(f"   {keys} component keys across {total} enrollment records are pairwise distinct "
-          f"(canonical bytes); re-share / uppercase-alias / malformed-key each detected")
+        # (d) A2: a RESPONSE-signer record that re-uses a Primary component key MUST be
+        # flagged — the uniqueness domain is global across primary/approver/response.
+        mutated_resp = copy.deepcopy(creds)
+        mutated_resp["response_signer_enrollments"][0]["component_public_keys_hex"][0] = classical_key
+        resp_conflict = cross_record_component_key_conflicts(mutated_resp)
+        check(bool(resp_conflict) and any(k == classical_key for k, _ in resp_conflict),
+              "A2: a response-signer record re-using a Primary component key MUST be flagged")
+    print(f"   {keys} component keys across {total} enrollment records (primary+approver+response) "
+          f"are pairwise distinct (canonical bytes); cross-record re-share / uppercase / malformed detected")
 
 
 def gate_verifier_clock(positives, negatives) -> None:
@@ -2064,7 +2074,11 @@ def gate_verifier_clock(positives, negatives) -> None:
               f"{v['id']} must be temporally valid at verifier_now {now} (iat {c[C_IAT]}, exp {c[C_EXP]})")
     for name, cred in creds["credentials"].items():
         cl = cred["claims"]
-        check(cl["iat"] <= now < cl["exp"],
+        # A4: NumericDate-validate iat/exp BEFORE the comparison so a string/null/bool/
+        # float timestamp is a clean denial here too, never an unhandled TypeError.
+        nd = validate_numericdate_claims(cl)
+        check(not nd, f"credential {name} iat/exp NumericDate: {nd}")
+        check(bool(nd) or (cl["iat"] <= now < cl["exp"]),
               f"credential {name} must be temporally valid at verifier_now {now}")
     # Load-bearing: pre-iat, at-exp, and a wall-clock-style instant are all outside
     # the interval, so evaluating there would deny an advertised positive.
@@ -2102,28 +2116,44 @@ def gate_response_signer(positives, negatives) -> None:
                 tps.append(_b64u(_suite_thumbprint(grp[2], pubs)))
         return aud, tps
 
+    def response_signer_errors(vec):
+        """A3: a response proof's realized plan MUST contain EXACTLY ONE signer group
+        that resolves EXACTLY ONE active audience-bound response-service enrollment."""
+        obj = decode(bytes.fromhex(vec["cbor_hex"]))
+        plan = decode(obj[0]).get(H_PLAN) or []
+        if len(plan) != 1:
+            return [f"a response proof must have exactly one signer group, got {len(plan)}"]
+        aud, tps = realized(vec)
+        if len(tps) != 1:
+            return [f"a response proof must resolve exactly one signer group, got {len(tps)}"]
+        return validate_response_signer_enrollment(
+            resolve_response_signer_enrollments(creds, aud, tps[0]), tps[0], aud, now)
+
     # Every RESPONSE positive resolves exactly one active response-service enrollment.
     resp_pos = [v for v in positives["vectors"]
                 if decode(decode(bytes.fromhex(v["cbor_hex"]))[0]).get(H_TYP) == TYP_RESPONSE]
     check(resp_pos, "at least one response positive (P-3/P-7) must exist")
     for v in resp_pos:
-        aud, tps = realized(v)
-        for tp in tps:
-            m = resolve_response_signer_enrollments(creds, aud, tp)
-            errs = validate_response_signer_enrollment(m, tp, aud, now)
-            check(not errs, f"{v['id']} response signer must resolve a valid enrollment: {errs}")
+        errs = response_signer_errors(v)
+        check(not errs, f"{v['id']} response signer must resolve exactly one valid enrollment: {errs}")
 
-    # The two shipped negatives (N-58 client-signed, N-59 wrong-audience) deny.
+    # Shipped negatives: N-58 client-signed, N-59 wrong-audience, N-60 two-group deny.
     by_id = {v["id"]: v for v in negatives["vectors"]}
-    for nid in ("N-58", "N-59"):
+    for nid in ("N-58", "N-59", "N-60"):
         v = by_id.get(nid)
         check(v is not None, f"response-signer negative {nid} must exist")
         if v is None:
             continue
-        aud, tps = realized(v)
-        denied = any(validate_response_signer_enrollment(
-            resolve_response_signer_enrollments(creds, aud, tp), tp, aud, now) for tp in tps)
-        check(denied, f"{nid} must deny at the response-signer resolver")
+        check(bool(response_signer_errors(v)), f"{nid} must deny at the response-signer check")
+    # A3 isolation: N-60's two groups are BOTH otherwise-enrolled (each resolves a
+    # valid record), so it denies solely on the exactly-one-group rule.
+    n60_aud, n60_tps = realized(by_id["N-60"])
+    check(len(n60_tps) == 2 and all(
+        not validate_response_signer_enrollment(
+            resolve_response_signer_enrollments(creds, n60_aud, tp), tp, n60_aud, now)
+        for tp in n60_tps), "N-60's two groups must each resolve a valid enrollment (isolation)")
+    check(response_signer_errors(by_id["N-60"])[0].startswith("a response proof must have exactly one"),
+          "N-60 must deny solely on the exactly-one-signer-group rule")
 
     # Record-level counter-proofs: mutating the shipped enrollment must deny a proof
     # that otherwise resolves it (the resolver is load-bearing on every field).
@@ -2530,6 +2560,28 @@ def gate_credential_context(positives, negatives) -> None:
           "the hybrid primary signer-suite record must not resolve an approver enrollment")
     print(f"   T1 cnf primary enrollment validated (content-recomputed; role/tenant/principal/"
           f"status/expiry); primary and approver records are distinct")
+
+    # ---- A1: the workload credential's cnf resolves a COHERENT primary enrollment
+    #      (principal == workload-1) and is exercised by the mapped positive P-10, so
+    #      the resolution is load-bearing (not vacuous). Wrong-principal, wrong-suite,
+    #      and missing records each deny.
+    wl_claims = creds["credentials"]["workload"]["claims"]
+    wl_cnf_b64 = wl_claims["cnf"]["hs_signer_suite"]
+    wl_princ, _we = terminal_signer_principal(wl_claims)
+    check(wl_princ == "workload-1", f"workload terminal principal must be workload-1, got {wl_princ!r}")
+    wl_prec = resolve_primary_enrollment(creds, wl_cnf_b64)
+    check(wl_prec is not None and not validate_primary_enrollment(
+        wl_prec, wl_cnf_b64, wl_claims["tenant"], wl_princ, now),
+        "the workload credential cnf must resolve a valid workload-1 primary enrollment")
+    check("P-10" in creds["positive_to_credential"] and creds["positive_to_credential"]["P-10"] == "workload",
+          "a positive proof (P-10) must be mapped to the workload credential (non-vacuous)")
+    check(bool(validate_primary_enrollment(
+        {**wl_prec, "principal": "user-1"}, wl_cnf_b64, wl_claims["tenant"], wl_princ, now)),
+        "A1 wrong-principal: a workload enrollment naming user-1 must deny")
+    check(resolve_primary_enrollment(creds, _b64u(_suite_thumbprint(SUITE_HYBRID, [b"\x33" * 32]))) is None,
+          "A1 wrong-suite/missing: an unmatched cnf must resolve no primary enrollment")
+    print("   A1 workload credential resolves a coherent workload-1 primary enrollment, "
+          "exercised by P-10; wrong-principal/wrong-suite/missing deny")
 
     # ---- T1 delegated (AsOriginator, design §8.1): the Primary record principal is
     #      the credential's TERMINAL signer principal, NOT unconditionally `sub`. For

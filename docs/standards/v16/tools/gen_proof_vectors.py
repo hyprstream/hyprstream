@@ -294,9 +294,11 @@ KID_CLIENT_ED = b"client-ed25519-1"
 # component is a DISTINCT enrolled key from the standalone classical enrollment's
 # key, so no component public key is enrolled for two suites at once.
 KID_CLIENT_ED_HY = b"client-ed25519-hy-1"
+KID_CLIENT_ED_WL = b"client-ed25519-wl-1"  # A1: workload-1 primary key
 KID_CLIENT_ML = b"client-mldsa65-1"
 KID_APPROVER_ED = b"approver-ed25519-1"
 KID_SERVICE_ED = b"service-ed25519-1"
+KID_SERVICE_ED_2 = b"service-ed25519-2"  # A3: second enrolled response-service signer
 KID_UNATTRIBUTED_ED = b"unattributed-ed25519-1"
 KID_UNATTRIBUTED_ML = b"unattributed-mldsa65-1"
 KID_ISSUER_ED = b"issuer-ed25519-1"  # credential issuer (type-confusion vectors)
@@ -391,8 +393,10 @@ def main() -> None:
         work = Path(tmp)
         seed_c_ed, sk_c_ed = ed25519_key(0x00)
         seed_c_ed_hy, sk_c_ed_hy = ed25519_key(0x01)  # V1: distinct hybrid-suite Ed25519 component
+        seed_c_ed_wl, sk_c_ed_wl = ed25519_key(0x02)  # A1: workload-1 primary key (distinct)
         seed_a_ed, sk_a_ed = ed25519_key(0x40)
         seed_s_ed, sk_s_ed = ed25519_key(0x60)
+        seed_s_ed_2, sk_s_ed_2 = ed25519_key(0x61)    # A3: second response-service signer key
         seed_u_ed, sk_u_ed = ed25519_key(0x80)
         seed_i_ed, sk_i_ed = ed25519_key(0xC0)  # credential issuer
         # Q2: nine independent Ed25519 signers for the isolated group-cap negative N-6.
@@ -424,14 +428,14 @@ def main() -> None:
         # fixture literal). Distinct from approver_enrollments (role "primary").
         PRIMARY_ENROLLMENT_EPOCH = 1
 
-        def primary_enrollment(suite, pubs):
+        def primary_enrollment(suite, pubs, principal=CREDENTIAL_SUBJECT):
             return {
                 "suite_id": suite,
                 "component_public_keys_hex": [p.hex() for p in pubs],
                 "thumbprint_b64": b64u(signer_suite_thumbprint(suite, pubs)),
                 "role": "primary",
                 "tenant": CREDENTIAL_TENANT,
-                "principal": CREDENTIAL_SUBJECT,
+                "principal": principal,
                 "status": "active",
                 "expires_at": 1786000060,
                 "enrollment_epoch": PRIMARY_ENROLLMENT_EPOCH,
@@ -439,6 +443,14 @@ def main() -> None:
 
         primary_enrollment_classical = primary_enrollment(SUITE_CLASSICAL, [client_ed_pub])
         primary_enrollment_hybrid = primary_enrollment(SUITE_HYBRID, [client_ed_hy_pub, ml_client.public])
+        # A1: a workload-specific primary key + enrollment whose principal is exactly
+        # `workload-1` (never reusing another enrollment's component key), so the
+        # workload credential's cnf resolves a coherent primary record.
+        workload_ed_pub = sk_c_ed_wl.public_key().public_bytes_raw()
+        cnf_workload = signer_suite_thumbprint(SUITE_CLASSICAL, [workload_ed_pub])
+        primary_enrollment_workload = primary_enrollment(
+            SUITE_CLASSICAL, [workload_ed_pub], principal=WORKLOAD_SUBJECT)
+        service_ed_2_pub = sk_s_ed_2.public_key().public_bytes_raw()  # A3 second response signer
 
         def build_at_jwt(jti: str, cnf_thumbprint: bytes, *, sid: str = None, exp: int = EXP,
                          sub: str = CREDENTIAL_SUBJECT, workload_session_id: str = None):
@@ -489,7 +501,7 @@ def main() -> None:
         # Y1: a workload-family credential carrying `workload_session_id` (no `sid`),
         # bound to an authoritative workload session (session_kind == "workload").
         cred_workload, hdr_workload, claims_workload = build_at_jwt(
-            "cred-workload-1", cnf_classical, sub=WORKLOAD_SUBJECT,
+            "cred-workload-1", cnf_workload, sub=WORKLOAD_SUBJECT,
             workload_session_id=WORKLOAD_SESSION_ID)
         CREDENTIAL_HASH = hashlib.sha256(cred_classical.encode("ascii")).digest()
         CREDENTIAL_HASH_HYBRID = hashlib.sha256(cred_hybrid.encode("ascii")).digest()
@@ -518,6 +530,13 @@ def main() -> None:
                     "public_hex": sk_c_ed_hy.public_key().public_bytes_raw().hex(),
                 },
                 {
+                    "role": "authenticated primary signer (WORKLOAD credential cnf-bound, A1 workload-1 principal)",
+                    "kid_hex": KID_CLIENT_ED_WL.hex(),
+                    "kid_ascii": KID_CLIENT_ED_WL.decode(),
+                    "seed_hex": seed_c_ed_wl.hex(),
+                    "public_hex": sk_c_ed_wl.public_key().public_bytes_raw().hex(),
+                },
+                {
                     "role": "approver signer group 2",
                     "kid_hex": KID_APPROVER_ED.hex(),
                     "kid_ascii": KID_APPROVER_ED.decode(),
@@ -530,6 +549,13 @@ def main() -> None:
                     "kid_ascii": KID_SERVICE_ED.decode(),
                     "seed_hex": seed_s_ed.hex(),
                     "public_hex": sk_s_ed.public_key().public_bytes_raw().hex(),
+                },
+                {
+                    "role": "second enrolled service response signer (A3 exactly-one negative)",
+                    "kid_hex": KID_SERVICE_ED_2.hex(),
+                    "kid_ascii": KID_SERVICE_ED_2.decode(),
+                    "seed_hex": seed_s_ed_2.hex(),
+                    "public_hex": sk_s_ed_2.public_key().public_bytes_raw().hex(),
                 },
                 {
                     "role": "unattributed self-asserted signer",
@@ -973,6 +999,34 @@ def main() -> None:
                 "Bound to the user-session credential (sid); proof exp 1786000020 <= "
                 "session exp 1786000020 <= credential exp 1786000030, valid at "
                 "verifier_now 1786000015."
+            ),
+        )
+
+        # ---------------- P-10: workload-session-bound classical proof (A1) --
+        # An authenticated classical proof bound to the WORKLOAD credential, signed by
+        # the workload-specific primary key. Its cnf resolves the workload primary
+        # enrollment (principal `workload-1`), and its exp is within the workload
+        # session bound (1786000022) and the credential exp (1786000030). This makes
+        # the workload credential's terminal-principal / signer-suite / workload-session
+        # / tenant / clearance-epoch / proof-expiry coherence LOAD-BEARING in both
+        # layers (previously `workload` was in no positive→credential mapping).
+        p10_plan = [group(1, SUITE_CLASSICAL, [component(ALG_ED25519, KID_CLIENT_ED_WL)])]
+        p10_protected = {
+            H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN1_AUTH, H_KID: KID_CLIENT_ED_WL,
+            H_TYP: TYP_REQUEST, H_DOMAIN: DOMAIN_REQUEST, H_PLAN: p10_plan, H_GROUP: 1,
+        }
+        p10_claims = request_claims(credential_hash=CREDENTIAL_HASH_WORKLOAD, extra={C_EXP: WORKLOAD_SESSION_EXP})
+        p10, p10_prot, p10_payload = sign1(p10_protected, p10_claims, sk_c_ed_wl)
+        record(
+            positives, "P-10",
+            "Workload-session-bound classical proof (workload primary key; exp within the workload session)",
+            "accept", "COSE_Sign1", p10,
+            protected_hex=p10_prot.hex(),
+            payload_hex=p10_payload.hex(),
+            notes=(
+                "Bound to the workload credential (workload_session_id); cnf resolves the "
+                "workload primary enrollment (principal workload-1); proof exp 1786000022 "
+                "<= workload session exp 1786000022 <= credential exp 1786000030."
             ),
         )
 
@@ -2366,6 +2420,36 @@ def main() -> None:
             deny_rule="a response proof's realized signer must resolve to an authoritative response-service enrollment for its EXACT audience",
             notes="Correctly service-signed, but no response-signer enrollment exists for this audience; denies solely on the audience-bound resolution.",
         )
+        # N-60 (A3): a fully valid, CDDL-clean TWO-group COSE_Sign response. Both groups
+        # are enrolled response-service signers for the SAME audience (service + the
+        # second service key), both signatures verify, coverage is complete — so the
+        # SOLE defect is the exactly-one-response-signer-group rule (a response proof's
+        # realized plan must resolve exactly one signer group/record). General non-
+        # response 1*8-group semantics are unaffected.
+        n60_plan = [
+            group(1, SUITE_CLASSICAL, [component(ALG_ED25519, KID_SERVICE_ED)]),
+            group(2, SUITE_CLASSICAL, [component(ALG_ED25519, KID_SERVICE_ED_2)]),
+        ]
+        n60_body = {
+            H_CRIT: CRIT_SIGN_BODY_AUTH,
+            H_TYP: TYP_RESPONSE,
+            H_DOMAIN: DOMAIN_RESPONSE,
+            H_PLAN: n60_plan,
+        }
+        n60_claims = request_claims(credential_hash=None, schema_id=SCHEMA_ID_RESPONSE, body=CAPNP_RESPONSE_BYTES)
+        n60_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_SERVICE_ED, H_GROUP: 1}, sk_s_ed),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_SERVICE_ED_2, H_GROUP: 2}, sk_s_ed_2),
+        ]
+        n60, _, _ = sign_multi(n60_body, n60_claims, n60_entries)
+        record(
+            negatives, "N-60",
+            "Two-group response COSE_Sign (both groups enrolled) — violates exactly-one response signer",
+            "deny", "COSE_Sign", n60,
+            deny_class="response-signer",
+            deny_rule="a response proof's realized plan MUST contain exactly one signer group resolving one active response-service enrollment for its audience",
+            notes="Both groups are enrolled response-service signers for the audience and both signatures verify (coverage complete); denies solely on the exactly-one response-signer-group rule.",
+        )
 
     meta = {
         "vector_set_version": 1,
@@ -2488,8 +2572,8 @@ def main() -> None:
                 "header": hdr_workload,
                 "claims": claims_workload,
                 "primary_suite": SUITE_CLASSICAL,
-                "cnf_preimage_hex": enc([SUITE_CLASSICAL, [client_ed_pub]]).hex(),
-                "cnf_thumbprint_b64": b64u(cnf_classical),
+                "cnf_preimage_hex": enc([SUITE_CLASSICAL, [workload_ed_pub]]).hex(),
+                "cnf_thumbprint_b64": b64u(cnf_workload),
                 "token_sha256": CREDENTIAL_HASH_WORKLOAD.hex(),
                 "workload_session_id": WORKLOAD_SESSION_ID,
             },
@@ -2573,7 +2657,7 @@ def main() -> None:
                 "epoch-changed record denies. Distinct from approver_enrollments."
             ),
         },
-        "primary_enrollments": [primary_enrollment_classical, primary_enrollment_hybrid],
+        "primary_enrollments": [primary_enrollment_classical, primary_enrollment_hybrid, primary_enrollment_workload],
         "approver_enrollments": [
             {
                 "suite_id": SUITE_CLASSICAL,
@@ -2613,6 +2697,19 @@ def main() -> None:
                 "status": "active",
                 "expires_at": 1786000060,
             },
+            {
+                # A3: a SECOND, distinct response-service signer enrolled for the SAME
+                # audience. It exists so the two-group response negative (N-60) has both
+                # groups otherwise-enrolled, isolating the exactly-one-signer-group rule.
+                "aud": SERVICE_DOMAIN,
+                "suite_id": SUITE_CLASSICAL,
+                "component_public_keys_hex": [service_ed_2_pub.hex()],
+                "thumbprint_b64": b64u(signer_suite_thumbprint(SUITE_CLASSICAL, [service_ed_2_pub])),
+                "role": "response-service",
+                "tenant": CREDENTIAL_TENANT,
+                "status": "active",
+                "expires_at": 1786000060,
+            },
         ],
         "credential_revocation_model": {
             "note": (
@@ -2642,6 +2739,7 @@ def main() -> None:
             "P-5": "classical",
             "P-6": "classical",
             "P-9": "session",
+            "P-10": "workload",
         },
     }
 

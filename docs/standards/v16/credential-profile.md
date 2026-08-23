@@ -355,22 +355,28 @@ A conforming verifier is checked against at least:
 11. **(X3) the entire RFC 8693 `act` delegation chain is validated recursively — every
     hop an object with a non-empty string `sub`, every hop's clearance composed into
     the effective meet (§2 `act` row); a malformed hop at any depth denies;**
-12. **(Y1) both authoritative session namespaces resolve exactly and disjointly —
+12. **(Y1/A1) both authoritative session namespaces resolve exactly and disjointly —
     `(iss, sid)` for `user-session` (`session_kind == interactive`) and
     `(iss, workload_session_id)` for `workload` (`session_kind == workload`) — with no
     fallback or collapse between them; a `workload_session_id` credential is never
     sessionless, and unknown/revoked/expired/wrong-kind/cross-subject/tenant/
-    epoch-mismatched sessions deny; and**
+    epoch-mismatched sessions deny. The `workload` credential carries a
+    workload-specific enrolled Primary key whose authoritative record's `principal` is
+    exactly `workload-1`, and a mapped positive proof exercises its terminal-principal,
+    signer-suite, workload-session, tenant, clearance-epoch, and proof-expiry coherence
+    in both layers (a wrong-principal or missing record denies); and**
 13. **(Y2) claim absence is distinguished from a present `null`/empty/whitespace/
     wrong-typed session identifier: a present `sid`/`workload_session_id` must be a
     non-empty opaque string or it fails closed directly in both layers, and a
     credential never carries both identifiers;**
-14. **(Z1) a response proof's signer is authorized only through authoritative off-wire
-    service trust state bound to the response audience (a `response-service`
+14. **(Z1/A3) a response proof's signer is authorized only through authoritative
+    off-wire service trust state bound to the response audience (a `response-service`
     enrollment keyed by the exact `aud` + signer-suite content), never a generic
-    known-`kid` lookup or a prose `role` string; the realized signer plan must resolve
-    exactly one active record for its audience, and unknown/wrong-role/wrong-audience/
-    inactive/expired/key-suite-mismatched/ambiguous records deny; and**
+    known-`kid` lookup or a prose `role` string; the realized plan must contain
+    **exactly one** signer group resolving **exactly one** active record for its
+    audience, and unknown/wrong-role/wrong-audience/inactive/expired/key-suite-
+    mismatched/ambiguous/multi-group responses deny (the general non-response `1*8`
+    cap is unaffected); and**
 15. **(Z2) `iat` and `exp` are integer Unix-second NumericDate values (Python `bool`
     excluded), validated before any temporal comparison in both layers; a boolean,
     string, `null`, float, or missing timestamp denies cleanly, never by exception.**

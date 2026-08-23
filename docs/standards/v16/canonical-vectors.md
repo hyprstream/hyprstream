@@ -12,8 +12,8 @@ Machine-readable files (the normative form — this page is the human index):
 | File | Contents |
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
-| [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 9 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 64 vectors that MUST deny |
+| [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 10 vectors that MUST verify |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 65 vectors that MUST deny |
 | [`vectors/proof-v1-thumbprints.json`](vectors/proof-v1-thumbprints.json) | Cross-implementation replay-namespace thumbprint vectors (C1) |
 | [`vectors/proof-v1-credentials.json`](vectors/proof-v1-credentials.json) | Frozen `verifier_now` clock (F1) and the issuer-signed at+jwt tokens the authenticated positives hash (F2) |
 
@@ -414,6 +414,7 @@ Ed25519 signature over the stripped object.
 | N-57 | proof-freshness | Over-limit unattributed proof: `exp − verifier_now` (45s) exceeds the Unattributed maximum (30s) | 470 |
 | N-58 | response-signer | Response proof signed by the client key (not the enrolled response-service signer) | 372 |
 | N-59 | response-signer | Service-signed response proof for an unenrolled audience (`other.svc.hyprstream.test`) | 371 |
+| N-60 | response-signer | Two-group `COSE_Sign` response (both groups enrolled) — violates exactly-one response signer | 539 |
 
 ### Notes on individual negatives
 
@@ -573,22 +574,25 @@ Ed25519 signature over the stripped object.
   at `verifier_now` per disposition, and the causality inventory asserts each denies
   on its single axis. (The unattributed-`Nonce` rule that N-16 exercises is a distinct
   class, `unattributed-nonce-required`, not proof freshness.)
-- **N-58 / N-59 (audience-bound response-signer authorization, Z1).** A response
-  proof's signer is authorized **only** through authoritative off-wire service trust
-  state bound to the response **audience** — never a generic known-`kid` lookup or the
-  prose `role` string in the key fixture. `proof-v1-credentials.json`
-  `response_signer_enrollments` holds a record keyed by the exact response `aud` + the
+- **N-58 / N-59 / N-60 (audience-bound response-signer authorization, Z1/A3).** A
+  response proof's signer is authorized **only** through authoritative off-wire service
+  trust state bound to the response **audience** — never a generic known-`kid` lookup or
+  the prose `role` string in the key fixture. `proof-v1-credentials.json`
+  `response_signer_enrollments` holds records keyed by the exact response `aud` + the
   signer-suite content (`suite_id` + ordered public keys, recomputed thumbprint), with
-  an explicit **`response-service`** role, active status, and expiry. The gate and
-  checker require every response positive's (P-3/P-7) **realized** signer plan to
-  resolve **exactly one** active such record for its audience; **N-58** is a
-  self-consistent response proof signed **entirely by the client key** (plan
-  component, `kid`, and signature all the client) — the exact shape accepted before
-  the resolver existed — and denies because the client is not an authorized response
-  signer; **N-59** is correctly **service-signed** but carries an **unenrolled
-  audience**, and denies solely on the audience-bound resolution. Unknown, wrong-role,
-  wrong-audience, inactive/expired, key/suite-mismatched, or ambiguous records deny;
-  neutralizing the resolver turns the gate red.
+  an explicit **`response-service`** role, active status, and expiry. Both the gate and
+  the checker require every response proof's **realized** plan to contain **exactly one**
+  signer group that resolves **exactly one** active such record for its audience (**A3**);
+  **N-58** is a self-consistent response signed **entirely by the client key** — the
+  exact shape accepted before the resolver existed — and denies because the client is
+  not an authorized response signer; **N-59** is correctly **service-signed** but carries
+  an **unenrolled audience**; **N-60** is a fully valid, CDDL-clean **two-group**
+  `COSE_Sign` response whose **both** groups are enrolled `response-service` signers for
+  the same audience (each resolves a valid record, both signatures verify) — so it denies
+  **solely** on the exactly-one-signer-group rule. Unknown, wrong-role, wrong-audience,
+  inactive/expired, key/suite-mismatched, ambiguous, or multi-group responses deny;
+  neutralizing the resolver turns the gate red. The general non-response `1*8`-group
+  cap (N-6) is unaffected — the exactly-one rule is response-specific.
 - **Credential `iat`/`exp` NumericDate (Z2).** A credential's `iat` and `exp` are
   validated as integer Unix-second NumericDate values, **explicitly excluding Python
   `bool`** (`True`/`False` are not timestamps), **before** any temporal comparison in
@@ -904,14 +908,16 @@ therefore stated as verifier obligations rather than shipped here:
 4. Component-key non-reuse across suites, profiles, and logical groups
    (CDDL §6). The **cross-record enrollment** case — no component public key may be
    enrolled in more than one enrollment record — is now mechanically enforced (gate
-   §V1 + checker) over the shipped `primary_enrollments`/`approver_enrollments`, with
+   §V1 + checker) over **one global domain** spanning `primary_enrollments`,
+   `approver_enrollments`, **and `response_signer_enrollments` (A2)**, with
    canonical-bytes key identity (an uppercase/lowercase re-encoding of a key still
    collides) and malformed component keys failing closed; a re-shared key across
-   records turns the gate red. The classical primary enrollment (`[client Ed25519]`)
-   and the hybrid primary enrollment (`[client Ed25519 (distinct hy key), client
-   ML-DSA-65]`) therefore share **no** component key. The remaining cross-*proof*
-   /cross-profile reuse (a live proof-plan key that also appears elsewhere at
-   authority-provisioning time) stays a CI enrollment-provisioning check.
+   any two records — including a response-signer record re-using a Primary component —
+   turns the gate red. The classical, hybrid, and **workload** primary enrollments, the
+   approver enrollment, and the two response-signer enrollments therefore share **no**
+   component key. The remaining cross-*proof*/cross-profile reuse (a live proof-plan
+   key that also appears elsewhere at authority-provisioning time) stays a CI
+   enrollment-provisioning check.
 5. Sign-then-encrypt wrapper vectors, pending the COSE HPKE profile
    (watch item; nothing in this profile depends on it).
 6. A dedicated credential-plane positive vector set for the amendment-10 integer
