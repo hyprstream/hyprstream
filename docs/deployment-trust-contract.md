@@ -8,7 +8,7 @@ has no PDS/host claim; consumers must not invent one.
 
 ## Fixed runtime artifacts
 
-Metal's root-owned projection service installs these files atomically after
+Metal's projection service installs these files atomically after
 validating them through `hyprstream trust verify-deployment`:
 
 | Artifact | Fixed path | Required representation |
@@ -18,9 +18,12 @@ validating them through `hyprstream trust verify-deployment`:
 | Authority head checkpoint | `/etc/hyprstream/trust/deployment-authority.head.json` | Independently provisioned `hyprstream.deployment-authority-checkpoint.v1` JSON containing the expected domain, log DID, sequence, and head CID |
 | Registry credential | `/run/hyprstream/credentials/registry-service.jwt` | Compact hybrid JWT with no whitespace or newline, profile `hyprstream.registry-deployment.v1`, audience `urn:hyprstream:service:registry`, lifetime at most 3,600 seconds |
 
-Every fixed-path file and parent directory is a regular root-owned OS path and
-must not be group/world writable. The verifier requires the log and checkpoint for
-direct-root and delegated credentials alike. A supplied log is accepted only
+Every fixed-path file and real parent directory must be owned by root or the
+daemon's effective service UID and must not be group/world writable. Symlinks
+are rejected. This same ownership rule applies to fixed and explicitly
+overridden paths: running non-root is a first-class production configuration,
+not a development-only exception. The verifier requires the log and checkpoint
+for direct-root and delegated credentials alike. A supplied log is accepted only
 when its verified DID, sequence, and head CID exactly equal the independently
 provisioned checkpoint; a signature-valid historical prefix therefore cannot
 reactivate a retired authority. The UCAN issuer must also remain in the
@@ -42,7 +45,7 @@ The trust directory supplies `deployment-ca.hybrid`,
 `CREDENTIALS_DIRECTORY` supplies `registry-service.jwt`. Each variable controls
 only its named side of the split; an absent variable falls back to the fixed
 path in the table, while an invalid present value fails startup without
-fallback. User-service paths require real, non-group/world-writable files and
+fallback. All selected paths require real, non-group/world-writable files and
 ancestors owned by root or the daemon's effective user, and symlinks are
 rejected.
 

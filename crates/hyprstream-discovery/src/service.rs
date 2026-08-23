@@ -2419,16 +2419,9 @@ pub fn verify_deployment_artifacts_with_authority_log(
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TrustFileOwner {
-    Root,
-    EffectiveUser,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TrustedArtifactPath {
     path: std::path::PathBuf,
-    owner: TrustFileOwner,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2463,52 +2456,38 @@ fn resolve_deployment_trust_paths_from(
     trust_directory: Option<std::ffi::OsString>,
     credentials_directory: Option<std::ffi::OsString>,
 ) -> Result<DeploymentTrustPaths> {
-    let (public_ca, authority_log, authority_checkpoint, trust_owner) = match trust_directory {
+    let (public_ca, authority_log, authority_checkpoint) = match trust_directory {
         Some(value) => {
             let directory = explicit_absolute_directory(DEPLOYMENT_TRUST_DIR_ENV, value)?;
             (
                 directory.join(DEPLOYMENT_CA_ROOT_FILE),
                 directory.join(DEPLOYMENT_AUTHORITY_LOG_FILE),
                 directory.join(DEPLOYMENT_AUTHORITY_CHECKPOINT_FILE),
-                TrustFileOwner::EffectiveUser,
             )
         }
         None => (
             std::path::PathBuf::from(DEPLOYMENT_CA_ROOT_PATH),
             std::path::PathBuf::from(DEPLOYMENT_AUTHORITY_LOG_PATH),
             std::path::PathBuf::from(DEPLOYMENT_AUTHORITY_CHECKPOINT_PATH),
-            TrustFileOwner::Root,
         ),
     };
-    let (registry_credential, credential_owner) = match credentials_directory {
+    let registry_credential = match credentials_directory {
         Some(value) => {
             let directory = explicit_absolute_directory(SYSTEMD_CREDENTIALS_DIRECTORY_ENV, value)?;
-            (
-                directory.join(REGISTRY_DEPLOYMENT_CREDENTIAL_FILE),
-                TrustFileOwner::EffectiveUser,
-            )
+            directory.join(REGISTRY_DEPLOYMENT_CREDENTIAL_FILE)
         }
-        None => (
-            std::path::PathBuf::from(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH),
-            TrustFileOwner::Root,
-        ),
+        None => std::path::PathBuf::from(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH),
     };
     Ok(DeploymentTrustPaths {
-        public_ca: TrustedArtifactPath {
-            path: public_ca,
-            owner: trust_owner,
-        },
+        public_ca: TrustedArtifactPath { path: public_ca },
         authority_log: TrustedArtifactPath {
             path: authority_log,
-            owner: trust_owner,
         },
         authority_checkpoint: TrustedArtifactPath {
             path: authority_checkpoint,
-            owner: trust_owner,
         },
         registry_credential: TrustedArtifactPath {
             path: registry_credential,
-            owner: credential_owner,
         },
     })
 }
@@ -2518,6 +2497,21 @@ fn resolve_deployment_trust_paths() -> Result<DeploymentTrustPaths> {
         std::env::var_os(DEPLOYMENT_TRUST_DIR_ENV),
         std::env::var_os(SYSTEMD_CREDENTIALS_DIRECTORY_ENV),
     )
+}
+
+#[cfg(unix)]
+fn validate_trusted_artifact_metadata(
+    owner_uid: u32,
+    mode: u32,
+    effective_uid: u32,
+    subject: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        owner_uid == 0 || owner_uid == effective_uid,
+        "{subject} has an untrusted owner"
+    );
+    anyhow::ensure!(mode & 0o022 == 0, "{subject} is group/world writable");
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2533,10 +2527,6 @@ fn read_trusted_artifact(artifact: &TrustedArtifactPath, description: &str) -> R
         // SAFETY: geteuid has no preconditions and returns process-local state.
         unsafe { libc::geteuid() }
     };
-    let owner_is_allowed = |uid| match artifact.owner {
-        TrustFileOwner::Root => uid == 0,
-        TrustFileOwner::EffectiveUser => uid == 0 || uid == effective_uid,
-    };
     for parent in artifact.path.ancestors().skip(1) {
         let parent_metadata = std::fs::symlink_metadata(parent).map_err(|error| {
             anyhow::anyhow!("{description} parent {parent:?} is unavailable: {error}")
@@ -2545,14 +2535,12 @@ fn read_trusted_artifact(artifact: &TrustedArtifactPath, description: &str) -> R
             parent_metadata.file_type().is_dir(),
             "{description} parent {parent:?} is not a real directory"
         );
-        anyhow::ensure!(
-            owner_is_allowed(parent_metadata.uid()),
-            "{description} parent {parent:?} has an untrusted owner"
-        );
-        anyhow::ensure!(
-            parent_metadata.mode() & 0o022 == 0,
-            "{description} parent {parent:?} is group/world writable"
-        );
+        validate_trusted_artifact_metadata(
+            parent_metadata.uid(),
+            parent_metadata.mode(),
+            effective_uid,
+            &format!("{description} parent {parent:?}"),
+        )?;
     }
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -2574,14 +2562,12 @@ fn read_trusted_artifact(artifact: &TrustedArtifactPath, description: &str) -> R
         metadata.file_type().is_file(),
         "{description} is not a regular file"
     );
-    anyhow::ensure!(
-        owner_is_allowed(metadata.uid()),
-        "{description} has an untrusted owner"
-    );
-    anyhow::ensure!(
-        metadata.mode() & 0o022 == 0,
-        "{description} is group/world writable"
-    );
+    validate_trusted_artifact_metadata(
+        metadata.uid(),
+        metadata.mode(),
+        effective_uid,
+        description,
+    )?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(|error| {
         anyhow::anyhow!(
@@ -4986,8 +4972,6 @@ mod resolver_tests {
             fixed.registry_credential.path,
             std::path::Path::new(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH)
         );
-        assert_eq!(fixed.public_ca.owner, TrustFileOwner::Root);
-        assert_eq!(fixed.registry_credential.owner, TrustFileOwner::Root);
 
         let trust_dir = std::path::Path::new("/run/user/1000/hyprstream/trust");
         let credentials_dir =
@@ -5013,11 +4997,6 @@ mod resolver_tests {
             overridden.registry_credential.path,
             credentials_dir.join(REGISTRY_DEPLOYMENT_CREDENTIAL_FILE)
         );
-        assert_eq!(overridden.public_ca.owner, TrustFileOwner::EffectiveUser);
-        assert_eq!(
-            overridden.registry_credential.owner,
-            TrustFileOwner::EffectiveUser
-        );
 
         let trust_only =
             resolve_deployment_trust_paths_from(Some(trust_dir.as_os_str().to_owned()), None)
@@ -5030,7 +5009,6 @@ mod resolver_tests {
             trust_only.registry_credential.path,
             std::path::Path::new(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH)
         );
-        assert_eq!(trust_only.registry_credential.owner, TrustFileOwner::Root);
 
         let credentials_only =
             resolve_deployment_trust_paths_from(None, Some(credentials_dir.as_os_str().to_owned()))
@@ -5043,7 +5021,6 @@ mod resolver_tests {
             credentials_only.registry_credential.path,
             credentials_dir.join(REGISTRY_DEPLOYMENT_CREDENTIAL_FILE)
         );
-        assert_eq!(credentials_only.public_ca.owner, TrustFileOwner::Root);
     }
 
     #[test]
@@ -5087,6 +5064,54 @@ mod resolver_tests {
                 "error did not identify {name}: {error}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_artifact_accepts_effective_uid_owned_file_without_path_override_policy() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::Builder::new()
+            .prefix(".trust-owner-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("secure fixture directory");
+        let path = fixture.path().join("fixed-path-policy-artifact");
+        std::fs::write(&path, b"service-owned trust").expect("trust artifact");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("read-only trust artifact");
+
+        let bytes = read_trusted_artifact(
+            &TrustedArtifactPath { path },
+            "service-owned trust artifact",
+        )
+        .expect("effective-uid-owned 0644 artifact must be trusted");
+        assert_eq!(bytes, b"service-owned trust");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_artifact_metadata_accepts_root_and_nonroot_service_but_rejects_other_uid() {
+        const NONROOT_SERVICE_UID: u32 = 1_000;
+        const OTHER_UID: u32 = 1_001;
+
+        validate_trusted_artifact_metadata(0, 0o100644, NONROOT_SERVICE_UID, "root artifact")
+            .expect("root-owned 0644 artifact must remain trusted");
+        validate_trusted_artifact_metadata(
+            NONROOT_SERVICE_UID,
+            0o100644,
+            NONROOT_SERVICE_UID,
+            "service artifact",
+        )
+        .expect("non-root effective-uid-owned 0644 artifact must be trusted");
+
+        let error = validate_trusted_artifact_metadata(
+            OTHER_UID,
+            0o100644,
+            NONROOT_SERVICE_UID,
+            "other-user artifact",
+        )
+        .expect_err("different non-service uid was trusted");
+        assert!(error.to_string().contains("untrusted owner"), "{error}");
     }
 
     #[cfg(unix)]
@@ -5191,15 +5216,21 @@ mod resolver_tests {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
 
         let (_fixture, paths, _ca, _registry) = user_service_trust_fixture();
-        std::fs::set_permissions(
-            &paths.registry_credential.path,
-            std::fs::Permissions::from_mode(0o622),
-        )
-        .expect("make credential writable");
-        let error = load_trusted_registry_deployment_credentials_from(&paths)
-            .err()
-            .expect("group-writable credential was trusted");
-        assert!(error.to_string().contains("group/world writable"));
+        for mode in [0o664, 0o666] {
+            std::fs::set_permissions(
+                &paths.registry_credential.path,
+                std::fs::Permissions::from_mode(mode),
+            )
+            .expect("make credential writable");
+            let error = match load_trusted_registry_deployment_credentials_from(&paths) {
+                Ok(_) => panic!("group/world-writable credential was trusted"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("group/world writable"),
+                "mode {mode:o} failed for the wrong reason: {error}"
+            );
+        }
 
         let real_credential = paths
             .registry_credential

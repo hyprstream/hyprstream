@@ -2150,7 +2150,6 @@ pub struct RuntimeConfig {
     /// `HYPRSTREAM_CONTINUOUS_BATCH_MAX`.
     #[serde(default = "default_continuous_batch_max")]
     pub continuous_batch_max: usize,
-
     /// FP8 GEMM via torch `_scaled_mm` for FP8 (e4m3) weight projections.
     /// **Default: off.**
     ///
@@ -2180,6 +2179,18 @@ pub struct RuntimeConfig {
     /// setting the field programmatically does not reach the model path.
     #[serde(default = "default_fp8_gemm")]
     pub fp8_gemm: bool,
+
+    /// Materialize FP8 weights as BF16 once at load time (applying the
+    /// block-wise `_scale_inv` scales during load) and drop the FP8+scale
+    /// tensors, instead of dequantizing inside every matmul on the hot path.
+    /// Trades ~2x weight VRAM for zero per-matmul dequant work. Tunable via
+    /// `HYPRSTREAM_FP8_DEQUANT_LOAD` (truthy = on). Off by default — off keeps
+    /// the FP8-in-VRAM behavior, which is required when the BF16 equivalent
+    /// would exceed VRAM. Ignored (with a warning) for multi-device pipelines:
+    /// weights are loaded onto the pool's primary device before layers are
+    /// distributed, so full-model BF16 materialization there could OOM.
+    #[serde(default = "default_fp8_dequant_load")]
+    pub fp8_dequant_load: bool,
 }
 
 /// Default for [`RuntimeConfig::continuous_batching`]: off unless
@@ -2207,6 +2218,15 @@ fn default_continuous_batch_max() -> usize {
 /// NVIDIA Hopper (SM90) + cuBLASLt ≥ 12.9 (no CPU/ROCm kernel in torch 2.11).
 pub(crate) fn default_fp8_gemm() -> bool {
     std::env::var("HYPRSTREAM_FP8_GEMM")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Default for [`RuntimeConfig::fp8_dequant_load`]: off unless
+/// `HYPRSTREAM_FP8_DEQUANT_LOAD` is set truthy. Off is the safe default — it
+/// keeps FP8 weights at FP8 size in VRAM with lazy per-matmul dequantization.
+fn default_fp8_dequant_load() -> bool {
+    std::env::var("HYPRSTREAM_FP8_DEQUANT_LOAD")
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
 }
@@ -2274,6 +2294,7 @@ impl Default for RuntimeConfig {
             continuous_batching: default_continuous_batching(),
             continuous_batch_max: default_continuous_batch_max(),
             fp8_gemm: default_fp8_gemm(),
+            fp8_dequant_load: default_fp8_dequant_load(),
         }
     }
 }

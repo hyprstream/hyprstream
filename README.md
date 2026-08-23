@@ -119,6 +119,15 @@ A multi-variant flake builds CPU, CUDA, and ROCm packages:
 nix build github:hyprstream/hyprstream#cpu     # or #cuda / #rocm
 ```
 
+### Install with RPM (FerruleOS/Hummingbird)
+
+The canonical dual-architecture RPM is maintained and built in the
+[FerruleOS RPM repository](https://gitlab.com/cyberdione/ferruleos/rpms/-/tree/main/rpms/hyprstream).
+See [RPM packaging and installation](docs/rpm-packaging.md) for the package
+generation and channel contract, an exact checksum-pinned installation
+example, and the compatibility boundary. Rolling channel URLs are discovery
+pointers, not provenance pins.
+
 ### Building from source
 
 ```bash
