@@ -69,7 +69,62 @@ pub(crate) struct LinearProjection {
     /// measured envelope in `fp8_rowwise_requant_error_envelope`). None when
     /// the flag is off or `scale` is None. Boxed: keeps `LinearProjection`
     /// small enough for the `Qwen3_5Mlp` enum (clippy large_enum_variant).
-    pub(crate) rowwise: Option<Box<(Tensor, Tensor)>>,
+    pub(crate) rowwise: Option<Box<RowwiseRequant>>,
+}
+
+/// Load-time rowwise representation used by the v1 scaled-mm recipe.
+///
+/// Keeping this as an owned value, rather than an anonymous tensor pair, makes
+/// its lifetime explicit at projection-fusion boundaries: consuming a source
+/// projection drops its derived rowwise copy before the fused copy is built.
+pub(crate) struct RowwiseRequant {
+    weight: Tensor,
+    scale: Tensor,
+}
+
+impl RowwiseRequant {
+    fn new(weight: Tensor, scale: Tensor) -> Self {
+        #[cfg(test)]
+        {
+            let live = ROWWISE_REQUANT_LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            ROWWISE_REQUANT_PEAK.fetch_max(live, std::sync::atomic::Ordering::SeqCst);
+        }
+        Self { weight, scale }
+    }
+}
+
+impl Drop for RowwiseRequant {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        {
+            ROWWISE_REQUANT_LIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Test-only allocation witnesses for causal construction/fusion probes.
+/// The probes run in exact child processes, so these counters describe one
+/// construction sequence without interference from parallel tests.
+#[cfg(test)]
+static ROWWISE_REQUANT_LIVE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static ROWWISE_REQUANT_PEAK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) fn reset_rowwise_requant_peak() {
+    ROWWISE_REQUANT_PEAK.store(
+        ROWWISE_REQUANT_LIVE.load(std::sync::atomic::Ordering::SeqCst),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+#[cfg(test)]
+pub(crate) fn rowwise_requant_live() -> usize {
+    ROWWISE_REQUANT_LIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+#[cfg(test)]
+pub(crate) fn rowwise_requant_peak() -> usize {
+    ROWWISE_REQUANT_PEAK.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Cached read of the FP8-GEMM gate ([`crate::config::RuntimeConfig::fp8_gemm`]).
@@ -144,7 +199,7 @@ fn quantize_activations_rowwise(x: &Tensor) -> (Tensor, Tensor) {
 /// Precision trade vs 128x128 blocks: one scale now covers the whole K extent
 /// of an output channel, so channels with large dynamic range along K lose
 /// resolution — measured envelope in `fp8_rowwise_requant_error_envelope`.
-fn build_rowwise_requant(weight: &Tensor, scale: &Tensor) -> (Tensor, Tensor) {
+fn build_rowwise_requant(weight: &Tensor, scale: &Tensor) -> RowwiseRequant {
     const FP8_MAX: f64 = 448.0;
     let ws = weight.size(); // [K, N]
     let ss = scale.size(); // [K/128, N/128]
@@ -157,7 +212,7 @@ fn build_rowwise_requant(weight: &Tensor, scale: &Tensor) -> (Tensor, Tensor) {
         .clamp(-FP8_MAX, FP8_MAX)
         .to_kind(tch::Kind::Float8e4m3fn)
         .contiguous();
-    (w_rq, s_b.view([1, ws[1]]).contiguous())
+    RowwiseRequant::new(w_rq, s_b.view([1, ws[1]]).contiguous())
 }
 
 /// `ScalingType::BlockWise1x128` / `BlockWise128x128` and `SwizzleType::NO_SWIZZLE`
@@ -355,19 +410,19 @@ impl LinearProjection {
     /// `[K, N]`, so we materialize one FP8 transpose per call (same spike
     /// overhead as the blockwise arm).
     fn try_rowwise_v1(&self, dev_idx: usize, input: &Tensor, m: i64, k: i64) -> Option<Tensor> {
-        let (w_rq, scale_b) = self.rowwise.as_deref()?;
+        let rowwise = self.rowwise.as_deref()?;
         if scaled_mm_latch().is_failed(dev_idx, ScaledMmRecipe::RowwiseV1) {
             return None;
         }
         let x2 = input.reshape([m, k]);
         let (q, scale_a) = quantize_activations_rowwise(&x2);
         // Column-major mat2 [K, N]: contiguous [N, K] copy, transposed view.
-        let mat2 = w_rq.transpose(0, 1).contiguous().transpose(0, 1);
+        let mat2 = rowwise.weight.transpose(0, 1).contiguous().transpose(0, 1);
         let bias = self.bias.as_ref().map(|b| b.to_kind(tch::Kind::BFloat16));
         q.f_internal_scaled_mm(
             &mat2,
             &scale_a,
-            scale_b,
+            &rowwise.scale,
             bias.as_ref(),
             None::<&Tensor>,
             tch::Kind::BFloat16,
@@ -403,12 +458,15 @@ impl LinearProjection {
     /// post-`take()` orientation). Also derives the load-time-packed
     /// `_scaled_mm_v2` scale layout (`scale_v2`) so the FP8 GEMM arm pays no
     /// per-call repack/padding cost, and — only when `HYPRSTREAM_FP8_GEMM` is
-    /// on — the rowwise-requantized weight pair (`rowwise`) for the v1 recipe
-    /// arm (SM89+; SM120 needs torch ≥ 2.11, see `apply_fp8_scaled_mm`).
+    /// on for E4M3 weights — the rowwise-requantized weight pair (`rowwise`)
+    /// for the v1 recipe arm (SM89+; SM120 needs torch ≥ 2.11, see
+    /// `apply_fp8_scaled_mm`). E5M2 never has a compatible scaled-mm recipe,
+    /// so it must not pay for a persistent E4M3 copy or its FP32 construction
+    /// temporary.
     #[inline]
     pub(crate) fn with_scale(weight: Tensor, scale: Tensor) -> Self {
         let scale_v2 = pack_scale_b_v2(&scale);
-        let rowwise = if fp8_gemm_enabled() {
+        let rowwise = if fp8_gemm_enabled() && weight.kind() == tch::Kind::Float8e4m3fn {
             Some(Box::new(build_rowwise_requant(&weight, &scale)))
         } else {
             None
@@ -425,7 +483,10 @@ impl LinearProjection {
             bias: self.bias.map(|b| b.to_device(device)),
             scale: self.scale.map(|s| s.to_device(device)),
             scale_v2: self.scale_v2.map(|s| s.to_device(device)),
-            rowwise: self.rowwise.map(|bs| Box::new((bs.0.to_device(device), bs.1.to_device(device)))),
+            rowwise: self.rowwise.map(|bs| Box::new(RowwiseRequant::new(
+                bs.weight.to_device(device),
+                bs.scale.to_device(device),
+            ))),
         }
     }
 
@@ -443,8 +504,10 @@ impl LinearProjection {
         // FP8 GEMM spike: config-gated (`RuntimeConfig::fp8_gemm` /
         // HYPRSTREAM_FP8_GEMM), NVIDIA Hopper (SM90, cuBLASLt ≥ 12.9) only in
         // practice. Falls through to lazy dequant when the path is unavailable
-        // or has latched off after a kernel error.
-        let fp8_out = if fp8_gemm_enabled() {
+        // or has latched off after a kernel error. `_scaled_mm` has no backward
+        // path for this recipe, so a gradient-carrying activation must retain
+        // the differentiable lazy matmul instead.
+        let fp8_out = if fp8_gemm_enabled() && !input.requires_grad() {
             self.apply_fp8_scaled_mm(input)
         } else {
             None
@@ -4209,37 +4272,54 @@ mod fp8_gemm_tests {
         started.elapsed().as_micros() as f64 / f64::from(iterations)
     }
 
-    /// Compute capability of a CUDA-visible logical device. `tch` does not
-    /// expose this CUDA-runtime query; `nvidia-smi` is available anywhere the
-    /// CUDA test can use an NVIDIA device. Respect a numeric
-    /// `CUDA_VISIBLE_DEVICES` mapping so CUDA device 0 is queried correctly.
-    fn cuda_compute_capability(device: usize) -> (u32, u32) {
+    /// Compute capability of a CUDA-visible NVIDIA device. `tch` presents
+    /// ROCm through CUDA-compatible APIs, so availability does not prove that
+    /// `nvidia-smi` exists. Return `None` to skip NVIDIA-only expectations.
+    fn nvidia_cuda_compute_capability(device: usize) -> Option<(u32, u32)> {
+        if tch::utils::has_hip() {
+            eprintln!("skipping NVIDIA FP8 capability test on ROCm/HIP backend");
+            return None;
+        }
         let gpu = std::env::var("CUDA_VISIBLE_DEVICES")
             .ok()
             .and_then(|visible| visible.split(',').nth(device).map(str::trim).map(str::to_owned))
             .filter(|id| !id.is_empty())
             .unwrap_or_else(|| device.to_string());
-        let output = Command::new("nvidia-smi")
+        let output = match Command::new("nvidia-smi")
             .arg(format!("--id={gpu}"))
             .arg("--query-gpu=compute_cap")
             .arg("--format=csv,noheader,nounits")
             .output()
-            .expect("nvidia-smi must be available to gate CUDA FP8 kernel expectations");
-        assert!(
-            output.status.success(),
-            "nvidia-smi compute-cap query failed for CUDA device {device}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        let capability = String::from_utf8(output.stdout)
-            .expect("nvidia-smi compute capability output must be UTF-8");
+        {
+            Ok(output) if output.status.success() => output,
+            Ok(output) => {
+                eprintln!("skipping NVIDIA FP8 capability test: nvidia-smi failed for CUDA device {device}: {}", String::from_utf8_lossy(&output.stderr).trim());
+                return None;
+            }
+            Err(error) => {
+                eprintln!("skipping NVIDIA FP8 capability test: cannot run nvidia-smi: {error}");
+                return None;
+            }
+        };
+        let capability = match String::from_utf8(output.stdout) {
+            Ok(capability) => capability,
+            Err(error) => {
+                eprintln!("skipping NVIDIA FP8 capability test: non-UTF-8 capability output: {error}");
+                return None;
+            }
+        };
         let capability = capability.trim();
-        let (major, minor) = capability
-            .split_once('.')
-            .expect("nvidia-smi must return compute capability as major.minor");
-        (
-            major.parse().expect("CUDA compute capability major must be numeric"),
-            minor.parse().expect("CUDA compute capability minor must be numeric"),
-        )
+        let Some((major, minor)) = capability.split_once('.') else {
+            eprintln!("skipping NVIDIA FP8 capability test: malformed compute capability {capability:?}");
+            return None;
+        };
+        match (major.parse(), minor.parse()) {
+            (Ok(major), Ok(minor)) => Some((major, minor)),
+            _ => {
+                eprintln!("skipping NVIDIA FP8 capability test: non-numeric compute capability {capability:?}");
+                None
+            }
+        }
     }
 
     /// Deterministic pseudo-random in [-1, 1]: frac(sin(i·12.9898)·43758.5453),
@@ -4407,14 +4487,14 @@ mod fp8_gemm_tests {
                 * ws.view([k / 128, 1, n / 128, 1])).view([k, n]);
 
             // Load-time rowwise requant from the FP8 checkpoint tensors.
-            let (w_rq, s_b) = build_rowwise_requant(&wq.view([k, n]), &ws);
-            assert_eq!(s_b.size(), [1, n]);
+            let rowwise = build_rowwise_requant(&wq.view([k, n]), &ws);
+            assert_eq!(rowwise.scale.size(), [1, n]);
 
             // Simulated v1 rowwise scaled_mm.
             let (q, s_a) = quantize_activations_rowwise(&x);
             assert_eq!(s_a.size(), [m, 1]);
             let x_deq = q.to_kind(Kind::Float) * s_a;
-            let w_deq = w_rq.to_kind(Kind::Float) * s_b;
+            let w_deq = rowwise.weight.to_kind(Kind::Float) * &rowwise.scale;
             let out_sim = x_deq.matmul(&w_deq);
 
             let out_lazy = x.to_kind(Kind::BFloat16)
@@ -4563,8 +4643,6 @@ mod fp8_gemm_tests {
 
         let w = det(&[256, 256], 31).clamp(-2.0, 2.0).to_kind(FP8);
         let p = LinearProjection::with_scale(w, Tensor::ones([2, 2], OPT));
-        assert_eq!(p.rowwise.is_some(), gate_on,
-            "rowwise metadata must follow FP8 GEMM only, not load-time dequant");
         let x_cpu = det(&[2, 256], 32).to_kind(Kind::BFloat16);
         let _ = p.apply(&x_cpu);
         if mode == "cpu" {
@@ -4572,6 +4650,7 @@ mod fp8_gemm_tests {
             // must stay on lazy dequant even when the FP8 gate is enabled.
             assert_eq!(FP8_APPLY_PATH.load(std::sync::atomic::Ordering::SeqCst), 2,
                 "CPU probe unexpectedly selected a scaled-mm path");
+            println!("causal gate probe: CPU lazy fallback observed");
             return;
         }
 
@@ -4580,6 +4659,13 @@ mod fp8_gemm_tests {
         assert!(tch::Cuda::is_available(), "SM120 probe requires CUDA");
         let dev = Device::Cuda(0);
         let p = p.into_device(dev);
+        let x_train = x_cpu.to_device(dev).set_requires_grad(true);
+        let out_train = p.apply(&x_train);
+        assert_eq!(FP8_APPLY_PATH.load(std::sync::atomic::Ordering::SeqCst), 2,
+            "autograd-capable input unexpectedly selected scaled-mm");
+        out_train.sum(Kind::Float).backward();
+        assert!(x_train.grad().defined(), "lazy matmul did not retain a backward path");
+
         let x = x_cpu.to_device(dev);
         let out = p.apply(&x);
         assert_eq!(out.size(), [2, 256]);
@@ -4592,6 +4678,18 @@ mod fp8_gemm_tests {
         println!("causal gate probe: FP8 on selected rowwise after blockwise latch; dequant gate off");
     }
 
+    #[test]
+    fn fp8_e5m2_no_requant_probe() {
+        if std::env::var_os("HYPRSTREAM_FP8_E5M2_PROBE").is_none() { return; }
+        assert!(fp8_gemm_enabled(), "E5M2 allocation probe requires FP8 gate on");
+        reset_rowwise_requant_peak();
+        let _projection = LinearProjection::with_scale(
+            det(&[256, 256], 41).to_kind(Kind::Float8e5m2), Tensor::ones([2, 2], OPT));
+        assert_eq!(rowwise_requant_live(), 0, "unsupported E5M2 construction retained a rowwise allocation");
+        assert_eq!(rowwise_requant_peak(), 0, "unsupported E5M2 construction invoked rowwise requantization");
+        println!("causal allocation probe: E5M2 did not construct rowwise requantization");
+    }
+
     /// Causal gate test with negative controls. Each child asserts the
     /// production `apply()` path, metadata construction, and independent
     /// dequant default; a broken gate, fallback, or env coupling fails here.
@@ -4599,41 +4697,57 @@ mod fp8_gemm_tests {
     /// manually injecting `rowwise` metadata.
     #[test]
     fn fp8_gate_causal_subprocesses() {
-        fn run_probe(name: &str, fp8: &str, dequant: &str, probe: &str) {
+        fn run_probe(name: &str, fp8: &str, dequant: &str, probe: &str, marker: &str) {
             let exe = std::env::current_exe().expect("test executable path");
-            let status = Command::new(exe)
+            let output = Command::new(exe)
                 .arg("--exact")
                 .arg(format!("runtime::architectures::llama::fp8_gemm_tests::{name}"))
                 .arg("--nocapture")
                 .env("HYPRSTREAM_FP8_GEMM", fp8)
                 .env("HYPRSTREAM_FP8_DEQUANT_LOAD", dequant)
                 .env("HYPRSTREAM_FP8_GATE_PROBE", probe)
-                .status()
+                .output()
                 .expect("spawn FP8 gate probe");
-            assert!(status.success(), "FP8 gate probe {probe} failed: {status}");
+            let transcript = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success(), "FP8 gate probe {probe} failed: {}\n{transcript}", output.status);
+            assert!(transcript.contains("1 passed"), "FP8 gate probe {probe} did not execute exactly one test:\n{transcript}");
+            assert!(transcript.contains(marker), "FP8 gate probe {probe} missed expected marker {marker:?}:\n{transcript}");
         }
 
-        run_probe("fp8_gate_probe", "0", "0", "cpu");
-        run_probe("fp8_gate_probe", "1", "0", "cpu");
-        run_probe("fp8_gate_probe", "0", "1", "cpu");
-        if tch::Cuda::is_available() {
-            run_probe("fp8_gate_probe", "1", "0", "sm120");
+        let cpu_marker = "causal gate probe: CPU lazy fallback observed";
+        run_probe("fp8_gate_probe", "0", "0", "cpu", cpu_marker);
+        run_probe("fp8_gate_probe", "1", "0", "cpu", cpu_marker);
+        run_probe("fp8_gate_probe", "0", "1", "cpu", cpu_marker);
+        let exe = std::env::current_exe().expect("test executable path");
+        let output = Command::new(&exe).arg("--exact")
+            .arg("runtime::architectures::llama::fp8_gemm_tests::fp8_e5m2_no_requant_probe")
+            .arg("--nocapture").env("HYPRSTREAM_FP8_GEMM", "1")
+            .env("HYPRSTREAM_FP8_E5M2_PROBE", "1").output().expect("spawn E5M2 allocation probe");
+        let transcript = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "E5M2 allocation probe failed: {}\n{transcript}", output.status);
+        assert!(transcript.contains("1 passed") && transcript.contains("causal allocation probe: E5M2 did not construct rowwise requantization"),
+            "E5M2 allocation probe did not execute its expected child:\n{transcript}");
+
+        if tch::Cuda::is_available() && matches!(nvidia_cuda_compute_capability(0), Some((12, _))) {
+            run_probe("fp8_gate_probe", "1", "0", "sm120", "causal gate probe: FP8 on selected rowwise after blockwise latch; dequant gate off");
         }
 
         // Fused Qwen projections run in their own exact child so their
         // `with_scale` reconstruction is checked with FP8 GEMM enabled from
         // process start, rather than inheriting this test's cached env state.
-        let exe = std::env::current_exe().expect("test executable path");
-        let status = Command::new(exe)
+        let output = Command::new(exe)
             .arg("--exact")
             .arg("runtime::architectures::qwen3_5::pipeline_tests::fp8_fused_projection_metadata_probe")
             .arg("--nocapture")
             .env("HYPRSTREAM_FP8_GEMM", "1")
             .env("HYPRSTREAM_FP8_DEQUANT_LOAD", "0")
             .env("HYPRSTREAM_QWEN_FP8_PROBE", "1")
-            .status()
+            .output()
             .expect("spawn Qwen FP8 metadata probe");
-        assert!(status.success(), "Qwen fused metadata probe failed: {status}");
+        let transcript = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "Qwen fused metadata probe failed: {}\n{transcript}", output.status);
+        assert!(transcript.contains("1 passed") && transcript.contains("Qwen fused FP8 allocation probe: source rowwise copies dropped before fused allocation"),
+            "Qwen fused allocation probe did not execute its expected child:\n{transcript}");
     }
 
     /// Real-kernel test on CUDA: rowwise must match the lazy-dequant baseline.
@@ -4664,7 +4778,7 @@ mod fp8_gemm_tests {
         let x = det_rand(&[m, k], 5).to_kind(Kind::BFloat16).to_device(dev);
 
         let out_lazy = proj.apply(&x); // flag off in tests → lazy dequant
-        let (cc_major, cc_minor) = cuda_compute_capability(0);
+        let Some((cc_major, cc_minor)) = nvidia_cuda_compute_capability(0) else { return; };
         println!("CUDA device 0 compute capability: {cc_major}.{cc_minor}");
 
         if cc_major == 9 {
