@@ -2450,6 +2450,22 @@ def main() -> None:
             deny_rule="a response proof's realized plan MUST contain exactly one signer group resolving one active response-service enrollment for its audience",
             notes="Both groups are enrolled response-service signers for the audience and both signatures verify (coverage complete); denies solely on the exactly-one response-signer-group rule.",
         )
+        # N-61 (B3): the WORKLOAD-path proof.exp <= session.expiry bound, mirroring N-51
+        # for the sid path. An otherwise-valid workload-bound proof (workload primary
+        # key, workload credential_hash) whose exp (1786000025) is WITHIN the workload
+        # credential exp (1786000030) but LATER than the authoritative workload session
+        # expiry (1786000022). Proof, credential, and session are all unexpired at
+        # verifier_now (1786000015), so it denies solely on the workload session bound.
+        n61_claims = request_claims(credential_hash=CREDENTIAL_HASH_WORKLOAD, extra={C_EXP: 1786000025})
+        n61, _, _ = sign1(p10_protected, n61_claims, sk_c_ed_wl)
+        record(
+            negatives, "N-61",
+            "Workload-session-bound proof whose exp (1786000025) exceeds the authoritative workload session exp (1786000022)",
+            "deny", "COSE_Sign1", n61,
+            deny_class="proof-session-expiry",
+            deny_rule="a proof exp MUST NOT exceed the authoritative session expiry for a workload_session_id credential",
+            notes="proof exp <= workload credential exp (1786000030) but > workload session exp (1786000022); the credential bound is satisfied, only the workload session bound denies.",
+        )
 
     meta = {
         "vector_set_version": 1,
@@ -2679,10 +2695,12 @@ def main() -> None:
                 "generic known-kid lookup or the prose `role` string in the key fixture. "
                 "Each record is keyed by the exact response `aud` + the signer-suite "
                 "content (suite_id + ordered public keys, recomputed thumbprint), with an "
-                "explicit `response-service` role, active status, expiry, and tenant "
-                "binding. The response proof's realized signer plan MUST match EXACTLY "
-                "ONE active record for its audience; unknown, wrong-role, wrong-audience, "
-                "inactive/expired, key/suite-mismatched, or ambiguous records deny. Not a "
+                "explicit `response-service` role, active status, expiry, and a `tenant` "
+                "bound to the tenant DERIVED FROM THE ORIGINATING AUTHENTICATED REQUEST "
+                "(B2). The response proof's realized plan MUST contain EXACTLY ONE signer "
+                "group resolving EXACTLY ONE active record for its audience; unknown, "
+                "wrong-role, wrong-audience, wrong-tenant, inactive/expired, "
+                "key/suite-mismatched, ambiguous, or multi-group responses deny. Not a "
                 "wire/proof field; no registry/IANA allocation."
             ),
         },

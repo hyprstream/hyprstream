@@ -369,14 +369,15 @@ A conforming verifier is checked against at least:
     wrong-typed session identifier: a present `sid`/`workload_session_id` must be a
     non-empty opaque string or it fails closed directly in both layers, and a
     credential never carries both identifiers;**
-14. **(Z1/A3) a response proof's signer is authorized only through authoritative
+14. **(Z1/A3/B2) a response proof's signer is authorized only through authoritative
     off-wire service trust state bound to the response audience (a `response-service`
-    enrollment keyed by the exact `aud` + signer-suite content), never a generic
-    known-`kid` lookup or a prose `role` string; the realized plan must contain
+    enrollment keyed by the exact `aud` + signer-suite content, and whose `tenant`
+    equals the tenant derived from the originating authenticated request), never a
+    generic known-`kid` lookup or a prose `role` string; the realized plan must contain
     **exactly one** signer group resolving **exactly one** active record for its
-    audience, and unknown/wrong-role/wrong-audience/inactive/expired/key-suite-
-    mismatched/ambiguous/multi-group responses deny (the general non-response `1*8`
-    cap is unaffected); and**
+    audience, and unknown/wrong-role/wrong-audience/wrong-tenant/inactive/expired/
+    key-suite-mismatched/ambiguous/multi-group responses deny (the general non-response
+    `1*8` cap is unaffected); and**
 15. **(Z2) `iat` and `exp` are integer Unix-second NumericDate values (Python `bool`
     excluded), validated before any temporal comparison in both layers; a boolean,
     string, `null`, float, or missing timestamp denies cleanly, never by exception.**

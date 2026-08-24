@@ -336,11 +336,13 @@ def resolve_response_signer_enrollments(creds_doc, aud, requested_thumbprint_b64
     return out
 
 
-def validate_response_signer_enrollment(matches, requested_thumbprint_b64, aud, now):
-    """Z1: a RESPONSE proof's realized signer plan MUST resolve to EXACTLY ONE active,
-    unexpired, `response-service`-role enrollment for its audience. Unknown, ambiguous,
-    tampered, key/suite-mismatched, wrong-audience, wrong-role, inactive, or expired
-    records deny (fail closed). `matches` is the resolver's result list."""
+def validate_response_signer_enrollment(matches, requested_thumbprint_b64, aud, now, expected_tenant=None):
+    """Z1/B2: a RESPONSE proof's realized signer plan MUST resolve to EXACTLY ONE
+    active, unexpired, `response-service`-role enrollment for its audience whose
+    `tenant` equals the tenant derived from the originating authenticated request
+    (B2, when `expected_tenant` is supplied). Unknown, ambiguous, tampered,
+    key/suite-mismatched, wrong-audience, wrong-role, wrong-tenant, inactive, or
+    expired records deny (fail closed). `matches` is the resolver's result list."""
     if not matches:
         return ["no authoritative response-signer enrollment for this audience + realized signer"]
     if len(matches) > 1:
@@ -358,6 +360,8 @@ def validate_response_signer_enrollment(matches, requested_thumbprint_b64, aud, 
         errs.append(f"response-signer enrollment audience {rec.get('aud')!r} != response audience {aud!r}")
     if rec.get("role") != "response-service":
         errs.append(f"response-signer enrollment role {rec.get('role')!r} is not 'response-service'")
+    if expected_tenant is not None and rec.get("tenant") != expected_tenant:
+        errs.append(f"response-signer enrollment tenant {rec.get('tenant')!r} != originating-request tenant {expected_tenant!r}")
     if rec.get("status") != "active":
         errs.append(f"response-signer enrollment status {rec.get('status')!r} is not active")
     ea = rec.get("expires_at")
@@ -1166,9 +1170,19 @@ def main() -> None:
         def signer_suite_tp(suite, pubs) -> bytes:
             return hashlib.sha256(enc([suite, list(pubs)])).digest()
 
-        # Z1/A3: a RESPONSE proof's realized plan MUST contain EXACTLY ONE signer group
-        # that resolves EXACTLY ONE active audience-bound response-service enrollment.
-        def _resp_signer_errors(o, bh):
+        # Z1/A3/B2: a RESPONSE proof's realized plan MUST contain EXACTLY ONE signer
+        # group resolving EXACTLY ONE active audience-bound response-service enrollment
+        # whose tenant equals the originating-request tenant (B2).
+        _p2c = cd.get("positive_to_credential", {})
+
+        def _orig_tenant(vec):
+            orig = vec.get("originating_request")
+            credname = _p2c.get(orig) if orig is not None else None
+            if credname is None:
+                return None
+            return cd["credentials"][credname]["claims"].get("tenant")
+
+        def _resp_signer_errors(o, bh, vec):
             aud = decode(o[2]).get(3) if isinstance(decode(o[2]), dict) else None
             plan = bh.get(H_PLAN) or []
             if len(plan) != 1:
@@ -1188,7 +1202,8 @@ def main() -> None:
             if len(tps) != 1:
                 return [f"a response proof must resolve exactly one signer group, got {len(tps)}"]
             return validate_response_signer_enrollment(
-                resolve_response_signer_enrollments(cd, aud, tps[0]), tps[0], aud, now)
+                resolve_response_signer_enrollments(cd, aud, tps[0]), tps[0], aud, now,
+                expected_tenant=_orig_tenant(vec))
 
         for v in positive["vectors"]:
             try:
@@ -1198,7 +1213,7 @@ def main() -> None:
                 continue
             if bh.get(H_TYP) != TYP_RESPONSE or H_KEYSET in bh:
                 continue
-            for e in _resp_signer_errors(o, bh):
+            for e in _resp_signer_errors(o, bh, v):
                 fail(f"{v['id']} response signer: {e}")
         # The response-signer negatives (N-58/N-59/N-60) MUST deny under the same rule.
         for v in negative["vectors"]:
@@ -1211,7 +1226,7 @@ def main() -> None:
                 continue
             if bh.get(H_TYP) != TYP_RESPONSE:
                 continue
-            if not _resp_signer_errors(o, bh):
+            if not _resp_signer_errors(o, bh, v):
                 fail(f"{v['id']}: a response-signer negative must deny under the exactly-one response-signer rule")
 
         def verify_at_jwt(token: str, label: str):
@@ -1336,12 +1351,17 @@ def main() -> None:
                 for e in validate_approver_enrollment(rec, gtp, cred_tenant, now):
                     fail(f"{pid} approver group_id {grp[1]}: {e}")
             # K1: proof exp <= credential exp, and for a sid-bearing credential also
-            # <= the authoritative session exp.
+            # <= the authoritative session exp. B1: the credential exp must be a valid
+            # NumericDate before the comparison (a bad type is a clean denial, never a
+            # TypeError); a non-NumericDate credential exp is already denied above.
             pexp = pclaims.get(4)
-            if isinstance(pexp, int) and pexp > cred_claims.get("exp", 0):
-                fail(f"{pid}: proof exp {pexp} exceeds credential exp {cred_claims.get('exp')}")
+            cexp = cred_claims.get("exp")
+            if not is_numericdate(cexp):
+                fail(f"{pid}: mapped credential exp must be a NumericDate, got {cexp!r}")
+            elif isinstance(pexp, int) and pexp > cexp:
+                fail(f"{pid}: proof exp {pexp} exceeds credential exp {cexp}")
             sess, _ = validate_session(cd, cred_claims, now)
-            if sess is not None and isinstance(pexp, int) and pexp > sess.get("expiry", 0):
+            if sess is not None and is_numericdate(sess.get("expiry")) and isinstance(pexp, int) and pexp > sess["expiry"]:
                 fail(f"{pid}: proof exp {pexp} exceeds session exp {sess.get('expiry')}")
 
     # ---- W1: proof freshness at the frozen verifier clock (design §4.5) ------

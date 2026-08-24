@@ -13,7 +13,7 @@ Machine-readable files (the normative form — this page is the human index):
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
 | [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 10 vectors that MUST verify |
-| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 65 vectors that MUST deny |
+| [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 66 vectors that MUST deny |
 | [`vectors/proof-v1-thumbprints.json`](vectors/proof-v1-thumbprints.json) | Cross-implementation replay-namespace thumbprint vectors (C1) |
 | [`vectors/proof-v1-credentials.json`](vectors/proof-v1-credentials.json) | Frozen `verifier_now` clock (F1) and the issuer-signed at+jwt tokens the authenticated positives hash (F2) |
 
@@ -415,6 +415,7 @@ Ed25519 signature over the stripped object.
 | N-58 | response-signer | Response proof signed by the client key (not the enrolled response-service signer) | 372 |
 | N-59 | response-signer | Service-signed response proof for an unenrolled audience (`other.svc.hyprstream.test`) | 371 |
 | N-60 | response-signer | Two-group `COSE_Sign` response (both groups enrolled) — violates exactly-one response signer | 539 |
+| N-61 | proof-session-expiry | Workload-session-bound proof whose `exp` (1786000025) is within the credential expiry but exceeds the authoritative workload session expiry (1786000022) | 401 |
 
 ### Notes on individual negatives
 
@@ -534,7 +535,14 @@ Ed25519 signature over the stripped object.
   bound is satisfied and all three are unexpired at `verifier_now`). The gate and
   checker enforce `proof.exp <= session.exp` for a session-bound proof and validate
   the session as active, `(iss, sid)`-keyed, and `iss`/`sub`/`tenant`-coherent with
-  the credential; an unknown, revoked, expired, or mismatched session denies. The
+  the credential; an unknown, revoked, expired, or mismatched session denies. The same
+  `proof.exp <= session.exp` bound is causally covered for the **workload** session
+  path (B3): **P-10** is the within-bound admits control (workload-bound proof whose
+  `exp` = the workload session expiry `1786000022`), and **N-61** is the causal denial —
+  an otherwise-valid workload-bound proof whose `exp` (`1786000025`) is within the
+  workload credential expiry (`1786000030`) but **past** the workload session expiry
+  (`1786000022`), so it denies **solely** on the workload session bound (mirroring
+  N-51 for the `sid` path). The
   authoritative session state also carries a **deterministic integer
   `clearance_epoch`** (§3.4, L3) — an off-wire authority field, never a credential
   claim; the gate and checker require it present and a non-negative integer, and a
@@ -580,8 +588,11 @@ Ed25519 signature over the stripped object.
   the prose `role` string in the key fixture. `proof-v1-credentials.json`
   `response_signer_enrollments` holds records keyed by the exact response `aud` + the
   signer-suite content (`suite_id` + ordered public keys, recomputed thumbprint), with
-  an explicit **`response-service`** role, active status, and expiry. Both the gate and
-  the checker require every response proof's **realized** plan to contain **exactly one**
+  an explicit **`response-service`** role, active status, expiry, and a **`tenant` bound
+  to the tenant derived from the originating authenticated request (B2)** — the response
+  proof's `originating_request` maps to a credential whose tenant the record must equal
+  (a wrong-tenant record denies; the corrected record admits). Both the gate and the
+  checker require every response proof's **realized** plan to contain **exactly one**
   signer group that resolves **exactly one** active such record for its audience (**A3**);
   **N-58** is a self-consistent response signed **entirely by the client key** — the
   exact shape accepted before the resolver existed — and denies because the client is
@@ -600,7 +611,13 @@ Ed25519 signature over the stripped object.
   `exp` produces a **clean profile denial** — never an exception or an incidental
   time-window failure — while `iat <= verifier_now < exp` and all proof/credential/
   session expiry bounds are preserved. Re-signed boolean and string `iat`/`exp`
-  counter-cases deny single-cause.
+  counter-cases deny single-cause. **(B1)** the guard is applied at **every** raw
+  credential-`exp` use in both layers — not only the F1 verifier-clock loop but the
+  F2 credential-vs-proof `exp` comparison, the §12 causality-inventory
+  credential/session-expiry map, and the checker's K1 proof-exp comparisons — so a
+  missing/string/null/bool/float credential `exp` denies cleanly there too, never a
+  `KeyError`/`TypeError` (the shipped fixtures all carry integer timestamps, so this is
+  purely defensive and byte-identical for them).
 - **N-12 / N-28 (suite ↔ component-plan binding).** Each suite_id is bound to its
   exact ordered algorithms and component count: `hs-cose-sign-ed25519-v1` is
   exactly one Ed25519 component, `hs-cose-sign-ed25519-mldsa65-wns-v1` is exactly

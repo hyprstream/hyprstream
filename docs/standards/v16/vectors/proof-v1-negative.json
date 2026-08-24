@@ -769,6 +769,18 @@
       "deny_class": "response-signer",
       "deny_rule": "a response proof's realized plan MUST contain exactly one signer group resolving one active response-service enrollment for its audience",
       "notes": "Both groups are enrolled response-service signers for the audience and both signatures verify (coverage complete); denies solely on the exactly-one response-signer-group rule."
+    },
+    {
+      "id": "N-61",
+      "title": "Workload-session-bound proof whose exp (1786000025) exceeds the authoritative workload session exp (1786000022)",
+      "expect": "deny",
+      "structure": "COSE_Sign1",
+      "size_bytes": 401,
+      "sha256": "09f6a027fb8a51141fe7ed4878a86634973f3d459da7762ca2385877d145e0ed",
+      "cbor_hex": "8458afa7013202833a000111d53a000111d43a000111d30453636c69656e742d656432353531392d776c2d311078246170706c69636174696f6e2f766e642e6879707273747265616d2e70726f6f662b6377743a000111d37768732d7270632d726571756573742d70726f6f662d76313a000111d481a30101027768732d636f73652d7369676e2d656432353531392d76310381a201320253636c69656e742d656432353531392d776c2d313a000111d501a0589aa803781c72656769737472792e7376632e6879707273747265616d2e74657374041a6a743299061a6a74328007503f1c9a04b7d2416e8c05a9137b6e2d803a000111705820a14e7de3f2525ad38e72dbf427489bf9805893f592b714c82a4eb0a2ab5f84923a000111711bd4d0f2a1b3c58e673a00011172581a00000000000000000100000017000000010005000000000000003a00011173f65840cf22082c61d88a8580d4030e173f347a6aec80793210250faec81e2699c2ece272e70cb1532481119cf78d0b7e1c8ef6113370932e37d4946686fcf14747450a",
+      "deny_class": "proof-session-expiry",
+      "deny_rule": "a proof exp MUST NOT exceed the authoritative session expiry for a workload_session_id credential",
+      "notes": "proof exp <= workload credential exp (1786000030) but > workload session exp (1786000022); the credential bound is satisfied, only the workload session bound denies."
     }
   ]
 }

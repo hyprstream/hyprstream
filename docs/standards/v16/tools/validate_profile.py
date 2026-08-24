@@ -70,7 +70,7 @@ from check_proof_vectors import (  # noqa: E402
     configured_issuer, is_credential_revoked, terminal_signer_principal,
     cross_record_component_key_conflicts,
     validate_jwt_header, validate_required_scalars, validate_act_chain, clearance_meet,
-    validate_numericdate_claims,
+    validate_numericdate_claims, is_numericdate,
     resolve_response_signer_enrollments, validate_response_signer_enrollment,
 )
 
@@ -1433,13 +1433,17 @@ def gate_causality_inventory(cddl, positives, negatives) -> None:
     _creds = _load_credentials()
     _now = _creds["verifier_now"]
     import hashlib as _hl
+    # B1: only credentials whose `exp` is a valid NumericDate enter the map (a missing/
+    # string/null/bool/float exp yields no entry, so downstream `.get()` returns None
+    # and the consumers handle it cleanly — never a KeyError/TypeError).
     cred_exp_by_hash = {_hl.sha256(c["token"].encode("ascii")).digest(): c["claims"]["exp"]
-                        for c in _creds["credentials"].values()}
+                        for c in _creds["credentials"].values()
+                        if is_numericdate(c["claims"].get("exp"))}
     # K1: token hash -> the authoritative session exp of a sid-bearing credential.
     cred_session_exp_by_hash = {}
     for c in _creds["credentials"].values():
         s, _ = validate_session(_creds, c["claims"], _now)
-        if s is not None:
+        if s is not None and is_numericdate(s.get("expiry")):
             cred_session_exp_by_hash[_hl.sha256(c["token"].encode("ascii")).digest()] = s["expiry"]
     PROOF_TYPS = (TYP_REQUEST, TYP_RESPONSE)
     REQUIRED_CLAIMS = {C_AUD, C_EXP, C_IAT, C_CTI, C_CREDENTIAL_HASH, C_SCHEMA_ID, C_BODY_BYTES, C_RESPONSE_BINDING}
@@ -2116,9 +2120,23 @@ def gate_response_signer(positives, negatives) -> None:
                 tps.append(_b64u(_suite_thumbprint(grp[2], pubs)))
         return aud, tps
 
+    p2c = creds.get("positive_to_credential", {})
+
+    def originating_tenant(vec):
+        """B2: the tenant derived from the response proof's ORIGINATING authenticated
+        request — its `originating_request` positive maps to a credential whose tenant
+        is the expected response-signer-enrollment tenant. None if no originating
+        request is declared."""
+        orig = vec.get("originating_request")
+        credname = p2c.get(orig) if orig is not None else None
+        if credname is None:
+            return None
+        return creds["credentials"][credname]["claims"].get("tenant")
+
     def response_signer_errors(vec):
-        """A3: a response proof's realized plan MUST contain EXACTLY ONE signer group
-        that resolves EXACTLY ONE active audience-bound response-service enrollment."""
+        """A3/B2: a response proof's realized plan MUST contain EXACTLY ONE signer group
+        that resolves EXACTLY ONE active audience-bound response-service enrollment
+        whose tenant equals the originating-request tenant (B2)."""
         obj = decode(bytes.fromhex(vec["cbor_hex"]))
         plan = decode(obj[0]).get(H_PLAN) or []
         if len(plan) != 1:
@@ -2127,7 +2145,8 @@ def gate_response_signer(positives, negatives) -> None:
         if len(tps) != 1:
             return [f"a response proof must resolve exactly one signer group, got {len(tps)}"]
         return validate_response_signer_enrollment(
-            resolve_response_signer_enrollments(creds, aud, tps[0]), tps[0], aud, now)
+            resolve_response_signer_enrollments(creds, aud, tps[0]), tps[0], aud, now,
+            expected_tenant=originating_tenant(vec))
 
     # Every RESPONSE positive resolves exactly one active response-service enrollment.
     resp_pos = [v for v in positives["vectors"]
@@ -2154,6 +2173,23 @@ def gate_response_signer(positives, negatives) -> None:
         for tp in n60_tps), "N-60's two groups must each resolve a valid enrollment (isolation)")
     check(response_signer_errors(by_id["N-60"])[0].startswith("a response proof must have exactly one"),
           "N-60 must deny solely on the exactly-one-signer-group rule")
+
+    # B2: the response-signer enrollment tenant MUST equal the tenant derived from the
+    # originating authenticated request. Corrected control admits; wrong-tenant denies.
+    p_bind = next((v for v in resp_pos if v.get("originating_request")), None)
+    check(p_bind is not None, "a response positive must declare an originating request (B2 tenant bind)")
+    if p_bind is not None:
+        exp_tenant = originating_tenant(p_bind)
+        b_aud, b_tps = realized(p_bind)
+        base_resp = creds["response_signer_enrollments"][0]
+        check(exp_tenant is not None and not validate_response_signer_enrollment(
+            [base_resp], b_tps[0], b_aud, now, expected_tenant=exp_tenant),
+            f"B2 control: shipped response enrollment tenant matches the originating request tenant {exp_tenant!r} (admits)")
+        wrong = bool(validate_response_signer_enrollment(
+            [{**base_resp, "tenant": "tenant-beta"}], b_tps[0], b_aud, now, expected_tenant=exp_tenant))
+        check(wrong, "B2 wrong-tenant: a response enrollment whose tenant != originating-request tenant denies")
+        print(f"   B2 response-signer tenant bound to the originating request ({exp_tenant}); "
+              f"wrong-tenant denies, corrected admits")
 
     # Record-level counter-proofs: mutating the shipped enrollment must deny a proof
     # that otherwise resolves it (the resolver is load-bearing on every field).
@@ -2314,14 +2350,19 @@ def gate_credential_context(positives, negatives) -> None:
         ch = pclaims.get(C_CREDENTIAL_HASH)
         check(ch == hashlib.sha256(cred["token"].encode("ascii")).digest(),
               f"{pid}: credential_hash must equal SHA-256 of the mapped {credname} credential")
-        # H1: a proof's exp MUST NOT exceed the mapped credential's exp.
-        check(pclaims[C_EXP] <= cred["claims"]["exp"],
-              f"{pid}: proof exp {pclaims[C_EXP]} must not exceed credential exp {cred['claims']['exp']}")
+        # H1: a proof's exp MUST NOT exceed the mapped credential's exp. B1: guard the
+        # raw credential-exp comparison — a non-NumericDate credential exp is already a
+        # clean denial via _verify_credential, so skip the compare rather than crash.
+        cexp = cred["claims"].get("exp")
+        check(is_numericdate(cexp), f"{pid}: mapped credential exp must be a NumericDate, got {cexp!r}")
+        if is_numericdate(cexp):
+            check(pclaims[C_EXP] <= cexp,
+                  f"{pid}: proof exp {pclaims[C_EXP]} must not exceed credential exp {cexp}")
         # K1: for a sid-bearing credential, the authoritative session must be valid
         # and the proof exp must not exceed the session exp either.
         sess, serrs = validate_session(creds, cred["claims"], now)
         check(not serrs, f"{pid}: mapped session invalid: {serrs}")
-        if sess is not None:
+        if sess is not None and is_numericdate(sess.get("expiry")):
             check(pclaims[C_EXP] <= sess["expiry"],
                   f"{pid}: proof exp {pclaims[C_EXP]} must not exceed session exp {sess['expiry']}")
     print(f"   both credentials valid; {len(creds['positive_to_credential'])} positives bind their "
@@ -2575,9 +2616,16 @@ def gate_credential_context(positives, negatives) -> None:
         "the workload credential cnf must resolve a valid workload-1 primary enrollment")
     check("P-10" in creds["positive_to_credential"] and creds["positive_to_credential"]["P-10"] == "workload",
           "a positive proof (P-10) must be mapped to the workload credential (non-vacuous)")
-    check(bool(validate_primary_enrollment(
-        {**wl_prec, "principal": "user-1"}, wl_cnf_b64, wl_claims["tenant"], wl_princ, now)),
-        "A1 wrong-principal: a workload enrollment naming user-1 must deny")
+    # A1 wrong-principal: a workload enrollment naming user-1 denies. O1: build the
+    # mutated record from wl_prec ONLY when it resolved (never spread a None record —
+    # a deleted/absent enrollment resolves to None and must itself deny cleanly).
+    if wl_prec is not None:
+        check(bool(validate_primary_enrollment(
+            {**wl_prec, "principal": "user-1"}, wl_cnf_b64, wl_claims["tenant"], wl_princ, now)),
+            "A1 wrong-principal: a workload enrollment naming user-1 must deny")
+    # O1: a DELETED (None) workload primary enrollment denies cleanly, never crashes.
+    check(bool(validate_primary_enrollment(None, wl_cnf_b64, wl_claims["tenant"], wl_princ, now)),
+          "A1/O1: a deleted (None) workload primary enrollment must deny cleanly")
     check(resolve_primary_enrollment(creds, _b64u(_suite_thumbprint(SUITE_HYBRID, [b"\x33" * 32]))) is None,
           "A1 wrong-suite/missing: an unmatched cnf must resolve no primary enrollment")
     print("   A1 workload credential resolves a coherent workload-1 primary enrollment, "
@@ -2781,10 +2829,27 @@ def gate_credential_context(positives, negatives) -> None:
           "a workload_session_id must not resolve in the user sid namespace")
     check(resolve_session(creds, sc["iss"], sc["sid"], "workload_session_id") is None,
           "a user sid must not resolve in the workload namespace")
-    # A workload-bound proof is also bounded by the workload session expiry (same
-    # rule the F2 loop applies to sid sessions): a proof exp beyond it is out of bound.
-    check(isinstance(s_wl.get("expiry"), int) and not (s_wl["expiry"] + 1 <= s_wl["expiry"]),
-          "the workload session must expose an integer expiry that bounds a workload-bound proof")
+    # B3: the workload `proof.exp <= session.expiry` bound is CAUSAL, not a tautology.
+    # It is enforced by the F2 loop for the mapped workload positive P-10 (exp within
+    # the workload session), and the shipped negative N-61 (an otherwise-valid
+    # workload-bound proof whose exp exceeds the workload session expiry) denies via the
+    # causality inventory. Assert both, and that N-61's exp sits between the session exp
+    # and the credential exp (so the SOLE cause is the workload session bound).
+    wl_exp = s_wl["expiry"]
+    check(isinstance(wl_exp, int), "the workload session must expose an integer expiry")
+    p10 = next((v for v in positives["vectors"] if v["id"] == "P-10"), None)
+    check(p10 is not None and claims_of(p10["cbor_hex"])[C_EXP] <= wl_exp,
+          "P-10 (mapped workload positive) exp must be within the workload session bound (admits-when-corrected control)")
+    n61 = next((v for v in negatives["vectors"] if v["id"] == "N-61"), None)
+    check(n61 is not None, "N-61 (workload over-session-expiry negative) must exist")
+    if n61 is not None:
+        n61_exp = claims_of(n61["cbor_hex"])[C_EXP]
+        wl_cred_exp = wl_cred["exp"]
+        check(wl_exp < n61_exp <= wl_cred_exp,
+              f"N-61 exp {n61_exp} must exceed the workload session exp {wl_exp} yet stay within the "
+              f"credential exp {wl_cred_exp} (denies solely on the workload session bound)")
+    print(f"   B3 workload proof-exp<=session-exp bound is causal: P-10 within-bound admits, "
+          f"N-61 over-bound denies")
 
     def workload_red(label, mutate):
         cd = _copy.deepcopy(creds)
