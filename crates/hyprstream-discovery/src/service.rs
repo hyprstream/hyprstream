@@ -810,6 +810,17 @@ pub struct DiscoveryService {
 }
 
 impl DiscoveryService {
+    /// Remove expired cross-process reach before exposing Discovery state to a
+    /// remote caller. A fetch is observational: it must not refresh a
+    /// publisher's heartbeat or let a remote resolver resurrect stale reach.
+    fn reap_stale_announced_endpoints(&self) {
+        let mut announced = self.announced_endpoints.write();
+        announced.retain(|_, endpoints| {
+            endpoints.retain(|endpoint| endpoint.last_heartbeat.elapsed() <= ANNOUNCED_ENDPOINT_TTL);
+            !endpoints.is_empty()
+        });
+    }
+
     /// Create a new discovery service with infrastructure.
     ///
     /// `signing_key` is used for envelope signing (should be the per-service key
@@ -4653,7 +4664,7 @@ mod resolver_tests {
     }
 
     #[tokio::test]
-    async fn ordinary_announcement_handler_populates_production_resolver() {
+    async fn ordinary_iroh_announcement_handler_populates_production_resolver() {
         let (state, service_signing) = accepted_state(12);
         let root = SigningKey::from_bytes(&[0x61; 32]);
         let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
@@ -4690,8 +4701,8 @@ mod resolver_tests {
                 1,
                 &ServiceAnnouncement {
                     service_name: "model".to_owned(),
-                    socket_kind: "quic".to_owned(),
-                    endpoint: "quic://localhost:127.0.0.1:9".to_owned(),
+                    socket_kind: "iroh".to_owned(),
+                    endpoint: format!("iroh://{}", hex::encode([0x7a; 32])),
                     service_jwt: Some(jwt),
                     service_did: Did::from(state.did.clone()),
                     capabilities: vec!["hyprstream-rpc/1".to_owned()],
@@ -4712,6 +4723,55 @@ mod resolver_tests {
             .await
             .expect("ordinary announcement must resolve");
         assert_eq!(resolved.evidence().accepted_state_digest, state.head_digest);
+        assert!(matches!(
+            &resolved.transport().endpoint,
+            EndpointType::Iroh {
+                node_id,
+                direct_addrs,
+                relay_url: None,
+            } if *node_id == [0x7a; 32] && direct_addrs.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_get_endpoints_omits_stale_and_fetch_cannot_refresh_it() {
+        let service = service();
+        let name = "stale-remote-reach";
+        service.announced_endpoints.write().insert(
+            name.to_owned(),
+            vec![legacy_endpoint(
+                "iroh",
+                &format!("iroh://{}", hex::encode([0x73; 32])),
+                Instant::now() - ANNOUNCED_ENDPOINT_TTL - Duration::from_secs(1),
+            )],
+        );
+        let signer = SigningKey::from_bytes(&[0x74; 32]);
+        let pq_signer = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signer);
+        let signed = hyprstream_rpc::SignedEnvelope::new_signed_hybrid(
+            hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()),
+            &signer,
+            &pq_signer,
+        );
+        let ctx = EnvelopeContext::from_verified_as_system(&signed);
+
+        let response = service
+            .handle_get_endpoints(&ctx, 1, name)
+            .await
+            .expect("remote getEndpoints handler");
+        assert!(matches!(response, DiscoveryResponseVariant::Error(_)));
+        assert!(
+            !service.announced_endpoints.read().contains_key(name),
+            "remote fetch must reap rather than refresh stale reach"
+        );
+
+        let listed = service
+            .handle_list_services(&ctx, 2)
+            .await
+            .expect("remote listServices handler");
+        let DiscoveryResponseVariant::ListServicesResult(services) = listed else {
+            panic!("listServices must return service summaries");
+        };
+        assert!(services.services.iter().all(|summary| summary.name != name));
     }
 
     #[tokio::test]
@@ -5703,6 +5763,10 @@ impl DiscoveryHandler for DiscoveryService {
             .collect();
         drop(reg);
 
+        // Reap before serializing remote service information. In particular,
+        // listing must not expose stale socket kinds after their reach expired.
+        self.reap_stale_announced_endpoints();
+
         // Merge announced endpoints from other processes
         let announced = self.announced_endpoints.read();
         let local_names: Vec<String> = summaries.iter().map(|s| s.name.clone()).collect();
@@ -5769,6 +5833,9 @@ impl DiscoveryHandler for DiscoveryService {
                 .collect(),
             None => Vec::new(),
         };
+
+        // Reap before serializing remote reach. Fetching is never a heartbeat.
+        self.reap_stale_announced_endpoints();
 
         // Merge announced endpoints from other processes (carry service JWT)
         let announced = self.announced_endpoints.read();

@@ -243,23 +243,13 @@ where
             ))
         }
         EndpointType::Iroh {
-            direct_addrs,
-            relay_url,
-            ..
-        } if direct_addrs.is_empty() && relay_url.is_none() => {
-            // Fail fast rather than hand iroh an EndpointId with no reachability,
-            // which would fall through to discovery and time out (~10-30s). The
-            // resolver is expected to supply at least one direct addr or a relay.
-            bail!(
-                "dial(): iroh endpoint has neither direct addrs nor a relay URL — \
-                 not dialable; the resolver must supply reachability"
-            )
-        }
-        EndpointType::Iroh {
             node_id,
             direct_addrs,
             relay_url,
         } => {
+            // Discovery may publish only the NodeId. LazyIrohTransport gives its
+            // N0-enabled endpoint that empty-hints address under a bounded connect
+            // timeout; NodeId never replaces the independent authority below.
             let response_key = server_verifying_key.ok_or_else(|| {
                 anyhow!(
                     "dial(): iroh reach has no independently resolved application response key; \
@@ -647,6 +637,21 @@ mod tests {
                 .contains("no iroh client endpoint installed"),
             "expected an install-endpoint error (node_id-alone is dialable once an \
              endpoint is installed); got: {err}"
+        );
+    }
+
+    #[test]
+    fn rpc_iroh_node_id_alone_builds_lazy_transport_but_never_uses_node_as_authority() {
+        let response_signer = SigningKey::generate(&mut OsRng);
+        let cfg = TransportConfig::iroh([0x19; 32], Vec::new(), None);
+
+        assert!(
+            dial(&cfg, test_signer(), Some(response_signer.verifying_key()), None).is_ok(),
+            "an empty-hints NodeId must reach LazyIrohTransport for bounded N0 discovery"
+        );
+        assert!(
+            dial(&cfg, test_signer(), None, None).is_err(),
+            "NodeId must not be repurposed as an application response key"
         );
     }
 

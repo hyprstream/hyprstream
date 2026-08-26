@@ -2751,6 +2751,24 @@ fn main() -> Result<()> {
                                                         }
                                                     };
                                                     runtime.block_on(async move {
+                                                        const ANNOUNCEMENT_REFRESH: std::time::Duration =
+                                                            std::time::Duration::from_secs(25);
+                                                        const RETRY_INITIAL: std::time::Duration =
+                                                            std::time::Duration::from_secs(5);
+                                                        let socket_kind = request.reach.socket_kind().to_owned();
+                                                        let endpoint = request.reach.endpoint();
+                                                        let service_name = request.service_name.clone();
+                                                        let jwt_expires_at_unix_ms = request.service_jwt.as_deref().and_then(|jwt| {
+                                                            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                                                            let payload = jwt.split('.').nth(1)?;
+                                                            let claims = URL_SAFE_NO_PAD.decode(payload).ok()
+                                                                .and_then(|payload| serde_json::from_slice::<serde_json::Value>(&payload).ok())?;
+                                                            claims["exp"].as_i64()?.checked_mul(1_000)
+                                                        });
+                                                        let refresh_expires_at_unix_ms = jwt_expires_at_unix_ms
+                                                            .map_or(request.expires_at_unix_ms, |jwt_expiry| {
+                                                                request.expires_at_unix_ms.min(jwt_expiry)
+                                                            });
                                                         let client = match hyprstream_discovery::DiscoveryClient::for_local_bootstrap(
                                                             request.signing_key,
                                                             request.discovery_verifying_key,
@@ -2763,9 +2781,9 @@ fn main() -> Result<()> {
                                                             }
                                                         };
                                                         let announcement = hyprstream_discovery::ServiceAnnouncement {
-                                                            service_name: request.service_name,
-                                                            socket_kind: "quic".to_owned(),
-                                                            endpoint: request.endpoint,
+                                                            service_name,
+                                                            socket_kind,
+                                                            endpoint,
                                                             service_jwt: request.service_jwt,
                                                             service_did: request.service_did,
                                                             capabilities: request.capabilities,
@@ -2776,9 +2794,42 @@ fn main() -> Result<()> {
                                                             request_kem_recipient: request.request_kem_recipient,
                                                             expires_at_unix_ms: request.expires_at_unix_ms,
                                                         };
-                                                        match client.announce(&announcement).await {
-                                                            Ok(_) => tracing::info!("Announced QUIC endpoint to DiscoveryService"),
-                                                            Err(error) => tracing::warn!("Failed to announce QUIC endpoint: {error}"),
+                                                        let mut delay = RETRY_INITIAL;
+                                                        loop {
+                                                            if chrono::Utc::now().timestamp_millis()
+                                                                >= refresh_expires_at_unix_ms
+                                                            {
+                                                                tracing::warn!(
+                                                                    service = %announcement.service_name,
+                                                                    socket_kind = %announcement.socket_kind,
+                                                                    "Stopping native announcement refresh: accepted-state/JWT material expired"
+                                                                );
+                                                                break;
+                                                            }
+                                                            match client.announce(&announcement).await {
+                                                                Ok(_) => {
+                                                                    tracing::info!(
+                                                                        service = %announcement.service_name,
+                                                                        socket_kind = %announcement.socket_kind,
+                                                                        endpoint = %announcement.endpoint,
+                                                                        "Announced native endpoint to DiscoveryService"
+                                                                    );
+                                                                    delay = ANNOUNCEMENT_REFRESH;
+                                                                }
+                                                                Err(error) => {
+                                                                    tracing::warn!(
+                                                                        service = %announcement.service_name,
+                                                                        socket_kind = %announcement.socket_kind,
+                                                                        "Failed to announce native endpoint: {error}"
+                                                                    );
+                                                                    delay = delay
+                                                                        .checked_mul(2)
+                                                                        .unwrap_or(ANNOUNCEMENT_REFRESH)
+                                                                        .min(ANNOUNCEMENT_REFRESH)
+                                                                        .max(RETRY_INITIAL);
+                                                                }
+                                                            }
+                                                            tokio::time::sleep(delay).await;
                                                         }
                                                     });
                                                 });
