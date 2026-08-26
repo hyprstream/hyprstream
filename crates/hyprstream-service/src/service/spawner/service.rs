@@ -86,6 +86,11 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
             let processor: Arc<dyn IrohRequestProcessor> = Arc::new(bridge);
 
             if let Some(mut qc) = quic_config {
+                if qc.iroh_required && !qc.iroh_enabled {
+                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "network-iroh-required rejects iroh = false".to_owned(),
+                    ));
+                }
                 // web-transport-quinn has no per-builder provider hook and
                 // resolves rustls's process default. Install and validate it at
                 // the actual bind seam so task/thread/subprocess startup cannot
@@ -292,7 +297,20 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                             // Advertise iroh reachability only now that the carrier
                             // is bound; EndpointId is never application authority.
                             if let Some(cb) = qc.on_iroh_bound.take() {
-                                cb(service_name.clone(), node_id);
+                                if let Err(error) = cb(service_name.clone(), node_id) {
+                                    if qc.iroh_required {
+                                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                                            format!(
+                                                "network-iroh-required initial Iroh announcement failed: {error}"
+                                            ),
+                                        ));
+                                    }
+                                    tracing::warn!(service = %service_name, "Iroh announcement failed; continuing compatibility profile: {error}");
+                                }
+                            } else if qc.iroh_required {
+                                return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                                    "network-iroh-required has no initial Iroh announcement callback".to_owned(),
+                                ));
                             }
                             tracing::info!(
                                 service = %service_name,
@@ -302,6 +320,11 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                             Some(substrate)
                         }
                         Err(e) => {
+                            if qc.iroh_required {
+                                return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                                    format!("network-iroh-required Iroh bind failed: {e}"),
+                                ));
+                            }
                             // Fail soft: an iroh bind failure must not take down the
                             // working quinn plane. Log and continue quinn-only.
                             tracing::warn!(
@@ -312,6 +335,11 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         }
                     }
                 } else {
+                    if qc.iroh_required {
+                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                            "network-iroh-required reached bind seam with Iroh disabled".to_owned(),
+                        ));
+                    }
                     None
                 };
                 // Drain the iroh substrate on shutdown (parallel to quinn drain).

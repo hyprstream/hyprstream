@@ -2445,10 +2445,15 @@ fn main() -> Result<()> {
                                     let mut qc = hyprstream_core::config::QuicConfig::default();
                                     qc.enabled = true;
                                     qc.bind_addr = bind_addr.clone();
+                                    qc.iroh = config.quic.iroh;
+                                    qc.native_network_profile = config.quic.native_network_profile;
                                     qc
                                 } else {
                                     config.quic.clone()
                                 };
+                                quic_cfg
+                                    .validate_native_network_profile()
+                                    .context("invalid native network profile")?;
 
                                 // Determine which services to start
                                 let service_names: Vec<String> = if let Some(ref svc_list) = multi_services {
@@ -2664,6 +2669,11 @@ fn main() -> Result<()> {
                                                 )?;
                                         }
                                         QuicCheckpointPolicy::DeferForFirstBoot => {
+                                                if quic_cfg.iroh_required() {
+                                                    anyhow::bail!(
+                                                        "network-iroh-required requires a checkpoint-verified accepted state and initial Iroh announcement; first-boot local/QUIC deferral is forbidden"
+                                                    );
+                                                }
                                                 // An explicit --quic-bind that cannot be
                                                 // honored (no accepted states exist yet) is
                                                 // an error, never a silent disable.
@@ -2735,11 +2745,23 @@ fn main() -> Result<()> {
                                         jwt_verifying_key: Some(ctx.jwt_verifying_key()),
                                         // #282: bind iroh in parallel to quinn when opted in.
                                         iroh_enabled: qc.iroh,
+                                        iroh_required: qc.iroh_required(),
                                         // #358: producer-chosen relay rendezvous (None = direct-only).
                                         moq_relay,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             |request: hyprstream_service::NativeAnnouncementRequest| {
+                                                let require_initial_iroh = matches!(
+                                                    &request.reach,
+                                                    hyprstream_service::NativeAnnouncementReach::Iroh { .. }
+                                                );
+                                                let (initial_tx, initial_rx) = if require_initial_iroh {
+                                                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                                                    (Some(tx), Some(rx))
+                                                } else {
+                                                    (None, None)
+                                                };
                                                 std::thread::spawn(move || {
+                                                    let mut initial_tx = initial_tx;
                                                     let runtime = match tokio::runtime::Builder::new_current_thread()
                                                         .enable_all()
                                                         .build()
@@ -2747,6 +2769,9 @@ fn main() -> Result<()> {
                                                         Ok(runtime) => runtime,
                                                         Err(error) => {
                                                             tracing::warn!("Failed to create announcement runtime: {error}");
+                                                            if let Some(tx) = initial_tx.take() {
+                                                                let _ = tx.send(Err(error.to_string()));
+                                                            }
                                                             return;
                                                         }
                                                     };
@@ -2777,6 +2802,9 @@ fn main() -> Result<()> {
                                                             Ok(client) => client,
                                                             Err(error) => {
                                                                 tracing::warn!("Failed to build DiscoveryClient: {error}");
+                                                                if let Some(tx) = initial_tx.take() {
+                                                                    let _ = tx.send(Err(error.to_string()));
+                                                                }
                                                                 return;
                                                             }
                                                         };
@@ -2808,6 +2836,9 @@ fn main() -> Result<()> {
                                                             }
                                                             match client.announce(&announcement).await {
                                                                 Ok(_) => {
+                                                                    if let Some(tx) = initial_tx.take() {
+                                                                        let _ = tx.send(Ok(()));
+                                                                    }
                                                                     tracing::info!(
                                                                         service = %announcement.service_name,
                                                                         socket_kind = %announcement.socket_kind,
@@ -2817,6 +2848,10 @@ fn main() -> Result<()> {
                                                                     delay = ANNOUNCEMENT_REFRESH;
                                                                 }
                                                                 Err(error) => {
+                                                                    if let Some(tx) = initial_tx.take() {
+                                                                        let _ = tx.send(Err(error.to_string()));
+                                                                        return;
+                                                                    }
                                                                     tracing::warn!(
                                                                         service = %announcement.service_name,
                                                                         socket_kind = %announcement.socket_kind,
@@ -2833,6 +2868,18 @@ fn main() -> Result<()> {
                                                         }
                                                     });
                                                 });
+                                                if let Some(rx) = initial_rx {
+                                                    match rx.recv() {
+                                                        Ok(Ok(())) => {}
+                                                        Ok(Err(error)) => anyhow::bail!(
+                                                            "initial Iroh announcement failed: {error}"
+                                                        ),
+                                                        Err(_) => anyhow::bail!(
+                                                            "initial Iroh announcement thread exited"
+                                                        ),
+                                                    }
+                                                }
+                                                Ok(())
                                             },
                                         )),
                                     };

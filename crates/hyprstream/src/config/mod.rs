@@ -408,6 +408,14 @@ fn default_tls_server_name() -> String { "localhost".to_owned() }
 /// cert_path = ""
 /// key_path = ""
 /// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeNetworkProfile {
+    #[default]
+    Compatibility,
+    NetworkIrohRequired,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicConfig {
     /// Whether QUIC/WebTransport is enabled (defaults to true)
@@ -439,6 +447,11 @@ pub struct QuicConfig {
     #[serde(default = "default_iroh_enabled")]
     pub iroh: bool,
 
+    /// Explicit native deployment profile. `network-iroh-required` forbids a
+    /// native QUIC/local fallback but does not disable the browser edge.
+    #[serde(default)]
+    pub native_network_profile: NativeNetworkProfile,
+
     /// #358: the producer-chosen moq RELAY this node rendezvouses through, as a
     /// dialable URI (`https://host:port` for the relay's WebTransport `/moq`
     /// endpoint, or an iroh node URI). Empty = direct-only (the baseline). When
@@ -459,12 +472,31 @@ impl Default for QuicConfig {
             cert_path: String::new(),
             key_path: String::new(),
             iroh: default_iroh_enabled(),
+            native_network_profile: NativeNetworkProfile::Compatibility,
             relay: String::new(),
         }
     }
 }
 
 impl QuicConfig {
+    pub fn iroh_required(&self) -> bool {
+        self.native_network_profile == NativeNetworkProfile::NetworkIrohRequired
+    }
+
+    pub fn validate_native_network_profile(&self) -> anyhow::Result<()> {
+        if self.iroh_required() {
+            anyhow::ensure!(
+                self.enabled,
+                "network-iroh-required requires [quic] enabled = true so native Iroh can bind"
+            );
+            anyhow::ensure!(
+                self.iroh,
+                "network-iroh-required rejects [quic] iroh = false"
+            );
+        }
+        Ok(())
+    }
+
     /// Parse bind_addr into a SocketAddr.
     pub fn socket_addr(&self) -> anyhow::Result<std::net::SocketAddr> {
         self.bind_addr.parse().map_err(|e| anyhow::anyhow!("invalid quic.bind_addr '{}': {}", self.bind_addr, e))
@@ -580,7 +612,8 @@ impl QuicConfig {
             // #410: iroh is the primary production transport (on by default).
             // This minimal builder mirrors the daemon bootstrap default; the
             // full `QuicSharedConfig` path in `main.rs` honours `[quic] iroh`.
-            iroh_enabled: default_iroh_enabled(),
+            iroh_enabled: self.iroh,
+            iroh_required: self.iroh_required(),
             on_iroh_bound: None,
             // #358: relay rendezvous is provisioned by the daemon bootstrap
             // (`QuicSharedConfig`), not this minimal builder. Direct-only here.
@@ -3117,6 +3150,22 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn network_iroh_required_is_serialized_and_rejects_iroh_disabled() -> anyhow::Result<()> {
+        let mut config = QuicConfig::default();
+        config.native_network_profile = NativeNetworkProfile::NetworkIrohRequired;
+        config.iroh = false;
+        assert!(config.validate_native_network_profile().is_err());
+
+        config.iroh = true;
+        config.validate_native_network_profile()?;
+        let serialized = toml::to_string(&config)?;
+        assert!(serialized.contains("native_network_profile = \"network-iroh-required\""));
+        let decoded: QuicConfig = toml::from_str(&serialized)?;
+        assert!(decoded.iroh_required());
+        Ok(())
+    }
+
     #[test]
     fn credentials_backend_default_matches_build_profile() {
         let config: CredentialsConfig =

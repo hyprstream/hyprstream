@@ -97,7 +97,7 @@ pub struct NativeAnnouncementRequest {
 }
 
 pub type NativeAnnouncementPublisher =
-    Arc<dyn Fn(NativeAnnouncementRequest) + Send + Sync + 'static>;
+    Arc<dyn Fn(NativeAnnouncementRequest) -> anyhow::Result<()> + Send + Sync + 'static>;
 
 #[allow(clippy::too_many_arguments)]
 fn publish_native_announcement(
@@ -109,7 +109,7 @@ fn publish_native_announcement(
     policy_verifying_key: VerifyingKey,
     discovery_verifying_key: VerifyingKey,
     accepted: Option<NativeServiceAnnouncement>,
-) {
+) -> anyhow::Result<()> {
     // Check if JWT needs renewal (within 2 days of expiry, or missing).
     let needs_renewal = service_jwt.as_ref().is_none_or(|jwt| {
         let parts: Vec<&str> = jwt.split('.').collect();
@@ -128,16 +128,12 @@ fn publish_native_announcement(
     });
 
     let Some(accepted) = accepted else {
-        tracing::warn!(
-            "Refusing production network announcement for '{service_name}': \
+        anyhow::bail!(
+            "refusing production network announcement for '{service_name}': \
              accepted native identity/KEM bundle is unavailable"
         );
-        return;
     };
-    if let Err(error) = accepted.validate(&service_name, &signing_key.verifying_key()) {
-        tracing::warn!("Refusing production network announcement for '{service_name}': {error}");
-        return;
-    }
+    accepted.validate(&service_name, &signing_key.verifying_key())?;
     if needs_renewal {
         tracing::warn!(
             "Service JWT for '{service_name}' expired or near-expiry. \
@@ -146,10 +142,9 @@ fn publish_native_announcement(
         let _ = policy_verifying_key;
     }
     let Some(publish) = publisher else {
-        tracing::warn!(
-            "Refusing production network announcement for '{service_name}': publisher is unavailable"
+        anyhow::bail!(
+            "refusing production network announcement for '{service_name}': publisher is unavailable"
         );
-        return;
     };
     publish(NativeAnnouncementRequest {
         service_name,
@@ -165,7 +160,7 @@ fn publish_native_announcement(
         request_kem_key_id: accepted.request_kem_key_id,
         request_kem_recipient: accepted.request_kem_recipient.encode(),
         expires_at_unix_ms: accepted.accepted_state_expires_at_unix_ms,
-    });
+    })
 }
 
 /// Complete native announcement material verified against one accepted state.
@@ -294,6 +289,7 @@ pub struct QuicSharedConfig {
     /// (kept for back-compat), for every QUIC-enabled service. On by default;
     /// an operator opts out via `[quic] iroh = false` to run quinn-only (legacy).
     pub iroh_enabled: bool,
+    pub iroh_required: bool,
     /// #358: the producer-chosen moq RELAY every QUIC-enabled service on this node
     /// rendezvouses through, in wire-reach form. `None` = direct-only. Sourced
     /// from the relay DID transport entry (default: the PDS / federation anchor)
@@ -343,6 +339,7 @@ impl QuicSharedConfig {
             on_quic_bound: None,
             // #282: bind iroh in parallel when the deployment opted in.
             iroh_enabled: self.iroh_enabled,
+            iroh_required: self.iroh_required,
             on_iroh_bound: None,
             // #358: thread the producer-chosen relay through so the spawner
             // advertises a Role::Relay reach + links the origin up to the relay.
@@ -372,7 +369,7 @@ impl QuicSharedConfig {
         let quic_jwt = service_jwt.clone();
         let quic_accepted = accepted.clone();
         config.on_quic_bound = Some(Box::new(move |svc_name, addr, sn| {
-            publish_native_announcement(
+            if let Err(error) = publish_native_announcement(
                 publisher.clone(),
                 svc_name,
                 NativeAnnouncementReach::Quic {
@@ -384,7 +381,9 @@ impl QuicSharedConfig {
                 policy_verifying_key,
                 discovery_verifying_key,
                 quic_accepted.clone(),
-            );
+            ) {
+                tracing::warn!("QUIC native announcement was not published: {error}");
+            }
         }));
         let iroh_publisher = self.native_announcement_publisher.clone();
         config.on_iroh_bound = Some(Box::new(move |svc_name, node_id| {
@@ -397,7 +396,7 @@ impl QuicSharedConfig {
                 policy_verifying_key,
                 discovery_verifying_key,
                 accepted.clone(),
-            );
+            )
         }));
         config
     }
@@ -711,6 +710,12 @@ impl ServiceContext {
     /// Check if QUIC/WebTransport is enabled.
     pub fn has_quic(&self) -> bool {
         self.quic_shared.is_some()
+    }
+
+    pub fn iroh_required(&self) -> bool {
+        self.quic_shared
+            .as_ref()
+            .is_some_and(|config| config.iroh_required)
     }
 
     /// Set the OAuth issuer URL for RFC 9728 metadata.
@@ -1174,10 +1179,14 @@ mod tests {
             oauth_issuer_url: None,
             jwt_verifying_key: None,
             iroh_enabled: true,
+            iroh_required: false,
             moq_relay: None,
             native_announcement_publisher: Some({
                 let published = Arc::clone(&published);
-                Arc::new(move |request| published.lock().push(request))
+                Arc::new(move |request| {
+                    published.lock().push(request);
+                    Ok(())
+                })
             }),
         };
         let mut config = shared.for_service_with_announce(
@@ -1196,7 +1205,11 @@ mod tests {
             "model.example.test".to_owned(),
         );
         let node_id = [0xab; 32];
-        config.on_iroh_bound.take().expect("Iroh callback")("model".to_owned(), node_id);
+        config
+            .on_iroh_bound
+            .take()
+            .expect("Iroh callback")("model".to_owned(), node_id)
+            .expect("Iroh announcement callback");
 
         let published = published.lock();
         assert_eq!(published.len(), 2);

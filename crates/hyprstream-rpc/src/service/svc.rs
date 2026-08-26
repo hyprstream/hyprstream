@@ -1313,12 +1313,17 @@ pub struct QuicLoopConfig {
     /// Set `false` (via `[quic] iroh = false`) to run quinn-only (legacy).
     #[cfg(not(target_arch = "wasm32"))]
     pub iroh_enabled: bool,
+    /// Iroh is a startup/readiness requirement for native traffic. Quinn may
+    /// still serve the browser edge but cannot satisfy this native contract.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub iroh_required: bool,
     /// #282: callback invoked after the iroh substrate binds, with
     /// (service_name, node_id) where `node_id` is the endpoint's 32-byte Ed25519
     /// public carrier address. Used to advertise only an `IrohTransport` service
     /// entry when bound; it must never become a verification method.
     #[cfg(not(target_arch = "wasm32"))]
-    pub on_iroh_bound: Option<Box<dyn FnOnce(String, [u8; 32]) + Send>>,
+    pub on_iroh_bound:
+        Option<Box<dyn FnOnce(String, [u8; 32]) -> anyhow::Result<()> + Send>>,
     /// #358: the producer-chosen moq RELAY this node rendezvouses through, in
     /// wire-reach form ([`crate::stream_info::TransportConfig`]). When set, the
     /// spawner places it in the service's `ProducerReachConfig` (so published
