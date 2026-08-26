@@ -239,18 +239,28 @@ where
     // a PEP process-globally via `install_mac_dispatch_pep`, this gate denies
     // with `NoPepInstalled`; after installation its decision is authoritative.
     //
+    // **Typed method identity (#1499):** the PEP evaluates the typed
+    // `(service, leaf/method)` identity of the call. The leaf is the canonical
+    // request-union discriminant, decoded once here from the verified payload
+    // (a bounded structural read of the signed body — the value the generated
+    // handler will independently decode and act on). A payload that does not
+    // decode to a canonical request union contributes no method identity:
+    // `None` matches no declared row, so the call fails closed below rather
+    // than at the handler's own decode. The browser commitment
+    // (`browser_method_discriminator`) remains the cross-check input to
+    // `ensure_browser_method` and is unchanged by this decode.
+    //
     // Streaming continuations: the continuation produced by a permitted
     // handler inherits this dispatch-time Permit. Explicit re-check of
     // long-running continuations against revoked authority is a DEFERRED
     // follow-up (#1267 scope expansion — `StaleAuthority` variant is reserved
     // for that future gate, not used today).
-    let mac_decision = crate::auth::mac::check_dispatch_mac(
-        &ctx,
-        actual_service_domain,
-        ctx.browser_method_discriminator,
-    );
+    let dispatch_method =
+        crate::browser_provisioning::canonical_method_discriminator(&payload).ok();
+    let mac_decision =
+        crate::auth::mac::check_dispatch_mac(&ctx, actual_service_domain, dispatch_method);
     if let crate::auth::mac::MacDecision::Deny(reason) = mac_decision {
-        let mac_resource = match ctx.browser_method_discriminator {
+        let mac_resource = match dispatch_method {
             Some(method) => format!("{actual_service_domain}:method:{method}"),
             None => format!("{actual_service_domain}:*"),
         };
