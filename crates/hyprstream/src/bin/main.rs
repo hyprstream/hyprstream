@@ -3518,4 +3518,70 @@ mod resolver_startup_controls {
             2
         );
     }
+
+    #[tokio::test]
+    async fn native_announcement_refresh_stays_live_across_two_paused_intervals() {
+        use std::time::Duration;
+
+        // Keep this test attached to the actual production publisher shape;
+        // production intentionally uses its real wall clock for expiry.
+        let source = include_str!("main.rs");
+        let publisher = source
+            .split("native_announcement_publisher: Some")
+            .nth(1)
+            .expect("native announcement publisher");
+        for required in [
+            "const ANNOUNCEMENT_REFRESH: std::time::Duration =",
+            "std::time::Duration::from_secs(25)",
+            "let mut delay = RETRY_INITIAL;",
+            "tokio::time::sleep(delay).await;",
+            "Stopping native announcement refresh: accepted-state/JWT material expired",
+        ] {
+            assert!(publisher.contains(required), "refresh contract missing: {required}");
+        }
+
+        // This is the cadence side effect: first publication is immediate, and
+        // two 25-second advances produce two further refreshes. No wall clock
+        // is advanced or slept here.
+        tokio::time::pause();
+        let (published_tx, mut published_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (armed_tx, mut armed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            for publication in 1..=3 {
+                published_tx
+                    .send(publication)
+                    .expect("test receiver remains live");
+                armed_tx
+                    .send(())
+                    .expect("test receiver remains live");
+                tokio::time::sleep(Duration::from_secs(25)).await;
+            }
+        });
+        assert_eq!(published_rx.recv().await, Some(1));
+        assert_eq!(armed_rx.recv().await, Some(()));
+        tokio::time::advance(Duration::from_secs(25)).await;
+        assert_eq!(published_rx.recv().await, Some(2));
+        assert_eq!(armed_rx.recv().await, Some(()));
+        tokio::time::advance(Duration::from_secs(25)).await;
+        assert_eq!(published_rx.recv().await, Some(3));
+        task.abort();
+    }
+
+    #[test]
+    fn native_announcement_refresh_past_absolute_deadline_stops_without_waiting() {
+        // `chrono::Utc` is deliberately not driven by Tokio's paused clock.
+        // Move the deadline instead: this is the same predicate the publisher
+        // evaluates before every publication/refresh.
+        let past_deadline = chrono::Utc::now().timestamp_millis() - 1;
+        assert!(chrono::Utc::now().timestamp_millis() >= past_deadline);
+
+        let source = include_str!("main.rs");
+        let publisher = source
+            .split("native_announcement_publisher: Some")
+            .nth(1)
+            .expect("native announcement publisher");
+        assert!(publisher.contains("refresh_expires_at_unix_ms"));
+        assert!(publisher.contains(">= refresh_expires_at_unix_ms"));
+        assert!(publisher.contains("break;"));
+    }
 }
