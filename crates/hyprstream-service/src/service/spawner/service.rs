@@ -45,6 +45,46 @@ impl<S: RequestService + Send + 'static> UnifiedServiceConfig<S> {
     }
 }
 
+/// Reject a required native profile before any compatibility carrier can start.
+fn validate_required_iroh_enabled(
+    config: &hyprstream_rpc::service::QuicLoopConfig,
+) -> Result<()> {
+    if config.iroh_required && !config.iroh_enabled {
+        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+            "network-iroh-required rejects iroh = false".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Complete the native bind seam: required deployments must publish their
+/// first Iroh reach, while the compatibility profile deliberately logs and
+/// continues on publication failure.
+fn announce_iroh_bound(
+    config: &mut hyprstream_rpc::service::QuicLoopConfig,
+    service_name: &str,
+    node_id: [u8; 32],
+) -> Result<()> {
+    match config.on_iroh_bound.take() {
+        Some(callback) => match callback(service_name.to_owned(), node_id) {
+            Ok(()) => Ok(()),
+            Err(error) if config.iroh_required => {
+                Err(hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                    "network-iroh-required initial Iroh announcement failed: {error}"
+                )))
+            }
+            Err(error) => {
+                tracing::warn!(service = %service_name, "Iroh announcement failed; continuing compatibility profile: {error}");
+                Ok(())
+            }
+        },
+        None if config.iroh_required => Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+            "network-iroh-required has no initial Iroh announcement callback".to_owned(),
+        )),
+        None => Ok(()),
+    }
+}
+
 impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConfig<S> {
     fn name(&self) -> &str {
         RequestService::name(&self.service)
@@ -86,11 +126,7 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
             let processor: Arc<dyn IrohRequestProcessor> = Arc::new(bridge);
 
             if let Some(mut qc) = quic_config {
-                if qc.iroh_required && !qc.iroh_enabled {
-                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                        "network-iroh-required rejects iroh = false".to_owned(),
-                    ));
-                }
+                validate_required_iroh_enabled(&qc)?;
                 // web-transport-quinn has no per-builder provider hook and
                 // resolves rustls's process default. Install and validate it at
                 // the actual bind seam so task/thread/subprocess startup cannot
@@ -296,22 +332,7 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                             }
                             // Advertise iroh reachability only now that the carrier
                             // is bound; EndpointId is never application authority.
-                            if let Some(cb) = qc.on_iroh_bound.take() {
-                                if let Err(error) = cb(service_name.clone(), node_id) {
-                                    if qc.iroh_required {
-                                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                                            format!(
-                                                "network-iroh-required initial Iroh announcement failed: {error}"
-                                            ),
-                                        ));
-                                    }
-                                    tracing::warn!(service = %service_name, "Iroh announcement failed; continuing compatibility profile: {error}");
-                                }
-                            } else if qc.iroh_required {
-                                return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                                    "network-iroh-required has no initial Iroh announcement callback".to_owned(),
-                                ));
-                            }
+                            announce_iroh_bound(&mut qc, &service_name, node_id)?;
                             tracing::info!(
                                 service = %service_name,
                                 node_id = %hex_short(&node_id),
@@ -335,11 +356,7 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         }
                     }
                 } else {
-                    if qc.iroh_required {
-                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                            "network-iroh-required reached bind seam with Iroh disabled".to_owned(),
-                        ));
-                    }
+                    validate_required_iroh_enabled(&qc)?;
                     None
                 };
                 // Drain the iroh substrate on shutdown (parallel to quinn drain).
@@ -1035,6 +1052,27 @@ mod tests {
         }
     }
 
+    fn loop_config(
+        iroh_enabled: bool,
+        iroh_required: bool,
+        on_iroh_bound: Option<Box<dyn FnOnce(String, [u8; 32]) -> anyhow::Result<()> + Send>>,
+    ) -> hyprstream_rpc::service::QuicLoopConfig {
+        hyprstream_rpc::service::QuicLoopConfig {
+            cert_chain: Vec::new(),
+            key_der: zeroize::Zeroizing::new(Vec::new()),
+            bind_addr: "127.0.0.1:0"
+                .parse()
+                .unwrap_or_else(|error| panic!("test socket address: {error}")),
+            server_name: "service.test".to_owned(),
+            protected_resource_json: None,
+            on_quic_bound: None,
+            iroh_enabled,
+            iroh_required,
+            on_iroh_bound,
+            moq_relay: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_tokio_spawner() -> hyprstream_rpc::Result<()> {
         let (signing_key, _verifying_key) = generate_signing_keypair();
@@ -1067,5 +1105,42 @@ mod tests {
 
         spawned.stop().await?;
         Ok(())
+    }
+
+    #[test]
+    fn required_profile_rejects_disabled_iroh_at_spawner_seam() {
+        let config = loop_config(false, true, None);
+        let error = match validate_required_iroh_enabled(&config) {
+            Ok(()) => panic!("required profile accepted a disabled Iroh carrier"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("rejects iroh = false"));
+    }
+
+    #[test]
+    fn required_profile_requires_announcement_while_compatibility_continues() {
+        let mut required = loop_config(true, true, None);
+        let error = match announce_iroh_bound(&mut required, "echo", [0x11; 32]) {
+            Ok(()) => panic!("required profile accepted a missing announcement callback"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("no initial Iroh announcement callback"));
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut compatibility = loop_config(
+            true,
+            false,
+            Some(Box::new({
+                let calls = Arc::clone(&calls);
+                move |_, _| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    anyhow::bail!("announcement unavailable")
+                }
+            })),
+        );
+        if let Err(error) = announce_iroh_bound(&mut compatibility, "echo", [0x22; 32]) {
+            panic!("compatibility profile did not continue after announcement failure: {error}");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
