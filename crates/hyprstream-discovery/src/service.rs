@@ -4735,6 +4735,10 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn remote_get_endpoints_omits_stale_and_fetch_cannot_refresh_it() {
+        hyprstream_rpc::registry::init(
+            hyprstream_rpc::registry::EndpointMode::Inproc,
+            None,
+        );
         let service = service();
         let name = "stale-remote-reach";
         service.announced_endpoints.write().insert(
