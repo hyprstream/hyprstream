@@ -14,11 +14,16 @@
 //!   directly) **and for external subscribers** — per spike #94's finding,
 //!   `moq_net::Server` does exactly this.
 //!
-//! **Trust model**: §7.5 unchanged. The transport is unauthenticated;
-//! subscribers learn the DH-derived (unguessable) Track path out-of-band
-//! via authenticated RPC (a signed `StreamInfo`), and the per-Frame
-//! payload carries the chained-HMAC envelope. CDN-portability per §10.x
-//! of the Federated Agentic Namespaces doc.
+//! **Trust model**: §7.5 unchanged. On the wire, subscribers learn the
+//! DH-derived (unguessable) Track path out-of-band via authenticated RPC
+//! (a signed `StreamInfo`), and the per-Frame payload carries the
+//! chained-HMAC envelope. CDN-portability per §10.x of the Federated Agentic
+//! Namespaces doc. Admission: without an authenticator the carrier is
+//! unauthenticated and the accept path refuses anonymous peers; with a
+//! [`crate::transport::moql_admission::MoqlAdmissionAuthenticator`] installed
+//! (#1027), each connection must first prove an accepted current
+//! Ed25519 + ML-DSA-65 identity inside the carrier, and is then served only
+//! its own tenant's scope.
 //!
 //! **What this module does NOT do**: refactor `StreamService` or
 //! `EventService` to use this. That lands in Phase 3 part 2+ along with
@@ -35,22 +40,35 @@ use web_transport_iroh::Session;
 use crate::moq_authz::{
     tenant_scoped_consumer, PeerIdentity, SharedSubscribeAuthorizer, SubscribeDecision,
 };
+use crate::transport::moql_admission::MoqlAdmissionAuthenticator;
 
 /// Resolves the tenant for an independently authenticated application peer.
-/// Carrier NodeId is never passed here. Until a caller can supply fresh proof,
-/// the iroh accept path refuses before invoking this resolver.
+/// Carrier NodeId is never passed here. Without a fresh-proof seam (#1027)
+/// the iroh accept path refuses before invoking this resolver; with a
+/// [`MoqlAdmissionAuthenticator`] installed, the resolver runs inside the
+/// admission exchange over the *verified* subject.
 pub type PeerTenantResolver = Arc<dyn Fn(&PeerIdentity) -> Option<String> + Send + Sync>;
 
 /// #276 authorization config for a moq accept path: an optional subscribe
 /// authorizer and an optional peer→tenant resolver for per-tenant announce
 /// scoping. Absence of fresh application/session proof is always fail-closed;
 /// these hooks cannot turn an anonymous carrier into an authenticated peer.
+///
+/// #1027: installing an [`MoqlAdmissionAuthenticator`] changes the posture —
+/// the accept path runs the inside-carrier Ed25519 + ML-DSA-65
+/// challenge/response before any moq machinery and serves only the admitted
+/// peer's tenant scope. Without it, the anonymous fail-closed refusal below is
+/// unchanged.
 #[derive(Clone, Default)]
 pub struct MoqAuthzConfig {
     /// Subscribe-time authorization hook (public-open / private-gated).
     pub authorizer: Option<SharedSubscribeAuthorizer>,
     /// Maps a peer identity to its tenant for per-tenant announce scoping.
     pub tenant_resolver: Option<PeerTenantResolver>,
+    /// #1027 inside-carrier admission authenticator. When set, every accepted
+    /// `moql` connection must prove an accepted current Ed25519 + ML-DSA-65
+    /// identity before the moq handshake; the carrier NodeId alone is refused.
+    pub admission: Option<Arc<MoqlAdmissionAuthenticator>>,
 }
 
 impl MoqAuthzConfig {
@@ -62,6 +80,15 @@ impl MoqAuthzConfig {
     /// Set/replace the subscribe authorizer.
     pub fn with_authorizer(mut self, authorizer: SharedSubscribeAuthorizer) -> Self {
         self.authorizer = Some(authorizer);
+        self
+    }
+
+    /// Install the #1027 inside-carrier admission authenticator. The
+    /// authenticator carries its own authoritative subject→tenant resolver;
+    /// `tenant_resolver` is only consulted for peers authenticated by other
+    /// means (none today on this path).
+    pub fn with_admission(mut self, admission: Arc<MoqlAdmissionAuthenticator>) -> Self {
+        self.admission = Some(admission);
         self
     }
 
@@ -170,8 +197,11 @@ impl IrohMoqProtocolHandler {
 
     /// Install the #276 subscribe-authz + per-tenant announce-scoping config.
     ///
-    /// The resolver is usable only after a future fresh-proof seam supplies an
-    /// authenticated [`PeerIdentity`]. Carrier EndpointId alone never reaches it.
+    /// With an [`MoqlAdmissionAuthenticator`] in the config (#1027), the accept
+    /// path runs the inside-carrier challenge/response first and the admitted
+    /// peer's tenant scope is served. Without one, no fresh-proof seam supplies
+    /// an authenticated [`PeerIdentity`] and the carrier NodeId alone never
+    /// reaches the resolver.
     pub fn with_authz(mut self, authz: MoqAuthzConfig) -> Self {
         self.rebuild_inner(|i| i.authz = authz);
         self
@@ -221,9 +251,38 @@ impl Default for IrohMoqProtocolHandler {
 
 impl ProtocolHandler for IrohMoqProtocolHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        // Carrier NodeId is transport metadata only. Until #1027 supplies fresh
-        // inside-carrier proof, authorization must see an anonymous peer.
-        let peer = PeerIdentity::anonymous();
+        // #1027: with an admission authenticator installed, the peer must
+        // complete the fresh inside-carrier Ed25519 + ML-DSA-65
+        // challenge/response BEFORE any moq machinery runs. The exchange binds
+        // the accepted-state epoch/head and both nonces into the transcript;
+        // replay, expiry, rotation, cross-tenant resolution failure, and
+        // NodeId-only identity all reject here, fail-closed.
+        let admitted = match &self.inner.authz.admission {
+            Some(admission) => match admission.accept(&conn).await {
+                Ok(admitted) => {
+                    tracing::debug!(
+                        subject = %admitted.peer.subject.as_deref().unwrap_or("?"),
+                        tenant = %admitted.tenant,
+                        epoch = admitted.epoch,
+                        carrier = %hex::encode(&admitted.carrier_node_id[..4]),
+                        "iroh-moq: inside-carrier admission succeeded"
+                    );
+                    Some(admitted)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "iroh-moq: admission rejected; closing carrier");
+                    conn.close(0u32.into(), b"moql admission rejected");
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
+        // Carrier NodeId is transport metadata only. Without #1027 admission
+        // proof, authorization sees an anonymous peer.
+        let peer = admitted
+            .as_ref()
+            .map(|a| a.peer.clone())
+            .unwrap_or_else(PeerIdentity::anonymous);
         if !self
             .inner
             .authz
@@ -238,17 +297,23 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
         }
         if !peer.is_authenticated() {
             tracing::warn!(
-                "iroh-moq: refusing anonymous carrier pending verified session proof (#1027/#726)"
+                "iroh-moq: refusing anonymous carrier pending verified session proof (#726)"
             );
             conn.close(0u32.into(), b"verified MoQ session proof required");
             return Ok(());
         }
 
-        // Future authenticated-session path: if a fresh-proof integration
-        // supplies a verified peer, hand it only a consumer narrowed to its own
-        // `{tenant}/` prefix. Missing tenant resolution must remain fail-closed;
-        // it must never fall back to the process-global consumer.
-        let publish_consumer = match self.inner.authz.tenant_for(&peer) {
+        // Authenticated-session path: hand the admitted peer only a consumer
+        // narrowed to its own `{tenant}/` prefix. The tenant comes from the
+        // admission exchange (server-resolved from the verified subject); the
+        // legacy resolver seam remains for any future proof source. Missing
+        // tenant resolution must remain fail-closed; it must never fall back
+        // to the process-global consumer.
+        let resolved_tenant = match &admitted {
+            Some(a) => Some(a.tenant.clone()),
+            None => self.inner.authz.tenant_for(&peer),
+        };
+        let publish_consumer = match resolved_tenant {
             Some(tenant) => {
                 // `scope` returns None when the tenant prefix is outside the
                 // origin's allowed prefixes — serve that peer nothing rather
@@ -353,6 +418,7 @@ mod tests {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Some("alice".to_owned())
             })),
+            admission: None,
         };
         let handler = IrohMoqProtocolHandler::new().with_authz(authz);
         let producer = handler.origin_producer().clone();

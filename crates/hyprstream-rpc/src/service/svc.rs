@@ -1332,6 +1332,16 @@ pub struct QuicLoopConfig {
     /// drift. `None` = direct-only (the S1/S2 behaviour). Native-only.
     #[cfg(not(target_arch = "wasm32"))]
     pub moq_relay: Option<crate::stream_info::TransportConfig>,
+    /// #1027: optional inside-carrier admission authenticator for the iroh
+    /// `moql` accept path. When set, every accepted `moql` connection must
+    /// prove an accepted current Ed25519 + ML-DSA-65 identity (fresh
+    /// challenge/response binding epoch/head/nonces) before the moq handshake;
+    /// the admitted peer is served only its resolved tenant's scope. When
+    /// `None`, the pre-#1027 posture stands: anonymous carriers are refused.
+    /// Native-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_admission:
+        Option<Arc<crate::transport::moql_admission::MoqlAdmissionAuthenticator>>,
 }
 
 /// Handle for a running service

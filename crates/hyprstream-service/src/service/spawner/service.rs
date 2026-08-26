@@ -268,6 +268,19 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         }
                         None => hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new(),
                     };
+                    // #1027: when the daemon threaded an admission authenticator
+                    // through `QuicLoopConfig`, install it so every accepted
+                    // `moql` connection must prove an accepted current
+                    // Ed25519 + ML-DSA-65 identity inside the carrier before the
+                    // moq handshake. Without it the accept path stays in its
+                    // fail-closed anonymous posture.
+                    let moq_handler = match qc.moq_admission.take() {
+                        Some(admission) => moq_handler.with_authz(
+                            hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig::default()
+                                .with_admission(admission),
+                        ),
+                        None => moq_handler,
+                    };
                     // RPC plane: same processor + signing key as the quinn path.
                     let rpc_handler =
                         hyprstream_rpc::transport::iroh_rpc::IrohRpcProtocolHandler::with_stream_limit(

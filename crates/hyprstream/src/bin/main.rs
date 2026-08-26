@@ -2737,6 +2737,11 @@ fn main() -> Result<()> {
                                         iroh_enabled: qc.iroh,
                                         // #358: producer-chosen relay rendezvous (None = direct-only).
                                         moq_relay,
+                                        // #1027: no moql admission material is provisioned at
+                                        // daemon bootstrap yet; the accept path stays in its
+                                        // fail-closed anonymous posture until a deployment
+                                        // installs an authenticator here.
+                                        moq_admission: None,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             |request: hyprstream_service::NativeAnnouncementRequest| {
                                                 std::thread::spawn(move || {

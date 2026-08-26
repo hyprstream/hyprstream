@@ -205,8 +205,10 @@ impl PeerIdentity {
 /// ## Wiring status
 ///
 /// - **iroh `moql` path** ([`crate::transport::iroh_moq::IrohMoqProtocolHandler`]):
-///   `remote_id()` is carrier metadata, so the hook receives anonymous until
-///   #1027 supplies fresh proof.
+///   `remote_id()` is carrier metadata, never identity. With a
+///   [`crate::transport::moql_admission::MoqlAdmissionAuthenticator`] installed
+///   (#1027) the hook receives the admitted (verified) peer; without one it
+///   receives anonymous and the accept path refuses.
 /// - **quinn `/moq` path** ([`crate::transport::quinn_transport::QuinnRpcServer`]):
 ///   as of #1153 the CONNECT is authenticated by
 ///   [`crate::transport::moq_connect_auth::MoqConnectAuthz`] (bearer JWT,

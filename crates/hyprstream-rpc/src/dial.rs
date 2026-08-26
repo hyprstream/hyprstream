@@ -446,20 +446,22 @@ async fn dial_iroh_moq(
         )
     })?;
 
-    dial_iroh_moq_from_endpoint(endpoint, node_id, direct_addrs, relay_url).await
+    let conn = dial_iroh_moq_from_endpoint(endpoint, node_id, direct_addrs, relay_url).await?;
+    Ok(web_transport_iroh::Session::raw(conn))
 }
 
-/// Dial from an explicitly owned endpoint.
+/// Dial from an explicitly owned endpoint, returning the raw `moql` connection.
 ///
 /// Tests use this primitive so a runtime-bound endpoint never leaks into the
 /// process-global production slot. The caller owns the endpoint for the full
-/// connection lifecycle.
+/// connection lifecycle. The raw connection lets the #1027 admission exchange
+/// consume the first bi stream before the session is wrapped.
 async fn dial_iroh_moq_from_endpoint(
     endpoint: iroh::Endpoint,
     node_id: &[u8; 32],
     direct_addrs: &[std::net::SocketAddr],
     relay_url: &Option<String>,
-) -> Result<web_transport_iroh::Session> {
+) -> Result<iroh::endpoint::Connection> {
     use crate::transport::iroh_substrate::ALPN_MOQ_LITE;
     use iroh::{EndpointAddr, EndpointId, TransportAddr};
 
@@ -481,7 +483,60 @@ async fn dial_iroh_moq_from_endpoint(
         .connect(addr, ALPN_MOQ_LITE)
         .await
         .map_err(|e| anyhow!("iroh moql connect: {e}"))?;
-    Ok(web_transport_iroh::Session::raw(conn))
+    Ok(conn)
+}
+
+/// #1027: dial the moq streaming plane over iroh `moql` and run the
+/// inside-carrier admission challenge/response
+/// ([`crate::transport::moql_admission`]) BEFORE returning the session. The
+/// returned session is admitted: the server has verified the proof against its
+/// current accepted Ed25519 + ML-DSA-65 state and scoped the session to the
+/// resolved tenant.
+///
+/// Admission is the iroh-carrier path only; the quinn `/moq` plane
+/// authenticates at CONNECT time ([`crate::transport::moq_connect_auth`]).
+/// Same-host endpoints are rejected exactly as in [`dial_stream`].
+pub async fn dial_stream_authenticated(
+    target: &TransportConfig,
+    proof: &crate::transport::moql_admission::MoqlAdmissionProof,
+) -> Result<MoqStreamSession> {
+    match &target.endpoint {
+        EndpointType::Iroh {
+            node_id,
+            direct_addrs,
+            relay_url,
+        } => {
+            let endpoint = crate::transport::lazy_iroh::iroh_client_endpoint().ok_or_else(|| {
+                anyhow!(
+                    "dial_stream_authenticated(): no iroh client endpoint installed — call \
+                     install_iroh_client_endpoint() at startup before dialing iroh streams"
+                )
+            })?;
+            let conn =
+                dial_iroh_moq_from_endpoint(endpoint, node_id, direct_addrs, relay_url).await?;
+            crate::transport::moql_admission::prove_moql_admission(
+                &conn,
+                proof,
+                crate::transport::moql_admission::DEFAULT_ADMISSION_TIMEOUT,
+            )
+            .await
+            .map_err(|e| anyhow!("moql admission proof failed: {e}"))?;
+            Ok(MoqStreamSession::Iroh(web_transport_iroh::Session::raw(conn)))
+        }
+        EndpointType::Quic { .. } => {
+            bail!(
+                "dial_stream_authenticated(): #1027 admission is the iroh `moql` path; \
+                 the quinn `/moq` plane authenticates at CONNECT time (#1153)"
+            )
+        }
+        EndpointType::Ipc { .. } | EndpointType::SystemdFd { .. } | EndpointType::Inproc { .. } => {
+            bail!(
+                "dial_stream_authenticated(): same-host endpoint ({:?}) is resolved from local \
+                 config, not dialed from the wire — use the UDS fast path",
+                target.endpoint
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -713,7 +768,7 @@ mod tests {
         let cfg = TransportConfig::iroh(server_id, direct, None);
         let session = match &cfg.endpoint {
             EndpointType::Iroh { node_id, direct_addrs, relay_url } => {
-                MoqStreamSession::Iroh(
+                MoqStreamSession::Iroh(web_transport_iroh::Session::raw(
                     dial_iroh_moq_from_endpoint(
                         client.endpoint().clone(),
                         node_id,
@@ -721,7 +776,7 @@ mod tests {
                         relay_url,
                     )
                     .await?,
-                )
+                ))
             }
             other => panic!("expected iroh endpoint, got {other:?}"),
         };
