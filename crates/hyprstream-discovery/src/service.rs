@@ -242,6 +242,14 @@ fn network_reach(transport: &TransportConfig) -> bool {
     )
 }
 
+fn native_iroh_reach(transport: &TransportConfig) -> bool {
+    matches!(transport.endpoint, EndpointType::Iroh { .. })
+}
+
+fn browser_webtransport_reach(transport: &TransportConfig) -> bool {
+    matches!(transport.endpoint, EndpointType::Quic { .. })
+}
+
 fn transport_fingerprint(transport: &TransportConfig) -> String {
     blake3::hash(format!("{transport:?}").as_bytes())
         .to_hex()
@@ -334,6 +342,14 @@ fn rejection_reason(
     match query.profile {
         ResolverProfile::NetworkDiscovery if !network_reach(&candidate.transport) => {
             return Some("local-reach-for-network-profile");
+        }
+        ResolverProfile::NativeIrohRequired if !native_iroh_reach(&candidate.transport) => {
+            return Some("non-iroh-reach-for-native-profile");
+        }
+        ResolverProfile::BrowserWebTransport
+            if !browser_webtransport_reach(&candidate.transport) =>
+        {
+            return Some("non-quic-reach-for-browser-profile");
         }
         ResolverProfile::LocalInproc
             if !matches!(candidate.transport.endpoint, EndpointType::Inproc { .. }) =>
@@ -1346,7 +1362,7 @@ impl DiscoveryServiceResolver {
         let query = ServiceQuery::new(
             request.service_name.clone(),
             [request.capability.clone()],
-            ResolverProfile::NetworkDiscovery,
+            ResolverProfile::BrowserWebTransport,
             1,
         )?;
         let resolved = self
@@ -3260,12 +3276,13 @@ pub mod test_fixtures {
         transport: &TransportConfig,
         last_heartbeat: Instant,
     ) -> Result<AnnouncedEndpoint> {
-        anyhow::ensure!(
-            matches!(&transport.endpoint, EndpointType::Quic { .. }),
-            "production inference fixture advertises only QUIC candidates"
-        );
+        let socket_kind = match &transport.endpoint {
+            EndpointType::Quic { .. } => "quic",
+            EndpointType::Iroh { .. } => "iroh",
+            _ => anyhow::bail!("production inference fixture advertises only network candidates"),
+        };
         Ok(AnnouncedEndpoint {
-            socket_kind: "quic".to_owned(),
+            socket_kind: socket_kind.to_owned(),
             endpoint: transport.endpoint_string(),
             service_jwt: "fixture-verified".to_owned(),
             service_did: Did::from(authority.state.did.clone()),
@@ -4451,9 +4468,25 @@ mod resolver_tests {
         )
     }
 
+    fn native_production_fixture(
+        local_reach: bool,
+    ) -> (DiscoveryServiceResolver, Arc<MutableAcceptedState>) {
+        let (resolver, source) = production_fixture(local_reach);
+        if !local_reach {
+            let mut endpoints = resolver.announced_endpoints.write();
+            let endpoint = endpoints
+                .get_mut("model")
+                .and_then(|entries| entries.first_mut())
+                .expect("fixture announcement");
+            endpoint.socket_kind = "iroh".to_owned();
+            endpoint.endpoint = format!("iroh://{}", hex::encode([0x51; 32]));
+        }
+        (resolver, source)
+    }
+
     #[tokio::test]
     async fn production_resolver_joins_announcement_to_current_pds_state() {
-        let (resolver, _) = production_fixture(false);
+        let (resolver, _) = native_production_fixture(false);
         let resolved = resolver
             .resolve_service(ServiceQuery::network("model").expect("query"))
             .await
@@ -4497,6 +4530,26 @@ mod resolver_tests {
         assert_eq!(validated.service_name(), "model");
         assert_eq!(validated.accepted_state_epoch(), 1);
         assert!(validated.service_did().starts_with("did:at9p:"));
+    }
+
+    #[tokio::test]
+    async fn network_iroh_profile_rejects_quic_and_browser_profile_rejects_iroh() {
+        let (resolver, _) = production_fixture(false);
+        let native = match resolver
+            .resolve_service(ServiceQuery::network("model").expect("native query"))
+            .await
+        {
+            Ok(_) => panic!("native Iroh profile accepted a valid QUIC candidate"),
+            Err(error) => error,
+        };
+        assert!(native.to_string().contains("no validated"));
+
+        let (resolver, _) = native_production_fixture(false);
+        let browser = resolver
+            .browser_provisioning(owned_browser_request())
+            .await
+            .expect_err("browser provisioning must reject Iroh reach");
+        assert!(browser.to_string().contains("no validated"));
     }
 
     #[tokio::test]
@@ -4780,7 +4833,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn accepted_state_advance_between_selection_and_dial_refuses() {
-        let (resolver, source) = production_fixture(false);
+        let (resolver, source) = native_production_fixture(false);
         let resolved = resolver
             .resolve_service(ServiceQuery::network("model").expect("query"))
             .await
@@ -4822,7 +4875,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn live_stream_continuation_fails_closed_after_snapshot_advance() {
-        let (resolver, source) = production_fixture(false);
+        let (resolver, source) = native_production_fixture(false);
         let resolver = Arc::new(resolver);
         let snapshot = resolver
             .resolve_service_candidates(ServiceQuery::network("model").expect("query"))
@@ -4862,7 +4915,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn router_selected_reach_must_match_current_authorized_candidate() {
-        let (resolver, _) = production_fixture(false);
+        let (resolver, _) = native_production_fixture(false);
         let expected = resolver
             .resolve_service_candidates(ServiceQuery::network("model").expect("query"))
             .await
@@ -4884,7 +4937,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn router_selected_reach_rejects_unadvertised_transport_and_wrong_domain() {
-        let (resolver, _) = production_fixture(false);
+        let (resolver, _) = native_production_fixture(false);
         let client = ProductionRpcClient::new(
             "model",
             "inference",
@@ -5540,7 +5593,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn stale_or_expired_production_evidence_is_rejected() {
-        let (resolver, _) = production_fixture(false);
+        let (resolver, _) = native_production_fixture(false);
         resolver
             .announced_endpoints
             .write()
@@ -5553,7 +5606,7 @@ mod resolver_tests {
             .await
             .is_err());
 
-        let (resolver, source) = production_fixture(false);
+        let (resolver, source) = native_production_fixture(false);
         source.0.lock().as_mut().expect("fixture state").expires_at =
             Some("2000-01-01T00:00:00Z".to_owned());
         assert!(resolver
@@ -5564,7 +5617,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn malformed_candidate_does_not_poison_valid_alternative() {
-        let (resolver, _) = production_fixture(false);
+        let (resolver, _) = native_production_fixture(false);
         {
             let mut endpoints = resolver.announced_endpoints.write();
             let entries = endpoints.get_mut("model").expect("fixture service");

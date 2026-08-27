@@ -275,7 +275,7 @@ fn resolve_registration_jwt(
 /// seeded into the trust store so that peer-client construction
 /// (`service_token`) and the background renewal task can read it.
 fn register_service_key(
-    _ctx: &ServiceContext,
+    ctx: &ServiceContext,
     service_name: &str,
     signing_key: &SigningKey,
 ) -> anyhow::Result<()> {
@@ -321,11 +321,16 @@ fn register_service_key(
         trust.insert(vk, att);
     }
 
+    if ctx.iroh_required() {
+        schedule_network_service_key_registration(service_name, signing_key.clone(), jwt.clone());
+        spawn_jwt_renewal_task(service_name, signing_key.clone(), creds_dir, secrets_profile, true);
+        return Ok(());
+    }
+
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(signing_key.clone(), policy_vk, Some(jwt.clone()))?;
+    let policy_client = legacy_policy_client(signing_key.clone(), policy_vk, Some(jwt.clone()))?;
 
     let request = RegisterServiceKey {
         service_name: service_name.to_owned(),
@@ -350,9 +355,60 @@ fn register_service_key(
         signing_key.clone(),
         creds_dir,
         secrets_profile,
+        false,
     );
 
     Ok(())
+}
+
+fn policy_client_for_deployment(
+    ctx: &ServiceContext,
+    signing_key: SigningKey,
+    policy_verifying_key: VerifyingKey,
+    token: Option<String>,
+) -> anyhow::Result<PolicyClient> {
+    if ctx.iroh_required() {
+        PolicyClient::from_resolver(signing_key, token)
+    } else {
+        legacy_policy_client(signing_key, policy_verifying_key, token)
+    }
+}
+
+fn legacy_policy_client(
+    signing_key: SigningKey,
+    policy_verifying_key: VerifyingKey,
+    token: Option<String>,
+) -> anyhow::Result<PolicyClient> {
+    PolicyClient::for_local_bootstrap(signing_key, policy_verifying_key, token)
+}
+
+fn schedule_network_service_key_registration(
+    service_name: &str,
+    signing_key: SigningKey,
+    service_jwt: String,
+) {
+    let service_name = service_name.to_owned();
+    tokio::spawn(async move {
+        let mut delay = std::time::Duration::from_secs(2);
+        loop {
+            let attempt = async {
+                let client = PolicyClient::from_resolver(signing_key.clone(), Some(service_jwt.clone()))?;
+                client.register_service_key(&RegisterServiceKey {
+                    service_name: service_name.clone(),
+                    verifying_key: signing_key.verifying_key().as_bytes().to_vec(),
+                    service_jwt: service_jwt.clone(),
+                }).await.map_err(|error| anyhow::anyhow!(error))
+            }.await;
+            match attempt {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(service = %service_name, "Policy registration over production resolver is not ready; retrying: {error}");
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(std::time::Duration::from_secs(30));
+                }
+            }
+        }
+    });
 }
 
 /// Decode the `exp` claim from a JWT without verifying the signature.
@@ -379,6 +435,7 @@ fn spawn_jwt_renewal_task(
     signing_key: SigningKey,
     credentials_dir: std::path::PathBuf,
     secrets_profile: crate::auth::identity_store::SecretsProfile,
+    iroh_required: bool,
 ) {
     let service_name = service_name.to_owned();
     tokio::spawn(async move {
@@ -436,11 +493,11 @@ fn spawn_jwt_renewal_task(
                 (vk, svc_jwt)
             };
 
-            let policy_client = match PolicyClient::for_local_bootstrap(
-                signing_key.clone(),
-                policy_vk,
-                Some(current_jwt),
-            ) {
+            let policy_client = match if iroh_required {
+                PolicyClient::from_resolver(signing_key.clone(), Some(current_jwt))
+            } else {
+                legacy_policy_client(signing_key.clone(), policy_vk, Some(current_jwt))
+            } {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(service = service_name, error = %e, "failed to create PolicyClient; skipping JWT renewal");
@@ -921,7 +978,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // #910a — the registry service is the sole PDS-record writer AND the sole
     // holder of the `#atproto` private key: it opens the durable store
@@ -1183,7 +1240,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // Create registry client
     let registry_client: RegistryClient =
@@ -1605,7 +1662,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // Create registry client
     let registry_client: RegistryClient =
@@ -2722,6 +2779,27 @@ fn compute_tls_endorsement(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_deployment_chain_has_no_local_policy_bootstrap() {
+        let source = include_str!("factories.rs");
+        for function in [
+            "fn register_service_key(",
+            "fn create_registry_service(",
+            "fn create_model_service(",
+            "fn create_oai_service(",
+        ] {
+            let start = source.find(function).expect("production factory function");
+            let rest = &source[start..];
+            let end = rest.find("\nfn ").unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                !body.contains("for_local_bootstrap"),
+                "{function} must not construct a local Policy client in the deployed chain"
+            );
+        }
+        assert!(source.contains("PolicyClient::from_resolver"));
+    }
 
     #[test]
     fn at9p_verify_factory_uses_canonical_service_name() {

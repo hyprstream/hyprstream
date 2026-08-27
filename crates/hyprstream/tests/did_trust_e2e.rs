@@ -202,6 +202,7 @@ async fn build_fixture() -> Fixture {
             let _ = addr_tx.send(addr);
         })),
         iroh_enabled: false,
+        iroh_required: false,
         on_iroh_bound: None,
         moq_relay: None,
     };

@@ -97,7 +97,7 @@ pub struct NativeAnnouncementRequest {
 }
 
 pub type NativeAnnouncementPublisher =
-    Arc<dyn Fn(NativeAnnouncementRequest) + Send + Sync + 'static>;
+    Arc<dyn Fn(NativeAnnouncementRequest) -> anyhow::Result<()> + Send + Sync + 'static>;
 
 #[allow(clippy::too_many_arguments)]
 fn publish_native_announcement(
@@ -109,7 +109,7 @@ fn publish_native_announcement(
     policy_verifying_key: VerifyingKey,
     discovery_verifying_key: VerifyingKey,
     accepted: Option<NativeServiceAnnouncement>,
-) {
+) -> anyhow::Result<()> {
     // Check if JWT needs renewal (within 2 days of expiry, or missing).
     let needs_renewal = service_jwt.as_ref().is_none_or(|jwt| {
         let parts: Vec<&str> = jwt.split('.').collect();
@@ -128,16 +128,12 @@ fn publish_native_announcement(
     });
 
     let Some(accepted) = accepted else {
-        tracing::warn!(
-            "Refusing production network announcement for '{service_name}': \
+        anyhow::bail!(
+            "refusing production network announcement for '{service_name}': \
              accepted native identity/KEM bundle is unavailable"
         );
-        return;
     };
-    if let Err(error) = accepted.validate(&service_name, &signing_key.verifying_key()) {
-        tracing::warn!("Refusing production network announcement for '{service_name}': {error}");
-        return;
-    }
+    accepted.validate(&service_name, &signing_key.verifying_key())?;
     if needs_renewal {
         tracing::warn!(
             "Service JWT for '{service_name}' expired or near-expiry. \
@@ -146,10 +142,9 @@ fn publish_native_announcement(
         let _ = policy_verifying_key;
     }
     let Some(publish) = publisher else {
-        tracing::warn!(
-            "Refusing production network announcement for '{service_name}': publisher is unavailable"
+        anyhow::bail!(
+            "refusing production network announcement for '{service_name}': publisher is unavailable"
         );
-        return;
     };
     publish(NativeAnnouncementRequest {
         service_name,
@@ -165,7 +160,7 @@ fn publish_native_announcement(
         request_kem_key_id: accepted.request_kem_key_id,
         request_kem_recipient: accepted.request_kem_recipient.encode(),
         expires_at_unix_ms: accepted.accepted_state_expires_at_unix_ms,
-    });
+    })
 }
 
 /// Complete native announcement material verified against one accepted state.
@@ -294,6 +289,7 @@ pub struct QuicSharedConfig {
     /// (kept for back-compat), for every QUIC-enabled service. On by default;
     /// an operator opts out via `[quic] iroh = false` to run quinn-only (legacy).
     pub iroh_enabled: bool,
+    pub iroh_required: bool,
     /// #358: the producer-chosen moq RELAY every QUIC-enabled service on this node
     /// rendezvouses through, in wire-reach form. `None` = direct-only. Sourced
     /// from the relay DID transport entry (default: the PDS / federation anchor)
@@ -343,6 +339,7 @@ impl QuicSharedConfig {
             on_quic_bound: None,
             // #282: bind iroh in parallel when the deployment opted in.
             iroh_enabled: self.iroh_enabled,
+            iroh_required: self.iroh_required,
             on_iroh_bound: None,
             // #358: thread the producer-chosen relay through so the spawner
             // advertises a Role::Relay reach + links the origin up to the relay.
@@ -372,7 +369,7 @@ impl QuicSharedConfig {
         let quic_jwt = service_jwt.clone();
         let quic_accepted = accepted.clone();
         config.on_quic_bound = Some(Box::new(move |svc_name, addr, sn| {
-            publish_native_announcement(
+            if let Err(error) = publish_native_announcement(
                 publisher.clone(),
                 svc_name,
                 NativeAnnouncementReach::Quic {
@@ -384,7 +381,9 @@ impl QuicSharedConfig {
                 policy_verifying_key,
                 discovery_verifying_key,
                 quic_accepted.clone(),
-            );
+            ) {
+                tracing::warn!("QUIC native announcement was not published: {error}");
+            }
         }));
         let iroh_publisher = self.native_announcement_publisher.clone();
         config.on_iroh_bound = Some(Box::new(move |svc_name, node_id| {
@@ -397,7 +396,7 @@ impl QuicSharedConfig {
                 policy_verifying_key,
                 discovery_verifying_key,
                 accepted.clone(),
-            );
+            )
         }));
         config
     }
@@ -711,6 +710,12 @@ impl ServiceContext {
     /// Check if QUIC/WebTransport is enabled.
     pub fn has_quic(&self) -> bool {
         self.quic_shared.is_some()
+    }
+
+    pub fn iroh_required(&self) -> bool {
+        self.quic_shared
+            .as_ref()
+            .is_some_and(|config| config.iroh_required)
     }
 
     /// Set the OAuth issuer URL for RFC 9728 metadata.
@@ -1113,6 +1118,57 @@ mod tests {
     use super::*;
     use parking_lot::Mutex;
 
+    fn accepted_announcement(
+        signer: &SigningKey,
+        expires_at_unix_ms: i64,
+    ) -> NativeServiceAnnouncement {
+        let recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .expect("recipient")
+        .public()
+        .clone();
+        NativeServiceAnnouncement {
+            service_did: hyprstream_rpc::identity::Did::from("did:at9p:factory-test"),
+            capabilities: vec!["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()],
+            accepted_state_digest: [0x52; 64],
+            accepted_state_epoch: 7,
+            accepted_state_expires_at_unix_ms: expires_at_unix_ms,
+            response_key_id: "did:at9p:factory-test#response".to_owned(),
+            response_verifying_key: signer.verifying_key().to_bytes(),
+            request_kem_key_id: "did:at9p:factory-test#mesh-kem".to_owned(),
+            request_kem_recipient: recipient,
+        }
+    }
+
+    fn announcement_config(
+        publisher: Option<NativeAnnouncementPublisher>,
+        accepted: Option<NativeServiceAnnouncement>,
+    ) -> hyprstream_rpc::service::QuicLoopConfig {
+        let signer = SigningKey::from_bytes(&[0x41; 32]);
+        QuicSharedConfig {
+            cert_chain: Vec::new(),
+            key_der: Zeroizing::new(Vec::new()),
+            base_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            server_name: "model.example.test".to_owned(),
+            oauth_issuer_url: None,
+            jwt_verifying_key: None,
+            iroh_enabled: true,
+            iroh_required: false,
+            moq_relay: None,
+            native_announcement_publisher: publisher,
+        }
+        .for_service_with_announce(
+            "model",
+            0,
+            signer.clone(),
+            Some("same-service-jwt".to_owned()),
+            signer.verifying_key(),
+            signer.verifying_key(),
+            accepted,
+        )
+    }
+
     #[test]
     fn test_service_factory_creation() {
         fn dummy_factory(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
@@ -1146,6 +1202,76 @@ mod tests {
     }
 
     #[test]
+    fn iroh_announcement_callback_propagates_publisher_error() {
+        let signer = SigningKey::from_bytes(&[0x41; 32]);
+        let calls = Arc::new(Mutex::new(0_u8));
+        let publisher: NativeAnnouncementPublisher = Arc::new({
+            let calls = Arc::clone(&calls);
+            move |_| {
+                *calls.lock() += 1;
+                anyhow::bail!("discovery publish failed")
+            }
+        });
+        let mut config = announcement_config(
+            Some(publisher),
+            Some(accepted_announcement(&signer, i64::MAX)),
+        );
+        let error = config
+            .on_iroh_bound
+            .take()
+            .expect("Iroh callback")("model".to_owned(), [0x31; 32])
+            .expect_err("publisher failure must abort the Iroh announcement callback");
+        assert!(error.to_string().contains("discovery publish failed"));
+        assert_eq!(*calls.lock(), 1);
+    }
+
+    #[test]
+    fn iroh_callback_rejects_missing_or_expired_state_while_quic_compatibility_continues() {
+        let signer = SigningKey::from_bytes(&[0x41; 32]);
+        let publisher: NativeAnnouncementPublisher = Arc::new(|_| Ok(()));
+        let mut missing = announcement_config(Some(Arc::clone(&publisher)), None);
+        let missing_error = missing
+            .on_iroh_bound
+            .take()
+            .expect("Iroh callback")("model".to_owned(), [0x32; 32])
+            .expect_err("missing accepted state must fail the Iroh callback");
+        assert!(missing_error.to_string().contains("accepted native identity/KEM bundle is unavailable"));
+
+        let mut expired = announcement_config(
+            Some(Arc::clone(&publisher)),
+            Some(accepted_announcement(&signer, 0)),
+        );
+        let expired_error = expired
+            .on_iroh_bound
+            .take()
+            .expect("Iroh callback")("model".to_owned(), [0x33; 32])
+            .expect_err("expired accepted state must fail the Iroh callback");
+        assert!(expired_error.to_string().contains("accepted state is unbounded or expired"));
+
+        let calls = Arc::new(Mutex::new(0_u8));
+        let compatibility_publisher: NativeAnnouncementPublisher = Arc::new({
+            let calls = Arc::clone(&calls);
+            move |_| {
+                *calls.lock() += 1;
+                anyhow::bail!("temporary discovery outage")
+            }
+        });
+        let mut compatibility = announcement_config(
+            Some(compatibility_publisher),
+            Some(accepted_announcement(&signer, i64::MAX)),
+        );
+        compatibility
+            .on_quic_bound
+            .take()
+            .expect("QUIC callback")(
+                "model".to_owned(),
+                "127.0.0.1:4242".parse().expect("socket address"),
+                "model.example.test".to_owned(),
+            );
+        assert_eq!(*calls.lock(), 1, "compatibility callback must attempt publication");
+    }
+
+    #[test]
     fn factory_emits_identical_authority_bundle_for_quic_and_iroh_reach() {
         let signer = SigningKey::from_bytes(&[0x41; 32]);
         let recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
@@ -1174,10 +1300,14 @@ mod tests {
             oauth_issuer_url: None,
             jwt_verifying_key: None,
             iroh_enabled: true,
+            iroh_required: false,
             moq_relay: None,
             native_announcement_publisher: Some({
                 let published = Arc::clone(&published);
-                Arc::new(move |request| published.lock().push(request))
+                Arc::new(move |request| {
+                    published.lock().push(request);
+                    Ok(())
+                })
             }),
         };
         let mut config = shared.for_service_with_announce(
@@ -1196,7 +1326,11 @@ mod tests {
             "model.example.test".to_owned(),
         );
         let node_id = [0xab; 32];
-        config.on_iroh_bound.take().expect("Iroh callback")("model".to_owned(), node_id);
+        config
+            .on_iroh_bound
+            .take()
+            .expect("Iroh callback")("model".to_owned(), node_id)
+            .expect("Iroh announcement callback");
 
         let published = published.lock();
         assert_eq!(published.len(), 2);

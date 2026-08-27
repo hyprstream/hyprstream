@@ -1741,6 +1741,7 @@ mod tests {
             cert_path: cert_path.to_string_lossy().into_owned(),
             key_path: key_path.to_string_lossy().into_owned(),
             iroh: false,
+            native_network_profile: crate::config::NativeNetworkProfile::Compatibility,
             relay: String::new(),
         };
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x53; 32]);

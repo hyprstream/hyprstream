@@ -1929,6 +1929,93 @@ where
     }
 }
 
+/// One-shot sender for the first native-announcement result.
+type NativeAnnouncementFirstResult =
+    std::result::Result<(), String>;
+
+/// Optional one-shot channel passed to the native-announcement loop body so it
+/// can report the result of the first announcement.
+type NativeAnnouncementFirstTx =
+    Option<std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<NativeAnnouncementFirstResult>>>>>;
+
+/// Spawn the native-announcement refresh loop on its own current-thread Tokio
+/// runtime and return a channel for the first announcement result.
+///
+/// `loop_body` receives an optional one-shot sender for the first result; it
+/// should send at most once. The runtime is kept alive until `loop_body`
+/// completes, so the refresh cadence continues after the handshake.
+fn spawn_native_announcement_loop<F, Fut>(
+    require_initial: bool,
+    loop_body: F,
+) -> Option<std::sync::mpsc::Receiver<NativeAnnouncementFirstResult>>
+where
+    F: FnOnce(NativeAnnouncementFirstTx) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (initial_tx, initial_rx) = if require_initial {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    std::thread::spawn(move || {
+        let mut initial_tx = initial_tx;
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::warn!("Failed to create announcement runtime: {error}");
+                if let Some(tx) = initial_tx.take() {
+                    let _ = tx.send(Err(error.to_string()));
+                }
+                return;
+            }
+        };
+
+        runtime.block_on(async move {
+            let (announce_tx, announce_rx) = if require_initial {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                (
+                    Some(std::sync::Arc::new(parking_lot::Mutex::new(Some(tx)))),
+                    Some(rx),
+                )
+            } else {
+                (None, None)
+            };
+
+            let task = tokio::spawn(loop_body(announce_tx));
+            if let Some(rx) = announce_rx {
+                match rx.await {
+                    Ok(Ok(())) => {
+                        if let Some(tx) = initial_tx.take() {
+                            let _ = tx.send(Ok(()));
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        if let Some(tx) = initial_tx.take() {
+                            let _ = tx.send(Err(error.clone()));
+                        }
+                        task.abort();
+                    }
+                    Err(_) => {
+                        if let Some(tx) = initial_tx.take() {
+                            let _ = tx.send(Err(
+                                "native announcement task exited before first result".to_owned(),
+                            ));
+                        }
+                    }
+                }
+            }
+            let _ = task.await;
+        });
+    });
+
+    initial_rx
+}
+
 fn main() -> Result<()> {
     // ROCm allocator and BLAS optimizations — must be set before any tch/libtorch init.
     // Expandable segments eliminates ~1,900 hipMalloc/hipFree calls per decode step.
@@ -2507,10 +2594,15 @@ fn main() -> Result<()> {
                                     let mut qc = hyprstream_core::config::QuicConfig::default();
                                     qc.enabled = true;
                                     qc.bind_addr = bind_addr.clone();
+                                    qc.iroh = config.quic.iroh;
+                                    qc.native_network_profile = config.quic.native_network_profile;
                                     qc
                                 } else {
                                     config.quic.clone()
                                 };
+                                quic_cfg
+                                    .validate_native_network_profile()
+                                    .context("invalid native network profile")?;
 
                                 // Determine which services to start
                                 let service_names: Vec<String> = if let Some(ref svc_list) = multi_services {
@@ -2726,6 +2818,11 @@ fn main() -> Result<()> {
                                                 )?;
                                         }
                                         QuicCheckpointPolicy::DeferForFirstBoot => {
+                                                if quic_cfg.iroh_required() {
+                                                    anyhow::bail!(
+                                                        "network-iroh-required requires a checkpoint-verified accepted state and initial Iroh announcement; first-boot local/QUIC deferral is forbidden"
+                                                    );
+                                                }
                                                 // An explicit --quic-bind that cannot be
                                                 // honored (no accepted states exist yet) is
                                                 // an error, never a silent disable.
@@ -2797,22 +2894,18 @@ fn main() -> Result<()> {
                                         jwt_verifying_key: Some(ctx.jwt_verifying_key()),
                                         // #282: bind iroh in parallel to quinn when opted in.
                                         iroh_enabled: qc.iroh,
+                                        iroh_required: qc.iroh_required(),
                                         // #358: producer-chosen relay rendezvous (None = direct-only).
                                         moq_relay,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             |request: hyprstream_service::NativeAnnouncementRequest| {
-                                                std::thread::spawn(move || {
-                                                    let runtime = match tokio::runtime::Builder::new_current_thread()
-                                                        .enable_all()
-                                                        .build()
-                                                    {
-                                                        Ok(runtime) => runtime,
-                                                        Err(error) => {
-                                                            tracing::warn!("Failed to create announcement runtime: {error}");
-                                                            return;
-                                                        }
-                                                    };
-                                                    runtime.block_on(async move {
+                                                let require_initial_iroh = matches!(
+                                                    &request.reach,
+                                                    hyprstream_service::NativeAnnouncementReach::Iroh { .. }
+                                                );
+                                                let initial_rx = spawn_native_announcement_loop(
+                                                    require_initial_iroh,
+                                                    move |announce_tx| async move {
                                                         let socket_kind = request.reach.socket_kind().to_owned();
                                                         let endpoint = request.reach.endpoint();
                                                         let service_name = request.service_name.clone();
@@ -2835,6 +2928,11 @@ fn main() -> Result<()> {
                                                             Ok(client) => client,
                                                             Err(error) => {
                                                                 tracing::warn!("Failed to build DiscoveryClient: {error}");
+                                                                if let Some(tx) = announce_tx {
+                                                                    if let Some(tx) = tx.lock().take() {
+                                                                        let _ = tx.send(Err(error.to_string()));
+                                                                    }
+                                                                }
                                                                 return;
                                                             }
                                                         };
@@ -2857,13 +2955,37 @@ fn main() -> Result<()> {
                                                             &announcement.socket_kind,
                                                             &announcement.endpoint,
                                                             refresh_expires_at_unix_ms,
-                                                            || async {
-                                                                client.announce(&announcement).await.map(|_| ())
+                                                            || {
+                                                                let announce_tx = announce_tx.as_ref().map(std::sync::Arc::clone);
+                                                                let client = &client;
+                                                                let announcement = &announcement;
+                                                                async move {
+                                                                    let result = client.announce(announcement).await.map(|_| ());
+                                                                    if let Some(tx) = announce_tx {
+                                                                        if let Some(tx) = tx.lock().take() {
+                                                                            let report = result.as_ref().map(|_| ()).map_err(std::string::ToString::to_string);
+                                                                            let _ = tx.send(report);
+                                                                        }
+                                                                    }
+                                                                    result
+                                                                }
                                                             },
                                                         )
                                                         .await;
-                                                    });
-                                                });
+                                                    },
+                                                );
+                                                if let Some(rx) = initial_rx {
+                                                    match rx.recv() {
+                                                        Ok(Ok(())) => {}
+                                                        Ok(Err(error)) => anyhow::bail!(
+                                                            "initial Iroh announcement failed: {error}"
+                                                        ),
+                                                        Err(_) => anyhow::bail!(
+                                                            "initial Iroh announcement thread exited"
+                                                        ),
+                                                    }
+                                                }
+                                                Ok(())
                                             },
                                         )),
                                     };
@@ -3741,4 +3863,97 @@ mod resolver_startup_controls {
         );
     }
 
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod native_announcement_wiring {
+    use std::time::Duration;
+
+    fn send_first_result(
+        announce_tx: &super::NativeAnnouncementFirstTx,
+        result: super::NativeAnnouncementFirstResult,
+    ) {
+        if let Some(tx) = announce_tx {
+            if let Some(tx) = tx.lock().take() {
+                let _ = tx.send(result);
+            }
+        }
+    }
+
+    #[test]
+    fn required_path_handshakes_and_runs_multiple_cycles() {
+        let (cycle_tx, cycle_rx) = std::sync::mpsc::sync_channel(10);
+        let initial_rx = super::spawn_native_announcement_loop(true, move |announce_tx| {
+            let cycle_tx = cycle_tx.clone();
+            async move {
+                for i in 0..3 {
+                    cycle_tx.send(i).expect("test receiver is live");
+                    if i == 0 {
+                        send_first_result(&announce_tx, Ok(()));
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        let result = initial_rx
+            .expect("required path has a handshake receiver")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handshake completes");
+        assert!(result.is_ok(), "first announcement should succeed");
+
+        let mut seen = Vec::with_capacity(3);
+        for _ in 0..3 {
+            seen.push(
+                cycle_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("loop continues producing cycles"),
+            );
+        }
+        assert_eq!(seen, vec![0, 1, 2], "observed three full publication cycles");
+    }
+
+    #[test]
+    fn compat_path_publishes_without_handshake() {
+        let (cycle_tx, cycle_rx) = std::sync::mpsc::sync_channel(10);
+        let initial_rx = super::spawn_native_announcement_loop(false, move |_announce_tx| {
+            let cycle_tx = cycle_tx.clone();
+            async move {
+                cycle_tx.send(0).expect("test receiver is live");
+            }
+        });
+
+        assert!(initial_rx.is_none(), "compat path has no handshake receiver");
+        let got = cycle_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("compat path publishes");
+        assert_eq!(got, 0);
+    }
+
+    #[test]
+    fn required_path_aborts_on_first_failure() {
+        let (cycle_tx, cycle_rx) = std::sync::mpsc::sync_channel(10);
+        let initial_rx = super::spawn_native_announcement_loop(true, move |announce_tx| {
+            let cycle_tx = cycle_tx.clone();
+            async move {
+                send_first_result(&announce_tx, Err("injected".to_owned()));
+                loop {
+                    tokio::task::yield_now().await;
+                    cycle_tx.send(1).expect("test receiver is live");
+                }
+            }
+        });
+
+        let result = initial_rx
+            .expect("required path has a handshake receiver")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handshake completes");
+        assert!(result.is_err(), "first failure must be reported");
+
+        assert!(
+            cycle_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "loop must abort after first failure; extra cycle observed"
+        );
+    }
 }
