@@ -3276,12 +3276,13 @@ pub mod test_fixtures {
         transport: &TransportConfig,
         last_heartbeat: Instant,
     ) -> Result<AnnouncedEndpoint> {
-        anyhow::ensure!(
-            matches!(&transport.endpoint, EndpointType::Quic { .. }),
-            "production inference fixture advertises only QUIC candidates"
-        );
+        let socket_kind = match &transport.endpoint {
+            EndpointType::Quic { .. } => "quic",
+            EndpointType::Iroh { .. } => "iroh",
+            _ => anyhow::bail!("production inference fixture advertises only network candidates"),
+        };
         Ok(AnnouncedEndpoint {
-            socket_kind: "quic".to_owned(),
+            socket_kind: socket_kind.to_owned(),
             endpoint: transport.endpoint_string(),
             service_jwt: "fixture-verified".to_owned(),
             service_did: Did::from(authority.state.did.clone()),
