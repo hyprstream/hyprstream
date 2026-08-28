@@ -36,7 +36,6 @@ class LicenseBoundaryFixtures(unittest.TestCase):
         agpl_packages: tuple[str, ...] = ("service",),
         apache_packages: tuple[str, ...] = ("apache", "middle"),
         permissive_roots: tuple[str, ...] = ("apache", "middle"),
-        agpl_aggregators: tuple[str, ...] = (),
         policy_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
@@ -127,7 +126,6 @@ class LicenseBoundaryFixtures(unittest.TestCase):
                     "standalone_manifests = "
                     f"['crates/{service_name}/Cargo.toml']\n"
                     f"permissive_roots = {list(permissive_roots)!r}\n"
-                    f"agpl_aggregators = {list(agpl_aggregators)!r}\n"
                 )
             (root / ".github" / "license-boundary.toml").write_text(
                 policy_text, encoding="utf-8"
@@ -179,21 +177,20 @@ class LicenseBoundaryFixtures(unittest.TestCase):
 
     def test_transitive_mit_root_dependency_fails_with_complete_path(self) -> None:
         result = self.run_fixture(
-            package_names=("mit-root", "middle", "service"),
+            package_names=("mit-root", "z-middle", "service"),
             license_declarations=(
                 'license = "MIT"',
                 'license = "Apache-2.0"',
                 'license = "AGPL-3.0-only"',
             ),
             mit_packages=("mit-root",),
-            apache_packages=("middle",),
-            permissive_roots=("mit-root",),
-            agpl_aggregators=("middle",),
-            apache_manifest='[dependencies]\nmiddle = { path = "../middle" }\n',
+            apache_packages=("z-middle",),
+            permissive_roots=("mit-root", "z-middle"),
+            apache_manifest='[dependencies]\nz-middle = { path = "../z-middle" }\n',
             middle_manifest='[dependencies]\nservice = { path = "../service" }\n',
         )
         self.assert_boundary_failure(result)
-        self.assertIn("mit-root -> middle -> service", result.stderr)
+        self.assertIn("mit-root -> z-middle -> service", result.stderr)
 
     def test_renamed_dependency_fails(self) -> None:
         result = self.run_fixture(
@@ -242,8 +239,17 @@ class LicenseBoundaryFixtures(unittest.TestCase):
             "bitsandbytes-sys": "MIT",
             "cas-serve": "MIT",
             "git-xet-filter": "MIT",
-            "hyprstream-metrics": "AGPL-3.0-only",
+            "hyprstream-pay": "MIT",
+            "hyprstream": "AGPL-3.0-only",
+            "hyprstream-appview": "AGPL-3.0-only",
+            "hyprstream-discovery": "AGPL-3.0-only",
             "hyprstream-flight": "AGPL-3.0-only",
+            "hyprstream-k8s-pds": "AGPL-3.0-only",
+            "hyprstream-ledger": "AGPL-3.0-only",
+            "hyprstream-metrics": "AGPL-3.0-only",
+            "hyprstream-pds": "AGPL-3.0-only",
+            "hyprstream-pds-service": "AGPL-3.0-only",
+            "hyprstream-service": "AGPL-3.0-only",
             "hyprstream-vfs-server": "AGPL-3.0-only",
             "hyprstream-workers": "AGPL-3.0-only",
         }
@@ -264,15 +270,21 @@ class LicenseBoundaryFixtures(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("resolved manifest license", result.stderr)
 
-    def test_former_provisional_agpl_package_is_now_apache(self) -> None:
+    def test_service_package_is_agpl(self) -> None:
         result = self.run_fixture(
             package_names=("hyprstream-k8s-pds", "middle", "service"),
-            apache_packages=("hyprstream-k8s-pds", "middle"),
-            permissive_roots=("hyprstream-k8s-pds", "middle"),
+            license_declarations=(
+                'license = "AGPL-3.0-only"',
+                'license = "Apache-2.0"',
+                'license = "AGPL-3.0-only"',
+            ),
+            apache_packages=("middle",),
+            agpl_packages=("hyprstream-k8s-pds", "service"),
+            permissive_roots=("middle",),
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_former_provisional_agpl_package_in_old_class_fails(self) -> None:
+    def test_service_package_in_apache_class_fails(self) -> None:
         result = self.run_fixture(
             package_names=("hyprstream-k8s-pds", "middle", "service"),
             apache_packages=("middle",),
@@ -400,7 +412,6 @@ class LicenseBoundaryFixtures(unittest.TestCase):
                         [
                             "standalone_manifests = ['crates/service/Cargo.toml']",
                             "permissive_roots = ['apache']",
-                            "agpl_aggregators = []",
                         ]
                     )
                     result = self.run_fixture(policy_text="\n".join(lines) + "\n")
@@ -432,30 +443,34 @@ class LicenseBoundaryFixtures(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("3 package licenses match policy", result.stdout)
 
-    def test_apache_application_agpl_aggregation_is_explicit_and_allowed(self) -> None:
+    def test_agpl_application_can_depend_on_an_agpl_service(self) -> None:
         result = self.run_fixture(
             package_names=("hyprstream", "middle", "hyprstream-flight"),
-            apache_packages=("hyprstream", "middle"),
-            agpl_packages=("hyprstream-flight",),
+            license_declarations=(
+                'license = "AGPL-3.0-only"',
+                'license = "Apache-2.0"',
+                'license = "AGPL-3.0-only"',
+            ),
+            apache_packages=("middle",),
+            agpl_packages=("hyprstream", "hyprstream-flight"),
             permissive_roots=("middle",),
-            agpl_aggregators=("hyprstream",),
             apache_manifest=(
                 "[dependencies]\n"
                 'hyprstream-flight = { path = "../hyprstream-flight" }\n'
             ),
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("1 declared AGPL aggregator", result.stdout)
+        self.assertIn("2 AGPL packages", result.stdout)
 
-    def test_undeclared_agpl_aggregation_fails(self) -> None:
+    def test_omitted_permissive_root_fails(self) -> None:
         result = self.run_fixture(
             apache_manifest='[dependencies]\nservice = { path = "../service" }\n',
             permissive_roots=(),
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("permissive package role omission", result.stderr)
+        self.assertIn("permissive package root omission", result.stderr)
 
-    def test_patched_local_agpl_dependency_cannot_escape_role_classification(self) -> None:
+    def test_patched_local_agpl_dependency_cannot_escape_root_classification(self) -> None:
         result = self.run_fixture(
             package_names=("app", "middle", "anyhow"),
             package_versions=("0.1.0", "0.1.0", "99.0.0"),
@@ -470,25 +485,8 @@ class LicenseBoundaryFixtures(unittest.TestCase):
             permissive_roots=("middle",),
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("permissive package role omission", result.stderr)
+        self.assertIn("permissive package root omission", result.stderr)
         self.assertIn("'app'", result.stderr)
-
-    def test_aggregator_cannot_be_a_permissive_root(self) -> None:
-        result = self.run_fixture(
-            apache_manifest='[dependencies]\nservice = { path = "../service" }\n',
-            permissive_roots=("apache",),
-            agpl_aggregators=("apache",),
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("permissive root/AGPL aggregator overlap", result.stderr)
-
-    def test_stale_agpl_aggregation_obligation_fails(self) -> None:
-        result = self.run_fixture(
-            permissive_roots=("middle",),
-            agpl_aggregators=("apache",),
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("does not reach an AGPL package", result.stderr)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,8 @@ license = "MIT"
 repository.workspace = true
 description = "MIT-licensed settlement/tariff RPC contract + client stub — the protocol surface cyberdione-product links against (#1399)"
 
-# This crate is intentionally MIT-only (not dual MIT/AGPL like hyprstream).
+# This protocol crate is intentionally MIT-only; the Hyprstream application is
+# AGPL-3.0-only.
 # It contains ONLY the protocol traits, types, capability model, and a client
 # stub. The AGPL service implementation lives in `hyprstream::services::pay`.
 
