@@ -8,8 +8,8 @@
 //! names. Full metadata resolution remains in the causal fixtures. When
 //! #1417's omission-checked `.github/license-boundary.toml` is present, its
 //! `agpl_packages` partition augments manifest metadata. Every MIT/Apache
-//! package must be exactly one of a strict reusable `permissive_root` or an
-//! `agpl_aggregator` with a real resolved path to a local AGPL package.
+//! package must be a strict reusable `permissive_root` with no resolved path
+//! to a local AGPL package.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -128,10 +128,6 @@ fn policy_permissive_roots(workspace_root: &Path) -> Result<BTreeSet<String>, St
     policy_packages(workspace_root, "permissive_roots")
 }
 
-fn policy_agpl_aggregators(workspace_root: &Path) -> Result<BTreeSet<String>, String> {
-    policy_packages(workspace_root, "agpl_aggregators")
-}
-
 fn policy_permissive_packages(workspace_root: &Path) -> Result<BTreeSet<String>, String> {
     let mut permissive = policy_packages(workspace_root, "mit_packages")?;
     permissive.extend(policy_packages(workspace_root, "apache_packages")?);
@@ -169,31 +165,18 @@ fn policy_standalone_manifests(workspace_root: &Path) -> Result<Vec<PathBuf>, St
         .collect()
 }
 
-fn validate_permissive_role_partition(
-    workspace_root: &Path,
-) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
+fn validate_permissive_root_partition(workspace_root: &Path) -> Result<BTreeSet<String>, String> {
     let permissive = policy_permissive_packages(workspace_root)?;
     let roots = policy_permissive_roots(workspace_root)?;
-    let aggregators = policy_agpl_aggregators(workspace_root)?;
-    let overlap = roots
-        .intersection(&aggregators)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !overlap.is_empty() {
-        return Err(format!(
-            "permissive root/AGPL aggregator overlap: {overlap:?}"
-        ));
-    }
-    let roles = roots.union(&aggregators).cloned().collect::<BTreeSet<_>>();
-    let omissions = permissive.difference(&roles).cloned().collect::<Vec<_>>();
-    let non_permissive = roles.difference(&permissive).cloned().collect::<Vec<_>>();
+    let omissions = permissive.difference(&roots).cloned().collect::<Vec<_>>();
+    let non_permissive = roots.difference(&permissive).cloned().collect::<Vec<_>>();
     if !omissions.is_empty() || !non_permissive.is_empty() {
         return Err(format!(
-            "permissive role partition mismatch; omissions: {omissions:?}; \
-             non-permissive roles: {non_permissive:?}"
+            "permissive root partition mismatch; omissions: {omissions:?}; \
+             non-permissive roots: {non_permissive:?}"
         ));
     }
-    Ok((roots, aggregators))
+    Ok(roots)
 }
 
 fn resolved_metadata(
@@ -676,17 +659,13 @@ fn assert_transitive_patch_resolved(
 }
 
 #[test]
-fn production_every_permissive_package_has_the_declared_resolved_role() {
+fn production_every_permissive_package_is_a_strict_root() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .expect("canonical workspace root");
-    let (roots, aggregators) = validate_permissive_role_partition(&workspace_root).unwrap();
+    let roots = validate_permissive_root_partition(&workspace_root).unwrap();
     assert!(!roots.is_empty(), "policy must select reusable roots");
-    assert!(
-        !aggregators.is_empty(),
-        "policy must select AGPL aggregators"
-    );
 
     let mut workspace_metadata =
         local_metadata(&workspace_root, &workspace_root.join("Cargo.toml")).unwrap();
@@ -705,9 +684,8 @@ fn production_every_permissive_package_has_the_declared_resolved_role() {
         workspace_metadata.packages.push(package);
     }
 
-    let roles = roots.union(&aggregators).cloned().collect::<BTreeSet<_>>();
     let mut checked = BTreeSet::new();
-    for package_name in &roles {
+    for package_name in &roots {
         let package = workspace_metadata
             .packages
             .iter()
@@ -752,23 +730,13 @@ fn production_every_permissive_package_has_the_declared_resolved_role() {
             )
         };
 
-        if roots.contains(package_name) {
-            boundary.unwrap_or_else(|error| {
-                panic!("reusable permissive root {package_name} is not strict: {error}")
-            });
-        } else {
-            let error = boundary.expect_err(&format!(
-                "AGPL aggregator {package_name} has no real AGPL path"
-            ));
-            assert!(
-                error.contains("permissive-root-to-AGPL dependency"),
-                "AGPL aggregator {package_name} failed for a non-boundary reason: {error}"
-            );
-        }
+        boundary.unwrap_or_else(|error| {
+            panic!("reusable permissive root {package_name} is not strict: {error}")
+        });
         checked.insert(package_name.clone());
     }
 
-    assert_eq!(checked, roles, "every permissive package must be checked");
+    assert_eq!(checked, roots, "every permissive package must be checked");
 }
 
 #[test]
@@ -1108,7 +1076,7 @@ anyhow = "=99.0.0""#,
 }
 
 #[test]
-fn patched_local_agpl_app_omitted_from_both_roles_is_rejected() {
+fn patched_local_agpl_app_omitted_from_permissive_roots_is_rejected() {
     let (directory, root_manifest) = patched_anyhow_fixture(
         r#"[dependencies]
 anyhow = "=99.0.0""#,
@@ -1131,7 +1099,6 @@ mit_packages = []
 agpl_packages = ["anyhow"]
 apache_packages = ["app"]
 permissive_roots = []
-agpl_aggregators = []
 "#,
     );
 
@@ -1140,10 +1107,10 @@ agpl_aggregators = []
         resolved_error.contains("app -> anyhow"),
         "fixture must prove the registry declaration resolves to local AGPL: {resolved_error}"
     );
-    let role_error = validate_permissive_role_partition(directory.path()).unwrap_err();
+    let role_error = validate_permissive_root_partition(directory.path()).unwrap_err();
     assert!(
         role_error.contains("omissions: [\"app\"]"),
-        "an app omitted from both resolved roles must fail closed: {role_error}"
+        "an app omitted from permissive roots must fail closed: {role_error}"
     );
 }
 
