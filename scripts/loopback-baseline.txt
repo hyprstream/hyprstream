@@ -5,7 +5,6 @@
 # is not banked via --update. Files that reach zero drop out on
 # the next --update. Do NOT hand-edit counts upward — the diff
 # is review-visible and that is the only defense.
-1	crates/hyprstream-discovery/src/service.rs
 1	crates/hyprstream-flight/src/cli/commands/sql.rs
 1	crates/hyprstream-flight/src/cli/handlers.rs
 2	crates/hyprstream-flight/src/client.rs

@@ -58,7 +58,7 @@ pub struct ValkeyStateConfig {
 impl Default for ValkeyStateConfig {
     fn default() -> Self {
         Self {
-            url: "redis://127.0.0.1:6379".to_owned(),
+            url: String::new(),
             key_prefix: "hs".to_owned(),
             pool_size: 8,
             announcement_capacity: 65_536,
@@ -645,6 +645,10 @@ impl ValkeyStateStore {
         anyhow::ensure!(
             config.pool_size > 0,
             "Discovery Valkey pool_size must be positive"
+        );
+        anyhow::ensure!(
+            !config.url.trim().is_empty(),
+            "Discovery Valkey URL must be configured explicitly"
         );
         anyhow::ensure!(
             config.command_timeout_ms > 0,

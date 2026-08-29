@@ -38,6 +38,8 @@ l1_max_ttl_ms = 1000
 first verifies its L2 revision, and cached lifetime is clamped to both the L1
 freshness window and the signed/effective record expiry. An L2 error is
 returned to the caller rather than serving an isolated or expired L1 value.
+The Valkey URL has no implicit loopback default and must be configured
+explicitly whenever `valkey` or `tiered` is selected.
 
 All keys for one configured prefix share a Valkey cluster hash tag so atomic
 Lua updates remain in one slot. Use a deployment-specific prefix when multiple
