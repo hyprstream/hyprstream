@@ -24,15 +24,21 @@ In particular, a verified subject is not implicitly allowed to spawn a task.
 | Operation authority | `AttachmentOperationGrant` is opaque and generation-bound. `TaskSpawn`, `TaskAttach`, `TaskSignal`, `TaskRead`, and `TaskPublish` are checked at their effect boundaries. | A production issuer must join a dispatch PEP/MAC decision and a distinct delegated-capability decision. Neither a dispatch MAC permit nor a JWT `cap` is silently treated as the other. |
 | Revocation | The current caller grant is rechecked before and after awaited pool/stream state, and before output publication. A task record binds attachment id, generation, and subject but contains no reusable scope grant. | Revocation that wins before a fence stops the next effect. It cannot retrospectively cancel a backend call that already crossed its fence. Durable cancellation/recovery is deferred. |
 | Task contract | `TaskService` supplies spawn, attach, signal, wait/result, and snapshot shapes over the existing `/exec` Worker projection. Argv spawn requires `TaskSpawn` plus `TaskPublish`; terminal signals require `TaskSignal` plus `TaskPublish`. | Child creation fails closed: no parent lineage or delegated attenuation is represented yet. |
-| `/exec` projection | `Mount::walk_with_context` provides a default-compatible seam; `MountBackend` retains an authorizer-returned exact grant at attach and calls the dynamic override. `ExecMount` stores that context on its fid, so a same-subject legacy caller cannot list or walk an attachment-bound Task. | The production 9P credential path does not yet issue the dual-evidence grant, and there is no `/exec/clone` VFS node; `TaskService::spawn_task` is the explicit allocation seam. |
+| `/exec` projection | `ExecRootMount` maps a trusted-policy, attachment-context walk of `/exec/clone` to one pending allocation on `open`; `instances` delegates to `ExecMount`, including lossless `exec-json` argv, bounded fd reads, and numeric process exit. The policy supplies a commitment digest plus enforced backend/timeout constraints. | This is a local Wanix/Fersh adapter mapping, not stock tree identity or a production Fersh broker. The digest is not an effective/admitted Namespace; production grant issuance and effective Namespace derivation/delivery remain deferred to P12. |
 | Namespace field | `NamespaceManifestDigest` records a hash of caller-provided description bytes alongside the Task. | This is asserted contract metadata only. The Worker neither derives a `Namespace` nor an effective mount description from it, and does not supply it to `PodSandboxConfig`; it is not namespace admission or a sandbox-binding proof. |
 | Result content | `ContentDigest` is content identity and `TaskContentRecord` is trusted-service observation/association metadata. Input association does not assert upstream production. | No output bytes are materialized into CAS, and public record fields are not signed or self-authenticating. A digest is not a retrievable artifact or independent provenance evidence. |
 | fd carrier | The local fd adapter has bounded 9P reads, explicit local truncation indication, and matching terminal MoQ metadata; the regression consumes the local carrier to test its encoding. | The standalone origin exports no Iroh endpoint, subscriber, admission, MAC-key handoff, or client-reachable locator. `TaskReaches` advertises no MoQ topic until that exists. |
 
 `TaskPayload::Content` remains in the forward contract but this Worker rejects
 it before sandbox allocation. Accepting a digest without fetching and
-materializing it would create a false-success running Task. Likewise, this
-spike has no Fersh fixture or application integration.
+materializing it would create a false-success running Task. P11 supplies a
+fake-backed Fersh/Wanix adapter fixture only; it makes no Fersh repository
+edit, broker, or production application-integration claim.
+
+The fixture maps Wanix's current `#task/new/<kind>` convention (using the
+`#task/new/auto` form) and its `cmd`/`ctl`/`fd`/`exit` files onto this bounded
+`/exec/clone` plus `instances` projection. It does not assert that this tree
+is a stock Wanix export.
 
 ## Effect and visibility rules
 
@@ -63,6 +69,10 @@ its verified context to all production mount construction remains separate.
 - context-bound Task invisibility to a same-subject legacy mount caller;
 - verified 9P attach propagation to a context-aware dynamic `Mount`, exact-grant
   reattach binding (including scopes), and revocation before the next ctl effect;
+- clone open allocates once from injected policy, while stat/readdir/bare reads
+  and same-subject legacy walks cannot allocate; the local adapter verifies
+  exact `exec-json` argv then covers `clone` → `instances/<id>/ctl` → `fd/1`
+  → numeric `exit`;
 - read-only and signal-only current grants cannot borrow wider spawn authority;
 - revocation after an awaited fd read/publish boundary is denied;
 - an armed lifecycle-policy denial remains `PermissionDenied`, not stale;
@@ -94,6 +104,7 @@ main
   -> codex/spike-attachment-revocation-fences
   -> codex/spike-task-attachment-record
   -> codex/spike-ninep-vfs-context
+  -> codex/spike-exec-clone-device
 ```
 
 | Layer | Branch | Review purpose |
@@ -108,9 +119,10 @@ main
 | 8 | `codex/spike-attachment-revocation-fences` | Current-caller grant fencing, policy-denial taxonomy, and effect rechecks. |
 | 9 | `codex/spike-task-attachment-record` | This boundary record and stack manifest. |
 | 10 | `codex/spike-ninep-vfs-context` | Verified 9P attach to VFS operation-context propagation, exact-grant reattach fencing, and dynamic `ExecMount` retention. |
+| 11 | `codex/spike-exec-clone-device` | Local `/exec/clone` allocation adapter, pending Task record, lossless argv ctl, and numeric process exit. |
 
 The stack must be rebased and revalidated at every head before merge. A future
 production follow-up must add the production dual-evidence 9P grant issuer and
-listener hand-off, namespace derivation/admission, durable
+listener hand-off, effective namespace derivation/delivery, durable
 artifact materialization, and reachable authenticated stream handoff rather
 than widening this local prototype by implication.

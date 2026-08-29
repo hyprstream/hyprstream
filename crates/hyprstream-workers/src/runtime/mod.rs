@@ -45,6 +45,7 @@ pub mod k8s_backend;
 // `/exec/instances/` VFS projection of `SandboxPool` (#608 P2 / #610) — a
 // `hyprstream_vfs::Mount` impl, so it has no `kata-vm`/`wasm` dependency.
 pub mod exec_mount;
+pub mod exec_root_mount;
 // Kata/CH VM backend — gated behind `kata` (pulls the kata/nydus toolchain).
 // `kata-vm` is a backward-compat alias for `kata` (#518).
 #[cfg(feature = "kata")]
@@ -131,6 +132,7 @@ pub use backend::{SandboxBackend, SandboxHandle};
 pub use cri_backend::{CriBackend, CriConfig, CriHandle};
 // `/exec/instances/` Plan9 projection of the pool (#608 P2 / #610)
 pub use exec_mount::ExecMount;
+pub use exec_root_mount::{CloneAdmission, CloneAdmissionSource, ExecRootMount};
 #[cfg(feature = "kata")]
 pub use kata_backend::{KataBackend, KataHandle};
 #[cfg(feature = "nspawn")]

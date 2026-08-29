@@ -41,8 +41,9 @@
 //! |           | change.                                                           |
 //! | `destroy` | calls `SandboxBackend::destroy`, then removes the instance from  |
 //! |           | the pool's active map and marks it terminal for `exit`/`status`. |
-//! | `exec`    | runs an argv-only task through this mount's `SandboxBackend`      |
-//! |           | seam, then latches stdout/stderr in `fd/1` and `fd/2`.            |
+//! | `exec`    | compatibility whitespace-split argv task through this mount's     |
+//! |           | `SandboxBackend` seam, then latches stdout/stderr in `fd/1,2`.   |
+//! | `exec-json` | lossless JSON string-array argv form; it is never shell-evaluated. |
 //!
 //! Unknown verbs return [`MountError::InvalidArgument`]. A verb may be
 //! followed by trailing whitespace, which is trimmed.
@@ -87,10 +88,17 @@ enum Verb {
     /// Execute a task through this Plan 9 projection. Arguments are already
     /// tokenized; this is deliberately not a shell-string interface.
     Exec(Vec<String>),
+    /// Lossless JSON argv form for adapters. Parsed as a JSON array only;
+    /// it is never passed to a shell.
+    ExecJson(Vec<String>),
 }
 
 impl Verb {
     fn parse(s: &str) -> Option<Self> {
+        if let Some(argv) = s.trim().strip_prefix("exec-json ") {
+            let argv: Vec<String> = serde_json::from_str(argv).ok()?;
+            return (!argv.is_empty()).then_some(Self::ExecJson(argv));
+        }
         let words: Vec<String> = s.split_whitespace().map(str::to_owned).collect();
         match words.as_slice() {
             [verb] if verb == "start" => Some(Self::Start),
@@ -392,6 +400,9 @@ struct TaskRecord {
     authority_generation: AuthorityGeneration,
     subject: Subject,
     namespace_manifest: hyprstream_rpc_std::task::NamespaceManifestDigest,
+    /// Timeout selected by the trusted clone policy (or the standard Task
+    /// request) and applied when this instance executes its one argv task.
+    timeout_secs: u64,
     state: TaskState,
     content_records: Vec<TaskContentRecord>,
 }
@@ -458,6 +469,9 @@ pub struct ExecMount {
     /// exactly once per instance (write-once), so a late `exit` read is
     /// served from here immediately.
     terminal: TerminalStore<String, TerminalStatus>,
+    /// Process completion is distinct from sandbox destruction: a completed
+    /// command keeps its sandbox reachable for later explicit cleanup.
+    task_exit: TerminalStore<String, i32>,
     /// Ids ever latched into `terminal`. `TerminalStore` doesn't expose key
     /// enumeration (by design — it's a per-key latch/read primitive, not a
     /// directory), so `readdir` tracks this separately to keep destroyed
@@ -502,6 +516,7 @@ impl ExecMount {
                 .build(),
             fd_streams: tokio::sync::Mutex::new(HashMap::new()),
             terminal: TerminalStore::new(),
+            task_exit: TerminalStore::new(),
             terminal_ids: PmMutex::new(std::collections::HashSet::new()),
             waiters: PmMutex::new(HashMap::new()),
             lifecycle: None,
@@ -559,6 +574,52 @@ impl ExecMount {
                 "failed to release sandbox while rolling back task spawn"
             );
         }
+    }
+
+    /// Allocate an attachment-bound Task without executing it. This is the
+    /// `/exec/clone` device seam: the caller supplies only a trusted-policy
+    /// namespace commitment/constraints object; clone bytes never become
+    /// policy input.
+    pub async fn allocate_pending_task(
+        &self,
+        context: &VfsOpContext,
+        namespace_manifest: hyprstream_rpc_std::task::NamespaceManifestDigest,
+        constraints: TaskRuntimeConstraints,
+    ) -> Result<String, MountError> {
+        context.ensure_operation(AttachmentOperation::TaskSpawn)?;
+        if let Some(requested) = constraints.backend_class.as_deref() {
+            if requested != self.pool.backend().backend_type() {
+                return Err(MountError::InvalidArgument(format!(
+                    "clone policy requested backend {requested}, pool is {}",
+                    self.pool.backend().backend_type()
+                )));
+            }
+        }
+        let id = self
+            .pool
+            .acquire(
+                context.subject(),
+                &super::client::PodSandboxConfig::default(),
+            )
+            .await
+            .map_err(|error| MountError::Io(error.to_string()))?;
+        if let Err(error) = context.ensure_operation(AttachmentOperation::TaskSpawn) {
+            let _ = self.pool.release(&id).await;
+            return Err(error);
+        }
+        self.task_records.lock().insert(
+            id.clone(),
+            TaskRecord {
+                attachment_id: context.attachment_id().clone(),
+                authority_generation: context.authority_generation(),
+                subject: context.subject().clone(),
+                namespace_manifest,
+                timeout_secs: constraints.timeout_secs.unwrap_or(300),
+                state: TaskState::Pending,
+                content_records: Vec::new(),
+            },
+        );
+        Ok(id)
     }
 
     /// Publish one completed task execution into the instance's terminal fd
@@ -834,6 +895,17 @@ impl ExecMount {
                 },
             ];
         }
+        // Process completion is separate from sandbox destruction.  Latch and
+        // wake here (rather than in one ctl spelling) so every execution path,
+        // including the standard `TaskService` path, makes `/exit` observable.
+        self.task_exit.latch(
+            id.to_owned(),
+            Terminal {
+                value: result.exit_code,
+                latched_by: "exec-result".to_owned(),
+            },
+        );
+        self.waiter_for(id).notify_waiters();
     }
 
     /// Execute through the selected sandbox backend and project the terminal
@@ -965,7 +1037,7 @@ impl ExecMount {
         // it before every ctl lifecycle effect; raw legacy instances keep the
         // compatibility path until all callers migrate.
         let task_operation = match &verb {
-            Verb::Exec(_) => AttachmentOperation::TaskSpawn,
+            Verb::Exec(_) | Verb::ExecJson(_) => AttachmentOperation::TaskSpawn,
             Verb::Start | Verb::Stop | Verb::Kill | Verb::Destroy => {
                 AttachmentOperation::TaskSignal
             }
@@ -994,7 +1066,7 @@ impl ExecMount {
                             "start is not a lifecycle-destructive verb".into(),
                         ));
                     }
-                    Verb::Exec(_) => {
+                    Verb::Exec(_) | Verb::ExecJson(_) => {
                         return Err(MountError::InvalidArgument(
                             "exec is not a lifecycle-destructive verb".into(),
                         ));
@@ -1064,9 +1136,14 @@ impl ExecMount {
                 self.waiter_for(id).notify_waiters();
                 Ok("ok: destroyed\n".to_owned())
             }
-            Verb::Exec(command) => {
+            Verb::Exec(command) | Verb::ExecJson(command) => {
+                let timeout_secs = self
+                    .task_records
+                    .lock()
+                    .get(id)
+                    .map_or(300, |record| record.timeout_secs);
                 let result = self
-                    .exec_task_with_context(id, caller, context, &command, 300)
+                    .exec_task_with_context(id, caller, context, &command, timeout_secs)
                     .await?;
                 self.record_exec_result(id, &result);
                 Ok(format!("ok: exited {}\n", result.exit_code))
@@ -1109,6 +1186,12 @@ impl ExecMount {
         context: Option<&VfsOpContext>,
     ) -> Result<String, MountError> {
         let key = id.to_owned();
+        if let Some(term) = self.task_exit.get(&key) {
+            if let Some(context) = context {
+                context.ensure_operation(AttachmentOperation::TaskRead)?;
+            }
+            return Ok(format!("{}\n", term.value));
+        }
         // Fast path: already latched — serve the retained value immediately,
         // exactly the "late reader" half of read-then-subscribe.
         if let Some(term) = self.terminal.get(&key) {
@@ -1128,6 +1211,12 @@ impl ExecMount {
         let notify = self.waiter_for(id);
         loop {
             let notified = notify.notified();
+            if let Some(term) = self.task_exit.get(&key) {
+                if let Some(context) = context {
+                    context.ensure_operation(AttachmentOperation::TaskRead)?;
+                }
+                return Ok(format!("{}\n", term.value));
+            }
             if let Some(term) = self.terminal.get(&key) {
                 if let Some(context) = context {
                     context.ensure_operation(AttachmentOperation::TaskRead)?;
@@ -1135,6 +1224,12 @@ impl ExecMount {
                 return Ok(term.value.render());
             }
             notified.await;
+            if let Some(term) = self.task_exit.get(&key) {
+                if let Some(context) = context {
+                    context.ensure_operation(AttachmentOperation::TaskRead)?;
+                }
+                return Ok(format!("{}\n", term.value));
+            }
             if let Some(term) = self.terminal.get(&key) {
                 if let Some(context) = context {
                     context.ensure_operation(AttachmentOperation::TaskRead)?;
@@ -1237,6 +1332,7 @@ impl TaskService for ExecMount {
             return Err(error);
         }
 
+        let timeout_secs = constraints.timeout_secs.unwrap_or(300);
         self.task_records.lock().insert(
             id.clone(),
             TaskRecord {
@@ -1244,12 +1340,12 @@ impl TaskService for ExecMount {
                 authority_generation: context.authority_generation(),
                 subject: context.subject().clone(),
                 namespace_manifest,
+                timeout_secs,
                 state: TaskState::Running,
                 content_records: Vec::new(),
             },
         );
 
-        let timeout_secs = constraints.timeout_secs.unwrap_or(300);
         let result = match self
             .exec_task_with_context(
                 &id,
@@ -1664,9 +1760,15 @@ mod tests {
     use crate::runtime::backend::{SandboxBackend, SandboxHandle};
     use crate::runtime::client::{LinuxContainerResources, PodSandboxConfig};
     use crate::runtime::sandbox::PodSandbox;
-    use hyprstream_rpc::VerifiedAttachment;
+    use crate::runtime::{CloneAdmission, CloneAdmissionSource, ExecRootMount};
+    use hyprstream_9p::{
+        AttachAuthorizer, Backend, MountBackend, SessionContext, VerifiedAttach,
+        VerifiedAttachIdentity,
+    };
+    use hyprstream_rpc::auth::mac::{CompartmentSet, Level, SecurityContext, VerifiedKeyMaterial};
     use hyprstream_rpc::moq_stream::{STREAM_TRACK, verify_moq_frame};
     use hyprstream_rpc::streaming::{StreamPayload, StreamVerifier};
+    use hyprstream_rpc::{AttachmentOperation, VerifiedAttachment};
     use hyprstream_rpc_std::task::NamespaceManifestDigest;
     use moq_net::Track;
     use std::any::Any;
@@ -1689,6 +1791,8 @@ mod tests {
         stopped: AtomicBool,
         fail_exec: AtomicBool,
         revoke_during_exec: PmMutex<Option<VerifiedAttachment>>,
+        commands: PmMutex<Vec<Vec<String>>>,
+        timeouts: PmMutex<Vec<u64>>,
     }
 
     #[async_trait]
@@ -1741,8 +1845,8 @@ mod tests {
         async fn exec_sync(
             &self,
             _sandbox: &PodSandbox,
-            _command: &[String],
-            _timeout_secs: u64,
+            command: &[String],
+            timeout_secs: u64,
         ) -> WorkerResult<(i32, Vec<u8>, Vec<u8>)> {
             if let Some(attachment) = self.revoke_during_exec.lock().take() {
                 attachment.revoke().map_err(|error| {
@@ -1754,6 +1858,8 @@ mod tests {
                     "scripted fake exec failure".into(),
                 ));
             }
+            self.commands.lock().push(command.to_vec());
+            self.timeouts.lock().push(timeout_secs);
             Ok((0, b"fake stdout\n".to_vec(), b"fake stderr\n".to_vec()))
         }
 
@@ -1766,14 +1872,17 @@ mod tests {
         }
     }
 
-    async fn make_pool() -> Arc<SandboxPool> {
-        let backend: Arc<dyn SandboxBackend> = Arc::new(FakeBackend::default());
+    async fn make_pool_with(backend: Arc<dyn SandboxBackend>) -> Arc<SandboxPool> {
         let config = PoolConfig {
             max_sandboxes: 10,
             warm_pool_size: 0,
             ..Default::default()
         };
         Arc::new(SandboxPool::new(config, backend))
+    }
+
+    async fn make_pool() -> Arc<SandboxPool> {
+        make_pool_with(Arc::new(FakeBackend::default())).await
     }
 
     fn subject() -> Subject {
@@ -1788,6 +1897,142 @@ mod tests {
     /// fail closed.
     fn admission_subject() -> Subject {
         Subject::new("test-user")
+    }
+
+    #[tokio::test]
+    async fn clone_device_adapts_pending_task_to_ctl_fd_and_numeric_exit() {
+        struct FixedAdmission;
+        impl CloneAdmissionSource for FixedAdmission {
+            fn admit(&self, _context: &VfsOpContext) -> Result<CloneAdmission, MountError> {
+                Ok(CloneAdmission::from_trusted_policy(
+                    NamespaceManifestDigest::from_description_bytes(b"/work=fake\n"),
+                    TaskRuntimeConstraints {
+                        backend_class: Some("fake".into()),
+                        timeout_secs: Some(30),
+                    },
+                ))
+            }
+        }
+
+        struct StaticGrantAuthorizer(VerifiedAttach);
+
+        #[async_trait]
+        impl AttachAuthorizer for StaticGrantAuthorizer {
+            async fn authenticate(
+                &self,
+                _uname: &str,
+                _aname: &str,
+            ) -> Result<VerifiedAttach, MountError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let fake = Arc::new(FakeBackend::default());
+        let instances = Arc::new(ExecMount::new(make_pool_with(fake.clone()).await));
+        let root = Arc::new(ExecRootMount::new(
+            Arc::clone(&instances),
+            Arc::new(FixedAdmission),
+        ));
+        let owner = Subject::new("clone-owner");
+        let attachment = VerifiedAttachment::for_test_local_root(owner.clone()).unwrap();
+        let grant = attachment.for_test_operations(&[
+            AttachmentOperation::TaskSpawn,
+            AttachmentOperation::TaskRead,
+            AttachmentOperation::TaskPublish,
+        ]);
+        let identity =
+            VerifiedAttachIdentity::from_verified_credential("clone-owner", "fixture-tenant");
+        let verified = VerifiedAttach::try_new_with_operation_grant(
+            identity.clone(),
+            owner.clone(),
+            SessionContext::from_verified_clearance(
+                identity,
+                SecurityContext::new(
+                    Level::Secret,
+                    CompartmentSet::EMPTY,
+                    VerifiedKeyMaterial::Classical,
+                ),
+            ),
+            &grant,
+        )
+        .unwrap();
+
+        // A same-Subject connection with no independently-issued Task grant
+        // can name `clone`, but cannot allocate from it.
+        let legacy = MountBackend::new(root.clone(), owner.clone());
+        legacy.walk(0, 10, &["clone".into()]).await.unwrap();
+        assert!(legacy.open(10, 0).await.is_err());
+
+        // This is the fake-backed Fersh/Wanix adapter fixture: the verified
+        // attach supplies the opaque grant once, then the 9P backend carries
+        // it over walk/open/read/write rather than deriving authority from a
+        // subject, path, or generic 9P write.
+        let backend =
+            MountBackend::with_authorizer(root, Arc::new(StaticGrantAuthorizer(verified)));
+        backend.attach("fixture-ticket", "", None).await.unwrap();
+        // Discovery operations and a bare clone read are non-effects: they
+        // cannot allocate a sandbox before the context-walked `open`.
+        backend.walk(0, 9, &[]).await.unwrap();
+        backend.stat(9).await.unwrap();
+        backend.readdir(9, 0, 4096).await.unwrap();
+        backend.walk(0, 1, &["clone".into()]).await.unwrap();
+        assert!(backend.read(1, 0, 4096).await.is_err());
+        assert!(instances.pool.list_active().await.is_empty());
+        backend.open(1, 0).await.unwrap();
+        backend.open(1, 0).await.unwrap();
+        assert_eq!(instances.pool.list_active().await.len(), 1);
+        let id = String::from_utf8(backend.read(1, 0, 4096).await.unwrap())
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert!(!id.is_empty());
+
+        backend
+            .walk(0, 2, &["instances".into(), id.clone(), "ctl".into()])
+            .await
+            .unwrap();
+        backend.open(2, 2).await.unwrap();
+        backend
+            .write(2, 0, br#"exec-json ["echo","arg with space"]"#)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(backend.read(2, 0, 4096).await.unwrap())
+                .unwrap()
+                .starts_with("ok: exited 0")
+        );
+        assert_eq!(
+            fake.commands.lock().as_slice(),
+            &[vec!["echo".to_owned(), "arg with space".to_owned()]],
+            "exec-json must reach the backend as the exact JSON argv"
+        );
+        assert_eq!(fake.timeouts.lock().as_slice(), &[30]);
+
+        backend
+            .walk(
+                0,
+                3,
+                &["instances".into(), id.clone(), "fd".into(), "1".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(backend.read(3, 0, 5).await.unwrap(), b"fake ");
+        backend
+            .walk(0, 4, &["instances".into(), id, "exit".into()])
+            .await
+            .unwrap();
+        assert_eq!(backend.read(4, 0, 64).await.unwrap(), b"0\n");
+
+        // The fid retains the grant issued at attach, so revocation blocks
+        // the next ctl effect before a second backend command can begin.
+        attachment.revoke().unwrap();
+        assert!(backend.read(3, 5, 4096).await.is_err());
+        assert!(
+            backend
+                .write(2, 0, br#"exec-json ["echo","must not run"]"#)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
