@@ -428,32 +428,17 @@ def main(root: Path = ROOT) -> None:
     permissive_roots = named_package_set(
         config, "permissive_roots", set(manifests)
     )
-    agpl_aggregators = named_package_set(
-        config, "agpl_aggregators", set(manifests)
-    )
     non_permissive_roots = permissive_roots - permissive
     if non_permissive_roots:
         fail(
             "permissive_roots contains non-MIT/Apache package(s): "
             f"{sorted(non_permissive_roots)}"
         )
-    non_permissive_aggregators = agpl_aggregators - permissive
-    if non_permissive_aggregators:
-        fail(
-            "agpl_aggregators contains non-MIT/Apache package(s): "
-            f"{sorted(non_permissive_aggregators)}"
-        )
-    root_aggregator_overlap = permissive_roots & agpl_aggregators
-    if root_aggregator_overlap:
-        fail(
-            "permissive root/AGPL aggregator overlap: "
-            f"{sorted(root_aggregator_overlap)}"
-        )
-    role_omissions = permissive - permissive_roots - agpl_aggregators
+    role_omissions = permissive - permissive_roots
     if role_omissions:
         fail(
-            "permissive package role omission; classify each as a reusable "
-            f"root or AGPL aggregator: {sorted(role_omissions)}"
+            "permissive package root omission; every MIT/Apache package must "
+            f"be guarded: {sorted(role_omissions)}"
         )
 
     paths_to_agpl = resolved_paths_for_permissive_packages(
@@ -468,18 +453,10 @@ def main(root: Path = ROOT) -> None:
         if path is not None:
             fail("permissive-root-to-AGPL dependency: " + " -> ".join(path))
 
-    for aggregator in sorted(agpl_aggregators):
-        if paths_to_agpl[aggregator] is None:
-            fail(
-                f"AGPL aggregator {aggregator!r} does not reach an AGPL package; "
-                "remove stale combined-distribution obligation"
-            )
-
     print(
         "license boundary OK: "
         f"{len(permissive_roots)} reusable MIT/Apache roots do not reach "
-        f"{len(agpl)} AGPL packages; {len(agpl_aggregators)} declared AGPL "
-        f"aggregator; {len(manifests)} package licenses match policy"
+        f"{len(agpl)} AGPL packages; {len(manifests)} package licenses match policy"
     )
 
 

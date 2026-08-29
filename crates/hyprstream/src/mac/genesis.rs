@@ -477,6 +477,12 @@ impl ObjectLabelResolver for CompositeObjectLabelResolver {
 /// Adapt the genesis/bind carrier resolver to the canonical cross-plane MAC
 /// resolver contract. For the VFS plane, `service_domain` is the normalized
 /// absolute object path and there is no browser method discriminator.
+///
+/// **RPC dispatch no longer routes through this adapter** (#1499): the
+/// dispatch PEP evaluates typed `(service, leaf/method)` rows from
+/// [`crate::mac::dispatch_labels`], so a bare service domain is never split
+/// as a path here. This impl serves the VFS/9P plane only
+/// ([`crate::mac::pep::production_vfs_pep`]).
 impl hyprstream_rpc::auth::mac::RpcObjectLabelResolver for CompositeObjectLabelResolver {
     fn resolve(&self, service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
         let components: Vec<&str> = service_domain

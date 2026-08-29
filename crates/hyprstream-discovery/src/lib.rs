@@ -53,6 +53,11 @@ pub mod generated {
 }
 
 mod service;
+mod state_store;
+pub use state_store::{
+    DiscoveryState, DiscoveryStateBackend, DiscoveryStateConfig, MemoryStateConfig,
+    TieredStateConfig, ValkeyStateConfig,
+};
 #[cfg(not(target_arch = "wasm32"))]
 mod checkpointed_pds;
 

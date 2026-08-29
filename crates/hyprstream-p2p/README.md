@@ -205,6 +205,8 @@ Pull requests are welcome! The project follows standard Rust conventions:
 
 ## License
 
-MIT License. Copyright (c) Erica Windisch
+Apache License 2.0 — see [LICENSE-APACHE](../../LICENSE-APACHE) for the current
+crate license. Portions derived from Chris Ball's original JavaScript GitTorrent
+retain their MIT notice in [LICENSE](LICENSE).
 
 Credit to Chris Ball for his inspirational work on the original Javascript-based Gittorrent.

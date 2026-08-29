@@ -355,12 +355,10 @@ impl EventAuthz for AllowAllEventAuthz {
 /// [`DenyAllEventAuthz`], never a dormant permit fallback.
 ///
 /// Typed identity (v16 §10 / #1510): each check parses the topic-prefix
-/// grammar exactly once at this boundary. A `prefix` that is not an object
-/// identity — including the tenant-qualified internal map keys the
-/// confidential paths pass (e.g. `"5:tenantworker"`), which are bookkeeping
-/// keys, not identities — denies as an unknown identity. Confidential-prefix
-/// admission therefore stays fail-closed until the event plane carries its
-/// tenant-qualified identity as typed data.
+/// grammar exactly once at this boundary. Tenant-qualified internal map keys
+/// (for example `"5:tenantworker"`) are bookkeeping keys, not identities,
+/// and must never cross this boundary. Confidential callers retain those keys
+/// only for state lookup, while presenting the underlying Event prefix here.
 pub struct MacEventAuthz {
     pep: MoqEventPep,
 }
@@ -731,8 +729,7 @@ impl EventPublisher {
             Some(did) => Subject::new(did.clone()),
             None => Subject::anonymous(),
         };
-        let object = if state.confidential { &key } else { &prefix };
-        if !self.authz.can_publish(&caller, object) {
+        if !self.authz.can_publish(&caller, &prefix) {
             return Err(anyhow!(
                 "publish denied by event-plane authz for prefix '{prefix}'"
             ));
@@ -1108,7 +1105,7 @@ impl EventSubscriber {
             );
         }
         let prefix_key = self.encrypted_prefix_key(prefix).await?;
-        if !self.authz.can_join_decrypt(&self.caller, &prefix_key) {
+        if !self.authz.can_join_decrypt(&self.caller, prefix) {
             return Err(format!(
                 "join/decrypt denied by event-plane MAC for prefix '{prefix}'"
             ));
@@ -1336,9 +1333,9 @@ impl EventSubscriber {
                 )
             };
         };
-        if !self.authz.can_subscribe(&self.caller, &key) {
+        if !self.authz.can_subscribe(&self.caller, prefix) {
             return FrameOutcome::Drop(
-                "subscribe denied by event-plane MAC for tenant-qualified prefix".to_owned(),
+                "subscribe denied by event-plane MAC for confidential prefix".to_owned(),
             );
         }
         let mut prefixes = self.prefixes.write().await;
@@ -1490,12 +1487,18 @@ enum FrameOutcome {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::auth::mac::{
+        Assurance, ClearanceSource, CompartmentSet, DeclaredTrackPolicyResolver, Level,
+        MoqEventPlane, MoqEventPolicyRow, MoqEventPolicyTable, MoqMacAuditRecord, MoqMacAuditSink,
+        SecurityContext, SecurityLabel, VerifiedKeyMaterial,
+    };
     use crate::crypto::group_key::{
         recipient_key_id, ControllerBinding, GroupKeyRegistry, GroupMembership, GroupRef,
         MembershipChange, MembershipResolver,
     };
     use crate::crypto::hybrid_kem::{generate_recipient, RecipientKeypair, SuiteId};
     use ml_dsa::Keypair;
+    use parking_lot::Mutex;
 
     const TEST_TENANT: &str = "tenant-test";
 
@@ -1510,6 +1513,92 @@ mod tests {
         let mut secret = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
         SigningKey::from_bytes(&secret)
+    }
+
+    fn public_label() -> SecurityLabel {
+        SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY)
+    }
+
+    struct PublicClearance;
+
+    impl ClearanceSource for PublicClearance {
+        fn clearance(&self, _subject: &Subject) -> Option<SecurityContext> {
+            Some(SecurityContext::from_clearance(
+                public_label(),
+                VerifiedKeyMaterial::Classical,
+            ))
+        }
+    }
+
+    struct NoopAudit;
+
+    impl MoqMacAuditSink for NoopAudit {
+        fn record_deny(&self, _record: &MoqMacAuditRecord) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A test-only wrapper around the production MAC adapter. It proves which
+    /// identity actually reaches the typed Event PEP rather than merely
+    /// asserting the internal map-key implementation detail.
+    struct RecordingMacEventAuthz {
+        inner: MacEventAuthz,
+        calls: Mutex<Vec<(MoqEventAction, String)>>,
+    }
+
+    impl RecordingMacEventAuthz {
+        fn declared_worker() -> Arc<Self> {
+            let table = MoqEventPolicyTable::build(
+                1,
+                [MoqEventPolicyRow::new(MoqEventPlane::Event, "worker", public_label())
+                    .unwrap()],
+            )
+            .unwrap();
+            Arc::new(Self {
+                inner: MacEventAuthz::new(MoqEventPep::new(
+                    Arc::new(DeclaredTrackPolicyResolver::new(table)),
+                    Arc::new(PublicClearance),
+                    Arc::new(NoopAudit),
+                )),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn empty() -> Arc<Self> {
+            Arc::new(Self {
+                inner: MacEventAuthz::new(MoqEventPep::new(
+                    Arc::new(DeclaredTrackPolicyResolver::new(MoqEventPolicyTable::empty())),
+                    Arc::new(PublicClearance),
+                    Arc::new(NoopAudit),
+                )),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<(MoqEventAction, String)> {
+            self.calls.lock().clone()
+        }
+
+        fn record(&self, action: MoqEventAction, prefix: &str) {
+            self.calls.lock().push((action, prefix.to_owned()));
+        }
+    }
+
+    impl EventAuthz for RecordingMacEventAuthz {
+        fn can_publish(&self, caller: &Subject, prefix: &str) -> bool {
+            self.record(MoqEventAction::Publish, prefix);
+            self.inner.can_publish(caller, prefix)
+        }
+
+        fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
+            self.record(MoqEventAction::Subscribe, prefix);
+            self.inner.can_subscribe(caller, prefix)
+        }
+
+        fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
+            self.record(MoqEventAction::JoinDecrypt, prefix);
+            self.inner.can_join_decrypt(caller, prefix)
+        }
     }
 
     #[tokio::test]
@@ -1544,6 +1633,89 @@ mod tests {
             }
         }
         panic!("subscriber did not observe the test frame");
+    }
+
+    #[tokio::test]
+    async fn declared_event_identity_authorizes_plaintext_and_confidential_paths() {
+        let authz = RecordingMacEventAuthz::declared_worker();
+
+        let origin = crate::moq_event::MoqEventOrigin::new();
+        let public = EventPublisher::from_public_prefix("worker", origin.publisher("worker").unwrap())
+            .unwrap()
+            .with_authz(authz.clone());
+        public.publish("sandbox1", "started", b"plaintext").await.unwrap();
+
+        let public_subscriber = EventSubscriber::new().unwrap().with_authz(authz.clone());
+        assert!(matches!(
+            public_subscriber
+                .decode_frame("worker.sandbox1.started", b"plaintext")
+                .await,
+            FrameOutcome::Passthrough
+        ));
+
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let (grant, key) = grant_for(&recipient, &ed, &pq).await;
+        let confidential = EventSubscriber::new()
+            .unwrap()
+            .with_authz(authz.clone())
+            .with_caller(Subject::new("did:web:member"));
+        expect_confidential(&confidential, "worker", &ed, &pq).await;
+        confidential
+            .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
+            .await
+            .unwrap();
+        let encrypted = event(&key, &ed, &pq, b"confidential", 1);
+        assert!(matches!(
+            confidential
+                .decode_frame(&encrypted.topic, &encrypted.encode_body())
+                .await,
+            FrameOutcome::Decoded(ref plaintext) if plaintext == b"confidential"
+        ));
+
+        assert_eq!(
+            authz.calls(),
+            vec![
+                (MoqEventAction::Publish, "worker".to_owned()),
+                (MoqEventAction::Subscribe, "worker".to_owned()),
+                (MoqEventAction::JoinDecrypt, "worker".to_owned()),
+                (MoqEventAction::Subscribe, "worker".to_owned()),
+            ],
+            "the MAC boundary must receive the typed Event prefix, never a tenant bookkeeping key"
+        );
+
+        let undeclared = RecordingMacEventAuthz::declared_worker();
+        let undeclared_subscriber = EventSubscriber::new()
+            .unwrap()
+            .with_authz(undeclared.clone())
+            .with_caller(Subject::new("did:web:member"));
+        expect_confidential(&undeclared_subscriber, "registry", &ed, &pq).await;
+        assert!(undeclared_subscriber
+            .install_epoch_grant("registry", &recipient, &grant, anchor(&ed, &pq), None, None)
+            .await
+            .unwrap_err()
+            .contains("join/decrypt denied by event-plane MAC"));
+        assert_eq!(
+            undeclared.calls(),
+            vec![(MoqEventAction::JoinDecrypt, "registry".to_owned())]
+        );
+
+        let empty = RecordingMacEventAuthz::empty();
+        let empty_subscriber = EventSubscriber::new()
+            .unwrap()
+            .with_authz(empty.clone())
+            .with_caller(Subject::new("did:web:member"));
+        expect_confidential(&empty_subscriber, "worker", &ed, &pq).await;
+        assert!(empty_subscriber
+            .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
+            .await
+            .unwrap_err()
+            .contains("join/decrypt denied by event-plane MAC"));
+        assert_eq!(
+            empty.calls(),
+            vec![(MoqEventAction::JoinDecrypt, "worker".to_owned())]
+        );
     }
 
     fn member(recipient: &RecipientKeypair, did: &str, blind: u8) -> GroupMembership {

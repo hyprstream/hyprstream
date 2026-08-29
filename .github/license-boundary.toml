@@ -9,8 +9,16 @@ mit_packages = [
 ]
 
 agpl_packages = [
+  "hyprstream",
+  "hyprstream-appview",
+  "hyprstream-discovery",
   "hyprstream-flight",
+  "hyprstream-k8s-pds",
+  "hyprstream-ledger",
   "hyprstream-metrics",
+  "hyprstream-pds",
+  "hyprstream-pds-service",
+  "hyprstream-service",
   "hyprstream-vfs-server",
   "hyprstream-workers",
 ]
@@ -18,25 +26,17 @@ agpl_packages = [
 apache_packages = [
   "chat-core",
   "git2db",
-  "hyprstream",
   "hyprstream-9p",
-  "hyprstream-appview",
   "hyprstream-compositor",
   "hyprstream-containedfs",
   "hyprstream-crypto",
-  "hyprstream-discovery",
   "hyprstream-k8s",
-  "hyprstream-k8s-pds",
-  "hyprstream-ledger",
   "hyprstream-p2p",
-  "hyprstream-pds",
-  "hyprstream-pds-service",
   "hyprstream-resource",
   "hyprstream-rpc",
   "hyprstream-rpc-build",
   "hyprstream-rpc-derive",
   "hyprstream-rpc-std",
-  "hyprstream-service",
   "hyprstream-tui",
   "hyprstream-util",
   "hyprstream-vfs",
@@ -67,23 +67,16 @@ permissive_roots = [
   "git-xet-filter",
   "git2db",
   "hyprstream-9p",
-  "hyprstream-appview",
   "hyprstream-compositor",
   "hyprstream-containedfs",
   "hyprstream-crypto",
-  "hyprstream-discovery",
   "hyprstream-k8s",
-  "hyprstream-k8s-pds",
-  "hyprstream-ledger",
   "hyprstream-p2p",
-  "hyprstream-pds",
-  "hyprstream-pds-service",
   "hyprstream-resource",
   "hyprstream-rpc",
   "hyprstream-rpc-build",
   "hyprstream-rpc-derive",
   "hyprstream-rpc-std",
-  "hyprstream-service",
   "hyprstream-tui",
   "hyprstream-util",
   "hyprstream-vfs",
@@ -93,11 +86,4 @@ permissive_roots = [
   "hyprstream-workers-wasmtime",
   "hyprstream-workers-wasmtime-fsguest",
   "waxterm",
-]
-
-# Apache-declared application source may aggregate AGPL components. Combined
-# distributions carry the AGPL obligation even though the application's own
-# source files remain Apache-2.0.
-agpl_aggregators = [
-  "hyprstream",
 ]

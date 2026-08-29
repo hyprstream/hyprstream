@@ -28,6 +28,7 @@ jobs:
           base-devel \
           rustup \
           cmake \
+          clang \
           capnproto \
           openssl \
           pkg-config \
