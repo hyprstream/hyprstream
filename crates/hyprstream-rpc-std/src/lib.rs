@@ -154,6 +154,8 @@ pub mod oauth_client {
 // either target. (#539 T3)
 pub mod vfs_mount;
 pub mod stream_mount;
+/// Cross-runtime Task contract; Worker placement remains in hyprstream-workers.
+pub mod task;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_exports;
 #[cfg(target_arch = "wasm32")]

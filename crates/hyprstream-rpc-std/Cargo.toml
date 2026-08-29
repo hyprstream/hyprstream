@@ -23,6 +23,7 @@ base64 = { workspace = true }
 subsecond = { workspace = true }
 inventory = { workspace = true }
 tracing = { workspace = true }
+blake3 = { workspace = true }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
 hyprstream-workers-tcl = { path = "../hyprstream-workers-tcl" }
 
@@ -62,6 +63,8 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true }
+# Enables only the explicit local-test-root fixture in contract tests.
+hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 
 # wasm32-only test deps: a real, browser-executed test for the
 # `BrowserSession` API (mirrors hyprstream-rpc/tests/wasm_browser_fetch.rs).
