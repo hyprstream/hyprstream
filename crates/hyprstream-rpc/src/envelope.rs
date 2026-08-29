@@ -357,14 +357,14 @@ pub fn current_timestamp() -> i64 {
 
 /// Generate a random 16-byte nonce for replay protection.
 pub fn generate_nonce() -> [u8; 16] {
-    // CodeQL-recognized CSPRNG: `OsRng.gen()` draws every byte uniformly at
+    // CodeQL-recognized CSPRNG: `OsRng.r#gen()` draws every byte uniformly at
     // random with no initialization literal. The previous `[0u8; 16]` scratch
     // buffer tripped `rust/hard-coded-cryptographic-value` even though
     // `fill_bytes` overwrote it entirely — this construction is equivalent in
     // strength (still OsRng-backed) but literal-free, matching the
     // `crypto::event_crypto::random_nonce` pattern used for AES-GCM nonces.
     use rand::Rng;
-    rand::rngs::OsRng.gen()
+    rand::rngs::OsRng.r#gen()
 }
 
 /// Authorization subject for Casbin policy checks and resource isolation.
