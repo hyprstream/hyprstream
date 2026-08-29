@@ -33,7 +33,7 @@ use anyhow::{anyhow, Context as _, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use hyprstream_rpc::Subject;
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError};
+use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, VfsOpContext};
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::backend::{Backend, OpenResult, StatResult, WalkResult};
@@ -83,6 +83,10 @@ struct MountFidEntry {
 pub struct MountBackend {
     mount: Arc<dyn Mount>,
     subject: OnceCell<Subject>,
+    /// The optional attachment context is fixed by the first successful
+    /// attach. It is separate from `subject`: a verified identity alone is
+    /// never elevated into Task authority.
+    operation_context: OnceCell<Option<VfsOpContext>>,
     /// Present only for the attach-time path; resolves `uname` → `Subject`.
     authorizer: Option<Arc<dyn AttachAuthorizer>>,
     fids: DashMap<u32, Arc<MountFidEntry>>,
@@ -97,6 +101,7 @@ impl MountBackend {
         Self {
             mount,
             subject: cell,
+            operation_context: OnceCell::new(),
             authorizer: None,
             fids: DashMap::new(),
         }
@@ -111,6 +116,7 @@ impl MountBackend {
         Self {
             mount,
             subject: OnceCell::new(),
+            operation_context: OnceCell::new(),
             authorizer: Some(authorizer),
             fids: DashMap::new(),
         }
@@ -122,6 +128,80 @@ impl MountBackend {
         self.subject
             .get()
             .ok_or_else(|| anyhow!("9P op before Tattach: session Subject not bound"))
+    }
+
+    /// Validate a context supplied by a verified attach before session state
+    /// is bound. This is deliberately not a conversion from the 9P MAC
+    /// session: only `VerifiedAttach::try_new_with_operation_grant` can
+    /// populate it from an independently-issued opaque grant.
+    fn requested_operation_context(
+        &self,
+        verified: Option<&VerifiedAttach>,
+    ) -> Result<Option<VfsOpContext>> {
+        let context = verified
+            .and_then(VerifiedAttach::operation_context)
+            .cloned();
+        if let (Some(verified), Some(context)) = (verified, context.as_ref()) {
+            if context.subject() != verified.subject() {
+                return Err(anyhow::Error::new(MountError::PermissionDenied(
+                    "attachment operation context differs from verified attach subject".to_owned(),
+                )));
+            }
+            context.ensure_current().map_err(anyhow::Error::new)?;
+        }
+        Ok(context)
+    }
+
+    /// Bind the optional context exactly once. Reattach is idempotent only for
+    /// an exact copy of the original grant, including its scope set; context
+    /// upgrades, downgrades, and replacements are all denied.
+    fn bind_operation_context(&self, requested: Option<VfsOpContext>) -> Result<()> {
+        // Check again immediately before binding. Revocation remains checked
+        // at every effect by the retained fid context, closing the remaining
+        // race after attach.
+        if let Some(context) = requested.as_ref() {
+            context.ensure_current().map_err(anyhow::Error::new)?;
+        }
+        match self.operation_context.set(requested) {
+            Ok(()) => Ok(()),
+            Err(attempted) => {
+                let bound = self.operation_context.get().ok_or_else(|| {
+                    anyhow!("bind attachment operation context: cell rejected without value")
+                })?;
+                let same = match (bound.as_ref(), attempted.as_ref()) {
+                    (None, None) => true,
+                    (Some(bound), Some(attempted)) => bound.same_grant(attempted),
+                    _ => false,
+                };
+                if same {
+                    Ok(())
+                } else {
+                    Err(anyhow::Error::new(MountError::PermissionDenied(
+                        "reattach cannot upgrade, downgrade, or replace attachment operation context"
+                            .to_owned(),
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Walk through the context-aware trait seam when attach carried a Task
+    /// grant. Generic mounts inherit `Mount`'s Subject-only default; mounts
+    /// such as `ExecMount` override it to retain the context on the returned
+    /// fid for later effects.
+    async fn walk_mount(&self, components: &[&str]) -> Result<Fid> {
+        match self.operation_context.get().and_then(Option::as_ref) {
+            Some(context) => self
+                .mount
+                .walk_with_context(components, context)
+                .await
+                .map_err(anyhow::Error::new),
+            None => self
+                .mount
+                .walk(components, self.caller()?)
+                .await
+                .map_err(anyhow::Error::new),
+        }
     }
 
     /// Clone out the `Arc` for a fid, dropping the `DashMap` guard so the mount
@@ -170,8 +250,11 @@ impl Backend for MountBackend {
                         "verified attach subject differs from fixed VFS subject".to_owned(),
                     )));
                 }
+                let context = self.requested_operation_context(Some(&verified))?;
+                self.bind_operation_context(context)?;
                 return Ok(Some(verified));
             }
+            self.bind_operation_context(None)?;
             return Ok(None);
         };
         // Attach-time ticket path (H1b): resolve+narrow the Subject AND validate
@@ -187,17 +270,22 @@ impl Backend for MountBackend {
         };
         let subject = verified.subject().clone();
         let attempted_subject = subject.clone();
+        let context = self.requested_operation_context(Some(&verified))?;
         // First attach wins; a second attach on the same connection must not
         // silently re-scope the session. Ignore a redundant identical set,
         // reject a conflicting one.
         match self.subject.set(subject) {
-            Ok(()) => Ok(Some(verified)),
+            Ok(()) => {
+                self.bind_operation_context(context)?;
+                Ok(Some(verified))
+            }
             Err(_) => {
                 let existing = self
                     .subject
                     .get()
                     .ok_or_else(|| anyhow!("bind session Subject: cell rejected without value"))?;
                 if existing == &attempted_subject {
+                    self.bind_operation_context(context)?;
                     Ok(Some(verified))
                 } else {
                     Err(anyhow::Error::new(MountError::PermissionDenied(
@@ -240,7 +328,7 @@ impl Backend for MountBackend {
             // explicitly clunked before returning the error, or every walk
             // that fails past its first component (e.g. `/a/b` where `a`
             // exists but `b` does not) leaks one backend handle.
-            let next = match self.mount.walk(&refs, self.caller()?).await {
+            let next = match self.walk_mount(&refs).await {
                 Ok(next) => next,
                 Err(e) => {
                     if let Some(previous) = handle.take() {
@@ -268,11 +356,7 @@ impl Backend for MountBackend {
 
         if components.is_empty() {
             let refs: Vec<&str> = new_path.iter().map(String::as_str).collect();
-            let next = self
-                .mount
-                .walk(&refs, self.caller()?)
-                .await
-                .context("mount walk failed")?;
+            let next = self.walk_mount(&refs).await.context("mount walk failed")?;
             qids.push(self.qid_of(&next).await?);
             handle = Some(next);
         }
@@ -443,6 +527,278 @@ mod tests {
         assert_eq!(lopen_flags_to_mode(0o1), 1);
         assert_eq!(lopen_flags_to_mode(0o2), 2);
         assert_eq!(lopen_flags_to_mode(0o101), 1);
+    }
+
+    /// The attach-to-VFS bridge is tested here with a deliberately small
+    /// attachment-aware mount instead of the Worker fake backend: this crate
+    /// owns the direct `Backend::attach` / `dyn Mount` boundary, while
+    /// `ExecMount` separately covers the same retained-fid context semantics
+    /// in its focused Worker tests. The fake fid treats `write` as a ctl effect
+    /// so this proves a post-attach revocation reaches the next 9P effect.
+    #[tokio::test]
+    async fn verified_attach_context_reaches_dyn_mount_and_fences_ctl_effects() {
+        use async_trait::async_trait;
+        use hyprstream_rpc::auth::mac::{
+            CompartmentSet, Level, SecurityContext, VerifiedKeyMaterial,
+        };
+        use hyprstream_rpc::{AttachmentOperation, VerifiedAttachment};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct AttachmentFid {
+            context: Option<VfsOpContext>,
+        }
+
+        struct AttachmentAwareMount {
+            legacy_walks: AtomicUsize,
+            contextual_walks: AtomicUsize,
+            ctl_effects: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Mount for AttachmentAwareMount {
+            async fn walk(
+                &self,
+                _components: &[&str],
+                _caller: &Subject,
+            ) -> Result<Fid, MountError> {
+                self.legacy_walks.fetch_add(1, Ordering::SeqCst);
+                Err(MountError::NotFound(
+                    "attachment-bound task is hidden without an operation context".into(),
+                ))
+            }
+
+            async fn walk_with_context(
+                &self,
+                _components: &[&str],
+                context: &VfsOpContext,
+            ) -> Result<Fid, MountError> {
+                context.ensure_operation(hyprstream_rpc::AttachmentOperation::TaskRead)?;
+                self.contextual_walks.fetch_add(1, Ordering::SeqCst);
+                Ok(Fid::new(AttachmentFid {
+                    context: Some(context.clone()),
+                }))
+            }
+
+            async fn open(
+                &self,
+                _fid: &mut Fid,
+                _mode: u8,
+                _caller: &Subject,
+            ) -> Result<(), MountError> {
+                Ok(())
+            }
+
+            async fn read(
+                &self,
+                fid: &Fid,
+                _offset: u64,
+                _count: u32,
+                _caller: &Subject,
+            ) -> Result<Vec<u8>, MountError> {
+                let context = fid
+                    .downcast_ref::<AttachmentFid>()
+                    .and_then(|fid| fid.context.as_ref())
+                    .ok_or_else(|| MountError::NotFound("task is hidden".into()))?;
+                context.ensure_operation(hyprstream_rpc::AttachmentOperation::TaskRead)?;
+                Ok(b"visible through the verified attach".to_vec())
+            }
+
+            async fn write(
+                &self,
+                fid: &Fid,
+                _offset: u64,
+                data: &[u8],
+                _caller: &Subject,
+            ) -> Result<u32, MountError> {
+                let context = fid
+                    .downcast_ref::<AttachmentFid>()
+                    .and_then(|fid| fid.context.as_ref())
+                    .ok_or_else(|| MountError::NotFound("task ctl is hidden".into()))?;
+                context.ensure_operation(hyprstream_rpc::AttachmentOperation::TaskSignal)?;
+                self.ctl_effects.fetch_add(1, Ordering::SeqCst);
+                Ok(data.len() as u32)
+            }
+
+            async fn readdir(
+                &self,
+                _fid: &Fid,
+                _caller: &Subject,
+            ) -> Result<Vec<DirEntry>, MountError> {
+                Err(MountError::NotDirectory("not a directory".into()))
+            }
+
+            async fn stat(
+                &self,
+                _fid: &Fid,
+                _caller: &Subject,
+            ) -> Result<hyprstream_vfs::Stat, MountError> {
+                Ok(hyprstream_vfs::Stat::unknown_qid(0, 0, "ctl".into(), 0))
+            }
+
+            async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
+        }
+
+        struct StaticGrantAuthorizer(VerifiedAttach);
+
+        #[async_trait]
+        impl AttachAuthorizer for StaticGrantAuthorizer {
+            async fn authenticate(
+                &self,
+                _uname: &str,
+                _aname: &str,
+            ) -> Result<VerifiedAttach, MountError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        fn verified_attach_for(
+            attachment: &VerifiedAttachment,
+            operations: &[AttachmentOperation],
+        ) -> VerifiedAttach {
+            let identity = VerifiedAttachIdentity::from_verified_credential(
+                attachment.subject().name().expect("non-anonymous fixture"),
+                "task-fixture-tenant",
+            );
+            let session = SessionContext::from_verified_clearance(
+                identity.clone(),
+                SecurityContext::new(
+                    Level::Secret,
+                    CompartmentSet::EMPTY,
+                    VerifiedKeyMaterial::Classical,
+                ),
+            );
+            let grant = attachment.for_test_operations(operations);
+            VerifiedAttach::try_new_with_operation_grant(
+                identity,
+                attachment.subject().clone(),
+                session,
+                &grant,
+            )
+            .expect("fixture grant and verified attach share a subject")
+        }
+
+        let attachment =
+            VerifiedAttachment::for_test_local_root(Subject::new("context-owner")).unwrap();
+        let permitted = verified_attach_for(
+            &attachment,
+            &[
+                AttachmentOperation::TaskRead,
+                AttachmentOperation::TaskSignal,
+            ],
+        );
+        let mount = Arc::new(AttachmentAwareMount {
+            legacy_walks: AtomicUsize::new(0),
+            contextual_walks: AtomicUsize::new(0),
+            ctl_effects: AtomicUsize::new(0),
+        });
+        let backend = MountBackend::with_authorizer(
+            mount.clone(),
+            Arc::new(StaticGrantAuthorizer(permitted.clone())),
+        );
+
+        // An authorizer returns the independently-issued opaque grant as part
+        // of its already-verified attach bundle. `MountBackend` retains it and
+        // dispatches through `dyn Mount::walk_with_context`.
+        backend.attach("ticket", "", None).await.unwrap();
+        backend
+            .walk(0, 1, &["task".to_owned(), "ctl".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(mount.contextual_walks.load(Ordering::SeqCst), 2);
+        assert_eq!(mount.legacy_walks.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            backend.read(1, 0, 4096).await.unwrap(),
+            b"visible through the verified attach"
+        );
+        assert_eq!(backend.write(1, 0, b"stop").await.unwrap(), 4);
+        assert_eq!(mount.ctl_effects.load(Ordering::SeqCst), 1);
+
+        // Reattach accepts an exact copy only. A same-attachment read-only
+        // grant is not equivalent: scope changes are denied, not silently
+        // applied to this established connection.
+        backend
+            .attach("ticket", "", Some(permitted.clone()))
+            .await
+            .unwrap();
+        let narrowed = verified_attach_for(&attachment, &[AttachmentOperation::TaskRead]);
+        assert!(backend.attach("ticket", "", Some(narrowed)).await.is_err());
+        let identity = VerifiedAttachIdentity::from_verified_credential(
+            "context-owner",
+            "task-fixture-tenant",
+        );
+        let legacy = VerifiedAttach::try_new(
+            identity.clone(),
+            Subject::new("context-owner"),
+            SessionContext::from_verified_clearance(
+                identity,
+                SecurityContext::new(
+                    Level::Secret,
+                    CompartmentSet::EMPTY,
+                    VerifiedKeyMaterial::Classical,
+                ),
+            ),
+        )
+        .unwrap();
+        assert!(backend.attach("ticket", "", Some(legacy)).await.is_err());
+
+        // Revocation is observed by the context retained in the walked fid;
+        // the next ctl effect is denied before the mount can perform it.
+        attachment.revoke().unwrap();
+        assert!(backend.attach("ticket", "", Some(permitted)).await.is_err());
+        assert!(backend.write(1, 0, b"stop").await.is_err());
+        assert_eq!(mount.ctl_effects.load(Ordering::SeqCst), 1);
+
+        // A verified legacy attach has no delegated Task grant. It therefore
+        // reaches only the generic Subject walk and the attachment-bound tree
+        // stays hidden.
+        let legacy_identity =
+            VerifiedAttachIdentity::from_verified_credential("legacy-owner", "task-fixture-tenant");
+        let legacy_attach = VerifiedAttach::try_new(
+            legacy_identity.clone(),
+            Subject::new("legacy-owner"),
+            SessionContext::from_verified_clearance(
+                legacy_identity,
+                SecurityContext::new(
+                    Level::Secret,
+                    CompartmentSet::EMPTY,
+                    VerifiedKeyMaterial::Classical,
+                ),
+            ),
+        )
+        .unwrap();
+        let missing_context_mount = Arc::new(AttachmentAwareMount {
+            legacy_walks: AtomicUsize::new(0),
+            contextual_walks: AtomicUsize::new(0),
+            ctl_effects: AtomicUsize::new(0),
+        });
+        let missing_context_backend = MountBackend::with_authorizer(
+            missing_context_mount.clone(),
+            Arc::new(StaticGrantAuthorizer(legacy_attach)),
+        );
+        missing_context_backend
+            .attach("ticket", "", None)
+            .await
+            .unwrap();
+        let upgrade_owner =
+            VerifiedAttachment::for_test_local_root(Subject::new("legacy-owner")).unwrap();
+        let attempted_upgrade =
+            verified_attach_for(&upgrade_owner, &[AttachmentOperation::TaskRead]);
+        assert!(missing_context_backend
+            .attach("ticket", "", Some(attempted_upgrade))
+            .await
+            .is_err());
+        assert!(missing_context_backend
+            .walk(0, 1, &["task".to_owned()])
+            .await
+            .is_err());
+        assert_eq!(
+            missing_context_mount
+                .contextual_walks
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(missing_context_mount.legacy_walks.load(Ordering::SeqCst), 1);
     }
 
     /// Regression: a multi-component walk that fails past its first hop must

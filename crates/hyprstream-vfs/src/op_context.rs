@@ -32,6 +32,16 @@ impl VfsOpContext {
         }
     }
 
+    /// Whether two contexts preserve exactly the same opaque operation grant.
+    ///
+    /// Trusted transport hand-off boundaries use this to make reattach
+    /// idempotent only for the same attachment, generation, subject, and
+    /// scope set. It does not authorize an operation by itself.
+    #[must_use]
+    pub fn same_grant(&self, other: &Self) -> bool {
+        self.grant.same_grant(&other.grant)
+    }
+
     /// The local subject view derived at the verified attachment boundary.
     #[must_use]
     pub fn subject(&self) -> &Subject {

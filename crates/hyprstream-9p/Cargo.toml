@@ -34,6 +34,10 @@ js-sys = "0.3"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tempfile = { workspace = true }
+# Enables only the explicitly test-gated opaque grant fixture constructor for
+# the attach-to-VFS context regression tests. Production dependencies retain no
+# grant issuer.
+hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 
 [features]
 default = []

@@ -20,11 +20,11 @@ In particular, a verified subject is not implicitly allowed to spawn a task.
 
 | Boundary | Current behavior | Limit of the claim |
 | --- | --- | --- |
-| Attachment identity | On native builds, `VerifiedAttachment::from_envelope` accepts only the private provenance marker installed by verified RPC dispatch. Public callback and public signed-envelope context constructors are rejected. | There is no production 9P verified-attach bridge yet. The local-root constructor and scoped grant issuer are test-only. |
+| Attachment identity | On native builds, `VerifiedAttachment::from_envelope` accepts only the private provenance marker installed by verified RPC dispatch. Public callback and public signed-envelope context constructors are rejected. A 9P authorizer may carry an already-issued opaque grant only when its exact subject matches the verified attach identity. | The production 9P credential path issues no delegated Task grant. The local-root constructor and scoped grant issuer are test-only; identity, MAC state, and generic 9P write permission are not translated into one. |
 | Operation authority | `AttachmentOperationGrant` is opaque and generation-bound. `TaskSpawn`, `TaskAttach`, `TaskSignal`, `TaskRead`, and `TaskPublish` are checked at their effect boundaries. | A production issuer must join a dispatch PEP/MAC decision and a distinct delegated-capability decision. Neither a dispatch MAC permit nor a JWT `cap` is silently treated as the other. |
 | Revocation | The current caller grant is rechecked before and after awaited pool/stream state, and before output publication. A task record binds attachment id, generation, and subject but contains no reusable scope grant. | Revocation that wins before a fence stops the next effect. It cannot retrospectively cancel a backend call that already crossed its fence. Durable cancellation/recovery is deferred. |
 | Task contract | `TaskService` supplies spawn, attach, signal, wait/result, and snapshot shapes over the existing `/exec` Worker projection. Argv spawn requires `TaskSpawn` plus `TaskPublish`; terminal signals require `TaskSignal` plus `TaskPublish`. | Child creation fails closed: no parent lineage or delegated attenuation is represented yet. |
-| `/exec` projection | Context-aware `walk_with_context` lets an attachment-bound Task be reached through the existing mount. A same-subject legacy `Mount` caller cannot list or walk it. | There is no generic context-carrying `Mount` migration and no `/exec/clone` VFS node; `TaskService::spawn_task` is the explicit allocation seam. |
+| `/exec` projection | `Mount::walk_with_context` provides a default-compatible seam; `MountBackend` retains an authorizer-returned exact grant at attach and calls the dynamic override. `ExecMount` stores that context on its fid, so a same-subject legacy caller cannot list or walk an attachment-bound Task. | The production 9P credential path does not yet issue the dual-evidence grant, and there is no `/exec/clone` VFS node; `TaskService::spawn_task` is the explicit allocation seam. |
 | Namespace field | `NamespaceManifestDigest` records a hash of caller-provided description bytes alongside the Task. | This is asserted contract metadata only. The Worker neither derives a `Namespace` nor an effective mount description from it, and does not supply it to `PodSandboxConfig`; it is not namespace admission or a sandbox-binding proof. |
 | Result content | `ContentDigest` is content identity and `TaskContentRecord` is trusted-service observation/association metadata. Input association does not assert upstream production. | No output bytes are materialized into CAS, and public record fields are not signed or self-authenticating. A digest is not a retrievable artifact or independent provenance evidence. |
 | fd carrier | The local fd adapter has bounded 9P reads, explicit local truncation indication, and matching terminal MoQ metadata; the regression consumes the local carrier to test its encoding. | The standalone origin exports no Iroh endpoint, subscriber, admission, MAC-key handoff, or client-reachable locator. `TaskReaches` advertises no MoQ topic until that exists. |
@@ -61,6 +61,8 @@ its verified context to all production mount construction remains separate.
 - cross-fid ctl response isolation and multi-chunk reads retain unread data;
 - stream owner isolation and replacement-race owner mismatch behavior;
 - context-bound Task invisibility to a same-subject legacy mount caller;
+- verified 9P attach propagation to a context-aware dynamic `Mount`, exact-grant
+  reattach binding (including scopes), and revocation before the next ctl effect;
 - read-only and signal-only current grants cannot borrow wider spawn authority;
 - revocation after an awaited fd read/publish boundary is denied;
 - an armed lifecycle-policy denial remains `PermissionDenied`, not stale;
@@ -91,6 +93,7 @@ main
   -> codex/spike-worker-attachment-vertical
   -> codex/spike-attachment-revocation-fences
   -> codex/spike-task-attachment-record
+  -> codex/spike-ninep-vfs-context
 ```
 
 | Layer | Branch | Review purpose |
@@ -104,9 +107,10 @@ main
 | 7 | `codex/spike-worker-attachment-vertical` | Fake Worker vertical slice, rollback, local carrier semantics, and honest reaches. |
 | 8 | `codex/spike-attachment-revocation-fences` | Current-caller grant fencing, policy-denial taxonomy, and effect rechecks. |
 | 9 | `codex/spike-task-attachment-record` | This boundary record and stack manifest. |
+| 10 | `codex/spike-ninep-vfs-context` | Verified 9P attach to VFS operation-context propagation, exact-grant reattach fencing, and dynamic `ExecMount` retention. |
 
 The stack must be rebased and revalidated at every head before merge. A future
-production follow-up must begin by defining the verified 9P attach boundary,
-production dual-evidence grant issuer, namespace derivation/admission, durable
+production follow-up must add the production dual-evidence 9P grant issuer and
+listener hand-off, namespace derivation/admission, durable
 artifact materialization, and reachable authenticated stream handoff rather
 than widening this local prototype by implication.

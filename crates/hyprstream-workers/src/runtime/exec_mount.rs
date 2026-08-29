@@ -658,8 +658,9 @@ impl ExecMount {
     }
 
     /// Context-aware fid creation for the attachment-bound Task projection.
-    /// This is intentionally separate from [`Mount::walk`]: accepting only a
-    /// `Subject` there would regress to ambient same-subject authority.
+    /// The [`Mount`] override below routes trait-object callers here so a 9P
+    /// attach cannot lose the opaque operation context while walking `/exec`.
+    /// Accepting only a `Subject` would regress to ambient same-subject authority.
     pub async fn walk_with_context(
         &self,
         components: &[&str],
@@ -1384,6 +1385,14 @@ impl Mount for ExecMount {
         // standard Task requires `walk_with_context`, so this method cannot
         // turn a same-Subject caller into an attachment authority.
         self.walk_inner(components, caller, None).await
+    }
+
+    async fn walk_with_context(
+        &self,
+        components: &[&str],
+        context: &VfsOpContext,
+    ) -> Result<Fid, MountError> {
+        ExecMount::walk_with_context(self, components, context).await
     }
 
     async fn open(&self, fid: &mut Fid, _mode: u8, caller: &Subject) -> Result<(), MountError> {
@@ -2337,7 +2346,14 @@ mod tests {
                 .iter()
                 .any(|entry| entry.name == handle.task.as_str())
         );
-        let bound_root = mount.walk_with_context(&[], &vfs_context).await.unwrap();
+        // Call through `dyn Mount`, as the 9P backend does. The override must
+        // retain the opaque context on the returned fid rather than falling
+        // back to the Subject-only compatibility walk.
+        let dynamic_mount: &dyn Mount = &mount;
+        let bound_root = dynamic_mount
+            .walk_with_context(&[], &vfs_context)
+            .await
+            .unwrap();
         assert!(
             mount
                 .readdir(&bound_root, &owner)
@@ -2347,7 +2363,7 @@ mod tests {
                 .any(|entry| entry.name == handle.task.as_str())
         );
 
-        let stdout = mount
+        let stdout = dynamic_mount
             .walk_with_context(&[handle.task.as_str(), "fd", "1"], &vfs_context)
             .await
             .unwrap();

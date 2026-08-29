@@ -79,8 +79,8 @@ use async_trait::async_trait;
 use hyprstream_rpc::auth::mac::{
     Assurance, CompartmentSet, Level, SecurityContext, SecurityLabel, VerifiedKeyMaterial,
 };
-use hyprstream_rpc::Subject;
-use hyprstream_vfs::MountError;
+use hyprstream_rpc::{AttachmentOperationGrant, Subject};
+use hyprstream_vfs::{MountError, VfsOpContext};
 
 pub use hyprstream_rpc::auth::mac::{ObjectLabelResolver, ObjectRef};
 
@@ -181,11 +181,16 @@ pub struct VerifiedAttachIdentity {
 /// One credential verification result shared by both enforcement sides of a
 /// 9P attach.  The MAC session and the VFS subject cannot be supplied
 /// independently.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct VerifiedAttach {
     identity: VerifiedAttachIdentity,
     subject: Subject,
     session: SessionContext,
+    /// Optional, independently-issued attachment operation grant. Production
+    /// attach credentials do not currently carry one, so legacy attaches keep
+    /// this absent rather than treating authenticated identity or MAC state as
+    /// Task permission.
+    operation_context: Option<VfsOpContext>,
 }
 
 impl VerifiedAttach {
@@ -218,7 +223,33 @@ impl VerifiedAttach {
             identity,
             subject,
             session,
+            operation_context: None,
         })
+    }
+
+    /// Bind an already-issued attachment operation grant to this verified
+    /// attach bundle.
+    ///
+    /// The grant is a distinct opaque authority input. Neither verified 9P
+    /// identity, the MAC security context, nor a generic 9P write scope can
+    /// create it. The exact subject match prevents an authorizer from pairing
+    /// one principal's verified credential with another principal's Task
+    /// grant.
+    pub fn try_new_with_operation_grant(
+        identity: VerifiedAttachIdentity,
+        subject: Subject,
+        session: SessionContext,
+        grant: &AttachmentOperationGrant,
+    ) -> Result<Self, MountError> {
+        let mut attach = Self::try_new(identity, subject, session)?;
+        if grant.subject() != attach.subject() {
+            return Err(MountError::PermissionDenied(
+                "attachment operation grant subject differs from verified attach subject"
+                    .to_owned(),
+            ));
+        }
+        attach.operation_context = Some(VfsOpContext::from_attachment_grant(grant));
+        Ok(attach)
     }
 
     pub fn identity(&self) -> &VerifiedAttachIdentity {
@@ -232,7 +263,29 @@ impl VerifiedAttach {
     pub fn session(&self) -> &SessionContext {
         &self.session
     }
+
+    /// Attachment operation context independently issued to this attach, if
+    /// any. Its absence is deliberate for legacy and current production
+    /// attach credentials that do not carry a delegated Task grant.
+    pub fn operation_context(&self) -> Option<&VfsOpContext> {
+        self.operation_context.as_ref()
+    }
 }
+
+impl PartialEq for VerifiedAttach {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.subject == other.subject
+            && self.session == other.session
+            && match (&self.operation_context, &other.operation_context) {
+                (Some(left), Some(right)) => left.same_grant(right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for VerifiedAttach {}
 
 impl VerifiedAttachIdentity {
     /// Construct an identity and tenant obtained from verified credential
@@ -591,6 +644,7 @@ impl ReferenceMonitor {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use hyprstream_rpc::{AttachmentOperation, VerifiedAttachment};
     use std::time::Duration;
 
     fn label(level: Level) -> SecurityLabel {
@@ -783,5 +837,24 @@ mod tests {
             "tenant-a",
         );
         assert!(SessionContext::deny().verified_attach_identity().is_none());
+    }
+
+    #[test]
+    fn verified_attach_rejects_another_subjects_operation_grant() {
+        let alice = VerifiedAttachment::for_test_local_root(Subject::new("alice")).unwrap();
+        let bob = VerifiedAttachment::for_test_local_root(Subject::new("bob")).unwrap();
+        let bob_grant = bob.for_test_operations(&[AttachmentOperation::TaskRead]);
+        let identity = VerifiedAttachIdentity::from_verified_credential("alice", "tenant-a");
+        let session = SessionContext::from_verified_clearance(identity.clone(), ctx(Level::Secret));
+
+        assert!(matches!(
+            VerifiedAttach::try_new_with_operation_grant(
+                identity,
+                alice.subject().clone(),
+                session,
+                &bob_grant,
+            ),
+            Err(MountError::PermissionDenied(_))
+        ));
     }
 }

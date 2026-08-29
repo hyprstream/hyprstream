@@ -3,6 +3,8 @@
 use async_trait::async_trait;
 use hyprstream_rpc::Subject;
 
+use crate::VfsOpContext;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Open mode constants (9P2000)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -184,6 +186,22 @@ impl Stat {
 pub trait Mount: Send + Sync {
     /// Walk path components, returning an opaque fid.
     async fn walk(&self, components: &[&str], caller: &Subject) -> Result<Fid, MountError>;
+
+    /// Walk with an optional attachment-bound operation context.
+    ///
+    /// The default preserves the established subject-scoped `Mount` contract
+    /// for mounts that have no attachment-aware state: it delegates to
+    /// [`Self::walk`] using the context's verified subject. A mount that
+    /// exposes attachment-bound state must override this method and retain the
+    /// context on the returned fid; a bare 9P identity, MAC label, or generic
+    /// write permission is not translated into a Task operation grant here.
+    async fn walk_with_context(
+        &self,
+        components: &[&str],
+        context: &VfsOpContext,
+    ) -> Result<Fid, MountError> {
+        self.walk(components, context.subject()).await
+    }
 
     /// Open a walked fid for I/O. `mode`: OREAD=0, OWRITE=1, ORDWR=2.
     async fn open(&self, fid: &mut Fid, mode: u8, caller: &Subject) -> Result<(), MountError>;

@@ -288,6 +288,22 @@ pub struct AttachmentOperationGrant {
 }
 
 impl AttachmentOperationGrant {
+    /// Whether two opaque grants carry exactly the same attachment authority
+    /// and operation set.
+    ///
+    /// This is a comparison aid for trusted hand-off boundaries that must
+    /// reject a reattach which attempts to replace, narrow, or widen a bound
+    /// grant. It does not expose a grant's private construction fields or
+    /// make a matching value bearer authorization.
+    #[must_use]
+    pub fn same_grant(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lease.attachment.state, &other.lease.attachment.state)
+            && self.lease.attachment_id() == other.lease.attachment_id()
+            && self.lease.subject() == other.lease.subject()
+            && self.lease.generation() == other.lease.generation()
+            && self.scopes == other.scopes
+    }
+
     /// Attachment identity for correlation/audit records.
     #[must_use]
     pub fn attachment_id(&self) -> &AttachmentId {
