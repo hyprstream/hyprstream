@@ -11,15 +11,13 @@
 //!                        optional — mounted only when running under Wanix,
 //!                        see [`mount_wanix`]). #409/#391.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use hyprstream_rpc::rpc_client::RpcClient;
 use hyprstream_rpc::Subject;
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
+use hyprstream_rpc::rpc_client::RpcClient;
+use hyprstream_vfs::{DevFileState, DirEntry, Fid, Mount, MountError, Stat};
 
 // ============================================================================
 // RpcClient is already Send + Sync — no wrapper needed.
@@ -33,6 +31,9 @@ use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 struct VfsFidState {
     path: Vec<String>,
     opened: bool,
+    /// The ctl write→read reply belongs to this open fid.  A mount-wide
+    /// response cache lets one caller consume another caller's control result.
+    ctl_response: DevFileState,
 }
 
 /// Apply offset+count slicing to a read result (9P semantics).
@@ -47,8 +48,8 @@ fn slice_read(data: Vec<u8>, offset: u64, count: u32) -> Vec<u8> {
 /// Same layout the streaming handshake expects (secret first, pubkey at `[32..64]`),
 /// built directly from `DefaultKeyExchange` so it works on native and wasm alike.
 fn ephemeral_keypair_64() -> Result<Vec<u8>, String> {
-    use hyprstream_rpc::crypto::key_exchange::DefaultKeyExchange;
     use hyprstream_rpc::crypto::KeyExchange;
+    use hyprstream_rpc::crypto::key_exchange::DefaultKeyExchange;
 
     let (secret, public) = DefaultKeyExchange::generate_keypair();
     let mut out = Vec::with_capacity(64);
@@ -58,24 +59,6 @@ fn ephemeral_keypair_64() -> Result<Vec<u8>, String> {
         return Err(format!("ephemeral keypair wrong length: {}", out.len()));
     }
     Ok(out)
-}
-
-// ============================================================================
-// CtlResponseCache — stores write→read response for ctl pattern
-// ============================================================================
-
-struct CtlResponseCache(Mutex<Option<Vec<u8>>>);
-
-impl CtlResponseCache {
-    fn new() -> Self {
-        Self(Mutex::new(None))
-    }
-    fn take(&self) -> Option<Vec<u8>> {
-        self.0.lock().take()
-    }
-    fn set(&self, data: Vec<u8>) {
-        *self.0.lock() = Some(data);
-    }
 }
 
 /// Monotonic counter for request IDs.
@@ -130,7 +113,6 @@ pub struct GenericServiceMount {
     client: Arc<dyn RpcClient>,
     service: Box<dyn ServiceDispatch>,
     next_id: IdCounter,
-    ctl_response: CtlResponseCache,
     stream_registry: std::sync::Arc<crate::stream_mount::StreamRegistry>,
 }
 
@@ -144,7 +126,6 @@ impl GenericServiceMount {
             client,
             service,
             next_id: IdCounter::new(),
-            ctl_response: CtlResponseCache::new(),
             stream_registry,
         }
     }
@@ -161,6 +142,7 @@ impl Mount for GenericServiceMount {
         Ok(Fid::new(VfsFidState {
             path: components.iter().map(|s| s.to_string()).collect(),
             opened: false,
+            ctl_response: DevFileState::new(),
         }))
     }
 
@@ -178,17 +160,20 @@ impl Mount for GenericServiceMount {
         count: u32,
         _caller: &Subject,
     ) -> Result<Vec<u8>, MountError> {
-        // Check for ctl response first (from previous write)
-        if let Some(resp) = self.ctl_response.take() {
-            return Ok(slice_read(resp, offset, count));
-        }
-
         let state = fid
             .downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
+        // A ctl reply is owned by the fid that issued the write. Keep it until
+        // the next write or clunk so normal offset/count reads cannot lose a
+        // suffix when the reply spans more than one 9P read.
+        let ctl_response = state.ctl_response.latched();
+        if !ctl_response.is_empty() {
+            return Ok(slice_read(ctl_response, offset, count));
+        }
+
         if state.path.is_empty() {
-            // After ctl write→read, second read returns empty (EOF)
+            // A ctl reply reaches EOF once offset reaches its retained length.
             // For plain cat on root, this is also correct (it's a directory)
             return Ok(Vec::new());
         }
@@ -315,7 +300,7 @@ impl Mount for GenericServiceMount {
             }
         };
         let len = resp.len() as u32;
-        self.ctl_response.set(resp);
+        state.ctl_response.latch(resp);
         Ok(len)
     }
 
@@ -390,6 +375,7 @@ impl Mount for DocMount {
         Ok(Fid::new(VfsFidState {
             path: components.iter().map(|s| s.to_string()).collect(),
             opened: false,
+            ctl_response: DevFileState::new(),
         }))
     }
 
@@ -990,6 +976,70 @@ mod automount_tests {
             child.mount_prefixes().contains(&"/srv/registry"),
             "forked namespace must inherit /srv/registry; got {:?}",
             child.mount_prefixes()
+        );
+    }
+
+    /// Minimal dispatcher used to prove the ctl response is scoped to the
+    /// fid that issued the write rather than shared by the whole mount.
+    struct EchoDispatch;
+
+    #[async_trait]
+    impl ServiceDispatch for EchoDispatch {
+        async fn dispatch(
+            &self,
+            method: &str,
+            _args_json: &str,
+            _client: &dyn RpcClient,
+        ) -> Result<ServiceDispatchResult, String> {
+            Ok(ServiceDispatchResult::Response(format!("reply:{method}")))
+        }
+
+        fn metadata(
+            &self,
+        ) -> (
+            &'static str,
+            &'static [hyprstream_rpc::metadata::MethodMeta],
+        ) {
+            ("echo", &[])
+        }
+    }
+
+    /// Regression for the generic service-mount ctl cache: two open fids
+    /// must read their own replies even when the second write arrives before
+    /// the first read.  The old mount-level cache returned `reply:beta` to
+    /// the alpha fid and left beta with no response.
+    #[tokio::test]
+    async fn generic_ctl_response_is_isolated_per_fid() {
+        let mount = GenericServiceMount::new(
+            Arc::new(NoopClient),
+            Box::new(EchoDispatch),
+            Arc::new(crate::stream_mount::StreamRegistry::new()),
+        );
+        let caller = Subject::new("verified-test-subject");
+
+        let mut alpha = mount.walk(&["ctl"], &caller).await.unwrap();
+        let mut beta = mount.walk(&["ctl"], &caller).await.unwrap();
+        mount.open(&mut alpha, 2, &caller).await.unwrap();
+        mount.open(&mut beta, 2, &caller).await.unwrap();
+
+        mount.write(&alpha, 0, b"alpha", &caller).await.unwrap();
+        mount.write(&beta, 0, b"beta", &caller).await.unwrap();
+
+        assert_eq!(mount.read(&alpha, 0, 6, &caller).await.unwrap(), b"reply:");
+        assert_eq!(
+            mount.read(&alpha, 6, 4096, &caller).await.unwrap(),
+            b"alpha"
+        );
+        assert!(
+            mount
+                .read(&alpha, 11, 4096, &caller)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            mount.read(&beta, 0, 4096, &caller).await.unwrap(),
+            b"reply:beta"
         );
     }
 }
