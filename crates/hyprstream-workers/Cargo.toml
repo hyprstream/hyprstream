@@ -9,6 +9,7 @@ description = "Isolated workload execution using Kata Containers with CRI-aligne
 [dependencies]
 # Workspace crates
 hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }
 # CRI v1 (runtime.v1) tonic-generated client bindings (#510): the CriBackend
 # drives an external, already-running CRI runtime service (containerd's CRI
 # plugin, or CRI-O) over CRI gRPC — the same protocol kubelet speaks — rather
@@ -325,6 +326,10 @@ hyprstream-rpc-build = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+moq-net = { workspace = true }
+# Enables only the explicit local-test-root fixture used by the attachment
+# vertical-slice test; production construction remains envelope-derived.
+hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 # F3 (#761) admission-config TOML round-trip regression test.
 toml = "0.8"
 # FS-B0 RAFS bootstrap builder tests: synthesize small OCI layer tarballs.

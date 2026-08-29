@@ -54,11 +54,17 @@ use async_trait::async_trait;
 use rand::RngCore;
 use tokio::sync::Notify;
 
+use hyprstream_rpc::AttachmentOperation;
 use hyprstream_rpc::latch::{Terminal, TerminalStore};
 use hyprstream_rpc::moq_stream::{MoqStreamOrigin, MoqStreamPublisher};
 use hyprstream_rpc::stream_info::Job;
 use hyprstream_rpc::streaming::StreamContext;
-use hyprstream_vfs::{DevFileState, DirEntry, Fid, Mount, MountError, Stat, Subject};
+use hyprstream_rpc_std::task::{
+    ContentDigest, TaskAttachmentBinding, TaskContentRecord, TaskContentRole, TaskError,
+    TaskHandle, TaskId, TaskPayload, TaskReaches, TaskResult, TaskRuntimeConstraints, TaskService,
+    TaskSignal, TaskSignalRequest, TaskSnapshot, TaskSpawnRequest, TaskState,
+};
+use hyprstream_vfs::{DevFileState, DirEntry, Fid, Mount, MountError, Stat, Subject, VfsOpContext};
 // `parking_lot::Mutex` remains for mount-level terminal and waiter maps.  Ctl
 // response state itself uses `DevFileState`, so it is unambiguously per fid.
 use parking_lot::Mutex as PmMutex;
@@ -188,6 +194,21 @@ impl TerminalStatus {
 /// backing MoQ stream keeps its `Job` profile (ordered, retained, terminal);
 /// this cap bounds the Plan 9 reader's local materialization.
 const MAX_RETAINED_FD_BYTES: usize = 1024 * 1024;
+/// Explicit terminal indication for local 9P consumers that the bounded
+/// retained fd projection omitted a suffix.
+const FD_TRUNCATION_MARKER: &[u8] = b"\n[hyprstream: output truncated]\n";
+/// Carrier terminal metadata for a complete local fd projection.
+const FD_COMPLETE_METADATA: &[u8] = br#"{"exec_fd":"complete"}"#;
+/// Carrier terminal metadata for a bounded projection that omitted a suffix.
+const FD_TRUNCATED_METADATA: &[u8] = br#"{"exec_fd":"truncated"}"#;
+
+const fn fd_complete_metadata(truncated: bool) -> &'static [u8] {
+    if truncated {
+        FD_TRUNCATED_METADATA
+    } else {
+        FD_COMPLETE_METADATA
+    }
+}
 
 /// A bounded terminal byte stream projected by one Plan 9 fd.
 struct TaskFdStream {
@@ -199,6 +220,10 @@ struct TaskFdState {
     bytes: Vec<u8>,
     closed: bool,
     truncated: bool,
+    // Kept test-only solely to verify the actual carrier terminal payload;
+    // production callers never receive this key.
+    #[cfg(test)]
+    mac_key: [u8; 32],
     publisher: MoqStreamPublisher,
 }
 
@@ -221,13 +246,20 @@ impl TaskFdStream {
                 bytes: Vec::new(),
                 closed: false,
                 truncated: false,
+                #[cfg(test)]
+                mac_key,
                 publisher,
             }),
             wake: Arc::new(Notify::new()),
         })
     }
 
-    async fn append(&self, data: &[u8]) -> Result<(), MountError> {
+    async fn append(&self, context: Option<&VfsOpContext>, data: &[u8]) -> Result<(), MountError> {
+        // This is the stream-continuation boundary: do not publish the next
+        // MoQ segment without a current explicit publish grant.
+        if let Some(context) = context {
+            context.ensure_operation(AttachmentOperation::TaskPublish)?;
+        }
         let mut state = self.state.lock().await;
         if state.closed {
             return Err(MountError::InvalidArgument(
@@ -252,19 +284,28 @@ impl TaskFdStream {
         Ok(())
     }
 
-    async fn close(&self) -> Result<(), MountError> {
+    async fn close(&self, context: Option<&VfsOpContext>) -> Result<(), MountError> {
+        // Completion is also a continuation/external effect. Recheck at the
+        // final publication boundary rather than inheriting a dispatch permit.
+        if let Some(context) = context {
+            context.ensure_operation(AttachmentOperation::TaskPublish)?;
+        }
         let mut state = self.state.lock().await;
         if !state.closed {
-            if state.truncated && state.bytes.len() < MAX_RETAINED_FD_BYTES {
-                let marker = b"\n[hyprstream: output truncated]\n";
-                let room = MAX_RETAINED_FD_BYTES - state.bytes.len();
-                state
-                    .bytes
-                    .extend_from_slice(&marker[..marker.len().min(room)]);
+            if state.truncated {
+                // `append` normally fills the retained buffer exactly, so an
+                // append-only marker would never fit. Reserve its space at
+                // close by replacing the final retained bytes. This makes a
+                // local fd reader observe truncation rather than silently
+                // treating bounded output as the complete terminal stream.
+                let retained_len = MAX_RETAINED_FD_BYTES.saturating_sub(FD_TRUNCATION_MARKER.len());
+                state.bytes.truncate(retained_len);
+                state.bytes.extend_from_slice(FD_TRUNCATION_MARKER);
             }
+            let terminal_metadata = fd_complete_metadata(state.truncated);
             state
                 .publisher
-                .complete_ref(b"exec-fd-eof")
+                .complete_ref(terminal_metadata)
                 .await
                 .map_err(|e| MountError::Io(format!("complete fd stream: {e}")))?;
             state.closed = true;
@@ -320,6 +361,17 @@ pub struct TaskExecResult {
     pub stderr: Vec<u8>,
 }
 
+/// Metadata retained for Tasks allocated through the attachment-bound standard
+/// contract. Existing pre-spike `/exec/instances` entries remain compatible;
+/// only a Task-contract allocation has this additional authority record.
+#[derive(Clone, Debug)]
+struct TaskRecord {
+    context: VfsOpContext,
+    namespace_manifest: hyprstream_rpc_std::task::NamespaceManifestDigest,
+    state: TaskState,
+    content_records: Vec<TaskContentRecord>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Fid types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -348,6 +400,11 @@ enum ExecFidKind {
 /// Fid state for the exec mount.
 struct ExecFid {
     kind: ExecFidKind,
+    /// A verified attachment context is retained on fids created through the
+    /// narrow context-aware entry point.  A raw `Mount::walk` cannot fabricate
+    /// it, so attachment-bound Tasks are hidden from the legacy Subject-only
+    /// path until the whole Mount trait migrates.
+    context: Option<VfsOpContext>,
     /// Latch for the ctl write→read pattern (verb result message).  This
     /// reusable per-fid primitive also backs other VFS device files, keeping
     /// a response local to the open fid that issued its lifecycle verb.
@@ -396,6 +453,10 @@ pub struct ExecMount {
     /// caller, the gap #1272 describes); `Some` ⇒ `stop`/`kill`/`destroy`
     /// must pass [`LifecyclePolicy::authorize`] before the backend is touched.
     lifecycle: Option<Arc<dyn LifecyclePolicy>>,
+    /// Authority-bound metadata for standard Task allocations. This is kept
+    /// separate from the pool's compatibility projection so a raw instance id
+    /// never becomes an authority bearer.
+    task_records: PmMutex<HashMap<String, TaskRecord>>,
 }
 
 impl ExecMount {
@@ -419,6 +480,7 @@ impl ExecMount {
             terminal_ids: PmMutex::new(std::collections::HashSet::new()),
             waiters: PmMutex::new(HashMap::new()),
             lifecycle: None,
+            task_records: PmMutex::new(HashMap::new()),
         }
     }
 
@@ -458,24 +520,251 @@ impl ExecMount {
         Ok(created)
     }
 
+    /// Remove every local reach for a Task whose spawn failed after sandbox
+    /// allocation, then return the sandbox to the pool. A failed spawn never
+    /// leaves an attachment-bound record that the caller cannot observe.
+    async fn rollback_task_allocation(&self, id: &str) {
+        self.task_records.lock().remove(id);
+        self.fd_streams.lock().await.remove(id);
+        self.waiters.lock().remove(id);
+        if let Err(error) = self.pool.release(id).await {
+            tracing::warn!(
+                sandbox_id = id,
+                error = %error,
+                "failed to release sandbox while rolling back task spawn"
+            );
+        }
+    }
+
     /// Publish one completed task execution into the instance's terminal fd
     /// streams. The runtime calls this after `SandboxBackend::exec_sync`; the
     /// Plan 9 readers observe the same bounded output and then EOF.
     async fn publish_exec_result(
         &self,
         id: &str,
+        caller: &Subject,
         stdout: &[u8],
         stderr: &[u8],
     ) -> Result<(), MountError> {
         if self.pool.get(id).await.is_none() && !self.terminal.is_latched(&id.to_owned()) {
             return Err(MountError::NotFound(format!("instances/{id}")));
         }
+        let context = self.task_context_for(id, caller, AttachmentOperation::TaskPublish)?;
         let streams = self.fd_streams_for(id).await?;
-        streams.stdout.append(stdout).await?;
-        streams.stderr.append(stderr).await?;
-        streams.stdout.close().await?;
-        streams.stderr.close().await?;
+        streams.stdout.append(context.as_ref(), stdout).await?;
+        streams.stderr.append(context.as_ref(), stderr).await?;
+        streams.stdout.close(context.as_ref()).await?;
+        streams.stderr.close(context.as_ref()).await?;
         Ok(())
+    }
+
+    /// Return a contract Task's context only when the caller is its verified
+    /// attachment subject and the generation remains current. Compatibility
+    /// instances have no record and retain their existing behavior.
+    fn task_context_for(
+        &self,
+        id: &str,
+        caller: &Subject,
+        operation: AttachmentOperation,
+    ) -> Result<Option<VfsOpContext>, MountError> {
+        let Some(record) = self.task_records.lock().get(id).cloned() else {
+            return Ok(None);
+        };
+        if record.context.subject() != caller {
+            return Err(MountError::PermissionDenied(
+                "caller does not own this task attachment".into(),
+            ));
+        }
+        record.context.ensure_operation(operation)?;
+        Ok(Some(record.context))
+    }
+
+    /// Verify that a fid reaching an attachment-bound task was created from
+    /// the exact attachment/generation that allocated it. This is the one-Mount
+    /// prototype for `VfsOpContext`; the generic `Mount` entry point has only a
+    /// Subject and therefore cannot be treated as an equivalent authority.
+    fn verify_fid_context(
+        &self,
+        kind: &ExecFidKind,
+        context: Option<&VfsOpContext>,
+        caller: &Subject,
+    ) -> Result<(), MountError> {
+        let id = match kind {
+            ExecFidKind::InstanceDir(id)
+            | ExecFidKind::Ctl(id)
+            | ExecFidKind::Status(id)
+            | ExecFidKind::Exit(id)
+            | ExecFidKind::Ns(id)
+            | ExecFidKind::FdDir(id)
+            | ExecFidKind::Fd(id, _) => id,
+            ExecFidKind::InstancesDir => return Ok(()),
+        };
+        let Some(record) = self.task_records.lock().get(id).cloned() else {
+            return Ok(());
+        };
+        let context = context.ok_or_else(|| {
+            MountError::PermissionDenied("task requires a verified attachment context".into())
+        })?;
+        if context.subject() != caller
+            || record.context.attachment_id() != context.attachment_id()
+            || record.context.authority_generation() != context.authority_generation()
+        {
+            return Err(MountError::PermissionDenied(
+                "attachment context does not authorize this task fid".into(),
+            ));
+        }
+        context.ensure_operation(AttachmentOperation::TaskRead)?;
+        record.context.ensure_current()?;
+        Ok(())
+    }
+
+    /// Context-aware fid creation for the attachment-bound Task projection.
+    /// This is intentionally separate from [`Mount::walk`]: accepting only a
+    /// `Subject` there would regress to ambient same-subject authority.
+    pub async fn walk_with_context(
+        &self,
+        components: &[&str],
+        context: &VfsOpContext,
+    ) -> Result<Fid, MountError> {
+        context.ensure_operation(AttachmentOperation::TaskRead)?;
+        self.walk_inner(components, context.subject(), Some(context.clone()))
+            .await
+    }
+
+    async fn walk_inner(
+        &self,
+        components: &[&str],
+        caller: &Subject,
+        context: Option<VfsOpContext>,
+    ) -> Result<Fid, MountError> {
+        let kind = match components {
+            [] => ExecFidKind::InstancesDir,
+            [id] => ExecFidKind::InstanceDir((*id).to_owned()),
+            [id, "ctl"] => ExecFidKind::Ctl((*id).to_owned()),
+            [id, "status"] => ExecFidKind::Status((*id).to_owned()),
+            [id, "exit"] => ExecFidKind::Exit((*id).to_owned()),
+            [id, "ns"] => ExecFidKind::Ns((*id).to_owned()),
+            [id, "fd"] => ExecFidKind::FdDir((*id).to_owned()),
+            [id, "fd", fd] => {
+                let fd = fd
+                    .parse::<u8>()
+                    .map_err(|_| MountError::NotFound(components.join("/")))?;
+                if !(1..=2).contains(&fd) {
+                    return Err(MountError::NotFound(components.join("/")));
+                }
+                ExecFidKind::Fd((*id).to_owned(), fd)
+            }
+            _ => return Err(MountError::NotFound(components.join("/"))),
+        };
+
+        // Validate that referenced instances exist (directory walk into an
+        // unknown id should 404, same as any 9P namespace).  Hide a
+        // contract Task from an unbound/wrong attachment rather than exposing
+        // whether its id exists.
+        let id_to_check: Option<&str> = match &kind {
+            ExecFidKind::InstanceDir(id)
+            | ExecFidKind::Ctl(id)
+            | ExecFidKind::Status(id)
+            | ExecFidKind::Exit(id)
+            | ExecFidKind::Ns(id)
+            | ExecFidKind::FdDir(id)
+            | ExecFidKind::Fd(id, _) => Some(id.as_str()),
+            ExecFidKind::InstancesDir => None,
+        };
+        if let Some(id) = id_to_check {
+            let exists =
+                self.pool.get(id).await.is_some() || self.terminal.is_latched(&id.to_owned());
+            if !exists {
+                return Err(MountError::NotFound(components.join("/")));
+            }
+            if self
+                .verify_fid_context(&kind, context.as_ref(), caller)
+                .is_err()
+            {
+                return Err(MountError::NotFound(components.join("/")));
+            }
+        }
+
+        Ok(Fid::new(ExecFid {
+            kind,
+            context,
+            write_buf: DevFileState::new(),
+        }))
+    }
+
+    fn task_error(error: MountError) -> TaskError {
+        match error {
+            MountError::NotFound(_) => {
+                TaskError::InvalidRequest("task projection disappeared".into())
+            }
+            MountError::PermissionDenied(_) => TaskError::StaleAttachment,
+            other => TaskError::Backend(other.to_string()),
+        }
+    }
+
+    fn task_handle(id: &str, state: TaskState) -> TaskHandle {
+        TaskHandle {
+            task: TaskId::from_worker_instance(id),
+            reaches: TaskReaches {
+                vfs_path: format!("/exec/instances/{id}"),
+                iroh_endpoint: None,
+                moq_topics: vec![format!("exec-{id}-fd-1"), format!("exec-{id}-fd-2")],
+            },
+            state,
+        }
+    }
+
+    fn bound_task_record(
+        &self,
+        task: &TaskId,
+        attachment: &TaskAttachmentBinding,
+        operation: AttachmentOperation,
+    ) -> Result<TaskRecord, TaskError> {
+        attachment.ensure(operation)?;
+        let record = self
+            .task_records
+            .lock()
+            .get(task.as_str())
+            .cloned()
+            .ok_or_else(|| TaskError::NotFound(task.clone()))?;
+        record
+            .context
+            .ensure_current()
+            .map_err(|_| TaskError::StaleAttachment)?;
+        if record.context.attachment_id() != attachment.attachment_id()
+            || record.context.authority_generation() != attachment.authority_generation()
+            || record.context.subject() != attachment.subject()
+        {
+            return Err(TaskError::PermissionDenied);
+        }
+        Ok(record)
+    }
+
+    fn record_exec_result(&self, id: &str, result: &TaskExecResult) {
+        if let Some(record) = self.task_records.lock().get_mut(id) {
+            record.state = TaskState::Exited {
+                code: result.exit_code,
+            };
+            let task = TaskId::from_worker_instance(id);
+            record.content_records = vec![
+                TaskContentRecord {
+                    content: ContentDigest::from_bytes(&result.stdout),
+                    task: task.clone(),
+                    attachment_id: record.context.attachment_id().clone(),
+                    authority_generation: record.context.authority_generation(),
+                    namespace_manifest: record.namespace_manifest,
+                    role: TaskContentRole::Stdout,
+                },
+                TaskContentRecord {
+                    content: ContentDigest::from_bytes(&result.stderr),
+                    task,
+                    attachment_id: record.context.attachment_id().clone(),
+                    authority_generation: record.context.authority_generation(),
+                    namespace_manifest: record.namespace_manifest,
+                    role: TaskContentRole::Stderr,
+                },
+            ];
+        }
     }
 
     /// Execute through the selected sandbox backend and project the terminal
@@ -488,6 +777,13 @@ impl ExecMount {
         command: &[String],
         timeout_secs: u64,
     ) -> Result<TaskExecResult, MountError> {
+        // First lifecycle-effect gate: a contract Task must still hold its
+        // verified attachment generation before a backend command can start.
+        self.task_context_for(id, caller, AttachmentOperation::TaskSpawn)?;
+        // `exec` necessarily emits terminal fd data, so refuse before the
+        // backend starts unless the same grant also permits publication. A
+        // spawn-only identity must not leave an unpublishable task result.
+        self.task_context_for(id, caller, AttachmentOperation::TaskPublish)?;
         let sandbox = self
             .pool
             .get(id)
@@ -523,7 +819,10 @@ impl ExecMount {
             .exec_sync(&sandbox, command, timeout_secs)
             .await
             .map_err(|e| MountError::Io(e.to_string()))?;
-        self.publish_exec_result(id, &stdout, &stderr).await?;
+        // Second gate: the backend may have run for a while. Do not publish a
+        // now-revoked Task's next MoQ/VFS output continuation.
+        self.publish_exec_result(id, caller, &stdout, &stderr)
+            .await?;
         Ok(TaskExecResult {
             exit_code,
             stdout,
@@ -531,10 +830,11 @@ impl ExecMount {
         })
     }
 
-    async fn close_fd_streams(&self, id: &str) -> Result<(), MountError> {
+    async fn close_fd_streams(&self, id: &str, caller: &Subject) -> Result<(), MountError> {
+        let context = self.task_context_for(id, caller, AttachmentOperation::TaskSignal)?;
         let streams = self.fd_streams_for(id).await?;
-        streams.stdout.close().await?;
-        streams.stderr.close().await?;
+        streams.stdout.close(context.as_ref()).await?;
+        streams.stderr.close(context.as_ref()).await?;
         Ok(())
     }
 
@@ -556,6 +856,22 @@ impl ExecMount {
             return Err(MountError::InvalidArgument(format!(
                 "instance {id} is already terminal"
             )));
+        }
+
+        // Standard Task allocations always carry an attachment context. Check
+        // it before every ctl lifecycle effect; raw legacy instances keep the
+        // compatibility path until all callers migrate.
+        let task_operation = match &verb {
+            Verb::Exec(_) => AttachmentOperation::TaskSpawn,
+            Verb::Start | Verb::Stop | Verb::Kill | Verb::Destroy => {
+                AttachmentOperation::TaskSignal
+            }
+        };
+        self.task_context_for(id, caller, task_operation)?;
+        if matches!(verb, Verb::Stop | Verb::Kill | Verb::Destroy) {
+            // Stopping/destroying also completes the fd carrier. Require that
+            // terminal publication before altering the backend lifecycle.
+            self.task_context_for(id, caller, AttachmentOperation::TaskPublish)?;
         }
 
         // MAC lifecycle gate (#1272): a destructive verb must be authorized by
@@ -609,7 +925,7 @@ impl ExecMount {
                     .map_err(|e| MountError::Io(e.to_string()))?;
                 // A stopped task can no longer produce output. Latch both
                 // reader streams to EOF so pending fd/1 and fd/2 readers wake.
-                self.close_fd_streams(id).await?;
+                self.close_fd_streams(id, caller).await?;
                 Ok("ok: stopped\n".to_owned())
             }
             Verb::Destroy => {
@@ -634,13 +950,14 @@ impl ExecMount {
                     },
                 );
                 self.terminal_ids.lock().insert(id.to_owned());
-                self.close_fd_streams(id).await?;
+                self.close_fd_streams(id, caller).await?;
                 // Wake any `exit` reader already blocked on this id.
                 self.waiter_for(id).notify_waiters();
                 Ok("ok: destroyed\n".to_owned())
             }
             Verb::Exec(command) => {
                 let result = self.exec_task(id, caller, &command, 300).await?;
+                self.record_exec_result(id, &result);
                 Ok(format!("ok: exited {}\n", result.exit_code))
             }
         }
@@ -715,62 +1032,197 @@ impl ExecMount {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl Mount for ExecMount {
-    async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
-        // NOTE on `Subject`: per the Mount contract this mount threads the
-        // caller through every op but does not itself authorize — the
-        // MAC reference-monitor (#547) is the eventual enforcement point.
-        // `SandboxPool`/`SandboxBackend` don't take a `Subject` today, so
-        // there is nothing further to pass it to here.
-        let kind = match components {
-            [] => ExecFidKind::InstancesDir,
-            [id] => ExecFidKind::InstanceDir((*id).to_owned()),
-            [id, "ctl"] => ExecFidKind::Ctl((*id).to_owned()),
-            [id, "status"] => ExecFidKind::Status((*id).to_owned()),
-            [id, "exit"] => ExecFidKind::Exit((*id).to_owned()),
-            [id, "ns"] => ExecFidKind::Ns((*id).to_owned()),
-            [id, "fd"] => ExecFidKind::FdDir((*id).to_owned()),
-            [id, "fd", fd] => {
-                let fd = fd
-                    .parse::<u8>()
-                    .map_err(|_| MountError::NotFound(components.join("/")))?;
-                if !(1..=2).contains(&fd) {
-                    return Err(MountError::NotFound(components.join("/")));
-                }
-                ExecFidKind::Fd((*id).to_owned(), fd)
-            }
-            _ => return Err(MountError::NotFound(components.join("/"))),
-        };
+#[async_trait]
+impl TaskService for ExecMount {
+    async fn spawn_task(&self, request: TaskSpawnRequest) -> Result<TaskHandle, TaskError> {
+        // `/exec/clone` is modeled as this explicit allocation effect. It is
+        // intentionally not a read: reaching this method allocates a sandbox
+        // only after the attachment generation check below succeeds.
+        request.validate_for_spawn()?;
+        let TaskSpawnRequest {
+            parent_task: _,
+            attachment,
+            namespace_manifest,
+            payload,
+            constraints,
+        } = request;
 
-        // Validate that referenced instances exist (directory walk into an
-        // unknown id should 404, same as any 9P namespace).
-        let id_to_check: Option<&str> = match &kind {
-            ExecFidKind::InstanceDir(id)
-            | ExecFidKind::Ctl(id)
-            | ExecFidKind::Status(id)
-            | ExecFidKind::Exit(id)
-            | ExecFidKind::Ns(id)
-            | ExecFidKind::FdDir(id)
-            | ExecFidKind::Fd(id, _) => Some(id.as_str()),
-            ExecFidKind::InstancesDir => None,
-        };
-        if let Some(id) = id_to_check {
-            let exists =
-                self.pool.get(id).await.is_some() || self.terminal.is_latched(&id.to_owned());
-            if !exists {
-                return Err(MountError::NotFound(components.join("/")));
+        // `namespace_manifest` is retained as a task-contract provenance
+        // commitment only. This spike does not derive a `Namespace` from it
+        // or pass an effective mount description to `PodSandboxConfig`.
+
+        if let Some(requested_backend) = constraints.backend_class.as_deref() {
+            if requested_backend != self.pool.backend().backend_type() {
+                return Err(TaskError::InvalidRequest(format!(
+                    "requested backend {requested_backend} does not match this fail-closed pool's {} backend",
+                    self.pool.backend().backend_type()
+                )));
             }
         }
 
-        Ok(Fid::new(ExecFid {
-            kind,
-            write_buf: DevFileState::new(),
-        }))
+        let context = VfsOpContext::from_attachment_grant(attachment.operation_grant());
+        context
+            .ensure_operation(AttachmentOperation::TaskSpawn)
+            .map_err(|_| TaskError::StaleAttachment)?;
+        let id = self
+            .pool
+            .acquire(
+                context.subject(),
+                &super::client::PodSandboxConfig::default(),
+            )
+            .await
+            .map_err(|error| TaskError::Backend(error.to_string()))?;
+
+        // The attachment may have been revoked while placement was in flight.
+        // Do not leave a newly allocated sandbox reachable if that happened.
+        if context.ensure_current().is_err() {
+            let _ = self.pool.release(&id).await;
+            return Err(TaskError::StaleAttachment);
+        }
+
+        self.task_records.lock().insert(
+            id.clone(),
+            TaskRecord {
+                context: context.clone(),
+                namespace_manifest,
+                state: TaskState::Running,
+                content_records: Vec::new(),
+            },
+        );
+
+        match payload {
+            TaskPayload::Argv(command) => {
+                let timeout_secs = constraints.timeout_secs.unwrap_or(300);
+                let result = match self
+                    .exec_task(&id, context.subject(), &command, timeout_secs)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.rollback_task_allocation(&id).await;
+                        return Err(Self::task_error(error));
+                    }
+                };
+                self.record_exec_result(&id, &result);
+            }
+            TaskPayload::Content(content) => {
+                // This is an unmaterialized content digest, not an artifact
+                // fetch. Record only its task association; placement,
+                // execution, and durable materialization remain Worker work.
+                if let Some(record) = self.task_records.lock().get_mut(&id) {
+                    record.content_records.push(TaskContentRecord {
+                        content,
+                        task: TaskId::from_worker_instance(&id),
+                        attachment_id: record.context.attachment_id().clone(),
+                        authority_generation: record.context.authority_generation(),
+                        namespace_manifest: record.namespace_manifest,
+                        role: TaskContentRole::Input,
+                    });
+                }
+            }
+        }
+
+        let state = self
+            .task_records
+            .lock()
+            .get(&id)
+            .map(|record| record.state)
+            .ok_or_else(|| TaskError::NotFound(TaskId::from_worker_instance(&id)))?;
+        Ok(Self::task_handle(&id, state))
     }
 
-    async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+    async fn attach_task(
+        &self,
+        task: &TaskId,
+        attachment: TaskAttachmentBinding,
+    ) -> Result<TaskHandle, TaskError> {
+        let record = self.bound_task_record(task, &attachment, AttachmentOperation::TaskAttach)?;
+        Ok(Self::task_handle(task.as_str(), record.state))
+    }
+
+    async fn signal_task(&self, request: TaskSignalRequest) -> Result<(), TaskError> {
+        self.bound_task_record(
+            &request.task,
+            &request.attachment,
+            AttachmentOperation::TaskSignal,
+        )?;
+        let verb = match request.signal {
+            TaskSignal::Stop => Verb::Stop,
+            TaskSignal::Kill => Verb::Kill,
+            TaskSignal::Destroy => Verb::Destroy,
+        };
+        self.apply_verb(request.task.as_str(), verb, request.attachment.subject())
+            .await
+            .map_err(Self::task_error)?;
+        if let Some(record) = self.task_records.lock().get_mut(request.task.as_str()) {
+            record.state = TaskState::Cancelled;
+        }
+        Ok(())
+    }
+
+    async fn wait_task(
+        &self,
+        task: &TaskId,
+        attachment: TaskAttachmentBinding,
+    ) -> Result<TaskResult, TaskError> {
+        // This spike's deterministic fake backend completes argv tasks during
+        // spawn. A non-terminal artifact task has no guest wait primitive yet,
+        // so it fails explicitly rather than pretending an empty read is EOF.
+        self.task_result(task, attachment).await
+    }
+
+    async fn snapshot_task(
+        &self,
+        task: &TaskId,
+        attachment: TaskAttachmentBinding,
+    ) -> Result<TaskSnapshot, TaskError> {
+        let record = self.bound_task_record(task, &attachment, AttachmentOperation::TaskRead)?;
+        Ok(TaskSnapshot {
+            task: task.clone(),
+            namespace_manifest: record.namespace_manifest,
+            state: record.state,
+        })
+    }
+
+    async fn task_result(
+        &self,
+        task: &TaskId,
+        attachment: TaskAttachmentBinding,
+    ) -> Result<TaskResult, TaskError> {
+        let record = self.bound_task_record(task, &attachment, AttachmentOperation::TaskRead)?;
+        match record.state {
+            TaskState::Exited { .. } | TaskState::Cancelled => Ok(TaskResult {
+                task: task.clone(),
+                state: record.state,
+                content_records: record.content_records,
+            }),
+            TaskState::Pending | TaskState::Running => Err(TaskError::InvalidRequest(
+                "task is not terminal; no guest wait bridge is installed yet".into(),
+            )),
+        }
+    }
+
+    async fn spawn_child_task(&self, request: TaskSpawnRequest) -> Result<TaskHandle, TaskError> {
+        let _ = request;
+        Err(TaskError::ChildDelegationRequired)
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl Mount for ExecMount {
+    async fn walk(&self, components: &[&str], caller: &Subject) -> Result<Fid, MountError> {
+        // Compatibility entry point for legacy Subject-scoped instances. A
+        // standard Task requires `walk_with_context`, so this method cannot
+        // turn a same-Subject caller into an attachment authority.
+        self.walk_inner(components, caller, None).await
+    }
+
+    async fn open(&self, fid: &mut Fid, _mode: u8, caller: &Subject) -> Result<(), MountError> {
+        let inner = fid
+            .downcast_ref::<ExecFid>()
+            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        self.verify_fid_context(&inner.kind, inner.context.as_ref(), caller)?;
         Ok(())
     }
 
@@ -779,11 +1231,12 @@ impl Mount for ExecMount {
         fid: &Fid,
         offset: u64,
         count: u32,
-        _caller: &Subject,
+        caller: &Subject,
     ) -> Result<Vec<u8>, MountError> {
         let inner = fid
             .downcast_ref::<ExecFid>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        self.verify_fid_context(&inner.kind, inner.context.as_ref(), caller)?;
 
         let data = match &inner.kind {
             ExecFidKind::Ctl(_) => {
@@ -838,6 +1291,7 @@ impl Mount for ExecMount {
         let inner = fid
             .downcast_ref::<ExecFid>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        self.verify_fid_context(&inner.kind, inner.context.as_ref(), caller)?;
 
         match &inner.kind {
             ExecFidKind::Ctl(id) => {
@@ -872,24 +1326,51 @@ impl Mount for ExecMount {
         }
     }
 
-    async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+    async fn readdir(&self, fid: &Fid, caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
         let inner = fid
             .downcast_ref::<ExecFid>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
+        if !matches!(&inner.kind, ExecFidKind::InstancesDir) {
+            self.verify_fid_context(&inner.kind, inner.context.as_ref(), caller)?;
+        }
+
         match &inner.kind {
             ExecFidKind::InstancesDir => {
+                let records = self.task_records.lock().clone();
                 let mut ids: Vec<String> = self
                     .pool
                     .list_active()
                     .await
                     .into_iter()
+                    .filter(|sandbox| {
+                        records.get(&sandbox.id).is_none_or(|record| {
+                            inner.context.as_ref().is_some_and(|context| {
+                                context.subject() == caller
+                                    && context.attachment_id() == record.context.attachment_id()
+                                    && context.authority_generation()
+                                        == record.context.authority_generation()
+                                    && context.ensure_current().is_ok()
+                            })
+                        })
+                    })
                     .map(|s| s.id)
                     .collect();
                 // Also surface ids that have been destroyed-through-this-mount
                 // (so `exit`/`status` remain reachable for stragglers that
                 // already read "not yet terminal" and need to poll again).
                 for id in self.terminal_ids.lock().iter() {
+                    if records.get(id).is_some_and(|record| {
+                        !inner.context.as_ref().is_some_and(|context| {
+                            context.subject() == caller
+                                && context.attachment_id() == record.context.attachment_id()
+                                && context.authority_generation()
+                                    == record.context.authority_generation()
+                                && context.ensure_current().is_ok()
+                        })
+                    }) {
+                        continue;
+                    }
                     if !ids.contains(id) {
                         ids.push(id.clone());
                     }
@@ -948,10 +1429,11 @@ impl Mount for ExecMount {
         }
     }
 
-    async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
+    async fn stat(&self, fid: &Fid, caller: &Subject) -> Result<Stat, MountError> {
         let inner = fid
             .downcast_ref::<ExecFid>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        self.verify_fid_context(&inner.kind, inner.context.as_ref(), caller)?;
 
         const QTDIR: u8 = 0x80;
         let (name, qtype) = match &inner.kind {
@@ -991,6 +1473,11 @@ mod tests {
     use crate::runtime::backend::{SandboxBackend, SandboxHandle};
     use crate::runtime::client::{LinuxContainerResources, PodSandboxConfig};
     use crate::runtime::sandbox::PodSandbox;
+    use hyprstream_rpc::VerifiedAttachment;
+    use hyprstream_rpc::moq_stream::{STREAM_TRACK, verify_moq_frame};
+    use hyprstream_rpc::streaming::{StreamPayload, StreamVerifier};
+    use hyprstream_rpc_std::task::NamespaceManifestDigest;
+    use moq_net::Track;
     use std::any::Any;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1009,6 +1496,8 @@ mod tests {
         /// Tracks whether `destroy` was called, for assertions.
         destroyed: AtomicBool,
         stopped: AtomicBool,
+        fail_exec: AtomicBool,
+        revoke_during_exec: PmMutex<Option<VerifiedAttachment>>,
     }
 
     #[async_trait]
@@ -1064,6 +1553,16 @@ mod tests {
             _command: &[String],
             _timeout_secs: u64,
         ) -> WorkerResult<(i32, Vec<u8>, Vec<u8>)> {
+            if let Some(attachment) = self.revoke_during_exec.lock().take() {
+                attachment.revoke().map_err(|error| {
+                    crate::error::WorkerError::ExecFailed(format!("test revoke failed: {error}"))
+                })?;
+            }
+            if self.fail_exec.load(Ordering::SeqCst) {
+                return Err(crate::error::WorkerError::ExecFailed(
+                    "scripted fake exec failure".into(),
+                ));
+            }
             Ok((0, b"fake stdout\n".to_vec(), b"fake stderr\n".to_vec()))
         }
 
@@ -1400,7 +1899,7 @@ mod tests {
         );
 
         mount
-            .publish_exec_result(&id, b"build output\n", b"warning output\n")
+            .publish_exec_result(&id, &subject(), b"build output\n", b"warning output\n")
             .await
             .unwrap();
 
@@ -1426,6 +1925,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fd_truncation_is_explicit_in_local_and_moq_terminal_views() {
+        let origin = MoqStreamOrigin::standalone()
+            .with_prefix("test/exec")
+            .build();
+        let fd = TaskFdStream::new(&origin, "truncated", 1).unwrap();
+        let oversized = vec![b'x'; MAX_RETAINED_FD_BYTES + 1];
+        fd.append(None, &oversized).await.unwrap();
+        fd.close(None).await.unwrap();
+
+        let (topic, mac_key, local) = {
+            let state = fd.state.lock().await;
+            (
+                state.publisher.topic().to_owned(),
+                state.mac_key,
+                state.bytes.clone(),
+            )
+        };
+        assert_eq!(local.len(), MAX_RETAINED_FD_BYTES);
+        assert!(local.ends_with(FD_TRUNCATION_MARKER));
+
+        // Consume the same carrier Objects that an Iroh/MoQ client would
+        // verify. The local tail marker and authenticated Complete metadata
+        // must agree on the bounded terminal result.
+        let path = origin.broadcast_path(&topic);
+        let broadcast = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            origin.consumer().announced_broadcast(path.as_str()),
+        )
+        .await
+        .unwrap()
+        .expect("fd broadcast must be announced");
+        let mut track = broadcast
+            .subscribe_track(&Track::new(STREAM_TRACK))
+            .unwrap();
+        let mut verifier = StreamVerifier::new(mac_key, topic.clone());
+        let mut payloads = Vec::new();
+        for _ in 0..2 {
+            let mut group =
+                tokio::time::timeout(std::time::Duration::from_secs(2), track.next_group())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expect("fd carrier group must exist");
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), group.read_frame())
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("fd carrier frame must exist");
+            payloads.extend(verify_moq_frame(&mut verifier, &topic, &frame).unwrap());
+        }
+        assert!(
+            matches!(&payloads[0], StreamPayload::Data(bytes) if bytes.len() == MAX_RETAINED_FD_BYTES)
+        );
+        assert!(
+            matches!(&payloads[1], StreamPayload::Complete(metadata) if metadata == FD_TRUNCATED_METADATA)
+        );
+    }
+
     /// Regression (#1447 r2/k3 Finding A): `read_until_closed` already slices
     /// the retained buffer at `[offset, offset+count)`; `Mount::read`'s shared
     /// offset tail must NOT re-apply `offset` to that already-offset result.
@@ -1447,7 +2005,7 @@ mod tests {
         let mount = ExecMount::new(pool);
 
         mount
-            .publish_exec_result(&id, b"0123456789", b"")
+            .publish_exec_result(&id, &subject(), b"0123456789", b"")
             .await
             .unwrap();
 
@@ -1533,6 +2091,170 @@ mod tests {
                 .unwrap()
                 .contains("caller does not own this task's Subject-scoped namespace")
         );
+    }
+
+    #[tokio::test]
+    async fn attachment_bound_task_uses_exec_projection_and_revocation_gates_effects() {
+        let fake = Arc::new(FakeBackend::default());
+        let backend: Arc<dyn SandboxBackend> = fake.clone();
+        let pool = Arc::new(SandboxPool::new(
+            PoolConfig {
+                max_sandboxes: 2,
+                warm_pool_size: 0,
+                ..Default::default()
+            },
+            backend,
+        ));
+        let mount = ExecMount::new(Arc::clone(&pool));
+        let owner = Subject::new("alice");
+        let attachment = VerifiedAttachment::for_test_local_root(owner.clone()).unwrap();
+        let grant = attachment.for_test_operations(&[
+            AttachmentOperation::TaskSpawn,
+            AttachmentOperation::TaskAttach,
+            AttachmentOperation::TaskSignal,
+            AttachmentOperation::TaskRead,
+            AttachmentOperation::TaskPublish,
+        ]);
+        let vfs_context = VfsOpContext::from_attachment_grant(&grant);
+        let binding = TaskAttachmentBinding::from_grant(&grant);
+        let request = TaskSpawnRequest::new(
+            binding.clone(),
+            NamespaceManifestDigest::from_description_bytes(b"/work=cid-a\n"),
+            TaskPayload::Argv(vec!["echo".into(), "hello".into()]),
+            TaskRuntimeConstraints {
+                backend_class: Some("fake".into()),
+                timeout_secs: Some(10),
+            },
+        );
+
+        // The explicit spawn is the `/exec/clone` allocation effect. It uses
+        // the existing fake-backed pool and projects exactly one task tree.
+        let handle = mount.spawn_task(request).await.unwrap();
+        assert!(matches!(handle.state, TaskState::Exited { code: 0 }));
+        assert!(handle.reaches.vfs_path.starts_with("/exec/instances/"));
+        assert_eq!(handle.reaches.moq_topics.len(), 2);
+        // The same Subject alone cannot replay the task through the legacy
+        // Subject-only Mount API; the opaque attachment context is required.
+        assert!(matches!(
+            mount.walk(&[handle.task.as_str(), "fd", "1"], &owner).await,
+            Err(MountError::NotFound(_))
+        ));
+        let unbound_root = mount.walk(&[], &owner).await.unwrap();
+        assert!(
+            !mount
+                .readdir(&unbound_root, &owner)
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name == handle.task.as_str())
+        );
+        let bound_root = mount.walk_with_context(&[], &vfs_context).await.unwrap();
+        assert!(
+            mount
+                .readdir(&bound_root, &owner)
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name == handle.task.as_str())
+        );
+
+        let stdout = mount
+            .walk_with_context(&[handle.task.as_str(), "fd", "1"], &vfs_context)
+            .await
+            .unwrap();
+        assert_eq!(
+            mount.read(&stdout, 0, 4096, &owner).await.unwrap(),
+            b"fake stdout\n"
+        );
+        let result = mount
+            .task_result(&handle.task, binding.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.content_records.len(), 2);
+        assert_eq!(
+            result.content_records[0].content,
+            ContentDigest::from_bytes(b"fake stdout\n")
+        );
+        assert_eq!(result.content_records[0].task, handle.task);
+        assert_eq!(result.content_records[0].role, TaskContentRole::Stdout);
+        let snapshot = mount
+            .snapshot_task(&handle.task, binding.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.namespace_manifest,
+            NamespaceManifestDigest::from_description_bytes(b"/work=cid-a\n")
+        );
+
+        // Revocation fences both the next ctl lifecycle effect and the next
+        // stream publication. The fake backend must not see a stop request.
+        attachment.revoke().unwrap();
+        let signal = mount
+            .signal_task(TaskSignalRequest {
+                task: handle.task.clone(),
+                attachment: binding,
+                signal: TaskSignal::Stop,
+            })
+            .await;
+        assert_eq!(signal, Err(TaskError::StaleAttachment));
+        assert!(!fake.stopped.load(Ordering::SeqCst));
+        assert!(matches!(
+            mount.read(&stdout, 0, 4096, &owner).await,
+            Err(MountError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            mount
+                .publish_exec_result(handle.task.as_str(), &owner, b"late", b"")
+                .await,
+            Err(MountError::PermissionDenied(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_or_revoked_spawn_rolls_back_every_local_task_reach() {
+        for revoke_during_exec in [false, true] {
+            let fake = Arc::new(FakeBackend::default());
+            fake.fail_exec.store(!revoke_during_exec, Ordering::SeqCst);
+            let backend: Arc<dyn SandboxBackend> = fake.clone();
+            let pool = Arc::new(SandboxPool::new(
+                PoolConfig {
+                    max_sandboxes: 2,
+                    warm_pool_size: 0,
+                    ..Default::default()
+                },
+                backend,
+            ));
+            let mount = ExecMount::new(Arc::clone(&pool));
+            let owner = Subject::new("rollback-owner");
+            let attachment = VerifiedAttachment::for_test_local_root(owner).unwrap();
+            let grant = attachment.for_test_operations(&[
+                AttachmentOperation::TaskSpawn,
+                AttachmentOperation::TaskPublish,
+            ]);
+            if revoke_during_exec {
+                fake.revoke_during_exec.lock().replace(attachment.clone());
+            }
+            let request = TaskSpawnRequest::new(
+                TaskAttachmentBinding::from_grant(&grant),
+                NamespaceManifestDigest::from_description_bytes(b"/work=rollback\n"),
+                TaskPayload::Argv(vec!["echo".into(), "rollback".into()]),
+                TaskRuntimeConstraints {
+                    backend_class: Some("fake".into()),
+                    timeout_secs: Some(10),
+                },
+            );
+
+            let error = mount.spawn_task(request).await.unwrap_err();
+            if revoke_during_exec {
+                assert_eq!(error, TaskError::StaleAttachment);
+            } else {
+                assert!(matches!(error, TaskError::Backend(_)));
+            }
+            assert!(pool.list_active().await.is_empty());
+            assert!(mount.task_records.lock().is_empty());
+            assert!(mount.fd_streams.lock().await.is_empty());
+            assert!(fake.stopped.load(Ordering::SeqCst));
+        }
     }
 
     #[tokio::test]
