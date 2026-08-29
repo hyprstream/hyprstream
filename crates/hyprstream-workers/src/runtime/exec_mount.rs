@@ -58,11 +58,9 @@ use hyprstream_rpc::latch::{Terminal, TerminalStore};
 use hyprstream_rpc::moq_stream::{MoqStreamOrigin, MoqStreamPublisher};
 use hyprstream_rpc::stream_info::Job;
 use hyprstream_rpc::streaming::StreamContext;
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject};
-// `parking_lot::Mutex` for the ctl write→read latch (interior mutability
-// through the `&Fid` that `Mount::write` receives). When this branch is
-// rebased onto a base containing #615, swap this hand-rolled latch for
-// `hyprstream_vfs::devfile::DevFileState` (same parking_lot::Mutex shape).
+use hyprstream_vfs::{DevFileState, DirEntry, Fid, Mount, MountError, Stat, Subject};
+// `parking_lot::Mutex` remains for mount-level terminal and waiter maps.  Ctl
+// response state itself uses `DevFileState`, so it is unambiguously per fid.
 use parking_lot::Mutex as PmMutex;
 
 use super::client::PodSandboxState;
@@ -158,12 +156,7 @@ pub trait LifecyclePolicy: Send + Sync {
 pub struct DenyAllLifecycle;
 
 impl LifecyclePolicy for DenyAllLifecycle {
-    fn authorize(
-        &self,
-        _caller: &Subject,
-        _id: &str,
-        _verb: LifecycleVerb,
-    ) -> Result<(), String> {
+    fn authorize(&self, _caller: &Subject, _id: &str, _verb: LifecycleVerb) -> Result<(), String> {
         Err("lifecycle verb denied: no permissive policy".into())
     }
 }
@@ -237,7 +230,9 @@ impl TaskFdStream {
     async fn append(&self, data: &[u8]) -> Result<(), MountError> {
         let mut state = self.state.lock().await;
         if state.closed {
-            return Err(MountError::InvalidArgument("fd stream is already closed".into()));
+            return Err(MountError::InvalidArgument(
+                "fd stream is already closed".into(),
+            ));
         }
         let available = MAX_RETAINED_FD_BYTES.saturating_sub(state.bytes.len());
         let retained = &data[..data.len().min(available)];
@@ -263,7 +258,9 @@ impl TaskFdStream {
             if state.truncated && state.bytes.len() < MAX_RETAINED_FD_BYTES {
                 let marker = b"\n[hyprstream: output truncated]\n";
                 let room = MAX_RETAINED_FD_BYTES - state.bytes.len();
-                state.bytes.extend_from_slice(&marker[..marker.len().min(room)]);
+                state
+                    .bytes
+                    .extend_from_slice(&marker[..marker.len().min(room)]);
             }
             state
                 .publisher
@@ -351,11 +348,10 @@ enum ExecFidKind {
 /// Fid state for the exec mount.
 struct ExecFid {
     kind: ExecFidKind,
-    /// Latch for the ctl write→read pattern (verb result message). A
-    /// `parking_lot::Mutex<Vec<u8>>` provides safe interior mutability through
-    /// the `&Fid` that `Mount::read`/`Mount::write` receive — so we avoid the
-    /// `unsafe *mut` cast-through-`&` hazard. Unused for non-ctl fid kinds.
-    write_buf: PmMutex<Vec<u8>>,
+    /// Latch for the ctl write→read pattern (verb result message).  This
+    /// reusable per-fid primitive also backs other VFS device files, keeping
+    /// a response local to the open fid that issued its lifecycle verb.
+    write_buf: DevFileState,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -415,7 +411,9 @@ impl ExecMount {
             // (the 9P fd reads below serve the local `TaskFdStream` buffer
             // instead). Deferred, not wired, pending epic #608's stream-plane
             // mount — see Finding 3 of REVIEW-connie-1447-r2-k3-2026-07-30.md.
-            fd_origin: MoqStreamOrigin::standalone().with_prefix("local/exec").build(),
+            fd_origin: MoqStreamOrigin::standalone()
+                .with_prefix("local/exec")
+                .build(),
             fd_streams: tokio::sync::Mutex::new(HashMap::new()),
             terminal: TerminalStore::new(),
             terminal_ids: PmMutex::new(std::collections::HashSet::new()),
@@ -545,7 +543,12 @@ impl ExecMount {
     /// `caller` is the [`Subject`] that wrote the `ctl` verb (#1272): when a
     /// [`LifecyclePolicy`] is armed, destructive verbs (stop/kill/destroy)
     /// must pass it before any backend state is touched.
-    async fn apply_verb(&self, id: &str, verb: Verb, caller: &Subject) -> Result<String, MountError> {
+    async fn apply_verb(
+        &self,
+        id: &str,
+        verb: Verb,
+        caller: &Subject,
+    ) -> Result<String, MountError> {
         // Instances already marked terminal (destroyed through this mount)
         // are not present in the pool's active map any more; ctl ops on them
         // are rejected rather than silently no-op'd.
@@ -570,12 +573,12 @@ impl ExecMount {
                     Verb::Start => {
                         return Err(MountError::InvalidArgument(
                             "start is not a lifecycle-destructive verb".into(),
-                        ))
+                        ));
                     }
                     Verb::Exec(_) => {
                         return Err(MountError::InvalidArgument(
                             "exec is not a lifecycle-destructive verb".into(),
-                        ))
+                        ));
                     }
                 };
                 policy
@@ -730,7 +733,9 @@ impl Mount for ExecMount {
             [id, "ns"] => ExecFidKind::Ns((*id).to_owned()),
             [id, "fd"] => ExecFidKind::FdDir((*id).to_owned()),
             [id, "fd", fd] => {
-                let fd = fd.parse::<u8>().map_err(|_| MountError::NotFound(components.join("/")))?;
+                let fd = fd
+                    .parse::<u8>()
+                    .map_err(|_| MountError::NotFound(components.join("/")))?;
                 if !(1..=2).contains(&fd) {
                     return Err(MountError::NotFound(components.join("/")));
                 }
@@ -761,7 +766,7 @@ impl Mount for ExecMount {
 
         Ok(Fid::new(ExecFid {
             kind,
-            write_buf: PmMutex::new(Vec::new()),
+            write_buf: DevFileState::new(),
         }))
     }
 
@@ -783,7 +788,7 @@ impl Mount for ExecMount {
         let data = match &inner.kind {
             ExecFidKind::Ctl(_) => {
                 // Ctl pattern: after a write, read returns the verb result.
-                inner.write_buf.lock().clone()
+                inner.write_buf.latched()
             }
             ExecFidKind::Status(id) => self.read_status(id).await?.into_bytes(),
             ExecFidKind::Exit(id) => self.read_exit(id).await?.into_bytes(),
@@ -795,10 +800,20 @@ impl Mount for ExecMount {
             // silently corrupt or premature-EOF any nonzero-offset fd read
             // (#1447 r2/k3 Finding A).
             ExecFidKind::Fd(id, 1) => {
-                return Ok(self.fd_streams_for(id).await?.stdout.read_until_closed(offset, count).await);
+                return Ok(self
+                    .fd_streams_for(id)
+                    .await?
+                    .stdout
+                    .read_until_closed(offset, count)
+                    .await);
             }
             ExecFidKind::Fd(id, 2) => {
-                return Ok(self.fd_streams_for(id).await?.stderr.read_until_closed(offset, count).await);
+                return Ok(self
+                    .fd_streams_for(id)
+                    .await?
+                    .stderr
+                    .read_until_closed(offset, count)
+                    .await);
             }
             ExecFidKind::Fd(_, _) => {
                 return Err(MountError::NotFound("invalid exec fd".into()));
@@ -808,11 +823,9 @@ impl Mount for ExecMount {
             }
         };
 
-        let start = offset as usize;
-        if start >= data.len() {
-            return Ok(Vec::new());
-        }
-        Ok(data[start..].to_vec())
+        let start = (offset as usize).min(data.len());
+        let end = start.saturating_add(count as usize).min(data.len());
+        Ok(data[start..end].to_vec())
     }
 
     async fn write(
@@ -849,10 +862,12 @@ impl Mount for ExecMount {
                 // cast-through-`&` the pre-review draft used — that would be a
                 // data race if two futures ever held `&Fid` to one fid
                 // concurrently (e.g. a 9P server multiplexing Twrite on one fid).
-                *inner.write_buf.lock() = response_bytes;
+                inner.write_buf.latch(response_bytes);
                 Ok(data.len() as u32)
             }
-            ExecFidKind::Fd(_, 1 | 2) => Err(MountError::NotSupported("fd/1 and fd/2 are read-only".into())),
+            ExecFidKind::Fd(_, 1 | 2) => Err(MountError::NotSupported(
+                "fd/1 and fd/2 are read-only".into(),
+            )),
             _ => Err(MountError::NotSupported("read-only".into())),
         }
     }
@@ -1097,7 +1112,10 @@ mod tests {
     #[tokio::test]
     async fn list_instances_after_acquire() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = ExecMount::new(pool);
 
         let fid = mount.walk(&[], &subject()).await.unwrap();
@@ -1118,7 +1136,10 @@ mod tests {
     #[tokio::test]
     async fn read_status_reflects_pool_state() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = ExecMount::new(pool);
 
         let mut fid = mount.walk(&[&id, "status"], &subject()).await.unwrap();
@@ -1131,7 +1152,10 @@ mod tests {
     #[tokio::test]
     async fn ctl_stop_invokes_backend() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = ExecMount::new(pool);
 
         let mut fid = mount.walk(&[&id, "ctl"], &subject()).await.unwrap();
@@ -1144,10 +1168,45 @@ mod tests {
         assert!(text.starts_with("ok:"), "got: {text}");
     }
 
+    /// `ctl` response state is a property of the open fid, not of the mount
+    /// or task.  Writing two lifecycle verbs before either reply is read must
+    /// preserve both results for their respective fids.
+    #[tokio::test]
+    async fn ctl_response_is_isolated_per_fid() {
+        let pool = make_pool().await;
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
+        let mount = ExecMount::new(pool);
+        let caller = subject();
+
+        let mut start = mount.walk(&[&id, "ctl"], &caller).await.unwrap();
+        let mut stop = mount.walk(&[&id, "ctl"], &caller).await.unwrap();
+        mount.open(&mut start, 2, &caller).await.unwrap();
+        mount.open(&mut stop, 2, &caller).await.unwrap();
+
+        mount.write(&start, 0, b"start", &caller).await.unwrap();
+        mount.write(&stop, 0, b"stop", &caller).await.unwrap();
+
+        assert_eq!(mount.read(&start, 0, 4, &caller).await.unwrap(), b"ok: ");
+        assert_eq!(
+            mount.read(&start, 4, 4096, &caller).await.unwrap(),
+            b"already started\n"
+        );
+        assert_eq!(
+            mount.read(&stop, 0, 4096, &caller).await.unwrap(),
+            b"ok: stopped\n"
+        );
+    }
+
     #[tokio::test]
     async fn ctl_unknown_verb_rejected() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = ExecMount::new(pool);
 
         let mut fid = mount.walk(&[&id, "ctl"], &subject()).await.unwrap();
@@ -1163,7 +1222,10 @@ mod tests {
     #[tokio::test]
     async fn exit_blocks_then_unblocks_on_destroy() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = Arc::new(ExecMount::new(pool));
 
         let reader = {
@@ -1180,7 +1242,10 @@ mod tests {
         // reach the `.await` inside `read_exit`'s slow path, then confirm it
         // hasn't completed on its own.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(!reader.is_finished(), "exit read must block before terminal");
+        assert!(
+            !reader.is_finished(),
+            "exit read must block before terminal"
+        );
 
         // Destroy from a separate task — this is what latches + wakes the
         // blocked reader above.
@@ -1206,7 +1271,10 @@ mod tests {
     #[tokio::test]
     async fn exit_after_destroy_reports_terminal() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = ExecMount::new(pool);
 
         // Drive destroy through ctl.
@@ -1243,7 +1311,10 @@ mod tests {
     #[tokio::test]
     async fn ctl_on_terminal_instance_rejected() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = ExecMount::new(pool);
 
         let mut ctl_fid = mount.walk(&[&id, "ctl"], &subject()).await.unwrap();
@@ -1266,7 +1337,10 @@ mod tests {
     #[tokio::test]
     async fn read_ns_returns_placeholder_info() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = ExecMount::new(pool);
 
         let mut fid = mount.walk(&[&id, "ns"], &subject()).await.unwrap();
@@ -1280,7 +1354,10 @@ mod tests {
     #[tokio::test]
     async fn readdir_instance_dir_lists_files() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = ExecMount::new(pool);
 
         let fid = mount.walk(&[&id], &subject()).await.unwrap();
@@ -1301,7 +1378,10 @@ mod tests {
     #[tokio::test]
     async fn fd_output_blocks_until_runtime_publishes_then_latches_eof() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = Arc::new(ExecMount::new(pool));
 
         let reader = {
@@ -1314,7 +1394,10 @@ mod tests {
             })
         };
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(!reader.is_finished(), "fd/1 must wait for terminal task output");
+        assert!(
+            !reader.is_finished(),
+            "fd/1 must wait for terminal task output"
+        );
 
         mount
             .publish_exec_result(&id, b"build output\n", b"warning output\n")
@@ -1334,7 +1417,11 @@ mod tests {
             b"warning output\n"
         );
         assert!(
-            mount.read(&stderr_fid, 4096, 4096, &subject()).await.unwrap().is_empty(),
+            mount
+                .read(&stderr_fid, 4096, 4096, &subject())
+                .await
+                .unwrap()
+                .is_empty(),
             "terminal stderr must report EOF after retained bytes"
         );
     }
@@ -1353,7 +1440,10 @@ mod tests {
     #[tokio::test]
     async fn fd_read_at_nonzero_offset_is_not_double_applied() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = ExecMount::new(pool);
 
         mount
@@ -1375,14 +1465,26 @@ mod tests {
     #[tokio::test]
     async fn ctl_exec_is_projected_to_terminal_fd_streams() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = ExecMount::new(pool);
 
-        let mut ctl = mount.walk(&[&id, "ctl"], &admission_subject()).await.unwrap();
+        let mut ctl = mount
+            .walk(&[&id, "ctl"], &admission_subject())
+            .await
+            .unwrap();
         mount.open(&mut ctl, 2, &admission_subject()).await.unwrap();
-        mount.write(&ctl, 0, b"exec build", &admission_subject()).await.unwrap();
+        mount
+            .write(&ctl, 0, b"exec build", &admission_subject())
+            .await
+            .unwrap();
         assert_eq!(
-            mount.read(&ctl, 0, 4096, &admission_subject()).await.unwrap(),
+            mount
+                .read(&ctl, 0, 4096, &admission_subject())
+                .await
+                .unwrap(),
             b"ok: exited 0\n"
         );
         let mut stdout = mount.walk(&[&id, "fd", "1"], &subject()).await.unwrap();
@@ -1402,7 +1504,10 @@ mod tests {
     #[tokio::test]
     async fn fd_zero_is_omitted_until_the_task_runtime_consumes_stdin() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = ExecMount::new(pool);
         assert!(matches!(
             mount.walk(&[&id, "fd", "0"], &subject()).await,
@@ -1413,7 +1518,10 @@ mod tests {
     #[tokio::test]
     async fn ctl_exec_rejects_a_different_subject() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = ExecMount::new(pool);
         let other = Subject::new("other-user");
         let mut ctl = mount.walk(&[&id, "ctl"], &other).await.unwrap();
@@ -1430,7 +1538,10 @@ mod tests {
     #[tokio::test]
     async fn stopping_instance_latches_waiting_fd_reader_to_eof() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = Arc::new(ExecMount::new(pool));
         let reader = {
             let mount = Arc::clone(&mount);
@@ -1442,7 +1553,10 @@ mod tests {
             })
         };
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(!reader.is_finished(), "fd reader must wait before cancellation");
+        assert!(
+            !reader.is_finished(),
+            "fd reader must wait before cancellation"
+        );
 
         let mut ctl = mount.walk(&[&id, "ctl"], &subject()).await.unwrap();
         mount.open(&mut ctl, 2, &subject()).await.unwrap();
@@ -1480,7 +1594,10 @@ mod tests {
     #[tokio::test]
     async fn ctl_concurrent_writes_to_one_fid_are_safe() {
         let pool = make_pool().await;
-        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let id = pool
+            .acquire(&admission_subject(), &PodSandboxConfig::default())
+            .await
+            .unwrap();
         let mount = ExecMount::new(pool);
 
         // One shared ctl fid; opened RDWR.
