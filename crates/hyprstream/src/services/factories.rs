@@ -2542,6 +2542,18 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
         ctx.jwt_verifying_key(),
         ctx.transport("discovery", SocketKind::Rep),
     )
+    .with_state({
+        let state_config = config.discovery.state.clone();
+        std::thread::spawn(move || -> anyhow::Result<hyprstream_discovery::DiscoveryState> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("build Discovery state bootstrap runtime")?;
+            runtime.block_on(hyprstream_discovery::DiscoveryState::connect(&state_config))
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("Discovery state bootstrap thread panicked"))??
+    })
     .with_auth_provider(Box::new(auth_provider))
     .with_record_resolver(std::sync::Arc::clone(&record_resolver)
         as std::sync::Arc<dyn hyprstream_discovery::RecordResolver>);

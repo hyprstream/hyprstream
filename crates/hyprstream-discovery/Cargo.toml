@@ -18,6 +18,9 @@ k8s = ["dep:hyprstream-k8s"]
 # Model-free downstream fixtures for the production selector boundary. Never
 # enabled by production features; `hyprstream` enables it only as a dev-dependency.
 test-fixtures = []
+# Native shared/tiered Discovery state. The dependency itself is target-gated
+# below so enabling the feature never pulls sockets into a WASM graph.
+valkey = ["dep:fred"]
 
 [dependencies]
 # Workspace crates
@@ -68,6 +71,7 @@ p256 = { workspace = true }
 # Production accepted-state authority is read directly from the concrete
 # checkpointed PDS store. No downstream callback/trait can supply authority.
 rocksdb = "0.23"
+fred = { version = "9", optional = true, features = ["i-scripts"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
