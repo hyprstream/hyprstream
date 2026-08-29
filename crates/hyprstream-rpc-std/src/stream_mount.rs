@@ -37,16 +37,17 @@
 //! [`StreamKind::Event`] rather than a separate plane — see [`StreamEntry`].
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use parking_lot::Mutex;
 
 use async_trait::async_trait;
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 use hyprstream_rpc::Subject;
 use hyprstream_rpc::stream_consumer::{StreamHandle, StreamPayload};
 use hyprstream_rpc::stream_info::{
     Completion, Delivery, Ordering, OverflowPolicy, Retention, StreamOpt,
 };
+use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 
 // ============================================================================
 // StreamKind — what plane a topic belongs to (#819: events ride the same surface)
@@ -229,8 +230,8 @@ impl Default for StreamQos {
 pub struct StreamEntry {
     /// Verified stream handle — does HMAC verification internally.
     pub handle: Option<Box<dyn StreamHandle>>,
-    /// Owner identity (for access control)
-    pub owner: String,
+    /// Subject-bound owner used for namespace visibility and stream control.
+    owner: StreamOwner,
     /// Bytes received so far
     pub bytes_received: u64,
     /// Blocks received so far
@@ -242,11 +243,14 @@ pub struct StreamEntry {
     /// Resume cursor (#169 seam): the next sequence/offset a resumed reader
     /// wants. `0` = live/from-start. Full at-least-once dedup is #169 follow-up.
     pub resume_seq: u64,
+    /// Private registration identity. Every replacement receives a new value
+    /// so a fid/handle checked out from an old entry cannot affect the new one.
+    generation: u64,
 }
 
 impl StreamEntry {
     /// A point-to-point stream entry at the reliable-in-order floor.
-    pub fn stream(handle: Option<Box<dyn StreamHandle>>, owner: String) -> Self {
+    pub fn stream(handle: Option<Box<dyn StreamHandle>>, owner: StreamOwner) -> Self {
         Self {
             handle,
             owner,
@@ -255,6 +259,7 @@ impl StreamEntry {
             kind: StreamKind::Stream,
             qos: StreamQos::reliable(),
             resume_seq: 0,
+            generation: 0,
         }
     }
 
@@ -264,7 +269,7 @@ impl StreamEntry {
     /// state matters more than every intermediate one (mirrors the `EventLive`
     /// StreamOpt preset). The `handle` is the event carrier subscription; see
     /// the events seam note on [`StreamRegistry::register`].
-    pub fn event(handle: Option<Box<dyn StreamHandle>>, owner: String) -> Self {
+    pub fn event(handle: Option<Box<dyn StreamHandle>>, owner: StreamOwner) -> Self {
         let mut qos = StreamQos::reliable();
         qos.apply_token("latest-wins");
         Self {
@@ -275,19 +280,51 @@ impl StreamEntry {
             kind: StreamKind::Event,
             qos,
             resume_seq: 0,
+            generation: 0,
         }
+    }
+}
+
+/// A non-anonymous subject that owns a `/stream` topic.
+///
+/// The namespace surface never accepts an owner name from a path or a ctl
+/// payload. It derives this value from the `Subject` supplied by the existing
+/// Mount caller and uses it only for exact matching. This is subject-scoped
+/// visibility under that caller's trusted-boundary assumption; it does not
+/// prove authentication or attachment authority. Attachment and revocation
+/// generations are a follow-up layer, and a topic name is not an authority
+/// handle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamOwner(String);
+
+impl StreamOwner {
+    /// Derive a topic owner from a non-anonymous subject.
+    ///
+    /// Anonymous callers cannot own or discover a stream topic. The
+    /// caller-facing `Subject` remains the legacy Mount API's trust input;
+    /// this type deliberately has no constructor from an arbitrary owner
+    /// string, but does not itself establish caller authentication.
+    pub fn from_subject(subject: &Subject) -> Result<Self, MountError> {
+        subject
+            .name()
+            .map(|name| Self(name.to_owned()))
+            .ok_or_else(|| {
+                MountError::PermissionDenied("stream topics require a non-anonymous subject".into())
+            })
     }
 }
 
 /// Registry of active streams, keyed by topic.
 pub struct StreamRegistry {
     streams: Mutex<HashMap<String, StreamEntry>>,
+    next_generation: AtomicU64,
 }
 
 impl StreamRegistry {
     pub fn new() -> Self {
         Self {
             streams: Mutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(1),
         }
     }
 
@@ -301,27 +338,60 @@ impl StreamRegistry {
     /// decryption over the moq_event `OriginConsumer`) is the marked follow-up;
     /// this seam is kind-aware and ready to carry it (an event entry with a
     /// `None` handle is an announced-but-not-yet-subscribed topic).
-    pub fn register(&self, topic: String, entry: StreamEntry) {
+    pub fn register(&self, topic: String, mut entry: StreamEntry) {
+        entry.generation = self.next_generation.fetch_add(1, AtomicOrdering::Relaxed);
         self.lock().insert(topic, entry);
     }
 
-    /// Check if a topic exists.
-    pub fn exists(&self, topic: &str) -> bool {
-        self.lock().contains_key(topic)
-    }
-
-    /// List active topic names (optionally filtered by owner).
-    pub fn list_topics(&self, owner_filter: Option<&str>) -> Vec<String> {
+    /// List topics visible to exactly one subject-scoped owner.
+    pub fn list_topics(&self, owner: &StreamOwner) -> Vec<String> {
         self.lock()
             .iter()
-            .filter(|(_, e)| owner_filter.is_none() || owner_filter == Some(e.owner.as_str()))
+            .filter(|(_, e)| e.owner == *owner)
             .map(|(k, _)| k.clone())
             .collect()
     }
 
-    /// Remove a stream and return it for cleanup.
-    pub fn remove(&self, topic: &str) -> Option<StreamEntry> {
-        self.lock().remove(topic)
+    /// Check whether `owner` may discover and operate `topic`.
+    fn is_owned_by(&self, topic: &str, owner: &StreamOwner) -> bool {
+        self.lock()
+            .get(topic)
+            .is_some_and(|entry| entry.owner == *owner)
+    }
+
+    /// Return the exact registration generation visible to `owner`.
+    fn owned_generation(&self, topic: &str, owner: &StreamOwner) -> Option<u64> {
+        self.lock()
+            .get(topic)
+            .filter(|entry| entry.owner == *owner)
+            .map(|entry| entry.generation)
+    }
+
+    /// Check a fid's owner and registration identity atomically.
+    fn owns_generation(&self, topic: &str, owner: &StreamOwner, generation: u64) -> bool {
+        self.lock()
+            .get(topic)
+            .is_some_and(|entry| entry.owner == *owner && entry.generation == generation)
+    }
+
+    /// Remove only the entry named by this owner and registration identity.
+    /// The check and removal share one lock so a replacement cannot be
+    /// cancelled through an old fid (topic-name ABA).
+    fn remove_owned(
+        &self,
+        topic: &str,
+        owner: &StreamOwner,
+        generation: u64,
+    ) -> Option<StreamEntry> {
+        let mut streams = self.lock();
+        if streams
+            .get(topic)
+            .is_some_and(|entry| entry.owner == *owner && entry.generation == generation)
+        {
+            streams.remove(topic)
+        } else {
+            None
+        }
     }
 
     /// Whether a topic currently holds its carrier-backed handle.
@@ -346,8 +416,11 @@ impl StreamRegistry {
     /// already checked out. The entry stays registered (info/qos/ctl remain
     /// addressable); the caller owns the subscription until it drops or
     /// re-parks it.
-    pub fn take_handle(&self, topic: &str) -> Option<Box<dyn StreamHandle>> {
-        self.lock().get_mut(topic).and_then(|e| e.handle.take())
+    pub fn take_handle(&self, topic: &str, owner: &StreamOwner) -> Option<Box<dyn StreamHandle>> {
+        self.lock()
+            .get_mut(topic)
+            .filter(|entry| entry.owner == *owner)
+            .and_then(|entry| entry.handle.take())
     }
 
     /// The plane a topic belongs to (stream vs event), if registered.
@@ -360,27 +433,37 @@ impl StreamRegistry {
         self.lock().get(topic).map(|e| e.qos.clone())
     }
 
-    /// Select QoS for a topic (the `qos`/`ctl` vocabulary write path).
-    /// Returns `false` if the topic is unknown.
-    pub fn set_qos(&self, topic: &str, qos: StreamQos) -> bool {
+    /// Mutate QoS only for the exact owner/registration identity.
+    fn set_qos_owned(
+        &self,
+        topic: &str,
+        owner: &StreamOwner,
+        generation: u64,
+        qos: StreamQos,
+    ) -> bool {
         match self.lock().get_mut(topic) {
-            Some(e) => {
-                e.qos = qos;
+            Some(entry) if entry.owner == *owner && entry.generation == generation => {
+                entry.qos = qos;
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
-    /// Set the resume cursor for a topic (#169 seam). Returns `false` if
-    /// the topic is unknown.
-    pub fn set_resume(&self, topic: &str, seq: u64) -> bool {
+    /// Mutate the resume cursor only for the exact owner/registration identity.
+    fn set_resume_owned(
+        &self,
+        topic: &str,
+        owner: &StreamOwner,
+        generation: u64,
+        seq: u64,
+    ) -> bool {
         match self.lock().get_mut(topic) {
-            Some(e) => {
-                e.resume_seq = seq;
+            Some(entry) if entry.owner == *owner && entry.generation == generation => {
+                entry.resume_seq = seq;
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -405,15 +488,28 @@ enum StreamFidState {
     /// /stream/ root directory
     Root,
     /// /stream/{topic}/ directory
-    TopicDir { topic: String },
+    TopicDir { topic: String, generation: u64 },
     /// /stream/{topic}/data — active data pipe
-    Data { topic: String },
+    Data { topic: String, generation: u64 },
     /// /stream/{topic}/info — metadata
-    Info { topic: String },
+    Info { topic: String, generation: u64 },
     /// /stream/{topic}/qos — read/select QoS (StreamOpt vocabulary)
-    Qos { topic: String },
+    Qos { topic: String, generation: u64 },
     /// /stream/{topic}/ctl — control
-    Ctl { topic: String },
+    Ctl { topic: String, generation: u64 },
+}
+
+impl StreamFidState {
+    fn topic_generation(&self) -> Option<(&str, u64)> {
+        match self {
+            Self::Root => None,
+            Self::TopicDir { topic, generation }
+            | Self::Data { topic, generation }
+            | Self::Info { topic, generation }
+            | Self::Qos { topic, generation }
+            | Self::Ctl { topic, generation } => Some((topic, *generation)),
+        }
+    }
 }
 
 // ============================================================================
@@ -442,34 +538,93 @@ impl StreamMount {
     pub fn new(registry: std::sync::Arc<StreamRegistry>) -> Self {
         Self { registry }
     }
+
+    fn require_fid_owner(
+        &self,
+        state: &StreamFidState,
+        caller: &Subject,
+    ) -> Result<(), MountError> {
+        match state.topic_generation() {
+            Some((topic, generation)) => {
+                let owner = StreamOwner::from_subject(caller)
+                    .map_err(|_| MountError::NotFound(topic.to_owned()))?;
+                if self.registry.owns_generation(topic, &owner, generation) {
+                    Ok(())
+                } else {
+                    Err(MountError::NotFound(topic.to_owned()))
+                }
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Mount for StreamMount {
-    async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
+    async fn walk(&self, components: &[&str], caller: &Subject) -> Result<Fid, MountError> {
         let state = match components {
             [] => StreamFidState::Root,
             [topic] => {
-                if !self.registry.exists(topic) {
-                    return Err(MountError::NotFound(topic.to_string()));
-                }
+                let owner = StreamOwner::from_subject(caller)
+                    .map_err(|_| MountError::NotFound((*topic).to_owned()))?;
+                let generation = self
+                    .registry
+                    .owned_generation(topic, &owner)
+                    .ok_or_else(|| MountError::NotFound((*topic).to_owned()))?;
                 StreamFidState::TopicDir {
                     topic: topic.to_string(),
+                    generation,
                 }
             }
-            [topic, "data"] => StreamFidState::Data {
-                topic: topic.to_string(),
-            },
-            [topic, "info"] => StreamFidState::Info {
-                topic: topic.to_string(),
-            },
-            [topic, "qos"] => StreamFidState::Qos {
-                topic: topic.to_string(),
-            },
-            [topic, "ctl"] => StreamFidState::Ctl {
-                topic: topic.to_string(),
-            },
+            [topic, "data"] => {
+                let owner = StreamOwner::from_subject(caller)
+                    .map_err(|_| MountError::NotFound((*topic).to_owned()))?;
+                let generation = self
+                    .registry
+                    .owned_generation(topic, &owner)
+                    .ok_or_else(|| MountError::NotFound((*topic).to_owned()))?;
+                StreamFidState::Data {
+                    topic: topic.to_string(),
+                    generation,
+                }
+            }
+            [topic, "info"] => {
+                let owner = StreamOwner::from_subject(caller)
+                    .map_err(|_| MountError::NotFound((*topic).to_owned()))?;
+                let generation = self
+                    .registry
+                    .owned_generation(topic, &owner)
+                    .ok_or_else(|| MountError::NotFound((*topic).to_owned()))?;
+                StreamFidState::Info {
+                    topic: topic.to_string(),
+                    generation,
+                }
+            }
+            [topic, "qos"] => {
+                let owner = StreamOwner::from_subject(caller)
+                    .map_err(|_| MountError::NotFound((*topic).to_owned()))?;
+                let generation = self
+                    .registry
+                    .owned_generation(topic, &owner)
+                    .ok_or_else(|| MountError::NotFound((*topic).to_owned()))?;
+                StreamFidState::Qos {
+                    topic: topic.to_string(),
+                    generation,
+                }
+            }
+            [topic, "ctl"] => {
+                let owner = StreamOwner::from_subject(caller)
+                    .map_err(|_| MountError::NotFound((*topic).to_owned()))?;
+                let generation = self
+                    .registry
+                    .owned_generation(topic, &owner)
+                    .ok_or_else(|| MountError::NotFound((*topic).to_owned()))?;
+                StreamFidState::Ctl {
+                    topic: topic.to_string(),
+                    generation,
+                }
+            }
             _ => {
                 return Err(MountError::NotFound(components.join("/")));
             }
@@ -487,7 +642,11 @@ impl Mount for StreamMount {
     /// this app-half story — the mount fails closed with the caller threaded
     /// through, ready for the PEP. It does not re-open the carrier per read:
     /// the subscription established at registration IS the handle.
-    async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+    async fn open(&self, fid: &mut Fid, _mode: u8, caller: &Subject) -> Result<(), MountError> {
+        let state = fid
+            .downcast_ref::<StreamFidState>()
+            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        self.require_fid_owner(state, caller)?;
         Ok(())
     }
 
@@ -496,46 +655,44 @@ impl Mount for StreamMount {
         fid: &Fid,
         offset: u64,
         count: u32,
-        _caller: &Subject,
+        caller: &Subject,
     ) -> Result<Vec<u8>, MountError> {
         let state = fid
             .downcast_ref::<StreamFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        self.require_fid_owner(state, caller)?;
 
         match state {
-            StreamFidState::Root => {
-                Err(MountError::IsDirectory("stream root".into()))
-            }
+            StreamFidState::Root => Err(MountError::IsDirectory("stream root".into())),
             StreamFidState::TopicDir { .. } => {
                 Err(MountError::IsDirectory("stream topic dir".into()))
             }
-            StreamFidState::Data { topic } => {
-                // Check completion + QoS WITHOUT holding borrow across await.
-                // `is_lossy` decides whether a mid-stream carrier error is
-                // surfaced as a hard read error (reliable) or a soft EOF
-                // (lossy-ok / latest-wins / drop-stale) — the consumer-visible
-                // half of the QoS vocabulary selected through the file (#819).
-                let (is_completed, is_lossy) = {
-                    let streams = self.registry.lock();
-                    let entry = streams
-                        .get(topic.as_str())
-                        .ok_or_else(|| MountError::NotFound(topic.clone()))?;
-                    let done = entry.handle.as_ref().map(|h| h.is_completed()).unwrap_or(true);
-                    (done, entry.qos.is_lossy())
-                };
-
-                if is_completed {
-                    return Ok(vec![]); // EOF
-                }
-
-                // Take handle out temporarily (avoids holding RefCell borrow across await)
-                let mut handle = {
+            StreamFidState::Data { topic, generation } => {
+                // Check owner, registration identity, completion, QoS, and
+                // checkout under one lock. A replacement cannot make this old
+                // fid consume or later re-park into its new entry.
+                let owner = StreamOwner::from_subject(caller)
+                    .map_err(|_| MountError::NotFound(topic.clone()))?;
+                let (mut handle, is_lossy) = {
                     let mut streams = self.registry.lock();
                     let entry = streams
                         .get_mut(topic.as_str())
+                        .filter(|entry| entry.owner == owner && entry.generation == *generation)
                         .ok_or_else(|| MountError::NotFound(topic.clone()))?;
-                    entry.handle.take()
-                        .ok_or_else(|| MountError::Io("stream read in progress".into()))?
+                    if entry
+                        .handle
+                        .as_ref()
+                        .map(|h| h.is_completed())
+                        .unwrap_or(true)
+                    {
+                        return Ok(vec![]); // EOF
+                    }
+                    let is_lossy = entry.qos.is_lossy();
+                    let handle = entry
+                        .handle
+                        .take()
+                        .ok_or_else(|| MountError::Io("stream read in progress".into()))?;
+                    (handle, is_lossy)
                 };
 
                 // Read next verified payload (await without holding borrow)
@@ -544,7 +701,10 @@ impl Mount for StreamMount {
                 // Put handle back (its completion state is tracked internally).
                 {
                     let mut streams = self.registry.lock();
-                    if let Some(entry) = streams.get_mut(topic.as_str()) {
+                    if let Some(entry) = streams
+                        .get_mut(topic.as_str())
+                        .filter(|entry| entry.owner == owner && entry.generation == *generation)
+                    {
                         entry.handle = Some(handle);
                     }
                 }
@@ -552,7 +712,10 @@ impl Mount for StreamMount {
                 match result {
                     Ok(Some(StreamPayload::Data(data))) => {
                         let mut streams = self.registry.lock();
-                        if let Some(entry) = streams.get_mut(topic.as_str()) {
+                        if let Some(entry) = streams
+                            .get_mut(topic.as_str())
+                            .filter(|entry| entry.owner == owner && entry.generation == *generation)
+                        {
                             entry.bytes_received += data.len() as u64;
                             entry.blocks_received += 1;
                         }
@@ -560,7 +723,10 @@ impl Mount for StreamMount {
                     }
                     Ok(Some(StreamPayload::Complete(meta))) => {
                         let mut streams = self.registry.lock();
-                        if let Some(entry) = streams.get_mut(topic.as_str()) {
+                        if let Some(entry) = streams
+                            .get_mut(topic.as_str())
+                            .filter(|entry| entry.owner == owner && entry.generation == *generation)
+                        {
                             entry.blocks_received += 1;
                         }
                         Ok(meta)
@@ -576,7 +742,10 @@ impl Mount for StreamMount {
                     }
                     Ok(Some(StreamPayload::Tagged { payload, .. })) => {
                         let mut streams = self.registry.lock();
-                        if let Some(entry) = streams.get_mut(topic.as_str()) {
+                        if let Some(entry) = streams
+                            .get_mut(topic.as_str())
+                            .filter(|entry| entry.owner == owner && entry.generation == *generation)
+                        {
                             entry.bytes_received += payload.len() as u64;
                             entry.blocks_received += 1;
                         }
@@ -592,13 +761,20 @@ impl Mount for StreamMount {
                     }
                 }
             }
-            StreamFidState::Info { topic } => {
+            StreamFidState::Info { topic, generation } => {
                 let streams = self.registry.lock();
+                let owner = StreamOwner::from_subject(caller)
+                    .map_err(|_| MountError::NotFound(topic.clone()))?;
                 let entry = streams
                     .get(topic.as_str())
+                    .filter(|entry| entry.owner == owner && entry.generation == *generation)
                     .ok_or_else(|| MountError::NotFound(topic.clone()))?;
 
-                let complete = entry.handle.as_ref().map(|h| h.is_completed()).unwrap_or(true);
+                let complete = entry
+                    .handle
+                    .as_ref()
+                    .map(|h| h.is_completed())
+                    .unwrap_or(true);
                 let info = serde_json::json!({
                     "topic": topic,
                     "kind": entry.kind.as_str(),
@@ -616,12 +792,15 @@ impl Mount for StreamMount {
                 let end = (start + count as usize).min(bytes.len());
                 Ok(bytes[start..end].to_vec())
             }
-            StreamFidState::Qos { topic } => {
+            StreamFidState::Qos { topic, generation } => {
                 // Read the current QoS selection as its token vocabulary
                 // (StreamOpt encoding, addressable through the file — #819).
                 let streams = self.registry.lock();
+                let owner = StreamOwner::from_subject(caller)
+                    .map_err(|_| MountError::NotFound(topic.clone()))?;
                 let entry = streams
                     .get(topic.as_str())
+                    .filter(|entry| entry.owner == owner && entry.generation == *generation)
                     .ok_or_else(|| MountError::NotFound(topic.clone()))?;
                 let mut line = entry.qos.to_tokens().join(" ");
                 line.push('\n');
@@ -642,14 +821,17 @@ impl Mount for StreamMount {
         fid: &Fid,
         _offset: u64,
         data: &[u8],
-        _caller: &Subject,
+        caller: &Subject,
     ) -> Result<u32, MountError> {
         let state = fid
             .downcast_ref::<StreamFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        self.require_fid_owner(state, caller)?;
 
         match state {
-            StreamFidState::Ctl { topic } => {
+            StreamFidState::Ctl { topic, generation } => {
+                let owner = StreamOwner::from_subject(caller)
+                    .map_err(|_| MountError::NotFound(topic.clone()))?;
                 let line = std::str::from_utf8(data).unwrap_or("").trim();
                 let (cmd, arg) = match line.split_once(char::is_whitespace) {
                     Some((c, a)) => (c, a.trim()),
@@ -657,7 +839,8 @@ impl Mount for StreamMount {
                 };
                 match cmd {
                     "cancel" => {
-                        if let Some(entry) = self.registry.remove(topic) {
+                        if let Some(entry) = self.registry.remove_owned(topic, &owner, *generation)
+                        {
                             if let Some(mut handle) = entry.handle {
                                 let _ = handle.cancel().await;
                             }
@@ -666,11 +849,10 @@ impl Mount for StreamMount {
                     }
                     // QoS selection through ctl (#819): `qos latest-wins drop-stale`.
                     "qos" => {
-                        let qos = StreamQos::parse(arg)
-                            .map_err(|tok| MountError::InvalidArgument(format!(
-                                "unknown qos token: {tok}"
-                            )))?;
-                        if !self.registry.set_qos(topic, qos) {
+                        let qos = StreamQos::parse(arg).map_err(|tok| {
+                            MountError::InvalidArgument(format!("unknown qos token: {tok}"))
+                        })?;
+                        if !self.registry.set_qos_owned(topic, &owner, *generation, qos) {
                             return Err(MountError::NotFound(topic.clone()));
                         }
                         Ok(data.len() as u32)
@@ -683,7 +865,10 @@ impl Mount for StreamMount {
                         let seq: u64 = arg.parse().map_err(|_| {
                             MountError::InvalidArgument(format!("bad resume seq: {arg}"))
                         })?;
-                        if !self.registry.set_resume(topic, seq) {
+                        if !self
+                            .registry
+                            .set_resume_owned(topic, &owner, *generation, seq)
+                        {
                             return Err(MountError::NotFound(topic.clone()));
                         }
                         Ok(data.len() as u32)
@@ -695,28 +880,34 @@ impl Mount for StreamMount {
                 }
             }
             // The `qos` file is directly writable — same vocabulary as `ctl qos`.
-            StreamFidState::Qos { topic } => {
+            StreamFidState::Qos { topic, generation } => {
+                let owner = StreamOwner::from_subject(caller)
+                    .map_err(|_| MountError::NotFound(topic.clone()))?;
                 let spec = std::str::from_utf8(data).unwrap_or("").trim();
                 let qos = StreamQos::parse(spec).map_err(|tok| {
                     MountError::InvalidArgument(format!("unknown qos token: {tok}"))
                 })?;
-                if !self.registry.set_qos(topic, qos) {
+                if !self.registry.set_qos_owned(topic, &owner, *generation, qos) {
                     return Err(MountError::NotFound(topic.clone()));
                 }
                 Ok(data.len() as u32)
             }
-            _ => Err(MountError::NotSupported("stream files are read-only".into())),
+            _ => Err(MountError::NotSupported(
+                "stream files are read-only".into(),
+            )),
         }
     }
 
-    async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+    async fn readdir(&self, fid: &Fid, caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
         let state = fid
             .downcast_ref::<StreamFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
         match state {
             StreamFidState::Root => {
-                let topics = self.registry.list_topics(None);
+                let topics = StreamOwner::from_subject(caller)
+                    .map(|owner| self.registry.list_topics(&owner))
+                    .unwrap_or_default();
                 Ok(topics
                     .into_iter()
                     .map(|name| DirEntry {
@@ -727,43 +918,47 @@ impl Mount for StreamMount {
                     })
                     .collect())
             }
-            StreamFidState::TopicDir { .. } => Ok(vec![
-                DirEntry {
-                    name: "data".into(),
-                    is_dir: false,
-                    size: 0,
-                    stat: None,
-                },
-                DirEntry {
-                    name: "info".into(),
-                    is_dir: false,
-                    size: 0,
-                    stat: None,
-                },
-                DirEntry {
-                    name: "qos".into(),
-                    is_dir: false,
-                    size: 0,
-                    stat: None,
-                },
-                DirEntry {
-                    name: "ctl".into(),
-                    is_dir: false,
-                    size: 0,
-                    stat: None,
-                },
-            ]),
+            StreamFidState::TopicDir { .. } => {
+                self.require_fid_owner(state, caller)?;
+                Ok(vec![
+                    DirEntry {
+                        name: "data".into(),
+                        is_dir: false,
+                        size: 0,
+                        stat: None,
+                    },
+                    DirEntry {
+                        name: "info".into(),
+                        is_dir: false,
+                        size: 0,
+                        stat: None,
+                    },
+                    DirEntry {
+                        name: "qos".into(),
+                        is_dir: false,
+                        size: 0,
+                        stat: None,
+                    },
+                    DirEntry {
+                        name: "ctl".into(),
+                        is_dir: false,
+                        size: 0,
+                        stat: None,
+                    },
+                ])
+            }
             _ => Err(MountError::NotDirectory("not a directory".into())),
         }
     }
 
-    async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
+    async fn stat(&self, fid: &Fid, caller: &Subject) -> Result<Stat, MountError> {
         let state = fid
             .downcast_ref::<StreamFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        self.require_fid_owner(state, caller)?;
         let (qtype, name) = match state {
             StreamFidState::Root => (0x80, "stream"),
-            StreamFidState::TopicDir { topic } => (0x80, topic.as_str()),
+            StreamFidState::TopicDir { topic, .. } => (0x80, topic.as_str()),
             StreamFidState::Data { .. } => (0, "data"),
             StreamFidState::Info { .. } => (0, "info"),
             StreamFidState::Qos { .. } => (0, "qos"),
@@ -816,6 +1011,7 @@ mod tests {
         assert_send(async move {
             let fid = Fid::new(StreamFidState::Data {
                 topic: "topic".to_string(),
+                generation: 0,
             });
             let caller = Subject::anonymous();
             let _ = mount.read(&fid, 0, 0, &caller).await;
@@ -878,6 +1074,22 @@ mod tests {
         Box::new(h)
     }
 
+    fn owner(name: &str) -> StreamOwner {
+        StreamOwner::from_subject(&Subject::new(name)).unwrap()
+    }
+
+    fn caller(name: &str) -> Subject {
+        Subject::new(name)
+    }
+
+    fn generation(registry: &StreamRegistry, topic: &str) -> u64 {
+        registry
+            .lock()
+            .get(topic)
+            .expect("registered topic")
+            .generation
+    }
+
     // ─── QoS vocabulary: StreamOpt encoding moved onto the file ─────────────
 
     #[test]
@@ -885,7 +1097,10 @@ mod tests {
         let q = StreamQos::reliable();
         assert!(matches!(q.stream_opt().ordering, Ordering::Ordered));
         assert!(matches!(q.stream_opt().completion, Completion::EndOfStream));
-        assert!(matches!(q.stream_opt().overflow_policy, OverflowPolicy::Block));
+        assert!(matches!(
+            q.stream_opt().overflow_policy,
+            OverflowPolicy::Block
+        ));
         assert!(!q.is_lossy());
         assert_eq!(q.to_tokens(), vec!["reliable"]);
     }
@@ -948,18 +1163,125 @@ mod tests {
                     "t",
                     vec![StreamPayload::Data(b"tok".to_vec())],
                 ))),
-                "owner".into(),
+                owner("owner"),
             ),
         );
         let mount = StreamMount::new(std::sync::Arc::clone(&reg));
-        let caller = Subject::anonymous();
-        let fid = Fid::new(StreamFidState::Data { topic: "t".into() });
+        let caller = caller("owner");
+        let fid = Fid::new(StreamFidState::Data {
+            topic: "t".into(),
+            generation: generation(&reg, "t"),
+        });
 
         let first = mount.read(&fid, 0, 0, &caller).await.unwrap();
         assert_eq!(first, b"tok");
         // Handle exhausted → completed → EOF.
         let eof = mount.read(&fid, 0, 0, &caller).await.unwrap();
         assert!(eof.is_empty());
+    }
+
+    /// A stream topic is visible only to its recorded subject-scoped owner. In
+    /// particular, the check is repeated at every file operation so a fid
+    /// walked by Alice cannot be handed to Bob as an ambient bearer handle.
+    #[tokio::test]
+    async fn stream_topics_are_hidden_and_fids_are_not_reusable_cross_owner() {
+        let reg = std::sync::Arc::new(StreamRegistry::new());
+        reg.register(
+            "alice-private".into(),
+            StreamEntry::stream(
+                Some(boxed(MockHandle::new("alice-private", vec![]))),
+                owner("alice"),
+            ),
+        );
+        reg.register(
+            "bob-private".into(),
+            StreamEntry::stream(
+                Some(boxed(MockHandle::new("bob-private", vec![]))),
+                owner("bob"),
+            ),
+        );
+        let mount = StreamMount::new(std::sync::Arc::clone(&reg));
+        let alice = caller("alice");
+        let bob = caller("bob");
+
+        let bob_root = mount.walk(&[], &bob).await.unwrap();
+        let visible_to_bob = mount.readdir(&bob_root, &bob).await.unwrap();
+        let names: Vec<&str> = visible_to_bob
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["bob-private"]);
+
+        let anonymous_root = mount.walk(&[], &Subject::anonymous()).await.unwrap();
+        assert!(
+            mount
+                .readdir(&anonymous_root, &Subject::anonymous())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(matches!(
+            mount.walk(&["alice-private"], &bob).await,
+            Err(MountError::NotFound(_))
+        ));
+
+        let mut alice_data = mount
+            .walk(&["alice-private", "data"], &alice)
+            .await
+            .unwrap();
+        mount.open(&mut alice_data, 0, &alice).await.unwrap();
+        assert!(matches!(
+            mount.read(&alice_data, 0, 4096, &bob).await,
+            Err(MountError::NotFound(_))
+        ));
+        assert!(reg.take_handle("alice-private", &owner("bob")).is_none());
+    }
+
+    #[tokio::test]
+    async fn replaced_topic_rejects_old_owner_fid_and_owner_blind_mutations() {
+        let reg = std::sync::Arc::new(StreamRegistry::new());
+        reg.register(
+            "reused".into(),
+            StreamEntry::stream(
+                Some(boxed(MockHandle::new("alice", vec![]))),
+                owner("alice"),
+            ),
+        );
+        let mount = StreamMount::new(std::sync::Arc::clone(&reg));
+        let alice = caller("alice");
+        let old_ctl = mount.walk(&["reused", "ctl"], &alice).await.unwrap();
+        let old_generation = generation(&reg, "reused");
+
+        // A new owner reuses the same topic spelling while Alice still holds a
+        // fid from the old registration. The old fid must not cancel/mutate
+        // Bob's replacement, and the registry helpers enforce the same rule
+        // even if a caller raced the Mount-level check.
+        reg.register(
+            "reused".into(),
+            StreamEntry::stream(Some(boxed(MockHandle::new("bob", vec![]))), owner("bob")),
+        );
+        assert!(matches!(
+            mount.write(&old_ctl, 0, b"cancel", &alice).await,
+            Err(MountError::NotFound(_))
+        ));
+        assert!(
+            reg.remove_owned("reused", &owner("alice"), old_generation)
+                .is_none(),
+            "old owner/generation must not remove a replacement"
+        );
+        assert!(!reg.set_qos_owned(
+            "reused",
+            &owner("alice"),
+            old_generation,
+            StreamQos::parse("lossy-ok").unwrap(),
+        ));
+        assert!(!reg.set_resume_owned("reused", &owner("alice"), old_generation, 99));
+
+        let bob_owner = owner("bob");
+        assert!(reg.is_owned_by("reused", &bob_owner));
+        assert!(reg.take_handle("reused", &bob_owner).is_some());
+        assert_eq!(reg.qos("reused").unwrap().to_tokens(), vec!["reliable"]);
     }
 
     /// The ceiling: the carrier-backed handle is taken *whole* for the bulk
@@ -975,22 +1297,25 @@ mod tests {
                     "bulk",
                     vec![StreamPayload::Data(b"a".to_vec())],
                 ))),
-                "owner".into(),
+                owner("owner"),
             ),
         );
         assert!(reg.has_carrier_handle("bulk"));
 
         // A bulk consumer takes the subscription whole and drives it directly.
-        let mut handle = reg.take_handle("bulk").expect("carrier handle");
+        let stream_owner = owner("owner");
+        let mut handle = reg
+            .take_handle("bulk", &stream_owner)
+            .expect("carrier handle");
         assert_eq!(handle.stream_id(), "bulk");
         let p = handle.next_payload().await.unwrap();
         assert!(matches!(p, Some(StreamPayload::Data(_))));
 
         // The entry stays registered (info/qos/ctl addressable) but the handle
         // is now owned by the bulk consumer — not re-openable per read.
-        assert!(reg.exists("bulk"));
+        assert!(reg.is_owned_by("bulk", &stream_owner));
         assert!(!reg.has_carrier_handle("bulk"));
-        assert!(reg.take_handle("bulk").is_none());
+        assert!(reg.take_handle("bulk", &stream_owner).is_none());
     }
 
     // ─── QoS ctl selection through the file interface ───────────────────────
@@ -1000,16 +1325,16 @@ mod tests {
         let reg = std::sync::Arc::new(StreamRegistry::new());
         reg.register(
             "s".into(),
-            StreamEntry::stream(
-                Some(boxed(MockHandle::new("s", vec![]))),
-                "owner".into(),
-            ),
+            StreamEntry::stream(Some(boxed(MockHandle::new("s", vec![]))), owner("owner")),
         );
         let mount = StreamMount::new(std::sync::Arc::clone(&reg));
-        let caller = Subject::anonymous();
+        let caller = caller("owner");
 
         // Select QoS by writing the vocabulary to `ctl`.
-        let ctl = Fid::new(StreamFidState::Ctl { topic: "s".into() });
+        let ctl = Fid::new(StreamFidState::Ctl {
+            topic: "s".into(),
+            generation: generation(&reg, "s"),
+        });
         mount
             .write(&ctl, 0, b"qos latest-wins drop-stale", &caller)
             .await
@@ -1021,7 +1346,10 @@ mod tests {
         ));
 
         // Reading the `qos` file reflects the selection as tokens.
-        let qfid = Fid::new(StreamFidState::Qos { topic: "s".into() });
+        let qfid = Fid::new(StreamFidState::Qos {
+            topic: "s".into(),
+            generation: generation(&reg, "s"),
+        });
         let shown = mount.read(&qfid, 0, 256, &caller).await.unwrap();
         let text = String::from_utf8(shown).unwrap();
         assert!(text.contains("latest-wins") || text.contains("drop-stale"));
@@ -1047,12 +1375,15 @@ mod tests {
                     "e",
                     vec![StreamPayload::Error("boom".into())],
                 ))),
-                "owner".into(),
+                owner("owner"),
             ),
         );
         let mount = StreamMount::new(std::sync::Arc::clone(&reg));
-        let caller = Subject::anonymous();
-        let fid = Fid::new(StreamFidState::Data { topic: "e".into() });
+        let caller = caller("owner");
+        let fid = Fid::new(StreamFidState::Data {
+            topic: "e".into(),
+            generation: generation(&reg, "e"),
+        });
 
         // Reliable (default): the error surfaces as a hard read error.
         let hard = mount.read(&fid, 0, 0, &caller).await;
@@ -1066,10 +1397,19 @@ mod tests {
                     "e",
                     vec![StreamPayload::Error("boom".into())],
                 ))),
-                "owner".into(),
+                owner("owner"),
             ),
         );
-        reg.set_qos("e", StreamQos::parse("lossy-ok").unwrap());
+        assert!(reg.set_qos_owned(
+            "e",
+            &owner("owner"),
+            generation(&reg, "e"),
+            StreamQos::parse("lossy-ok").unwrap(),
+        ));
+        let fid = Fid::new(StreamFidState::Data {
+            topic: "e".into(),
+            generation: generation(&reg, "e"),
+        });
         let soft = mount.read(&fid, 0, 0, &caller).await.unwrap();
         assert!(soft.is_empty()); // soft EOF
     }
@@ -1081,16 +1421,20 @@ mod tests {
         let reg = std::sync::Arc::new(StreamRegistry::new());
         reg.register(
             "model-lifecycle".into(),
-            StreamEntry::event(Some(boxed(MockHandle::new("model-lifecycle", vec![]))), "svc".into()),
+            StreamEntry::event(
+                Some(boxed(MockHandle::new("model-lifecycle", vec![]))),
+                owner("svc"),
+            ),
         );
         assert_eq!(reg.kind("model-lifecycle"), Some(StreamKind::Event));
 
         // The event topic is addressable on `/stream` and its `info` reports
         // `kind: event` — one surface, not a separate plane.
         let mount = StreamMount::new(std::sync::Arc::clone(&reg));
-        let caller = Subject::anonymous();
+        let caller = caller("svc");
         let info_fid = Fid::new(StreamFidState::Info {
             topic: "model-lifecycle".into(),
+            generation: generation(&reg, "model-lifecycle"),
         });
         let info = mount.read(&info_fid, 0, 4096, &caller).await.unwrap();
         let text = String::from_utf8(info).unwrap();
@@ -1106,17 +1450,27 @@ mod tests {
         let reg = std::sync::Arc::new(StreamRegistry::new());
         reg.register(
             "r".into(),
-            StreamEntry::stream(Some(boxed(MockHandle::new("r", vec![]))), "o".into()),
+            StreamEntry::stream(Some(boxed(MockHandle::new("r", vec![]))), owner("o")),
         );
         let mount = StreamMount::new(std::sync::Arc::clone(&reg));
-        let caller = Subject::anonymous();
-        let ctl = Fid::new(StreamFidState::Ctl { topic: "r".into() });
+        let caller = caller("o");
+        let ctl = Fid::new(StreamFidState::Ctl {
+            topic: "r".into(),
+            generation: generation(&reg, "r"),
+        });
 
         mount.write(&ctl, 0, b"resume 42", &caller).await.unwrap();
 
-        let info_fid = Fid::new(StreamFidState::Info { topic: "r".into() });
+        let info_fid = Fid::new(StreamFidState::Info {
+            topic: "r".into(),
+            generation: generation(&reg, "r"),
+        });
         let info = mount.read(&info_fid, 0, 4096, &caller).await.unwrap();
-        assert!(String::from_utf8(info).unwrap().contains("\"resumeSeq\": 42"));
+        assert!(
+            String::from_utf8(info)
+                .unwrap()
+                .contains("\"resumeSeq\": 42")
+        );
 
         // A non-numeric resume arg is rejected.
         assert!(matches!(
@@ -1132,14 +1486,11 @@ mod tests {
         let reg = std::sync::Arc::new(StreamRegistry::new());
         reg.register(
             "d".into(),
-            StreamEntry::stream(Some(boxed(MockHandle::new("d", vec![]))), "o".into()),
+            StreamEntry::stream(Some(boxed(MockHandle::new("d", vec![]))), owner("o")),
         );
         let mount = StreamMount::new(reg);
-        let caller = Subject::anonymous();
-        let dir = mount
-            .walk(&["d"], &caller)
-            .await
-            .unwrap();
+        let caller = caller("o");
+        let dir = mount.walk(&["d"], &caller).await.unwrap();
         let entries = mount.readdir(&dir, &caller).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"data"));
