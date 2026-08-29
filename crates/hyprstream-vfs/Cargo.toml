@@ -46,3 +46,6 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 tempfile = "3"
+# Exposes the explicit local-test-root constructor only in VFS test builds;
+# production attachments still originate at verified boundaries.
+hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }

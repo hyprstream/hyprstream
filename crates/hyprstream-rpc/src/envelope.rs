@@ -2924,7 +2924,7 @@ pub fn unwrap_envelope(
 
     let ctx = match &opts.verification {
         EnvelopeVerification::FixedSigner(_) => {
-            crate::service::EnvelopeContext::from_verified_as_system(&signed)
+            crate::service::EnvelopeContext::from_verified_fixed_signer(&signed)
         }
         EnvelopeVerification::AnySigner => crate::service::EnvelopeContext::from_verified(&signed),
     };

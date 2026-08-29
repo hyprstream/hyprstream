@@ -208,6 +208,9 @@ pub mod did_plc;
 pub mod did_url;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod admission;
+/// Process-local verified attachment + revocation generation seam used by the
+/// Task/attachment spike. It intentionally exposes no wire bearer format.
+pub mod attachment;
 // Additive, session-scoped PQ binding overlay: trust-on-first-use continuity
 // for dynamically-identified clients, with out-of-band promotion. Consulted by
 // the envelope verify path after the admin-anchored store misses; never mutates
@@ -261,6 +264,10 @@ pub mod node_identity;
 pub mod federated_identity;
 pub mod signer;
 pub use stream_info::StreamInfo;
+pub use attachment::{
+    AttachmentError, AttachmentId, AttachmentOperation, AttachmentOperationGrant,
+    AuthorityGeneration, VerifiedAttachment,
+};
 pub use crypto::{
     generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes,
     DefaultKeyExchange, KeyExchange, SharedSecret, SigningKey, StreamHmacState, VerifyingKey,

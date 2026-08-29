@@ -24,6 +24,8 @@ mod fsmount;
 pub mod mac_pep;
 mod mount;
 mod namespace;
+/// TCB-internal operation context derived from a verified attachment lease.
+pub mod op_context;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod proxy;
 
@@ -48,6 +50,7 @@ pub use fsmount::{FsMount, SetAttr};
 pub use hyprstream_rpc::Subject;
 pub use mount::{DirEntry, Fid, Mount, MountError, Stat, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE, DMDIR};
 pub use namespace::{BindFlag, MountTarget, Namespace, NamespaceError};
+pub use op_context::VfsOpContext;
 pub use mac_pep::NamespaceAction;
 #[cfg(not(target_arch = "wasm32"))]
 pub use mac_pep::{

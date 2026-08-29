@@ -176,6 +176,24 @@ pub struct EnvelopeContext {
     /// PolicyService's bare-`sub` token and is accepted ONLY for local callers;
     /// a networked peer presenting an empty-`iss` token is rejected (fail-closed).
     is_local_caller: bool,
+
+    /// Private provenance retained only by constructors that execute after
+    /// envelope signature/replay verification. A context-shaped value alone is
+    /// not evidence of verification: `SignedEnvelope` and the legacy local
+    /// constructors are public compatibility APIs.
+    envelope_provenance: EnvelopeProvenance,
+}
+
+/// Whether this context was produced by the verified envelope pipeline.
+///
+/// This is deliberately private. It is a non-serializable, unforgeable-in-API
+/// marker used by sensitive local factories such as `VerifiedAttachment`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeProvenance {
+    VerifiedEnvelope,
+    PublicConstructor,
+    CallbackService,
+    TestFixture,
 }
 
 impl EnvelopeContext {
@@ -206,6 +224,7 @@ impl EnvelopeContext {
             browser_method_discriminator: None,
             // AnySigner / networked plane — NOT a local caller (#328).
             is_local_caller: false,
+            envelope_provenance: EnvelopeProvenance::VerifiedEnvelope,
         }
     }
 
@@ -215,6 +234,25 @@ impl EnvelopeContext {
     /// returns `"system"` for this context regardless of any caller-asserted
     /// authorization field. Used in `process_request` for inproc callers.
     pub fn from_verified_as_system(envelope: &SignedEnvelope) -> Self {
+        // `SignedEnvelope` fields are intentionally public for codec
+        // compatibility, so this public constructor cannot itself prove that
+        // `envelope` was verified. Keep its historical context behavior but
+        // mark it unusable for attachment minting; dispatcher code uses the
+        // crate-private verified constructor below.
+        Self::from_system_envelope(envelope, EnvelopeProvenance::PublicConstructor)
+    }
+
+    /// Build a FixedSigner context after `unwrap_and_verify` has admitted the
+    /// envelope. Only the envelope module can call this, preventing external
+    /// code from treating a hand-built `SignedEnvelope` as verification proof.
+    pub(crate) fn from_verified_fixed_signer(envelope: &SignedEnvelope) -> Self {
+        Self::from_system_envelope(envelope, EnvelopeProvenance::VerifiedEnvelope)
+    }
+
+    fn from_system_envelope(
+        envelope: &SignedEnvelope,
+        envelope_provenance: EnvelopeProvenance,
+    ) -> Self {
         Self {
             request_id: envelope.request_id(),
             claims: None,
@@ -234,6 +272,7 @@ impl EnvelopeContext {
             browser_method_discriminator: None,
             // FixedSigner mutual-auth plane — genuine in-process / IPC caller (#328).
             is_local_caller: true,
+            envelope_provenance,
         }
     }
 
@@ -266,6 +305,7 @@ impl EnvelopeContext {
             browser_method_discriminator: None,
             // Internal self-call that never crosses a network boundary (#328).
             is_local_caller: true,
+            envelope_provenance: EnvelopeProvenance::CallbackService,
         }
     }
 
@@ -311,6 +351,7 @@ impl EnvelopeContext {
             service_domain: None,
             browser_method_discriminator: None,
             is_local_caller: false,
+            envelope_provenance: EnvelopeProvenance::TestFixture,
         }
     }
 
@@ -337,6 +378,14 @@ impl EnvelopeContext {
             return s.clone();
         }
         Subject::anonymous()
+    }
+
+    /// Return a subject only when this context carries a private marker from
+    /// the envelope verification pipeline. Callback and public compatibility
+    /// constructors may be useful for ordinary in-process plumbing, but are
+    /// not authority evidence for attachment/task allocation.
+    pub(crate) fn verified_attachment_subject(&self) -> Option<Subject> {
+        (self.envelope_provenance == EnvelopeProvenance::VerifiedEnvelope).then(|| self.subject())
     }
 
     /// Derive the Casbin request domain from the verified tenant binding.
@@ -463,6 +512,7 @@ impl EnvelopeContext {
             service_domain: None,
             browser_method_discriminator: None,
             is_local_caller: false,
+            envelope_provenance: EnvelopeProvenance::TestFixture,
         }
     }
 
@@ -1530,6 +1580,7 @@ mod empty_iss_gate_tests {
             service_domain: None,
             browser_method_discriminator: None,
             is_local_caller,
+            envelope_provenance: EnvelopeProvenance::TestFixture,
         }
     }
 
@@ -2142,6 +2193,7 @@ mod ipc_key_identity_tests {
             browser_method_discriminator: None,
             // AnySigner / networked-or-UDS plane.
             is_local_caller: false,
+            envelope_provenance: EnvelopeProvenance::TestFixture,
         }
     }
 
@@ -2443,6 +2495,7 @@ mod accounting_audit_tests {
             service_domain: None,
             browser_method_discriminator: None,
             is_local_caller: true,
+            envelope_provenance: EnvelopeProvenance::TestFixture,
         }
     }
 
@@ -2501,6 +2554,7 @@ mod accounting_audit_tests {
             service_domain: None,
             browser_method_discriminator: None,
             is_local_caller: false,
+            envelope_provenance: EnvelopeProvenance::TestFixture,
         };
         let records = capture(|| {
             ctx.audit_authz("registry:*", "write", /* allowed */ false);
@@ -2569,6 +2623,7 @@ mod accounting_audit_tests {
             service_domain: None,
             browser_method_discriminator: None,
             is_local_caller: false,
+            envelope_provenance: EnvelopeProvenance::TestFixture,
         }
     }
 
