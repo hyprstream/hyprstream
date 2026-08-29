@@ -4618,7 +4618,7 @@ mod resolver_tests {
     }
 
     #[tokio::test]
-    async fn ordinary_announcement_handler_populates_production_resolver() {
+    async fn ordinary_iroh_announcement_handler_populates_production_resolver() {
         let (state, service_signing) = accepted_state(12);
         let root = SigningKey::from_bytes(&[0x61; 32]);
         let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
@@ -4655,8 +4655,8 @@ mod resolver_tests {
                 1,
                 &ServiceAnnouncement {
                     service_name: "model".to_owned(),
-                    socket_kind: "quic".to_owned(),
-                    endpoint: "quic://localhost:127.0.0.1:9".to_owned(),
+                    socket_kind: "iroh".to_owned(),
+                    endpoint: format!("iroh://{}", hex::encode([0x7a; 32])),
                     service_jwt: Some(jwt),
                     service_did: Did::from(state.did.clone()),
                     capabilities: vec!["hyprstream-rpc/1".to_owned()],
@@ -4677,6 +4677,65 @@ mod resolver_tests {
             .await
             .expect("ordinary announcement must resolve");
         assert_eq!(resolved.evidence().accepted_state_digest, state.head_digest);
+        assert!(matches!(
+            &resolved.transport().endpoint,
+            EndpointType::Iroh {
+                node_id,
+                direct_addrs,
+                relay_url: None,
+            } if *node_id == [0x7a; 32] && direct_addrs.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_get_endpoints_omits_stale_and_fetch_cannot_refresh_it() {
+        hyprstream_rpc::registry::init(
+            hyprstream_rpc::registry::EndpointMode::Inproc,
+            None,
+        );
+        let service = service();
+        let name = "stale-remote-reach";
+        service
+            .state_store
+            .put_announcement(
+                name,
+                legacy_endpoint(
+                    "iroh",
+                    &format!("iroh://{}", hex::encode([0x73; 32])),
+                    Instant::now() - ANNOUNCED_ENDPOINT_TTL - Duration::from_secs(1),
+                ),
+            )
+            .await
+            .expect("install stale endpoint fixture");
+        let signer = SigningKey::from_bytes(&[0x74; 32]);
+        let pq_signer = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signer);
+        let signed = hyprstream_rpc::SignedEnvelope::new_signed_hybrid(
+            hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()),
+            &signer,
+            &pq_signer,
+        );
+        let ctx = EnvelopeContext::from_verified_as_system(&signed);
+
+        let response = service
+            .handle_get_endpoints(&ctx, 1, name)
+            .await
+            .expect("remote getEndpoints handler");
+        assert!(matches!(response, DiscoveryResponseVariant::Error(_)));
+        assert!(service
+            .state_store
+            .announcements_for(name, unix_millis_now())
+            .await
+            .expect("inspect state after fetch")
+            .is_empty());
+
+        let listed = service
+            .handle_list_services(&ctx, 2)
+            .await
+            .expect("remote listServices handler");
+        let DiscoveryResponseVariant::ListServicesResult(services) = listed else {
+            panic!("listServices must return service summaries");
+        };
+        assert!(services.services.iter().all(|summary| summary.name != name));
     }
 
     #[tokio::test]

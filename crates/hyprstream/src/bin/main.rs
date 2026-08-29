@@ -1867,6 +1867,68 @@ fn install_session_pq_overlay() {
     }
 }
 
+/// The only native-announcement refresh path used by the production publisher.
+///
+/// The operation is injected so the production cadence and terminal-expiry
+/// behavior can be exercised without a live Discovery service. The production
+/// caller still supplies [`hyprstream_discovery::DiscoveryClient::announce`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeAnnouncementRefreshCompletion {
+    Expired,
+}
+
+async fn refresh_native_announcement<F, Fut, Error>(
+    service_name: &str,
+    socket_kind: &str,
+    endpoint: &str,
+    refresh_expires_at_unix_ms: i64,
+    mut announce: F,
+) -> NativeAnnouncementRefreshCompletion
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), Error>>,
+    Error: std::fmt::Display,
+{
+    const ANNOUNCEMENT_REFRESH: std::time::Duration = std::time::Duration::from_secs(25);
+    const RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let mut delay = RETRY_INITIAL;
+    loop {
+        if chrono::Utc::now().timestamp_millis() >= refresh_expires_at_unix_ms {
+            tracing::warn!(
+                service = service_name,
+                socket_kind,
+                "Stopping native announcement refresh: accepted-state/JWT material expired"
+            );
+            return NativeAnnouncementRefreshCompletion::Expired;
+        }
+        match announce().await {
+            Ok(()) => {
+                tracing::info!(
+                    service = service_name,
+                    socket_kind,
+                    endpoint,
+                    "Announced native endpoint to DiscoveryService"
+                );
+                delay = ANNOUNCEMENT_REFRESH;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    service = service_name,
+                    socket_kind,
+                    "Failed to announce native endpoint: {error}"
+                );
+                delay = delay
+                    .checked_mul(2)
+                    .unwrap_or(ANNOUNCEMENT_REFRESH)
+                    .min(ANNOUNCEMENT_REFRESH)
+                    .max(RETRY_INITIAL);
+            }
+        }
+        tokio::time::sleep(delay).await;
+    }
+}
+
 fn main() -> Result<()> {
     // ROCm allocator and BLAS optimizations — must be set before any tch/libtorch init.
     // Expandable segments eliminates ~1,900 hipMalloc/hipFree calls per decode step.
@@ -2751,6 +2813,20 @@ fn main() -> Result<()> {
                                                         }
                                                     };
                                                     runtime.block_on(async move {
+                                                        let socket_kind = request.reach.socket_kind().to_owned();
+                                                        let endpoint = request.reach.endpoint();
+                                                        let service_name = request.service_name.clone();
+                                                        let jwt_expires_at_unix_ms = request.service_jwt.as_deref().and_then(|jwt| {
+                                                            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                                                            let payload = jwt.split('.').nth(1)?;
+                                                            let claims = URL_SAFE_NO_PAD.decode(payload).ok()
+                                                                .and_then(|payload| serde_json::from_slice::<serde_json::Value>(&payload).ok())?;
+                                                            claims["exp"].as_i64()?.checked_mul(1_000)
+                                                        });
+                                                        let refresh_expires_at_unix_ms = jwt_expires_at_unix_ms
+                                                            .map_or(request.expires_at_unix_ms, |jwt_expiry| {
+                                                                request.expires_at_unix_ms.min(jwt_expiry)
+                                                            });
                                                         let client = match hyprstream_discovery::DiscoveryClient::for_local_bootstrap(
                                                             request.signing_key,
                                                             request.discovery_verifying_key,
@@ -2763,9 +2839,9 @@ fn main() -> Result<()> {
                                                             }
                                                         };
                                                         let announcement = hyprstream_discovery::ServiceAnnouncement {
-                                                            service_name: request.service_name,
-                                                            socket_kind: "quic".to_owned(),
-                                                            endpoint: request.endpoint,
+                                                            service_name,
+                                                            socket_kind,
+                                                            endpoint,
                                                             service_jwt: request.service_jwt,
                                                             service_did: request.service_did,
                                                             capabilities: request.capabilities,
@@ -2776,10 +2852,16 @@ fn main() -> Result<()> {
                                                             request_kem_recipient: request.request_kem_recipient,
                                                             expires_at_unix_ms: request.expires_at_unix_ms,
                                                         };
-                                                        match client.announce(&announcement).await {
-                                                            Ok(_) => tracing::info!("Announced QUIC endpoint to DiscoveryService"),
-                                                            Err(error) => tracing::warn!("Failed to announce QUIC endpoint: {error}"),
-                                                        }
+                                                        let _completion = refresh_native_announcement(
+                                                            &announcement.service_name,
+                                                            &announcement.socket_kind,
+                                                            &announcement.endpoint,
+                                                            refresh_expires_at_unix_ms,
+                                                            || async {
+                                                                client.announce(&announcement).await.map(|_| ())
+                                                            },
+                                                        )
+                                                        .await;
                                                     });
                                                 });
                                             },
@@ -3360,6 +3442,65 @@ fn main() -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod resolver_startup_controls {
+    const REFRESH_SCHEDULER_TURNS: usize = 32;
+
+    async fn assert_publication_ready(
+        published_rx: &mut tokio::sync::mpsc::UnboundedReceiver<usize>,
+        expected: usize,
+        label: &str,
+    ) {
+        for _ in 0..REFRESH_SCHEDULER_TURNS {
+            match published_rx.try_recv() {
+                Ok(publication) => {
+                    assert_eq!(publication, expected, "{label}");
+                    return;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("{label}: production refresh task exited before publishing");
+                }
+            }
+        }
+        panic!("{label}: publication was not ready after bounded scheduler turns");
+    }
+
+    async fn publication_ready(
+        published_rx: &mut tokio::sync::mpsc::UnboundedReceiver<usize>,
+        label: &str,
+    ) -> Option<usize> {
+        for _ in 0..REFRESH_SCHEDULER_TURNS {
+            match published_rx.try_recv() {
+                Ok(publication) => return Some(publication),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("{label}: production refresh task exited before publishing");
+                }
+            }
+        }
+        None
+    }
+
+    async fn assert_no_publication_ready(
+        published_rx: &mut tokio::sync::mpsc::UnboundedReceiver<usize>,
+        label: &str,
+    ) {
+        for _ in 0..REFRESH_SCHEDULER_TURNS {
+            match published_rx.try_recv() {
+                Ok(publication) => panic!("{label}: unexpected publication {publication}"),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("{label}: production refresh task exited unexpectedly");
+                }
+            }
+        }
+    }
+
     #[test]
     fn command_and_service_processes_install_before_consumers() {
         let source = include_str!("main.rs");
@@ -3467,4 +3608,137 @@ mod resolver_startup_controls {
             2
         );
     }
+
+    #[tokio::test]
+    async fn native_announcement_refresh_loop_publishes_immediately_and_after_two_intervals() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use std::time::Duration;
+
+        tokio::time::pause();
+        // Tokio's timer wheel rounds an unaligned sleep deadline up to its next
+        // millisecond tick. Align before establishing the cadence baseline;
+        // each refresh then has an explicit one-tick observation window.
+        tokio::time::sleep(Duration::ZERO).await;
+        let initial_time = tokio::time::Instant::now();
+        let just_before_refresh = Duration::from_secs(24) + Duration::from_millis(999);
+        let timer_tick = Duration::from_millis(1);
+        let publications = Arc::new(AtomicUsize::new(0));
+        let (published_tx, mut published_rx) = tokio::sync::mpsc::unbounded_channel();
+        let observed_publications = Arc::clone(&publications);
+        let task = tokio::spawn(async move {
+            super::refresh_native_announcement(
+                "model",
+                "iroh",
+                "iroh://test-node",
+                chrono::Utc::now().timestamp_millis() + 60_000,
+                move || {
+                    let publication = observed_publications.fetch_add(1, Ordering::SeqCst) + 1;
+                    published_tx
+                        .send(publication)
+                        .expect("test receiver remains live");
+                    async { Ok::<(), std::convert::Infallible>(()) }
+                },
+            )
+            .await
+        });
+
+        assert_publication_ready(&mut published_rx, 1, "initial production publish").await;
+        assert_no_publication_ready(&mut published_rx, "duplicate immediate publish").await;
+        assert_eq!(tokio::time::Instant::now(), initial_time);
+
+        tokio::time::advance(just_before_refresh).await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            initial_time + just_before_refresh
+        );
+        assert_no_publication_ready(&mut published_rx, "refresh before 25 virtual seconds").await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            initial_time + just_before_refresh
+        );
+        tokio::time::advance(timer_tick).await;
+        let first_nominal_wake = initial_time + Duration::from_secs(25);
+        let second_wake =
+            match publication_ready(&mut published_rx, "25-second production refresh").await {
+                Some(publication) => {
+                    assert_eq!(publication, 2, "25-second production refresh");
+                    tokio::time::Instant::now()
+                }
+                None => {
+                    tokio::time::advance(timer_tick).await;
+                    assert_publication_ready(&mut published_rx, 2, "25-second production refresh")
+                        .await;
+                    tokio::time::Instant::now()
+                }
+            };
+        assert!(
+            second_wake >= first_nominal_wake && second_wake <= first_nominal_wake + timer_tick,
+            "production refresh must occur at its 25-second cadence or within one Tokio timer tick"
+        );
+        assert_no_publication_ready(&mut published_rx, "duplicate 25-second refresh").await;
+        assert_eq!(tokio::time::Instant::now(), second_wake);
+
+        tokio::time::advance(just_before_refresh).await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            second_wake + just_before_refresh
+        );
+        assert_no_publication_ready(&mut published_rx, "refresh before 50 virtual seconds").await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            second_wake + just_before_refresh
+        );
+        tokio::time::advance(timer_tick).await;
+        let second_nominal_wake = second_wake + Duration::from_secs(25);
+        let third_wake =
+            match publication_ready(&mut published_rx, "50-second production refresh").await {
+                Some(publication) => {
+                    assert_eq!(publication, 3, "50-second production refresh");
+                    tokio::time::Instant::now()
+                }
+                None => {
+                    tokio::time::advance(timer_tick).await;
+                    assert_publication_ready(&mut published_rx, 3, "50-second production refresh")
+                        .await;
+                    tokio::time::Instant::now()
+                }
+            };
+        assert!(
+            third_wake >= second_nominal_wake && third_wake <= second_nominal_wake + timer_tick,
+            "next production refresh must use the prior actual wake and stay within one Tokio timer tick"
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            third_wake
+        );
+        assert_eq!(publications.load(Ordering::SeqCst), 3);
+
+        task.abort();
+        assert!(task.await.expect_err("refresh task is cancelled").is_cancelled());
+    }
+
+    async fn expired_announcement_must_not_run() -> Result<(), std::convert::Infallible> {
+        panic!("expired production refresh loop attempted an announcement");
+    }
+
+    #[tokio::test]
+    async fn native_announcement_refresh_loop_stops_before_announce_after_absolute_expiry() {
+        let completion = super::refresh_native_announcement(
+            "model",
+            "iroh",
+            "iroh://test-node",
+            chrono::Utc::now().timestamp_millis() - 1,
+            expired_announcement_must_not_run,
+        )
+        .await;
+
+        assert_eq!(
+            completion,
+            super::NativeAnnouncementRefreshCompletion::Expired
+        );
+    }
+
 }

@@ -23,6 +23,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -33,10 +34,55 @@ use crate::service::spawner::Spawnable;
 use hyprstream_rpc::registry::{global as global_registry, SocketKind};
 use hyprstream_rpc::transport::TransportConfig;
 
+/// Dynamic carrier reach for an otherwise authority-bound announcement.
+///
+/// This deliberately contains only transport evidence.  The surrounding
+/// [`NativeAnnouncementRequest`] carries the independently accepted service
+/// identity, capability, response-key, and KEM material.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeAnnouncementReach {
+    Quic {
+        address: SocketAddr,
+        server_name: String,
+    },
+    Iroh {
+        node_id: [u8; 32],
+    },
+}
+
+impl NativeAnnouncementReach {
+    pub fn socket_kind(&self) -> &'static str {
+        match self {
+            Self::Quic { .. } => "quic",
+            Self::Iroh { .. } => "iroh",
+        }
+    }
+
+    pub fn endpoint(&self) -> String {
+        match self {
+            Self::Quic {
+                address,
+                server_name,
+            } => format!("quic://{server_name}:{address}"),
+            Self::Iroh { node_id } => format!("iroh://{}", lowercase_hex(node_id)),
+        }
+    }
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
 /// Complete, already-validated native announcement ready for publication.
 pub struct NativeAnnouncementRequest {
     pub service_name: String,
-    pub endpoint: String,
+    pub reach: NativeAnnouncementReach,
     pub signing_key: SigningKey,
     pub service_jwt: Option<String>,
     pub discovery_verifying_key: VerifyingKey,
@@ -52,6 +98,75 @@ pub struct NativeAnnouncementRequest {
 
 pub type NativeAnnouncementPublisher =
     Arc<dyn Fn(NativeAnnouncementRequest) + Send + Sync + 'static>;
+
+#[allow(clippy::too_many_arguments)]
+fn publish_native_announcement(
+    publisher: Option<NativeAnnouncementPublisher>,
+    service_name: String,
+    reach: NativeAnnouncementReach,
+    signing_key: SigningKey,
+    service_jwt: Option<String>,
+    policy_verifying_key: VerifyingKey,
+    discovery_verifying_key: VerifyingKey,
+    accepted: Option<NativeServiceAnnouncement>,
+) {
+    // Check if JWT needs renewal (within 2 days of expiry, or missing).
+    let needs_renewal = service_jwt.as_ref().is_none_or(|jwt| {
+        let parts: Vec<&str> = jwt.split('.').collect();
+        if parts.len() != 3 {
+            return true;
+        }
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        if let Ok(payload) = URL_SAFE_NO_PAD.decode(parts[1]) {
+            if let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                if let Some(exp) = claims["exp"].as_i64() {
+                    return chrono::Utc::now().timestamp() > exp - 2 * 86_400;
+                }
+            }
+        }
+        true
+    });
+
+    let Some(accepted) = accepted else {
+        tracing::warn!(
+            "Refusing production network announcement for '{service_name}': \
+             accepted native identity/KEM bundle is unavailable"
+        );
+        return;
+    };
+    if let Err(error) = accepted.validate(&service_name, &signing_key.verifying_key()) {
+        tracing::warn!("Refusing production network announcement for '{service_name}': {error}");
+        return;
+    }
+    if needs_renewal {
+        tracing::warn!(
+            "Service JWT for '{service_name}' expired or near-expiry. \
+             Renewal RPC pending capnp schema update. Re-run wizard to refresh JWTs."
+        );
+        let _ = policy_verifying_key;
+    }
+    let Some(publish) = publisher else {
+        tracing::warn!(
+            "Refusing production network announcement for '{service_name}': publisher is unavailable"
+        );
+        return;
+    };
+    publish(NativeAnnouncementRequest {
+        service_name,
+        reach,
+        signing_key,
+        service_jwt,
+        discovery_verifying_key,
+        service_did: accepted.service_did,
+        capabilities: accepted.capabilities,
+        accepted_state_digest: accepted.accepted_state_digest.to_vec(),
+        accepted_state_epoch: accepted.accepted_state_epoch,
+        response_key_id: accepted.response_key_id,
+        request_kem_key_id: accepted.request_kem_key_id,
+        request_kem_recipient: accepted.request_kem_recipient.encode(),
+        expires_at_unix_ms: accepted.accepted_state_expires_at_unix_ms,
+    });
+}
 
 /// Complete native announcement material verified against one accepted state.
 #[derive(Clone)]
@@ -237,7 +352,7 @@ impl QuicSharedConfig {
 
     /// Build a per-service `QuicLoopConfig` with an announce callback.
     ///
-    /// After binding, the callback announces the QUIC endpoint to the DiscoveryService.
+    /// After binding, callbacks announce each bound native carrier to Discovery.
     ///
     /// If the service JWT is close to expiry, the callback requests a renewed JWT
     /// from PolicyService via the `issueToken` RPC (no local CA key needed).
@@ -253,74 +368,36 @@ impl QuicSharedConfig {
     ) -> hyprstream_rpc::service::QuicLoopConfig {
         let mut config = self.for_service(service_name, port);
         let publisher = self.native_announcement_publisher.clone();
+        let quic_signing_key = signing_key.clone();
+        let quic_jwt = service_jwt.clone();
+        let quic_accepted = accepted.clone();
         config.on_quic_bound = Some(Box::new(move |svc_name, addr, sn| {
-            let endpoint = format!("quic://{sn}:{addr}");
-            let sk = signing_key.clone();
-            let jwt = service_jwt.clone();
-            let accepted = accepted.clone();
-
-            // Check if JWT needs renewal (within 2 days of expiry, or missing)
-            let needs_renewal = jwt.as_ref().is_none_or(|j| {
-                let parts: Vec<&str> = j.split('.').collect();
-                if parts.len() != 3 {
-                    return true;
-                }
-                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-                if let Ok(payload) = URL_SAFE_NO_PAD.decode(parts[1]) {
-                    if let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&payload) {
-                        if let Some(exp) = claims["exp"].as_i64() {
-                            let now = chrono::Utc::now().timestamp();
-                            return now > exp - 2 * 86_400;
-                        }
-                    }
-                }
-                true
-            });
-
-            if needs_renewal {
-                tracing::info!(
-                    "Service JWT for '{svc_name}' needs renewal — requesting from PolicyService"
-                );
-            }
-
-            let discovery_vk = discovery_verifying_key;
-            let policy_vk = policy_verifying_key;
-            let Some(accepted) = accepted else {
-                tracing::warn!("Refusing production network announcement for '{svc_name}': accepted native identity/KEM bundle is unavailable");
-                return;
-            };
-            if let Err(error) = accepted.validate(&svc_name, &sk.verifying_key()) {
-                tracing::warn!(
-                    "Refusing production network announcement for '{svc_name}': {error}"
-                );
-                return;
-            }
-            if needs_renewal {
-                tracing::warn!(
-                    "Service JWT for '{svc_name}' expired or near-expiry. \
-                     Renewal RPC pending capnp schema update. Re-run wizard to refresh JWTs."
-                );
-                let _ = policy_vk;
-            }
-            let Some(publish) = publisher.clone() else {
-                tracing::warn!("Refusing production network announcement for '{svc_name}': publisher is unavailable");
-                return;
-            };
-            publish(NativeAnnouncementRequest {
-                service_name: svc_name,
-                endpoint,
-                signing_key: sk,
-                service_jwt: jwt,
-                discovery_verifying_key: discovery_vk,
-                service_did: accepted.service_did,
-                capabilities: accepted.capabilities,
-                accepted_state_digest: accepted.accepted_state_digest.to_vec(),
-                accepted_state_epoch: accepted.accepted_state_epoch,
-                response_key_id: accepted.response_key_id,
-                request_kem_key_id: accepted.request_kem_key_id,
-                request_kem_recipient: accepted.request_kem_recipient.encode(),
-                expires_at_unix_ms: accepted.accepted_state_expires_at_unix_ms,
-            });
+            publish_native_announcement(
+                publisher.clone(),
+                svc_name,
+                NativeAnnouncementReach::Quic {
+                    address: addr,
+                    server_name: sn,
+                },
+                quic_signing_key.clone(),
+                quic_jwt.clone(),
+                policy_verifying_key,
+                discovery_verifying_key,
+                quic_accepted.clone(),
+            );
+        }));
+        let iroh_publisher = self.native_announcement_publisher.clone();
+        config.on_iroh_bound = Some(Box::new(move |svc_name, node_id| {
+            publish_native_announcement(
+                iroh_publisher.clone(),
+                svc_name,
+                NativeAnnouncementReach::Iroh { node_id },
+                signing_key.clone(),
+                service_jwt.clone(),
+                policy_verifying_key,
+                discovery_verifying_key,
+                accepted.clone(),
+            );
         }));
         config
     }
@@ -1034,6 +1111,7 @@ pub fn list_factories() -> impl Iterator<Item = &'static ServiceFactory> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
 
     #[test]
     fn test_service_factory_creation() {
@@ -1065,6 +1143,94 @@ mod tests {
         assert!(announcement
             .validate("model", &signer.verifying_key())
             .is_err());
+    }
+
+    #[test]
+    fn factory_emits_identical_authority_bundle_for_quic_and_iroh_reach() {
+        let signer = SigningKey::from_bytes(&[0x41; 32]);
+        let recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .expect("recipient")
+        .public()
+        .clone();
+        let accepted = NativeServiceAnnouncement {
+            service_did: hyprstream_rpc::identity::Did::from("did:at9p:factory-test"),
+            capabilities: vec!["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()],
+            accepted_state_digest: [0x52; 64],
+            accepted_state_epoch: 7,
+            accepted_state_expires_at_unix_ms: i64::MAX,
+            response_key_id: "did:at9p:factory-test#response".to_owned(),
+            response_verifying_key: signer.verifying_key().to_bytes(),
+            request_kem_key_id: "did:at9p:factory-test#mesh-kem".to_owned(),
+            request_kem_recipient: recipient,
+        };
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let shared = QuicSharedConfig {
+            cert_chain: Vec::new(),
+            key_der: Zeroizing::new(Vec::new()),
+            base_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            server_name: "model.example.test".to_owned(),
+            oauth_issuer_url: None,
+            jwt_verifying_key: None,
+            iroh_enabled: true,
+            moq_relay: None,
+            native_announcement_publisher: Some({
+                let published = Arc::clone(&published);
+                Arc::new(move |request| published.lock().push(request))
+            }),
+        };
+        let mut config = shared.for_service_with_announce(
+            "model",
+            0,
+            signer.clone(),
+            Some("same-service-jwt".to_owned()),
+            signer.verifying_key(),
+            signer.verifying_key(),
+            Some(accepted),
+        );
+
+        config.on_quic_bound.take().expect("QUIC callback")(
+            "model".to_owned(),
+            "127.0.0.1:4242".parse().expect("socket address"),
+            "model.example.test".to_owned(),
+        );
+        let node_id = [0xab; 32];
+        config.on_iroh_bound.take().expect("Iroh callback")("model".to_owned(), node_id);
+
+        let published = published.lock();
+        assert_eq!(published.len(), 2);
+        let quic = &published[0];
+        let iroh = &published[1];
+        assert_eq!(quic.reach.socket_kind(), "quic");
+        assert_eq!(iroh.reach.socket_kind(), "iroh");
+        assert_eq!(
+            quic.reach.endpoint(),
+            "quic://model.example.test:127.0.0.1:4242"
+        );
+        assert_eq!(
+            iroh.reach.endpoint(),
+            format!("iroh://{}", "ab".repeat(32))
+        );
+        assert_eq!(iroh.reach.endpoint().len(), "iroh://".len() + 64);
+        assert_eq!(quic.service_name, iroh.service_name);
+        assert_eq!(quic.service_jwt, iroh.service_jwt);
+        assert_eq!(quic.service_did, iroh.service_did);
+        assert_eq!(quic.capabilities, iroh.capabilities);
+        assert_eq!(quic.accepted_state_digest, iroh.accepted_state_digest);
+        assert_eq!(quic.accepted_state_epoch, iroh.accepted_state_epoch);
+        assert_eq!(quic.response_key_id, iroh.response_key_id);
+        assert_eq!(quic.request_kem_key_id, iroh.request_kem_key_id);
+        assert_eq!(quic.request_kem_recipient, iroh.request_kem_recipient);
+        assert_eq!(quic.expires_at_unix_ms, iroh.expires_at_unix_ms);
+        assert_eq!(
+            quic.signing_key.verifying_key().to_bytes(),
+            iroh.signing_key.verifying_key().to_bytes()
+        );
+        assert_eq!(
+            quic.discovery_verifying_key.to_bytes(),
+            iroh.discovery_verifying_key.to_bytes()
+        );
     }
 
     /// #1188 / #1183: a native service announcement projects from an accepted
