@@ -70,6 +70,7 @@ use hyprstream_vfs::{DevFileState, DirEntry, Fid, Mount, MountError, Stat, Subje
 // response state itself uses `DevFileState`, so it is unambiguously per fid.
 use parking_lot::Mutex as PmMutex;
 
+use super::backend::{NamespaceDelivery, NamespaceTransport};
 use super::client::PodSandboxState;
 use super::pool::SandboxPool;
 
@@ -400,6 +401,10 @@ struct TaskRecord {
     authority_generation: AuthorityGeneration,
     subject: Subject,
     namespace_manifest: hyprstream_rpc_std::task::NamespaceManifestDigest,
+    /// Keeps transport-specific delivery guards alive while the Task is
+    /// reachable (for example a VirtioFs serving guard). `None` denotes a
+    /// legacy/TaskService allocation that has not used this clone path.
+    _namespace_delivery: Option<Arc<NamespaceDelivery>>,
     /// Timeout selected by the trusted clone policy (or the standard Task
     /// request) and applied when this instance executes its one argv task.
     timeout_secs: u64,
@@ -577,13 +582,14 @@ impl ExecMount {
     }
 
     /// Allocate an attachment-bound Task without executing it. This is the
-    /// `/exec/clone` device seam: the caller supplies only a trusted-policy
-    /// namespace commitment/constraints object; clone bytes never become
-    /// policy input.
+    /// `/exec/clone` device seam: the caller supplies a frozen effective
+    /// namespace plus transport selected by trusted admission; clone bytes
+    /// never become namespace or policy input.
     pub async fn allocate_pending_task(
         &self,
         context: &VfsOpContext,
-        namespace_manifest: hyprstream_rpc_std::task::NamespaceManifestDigest,
+        namespace: hyprstream_vfs::AdmittedNamespace,
+        transport: NamespaceTransport,
         constraints: TaskRuntimeConstraints,
     ) -> Result<String, MountError> {
         context.ensure_operation(AttachmentOperation::TaskSpawn)?;
@@ -604,7 +610,47 @@ impl ExecMount {
             .await
             .map_err(|error| MountError::Io(error.to_string()))?;
         if let Err(error) = context.ensure_operation(AttachmentOperation::TaskSpawn) {
-            let _ = self.pool.release(&id).await;
+            self.rollback_task_allocation(&id).await;
+            return Err(error);
+        }
+        let sandbox = match self.pool.get(&id).await {
+            Some(sandbox) => sandbox,
+            None => {
+                self.rollback_task_allocation(&id).await;
+                return Err(MountError::NotFound(format!("instances/{id}")));
+            }
+        };
+        // `pool.get` awaited. Fence the exact current grant immediately
+        // before the backend receives its one fork of the admitted namespace.
+        if let Err(error) = context.ensure_operation(AttachmentOperation::TaskSpawn) {
+            self.rollback_task_allocation(&id).await;
+            return Err(error);
+        }
+        let namespace_manifest =
+            hyprstream_rpc_std::task::NamespaceManifestDigest::from(&namespace);
+        let delivery = match self
+            .pool
+            .backend()
+            .deliver_namespace(
+                &sandbox,
+                namespace.fork(),
+                context.subject().clone(),
+                transport,
+            )
+            .await
+        {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                self.rollback_task_allocation(&id).await;
+                return Err(MountError::Io(error.to_string()));
+            }
+        };
+        // Delivery may serve or import state asynchronously. If revocation won
+        // while it was in flight, drop the delivery (including any guard),
+        // release the sandbox, and never make a Task record visible.
+        if let Err(error) = context.ensure_operation(AttachmentOperation::TaskSpawn) {
+            drop(delivery);
+            self.rollback_task_allocation(&id).await;
             return Err(error);
         }
         self.task_records.lock().insert(
@@ -614,6 +660,7 @@ impl ExecMount {
                 authority_generation: context.authority_generation(),
                 subject: context.subject().clone(),
                 namespace_manifest,
+                _namespace_delivery: Some(Arc::new(delivery)),
                 timeout_secs: constraints.timeout_secs.unwrap_or(300),
                 state: TaskState::Pending,
                 content_records: Vec::new(),
@@ -1340,6 +1387,7 @@ impl TaskService for ExecMount {
                 authority_generation: context.authority_generation(),
                 subject: context.subject().clone(),
                 namespace_manifest,
+                _namespace_delivery: None,
                 timeout_secs,
                 state: TaskState::Running,
                 content_records: Vec::new(),
@@ -1770,6 +1818,10 @@ mod tests {
     use hyprstream_rpc::streaming::{StreamPayload, StreamVerifier};
     use hyprstream_rpc::{AttachmentOperation, VerifiedAttachment};
     use hyprstream_rpc_std::task::NamespaceManifestDigest;
+    use hyprstream_vfs::{
+        AdmittedMount, AdmittedNamespace, BindFlag, MountIdentity, MountTarget,
+        NamespaceMountTopology, NamespacePolicyCommitment, SyntheticMount, SyntheticNode,
+    };
     use moq_net::Track;
     use std::any::Any;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1791,6 +1843,10 @@ mod tests {
         stopped: AtomicBool,
         fail_exec: AtomicBool,
         revoke_during_exec: PmMutex<Option<VerifiedAttachment>>,
+        revoke_during_delivery: PmMutex<Option<VerifiedAttachment>>,
+        fail_delivery: AtomicBool,
+        delivered_namespaces: PmMutex<Vec<(Vec<NamespaceMountTopology>, Subject)>>,
+        events: PmMutex<Vec<&'static str>>,
         commands: PmMutex<Vec<Vec<String>>>,
         timeouts: PmMutex<Vec<u64>>,
     }
@@ -1838,6 +1894,37 @@ mod tests {
             Ok(vec![])
         }
 
+        async fn deliver_namespace(
+            &self,
+            _sandbox: &PodSandbox,
+            namespace: hyprstream_vfs::Namespace,
+            subject: Subject,
+            transport: NamespaceTransport,
+        ) -> WorkerResult<NamespaceDelivery> {
+            if !matches!(transport, NamespaceTransport::HostImports) {
+                return Err(crate::error::WorkerError::Unsupported(
+                    "fake backend only accepts HostImports namespace delivery".into(),
+                ));
+            }
+            if let Some(attachment) = self.revoke_during_delivery.lock().take() {
+                attachment.revoke().map_err(|error| {
+                    crate::error::WorkerError::ExecFailed(format!(
+                        "test delivery revoke failed: {error}"
+                    ))
+                })?;
+            }
+            if self.fail_delivery.load(Ordering::SeqCst) {
+                return Err(crate::error::WorkerError::ExecFailed(
+                    "scripted namespace delivery failure".into(),
+                ));
+            }
+            self.delivered_namespaces
+                .lock()
+                .push((namespace.mount_topology(), subject));
+            self.events.lock().push("deliver_namespace");
+            Ok(NamespaceDelivery::HostImports)
+        }
+
         fn supports_exec(&self) -> bool {
             true
         }
@@ -1860,6 +1947,7 @@ mod tests {
             }
             self.commands.lock().push(command.to_vec());
             self.timeouts.lock().push(timeout_secs);
+            self.events.lock().push("exec_sync");
             Ok((0, b"fake stdout\n".to_vec(), b"fake stderr\n".to_vec()))
         }
 
@@ -1899,13 +1987,47 @@ mod tests {
         Subject::new("test-user")
     }
 
+    fn admitted_test_namespace() -> AdmittedNamespace {
+        let lower: MountTarget = Arc::new(SyntheticMount::new(SyntheticNode::dir()));
+        let upper: MountTarget = Arc::new(SyntheticMount::new(SyntheticNode::dir()));
+        let policy = NamespacePolicyCommitment::from_trusted_policy("fixture-policy-v1")
+            .expect("nonempty trusted policy commitment");
+        AdmittedNamespace::compose(
+            policy,
+            [
+                AdmittedMount::new(
+                    "/work/../work",
+                    lower,
+                    BindFlag::Replace,
+                    Some(
+                        MountIdentity::from_trusted_policy("fixture-lower-v1")
+                            .expect("nonempty lower identity"),
+                    ),
+                )
+                .expect("identified lower mount"),
+                AdmittedMount::new(
+                    "/work",
+                    upper,
+                    BindFlag::Upper,
+                    Some(
+                        MountIdentity::from_trusted_policy("fixture-upper-v1")
+                            .expect("nonempty upper identity"),
+                    ),
+                )
+                .expect("identified upper mount"),
+            ],
+        )
+        .expect("compose identified fixture namespace")
+    }
+
     #[tokio::test]
     async fn clone_device_adapts_pending_task_to_ctl_fd_and_numeric_exit() {
         struct FixedAdmission;
         impl CloneAdmissionSource for FixedAdmission {
             fn admit(&self, _context: &VfsOpContext) -> Result<CloneAdmission, MountError> {
-                Ok(CloneAdmission::from_trusted_policy(
-                    NamespaceManifestDigest::from_description_bytes(b"/work=fake\n"),
+                Ok(CloneAdmission::from_admitted_namespace(
+                    admitted_test_namespace(),
+                    NamespaceTransport::HostImports,
                     TaskRuntimeConstraints {
                         backend_class: Some("fake".into()),
                         timeout_secs: Some(30),
@@ -2007,6 +2129,30 @@ mod tests {
             "exec-json must reach the backend as the exact JSON argv"
         );
         assert_eq!(fake.timeouts.lock().as_slice(), &[30]);
+        assert_eq!(
+            fake.events.lock().as_slice(),
+            &["deliver_namespace", "exec_sync"],
+            "the exact admitted namespace is delivered before the backend executes argv"
+        );
+        let expected_manifest = NamespaceManifestDigest::from(&admitted_test_namespace());
+        let task = TaskId::from_worker_instance(&id);
+        let snapshot = instances
+            .snapshot_task(&task, TaskAttachmentBinding::from_grant(&grant))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.namespace_manifest, expected_manifest);
+        assert_eq!(
+            fake.delivered_namespaces.lock().as_slice(),
+            &[(
+                vec![NamespaceMountTopology {
+                    prefix: "/work".into(),
+                    target_count: 2,
+                    upper_target_index: Some(0),
+                }],
+                owner.clone(),
+            )],
+            "the fake backend receives the admitted namespace before exec"
+        );
 
         backend
             .walk(
@@ -2033,6 +2179,58 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn clone_namespace_delivery_failure_or_revocation_rolls_back_before_task_record() {
+        let owner = Subject::new("namespace-owner");
+        let attachment = VerifiedAttachment::for_test_local_root(owner.clone()).unwrap();
+        let grant = attachment.for_test_operations(&[AttachmentOperation::TaskSpawn]);
+        let context = VfsOpContext::from_attachment_grant(&grant);
+        let constraints = TaskRuntimeConstraints {
+            backend_class: Some("fake".into()),
+            timeout_secs: Some(30),
+        };
+
+        let failed_delivery = Arc::new(FakeBackend::default());
+        failed_delivery.fail_delivery.store(true, Ordering::SeqCst);
+        let failed_pool = make_pool_with(failed_delivery).await;
+        let failed_mount = ExecMount::new(Arc::clone(&failed_pool));
+        assert!(
+            failed_mount
+                .allocate_pending_task(
+                    &context,
+                    admitted_test_namespace(),
+                    NamespaceTransport::HostImports,
+                    constraints.clone(),
+                )
+                .await
+                .is_err()
+        );
+        assert!(failed_pool.list_active().await.is_empty());
+        assert!(failed_mount.task_records.lock().is_empty());
+
+        let revoked_delivery = Arc::new(FakeBackend::default());
+        revoked_delivery
+            .revoke_during_delivery
+            .lock()
+            .replace(attachment.clone());
+        let revoked_pool = make_pool_with(revoked_delivery.clone()).await;
+        let revoked_mount = ExecMount::new(Arc::clone(&revoked_pool));
+        assert!(
+            revoked_mount
+                .allocate_pending_task(
+                    &context,
+                    admitted_test_namespace(),
+                    NamespaceTransport::HostImports,
+                    constraints,
+                )
+                .await
+                .is_err()
+        );
+        assert!(revoked_pool.list_active().await.is_empty());
+        assert!(revoked_mount.task_records.lock().is_empty());
+        assert_eq!(revoked_delivery.delivered_namespaces.lock().len(), 1);
     }
 
     #[tokio::test]

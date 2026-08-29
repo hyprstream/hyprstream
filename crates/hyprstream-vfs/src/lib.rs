@@ -16,6 +16,7 @@
 //!
 //! All types are WASM-compatible. Transport is abstracted via traits.
 
+pub mod admission;
 pub mod devfile;
 mod fsmount;
 /// MAC PEP for the direct Namespace API (#1272): the contract `Namespace`
@@ -45,11 +46,15 @@ pub mod overlay;
 #[cfg(not(target_arch = "wasm32"))]
 mod zero_open;
 
+pub use admission::{
+    AdmittedMount, AdmittedNamespace, MountIdentity, NamespaceAdmissionError,
+    NamespacePolicyCommitment,
+};
 pub use devfile::{ControlFile, DevFileState, DevFuture, DynamicDir, FieldFile, NoSetter};
 pub use fsmount::{FsMount, SetAttr};
 pub use hyprstream_rpc::Subject;
 pub use mount::{DirEntry, Fid, Mount, MountError, Stat, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE, DMDIR};
-pub use namespace::{BindFlag, MountTarget, Namespace, NamespaceError};
+pub use namespace::{BindFlag, MountTarget, Namespace, NamespaceError, NamespaceMountTopology};
 pub use op_context::VfsOpContext;
 pub use mac_pep::NamespaceAction;
 #[cfg(not(target_arch = "wasm32"))]

@@ -19,6 +19,7 @@ use hyprstream_rpc::{
     AttachmentError, AttachmentId, AttachmentOperation, AttachmentOperationGrant,
     AuthorityGeneration, Subject,
 };
+use hyprstream_vfs::AdmittedNamespace;
 
 /// Opaque worker task identifier.  It names a task but grants no authority to
 /// it; every service operation also carries a [`TaskAttachmentBinding`].
@@ -47,12 +48,19 @@ impl fmt::Display for TaskId {
     }
 }
 
-/// Caller-supplied namespace description digest recorded by a Task spawn.
+/// Namespace commitment recorded by a Task spawn.
+///
+/// The standard TaskService prototype can still construct this from
+/// caller-supplied description bytes, which is asserted metadata only. The
+/// attachment-bound `/exec/clone` path instead derives it from an
+/// [`AdmittedNamespace`] that is forked and delivered before the Task is made
+/// visible. These representations intentionally share a wire digest while the
+/// unadmitted TaskService path remains a separately documented limitation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NamespaceManifestDigest([u8; 32]);
 
 impl NamespaceManifestDigest {
-    /// Hash bytes at the contract-prototype boundary.
+    /// Hash caller-supplied bytes at the legacy contract-prototype boundary.
     ///
     /// This is an asserted metadata commitment only. The current Worker pool
     /// neither derives a `Namespace`/effective mount description from these
@@ -67,6 +75,16 @@ impl NamespaceManifestDigest {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+/// Project the digest of a trusted, frozen effective namespace into the Task
+/// contract. This conversion is deliberately from [`AdmittedNamespace`], not
+/// caller-supplied canonical bytes: the same object that supplied this digest
+/// is forked and delivered to the Worker sandbox.
+impl From<&AdmittedNamespace> for NamespaceManifestDigest {
+    fn from(namespace: &AdmittedNamespace) -> Self {
+        Self(*namespace.digest())
     }
 }
 

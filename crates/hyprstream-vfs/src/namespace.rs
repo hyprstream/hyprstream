@@ -69,6 +69,19 @@ pub enum BindFlag {
 /// What a mount point routes to — always an in-process Mount impl.
 pub type MountTarget = Arc<dyn Mount>;
 
+/// Observable topology of one effective namespace mount point.
+///
+/// This exposes placement semantics (normalised prefix, union target order,
+/// and designated upper position) without leaking a raw [`MountTarget`]
+/// capability. It is intended for trusted admission commitments and backend
+/// delivery diagnostics, never as an authority input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamespaceMountTopology {
+    pub prefix: String,
+    pub target_count: usize,
+    pub upper_target_index: Option<usize>,
+}
+
 struct MountEntry {
     prefix: String,
     targets: Vec<MountTarget>,
@@ -328,6 +341,26 @@ impl Namespace {
     /// List all mount prefixes (for debugging / `ls /`).
     pub fn mount_prefixes(&self) -> Vec<&str> {
         self.mounts.iter().map(|m| m.prefix.as_str()).collect()
+    }
+
+    /// Snapshot the mount topology without exposing the mount capabilities.
+    /// The target order is the effective union lookup order; an `Upper` bind
+    /// is recorded by its exact target position.
+    #[must_use]
+    pub fn mount_topology(&self) -> Vec<NamespaceMountTopology> {
+        self.mounts
+            .iter()
+            .map(|entry| NamespaceMountTopology {
+                prefix: entry.prefix.clone(),
+                target_count: entry.targets.len(),
+                upper_target_index: entry.upper.as_ref().and_then(|upper| {
+                    entry
+                        .targets
+                        .iter()
+                        .position(|target| Arc::ptr_eq(target, upper))
+                }),
+            })
+            .collect()
     }
 
     /// Whether the union at `prefix` has a designated copy-up upper

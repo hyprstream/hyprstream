@@ -29,6 +29,10 @@ anyhow = { workspace = true }
 # disallows std::sync::Mutex/RwLock in favor of this.
 parking_lot = { workspace = true }
 
+# Canonical commitments for trusted effective-namespace admission. The digest
+# binds policy-supplied mount identities to the actual forkable topology.
+blake3 = { workspace = true }
+
 # Native filesystem backends for the FsMount overlay adapter (FS-C #364).
 # fuse-backend-rs provides the FileSystem trait, OverlayFs (v1 overlay engine)
 # and PassthroughFs. The overlayfs/passthrough modules are Linux-only, so the

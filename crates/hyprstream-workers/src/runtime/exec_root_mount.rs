@@ -8,39 +8,54 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hyprstream_rpc::AttachmentOperation;
-use hyprstream_rpc_std::task::{NamespaceManifestDigest, TaskRuntimeConstraints};
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject, VfsOpContext};
+use hyprstream_rpc_std::task::TaskRuntimeConstraints;
+use hyprstream_vfs::{
+    AdmittedNamespace, DirEntry, Fid, Mount, MountError, Stat, Subject, VfsOpContext,
+};
 
+use super::backend::NamespaceTransport;
 use super::exec_mount::ExecMount;
 
-/// Trusted policy result supplied to the clone device before allocation.
+/// Trusted admission result supplied to the clone device before allocation.
 ///
-/// The device never parses manifest bytes. Its namespace digest is a
-/// commitment only, not an effective/admitted `Namespace`; P12 must replace
-/// this seam with derived/effective Namespace delivery.
-#[derive(Clone, Debug)]
+/// It owns the frozen effective namespace that is forked and delivered to the
+/// selected sandbox. The corresponding Task digest is derived from this exact
+/// object; clone bytes are never namespace or policy input.
 pub struct CloneAdmission {
-    namespace_manifest: NamespaceManifestDigest,
+    namespace: AdmittedNamespace,
+    transport: NamespaceTransport,
     constraints: TaskRuntimeConstraints,
 }
 
 impl CloneAdmission {
-    /// Construct a result selected by an injected trusted policy boundary.
-    /// This is not namespace admission and does not mint Task authority.
-    #[must_use]
-    pub fn from_trusted_policy(
-        namespace_manifest: NamespaceManifestDigest,
+    /// Construct a result selected by an injected trusted admission boundary.
+    /// The boundary has already composed the actual effective namespace; this
+    /// constructor does not mint Task authority from it.
+    pub fn from_admitted_namespace(
+        namespace: AdmittedNamespace,
+        transport: NamespaceTransport,
         constraints: TaskRuntimeConstraints,
     ) -> Self {
         Self {
-            namespace_manifest,
+            namespace,
+            transport,
             constraints,
         }
     }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        AdmittedNamespace,
+        NamespaceTransport,
+        TaskRuntimeConstraints,
+    ) {
+        (self.namespace, self.transport, self.constraints)
+    }
 }
 
-/// Injection point for trusted clone policy. Identity, a 9P path, and clone
-/// file bytes are deliberately not sufficient to create a policy result.
+/// Injection point for trusted clone admission. Identity, a 9P path, and clone
+/// file bytes are deliberately not sufficient to compose an admission result.
 pub trait CloneAdmissionSource: Send + Sync {
     fn admit(&self, context: &VfsOpContext) -> Result<CloneAdmission, MountError>;
 }
@@ -134,13 +149,10 @@ impl Mount for ExecRootMount {
                 if allocated.is_none() {
                     let admission = self.admission.admit(context)?;
                     context.ensure_operation(AttachmentOperation::TaskSpawn)?;
+                    let (namespace, transport, constraints) = admission.into_parts();
                     *allocated = Some(
                         self.instances
-                            .allocate_pending_task(
-                                context,
-                                admission.namespace_manifest,
-                                admission.constraints,
-                            )
+                            .allocate_pending_task(context, namespace, transport, constraints)
                             .await?,
                     );
                 }

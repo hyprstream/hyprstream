@@ -24,8 +24,8 @@ In particular, a verified subject is not implicitly allowed to spawn a task.
 | Operation authority | `AttachmentOperationGrant` is opaque and generation-bound. `TaskSpawn`, `TaskAttach`, `TaskSignal`, `TaskRead`, and `TaskPublish` are checked at their effect boundaries. | A production issuer must join a dispatch PEP/MAC decision and a distinct delegated-capability decision. Neither a dispatch MAC permit nor a JWT `cap` is silently treated as the other. |
 | Revocation | The current caller grant is rechecked before and after awaited pool/stream state, and before output publication. A task record binds attachment id, generation, and subject but contains no reusable scope grant. | Revocation that wins before a fence stops the next effect. It cannot retrospectively cancel a backend call that already crossed its fence. Durable cancellation/recovery is deferred. |
 | Task contract | `TaskService` supplies spawn, attach, signal, wait/result, and snapshot shapes over the existing `/exec` Worker projection. Argv spawn requires `TaskSpawn` plus `TaskPublish`; terminal signals require `TaskSignal` plus `TaskPublish`. | Child creation fails closed: no parent lineage or delegated attenuation is represented yet. |
-| `/exec` projection | `ExecRootMount` maps a trusted-policy, attachment-context walk of `/exec/clone` to one pending allocation on `open`; `instances` delegates to `ExecMount`, including lossless `exec-json` argv, bounded fd reads, and numeric process exit. The policy supplies a commitment digest plus enforced backend/timeout constraints. | This is a local Wanix/Fersh adapter mapping, not stock tree identity or a production Fersh broker. The digest is not an effective/admitted Namespace; production grant issuance and effective Namespace derivation/delivery remain deferred to P12. |
-| Namespace field | `NamespaceManifestDigest` records a hash of caller-provided description bytes alongside the Task. | This is asserted contract metadata only. The Worker neither derives a `Namespace` nor an effective mount description from it, and does not supply it to `PodSandboxConfig`; it is not namespace admission or a sandbox-binding proof. |
+| `/exec` projection | `ExecRootMount` maps a trusted-admission, attachment-context walk of `/exec/clone` to one pending allocation on `open`; `instances` delegates to `ExecMount`, including lossless `exec-json` argv, bounded fd reads, and numeric process exit. The admission supplies a frozen effective namespace, transport, and enforced backend/timeout constraints. | This is a local Wanix/Fersh adapter mapping, not stock tree identity or a production Fersh broker. Production grant issuance and authenticated policy assertion remain deferred. |
+| Effective namespace | P12 composes an actual forkable `AdmittedNamespace` and canonical final-table digest from explicit mount targets, normalized prefixes, effective union order/upper semantics, a policy commitment, and immutable mount-identity commitments. Clone allocation forks that exact namespace and calls `SandboxBackend::deliver_namespace` before exposing a pending Task. | Policy and mount identities are trusted assertions with type discipline, not cryptographic proof. Composition starts from an unarmed `Namespace::new`; PEP installation and object-label binding remain production work. The standard `TaskService` path still accepts caller description bytes and does not deliver a namespace. |
 | Result content | `ContentDigest` is content identity and `TaskContentRecord` is trusted-service observation/association metadata. Input association does not assert upstream production. | No output bytes are materialized into CAS, and public record fields are not signed or self-authenticating. A digest is not a retrievable artifact or independent provenance evidence. |
 | fd carrier | The local fd adapter has bounded 9P reads, explicit local truncation indication, and matching terminal MoQ metadata; the regression consumes the local carrier to test its encoding. | The standalone origin exports no Iroh endpoint, subscriber, admission, MAC-key handoff, or client-reachable locator. `TaskReaches` advertises no MoQ topic until that exists. |
 
@@ -69,10 +69,14 @@ its verified context to all production mount construction remains separate.
 - context-bound Task invisibility to a same-subject legacy mount caller;
 - verified 9P attach propagation to a context-aware dynamic `Mount`, exact-grant
   reattach binding (including scopes), and revocation before the next ctl effect;
-- clone open allocates once from injected policy, while stat/readdir/bare reads
-  and same-subject legacy walks cannot allocate; the local adapter verifies
-  exact `exec-json` argv then covers `clone` → `instances/<id>/ctl` → `fd/1`
-  → numeric `exit`;
+- effective namespace admission rejects empty/missing mount commitments,
+  canonicalizes normalized final topology (including union order/upper), and
+  forks it to the backend before creating a Task record; delivery errors and
+  delivery-time revocation roll back the sandbox and leave no task record;
+- clone open allocates once from injected admission, while stat/readdir/bare
+  reads and same-subject legacy walks cannot allocate; the local adapter
+  verifies exact `exec-json` argv then covers `clone` → `instances/<id>/ctl`
+  → `fd/1` → numeric `exit`;
 - read-only and signal-only current grants cannot borrow wider spawn authority;
 - revocation after an awaited fd read/publish boundary is denied;
 - an armed lifecycle-policy denial remains `PermissionDenied`, not stale;
@@ -105,6 +109,7 @@ main
   -> codex/spike-task-attachment-record
   -> codex/spike-ninep-vfs-context
   -> codex/spike-exec-clone-device
+  -> codex/spike-effective-namespace-admission
 ```
 
 | Layer | Branch | Review purpose |
@@ -120,9 +125,11 @@ main
 | 9 | `codex/spike-task-attachment-record` | This boundary record and stack manifest. |
 | 10 | `codex/spike-ninep-vfs-context` | Verified 9P attach to VFS operation-context propagation, exact-grant reattach fencing, and dynamic `ExecMount` retention. |
 | 11 | `codex/spike-exec-clone-device` | Local `/exec/clone` allocation adapter, pending Task record, lossless argv ctl, and numeric process exit. |
+| 12 | `codex/spike-effective-namespace-admission` | Trusted effective-namespace composition, derived digest, delivery-before-record fencing, and fake `HostImports` fixture coverage. |
 
 The stack must be rebased and revalidated at every head before merge. A future
 production follow-up must add the production dual-evidence 9P grant issuer and
-listener hand-off, effective namespace derivation/delivery, durable
-artifact materialization, and reachable authenticated stream handoff rather
-than widening this local prototype by implication.
+listener hand-off, authenticated policy/mount-identity assertion issuance,
+PEP installation/object-label binding, durable artifact materialization, and
+reachable authenticated stream handoff rather than widening this local
+prototype by implication.
