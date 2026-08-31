@@ -220,7 +220,6 @@ pub struct DelegateRegistrySignerArgs {
 #[derive(Debug, Args)]
 #[command(group = clap::ArgGroup::new("delegated_signer")
     .args(["via_delegated_signer", "via_delegated_signer_fd"])
-    .required(true)
     .multiple(false)
     .conflicts_with("root"))]
 pub struct MintRegistryJwtArgs {
@@ -277,7 +276,9 @@ pub struct MintRegistryJwtArgs {
     pub authority_checkpoint: PathBuf,
 
     /// Rare/bootstrap path: sign directly with the deployment authority.
-    #[arg(long)]
+    /// Required unless a delegated signer (path or inherited-FD form) is
+    /// selected; conflicts with both via the `delegated_signer` group.
+    #[arg(long, required_unless_present = "delegated_signer")]
     pub root: bool,
 
     /// Raw 32-byte Ed25519 registry-service public key for the cnf claim.

@@ -4562,8 +4562,26 @@ mod tests {
             "id"
         ])
         .is_err());
+        // --root + signer path conflict (behavior carried over from main).
+        assert!(parse(&[
+            "--root",
+            "--via-delegated-signer",
+            "k.age",
+            "--identity",
+            "id",
+            "--registry-public-key",
+            "r",
+        ])
+        .is_err());
         // Exactly one signer source is required unless --root.
         assert!(parse(&["--identity", "id"]).is_err());
+        // The --root bootstrap path parses WITHOUT any signer flag; on main
+        // --via-delegated-signer was required_unless_present = "root", and
+        // clap does not waive a required ArgGroup for a conflicting flag, so
+        // this case pins the restored semantics against that regression.
+        if let Err(error) = parse(&["--root", "--identity", "id", "--registry-public-key", "r"]) {
+            panic!("--root bootstrap form must parse: {error}");
+        }
         // The pure FD form parses.
         if let Err(error) = parse(&[
             "--via-delegated-signer-fd",
