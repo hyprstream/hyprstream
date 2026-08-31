@@ -6,7 +6,7 @@
 
 #![allow(clippy::print_stdout)]
 
-use crate::auth::age_seal::{AgeIdentities, AgeRecipients};
+use crate::auth::age_seal::{AgeIdentities, AgeIdentitySource, AgeRecipients};
 use crate::cli::commands::{
     DelegateRegistrySignerArgs, EnrollServiceKeyArgs, InstallDeploymentTrustArgs,
     MintAnchorCapsuleArgs, MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs,
@@ -51,6 +51,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
     io::{Read as _, Write as _},
+    os::fd::{FromRawFd as _, RawFd},
     os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -516,7 +517,7 @@ fn mint_registry_jwt(args: &MintRegistryJwtArgs) -> Result<()> {
         .try_into()
         .map_err(|_| anyhow!("registry public key must be exactly 32 bytes"))?;
     VerifyingKey::from_bytes(&registry_key).context("invalid registry Ed25519 public key")?;
-    let identities = combined_identities(&args.identities, &args.yubikey_identities)?;
+    let identities = mint_identities(args)?;
     let authority_log_bytes = read_limited(&args.authority_log, MAX_CLOUD_SECRET_BYTES)?;
     let installed_log: AuthorityLogFile =
         serde_json::from_slice(&authority_log_bytes).context("decode installed authority log")?;
@@ -541,10 +542,6 @@ fn mint_registry_jwt(args: &MintRegistryJwtArgs) -> Result<()> {
         ensure_active_authority(&authority, &active)?;
         (authority, None)
     } else {
-        let delegated_path = args
-            .via_delegated_signer
-            .as_ref()
-            .ok_or_else(|| anyhow!("--via-delegated-signer is required"))?;
         let artifact_path = args
             .delegation
             .as_ref()
@@ -557,7 +554,21 @@ fn mint_registry_jwt(args: &MintRegistryJwtArgs) -> Result<()> {
             &artifact,
             now_unix_u64()?,
         )?;
-        let delegated = decrypt_authority(delegated_path, &identities, args.software_recovery)?;
+        let delegated = match (
+            args.via_delegated_signer.as_deref(),
+            args.via_delegated_signer_fd,
+        ) {
+            (Some(delegated_path), None) => {
+                decrypt_authority(delegated_path, &identities, args.software_recovery)?
+            }
+            (None, Some(fd)) => {
+                let ciphertext = read_fd_limited(fd, MAX_AGE_CIPHERTEXT_BYTES, "delegated signer")?;
+                decrypt_authority_ciphertext(&ciphertext, &identities, args.software_recovery)?
+            }
+            // Clap requires exactly one signer source unless --root; this arm
+            // only fires if that invariant is bypassed programmatically.
+            _ => bail!("--via-delegated-signer or --via-delegated-signer-fd is required"),
+        };
         ensure!(
             delegated.bundle.purpose == AuthorityPurpose::RegistryDelegatedSigner,
             "selected key is not a registry delegated signer"
@@ -1113,7 +1124,7 @@ fn trial_decrypt_delegated_signer(
     // the identical derivation path the refresher will exercise on every timer
     // firing. software_recovery is false because the refresher ExecStart never
     // passes --software-recovery.
-    let identities = vec![refresh_identity.to_path_buf()];
+    let identities = AgeIdentities::new(vec![refresh_identity.to_path_buf()])?;
     let trial = decrypt_authority(delegated_key, &identities, false)
         .context("refresh identity cannot decrypt the delegated signer ciphertext")?;
     ensure!(
@@ -1841,20 +1852,45 @@ fn distinct_recipients(recipients: Vec<String>) -> Result<Vec<String>> {
     Ok(unique.into_iter().collect())
 }
 
-fn combined_identities(generic: &[PathBuf], yubikey: &[PathBuf]) -> Result<Vec<PathBuf>> {
+fn combined_identities(generic: &[PathBuf], yubikey: &[PathBuf]) -> Result<AgeIdentities> {
     let identities: Vec<_> = generic.iter().chain(yubikey).cloned().collect();
     ensure!(
         !identities.is_empty(),
         "at least one --identity or --yubikey-identity is required"
     );
-    for identity in &identities {
-        ensure!(
-            identity.is_file(),
-            "age identity file does not exist: {}",
-            identity.display()
-        );
+    AgeIdentities::new(identities)
+}
+
+/// Resolve the mint identity set: either the on-disk path forms (existing
+/// ceremony tooling) or the inherited-FD form used by the staging stack
+/// (systemd `LoadCredentialEncrypted` + podman `--preserve-fds`), which clap
+/// makes mutually exclusive with `--identity`. FD identity bytes are validated
+/// and size-capped here, then handed to the `age` child through anonymous
+/// memfds so plaintext never touches a filesystem path.
+fn mint_identities(args: &MintRegistryJwtArgs) -> Result<AgeIdentities> {
+    if args.identity_fds.is_empty() {
+        return combined_identities(&args.identities, &args.yubikey_identities);
     }
-    Ok(identities)
+    let mut bytes = Vec::with_capacity(args.identity_fds.len());
+    for &fd in &args.identity_fds {
+        bytes.push(Zeroizing::new(read_fd_limited(
+            fd,
+            MAX_AGE_IDENTITY_BYTES,
+            "age identity",
+        )?));
+    }
+    if args.yubikey_identities.is_empty() {
+        return AgeIdentities::new_in_memory(bytes);
+    }
+    // YubiKey path identities may be mixed in, exactly like the path forms.
+    let mut sources: Vec<_> = args
+        .yubikey_identities
+        .iter()
+        .cloned()
+        .map(AgeIdentitySource::Path)
+        .collect();
+    sources.extend(bytes.into_iter().map(AgeIdentitySource::InMemory));
+    AgeIdentities::from_sources(sources)
 }
 
 fn encrypt_age(plaintext: &[u8], recipients: &[String]) -> Result<Vec<u8>> {
@@ -1863,20 +1899,42 @@ fn encrypt_age(plaintext: &[u8], recipients: &[String]) -> Result<Vec<u8>> {
         .context("encrypt authority through deployment age seam")
 }
 
-fn decrypt_age(path: &Path, identities: &[PathBuf]) -> Result<Zeroizing<Vec<u8>>> {
-    AgeIdentities::new(identities.to_vec())?
-        .open_file(path, 128 * 1024)
+const MAX_AGE_PLAINTEXT_BYTES: usize = 128 * 1024;
+
+fn decrypt_age(path: &Path, identities: &AgeIdentities) -> Result<Zeroizing<Vec<u8>>> {
+    identities
+        .open_file(path, MAX_AGE_PLAINTEXT_BYTES)
+        .context("decrypt authority through deployment age seam")
+}
+
+fn decrypt_age_bytes(ciphertext: &[u8], identities: &AgeIdentities) -> Result<Zeroizing<Vec<u8>>> {
+    identities
+        .open(ciphertext, MAX_AGE_PLAINTEXT_BYTES)
         .context("decrypt authority through deployment age seam")
 }
 
 fn decrypt_authority(
     path: &Path,
-    identities: &[PathBuf],
+    identities: &AgeIdentities,
     software_recovery: bool,
 ) -> Result<LoadedAuthority> {
     let plaintext = decrypt_age(path, identities)?;
+    decode_authority(&plaintext, software_recovery)
+}
+
+/// Decrypt an age ciphertext already held in memory (inherited-FD form).
+fn decrypt_authority_ciphertext(
+    ciphertext: &[u8],
+    identities: &AgeIdentities,
+    software_recovery: bool,
+) -> Result<LoadedAuthority> {
+    let plaintext = decrypt_age_bytes(ciphertext, identities)?;
+    decode_authority(&plaintext, software_recovery)
+}
+
+fn decode_authority(plaintext: &[u8], software_recovery: bool) -> Result<LoadedAuthority> {
     let bundle: AuthorityBundle =
-        serde_json::from_slice(&plaintext).context("decode authority bundle")?;
+        serde_json::from_slice(plaintext).context("decode authority bundle")?;
     ensure!(
         bundle.schema == AUTHORITY_BUNDLE_SCHEMA,
         "unsupported authority bundle schema"
@@ -3106,6 +3164,31 @@ fn read_json_limited<T: for<'de> Deserialize<'de>>(path: &Path, max: usize) -> R
         .with_context(|| format!("decode JSON {}", path.display()))
 }
 
+/// Read an inherited credential file descriptor to EOF under a hard size cap.
+///
+/// The descriptor is duplicated first so the caller's fd stays open; the read
+/// then consumes the exact byte stream (pipe-friendly, no seek assumptions).
+/// Any I/O error, short read, EOF error, or over-cap stream fails closed.
+/// Used by the systemd `LoadCredentialEncrypted` / podman `--preserve-fds`
+/// interface so plaintext credentials never touch a filesystem path.
+fn read_fd_limited(fd: RawFd, max: usize, description: &str) -> Result<Vec<u8>> {
+    let duped = unsafe { libc::dup(fd) };
+    if duped < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("dup inherited {description} fd {fd}"));
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(duped) };
+    let mut bytes = Vec::new();
+    file.take(u64::try_from(max + 1).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read inherited {description} fd {fd}"))?;
+    ensure!(
+        bytes.len() <= max,
+        "inherited {description} fd {fd} exceeds {max} bytes"
+    );
+    Ok(bytes)
+}
+
 fn decode_fixed_b64<const N: usize>(value: &str, description: &str) -> Result<Zeroizing<[u8; N]>> {
     let decoded = Zeroizing::new(
         STANDARD
@@ -3173,6 +3256,7 @@ fn now_unix_u64() -> Result<u64> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd as _;
 
     fn test_authority(
         purpose: AuthorityPurpose,
@@ -4874,5 +4958,383 @@ mod tests {
                 subcommand.join(" ")
             );
         }
+    }
+
+    // ---- inherited-FD credential interface (#1561) ---------------------
+
+    /// Write `bytes` into a pipe and return the read end, emulating an
+    /// inherited, non-seekable credential fd (systemd LoadCredentialEncrypted
+    /// + podman --preserve-fds).
+    fn fd_pipe(bytes: &[u8]) -> std::fs::File {
+        let mut fds = [0_i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+        let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        writer.write_all(bytes).expect("write pipe");
+        drop(writer); // closing the write end gives the reader a clean EOF
+        unsafe { std::fs::File::from_raw_fd(fds[0]) }
+    }
+
+    // TEST-ONLY static age key material for the FD-interface fixture. The
+    // rust-builder merge-gate container has no `age-keygen` binary, so the
+    // tests must not launch one; these keys protect only ephemeral tempdir
+    // artifacts and must never be used for a real deployment.
+    const TEST_ONLY_ROOT_IDENTITY: &str =
+        "AGE-SECRET-KEY-18DUYV5CM8FZ2DPGXFFN0NPA5QZVW6L245K04YN74FGYUDJU2DVYQUL97GF\n";
+    const TEST_ONLY_ROOT_RECIPIENT: &str =
+        "age1lpty3rrqge6ql2qu3ppyx2xxvwdwau593v88ffsgjt0lgu5jayqqrzhgqx";
+    const TEST_ONLY_BACKUP_RECIPIENT: &str =
+        "age1tvwjdr4gpg97ys63y34m78n2cmh5yvvc40em3ute8ztwml6hvfgssl9jqv";
+    const TEST_ONLY_SIGNER_IDENTITY: &str =
+        "AGE-SECRET-KEY-14JDHVJAXQKXE9YV9EG3GN2ZAMR37CKJF4VJHZDZDDCRATE2EGZ7QRM86RV\n";
+    const TEST_ONLY_SIGNER_RECIPIENT: &str =
+        "age1w886v3ltxtmc4vls30227nlf72sxcdgag60gup9j50srw2jgx93spxpwkk";
+
+    struct MintFdFixture {
+        // Holds the tempdir open for the fixture's lifetime.
+        _dir: tempfile::TempDir,
+        public_ca: PathBuf,
+        authority_key: PathBuf,
+        authority_log: PathBuf,
+        authority_checkpoint: PathBuf,
+        delegation: PathBuf,
+        registry_public_key: PathBuf,
+        delegated_key_bytes: Vec<u8>,
+        signer_identity_bytes: Vec<u8>,
+        registry_key_bytes: [u8; 32],
+    }
+
+    /// Run the real path-form ceremony (mint-deployment-ca +
+    /// delegate-registry-signer) into a tempdir, returning everything the
+    /// FD-form mint needs. Requires the `age` binary (production mint shells
+    /// out to it); callers skip when it is absent, matching the
+    /// `trial_decrypt_*` convention.
+    fn mint_fd_fixture() -> MintFdFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let root_identity = dir.path().join("root.identity");
+        std::fs::write(&root_identity, TEST_ONLY_ROOT_IDENTITY).unwrap();
+
+        let public_ca = dir.path().join("deployment-ca.hybrid");
+        let authority_key = dir.path().join("deployment-ca.age");
+        let authority_log = dir.path().join("deployment-authority.log.json");
+        let authority_checkpoint = dir.path().join("deployment-authority.head.json");
+        mint_deployment_ca(&MintDeploymentCaArgs {
+            public_ca: public_ca.clone(),
+            authority_key: authority_key.clone(),
+            authority_log: authority_log.clone(),
+            authority_checkpoint: authority_checkpoint.clone(),
+            recipients: vec![
+                TEST_ONLY_ROOT_RECIPIENT.to_owned(),
+                TEST_ONLY_BACKUP_RECIPIENT.to_owned(),
+            ],
+            yubikey_recipients: vec![],
+            kms_plugin_recipients: vec![],
+            piv_slot: None,
+            force: false,
+        })
+        .unwrap();
+
+        let delegated_key = dir.path().join("registry-delegated-signer.age");
+        let delegation = dir.path().join("registry-signer.delegation.json");
+        delegate_registry_signer(&DelegateRegistrySignerArgs {
+            public_ca: public_ca.clone(),
+            authority_log: authority_log.clone(),
+            authority_checkpoint: authority_checkpoint.clone(),
+            authority_key: authority_key.clone(),
+            identities: vec![root_identity],
+            yubikey_identities: vec![],
+            software_recovery: false,
+            signer_recipients: vec![TEST_ONLY_SIGNER_RECIPIENT.to_owned()],
+            delegated_key: delegated_key.clone(),
+            delegation: delegation.clone(),
+            delegation_ttl_seconds: 2_592_000,
+            force: false,
+        })
+        .unwrap();
+
+        let registry_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let registry_public_key = dir.path().join("registry-public-key");
+        std::fs::write(
+            &registry_public_key,
+            registry_key.verifying_key().as_bytes(),
+        )
+        .unwrap();
+
+        MintFdFixture {
+            delegated_key_bytes: std::fs::read(&delegated_key).unwrap(),
+            signer_identity_bytes: TEST_ONLY_SIGNER_IDENTITY.as_bytes().to_vec(),
+            registry_key_bytes: registry_key.verifying_key().to_bytes(),
+            _dir: dir,
+            public_ca,
+            authority_key,
+            authority_log,
+            authority_checkpoint,
+            delegation,
+            registry_public_key,
+        }
+    }
+
+    fn mint_fd_args(
+        fixture: &MintFdFixture,
+        signer_fd: RawFd,
+        identity_fd: RawFd,
+        out: &Path,
+    ) -> MintRegistryJwtArgs {
+        MintRegistryJwtArgs {
+            public_ca: fixture.public_ca.clone(),
+            authority_key: fixture.authority_key.clone(),
+            identities: vec![],
+            identity_fds: vec![identity_fd],
+            yubikey_identities: vec![],
+            software_recovery: false,
+            via_delegated_signer: None,
+            via_delegated_signer_fd: Some(signer_fd),
+            delegation: Some(fixture.delegation.clone()),
+            authority_log: fixture.authority_log.clone(),
+            authority_checkpoint: fixture.authority_checkpoint.clone(),
+            root: false,
+            registry_public_key: fixture.registry_public_key.clone(),
+            ttl_seconds: 3600,
+            jwt: out.join("registry-service.jwt"),
+            contract: out.join("deployment-trust.contract.json"),
+            force: false,
+        }
+    }
+
+    #[test]
+    fn mint_registry_jwt_via_inherited_fds_round_trips_through_production_verifier() {
+        // Production mint shells out to `age`; skip where it is absent (the
+        // rust-builder merge-gate container), matching the trial_decrypt_*
+        // convention. The static TEST-ONLY key material above means
+        // `age-keygen` is never needed.
+        if !age_available() {
+            eprintln!("skipping: age binary not on PATH");
+            return;
+        }
+        let fixture = mint_fd_fixture();
+        let out = tempfile::tempdir().unwrap();
+        let signer = fd_pipe(&fixture.delegated_key_bytes);
+        let identity = fd_pipe(&fixture.signer_identity_bytes);
+        let args = mint_fd_args(
+            &fixture,
+            signer.as_raw_fd(),
+            identity.as_raw_fd(),
+            out.path(),
+        );
+        mint_registry_jwt(&args).expect("FD-form mint must succeed");
+
+        // The same production verifier the registry runs at boot must accept
+        // the credential minted purely from inherited fds.
+        let token = std::fs::read_to_string(out.path().join("registry-service.jwt")).unwrap();
+        let verified = hyprstream_discovery::verify_deployment_artifacts_with_authority_log(
+            &std::fs::read(&fixture.public_ca).unwrap(),
+            &std::fs::read(&fixture.authority_log).unwrap(),
+            &std::fs::read(&fixture.authority_checkpoint).unwrap(),
+            &token,
+        )
+        .expect("production verifier must accept the FD-minted credential");
+        assert_eq!(verified.registry_public_key, fixture.registry_key_bytes);
+    }
+
+    #[test]
+    fn mint_registry_jwt_fd_flags_conflict_with_path_forms() {
+        use clap::Subcommand as _;
+        let parse = |extra: &[&str]| {
+            TrustCommand::augment_subcommands(clap::Command::new("hyprstream"))
+                .try_get_matches_from(
+                    ["hyprstream", "mint-registry-jwt"]
+                        .into_iter()
+                        .chain(extra.iter().copied()),
+                )
+        };
+        // Signer path + signer fd conflict.
+        assert!(parse(&[
+            "--via-delegated-signer",
+            "k.age",
+            "--via-delegated-signer-fd",
+            "3",
+            "--identity",
+            "id",
+        ])
+        .is_err());
+        // Identity path + identity fd conflict.
+        assert!(parse(&[
+            "--via-delegated-signer",
+            "k.age",
+            "--identity",
+            "id",
+            "--identity-fd",
+            "4",
+        ])
+        .is_err());
+        // --root + signer fd conflict.
+        assert!(parse(&[
+            "--root",
+            "--via-delegated-signer-fd",
+            "3",
+            "--identity",
+            "id"
+        ])
+        .is_err());
+        // --root + signer path conflict (behavior carried over from main).
+        assert!(parse(&[
+            "--root",
+            "--via-delegated-signer",
+            "k.age",
+            "--identity",
+            "id",
+            "--registry-public-key",
+            "r",
+        ])
+        .is_err());
+        // Exactly one signer source is required unless --root.
+        assert!(parse(&["--identity", "id"]).is_err());
+        // The --root bootstrap path parses WITHOUT any signer flag; on main
+        // --via-delegated-signer was required_unless_present = "root", and
+        // clap does not waive a required ArgGroup for a conflicting flag, so
+        // this case pins the restored semantics against that regression.
+        if let Err(error) = parse(&["--root", "--identity", "id", "--registry-public-key", "r"]) {
+            panic!("--root bootstrap form must parse: {error}");
+        }
+        // The pure FD form parses.
+        if let Err(error) = parse(&[
+            "--via-delegated-signer-fd",
+            "3",
+            "--identity-fd",
+            "4",
+            "--delegation",
+            "d.json",
+            "--registry-public-key",
+            "r",
+        ]) {
+            panic!("FD form must parse: {error}");
+        }
+        // The path forms are unchanged.
+        assert!(parse(&[
+            "--via-delegated-signer",
+            "k.age",
+            "--identity",
+            "id",
+            "--delegation",
+            "d.json",
+            "--registry-public-key",
+            "r",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn mint_registry_jwt_fd_read_failures_fail_closed() {
+        // Identity-fd read failures abort during identity resolution, before
+        // any authority-log/delegation validation or `age` subprocess runs, so
+        // these cases hold even where the age binary is absent (the
+        // rust-builder merge-gate container).
+        let stage = tempfile::tempdir().unwrap();
+        let authority = test_authority(AuthorityPurpose::Root, None);
+        let public_ca = stage.path().join("ca");
+        std::fs::write(&public_ca, authority.public_bytes()).unwrap();
+        let registry_public_key = stage.path().join("registry-pub");
+        std::fs::write(
+            &registry_public_key,
+            SigningKey::generate(&mut rand::rngs::OsRng)
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap();
+        let identity_fail_args = |identity_fd: RawFd, out: &Path| MintRegistryJwtArgs {
+            public_ca: public_ca.clone(),
+            authority_key: stage.path().join("unused.age"),
+            identities: vec![],
+            identity_fds: vec![identity_fd],
+            yubikey_identities: vec![],
+            software_recovery: false,
+            via_delegated_signer: None,
+            via_delegated_signer_fd: Some(0),
+            delegation: Some(stage.path().join("unused.json")),
+            authority_log: stage.path().join("unused.log"),
+            authority_checkpoint: stage.path().join("unused.head"),
+            root: false,
+            registry_public_key: registry_public_key.clone(),
+            ttl_seconds: 3600,
+            jwt: out.join("registry-service.jwt"),
+            contract: out.join("deployment-trust.contract.json"),
+            force: false,
+        };
+        for (name, bytes) in [
+            ("oversize", vec![b'x'; MAX_AGE_IDENTITY_BYTES + 1]),
+            ("empty", Vec::new()),
+        ] {
+            let out = tempfile::tempdir().unwrap();
+            let identity = fd_pipe(&bytes);
+            let args = identity_fail_args(identity.as_raw_fd(), out.path());
+            assert!(
+                mint_registry_jwt(&args).is_err(),
+                "{name} identity fd must fail closed"
+            );
+            assert!(
+                !out.path().join("registry-service.jwt").exists(),
+                "{name} identity fd left a partial JWT artifact"
+            );
+        }
+
+        // The remaining cases exercise signer-fd reads and age decryption,
+        // which need the full ceremony fixture and therefore the age binary;
+        // skip them where it is absent (trial_decrypt_* convention).
+        if !age_available() {
+            eprintln!("skipping age-dependent cases: age binary not on PATH");
+            return;
+        }
+        let fixture = mint_fd_fixture();
+        let run = |signer_fd: RawFd, identity_fd: RawFd| {
+            let out = tempfile::tempdir().unwrap();
+            let args = mint_fd_args(&fixture, signer_fd, identity_fd, out.path());
+            let result = mint_registry_jwt(&args);
+            (out, result)
+        };
+
+        // An invalid descriptor must fail the mint, not fall back anywhere.
+        let identity = fd_pipe(&fixture.signer_identity_bytes);
+        let (out, result) = run(-1, identity.as_raw_fd());
+        assert!(result.is_err(), "invalid signer fd must fail closed");
+        assert!(!out.path().join("registry-service.jwt").exists());
+
+        // A write-only descriptor yields a read error, not an empty secret.
+        let write_only = OpenOptions::new().write(true).open("/dev/null").unwrap();
+        let identity = fd_pipe(&fixture.signer_identity_bytes);
+        let (out, result) = run(write_only.as_raw_fd(), identity.as_raw_fd());
+        assert!(result.is_err(), "unreadable signer fd must fail closed");
+        assert!(!out.path().join("registry-service.jwt").exists());
+
+        // An over-cap identity stream is rejected before decryption.
+        let signer = fd_pipe(&fixture.delegated_key_bytes);
+        let oversize = fd_pipe(vec![b'x'; MAX_AGE_IDENTITY_BYTES + 1].as_slice());
+        let (out, result) = run(signer.as_raw_fd(), oversize.as_raw_fd());
+        assert!(result.is_err(), "oversize identity fd must fail closed");
+        assert!(!out.path().join("registry-service.jwt").exists());
+
+        // An empty identity stream is rejected before decryption.
+        let signer = fd_pipe(&fixture.delegated_key_bytes);
+        let empty = fd_pipe(b"");
+        let (out, result) = run(signer.as_raw_fd(), empty.as_raw_fd());
+        assert!(result.is_err(), "empty identity fd must fail closed");
+        assert!(!out.path().join("registry-service.jwt").exists());
+
+        // A truncated signer ciphertext (short read / EOF mid-stream) must not
+        // mint a partial credential.
+        let truncated =
+            fd_pipe(&fixture.delegated_key_bytes[..fixture.delegated_key_bytes.len() / 2]);
+        let identity = fd_pipe(&fixture.signer_identity_bytes);
+        let (out, result) = run(truncated.as_raw_fd(), identity.as_raw_fd());
+        assert!(result.is_err(), "truncated signer fd must fail closed");
+        assert!(!out.path().join("registry-service.jwt").exists());
+
+        // Identity bytes that cannot open the ciphertext fail in age.
+        let signer = fd_pipe(&fixture.delegated_key_bytes);
+        let wrong = fd_pipe(b"# not an identity\n");
+        let (out, result) = run(signer.as_raw_fd(), wrong.as_raw_fd());
+        assert!(
+            result.is_err(),
+            "non-decrypting identity fd must fail closed"
+        );
+        assert!(!out.path().join("registry-service.jwt").exists());
     }
 }
