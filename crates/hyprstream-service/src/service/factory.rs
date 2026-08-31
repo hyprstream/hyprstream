@@ -190,6 +190,13 @@ pub struct QuicSharedConfig {
     /// Application-owned publisher. Keeping this callback here avoids making
     /// orchestration depend on the Discovery implementation crate.
     pub native_announcement_publisher: Option<NativeAnnouncementPublisher>,
+    /// #1027: optional inside-carrier `moql` admission authenticator holding
+    /// the daemon-owned accepted-state/currentness authority and the
+    /// operator-controlled subject→tenant resolver. Threaded unchanged into
+    /// every service's `QuicLoopConfig`; the spawner installs it on the iroh
+    /// `moql` handler. `None` keeps the fail-closed anonymous posture.
+    pub moq_admission:
+        Option<Arc<hyprstream_rpc::transport::moql_admission::MoqlAdmissionAuthenticator>>,
 }
 
 impl QuicSharedConfig {
@@ -232,6 +239,9 @@ impl QuicSharedConfig {
             // #358: thread the producer-chosen relay through so the spawner
             // advertises a Role::Relay reach + links the origin up to the relay.
             moq_relay: self.moq_relay.clone(),
+            // #1027: thread the daemon-owned moql admission authenticator
+            // through so the spawner installs it on the iroh `moql` handler.
+            moq_admission: self.moq_admission.clone(),
         }
     }
 
