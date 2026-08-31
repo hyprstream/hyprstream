@@ -4367,23 +4367,20 @@ mod tests {
         unsafe { std::fs::File::from_raw_fd(fds[0]) }
     }
 
-    fn age_keygen_to_file(path: &Path) -> String {
-        let output = Command::new("age-keygen")
-            .output()
-            .expect("launch age-keygen");
-        assert!(output.status.success(), "age-keygen failed");
-        std::fs::write(path, &output.stdout).unwrap();
-        let text = String::from_utf8(output.stdout).unwrap();
-        for line in text.lines() {
-            let line = line.trim();
-            for prefix in ["# public key: ", "Public key: "] {
-                if let Some(recipient) = line.strip_prefix(prefix) {
-                    return recipient.to_owned();
-                }
-            }
-        }
-        panic!("age-keygen printed no recipient");
-    }
+    // TEST-ONLY static age key material for the FD-interface fixture. The
+    // rust-builder merge-gate container has no `age-keygen` binary, so the
+    // tests must not launch one; these keys protect only ephemeral tempdir
+    // artifacts and must never be used for a real deployment.
+    const TEST_ONLY_ROOT_IDENTITY: &str =
+        "AGE-SECRET-KEY-18DUYV5CM8FZ2DPGXFFN0NPA5QZVW6L245K04YN74FGYUDJU2DVYQUL97GF\n";
+    const TEST_ONLY_ROOT_RECIPIENT: &str =
+        "age1lpty3rrqge6ql2qu3ppyx2xxvwdwau593v88ffsgjt0lgu5jayqqrzhgqx";
+    const TEST_ONLY_BACKUP_RECIPIENT: &str =
+        "age1tvwjdr4gpg97ys63y34m78n2cmh5yvvc40em3ute8ztwml6hvfgssl9jqv";
+    const TEST_ONLY_SIGNER_IDENTITY: &str =
+        "AGE-SECRET-KEY-14JDHVJAXQKXE9YV9EG3GN2ZAMR37CKJF4VJHZDZDDCRATE2EGZ7QRM86RV\n";
+    const TEST_ONLY_SIGNER_RECIPIENT: &str =
+        "age1w886v3ltxtmc4vls30227nlf72sxcdgag60gup9j50srw2jgx93spxpwkk";
 
     struct MintFdFixture {
         // Holds the tempdir open for the fixture's lifetime.
@@ -4401,15 +4398,13 @@ mod tests {
 
     /// Run the real path-form ceremony (mint-deployment-ca +
     /// delegate-registry-signer) into a tempdir, returning everything the
-    /// FD-form mint needs.
+    /// FD-form mint needs. Requires the `age` binary (production mint shells
+    /// out to it); callers skip when it is absent, matching the
+    /// `trial_decrypt_*` convention.
     fn mint_fd_fixture() -> MintFdFixture {
         let dir = tempfile::tempdir().unwrap();
         let root_identity = dir.path().join("root.identity");
-        let root_recipient = age_keygen_to_file(&root_identity);
-        let backup_identity = dir.path().join("backup.identity");
-        let backup_recipient = age_keygen_to_file(&backup_identity);
-        let signer_identity = dir.path().join("signer.identity");
-        let signer_recipient = age_keygen_to_file(&signer_identity);
+        std::fs::write(&root_identity, TEST_ONLY_ROOT_IDENTITY).unwrap();
 
         let public_ca = dir.path().join("deployment-ca.hybrid");
         let authority_key = dir.path().join("deployment-ca.age");
@@ -4420,7 +4415,10 @@ mod tests {
             authority_key: authority_key.clone(),
             authority_log: authority_log.clone(),
             authority_checkpoint: authority_checkpoint.clone(),
-            recipients: vec![root_recipient, backup_recipient],
+            recipients: vec![
+                TEST_ONLY_ROOT_RECIPIENT.to_owned(),
+                TEST_ONLY_BACKUP_RECIPIENT.to_owned(),
+            ],
             yubikey_recipients: vec![],
             kms_plugin_recipients: vec![],
             piv_slot: None,
@@ -4438,7 +4436,7 @@ mod tests {
             identities: vec![root_identity],
             yubikey_identities: vec![],
             software_recovery: false,
-            signer_recipients: vec![signer_recipient],
+            signer_recipients: vec![TEST_ONLY_SIGNER_RECIPIENT.to_owned()],
             delegated_key: delegated_key.clone(),
             delegation: delegation.clone(),
             delegation_ttl_seconds: 2_592_000,
@@ -4456,7 +4454,7 @@ mod tests {
 
         MintFdFixture {
             delegated_key_bytes: std::fs::read(&delegated_key).unwrap(),
-            signer_identity_bytes: std::fs::read(&signer_identity).unwrap(),
+            signer_identity_bytes: TEST_ONLY_SIGNER_IDENTITY.as_bytes().to_vec(),
             registry_key_bytes: registry_key.verifying_key().to_bytes(),
             _dir: dir,
             public_ca,
@@ -4497,6 +4495,14 @@ mod tests {
 
     #[test]
     fn mint_registry_jwt_via_inherited_fds_round_trips_through_production_verifier() {
+        // Production mint shells out to `age`; skip where it is absent (the
+        // rust-builder merge-gate container), matching the trial_decrypt_*
+        // convention. The static TEST-ONLY key material above means
+        // `age-keygen` is never needed.
+        if !age_available() {
+            eprintln!("skipping: age binary not on PATH");
+            return;
+        }
         let fixture = mint_fd_fixture();
         let out = tempfile::tempdir().unwrap();
         let signer = fd_pipe(&fixture.delegated_key_bytes);
@@ -4611,6 +4617,65 @@ mod tests {
 
     #[test]
     fn mint_registry_jwt_fd_read_failures_fail_closed() {
+        // Identity-fd read failures abort during identity resolution, before
+        // any authority-log/delegation validation or `age` subprocess runs, so
+        // these cases hold even where the age binary is absent (the
+        // rust-builder merge-gate container).
+        let stage = tempfile::tempdir().unwrap();
+        let authority = test_authority(AuthorityPurpose::Root, None);
+        let public_ca = stage.path().join("ca");
+        std::fs::write(&public_ca, authority.public_bytes()).unwrap();
+        let registry_public_key = stage.path().join("registry-pub");
+        std::fs::write(
+            &registry_public_key,
+            SigningKey::generate(&mut rand::rngs::OsRng)
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap();
+        let identity_fail_args = |identity_fd: RawFd, out: &Path| MintRegistryJwtArgs {
+            public_ca: public_ca.clone(),
+            authority_key: stage.path().join("unused.age"),
+            identities: vec![],
+            identity_fds: vec![identity_fd],
+            yubikey_identities: vec![],
+            software_recovery: false,
+            via_delegated_signer: None,
+            via_delegated_signer_fd: Some(0),
+            delegation: Some(stage.path().join("unused.json")),
+            authority_log: stage.path().join("unused.log"),
+            authority_checkpoint: stage.path().join("unused.head"),
+            root: false,
+            registry_public_key: registry_public_key.clone(),
+            ttl_seconds: 3600,
+            jwt: out.join("registry-service.jwt"),
+            contract: out.join("deployment-trust.contract.json"),
+            force: false,
+        };
+        for (name, bytes) in [
+            ("oversize", vec![b'x'; MAX_AGE_IDENTITY_BYTES + 1]),
+            ("empty", Vec::new()),
+        ] {
+            let out = tempfile::tempdir().unwrap();
+            let identity = fd_pipe(&bytes);
+            let args = identity_fail_args(identity.as_raw_fd(), out.path());
+            assert!(
+                mint_registry_jwt(&args).is_err(),
+                "{name} identity fd must fail closed"
+            );
+            assert!(
+                !out.path().join("registry-service.jwt").exists(),
+                "{name} identity fd left a partial JWT artifact"
+            );
+        }
+
+        // The remaining cases exercise signer-fd reads and age decryption,
+        // which need the full ceremony fixture and therefore the age binary;
+        // skip them where it is absent (trial_decrypt_* convention).
+        if !age_available() {
+            eprintln!("skipping age-dependent cases: age binary not on PATH");
+            return;
+        }
         let fixture = mint_fd_fixture();
         let run = |signer_fd: RawFd, identity_fd: RawFd| {
             let out = tempfile::tempdir().unwrap();
