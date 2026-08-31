@@ -89,18 +89,32 @@ jobs:
       matrix:
         variant: [cpu, cuda128, cuda130, rocm71]
         include:
+          # delay_seconds de-synchronizes the four legs' registry cache-import
+          # bursts. All legs start simultaneously behind one NAT IP, and each
+          # mode=max cache-from import fires hundreds of blob GETs at ghcr.io
+          # at once; ghcr answers with 429 Too Many Requests (runs
+          # 33420411621, 33429089855: rocm71/cuda128 died in "Build and push
+          # Docker image" on "httpReadSeeker: failed open ... 429"). A small
+          # deterministic per-variant offset keeps the t=0 import bursts from
+          # colliding. It does NOT help a leg that trips the limiter later in
+          # its build (one failure was ~26 min in) — that residual risk is
+          # accepted; #1567 already contains the blast radius of a failed leg.
           - variant: cpu
             tag_suffix: cpu
             docker_variant: cpu
+            delay_seconds: 0
           - variant: cuda128
             tag_suffix: cuda128
             docker_variant: cuda128
+            delay_seconds: 30
           - variant: cuda130
             tag_suffix: cuda130
             docker_variant: cuda130
+            delay_seconds: 60
           - variant: rocm71
             tag_suffix: rocm71
             docker_variant: rocm71
+            delay_seconds: 90
 
     steps:
     - name: Clean up disk space before build
@@ -154,6 +168,15 @@ jobs:
           type=semver,pattern={{version}},suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' }}
           type=semver,pattern={{major}}.{{minor}},suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' }}
 
+    - name: Stagger registry cache-import start
+      # Sleep the per-variant offset (see matrix include above) so the four
+      # legs don't open their ghcr.io blob-GET bursts at the same instant.
+      # Runs BEFORE the build step (not earlier) so the offset lands right at
+      # the cache-from import and isn't eaten by step-startup jitter.
+      run: |
+        echo "delaying ${{ matrix.variant }} leg by ${{ matrix.delay_seconds }}s to stagger ghcr.io cache import"
+        sleep "${{ matrix.delay_seconds }}"
+
     - name: Build and push Docker image
       uses: docker/build-push-action@v6
       with:
@@ -165,10 +188,14 @@ jobs:
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
         platforms: linux/amd64
-        # Registry cache: no 10GB limit, persists across branches, faster than GHA cache
+        # Registry cache: no 10GB limit, persists across branches, faster than
+        # GHA cache. cache-from intentionally lists ONLY the per-variant ref:
+        # the former buildcache-base importer was never pushed by any job
+        # (git log -S confirms it was cache-from-only since its introduction),
+        # so every leg wasted ghcr.io requests probing a dead ref — extra
+        # pressure against the 429 rate limiter for zero benefit.
         cache-from: |
           type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.variant }}
-          type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-base
         cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.variant }},mode=max
 
     - name: Generate SBOM
