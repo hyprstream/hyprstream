@@ -150,10 +150,14 @@ pub use service::{
     production_inference_rpc_client_at_transport, production_rpc_client,
     verify_genesis_deployment_artifacts,
     verify_deployment_artifacts_with_authority_log, verify_deployment_public_ca,
-    verify_service_key_enrollment,
+    verify_os_owned_service_key_enrollment, verify_service_key_enrollment,
+    registry_mint_capability, service_key_enrollment_capability,
+    delegation_capability_set_grants_enrollment, validate_delegation_ucan,
+    validate_registry_delegation,
     DeploymentAuthorityCheckpoint, DeploymentAuthorityLog, RegistryDelegationArtifact,
     ServiceKeyEnrollmentArtifact, ServiceKeyEnrollmentSigningBody,
-    VerifiedDeploymentArtifacts, VerifiedServiceKeyEnrollment,
+    ValidatedDelegation, VerifiedDeploymentArtifacts, VerifiedServiceKeyEnrollment,
+    SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES,
 };
 #[cfg(feature = "test-fixtures")]
 #[doc(hidden)]

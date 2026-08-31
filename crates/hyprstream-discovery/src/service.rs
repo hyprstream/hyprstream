@@ -1542,7 +1542,7 @@ const SERVICE_KEY_ENROLLMENT_SIGNATURE_CONTEXT: &[u8] = b"hyprstream.service-key
 /// Fixed allowlist per hyprstream#1562: registry stays JWT-enrolled and
 /// policy-CA/authority keys are out of scope, so exactly these services may be
 /// enrolled by a delegated signer.
-const SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES: [&str; 2] = ["discovery", "policy"];
+pub const SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES: [&str; 2] = ["discovery", "policy"];
 const MAX_SERVICE_KEY_ENROLLMENT_BYTES: usize = 256 * 1024;
 
 /// Signed DidOp authority history embedded in a registry delegation.
@@ -2240,7 +2240,11 @@ impl hyprstream_rpc::auth::ucan::UcanVerifier for AuthoritySetUcanVerifier<'_> {
 }
 
 /// The exact registry-mint capability every delegation must carry.
-fn registry_mint_capability(
+///
+/// Public so the ceremony/mint CLI constructs delegations with the same code
+/// the verifier validates them with (hyprstream#1562 H3) — no second copy to
+/// drift.
+pub fn registry_mint_capability(
     deployment_domain: &str,
     delegated_public_key_b64: &str,
 ) -> hyprstream_rpc::auth::ucan::Capability {
@@ -2278,7 +2282,10 @@ fn registry_mint_capability(
 
 /// The exact service-key-enrollment capability (hyprstream#1562): a fixed
 /// allowlist, hybrid-only key type, and a one-hour attestation TTL ceiling.
-fn service_key_enrollment_capability(
+///
+/// Public so the ceremony/mint CLI constructs delegations with the same code
+/// the verifier validates them with (hyprstream#1562 H3).
+pub fn service_key_enrollment_capability(
     deployment_domain: &str,
     delegated_public_key_b64: &str,
 ) -> hyprstream_rpc::auth::ucan::Capability {
@@ -2323,7 +2330,7 @@ fn service_key_enrollment_capability(
 /// the legacy registry-only scope minted before enrollment existed, or exactly
 /// the registry + enrollment pair. Anything narrower, wider, or reordered is
 /// rejected. Returns true when the enrollment capability is present.
-fn delegation_capability_set_grants_enrollment(
+pub fn delegation_capability_set_grants_enrollment(
     capabilities: &[hyprstream_rpc::auth::ucan::Capability],
     deployment_domain: &str,
     delegated_public_key_b64: &str,
@@ -2342,6 +2349,69 @@ fn delegation_capability_set_grants_enrollment(
     Ok(true)
 }
 
+/// Outcome of validating a root-authorized delegation: whether it may enroll
+/// service keys, and the delegation expiry that caps anything it mints.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedDelegation {
+    pub grants_service_key_enrollment: bool,
+    pub expires_at: u64,
+}
+
+/// Validate one root-authorized delegation UCAN (hyprstream#1562): a single
+/// authority-to-signer link (no proofs), signed by an active authority,
+/// addressed to the delegated signer, carrying exactly the registry-mint or
+/// the registry + service-key-enrollment capability set, and expiring.
+///
+/// Public so the ceremony/mint CLI self-checks freshly minted delegations with
+/// the same code the production verifier applies (hyprstream#1562 H3).
+pub fn validate_delegation_ucan(
+    ucan: &hyprstream_rpc::auth::ucan::Ucan,
+    deployment_domain: &str,
+    delegated_public_key_b64: &str,
+    active_keys: &[crate::did_op::HybridRotationKey],
+    now: u64,
+) -> Result<ValidatedDelegation> {
+    use hyprstream_rpc::auth::ucan::validate as validate_ucan;
+
+    anyhow::ensure!(
+        ucan.proofs.is_empty(),
+        "registry delegation must be one authority-to-signer link"
+    );
+    validate_ucan(ucan, &AuthoritySetUcanVerifier { keys: active_keys }, now)
+        .context("validating registry delegation UCAN")?;
+    anyhow::ensure!(
+        active_keys
+            .iter()
+            .any(|key| ucan.issuer().to_ed25519().ok() == Some(key.ed25519_pub)),
+        "registry delegation issuer is not an active authority"
+    );
+    let delegated_public = base64::engine::general_purpose::STANDARD
+        .decode(delegated_public_key_b64)
+        .context("decoding delegated registry-signer public key")?;
+    let delegated_ed: [u8; ED25519_PUBLIC_KEY_BYTES] = delegated_public
+        .get(..ED25519_PUBLIC_KEY_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("delegated registry-signer public key is truncated"))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("delegated Ed25519 key is malformed"))?;
+    anyhow::ensure!(
+        ucan.audience().to_ed25519()? == delegated_ed,
+        "registry delegation audience does not match delegated signer"
+    );
+    let grants_service_key_enrollment = delegation_capability_set_grants_enrollment(
+        ucan.capabilities(),
+        deployment_domain,
+        delegated_public_key_b64,
+    )?;
+    let expires_at = ucan
+        .payload
+        .expiration
+        .ok_or_else(|| anyhow::anyhow!("registry delegation must expire"))?;
+    Ok(ValidatedDelegation {
+        grants_service_key_enrollment,
+        expires_at,
+    })
+}
+
 /// Outcome of validating a delegation artifact: the authenticated delegated
 /// signer, whether it may enroll service keys, and the delegation expiry that
 /// caps anything it mints.
@@ -2358,7 +2428,7 @@ fn validate_registry_delegation_artifact(
     active: &crate::did_op::VerifiedDidOpLog,
     now: u64,
 ) -> Result<ValidatedRegistryDelegation> {
-    use hyprstream_rpc::auth::ucan::{validate as validate_ucan, Ucan};
+    use hyprstream_rpc::auth::ucan::Ucan;
 
     anyhow::ensure!(
         artifact.schema == REGISTRY_DELEGATION_SCHEMA,
@@ -2394,35 +2464,41 @@ fn validate_registry_delegation_artifact(
         "registry delegation UCAN is too large"
     );
     let ucan = Ucan::from_cbor(&ucan_bytes).context("decoding registry delegation UCAN")?;
-    anyhow::ensure!(
-        ucan.proofs.is_empty(),
-        "registry delegation must be one authority-to-signer link"
-    );
-    validate_ucan(&ucan, &AuthoritySetUcanVerifier { keys: active_keys }, now)
-        .context("validating registry delegation UCAN")?;
-    anyhow::ensure!(
-        active_keys
-            .iter()
-            .any(|key| ucan.issuer().to_ed25519().ok() == Some(key.ed25519_pub)),
-        "registry delegation issuer is not an active authority"
-    );
-    anyhow::ensure!(
-        ucan.audience().to_ed25519()? == delegated.ed25519.to_bytes(),
-        "registry delegation audience does not match delegated signer"
-    );
-    let grants_service_key_enrollment = delegation_capability_set_grants_enrollment(
-        ucan.capabilities(),
-        &root.domain(),
+    let validated = validate_delegation_ucan(
+        &ucan,
+        &artifact.deployment_domain,
         &artifact.delegated_public_key_b64,
+        active_keys,
+        now,
     )?;
-    let expires_at = ucan
-        .payload
-        .expiration
-        .ok_or_else(|| anyhow::anyhow!("registry delegation must expire"))?;
     Ok(ValidatedRegistryDelegation {
         delegated,
-        grants_service_key_enrollment,
-        expires_at,
+        grants_service_key_enrollment: validated.grants_service_key_enrollment,
+        expires_at: validated.expires_at,
+    })
+}
+
+/// Validate a delegation artifact against the pinned production root and the
+/// installed/current authority log with its independently trusted head
+/// (hyprstream#1562 H3).
+///
+/// This is the ceremony/mint-side entry point: it runs the exact checks the
+/// production verifier applies, so tooling cannot bless a delegation shape
+/// production would reject.
+pub fn validate_registry_delegation(
+    public_ca: &[u8],
+    authority_log: &DeploymentAuthorityLog,
+    authority_checkpoint: &DeploymentAuthorityCheckpoint,
+    artifact: &RegistryDelegationArtifact,
+    now: u64,
+) -> Result<ValidatedDelegation> {
+    let root = HybridDeploymentCa::from_os_pin(public_ca)?;
+    let active = validate_deployment_authority_log(&root, authority_log, authority_checkpoint)?;
+    let validated =
+        validate_registry_delegation_artifact(&root, artifact, authority_log, &active, now)?;
+    Ok(ValidatedDelegation {
+        grants_service_key_enrollment: validated.grants_service_key_enrollment,
+        expires_at: validated.expires_at,
     })
 }
 
@@ -2736,6 +2812,26 @@ pub fn verify_service_key_enrollment(
         hybrid_public_key,
         expires_at: attestation.expires_at,
     })
+}
+
+/// Verify a `hyprstream.service-key-enrollment.v1` attestation against this
+/// node's OS-owned deployment trust chain (hyprstream#1562 H3).
+///
+/// The root, authority log, and checkpoint are read through the same
+/// trusted-artifact seam the process bootstrap uses (root-owned,
+/// symlink-free, not group/world-writable), so the attestation is
+/// authenticated by the ceremony chain — never by pinned key material. Every
+/// failure mode of [`verify_service_key_enrollment`] applies; an unreadable
+/// or untrusted chain artifact is equally fatal.
+pub fn verify_os_owned_service_key_enrollment(
+    attestation_json: &[u8],
+) -> Result<VerifiedServiceKeyEnrollment> {
+    let paths = resolve_deployment_trust_paths()?;
+    let public_ca = read_trusted_artifact(&paths.public_ca, "deployment CA root")?;
+    let authority_log = read_trusted_artifact(&paths.authority_log, "deployment authority log")?;
+    let authority_checkpoint =
+        read_trusted_artifact(&paths.authority_checkpoint, "deployment authority checkpoint")?;
+    verify_service_key_enrollment(&public_ca, &authority_log, &authority_checkpoint, attestation_json)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5600,6 +5696,32 @@ mod resolver_tests {
         assert!(
             error.to_string().contains("not a real directory"),
             "unexpected ancestor-symlink rejection: {error}"
+        );
+    }
+
+    /// H3: the OS-owned enrollment seam reads the chain through the trusted
+    /// artifact policy, so a trust dir without the chain fails closed before
+    /// any attestation bytes are even parsed.
+    #[cfg(unix)]
+    #[test]
+    fn os_owned_enrollment_verification_fails_closed_without_chain() {
+        static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _serial = ENV_LOCK.lock();
+        let fixture = tempfile::Builder::new()
+            .prefix(".enrollment-trust-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("secure fixture directory");
+        let prev = std::env::var_os(DEPLOYMENT_TRUST_DIR_ENV);
+        std::env::set_var(DEPLOYMENT_TRUST_DIR_ENV, fixture.path());
+        let result = verify_os_owned_service_key_enrollment(b"{}");
+        match &prev {
+            Some(value) => std::env::set_var(DEPLOYMENT_TRUST_DIR_ENV, value),
+            None => std::env::remove_var(DEPLOYMENT_TRUST_DIR_ENV),
+        }
+        let error = result.expect_err("attestation verified without a chain");
+        assert!(
+            error.to_string().contains("deployment CA root"),
+            "unexpected failure mode: {error}"
         );
     }
 

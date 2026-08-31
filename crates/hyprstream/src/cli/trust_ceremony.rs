@@ -798,6 +798,7 @@ pub fn ceremony_commands(inputs: &CeremonyInputs) -> Result<Vec<TrustCommand>> {
             authority_log: inputs.paths.authority_log(),
             authority_checkpoint: inputs.paths.authority_checkpoint(),
             contract: Some(inputs.paths.contract()),
+            service_key_attestations: Vec::new(),
         }),
     ])
 }
