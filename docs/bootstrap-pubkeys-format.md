@@ -124,6 +124,24 @@ itself, can report precisely which services are stale. This rule is scoped to
 the node's own services: external classical clients and federated peers do not
 appear in this file and are unaffected by it.
 
+## Per-service public sidecars
+
+Each service also publishes its own entry as standalone public files next to
+its signing-key seed, written (and backfilled for pre-existing seeds) by the
+key loader and by `hyprstream service ensure-key <name>`:
+
+- `{service}/signing-key.pub` — the raw 32-byte Ed25519 verifying key.
+- `{service}/service-pubkey.hybrid` — the raw 1984-byte hybrid entry value
+  (before base64), byte-for-byte the same value this file encodes for that
+  service.
+
+Both are public trust material (mode 0644) derived from the key's public half
+only; the seed never appears in either. They exist so consumers that need one
+service's live public key — the registry credential mint, the bootstrap
+enrollment mint — can read it from a volume mount without access to any secret
+material. For `policy`, whose key is the flat node/CA key, the sidecars are
+written flat alongside `credentials/signing-key`.
+
 ## Which service names matter
 
 The wizard mints a keypair for every registered factory, but the runtime only

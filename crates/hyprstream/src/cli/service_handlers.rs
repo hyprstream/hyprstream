@@ -1187,6 +1187,39 @@ pub fn handle_print_cert_hash(quic_config: &crate::config::QuicConfig) -> Result
     Ok(())
 }
 
+/// Handle `service ensure-key` — materialize a service's signing key and its
+/// public sidecars without starting any services.
+///
+/// Runs the same loader the service itself uses (`resolve_service_signing_key`,
+/// so `policy` resolves to the flat node/CA key), then guarantees the public
+/// sidecars exist next to the seed:
+///
+/// - `signing-key.pub` — 32-byte Ed25519 verifying key (mode 0644)
+/// - `service-pubkey.hybrid` — 1984-byte hybrid bootstrap entry (mode 0644)
+///
+/// Idempotent: an existing key is loaded, never rotated, and up-to-date
+/// sidecars are left untouched. Prints the base64 public key and the sidecar
+/// paths for provisioning units that wire them into a credential mint.
+pub fn handle_service_ensure_key(config: Option<&crate::config::HyprConfig>, name: &str) -> Result<()> {
+    use base64::Engine as _;
+    use crate::auth::identity_store;
+
+    identity_store::validate_service_name(name)?;
+    let secrets_dir = identity_store::credentials_dir_for_config(config)?;
+    let profile = identity_store::SecretsProfile::from_env()?;
+    let key = identity_store::resolve_service_signing_key(&secrets_dir, name, profile)?;
+    let key_dir = identity_store::service_signing_key_dir(&secrets_dir, name, profile);
+    identity_store::ensure_service_key_sidecars(&key_dir, &key)?;
+
+    let pubkey_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(key.verifying_key().as_bytes());
+    println!("service '{name}' signing key ensured");
+    println!("  public key (base64): {pubkey_b64}");
+    println!("  {}", key_dir.join(identity_store::SIGNING_KEY_PUB_NAME).display());
+    println!("  {}", key_dir.join(identity_store::SERVICE_PUBKEY_HYBRID_NAME).display());
+    Ok(())
+}
+
 /// Update shell profiles to include bin_dir in PATH
 fn update_shell_profiles(home: &Path, bin_dir: &Path) -> Result<Vec<String>> {
     let path_line = format!(r#"export PATH="{}:$PATH""#, bin_dir.display());

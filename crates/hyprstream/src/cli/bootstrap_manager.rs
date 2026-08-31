@@ -809,6 +809,18 @@ fn provision_service_identities(
             service_name.to_owned(),
             identity_store::BootstrapPubkey::for_service_key(&service_key)?,
         );
+
+        // Publish the public sidecars (`signing-key.pub`, `service-pubkey.hybrid`)
+        // next to the key so the bootstrap-enrollment mint can read them without
+        // secret material (#1562 H1). For non-policy services the key loader
+        // already wrote them — an idempotent no-op here; for policy this writes
+        // them flat, alongside the node/CA seed.
+        let sidecar_dir = identity_store::service_signing_key_dir(
+            credentials_dir,
+            service_name,
+            identity_store::SecretsProfile::SharedDirectory,
+        );
+        identity_store::ensure_service_key_sidecars(&sidecar_dir, &service_key)?;
     }
 
     identity_store::write_bootstrap_pubkeys_hybrid(credentials_dir, &bootstrap_pubkeys)?;
