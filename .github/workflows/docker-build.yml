@@ -66,6 +66,23 @@ jobs:
       packages: write
       attestations: write
       id-token: write
+    # Decouple the flavor legs from each other's consumers: the only
+    # downstream job, publish-cpu-manifest, composes the CPU index from the
+    # cpu leg's sha-<rev>-cpu-amd64 staging tag (plus build-docker-arm64's
+    # -cpu-arm64 tag); needs is per-JOB, not per-leg, so without this a
+    # failed cuda/rocm leg fails the whole build-docker job and SKIPS the
+    # CPU manifest publish (run 33420411621: transient ghcr.io 429 on rocm71
+    # killed an otherwise-good CPU publish). The cuda*/rocm71 flavors are
+    # single-arch amd64 and push their own final tags (latest-cuda128,
+    # semver, ...) directly from their build-push step, so each flavor's
+    # publish path is already self-contained within its leg and nothing
+    # downstream consumes them. Let a non-cpu leg fail without failing the
+    # matrix job. The cpu leg stays critical: if IT fails, build-docker
+    # still fails and publish-cpu-manifest is skipped rather than composing
+    # a partial/stale index. A failed non-cpu leg remains visible as a red
+    # leg in the run, but the run conclusion is green — on release tags,
+    # check the leg list for a missing flavor before announcing.
+    continue-on-error: ${{ matrix.variant != 'cpu' }}
 
     strategy:
       fail-fast: false
