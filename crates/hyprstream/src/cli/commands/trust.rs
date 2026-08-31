@@ -22,6 +22,9 @@ pub enum TrustCommand {
     DelegateRegistrySigner(DelegateRegistrySignerArgs),
     /// Mint the one-hour registry deployment credential.
     MintRegistryJwt(MintRegistryJwtArgs),
+    /// Attest a discovery/policy service's live hybrid public key into the
+    /// deployment trust chain (hyprstream#1562).
+    EnrollServiceKey(EnrollServiceKeyArgs),
     /// Verify deployment artifacts through the production verifier.
     VerifyDeployment(VerifyDeploymentArgs),
     /// Add or replace an authority key through the signed rotation log.
@@ -282,6 +285,62 @@ pub struct MintRegistryJwtArgs {
     /// Out-of-band cloud-secret publisher manifest (never pass its values to Terraform).
     #[arg(long, default_value = "deployment-trust.contract.json")]
     pub contract: PathBuf,
+
+    /// Replace existing output files.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EnrollServiceKeyArgs {
+    /// Raw 1984-byte public deployment root.
+    #[arg(long, default_value = "deployment-ca.hybrid")]
+    pub public_ca: PathBuf,
+
+    /// Installed/current public authority log.
+    #[arg(long, default_value = "deployment-authority.log.json")]
+    pub authority_log: PathBuf,
+
+    /// Independently trusted expected authority-log head.
+    #[arg(long, default_value = "deployment-authority.head.json")]
+    pub authority_checkpoint: PathBuf,
+
+    /// Age identity file. Repeatable for native or plugin identities.
+    #[arg(long = "identity", value_name = "AGE_IDENTITY_FILE")]
+    pub identities: Vec<PathBuf>,
+
+    /// age-plugin-yubikey identity file. Repeatable; decryption requires the token.
+    #[arg(long = "yubikey-identity", value_name = "AGE_YUBIKEY_IDENTITY_FILE")]
+    pub yubikey_identities: Vec<PathBuf>,
+
+    /// Break-glass: use the age-wrapped recovery copy of a PIV Ed25519 key.
+    #[arg(long)]
+    pub software_recovery: bool,
+
+    /// Age-encrypted delegated online signer carrying the enrollment scope.
+    #[arg(long, value_name = "DELEGATED_KEY.age")]
+    pub via_delegated_signer: PathBuf,
+
+    /// Two-capability delegation authorizing --via-delegated-signer.
+    #[arg(long, value_name = "DELEGATION.json")]
+    pub delegation: PathBuf,
+
+    /// Service whose key is enrolled (fixed allowlist, hyprstream#1562).
+    #[arg(long, value_parser = ["discovery", "policy"])]
+    pub service: String,
+
+    /// Raw 1984-byte hybrid service public key (`service-pubkey.hybrid`:
+    /// 32-byte Ed25519 followed by 1952-byte ML-DSA-65).
+    #[arg(long, value_name = "PATH")]
+    pub service_public_key: PathBuf,
+
+    /// Attestation lifetime in seconds; the capability caps this at one hour.
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u32).range(1..=3600))]
+    pub ttl_seconds: u32,
+
+    /// Service-key enrollment attestation output (public, 0644).
+    #[arg(long, default_value = "service-key-enrollment.json")]
+    pub attestation: PathBuf,
 
     /// Replace existing output files.
     #[arg(long)]

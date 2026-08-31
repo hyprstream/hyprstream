@@ -13,9 +13,9 @@ pub use git::{GitAction, GitCommand};
 pub use policy::{PolicyCommand, RoleCommand, TokenCommand};
 pub use training::{TrainingAction, TrainingCommand};
 pub use trust::{
-    DelegateRegistrySignerArgs, InstallDeploymentTrustArgs, MintAnchorCapsuleArgs,
-    MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs, TrustCommand,
-    VerifyDeploymentArgs,
+    DelegateRegistrySignerArgs, EnrollServiceKeyArgs, InstallDeploymentTrustArgs,
+    MintAnchorCapsuleArgs, MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs,
+    TrustCommand, VerifyDeploymentArgs,
 };
 pub use user::{UserCommand, UserKeysCommand, UserKeysImportFormat};
 pub use worker::{ImageCommand, WorkerAction};

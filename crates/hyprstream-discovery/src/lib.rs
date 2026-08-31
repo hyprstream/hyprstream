@@ -150,8 +150,10 @@ pub use service::{
     production_inference_rpc_client_at_transport, production_rpc_client,
     verify_genesis_deployment_artifacts,
     verify_deployment_artifacts_with_authority_log, verify_deployment_public_ca,
+    verify_service_key_enrollment,
     DeploymentAuthorityCheckpoint, DeploymentAuthorityLog, RegistryDelegationArtifact,
-    VerifiedDeploymentArtifacts,
+    ServiceKeyEnrollmentArtifact, ServiceKeyEnrollmentSigningBody,
+    VerifiedDeploymentArtifacts, VerifiedServiceKeyEnrollment,
 };
 #[cfg(feature = "test-fixtures")]
 #[doc(hidden)]
