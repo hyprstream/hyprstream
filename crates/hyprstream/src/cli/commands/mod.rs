@@ -283,4 +283,20 @@ pub enum ServiceAction {
         #[arg(long, short = 'v')]
         verbose: bool,
     },
+
+    /// Generate or load a service's signing key and write its public sidecars
+    ///
+    /// Runs the same key loader the service itself uses (with
+    /// `resolve_service_signing_key` semantics, so `policy` resolves to the
+    /// flat node/CA key), then ensures the public sidecars exist next to the
+    /// seed: `signing-key.pub` (32-byte Ed25519 verifying key, 0644) and
+    /// `service-pubkey.hybrid` (1984-byte hybrid bootstrap entry, 0644).
+    ///
+    /// Idempotent: an existing key is loaded, never rotated, and up-to-date
+    /// sidecars are left untouched. Does not start any services — intended
+    /// for provisioning/keygen units that run before service startup.
+    EnsureKey {
+        /// Service name (e.g. registry, discovery, policy)
+        name: String,
+    },
 }

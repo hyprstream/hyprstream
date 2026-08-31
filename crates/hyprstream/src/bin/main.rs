@@ -2256,6 +2256,26 @@ fn main() -> Result<()> {
         }
     }
 
+    // ── `service ensure-key` early dispatch ─────────────────────────────────
+    // Key materialization for provisioning/keygen units: it must work on a
+    // fresh install (before any bootstrap-pubkeys exist) and must not start
+    // any services, so dispatch before the registry bootstrap below — same
+    // rationale as `service repair`.
+    if let Some(("service", sub_m)) = matches.subcommand() {
+        if let Some(("ensure-key", ek_m)) = sub_m.subcommand() {
+            // `name` is a required positional; a missing value is a clap bug,
+            // not operator error, so fail loudly rather than guess.
+            let name = ek_m
+                .get_one::<String>("name")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("service ensure-key: missing required <name>"))?;
+            return hyprstream_core::cli::service_handlers::handle_service_ensure_key(
+                Some(&config),
+                &name,
+            );
+        }
+    }
+
     // Start registry service ONCE at CLI level
     let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -3103,6 +3123,16 @@ fn main() -> Result<()> {
                         || async move {
                             hyprstream_core::cli::service_handlers::run_repair_checks(&models_dir, verbose).await
                         },
+                    )?;
+                }
+
+                ServiceAction::EnsureKey { name } => {
+                    // Normally handled by the early dispatch above (before any
+                    // services start). Defense-in-depth fallback if that
+                    // dispatch is ever bypassed.
+                    hyprstream_core::cli::service_handlers::handle_service_ensure_key(
+                        Some(ctx.config()),
+                        &name,
                     )?;
                 }
             }
