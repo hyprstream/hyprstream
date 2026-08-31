@@ -1,4 +1,5 @@
 use clap::{Args, Subcommand};
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 
 #[cfg(test)]
@@ -217,6 +218,11 @@ pub struct DelegateRegistrySignerArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group = clap::ArgGroup::new("delegated_signer")
+    .args(["via_delegated_signer", "via_delegated_signer_fd"])
+    .required(true)
+    .multiple(false)
+    .conflicts_with("root"))]
 pub struct MintRegistryJwtArgs {
     /// Raw 1984-byte public deployment root.
     #[arg(long, default_value = "deployment-ca.hybrid")]
@@ -227,8 +233,18 @@ pub struct MintRegistryJwtArgs {
     pub authority_key: PathBuf,
 
     /// Age identity file. Repeatable for native or plugin identities.
-    #[arg(long = "identity", value_name = "AGE_IDENTITY_FILE")]
+    #[arg(
+        long = "identity",
+        value_name = "AGE_IDENTITY_FILE",
+        conflicts_with = "identity_fds"
+    )]
     pub identities: Vec<PathBuf>,
+
+    /// Inherited FD carrying an age identity (systemd LoadCredentialEncrypted /
+    /// podman --preserve-fds); plaintext never touches a filesystem path.
+    /// Repeatable; mutually exclusive with --identity.
+    #[arg(long = "identity-fd", value_name = "FD", value_parser = clap::value_parser!(RawFd).range(0..))]
+    pub identity_fds: Vec<RawFd>,
 
     /// age-plugin-yubikey identity file. Repeatable; decryption requires the token.
     #[arg(long = "yubikey-identity", value_name = "AGE_YUBIKEY_IDENTITY_FILE")]
@@ -239,20 +255,17 @@ pub struct MintRegistryJwtArgs {
     pub software_recovery: bool,
 
     /// Common path: decrypt this scoped online signer.
-    #[arg(
-        long,
-        value_name = "DELEGATED_KEY.age",
-        conflicts_with = "root",
-        required_unless_present = "root"
-    )]
+    #[arg(long, value_name = "DELEGATED_KEY.age")]
     pub via_delegated_signer: Option<PathBuf>,
 
-    /// Delegation authorizing --via-delegated-signer.
-    #[arg(
-        long,
-        value_name = "DELEGATION.json",
-        requires = "via_delegated_signer"
-    )]
+    /// Inherited FD carrying the age-encrypted scoped online signer (systemd
+    /// LoadCredentialEncrypted / podman --preserve-fds). Mutually exclusive
+    /// with --via-delegated-signer and --root.
+    #[arg(long, value_name = "FD", value_parser = clap::value_parser!(RawFd).range(0..))]
+    pub via_delegated_signer_fd: Option<RawFd>,
+
+    /// Delegation authorizing the selected delegated signer.
+    #[arg(long, value_name = "DELEGATION.json", requires = "delegated_signer")]
     pub delegation: Option<PathBuf>,
 
     /// Installed/current public authority log. Required for every credential.
@@ -264,7 +277,7 @@ pub struct MintRegistryJwtArgs {
     pub authority_checkpoint: PathBuf,
 
     /// Rare/bootstrap path: sign directly with the deployment authority.
-    #[arg(long, conflicts_with = "via_delegated_signer")]
+    #[arg(long)]
     pub root: bool,
 
     /// Raw 32-byte Ed25519 registry-service public key for the cnf claim.
