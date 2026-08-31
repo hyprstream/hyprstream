@@ -16,7 +16,7 @@
 //!   the systemd credentials ramfs), missing secrets are a hard error rather than
 //!   triggering key generation.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use zeroize::{Zeroize, Zeroizing};
@@ -853,6 +853,61 @@ pub fn write_bootstrap_pubkeys_hybrid(
         .collect();
     let data = serde_json::to_vec(&json).context("failed to serialize bootstrap-pubkeys")?;
     write_secret(credentials_dir, BOOTSTRAP_PUBKEYS_NAME, &data)
+}
+
+/// Directory sibling to `bootstrap-pubkeys` holding the per-service chain-signed
+/// enrollment attestations (hyprstream#1562 H3): `{service}.json` per
+/// allowlisted service.
+pub const BOOTSTRAP_PUBKEYS_ENROLLMENT_DIR: &str = "bootstrap-pubkeys.enrollment";
+
+/// Fail-closed enrollment check for OS-owned deployments (hyprstream#1562 H3).
+///
+/// Every bootstrap entry for a service in the fixed enrollment allowlist
+/// (`hyprstream_discovery::SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES`) must be
+/// backed by an attestation in
+/// `{credentials_dir}/bootstrap-pubkeys.enrollment/{service}.json` that
+/// verifies against the node's OS-owned deployment trust chain and names
+/// exactly this entry's hybrid key — the unsigned-TOFU posture is refused.
+/// Missing, malformed, expired, or mismatched attestations are fatal. Entries
+/// outside the allowlist cannot be enrolled by design and keep their existing
+/// local posture. Wizard/dev (non-OsOwnedFiles) deployments never call this.
+pub fn ensure_bootstrap_pubkeys_enrolled(
+    credentials_dir: &std::path::Path,
+    entries: &std::collections::HashMap<String, BootstrapPubkey>,
+) -> Result<()> {
+    let mut names: Vec<&str> = entries.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    for name in names {
+        if !hyprstream_discovery::SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES.contains(&name) {
+            continue;
+        }
+        let path = credentials_dir
+            .join(BOOTSTRAP_PUBKEYS_ENROLLMENT_DIR)
+            .join(format!("{name}.json"));
+        let bytes = std::fs::read(&path).map_err(|error| {
+            anyhow!(
+                "OS-owned deployment requires a chain-signed enrollment attestation for \
+                 service '{name}' at {}: {error} (re-run the service-key enrollment \
+                 provisioning step)",
+                path.display()
+            )
+        })?;
+        let verified = hyprstream_discovery::verify_os_owned_service_key_enrollment(&bytes)
+            .with_context(|| format!("enrollment attestation for service '{name}' rejected"))?;
+        ensure!(
+            verified.service == name,
+            "enrollment attestation at {} is for service '{}', not '{name}'",
+            path.display(),
+            verified.service
+        );
+        let entry = &entries[name];
+        ensure!(
+            entry.is_hybrid() && verified.hybrid_public_key == entry.to_key_bytes(),
+            "enrollment attestation for service '{name}' does not match its \
+             bootstrap-pubkeys entry"
+        );
+    }
+    Ok(())
 }
 
 // ─── Node-level key loaders ──────────────────────────────────────────────────
@@ -2230,6 +2285,42 @@ mod tests {
         }
         ensure_bootstrap_pubkeys_hybrid(&map).unwrap();
         ensure_bootstrap_pubkeys_hybrid(&std::collections::HashMap::new()).unwrap();
+    }
+
+    /// H3: in an OS-owned deployment an allowlisted service without a
+    /// chain-signed enrollment attestation fails closed — the missing-file
+    /// check fires before any chain access, so no trust dir is needed here.
+    #[test]
+    fn enrollment_attestation_missing_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "discovery".to_owned(),
+            BootstrapPubkey::for_service_key(&bootstrap_ed_key(41)).unwrap(),
+        );
+        let err = ensure_bootstrap_pubkeys_enrolled(dir.path(), &map)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(BOOTSTRAP_PUBKEYS_ENROLLMENT_DIR),
+            "error names the enrollment directory: {err}"
+        );
+        assert!(err.contains("discovery"), "error names the service: {err}");
+    }
+
+    /// H3: services outside the fixed enrollment allowlist cannot be enrolled
+    /// by design, so they require no attestation — and an empty (unprovisioned)
+    /// node passes, matching the hybrid check's posture.
+    #[test]
+    fn unallowlisted_bootstrap_entries_need_no_attestation() {
+        let dir = TempDir::new().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "inference".to_owned(),
+            BootstrapPubkey::for_service_key(&bootstrap_ed_key(42)).unwrap(),
+        );
+        ensure_bootstrap_pubkeys_enrolled(dir.path(), &map).unwrap();
+        ensure_bootstrap_pubkeys_enrolled(dir.path(), &std::collections::HashMap::new()).unwrap();
     }
 
     /// A provisioned service entry round-trips through the file and then

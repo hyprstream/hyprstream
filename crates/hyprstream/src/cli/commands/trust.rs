@@ -502,4 +502,12 @@ pub struct VerifyDeploymentArgs {
     /// Optional contract whose public artifacts must match the files.
     #[arg(long)]
     pub contract: Option<PathBuf>,
+
+    /// Service-key enrollment attestation to verify against the deployment
+    /// trust chain (hyprstream#1562). Repeatable; every attestation must
+    /// verify against the same root, authority log, and checkpoint — any
+    /// missing, malformed, expired, or out-of-scope attestation fails the
+    /// command.
+    #[arg(long = "service-key-attestation", value_name = "ATTESTATION_FILE")]
+    pub service_key_attestations: Vec<PathBuf>,
 }

@@ -1595,6 +1595,10 @@ async fn install_process_production_resolver(
     signing_key: &SigningKey,
     config: &HyprConfig,
 ) -> Result<bool> {
+    let trust_source = hyprstream_discovery::DeploymentTrustSource::from_anchors(
+        config.cluster_at9p_did.as_deref(),
+        config.cluster_did_web.as_deref(),
+    )?;
     // Every service identity this node provisions is hybrid, so a classical
     // service entry means the node was provisioned by a pre-hybrid wizard and
     // its services can never be anchored for post-quantum verification. Fail
@@ -1608,6 +1612,19 @@ async fn install_process_production_resolver(
         let entries =
             hyprstream_core::auth::identity_store::load_bootstrap_pubkeys_hybrid(&secrets_dir)?;
         hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries)?;
+        // hyprstream#1562 H3: an OS-owned deployment must enroll its discovery/
+        // policy service keys into the ceremony signature chain — unsigned-TOFU
+        // bootstrap-pubkeys are refused. DID-anchored and wizard/dev
+        // deployments are unchanged.
+        if matches!(
+            trust_source,
+            hyprstream_discovery::DeploymentTrustSource::OsOwnedFiles
+        ) {
+            hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_enrolled(
+                &secrets_dir,
+                &entries,
+            )?;
+        }
     }
 
     // The bootstrap pins the discovery service key from the process trust
@@ -1615,10 +1632,6 @@ async fn install_process_production_resolver(
     // the node's own bootstrap-pubkeys (the same source resolve_service_vk
     // uses on first use) — a no-op when already populated or unprovisioned.
     let _ = resolve_service_vk("discovery");
-    let trust_source = hyprstream_discovery::DeploymentTrustSource::from_anchors(
-        config.cluster_at9p_did.as_deref(),
-        config.cluster_did_web.as_deref(),
-    )?;
     // Private-PKI deployments may terminate the did:web host with an internal
     // CA; the extra root is additive (never disables verification), and an
     // unreadable file is a hard configuration error, not a silent skip.
