@@ -2150,6 +2150,36 @@ pub struct RuntimeConfig {
     /// `HYPRSTREAM_CONTINUOUS_BATCH_MAX`.
     #[serde(default = "default_continuous_batch_max")]
     pub continuous_batch_max: usize,
+    /// FP8 GEMM via torch `_scaled_mm` for FP8 (e4m3) weight projections.
+    /// **Default: off.**
+    ///
+    /// When enabled, `LinearProjection::apply` computes FP8-weight matmuls
+    /// with `at::_scaled_mm` instead of the lazy BF16 dequant-then-matmul,
+    /// picking the first recipe the device supports (torch 2.11, verified
+    /// against release/2.11 ScaledBlas.cpp / RowwiseScaledMM.cu):
+    ///
+    ///  1. v2 blockwise (1x128 activation × 128x128 weight blocks, the
+    ///     checkpoint's native scales): **NVIDIA Hopper (SM90) + cuBLASLt ≥
+    ///     12.9 only** — `_check_deepseek_support` hard-errors on SM120,
+    ///     SM100, SM89, and there is no CPU kernel.
+    ///  2. v1 rowwise (per-token × per-output-channel scales): **SM90+,
+    ///     including SM120/Blackwell** — cuBLASLt rowwise at cuBLAS ≥ 12.9,
+    ///     otherwise the CUTLASS `f8f8bf16_rowwise` SM120 kernel. Requires a
+    ///     load-time requantization of the weight to per-output-channel
+    ///     scales (coarser than 128x128 blocks; +1x FP8 weight memory while
+    ///     the flag is on).
+    ///
+    /// Each recipe latches off per device after its first kernel error and the
+    /// runtime falls back to lazy dequant, so enabling this on unsupported
+    /// hardware costs one warning per device per recipe, not a failure.
+    ///
+    /// Precedence note: like `mmap`, this field is currently **env-only in
+    /// effect** — model construction has no `RuntimeConfig` plumbing, so the
+    /// runtime reads `HYPRSTREAM_FP8_GEMM` directly (cached per process);
+    /// setting the field programmatically does not reach the model path.
+    #[serde(default = "default_fp8_gemm")]
+    pub fp8_gemm: bool,
+
     /// Materialize FP8 weights as BF16 once at load time (applying the
     /// block-wise `_scale_inv` scales during load) and drop the FP8+scale
     /// tensors, instead of dequantizing inside every matmul on the hot path.
@@ -2182,10 +2212,20 @@ fn default_continuous_batch_max() -> usize {
         .unwrap_or(16)
 }
 
+/// Default for [`RuntimeConfig::fp8_gemm`]: off unless `HYPRSTREAM_FP8_GEMM`
+/// is set truthy. Off is the safe default — the lazy BF16 dequant matmul is
+/// the verified reference, and the `_scaled_mm_v2` blockwise path requires
+/// NVIDIA Hopper (SM90) + cuBLASLt ≥ 12.9 (no CPU/ROCm kernel in torch 2.11).
+pub(crate) fn default_fp8_gemm() -> bool {
+    std::env::var("HYPRSTREAM_FP8_GEMM")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 /// Default for [`RuntimeConfig::fp8_dequant_load`]: off unless
 /// `HYPRSTREAM_FP8_DEQUANT_LOAD` is set truthy. Off is the safe default — it
 /// keeps FP8 weights at FP8 size in VRAM with lazy per-matmul dequantization.
-fn default_fp8_dequant_load() -> bool {
+pub(crate) fn default_fp8_dequant_load() -> bool {
     std::env::var("HYPRSTREAM_FP8_DEQUANT_LOAD")
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
@@ -2253,6 +2293,7 @@ impl Default for RuntimeConfig {
             default_model_load_timeout_ms: 300000, // 5 minutes
             continuous_batching: default_continuous_batching(),
             continuous_batch_max: default_continuous_batch_max(),
+            fp8_gemm: default_fp8_gemm(),
             fp8_dequant_load: default_fp8_dequant_load(),
         }
     }
