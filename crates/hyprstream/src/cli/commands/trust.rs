@@ -306,6 +306,10 @@ pub struct MintRegistryJwtArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group = clap::ArgGroup::new("delegated_signer")
+    .args(["via_delegated_signer", "via_delegated_signer_fd"])
+    .required(true)
+    .multiple(false))]
 pub struct EnrollServiceKeyArgs {
     /// Raw 1984-byte public deployment root.
     #[arg(long, default_value = "deployment-ca.hybrid")]
@@ -320,8 +324,18 @@ pub struct EnrollServiceKeyArgs {
     pub authority_checkpoint: PathBuf,
 
     /// Age identity file. Repeatable for native or plugin identities.
-    #[arg(long = "identity", value_name = "AGE_IDENTITY_FILE")]
+    #[arg(
+        long = "identity",
+        value_name = "AGE_IDENTITY_FILE",
+        conflicts_with = "identity_fds"
+    )]
     pub identities: Vec<PathBuf>,
+
+    /// Inherited FD carrying an age identity (systemd LoadCredentialEncrypted /
+    /// podman --preserve-fds); plaintext never touches a filesystem path.
+    /// Repeatable; mutually exclusive with --identity.
+    #[arg(long = "identity-fd", value_name = "FD", value_parser = clap::value_parser!(RawFd).range(0..))]
+    pub identity_fds: Vec<RawFd>,
 
     /// age-plugin-yubikey identity file. Repeatable; decryption requires the token.
     #[arg(long = "yubikey-identity", value_name = "AGE_YUBIKEY_IDENTITY_FILE")]
@@ -333,7 +347,13 @@ pub struct EnrollServiceKeyArgs {
 
     /// Age-encrypted delegated online signer carrying the enrollment scope.
     #[arg(long, value_name = "DELEGATED_KEY.age")]
-    pub via_delegated_signer: PathBuf,
+    pub via_delegated_signer: Option<PathBuf>,
+
+    /// Inherited FD carrying the age-encrypted delegated signer (systemd
+    /// LoadCredentialEncrypted / podman --preserve-fds). Mutually exclusive
+    /// with --via-delegated-signer.
+    #[arg(long, value_name = "FD", value_parser = clap::value_parser!(RawFd).range(0..))]
+    pub via_delegated_signer_fd: Option<RawFd>,
 
     /// Two-capability delegation authorizing --via-delegated-signer.
     #[arg(long, value_name = "DELEGATION.json")]
