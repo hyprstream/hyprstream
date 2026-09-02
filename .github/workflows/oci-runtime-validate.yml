@@ -109,12 +109,13 @@ jobs:
       # KNOWN GAP: full serving requires deployment trust infrastructure
       # (/etc/hyprstream/trust/deployment-ca.hybrid and related files) that
       # a bare CI container does not have. The wizard bootstrap creates
-      # signing keys and service JWTs, but NOT the deployment CA root — that
-      # is provisioned by the deployment stack (cyberdione/metal). Minting
-      # throwaway trust inside this job is not currently possible: the trust
-      # ceremony shells out to age-keygen for identities, and the distroless
-      # runtime image contains only the hyprstream binary; the registry
-      # credential additionally requires decrypting the authority bundle.
+      # signing keys and service JWTs, but NOT the deployment CA root or
+      # chain-signed discovery enrollment — those are provisioned by the
+      # deployment stack (cyberdione/metal). Minting throwaway trust inside
+      # this job is not currently possible: the trust ceremony shells out to
+      # age-keygen for identities, and the distroless runtime image contains
+      # only the hyprstream binary; the registry credential additionally
+      # requires decrypting the authority bundle.
       # The service's trusted-artifact loader also rejects any trust path
       # whose ancestor directories are group/world-writable, which rules out
       # the 777 volume mounts the unprivileged runtime uid needs elsewhere.
@@ -193,10 +194,17 @@ jobs:
               break
             fi
             if [ "$(podman inspect --format '{{.State.Status}}' "$SMOKE_CONTAINER")" != "running" ]; then
-              # The container exited before serving. The only acceptable exit
-              # is the deployment-trust refusal: it proves startup reached
-              # trust enforcement on the new runtime base.
+              # The container exited before serving. The only acceptable exits
+              # are exact deployment-trust refusals: an absent deployment CA
+              # root, or the bare-CI-specific missing discovery enrollment.
+              # Both prove startup reached trust enforcement on the runtime
+              # base; any other early exit remains a hard failure.
               if podman logs "$SMOKE_CONTAINER" 2>&1 | grep -q "deployment CA root"; then
+                refusal=1
+              elif podman logs "$SMOKE_CONTAINER" 2>&1 \
+                | grep -Fq "OS-owned deployment requires a chain-signed enrollment attestation for service 'discovery'" \
+                && podman logs "$SMOKE_CONTAINER" 2>&1 \
+                  | grep -Fq "(re-run the service-key enrollment provisioning step)"; then
                 refusal=1
               else
                 echo "::error::Container exited before /health responded, without the recognized deployment-trust refusal."
@@ -215,7 +223,7 @@ jobs:
             echo "OK: OAuth service is serving /health."
           elif [ "$refusal" = "1" ]; then
             echo "SMOKE_OUTCOME=trust-refusal" >> "$GITHUB_ENV"
-            echo "OK: service started on the runtime base and refused cleanly at deployment-trust enforcement (no CA in a bare CI container — expected)."
+            echo "OK: service started on the runtime base and refused cleanly at the recognized deployment-trust boundary (no CA or discovery enrollment in bare CI — expected)."
             echo "=== container logs (last 20 lines) ==="
             podman logs "$SMOKE_CONTAINER" 2>&1 | tail -20
           else

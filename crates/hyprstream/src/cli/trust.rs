@@ -683,7 +683,11 @@ fn enroll_service_key(args: &EnrollServiceKeyArgs) -> Result<()> {
         "service public key must be exactly {PUBLIC_CA_BYTES} bytes \
          (32-byte Ed25519 followed by 1952-byte ML-DSA-65; key type {ENROLLMENT_KEY_TYPE})"
     );
-    let identities = combined_identities(&args.identities, &args.yubikey_identities)?;
+    let identities = inherited_identities(
+        &args.identities,
+        &args.identity_fds,
+        &args.yubikey_identities,
+    )?;
     let authority_log_bytes = read_limited(&args.authority_log, MAX_CLOUD_SECRET_BYTES)?;
     let installed_log: AuthorityLogFile =
         serde_json::from_slice(&authority_log_bytes).context("decode installed authority log")?;
@@ -707,11 +711,21 @@ fn enroll_service_key(args: &EnrollServiceKeyArgs) -> Result<()> {
         grants_enrollment,
         "delegation does not carry the service-key-enrollment capability"
     );
-    let delegated = decrypt_authority(
-        &args.via_delegated_signer,
-        &identities,
-        args.software_recovery,
-    )?;
+    let delegated = match (
+        args.via_delegated_signer.as_deref(),
+        args.via_delegated_signer_fd,
+    ) {
+        (Some(delegated_path), None) => {
+            decrypt_authority(delegated_path, &identities, args.software_recovery)?
+        }
+        (None, Some(fd)) => {
+            let ciphertext = read_fd_limited(fd, MAX_AGE_CIPHERTEXT_BYTES, "delegated signer")?;
+            decrypt_authority_ciphertext(&ciphertext, &identities, args.software_recovery)?
+        }
+        // Clap requires exactly one signer source. This arm only fires if the
+        // invariant is bypassed programmatically.
+        _ => bail!("--via-delegated-signer or --via-delegated-signer-fd is required"),
+    };
     ensure!(
         delegated.bundle.purpose == AuthorityPurpose::RegistryDelegatedSigner,
         "selected key is not a registry delegated signer"
@@ -1898,23 +1912,37 @@ fn combined_identities(generic: &[PathBuf], yubikey: &[PathBuf]) -> Result<AgeId
 /// and size-capped here, then handed to the `age` child through anonymous
 /// memfds so plaintext never touches a filesystem path.
 fn mint_identities(args: &MintRegistryJwtArgs) -> Result<AgeIdentities> {
-    if args.identity_fds.is_empty() {
-        return combined_identities(&args.identities, &args.yubikey_identities);
+    inherited_identities(
+        &args.identities,
+        &args.identity_fds,
+        &args.yubikey_identities,
+    )
+}
+
+/// Resolve either path-backed or inherited-FD age identities. FD bytes remain
+/// zeroized while `AgeIdentities` materializes anonymous memfds for the age
+/// child; they are never reopened through a credential pathname.
+fn inherited_identities(
+    generic: &[PathBuf],
+    identity_fds: &[RawFd],
+    yubikey: &[PathBuf],
+) -> Result<AgeIdentities> {
+    if identity_fds.is_empty() {
+        return combined_identities(generic, yubikey);
     }
-    let mut bytes = Vec::with_capacity(args.identity_fds.len());
-    for &fd in &args.identity_fds {
+    let mut bytes = Vec::with_capacity(identity_fds.len());
+    for &fd in identity_fds {
         bytes.push(Zeroizing::new(read_fd_limited(
             fd,
             MAX_AGE_IDENTITY_BYTES,
             "age identity",
         )?));
     }
-    if args.yubikey_identities.is_empty() {
+    if yubikey.is_empty() {
         return AgeIdentities::new_in_memory(bytes);
     }
     // YubiKey path identities may be mixed in, exactly like the path forms.
-    let mut sources: Vec<_> = args
-        .yubikey_identities
+    let mut sources: Vec<_> = yubikey
         .iter()
         .cloned()
         .map(AgeIdentitySource::Path)
@@ -5155,6 +5183,32 @@ mod tests {
         }
     }
 
+    fn enrollment_fd_args(
+        fixture: &MintFdFixture,
+        signer_fd: RawFd,
+        identity_fd: RawFd,
+        service_public_key: PathBuf,
+        attestation: PathBuf,
+    ) -> EnrollServiceKeyArgs {
+        EnrollServiceKeyArgs {
+            public_ca: fixture.public_ca.clone(),
+            authority_log: fixture.authority_log.clone(),
+            authority_checkpoint: fixture.authority_checkpoint.clone(),
+            identities: vec![],
+            identity_fds: vec![identity_fd],
+            yubikey_identities: vec![],
+            software_recovery: false,
+            via_delegated_signer: None,
+            via_delegated_signer_fd: Some(signer_fd),
+            delegation: fixture.delegation.clone(),
+            service: "discovery".to_owned(),
+            service_public_key,
+            ttl_seconds: 3_600,
+            attestation,
+            force: false,
+        }
+    }
+
     #[test]
     fn mint_registry_jwt_via_inherited_fds_round_trips_through_production_verifier() {
         // Production mint shells out to `age`; skip where it is absent (the
@@ -5188,6 +5242,127 @@ mod tests {
         )
         .expect("production verifier must accept the FD-minted credential");
         assert_eq!(verified.registry_public_key, fixture.registry_key_bytes);
+    }
+
+    #[test]
+    fn enroll_service_key_via_inherited_fds_round_trips_through_production_verifier() {
+        // The same real age seam as staging is used here: a non-seekable
+        // signer credential and identity are consumed directly from inherited
+        // FDs, never reopened through /proc/self/fd/N.
+        if !age_available() {
+            eprintln!("skipping: age binary not on PATH");
+            return;
+        }
+        let fixture = mint_fd_fixture();
+        let out = tempfile::tempdir().unwrap();
+        let service_public_key = out.path().join("service-pubkey.hybrid");
+        let service = test_authority(AuthorityPurpose::Root, None);
+        std::fs::write(&service_public_key, service.public_bytes()).unwrap();
+        let attestation = out.path().join("service-key-enrollment.json");
+        let signer = fd_pipe(&fixture.delegated_key_bytes);
+        let identity = fd_pipe(&fixture.signer_identity_bytes);
+        let args = enrollment_fd_args(
+            &fixture,
+            signer.as_raw_fd(),
+            identity.as_raw_fd(),
+            service_public_key,
+            attestation.clone(),
+        );
+
+        enroll_service_key(&args).expect("FD-form enrollment must succeed");
+
+        let verified = hyprstream_discovery::verify_service_key_enrollment(
+            &std::fs::read(&fixture.public_ca).unwrap(),
+            &std::fs::read(&fixture.authority_log).unwrap(),
+            &std::fs::read(&fixture.authority_checkpoint).unwrap(),
+            &std::fs::read(&attestation).unwrap(),
+        )
+        .expect("production verifier must accept the FD-minted attestation");
+        assert_eq!(verified.service, "discovery");
+        assert_eq!(verified.hybrid_public_key, service.public_bytes());
+    }
+
+    #[test]
+    fn enroll_service_key_fd_flags_reject_incomplete_or_mixed_forms() {
+        use clap::Subcommand as _;
+        let parse = |extra: &[&str]| {
+            TrustCommand::augment_subcommands(clap::Command::new("hyprstream"))
+                .try_get_matches_from(
+                    ["hyprstream", "enroll-service-key"]
+                        .into_iter()
+                        .chain(extra.iter().copied()),
+                )
+        };
+        let required = [
+            "--delegation",
+            "d.json",
+            "--service",
+            "discovery",
+            "--service-public-key",
+            "service-pubkey.hybrid",
+        ];
+        // A signer input is mandatory; there is no implicit path fallback.
+        assert!(parse(&[
+            "--identity",
+            "id",
+            "--delegation",
+            "d.json",
+            "--service",
+            "discovery",
+            "--service-public-key",
+            "service-pubkey.hybrid",
+        ])
+        .is_err());
+        // Path and inherited-FD signer forms are exclusive.
+        assert!(parse(&[
+            "--via-delegated-signer",
+            "signer.age",
+            "--via-delegated-signer-fd",
+            "10",
+            "--identity",
+            "id",
+            "--delegation",
+            "d.json",
+            "--service",
+            "discovery",
+            "--service-public-key",
+            "service-pubkey.hybrid",
+        ])
+        .is_err());
+        // Path and inherited-FD identity forms are exclusive.
+        assert!(parse(&[
+            "--via-delegated-signer-fd",
+            "10",
+            "--identity",
+            "id",
+            "--identity-fd",
+            "11",
+            "--delegation",
+            "d.json",
+            "--service",
+            "discovery",
+            "--service-public-key",
+            "service-pubkey.hybrid",
+        ])
+        .is_err());
+        // The pure inherited-FD form parses and has no pathname credential.
+        let mut fd_form = vec!["--via-delegated-signer-fd", "10", "--identity-fd", "11"];
+        fd_form.extend(required);
+        assert!(parse(&fd_form).is_ok());
+        // The established path form remains accepted.
+        assert!(parse(&[
+            "--via-delegated-signer",
+            "signer.age",
+            "--identity",
+            "id",
+            "--delegation",
+            "d.json",
+            "--service",
+            "discovery",
+            "--service-public-key",
+            "service-pubkey.hybrid",
+        ])
+        .is_ok());
     }
 
     #[test]
