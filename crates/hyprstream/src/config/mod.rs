@@ -1774,6 +1774,10 @@ pub struct DiscoveryServiceConfig {
     /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
     #[serde(default)]
     pub quic_port: Option<u16>,
+    /// Volatile Discovery state. Memory is the single-process/WASM default;
+    /// active-active deployments must select Valkey or tiered memory+Valkey.
+    #[serde(default)]
+    pub state: hyprstream_discovery::DiscoveryStateConfig,
 }
 
 /// TUI display server configuration.
