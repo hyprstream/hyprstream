@@ -388,6 +388,12 @@ static BOOTSTRAP_SERVICE_CLEARANCES: &[ServiceSubjectClearance] = &[
              clearance",
     },
     ServiceSubjectClearance {
+        service: "model",
+        clearance: BOOTSTRAP_SERVICE_CLEARANCE,
+        justification: "the staged synthetic model registers its key before \
+             its inference RPC surface can start",
+    },
+    ServiceSubjectClearance {
         service: "oauth",
         clearance: BOOTSTRAP_SERVICE_CLEARANCE,
         justification: "login/session issuance is how identity standing is \
@@ -469,14 +475,14 @@ mod tests {
             assert!(!row.justification.is_empty());
         }
 
-        // The five staging bootstrap services each hold the deliberate
+        // The six staging bootstrap services each hold the deliberate
         // service subject clearance, and each declared caller's clearance
         // dominates every declared object label (the boot calls evaluate).
         let mut services: Vec<&str> = table.clearances().iter().map(|row| row.service).collect();
         services.sort_unstable();
         assert_eq!(
             services,
-            ["discovery", "event", "oauth", "policy", "registry"]
+            ["discovery", "event", "model", "oauth", "policy", "registry"]
         );
         for row in table.clearances() {
             assert_eq!(row.clearance, BOOTSTRAP_SERVICE_CLEARANCE);
@@ -557,7 +563,7 @@ mod tests {
             .is_none());
         // Undeclared service clearance.
         assert!(table.service_clearance("ghost").is_none());
-        assert!(table.service_clearance("model").is_none());
+        assert!(table.service_clearance("metrics").is_none());
 
         // The RpcObjectLabelResolver view agrees (None ⇒ deny).
         let resolver: &dyn RpcObjectLabelResolver = table;
@@ -659,7 +665,7 @@ mod tests {
         // Every declared bootstrap service caller permits the boot
         // registration call (deliberate clearance composed with verified key
         // material).
-        for service in ["discovery", "event", "oauth", "policy", "registry"] {
+        for service in ["discovery", "event", "model", "oauth", "policy", "registry"] {
             let ctx = service_subject_ctx(service, 0x63);
             assert_eq!(
                 pep.check(&ctx, "policy", Some(policy_methods::REGISTER_SERVICE_KEY)),
