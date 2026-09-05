@@ -991,6 +991,7 @@ fn handle_quick_command(
                         };
                         handle_training_infer(
                             registry,
+                            hyprstream_rpc::registry::global().endpoint("policy", SocketKind::Rep),
                             &model,
                             &prompt_text,
                             image,
@@ -1025,6 +1026,7 @@ fn handle_quick_command(
                     } => {
                         handle_training_batch(
                             registry,
+                            hyprstream_rpc::registry::global().endpoint("policy", SocketKind::Rep),
                             &model,
                             input,
                             input_dir,
