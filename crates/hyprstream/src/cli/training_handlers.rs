@@ -325,6 +325,7 @@ fn save_training_config(
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_training_infer(
     registry: &RegistryClient,
+    policy_transport: hyprstream_rpc::transport::TransportConfig,
     model_ref_str: &str,
     prompt: &str,
     image_path: Option<String>,
@@ -389,6 +390,7 @@ pub async fn handle_training_infer(
         verifying_key,
         signing_key.clone(),
         transport,
+        policy_transport,
         None, // CLI: no FsOps
     );
     let spawner = ServiceSpawner::threaded();
@@ -563,6 +565,7 @@ async fn collect_inference_stream(
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_training_batch(
     registry: &RegistryClient,
+    policy_transport: hyprstream_rpc::transport::TransportConfig,
     model_ref_str: &str,
     input_files: Vec<String>,
     input_dir: Option<PathBuf>,
@@ -683,6 +686,7 @@ pub async fn handle_training_batch(
         verifying_key,
         signing_key.clone(),
         transport,
+        policy_transport,
         None, // CLI: no FsOps
     );
     let spawner = ServiceSpawner::threaded();
