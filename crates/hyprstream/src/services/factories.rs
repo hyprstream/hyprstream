@@ -56,6 +56,32 @@ fn service_token(signing_key: &SigningKey) -> Option<String> {
         .and_then(|att| att.jwt)
 }
 
+/// Construct a Policy client through the service context's resolved transport.
+///
+/// `for_local_bootstrap` reads only the process-local endpoint registry. That
+/// is appropriate for co-located services, but a rootless Quadlet starts each
+/// service in a separate process. `ServiceContext::transport` preserves the
+/// in-process endpoint when applicable and resolves the shared IPC socket when
+/// `--ipc` is selected.
+fn policy_client_for_context(
+    ctx: &ServiceContext,
+    signing_key: SigningKey,
+    policy_vk: hyprstream_rpc::crypto::VerifyingKey,
+    token: Option<String>,
+) -> anyhow::Result<PolicyClient> {
+    let transport = ctx.transport("policy", SocketKind::Rep);
+    PolicyClient::for_local_transport_bootstrap(&transport, signing_key, policy_vk, token)
+}
+
+fn policy_client_for_transport(
+    transport: &hyprstream_rpc::transport::TransportConfig,
+    signing_key: SigningKey,
+    policy_vk: hyprstream_rpc::crypto::VerifyingKey,
+    token: Option<String>,
+) -> anyhow::Result<PolicyClient> {
+    PolicyClient::for_local_transport_bootstrap(transport, signing_key, policy_vk, token)
+}
+
 /// Shared Git2DB registry instance. Lazily initialized by the first factory
 /// that needs it. Both PolicyService and RegistryService share this instance.
 static SHARED_GIT2DB: std::sync::OnceLock<Arc<RwLock<Git2DB>>> = std::sync::OnceLock::new();
@@ -275,7 +301,7 @@ fn resolve_registration_jwt(
 /// seeded into the trust store so that peer-client construction
 /// (`service_token`) and the background renewal task can read it.
 fn register_service_key(
-    _ctx: &ServiceContext,
+    ctx: &ServiceContext,
     service_name: &str,
     signing_key: &SigningKey,
 ) -> anyhow::Result<()> {
@@ -324,8 +350,13 @@ fn register_service_key(
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(signing_key.clone(), policy_vk, Some(jwt.clone()))?;
+    let policy_transport = ctx.transport("policy", SocketKind::Rep);
+    let policy_client = policy_client_for_transport(
+        &policy_transport,
+        signing_key.clone(),
+        policy_vk,
+        Some(jwt.clone()),
+    )?;
 
     let request = RegisterServiceKey {
         service_name: service_name.to_owned(),
@@ -350,6 +381,7 @@ fn register_service_key(
         signing_key.clone(),
         creds_dir,
         secrets_profile,
+        policy_transport,
     );
 
     Ok(())
@@ -379,6 +411,7 @@ fn spawn_jwt_renewal_task(
     signing_key: SigningKey,
     credentials_dir: std::path::PathBuf,
     secrets_profile: crate::auth::identity_store::SecretsProfile,
+    policy_transport: hyprstream_rpc::transport::TransportConfig,
 ) {
     let service_name = service_name.to_owned();
     tokio::spawn(async move {
@@ -436,7 +469,8 @@ fn spawn_jwt_renewal_task(
                 (vk, svc_jwt)
             };
 
-            let policy_client = match PolicyClient::for_local_bootstrap(
+            let policy_client = match policy_client_for_transport(
+                &policy_transport,
                 signing_key.clone(),
                 policy_vk,
                 Some(current_jwt),
@@ -920,8 +954,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // #910a — the registry service is the sole PDS-record writer AND the sole
     // holder of the `#atproto` private key: it opens the durable store
@@ -1182,8 +1215,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // Create registry client
     let registry_client: RegistryClient =
@@ -1434,11 +1466,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = crate::services::PolicyClient::for_local_bootstrap(
-        sk.clone(),
-        policy_vk,
-        service_token(&sk),
-    )?;
+    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     worker_service.set_authorize_fn(super::worker::build_authorize_fn(policy_client));
     if let Some(issuer) = ctx.oauth_issuer_url() {
         worker_service.set_expected_audience(issuer.to_owned());
@@ -1513,11 +1541,7 @@ fn create_workflow_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = crate::services::PolicyClient::for_local_bootstrap(
-        sk.clone(),
-        policy_vk,
-        service_token(&sk),
-    )?;
+    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     workflow_service.set_authorize_fn(crate::services::worker::build_authorize_fn(policy_client));
     if let Some(issuer) = ctx.oauth_issuer_url() {
         workflow_service.set_expected_audience(issuer.to_owned());
@@ -1604,8 +1628,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // Create registry client
     let registry_client: RegistryClient =
@@ -1708,8 +1731,7 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     let federation_resolver = Arc::new(
         crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
             .with_policy_client(Arc::new(policy_client)),
@@ -1804,8 +1826,7 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     let federation_resolver = Arc::new(
         crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
             .with_policy_client(Arc::new(policy_client.clone())),
@@ -1966,7 +1987,8 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         if let Some(fed) = federation_key_source {
             fed
         } else {
-            let fallback_policy_client = std::sync::Arc::new(PolicyClient::for_local_bootstrap(
+            let fallback_policy_client = std::sync::Arc::new(policy_client_for_context(
+                ctx,
                 ctx.service_signing_key("mcp"),
                 policy_vk,
                 service_token(&sk),
@@ -2402,8 +2424,7 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // Build the direct-VFS PEP before exposing the namespace. Failure to open
     // its signed WAL aborts construction; there is no unarmed fallback.
@@ -2495,8 +2516,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     let auth_provider = crate::services::discovery::PolicyAuthProvider::new(policy_client);
 
     // #431 — record resolver backing getRecord/getRepo, over the durable
@@ -2639,8 +2659,7 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     let mut metrics_service = MetricsService::new(
         orchestrator,
@@ -2722,6 +2741,28 @@ fn compute_tls_endorsement(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Rootless Quadlets run each service in a distinct process, so the
+    /// process-local endpoint registry cannot resolve Policy for Discovery or
+    /// its downstream peers. The typed IPC transport remains lazy: creating a
+    /// client for the shared socket must not require a co-located registration.
+    #[test]
+    fn policy_client_accepts_unregistered_ipc_transport() {
+        let signing_key = SigningKey::from_bytes(&[0x63; 32]);
+        let transport =
+            hyprstream_rpc::transport::TransportConfig::ipc("/run/hyprstream/policy.sock");
+
+        let client = policy_client_for_transport(
+            &transport,
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            None,
+        );
+        assert!(
+            client.is_ok(),
+            "IPC policy client must be lazy at first boot"
+        );
+    }
 
     #[test]
     fn at9p_verify_factory_uses_canonical_service_name() {
