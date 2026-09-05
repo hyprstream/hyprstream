@@ -57,6 +57,7 @@ use std::sync::Arc;
 // Unified service manager API
 use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
 use hyprstream_rpc::transport::TransportConfig;
+use hyprstream_rpc::registry::SocketKind;
 use hyprstream_rpc::{SigningKey, VerifyingKey};
 
 fn supports_tui() -> bool {
@@ -2759,6 +2760,7 @@ fn main() -> Result<()> {
                                             }
                                         }
                                     };
+                                    let discovery_transport = ctx.transport("discovery", SocketKind::Rep);
                                     let shared = hyprstream_service::QuicSharedConfig {
                                         cert_chain,
                                         key_der,
@@ -2771,7 +2773,8 @@ fn main() -> Result<()> {
                                         // #358: producer-chosen relay rendezvous (None = direct-only).
                                         moq_relay,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
-                                            |request: hyprstream_service::NativeAnnouncementRequest| {
+                                            move |request: hyprstream_service::NativeAnnouncementRequest| {
+                                                let discovery_transport = discovery_transport.clone();
                                                 std::thread::spawn(move || {
                                                     let runtime = match tokio::runtime::Builder::new_current_thread()
                                                         .enable_all()
@@ -2784,7 +2787,8 @@ fn main() -> Result<()> {
                                                         }
                                                     };
                                                     runtime.block_on(async move {
-                                                        let client = match hyprstream_discovery::DiscoveryClient::for_local_bootstrap(
+                                                        let client = match hyprstream_discovery::DiscoveryClient::for_local_transport_bootstrap(
+                                                            &discovery_transport,
                                                             request.signing_key,
                                                             request.discovery_verifying_key,
                                                             None,

@@ -1238,6 +1238,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
                 policy_client,
                 registry_client,
                 ctx.transport("model", SocketKind::Rep),
+                ctx.transport("policy", SocketKind::Rep),
             )
         })
     })?;
@@ -1312,6 +1313,7 @@ fn create_inference_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
         sk.verifying_key(),
         sk.clone(),
         ctx.transport(&instance_name, SocketKind::Rep),
+        ctx.transport("policy", SocketKind::Rep),
         None,
     )
     .with_instance_identity(

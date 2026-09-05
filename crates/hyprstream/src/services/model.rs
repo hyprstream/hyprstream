@@ -188,6 +188,7 @@ pub struct ModelServiceInner {
     registry: RegistryClient,
     // Infrastructure (for Spawnable)
     transport: TransportConfig,
+    policy_transport: TransportConfig,
     /// Expected JWT audience for token validation (RFC 8707).
     expected_audience: Option<String>,
     /// Unified JWT key source for verifying JWTs (local and federated).
@@ -414,6 +415,7 @@ impl ModelService {
         policy_client: PolicyClient,
         registry: RegistryClient,
         transport: TransportConfig,
+        policy_transport: TransportConfig,
     ) -> Result<Self> {
         config.inference_deployment.validate()?;
         // SAFETY: 5 is a valid non-zero value
@@ -436,6 +438,7 @@ impl ModelService {
             event_publisher,
             registry,
             transport,
+            policy_transport,
             expected_audience: None,
             jwt_key_source: None,
             discovery_client: None,
@@ -994,6 +997,7 @@ impl ModelService {
             self.signing_key.verifying_key(),
             self.signing_key.clone(),
             transport.clone(),
+            self.policy_transport.clone(),
             fs,
         )
         .with_instance_identity(
@@ -2763,6 +2767,7 @@ mod tests {
             PolicyClient::new(Arc::clone(&infrastructure_rpc)),
             RegistryClient::new(infrastructure_rpc),
             TransportConfig::inproc("selector-model-service"),
+            TransportConfig::inproc("policy"),
         )
         .await
         .unwrap_or_else(|error| panic!("construct model-free selector service failed: {error}"))

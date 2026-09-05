@@ -389,6 +389,7 @@ pub async fn handle_training_infer(
         verifying_key,
         signing_key.clone(),
         transport,
+        hyprstream_rpc::transport::TransportConfig::inproc("policy"),
         None, // CLI: no FsOps
     );
     let spawner = ServiceSpawner::threaded();
@@ -683,6 +684,7 @@ pub async fn handle_training_batch(
         verifying_key,
         signing_key.clone(),
         transport,
+        hyprstream_rpc::transport::TransportConfig::inproc("policy"),
         None, // CLI: no FsOps
     );
     let spawner = ServiceSpawner::threaded();
