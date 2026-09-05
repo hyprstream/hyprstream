@@ -1908,6 +1908,8 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         config.account.clone(),
         sk,
         ctx.transport("oauth", SocketKind::Rep),
+        ctx.transport("policy", SocketKind::Rep),
+        ctx.transport("discovery", SocketKind::Rep),
         ctx.verifying_key(),
         ctx.jwt_verifying_key(),
     )
@@ -1959,6 +1961,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         verifying_key: ctx.verifying_key(),
         signing_key: sk.clone(),
         transport: ctx.transport("mcp", SocketKind::Rep),
+        policy_transport: ctx.transport("policy", SocketKind::Rep),
         ctx: None, // ServiceContext not yet available as Arc — handlers use signing_key directly
         policy_verifying_key: policy_vk,
         expected_audience: Some(config.mcp.resource_url()),
