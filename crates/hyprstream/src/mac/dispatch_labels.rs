@@ -141,11 +141,11 @@ impl DeclaredDispatchTable {
     /// The production staging-bootstrap declarations (#1499).
     ///
     /// Object rows cover exactly the dispatch calls the fresh-state
-    /// `service start --services event,policy,discovery,registry,oauth` boot
+    /// `service start --services event,policy,discovery,registry,model,oai,oauth` boot
     /// graph makes: every keyed non-policy service registers its signing key
     /// with the PolicyService CA at startup and renews that identity
     /// hourly. Subject rows declare the deliberate caller clearance for all
-    /// five bootstrap services.
+    /// seven bootstrap services.
     #[must_use]
     pub fn production() -> &'static Self {
         &PRODUCTION_TABLE
@@ -394,6 +394,12 @@ static BOOTSTRAP_SERVICE_CLEARANCES: &[ServiceSubjectClearance] = &[
              its inference RPC surface can start",
     },
     ServiceSubjectClearance {
+        service: "oai",
+        clearance: BOOTSTRAP_SERVICE_CLEARANCE,
+        justification: "the staged OpenAI-compatible API registers its key \
+             before accepting requests on its public HTTP surface",
+    },
+    ServiceSubjectClearance {
         service: "oauth",
         clearance: BOOTSTRAP_SERVICE_CLEARANCE,
         justification: "login/session issuance is how identity standing is \
@@ -452,7 +458,7 @@ mod tests {
     fn every_declared_call_resolves_to_the_intended_typed_label_and_clearance() {
         let table = DeclaredDispatchTable::production();
 
-        // The fresh boot graph: discovery, registry, and oauth each call
+        // The fresh boot graph: discovery, registry, model, oai, and oauth each call
         // policy.registerServiceKey on fresh state; renewal uses
         // policy.refreshServiceToken. Every declared row resolves to the
         // intended typed label — the lattice floor, deliberate and reviewed.
@@ -475,14 +481,22 @@ mod tests {
             assert!(!row.justification.is_empty());
         }
 
-        // The six staging bootstrap services each hold the deliberate
+        // The seven staging bootstrap services each hold the deliberate
         // service subject clearance, and each declared caller's clearance
         // dominates every declared object label (the boot calls evaluate).
         let mut services: Vec<&str> = table.clearances().iter().map(|row| row.service).collect();
         services.sort_unstable();
         assert_eq!(
             services,
-            ["discovery", "event", "model", "oauth", "policy", "registry"]
+            [
+                "discovery",
+                "event",
+                "model",
+                "oai",
+                "oauth",
+                "policy",
+                "registry"
+            ]
         );
         for row in table.clearances() {
             assert_eq!(row.clearance, BOOTSTRAP_SERVICE_CLEARANCE);
@@ -665,7 +679,15 @@ mod tests {
         // Every declared bootstrap service caller permits the boot
         // registration call (deliberate clearance composed with verified key
         // material).
-        for service in ["discovery", "event", "model", "oauth", "policy", "registry"] {
+        for service in [
+            "discovery",
+            "event",
+            "model",
+            "oai",
+            "oauth",
+            "policy",
+            "registry",
+        ] {
             let ctx = service_subject_ctx(service, 0x63);
             assert_eq!(
                 pep.check(&ctx, "policy", Some(policy_methods::REGISTER_SERVICE_KEY)),
