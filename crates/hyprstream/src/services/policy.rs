@@ -272,6 +272,30 @@ impl PolicyService {
         Ok(oid.to_string())
     }
 
+    /// Preserve the shared repository index before a role mutation is staged.
+    /// A failed audit commit must not leave the rejected role change staged for
+    /// git2db startup recovery to commit later.
+    async fn snapshot_policy_index(&self) -> Result<git2::Oid> {
+        let reg = self.git2db.read().await;
+        let handle = reg.repo(&self.registry_repo_id)?;
+        handle
+            .staging()
+            .snapshot()
+            .await
+            .map_err(|e| anyhow!("Failed to snapshot policy staging index: {e}"))
+    }
+
+    /// Restore the index captured before a failed role audit transaction.
+    async fn restore_policy_index(&self, snapshot: git2::Oid) -> Result<()> {
+        let reg = self.git2db.read().await;
+        let handle = reg.repo(&self.registry_repo_id)?;
+        handle
+            .staging()
+            .restore(snapshot)
+            .await
+            .map_err(|e| anyhow!("Failed to restore policy staging index: {e}"))
+    }
+
     /// Select the Casbin domain for PolicyService itself.
     ///
     /// Tenant-bearing callers stay in their authority-verified tenant. The
@@ -1370,6 +1394,7 @@ impl PolicyHandler for PolicyService {
         }
 
         let _write_guard = self.policy_write_lock.lock().await;
+        let index_snapshot = self.snapshot_policy_index().await?;
         // Global bootstrap policy stores memberships in Casbin's global `g`
         // relation; tenant-scoped memberships live in `g2`. Do not turn a
         // global authority domain into a literal `g2(..., "*")` row.
@@ -1438,13 +1463,22 @@ impl PolicyHandler for PolicyService {
                         .await
                 };
                 match rollback {
-                    Ok(true) => self.policy_manager.save().await.map_err(|rollback_error| {
-                        anyhow!(
-                            "Role grant audit commit failed: {}; rollback persistence failed: {}",
-                            e,
-                            rollback_error
-                        )
-                    })?,
+                    Ok(true) => {
+                        self.policy_manager.save().await.map_err(|rollback_error| {
+                            anyhow!(
+                                "Role grant audit commit failed: {}; rollback persistence failed: {}",
+                                e,
+                                rollback_error
+                            )
+                        })?;
+                        self.restore_policy_index(index_snapshot).await.map_err(|rollback_error| {
+                            anyhow!(
+                                "Role grant audit commit failed: {}; rollback index restoration failed: {}",
+                                e,
+                                rollback_error
+                            )
+                        })?;
+                    }
                     Ok(false) => return Err(anyhow!(
                         "Role grant audit commit failed: {}; rollback was not applied",
                         e
@@ -1508,6 +1542,7 @@ impl PolicyHandler for PolicyService {
         }
 
         let _write_guard = self.policy_write_lock.lock().await;
+        let index_snapshot = self.snapshot_policy_index().await?;
         // Match the grouping relation selected by role grant above. A global
         // bootstrap membership is `g(user, role)`, not `g2(user, role, "*")`.
         let changed = if domain == "*" {
@@ -1572,13 +1607,22 @@ impl PolicyHandler for PolicyService {
                         .await
                 };
                 match rollback {
-                    Ok(true) => self.policy_manager.save().await.map_err(|rollback_error| {
-                        anyhow!(
-                            "Role revoke audit commit failed: {}; rollback persistence failed: {}",
-                            e,
-                            rollback_error
-                        )
-                    })?,
+                    Ok(true) => {
+                        self.policy_manager.save().await.map_err(|rollback_error| {
+                            anyhow!(
+                                "Role revoke audit commit failed: {}; rollback persistence failed: {}",
+                                e,
+                                rollback_error
+                            )
+                        })?;
+                        self.restore_policy_index(index_snapshot).await.map_err(|rollback_error| {
+                            anyhow!(
+                                "Role revoke audit commit failed: {}; rollback index restoration failed: {}",
+                                e,
+                                rollback_error
+                            )
+                        })?;
+                    }
                     Ok(false) => return Err(anyhow!(
                         "Role revoke audit commit failed: {}; rollback was not applied",
                         e
