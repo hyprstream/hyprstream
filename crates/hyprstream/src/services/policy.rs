@@ -1364,15 +1364,10 @@ impl PolicyHandler for PolicyService {
                 .await
         }
         .map_err(|e| anyhow!("Failed to add role: {}", e))?;
-        if !changed {
-            return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: format!("Role '{}' is already assigned to '{}'", data.role, data.user),
-                code: "NO_CHANGE".to_owned(),
-                details: "No policy update was committed.".to_owned(),
-            }));
-        }
 
-        // Persist in-memory Casbin state to disk before staging
+        // Persist and stage even when Casbin reports no new edge: a prior
+        // mutation may have succeeded in memory while its save or commit
+        // failed, and this request is the durable retry.
         self.policy_manager.save().await
             .map_err(|e| anyhow!("Failed to save policy after role grant: {}", e))?;
 
@@ -1388,6 +1383,14 @@ impl PolicyHandler for PolicyService {
                 format!("(commit failed: {})", e)
             }
         };
+
+        if !changed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Role '{}' is already assigned to '{}'", data.role, data.user),
+                code: "NO_CHANGE".to_owned(),
+                details: "Any pending policy persistence was retried.".to_owned(),
+            }));
+        }
 
         info!(
             "Granted role '{}' to '{}' in domain '{}' (caller={})",
@@ -1444,15 +1447,10 @@ impl PolicyHandler for PolicyService {
                 .await
         }
         .map_err(|e| anyhow!("Failed to remove role: {}", e))?;
-        if !changed {
-            return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: format!("Role '{}' is not assigned to '{}'", data.role, data.user),
-                code: "NOT_FOUND".to_owned(),
-                details: "No policy update was committed.".to_owned(),
-            }));
-        }
 
-        // Persist in-memory Casbin state to disk before staging
+        // A false result can be a retry after an in-memory removal whose
+        // prior save or commit failed. Persist and stage that state before
+        // reporting the semantic no-op to the caller.
         self.policy_manager.save().await
             .map_err(|e| anyhow!("Failed to save policy after role revoke: {}", e))?;
 
@@ -1468,6 +1466,14 @@ impl PolicyHandler for PolicyService {
                 format!("(commit failed: {})", e)
             }
         };
+
+        if !changed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Role '{}' is not assigned to '{}'", data.role, data.user),
+                code: "NOT_FOUND".to_owned(),
+                details: "Any pending policy persistence was retried.".to_owned(),
+            }));
+        }
 
         info!(
             "Revoked role '{}' from '{}' in domain '{}' (caller={})",
