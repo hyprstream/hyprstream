@@ -3122,6 +3122,30 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn discovery_state_documentation_configures_root_backend() {
+        let doc = include_str!("../../../../docs/discovery-state.md");
+        let example = doc
+            .split_once("```toml\n")
+            .unwrap_or_else(|| panic!("TOML example"))
+            .1
+            .split_once("```")
+            .unwrap_or_else(|| panic!("closed TOML example"))
+            .0;
+        let config: HyprConfig = toml::from_str(example).unwrap_or_else(|e| panic!("{e}"));
+        let state = config.discovery.state;
+        assert_eq!(
+            state.backend,
+            hyprstream_discovery::DiscoveryStateBackend::Tiered
+        );
+        assert!(state.active_active);
+        assert_eq!(state.memory.announcement_capacity, 16_384);
+        assert_eq!(state.valkey.announcement_capacity, 65_536);
+        assert_eq!(state.valkey.key_prefix, "production");
+        assert_eq!(state.valkey.url, "rediss://discovery-state.example:6379");
+        assert_eq!(state.tiered.l1_max_ttl_ms, 1_000);
+    }
+
+    #[test]
     fn credentials_backend_default_matches_build_profile() {
         let config: CredentialsConfig =
             toml::from_str("").unwrap_or_else(|error| panic!("{error}"));

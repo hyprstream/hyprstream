@@ -745,6 +745,32 @@ pub struct DiscoveryService {
 }
 
 impl DiscoveryService {
+    /// Populate this replica's verified placement projection for an admitted
+    /// shared live node. Failed/absent repos use the existing bounded retry gate.
+    async fn ensure_placement_ingested(&self, node: &Did) {
+        if self.placement_index.record_uri(node.as_str()).is_none()
+            && self.placement_ingest_attempts.insert_if_absent(
+                node.clone(),
+                (),
+                PLACEMENT_INGEST_RETRY_TTL,
+            )
+        {
+            if let Some(resolver) = &self.record_resolver {
+                if let Err(e) = self
+                    .placement_index
+                    .ingest_did(resolver.as_ref(), node.as_str())
+                    .await
+                {
+                    tracing::warn!(
+                        node = %node,
+                        error = %e,
+                        "placement directory ingestion failed for live node (liveness still recorded)"
+                    );
+                }
+            }
+        }
+    }
+
     /// Create a new discovery service with infrastructure.
     ///
     /// `signing_key` is used for envelope signing (should be the per-service key
@@ -6022,8 +6048,7 @@ impl DiscoveryHandler for DiscoveryService {
                 &data.request_kem_recipient,
             )?;
             anyhow::ensure!(
-                recipient.suite_id
-                    == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
+                recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
                     && recipient.eks.len() == recipient.suite_id.components().len(),
                 "identity-bound announcement requires suite-complete hybrid KEM material"
             );
@@ -6114,9 +6139,15 @@ impl DiscoveryHandler for DiscoveryService {
         }
 
         let now_unix_ms = unix_millis_now();
-        let heartbeat_expiry = now_unix_ms
-            .saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64);
-        let mut live_until_unix_ms = data.expires_at_unix_ms.min(heartbeat_expiry);
+        let heartbeat_expiry = now_unix_ms.saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64);
+        // Legacy clients omit identity expiry (Cap'n Proto defaults it to 0).
+        // Only identity-bound announcements carry a signed expiry constraint.
+        let expires_at_unix_ms = if identity_bound {
+            data.expires_at_unix_ms
+        } else {
+            heartbeat_expiry
+        };
+        let mut live_until_unix_ms = expires_at_unix_ms.min(heartbeat_expiry);
         if identity_bound {
             if let Some(source) = &self.accepted_state_source {
                 let state = source
@@ -6127,8 +6158,7 @@ impl DiscoveryHandler for DiscoveryService {
                         && state.head_digest.as_slice() == data.accepted_state_digest.as_slice(),
                     "announcement does not match accepted-current state"
                 );
-                live_until_unix_ms =
-                    live_until_unix_ms.min(accepted_expiry_unix_ms(&state)?);
+                live_until_unix_ms = live_until_unix_ms.min(accepted_expiry_unix_ms(&state)?);
             }
         }
         anyhow::ensure!(
@@ -6147,7 +6177,7 @@ impl DiscoveryHandler for DiscoveryService {
             response_key_id: data.response_key_id.clone(),
             request_kem_key_id: data.request_kem_key_id.clone(),
             request_kem_recipient: data.request_kem_recipient.clone(),
-            expires_at_unix_ms: data.expires_at_unix_ms,
+            expires_at_unix_ms,
             source_signer: ctx.cnf,
             live_until_unix_ms,
         };
@@ -6493,11 +6523,7 @@ impl DiscoveryHandler for DiscoveryService {
             .selectors
             .iter()
             .map(|s| {
-                scheduling::LabelSelector::new(
-                    s.key.clone(),
-                    to_scheduling_op(s.op),
-                    s.values.clone(),
-                )
+                scheduling::LabelSelector::new(s.key.clone(), to_scheduling_op(s.op), s.values.clone())
             })
             .collect();
         let resources: Vec<scheduling::ResourceRequest> = data
@@ -6509,23 +6535,36 @@ impl DiscoveryHandler for DiscoveryService {
         // Hard liveness exclusion (decision #1): only nodes with a live,
         // unexpired `reportNodeLiveness` entry become candidates at all.
         let mut candidates: Vec<Candidate> = Vec::new();
-        for did in self.placement_index.known_node_dids() {
-            if let Some(live) = self
-                .state_store
-                .liveness(&Did::new(did.clone()), unix_millis_now())
-                .await?
+        for (node, _) in self.state_store.all_liveness(unix_millis_now()).await? {
+            let did = node.as_str().to_owned();
+            // Authorize before a query can trigger resolver work on this
+            // replica. Liveness is shared, but placement facts still come only
+            // from the verified repository ingestion path.
+            if self
+                .authorize(ctx, &format!("placement:candidate:{did}"), "query")
+                .await
+                .is_err()
             {
-                let labels = self.placement_index.effective_labels(&did);
-                let record_uri = self.placement_index.record_uri(&did).unwrap_or_default();
-                candidates.push(Candidate {
-                    did,
-                    record_uri,
-                    load_fraction: live.load_fraction,
-                    allocatable: live.allocatable,
-                    last_seen: live.last_seen,
-                    labels,
-                });
+                continue;
             }
+            self.ensure_placement_ingested(&node).await;
+            let Some(record_uri) = self.placement_index.record_uri(&did) else {
+                continue;
+            };
+            // Repository ingestion can take time; never return a node whose
+            // heartbeat expired while this replica was loading its facts.
+            let Some(live) = self.state_store.liveness(&node, unix_millis_now()).await? else {
+                continue;
+            };
+            let labels = self.placement_index.effective_labels(&did);
+            candidates.push(Candidate {
+                did,
+                record_uri,
+                load_fraction: live.load_fraction,
+                allocatable: live.allocatable,
+                last_seen: live.last_seen,
+                labels,
+            });
         }
 
         let predicates: Vec<scheduling::Predicate<Candidate>> = vec![
@@ -6683,27 +6722,7 @@ impl DiscoveryHandler for DiscoveryService {
         };
         self.state_store.put_liveness(&data.node, live).await?;
 
-        if self.placement_index.record_uri(&node_did).is_none()
-            && self.placement_ingest_attempts.insert_if_absent(
-                data.node.clone(),
-                (),
-                PLACEMENT_INGEST_RETRY_TTL,
-            )
-        {
-            if let Some(resolver) = &self.record_resolver {
-                if let Err(e) = self
-                    .placement_index
-                    .ingest_did(resolver.as_ref(), &node_did)
-                    .await
-                {
-                    tracing::warn!(
-                        node = %node_did,
-                        error = %e,
-                        "placement directory ingestion failed for heartbeating node (liveness still recorded)"
-                    );
-                }
-            }
-        }
+        self.ensure_placement_ingested(&data.node).await;
 
         Ok(DiscoveryResponseVariant::ReportNodeLivenessResult)
     }
@@ -7283,6 +7302,172 @@ mod query_candidates_tests {
             resp,
             DiscoveryResponseVariant::ReportNodeLivenessResult
         ));
+    }
+
+    async fn assert_cross_replica_candidates(a: DiscoveryState, b: DiscoveryState) {
+        let did = "did:web:shared-node.example";
+        let rec = sample_node_record(did, vec![("zone", "shared")]);
+        let repos = HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]);
+        let replica_a = service_with(Box::new(AllowAll), repos.clone()).with_state(a);
+        let replica_b = service_with(Box::new(AllowAll), repos.clone()).with_state(b.clone());
+        heartbeat(&replica_a, did, vec![("cpu", "8")], 0.25).await;
+        assert!(replica_b.placement_index.known_node_dids().is_empty());
+        let req = QueryCandidatesRequest {
+            selectors: vec![LabelSelector {
+                key: "zone".to_owned(),
+                op: SelectorOp::In,
+                values: vec!["shared".to_owned()],
+            }],
+            resources: vec![ResourceRequest {
+                name: "cpu".to_owned(),
+                min_quantity: "4".to_owned(),
+            }],
+            max_candidates: 0,
+        };
+        let result = as_set(
+            replica_b
+                .handle_query_candidates(&test_ctx(), 1, &req)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result.total_matching, 1);
+        assert_eq!(result.candidates[0].node, did);
+        assert_eq!(
+            result.candidates[0].record_uri,
+            format!("at://{did}/{}/3a", node::COLLECTION_NSID)
+        );
+        // A restarted replica and a policy-denied replica start without local
+        // placement state too. Only an authorized verified node is surfaced.
+        let restarted = service_with(Box::new(AllowAll), repos.clone()).with_state(b.clone());
+        assert_eq!(
+            as_set(
+                restarted
+                    .handle_query_candidates(&test_ctx(), 1, &req)
+                    .await
+                    .unwrap()
+            )
+            .total_matching,
+            1
+        );
+        let denied = service_with(Box::new(DenyNode(did.to_owned())), repos).with_state(b.clone());
+        assert_eq!(
+            as_set(
+                denied
+                    .handle_query_candidates(&test_ctx(), 1, &empty_query(0))
+                    .await
+                    .unwrap()
+            )
+            .total_matching,
+            0
+        );
+        assert!(denied.placement_index.known_node_dids().is_empty());
+        let missing_repo = service_with(Box::new(AllowAll), HashMap::new()).with_state(b);
+        assert_eq!(
+            as_set(
+                missing_repo
+                    .handle_query_candidates(&test_ctx(), 1, &empty_query(0))
+                    .await
+                    .unwrap()
+            )
+            .total_matching,
+            0
+        );
+        // Expiring the shared record excludes it even from populated indexes.
+        replica_a
+            .state_store
+            .all_liveness(unix_millis_now() + LIVENESS_TTL.as_millis() as i64 + 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            as_set(
+                replica_b
+                    .handle_query_candidates(&test_ctx(), 1, &req)
+                    .await
+                    .unwrap()
+            )
+            .total_matching,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_liveness_seeds_replica_without_local_placement() {
+        let state = DiscoveryState::connect(&crate::DiscoveryStateConfig::default())
+            .await
+            .unwrap();
+        assert_cross_replica_candidates(state.clone(), state).await;
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_shared_liveness_seeds_other_replica_and_restart() {
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        for backend in [
+            crate::DiscoveryStateBackend::Valkey,
+            crate::DiscoveryStateBackend::Tiered,
+        ] {
+            let config = crate::DiscoveryStateConfig {
+                backend,
+                active_active: true,
+                valkey: crate::ValkeyStateConfig {
+                    url: url.clone(),
+                    key_prefix: format!(
+                        "pr1560-candidates-{}-{}-{backend:?}",
+                        std::process::id(),
+                        unix_millis_now()
+                    ),
+                    pool_size: 2,
+                    ..crate::ValkeyStateConfig::default()
+                },
+                ..crate::DiscoveryStateConfig::default()
+            };
+            let a = DiscoveryState::connect(&config).await.unwrap();
+            let b = DiscoveryState::connect(&config).await.unwrap();
+            assert_cross_replica_candidates(a, b).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_announcement_without_identity_expiry_uses_heartbeat_ttl() {
+        let svc = service_with(Box::new(AllowAll), HashMap::new());
+        let request = ServiceAnnouncement {
+            service_name: "legacy".to_owned(),
+            socket_kind: "rep".to_owned(),
+            endpoint: "inproc://legacy".to_owned(),
+            service_jwt: None,
+            service_did: Did::new(String::new()),
+            capabilities: vec![],
+            accepted_state_digest: vec![],
+            accepted_state_epoch: 0,
+            response_key_id: String::new(),
+            request_kem_key_id: String::new(),
+            request_kem_recipient: vec![],
+            expires_at_unix_ms: 0,
+        };
+        let now = unix_millis_now();
+        assert!(matches!(
+            svc.handle_announce(&test_ctx(), 1, &request).await.unwrap(),
+            DiscoveryResponseVariant::AnnounceResult
+        ));
+        let entries = svc
+            .state_store
+            .announcements_for("legacy", now)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].live_until_unix_ms >= now + ANNOUNCED_ENDPOINT_TTL.as_millis() as i64);
+        assert_eq!(entries[0].expires_at_unix_ms, entries[0].live_until_unix_ms);
+        assert!(svc
+            .state_store
+            .announcements_for("legacy", entries[0].live_until_unix_ms)
+            .await
+            .unwrap()
+            .is_empty());
+        let mut bound = request;
+        bound.service_did = Did::new("did:at9p:identity-bound".to_owned());
+        assert!(svc.handle_announce(&test_ctx(), 1, &bound).await.is_err());
     }
 
     /// A denied heartbeat must not create a volatile liveness entry or trigger

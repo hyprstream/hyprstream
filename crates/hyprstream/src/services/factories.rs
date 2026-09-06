@@ -2543,6 +2543,8 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
         ctx.transport("discovery", SocketKind::Rep),
     )
     .with_state({
+        // Shared backends retain their own driver runtime after this temporary
+        // bootstrap runtime exits; service state owns its shutdown lifetime.
         let state_config = config.discovery.state.clone();
         std::thread::spawn(move || -> anyhow::Result<hyprstream_discovery::DiscoveryState> {
             let runtime = tokio::runtime::Builder::new_current_thread()
