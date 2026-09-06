@@ -38,7 +38,7 @@ jobs:
         set -euo pipefail
         runs="$(
           gh api \
-            "repos/${REPOSITORY}/actions/runs?head_sha=${EXPECTED_SHA}&event=merge_group&per_page=100"
+            "repos/${REPOSITORY}/actions/runs?head_sha=${EXPECTED_SHA}&per_page=100"
         )"
         matches="$(
           jq \
