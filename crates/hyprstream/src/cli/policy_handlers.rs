@@ -27,13 +27,31 @@ use std::process::Command;
 
 /// Create a PolicyClient for RPC calls.
 ///
-/// The top-level CLI installs the authenticated production resolver before it
-/// dispatches policy commands. It resolves the policy service's same-host IPC
-/// endpoint and pinned response key from deployment trust. Do not use the
-/// process-local bootstrap registry here: a `podman exec` CLI is a distinct
-/// process and therefore cannot inherit the server process's registrations.
+/// PolicyService's identity is the node root/CA key, so the local bootstrap
+/// caller and the target response verifier intentionally use the same pinned
+/// key. The endpoint registry's IPC default is deterministic from the runtime
+/// directory; unlike `registered_endpoint`, it is available to a separate
+/// `podman exec` process that did not start the PolicyService itself.
 fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
-    PolicyClient::from_resolver(signing_key.clone(), None)
+    let registry = hyprstream_rpc::registry::try_global()
+        .ok_or_else(|| anyhow::anyhow!("EndpointRegistry not initialized"))?;
+    let transport = policy_ipc_transport(&registry)?;
+    PolicyClient::for_local_transport_bootstrap(
+        &transport,
+        signing_key.clone(),
+        signing_key.verifying_key(),
+        None,
+    )
+}
+
+/// Resolve the deterministic same-host PolicyService REP socket without
+/// requiring a process-local service registration.
+fn policy_ipc_transport(
+    registry: &hyprstream_rpc::registry::EndpointRegistry,
+) -> Result<hyprstream_rpc::transport::TransportConfig> {
+    registry
+        .try_endpoint("policy", hyprstream_rpc::registry::SocketKind::Rep)
+        .context("resolve local PolicyService IPC endpoint")
 }
 
 /// Handle `policy show` - Display the running policy via RPC
@@ -693,20 +711,23 @@ mod tests {
     }
 
     #[test]
-    fn policy_cli_client_uses_authenticated_process_resolver() {
-        let source = include_str!("policy_handlers.rs");
-        let client_factory = source
-            .split("/// Handle `policy show`")
-            .next()
-            .expect("policy client factory precedes policy handlers");
+    fn policy_cli_uses_ipc_default_without_process_local_registration() {
+        let registry = hyprstream_rpc::registry::EndpointRegistry::new(
+            hyprstream_rpc::registry::EndpointMode::Ipc,
+            Some(std::path::PathBuf::from("/run/hyprstream")),
+        );
 
         assert!(
-            client_factory.contains("PolicyClient::from_resolver(signing_key.clone(), None)"),
-            "policy CLI must use the resolver installed by top-level bootstrap"
+            registry
+                .registered_endpoint("policy", hyprstream_rpc::registry::SocketKind::Rep)
+                .is_none(),
+            "this simulates the distinct podman-exec CLI process"
         );
-        assert!(
-            !client_factory.contains("PolicyClient::for_local_bootstrap("),
-            "a distinct CLI process has no server-local endpoint registry"
+        let transport = policy_ipc_transport(&registry)
+            .expect("IPC mode must provide the deterministic policy REP socket");
+        assert_eq!(
+            transport.endpoint_string(),
+            "ipc:///run/hyprstream/policy.sock",
         );
     }
 }
