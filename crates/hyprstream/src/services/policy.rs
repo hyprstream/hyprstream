@@ -956,7 +956,7 @@ impl PolicyHandler for PolicyService {
         data: &ApplyDraft,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
         let allowed = self.policy_manager.check_with_domain(
             &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
@@ -1008,7 +1008,7 @@ impl PolicyHandler for PolicyService {
         data: &RollbackPolicy,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
         let allowed = self.policy_manager.check_with_domain(
             &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
@@ -1104,7 +1104,7 @@ impl PolicyHandler for PolicyService {
         data: &GetHistory,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
         let allowed = self.policy_manager.check_with_domain(
             &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
@@ -1192,7 +1192,7 @@ impl PolicyHandler for PolicyService {
         data: &GetDiff,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
         let allowed = self.policy_manager.check_with_domain(
             &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
@@ -1250,7 +1250,7 @@ impl PolicyHandler for PolicyService {
         _request_id: u64,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
         let allowed = self.policy_manager.check_with_domain(
             &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
@@ -1299,7 +1299,7 @@ impl PolicyHandler for PolicyService {
         data: &AddGrouping,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
 
         // Fine-grained permission check: caller must have ttt.writeback on policy:roles
         let allowed = self.policy_manager.check_with_domain(
@@ -1390,7 +1390,7 @@ impl PolicyHandler for PolicyService {
         data: &RemoveGrouping,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
 
         // Fine-grained permission check: caller must have ttt.writeback on policy:roles
         let allowed = self.policy_manager.check_with_domain(
@@ -2438,6 +2438,85 @@ mod tests {
             response,
             PolicyResponseVariant::ApplyTemplateResult(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn tokenless_local_policy_authority_uses_global_domain_for_policy_control_plane() {
+        let (service, _root) = test_service().await;
+        let context = EnvelopeContext::for_test_authenticated_subject(
+            Subject::new("service:policy"),
+            service.signing_key.verifying_key(),
+        );
+
+        let assert_not_missing_tenant = |operation: &str, result: Result<PolicyResponseVariant>| {
+            if let Err(error) = result {
+                assert!(
+                    !error.to_string().contains("no verified tenant domain"),
+                    "{operation} reached a tenant-only handler path: {error}"
+                );
+            }
+        };
+
+        assert_not_missing_tenant(
+            "apply draft",
+            service
+                .handle_apply_draft(&context, 1, &ApplyDraft { message: None })
+                .await,
+        );
+        assert_not_missing_tenant(
+            "rollback",
+            service
+                .handle_rollback(
+                    &context,
+                    2,
+                    &RollbackPolicy {
+                        git_ref: "HEAD".to_owned(),
+                    },
+                )
+                .await,
+        );
+        assert_not_missing_tenant(
+            "history",
+            service
+                .handle_get_history(&context, 3, &GetHistory { count: 1 })
+                .await,
+        );
+        assert_not_missing_tenant(
+            "diff",
+            service
+                .handle_get_diff(&context, 4, &GetDiff { git_ref: None })
+                .await,
+        );
+        assert_not_missing_tenant(
+            "draft status",
+            service.handle_get_draft_status(&context, 5).await,
+        );
+        assert_not_missing_tenant(
+            "role grant",
+            service
+                .handle_add_grouping(
+                    &context,
+                    6,
+                    &AddGrouping {
+                        user: "bootstrap-user".to_owned(),
+                        role: "viewer".to_owned(),
+                    },
+                )
+                .await,
+        );
+        assert_not_missing_tenant(
+            "role revoke",
+            service
+                .handle_remove_grouping(
+                    &context,
+                    7,
+                    &RemoveGrouping {
+                        user: "bootstrap-user".to_owned(),
+                        role: "viewer".to_owned(),
+                    },
+                )
+                .await,
+        );
     }
 
     #[tokio::test]

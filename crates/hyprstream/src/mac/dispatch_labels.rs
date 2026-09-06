@@ -66,6 +66,26 @@ pub const SERVICE_SUBJECT_PREFIX: &str = "service:";
 /// real serialized requests and pins these values to the schema; changing the
 /// union order fails CI rather than silently relabeling the dispatch plane.
 pub mod policy_methods {
+    /// `check` — inspect the local effective policy.
+    pub const CHECK: u16 = 1;
+    /// `getPolicy` — read the local control-plane policy.
+    pub const GET_POLICY: u16 = 4;
+    /// `applyTemplate` — install a reviewed bootstrap template.
+    pub const APPLY_TEMPLATE: u16 = 5;
+    /// `applyDraft` — commit a local policy draft.
+    pub const APPLY_DRAFT: u16 = 6;
+    /// `rollback` — restore a local policy revision.
+    pub const ROLLBACK: u16 = 7;
+    /// `getHistory` — inspect local policy revisions.
+    pub const GET_HISTORY: u16 = 8;
+    /// `getDiff` — inspect a local policy draft.
+    pub const GET_DIFF: u16 = 9;
+    /// `getDraftStatus` — inspect local draft state.
+    pub const GET_DRAFT_STATUS: u16 = 10;
+    /// `addGrouping` — add a local role assignment.
+    pub const ADD_GROUPING: u16 = 11;
+    /// `removeGrouping` — remove a local role assignment.
+    pub const REMOVE_GROUPING: u16 = 12;
     /// `registerServiceKey` — a keyed service installs its identity with the
     /// CA. Bootstrap-critical: it precedes identity standing.
     pub const REGISTER_SERVICE_KEY: u16 = 18;
@@ -140,12 +160,12 @@ pub struct DeclaredDispatchTable {
 impl DeclaredDispatchTable {
     /// The production staging-bootstrap declarations (#1499).
     ///
-    /// Object rows cover exactly the dispatch calls the fresh-state
+    /// Object rows cover the fresh-state
     /// `service start --services event,policy,discovery,registry,model,oai,oauth` boot
-    /// graph makes: every keyed non-policy service registers its signing key
-    /// with the PolicyService CA at startup and renews that identity
-    /// hourly. Subject rows declare the deliberate caller clearance for all
-    /// seven bootstrap services.
+    /// graph plus the PolicyService authority's local policy-control-plane
+    /// commands. The production wrapper further restricts those local commands
+    /// to the verified, tokenless `service:policy` authority. Subject rows
+    /// declare the deliberate caller clearance for all seven bootstrap services.
     #[must_use]
     pub fn production() -> &'static Self {
         &PRODUCTION_TABLE
@@ -348,6 +368,66 @@ impl MacDispatchPep for DeclaredDispatchPep {
 
 static BOOTSTRAP_METHODS: &[DispatchMethodPolicy] = &[
     DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::CHECK },
+        method_name: "check",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService control-plane inspection; only the tokenless policy authority reaches this row",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::GET_POLICY },
+        method_name: "getPolicy",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService control-plane read; only the tokenless policy authority reaches this row",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::APPLY_TEMPLATE },
+        method_name: "applyTemplate",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService installs a reviewed bootstrap template; the handler still enforces Casbin writeback",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::APPLY_DRAFT },
+        method_name: "applyDraft",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService commits a local draft; the handler still enforces Casbin writeback",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::ROLLBACK },
+        method_name: "rollback",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService restores a local revision; the handler still enforces Casbin writeback",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::GET_HISTORY },
+        method_name: "getHistory",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService control-plane history read; only the tokenless policy authority reaches this row",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::GET_DIFF },
+        method_name: "getDiff",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService control-plane draft inspection; only the tokenless policy authority reaches this row",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::GET_DRAFT_STATUS },
+        method_name: "getDraftStatus",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService draft-state inspection; only the tokenless policy authority reaches this row",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::ADD_GROUPING },
+        method_name: "addGrouping",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService role update; the handler still enforces Casbin writeback",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::REMOVE_GROUPING },
+        method_name: "removeGrouping",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService role removal; the handler still enforces Casbin writeback",
+    },
+    DispatchMethodPolicy {
         id: DispatchMethodId {
             service: "policy",
             method: policy_methods::REGISTER_SERVICE_KEY,
@@ -408,9 +488,8 @@ static BOOTSTRAP_SERVICE_CLEARANCES: &[ServiceSubjectClearance] = &[
     ServiceSubjectClearance {
         service: "policy",
         clearance: BOOTSTRAP_SERVICE_CLEARANCE,
-        justification: "the CA itself; it makes no boot RPC calls, but its \
-             enrolled caller clearance is declared with the same deliberate \
-             value as the services it certifies",
+        justification: "the CA itself; its local control-plane rows are separately \
+             restricted to the verified tokenless service:policy authority",
     },
     ServiceSubjectClearance {
         service: "registry",
@@ -458,11 +537,20 @@ mod tests {
     fn every_declared_call_resolves_to_the_intended_typed_label_and_clearance() {
         let table = DeclaredDispatchTable::production();
 
-        // The fresh boot graph: discovery, registry, model, oai, and oauth each call
-        // policy.registerServiceKey on fresh state; renewal uses
-        // policy.refreshServiceToken. Every declared row resolves to the
-        // intended typed label — the lattice floor, deliberate and reviewed.
+        // The fresh boot graph declares the local PolicyService control-plane
+        // operations plus registration and renewal. Every declared row resolves
+        // to the intended typed label — the lattice floor, deliberate and reviewed.
         let expected: &[(u16, &str)] = &[
+            (policy_methods::CHECK, "check"),
+            (policy_methods::GET_POLICY, "getPolicy"),
+            (policy_methods::APPLY_TEMPLATE, "applyTemplate"),
+            (policy_methods::APPLY_DRAFT, "applyDraft"),
+            (policy_methods::ROLLBACK, "rollback"),
+            (policy_methods::GET_HISTORY, "getHistory"),
+            (policy_methods::GET_DIFF, "getDiff"),
+            (policy_methods::GET_DRAFT_STATUS, "getDraftStatus"),
+            (policy_methods::ADD_GROUPING, "addGrouping"),
+            (policy_methods::REMOVE_GROUPING, "removeGrouping"),
             (policy_methods::REGISTER_SERVICE_KEY, "registerServiceKey"),
             (policy_methods::REFRESH_SERVICE_TOKEN, "refreshServiceToken"),
         ];

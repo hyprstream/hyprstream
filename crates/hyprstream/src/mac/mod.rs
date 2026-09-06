@@ -125,10 +125,58 @@ pub use te::{
 /// plane only); unknown services, unknown leaves, and VFS-shaped aliases deny
 /// `UnlabeledObject` before handler entry.
 pub fn install_production_rpc_dispatch_pep() {
+    let default = dispatch_labels::DeclaredDispatchPep::new(
+        dispatch_labels::DeclaredDispatchTable::production(),
+    )
+    .with_activation_control();
     hyprstream_rpc::auth::mac::install_mac_dispatch_pep(std::sync::Arc::new(
-        dispatch_labels::DeclaredDispatchPep::new(dispatch_labels::DeclaredDispatchTable::production())
-            .with_activation_control(),
+        ProductionDispatchPep { default },
     ));
+}
+
+/// Production typed dispatch policy with a further restriction for the local
+/// PolicyService control plane. The table declares its exact method set; this
+/// wrapper makes those rows reachable only to the cryptographically verified,
+/// non-federated, bearerless `service:policy` authority. It can only add denies
+/// to the table PEP, never bypass a missing typed declaration.
+struct ProductionDispatchPep {
+    default: dispatch_labels::DeclaredDispatchPep,
+}
+
+impl hyprstream_rpc::auth::mac::MacDispatchPep for ProductionDispatchPep {
+    fn check(
+        &self,
+        ctx: &hyprstream_rpc::service::EnvelopeContext,
+        service_domain: &str,
+        method: Option<u16>,
+    ) -> hyprstream_rpc::auth::mac::MacDecision {
+        let is_local_policy_control_plane = service_domain == "policy"
+            && matches!(
+                method,
+                Some(
+                    policy_methods::CHECK
+                        | policy_methods::GET_POLICY
+                        | policy_methods::APPLY_TEMPLATE
+                        | policy_methods::APPLY_DRAFT
+                        | policy_methods::ROLLBACK
+                        | policy_methods::GET_HISTORY
+                        | policy_methods::GET_DIFF
+                        | policy_methods::GET_DRAFT_STATUS
+                        | policy_methods::ADD_GROUPING
+                        | policy_methods::REMOVE_GROUPING
+                )
+            );
+        if is_local_policy_control_plane
+            && !(ctx.jwt_token().is_none()
+                && !ctx.subject().is_federated()
+                && ctx.subject().name() == Some("service:policy"))
+        {
+            return hyprstream_rpc::auth::mac::MacDecision::Deny(
+                hyprstream_rpc::auth::mac::MacDenyReason::NoClearance,
+            );
+        }
+        self.default.check(ctx, service_domain, method)
+    }
 }
 
 /// Explicit permit fixture for unit tests that exercise service plumbing
@@ -150,6 +198,48 @@ pub(crate) fn install_explicit_test_dispatch_pep() {
     }
 
     hyprstream_rpc::auth::mac::install_mac_dispatch_pep(std::sync::Arc::new(ExplicitTestPep));
+}
+
+#[cfg(test)]
+mod production_dispatch_tests {
+    use super::*;
+    use hyprstream_rpc::auth::mac::{MacDecision, MacDispatchPep};
+    use hyprstream_rpc::envelope::Subject;
+    use hyprstream_rpc::service::EnvelopeContext;
+
+    fn production_pep() -> ProductionDispatchPep {
+        ProductionDispatchPep {
+            default: dispatch_labels::DeclaredDispatchPep::new(
+                dispatch_labels::DeclaredDispatchTable::production(),
+            )
+            .with_activation_control(),
+        }
+    }
+
+    #[test]
+    fn local_policy_control_plane_requires_the_exact_tokenless_policy_authority() {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]).verifying_key();
+        let policy =
+            EnvelopeContext::for_test_authenticated_subject(Subject::new("service:policy"), signer);
+        let registry = EnvelopeContext::for_test_authenticated_subject(
+            Subject::new("service:registry"),
+            signer,
+        );
+        let pep = production_pep();
+
+        assert_eq!(
+            pep.check(&policy, "policy", Some(policy_methods::APPLY_TEMPLATE)),
+            MacDecision::Permit,
+        );
+        assert_eq!(
+            pep.check(&registry, "policy", Some(policy_methods::APPLY_TEMPLATE)),
+            MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::NoClearance),
+        );
+        assert_eq!(
+            pep.check(&policy, "policy", Some(17)),
+            MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject),
+        );
+    }
 }
 // S5 (#571): the UCAN→TE policy compiler — compile a validated grant into a
 // CompiledPolicy, verify it grants no privilege beyond the grant, and sign it
