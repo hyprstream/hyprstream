@@ -42,6 +42,7 @@ fn sample_info(qos: StreamOpt) -> StreamInfo {
         dh_public: [7u8; 32],
         qos,
         broadcast_path: "local/streams/deadbeef".to_owned(),
+        moql_server_identity: Default::default(),
         // #554: classical DH-keyed sample — no hybrid KEM ciphertexts.
         kem_ciphertexts: Vec::new(),
         // #274: exercise the native-capnp reach codec (List(struct) + union + group).
@@ -168,6 +169,7 @@ fn stream_info_iroh_reach_roundtrips() {
         dh_public: [3u8; 32],
         qos: StreamOpt::default(),
         broadcast_path: "local/streams/iroh".to_owned(),
+        moql_server_identity: Default::default(),
         // #554: non-empty hybrid-KEM ciphertexts so the round-trip proves the
         // Data field is carried through the capnp codec (not silently dropped).
         kem_ciphertexts: vec![0xABu8; 40],

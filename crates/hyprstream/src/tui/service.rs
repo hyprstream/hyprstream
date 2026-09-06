@@ -2455,6 +2455,7 @@ mod tests {
 
         let addr: std::net::SocketAddr = "127.0.0.1:4433".parse().expect("addr");
         let reach = ProducerReachConfig {
+            moql_server_identity: None,
             iroh_node_id: None,
             quic_reach: Some(NodeStreamReach {
                 addr,

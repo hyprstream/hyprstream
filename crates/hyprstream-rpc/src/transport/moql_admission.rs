@@ -760,6 +760,10 @@ pub struct MoqlAdmissionProof {
     pub ed25519: SigningKey,
     /// ML-DSA-65 signing key bound to that Ed25519 key in the accepted state.
     pub ml_dsa_65: MlDsaSigningKey,
+    /// Public, resolver-verified accepted-state witness expected from the Iroh
+    /// server during mutual admission. Empty/default is never accepted for an
+    /// Iroh dial.
+    pub expected_server: crate::stream_info::MoqlServerIdentity,
 }
 
 impl std::fmt::Debug for MoqlAdmissionProof {

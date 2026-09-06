@@ -41,7 +41,10 @@ pub struct UnifiedServiceConfig<S: RequestService + Send + 'static> {
 impl<S: RequestService + Send + 'static> UnifiedServiceConfig<S> {
     /// Create a unified service config with optional QUIC.
     pub fn new(service: S, quic_config: Option<hyprstream_rpc::service::QuicLoopConfig>) -> Self {
-        Self { service, quic_config }
+        Self {
+            service,
+            quic_config,
+        }
     }
 }
 
@@ -51,7 +54,10 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
     }
 
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
-        vec![(SocketKind::Rep, RequestService::transport(&self.service).clone())]
+        vec![(
+            SocketKind::Rep,
+            RequestService::transport(&self.service).clone(),
+        )]
     }
 
     fn run(
@@ -61,7 +67,10 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
     ) -> Result<()> {
         use hyprstream_rpc::transport::rpc_session::IrohRequestProcessor;
 
-        let UnifiedServiceConfig { service, quic_config } = *self;
+        let UnifiedServiceConfig {
+            service,
+            quic_config,
+        } = *self;
         let transport = RequestService::transport(&service).clone();
         let signing_key = RequestService::signing_key(&service);
         let server_pubkey = signing_key.verifying_key();
@@ -208,7 +217,12 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     );
                 }
                 if let Some(handle) = &reach_config_handle {
+                    let moql_server_identity = qc
+                        .moq_admission_proof
+                        .as_ref()
+                        .map(|proof| proof.expected_server.clone());
                     *handle.write() = hyprstream_rpc::moq_stream::ProducerReachConfig {
+                        moql_server_identity,
                         iroh_node_id: None,
                         quic_reach: Some(hyprstream_rpc::moq_stream::NodeStreamReach {
                         addr: advertise_addr,
@@ -504,7 +518,8 @@ impl ServiceSpawner {
             ServiceMode::Tokio => self.spawn_tokio(service, registration).await,
             ServiceMode::Thread => self.spawn_thread(service, registration).await,
             ServiceMode::Subprocess { binary } => {
-                self.spawn_subprocess(service, binary.clone(), registration).await
+                self.spawn_subprocess(service, binary.clone(), registration)
+                    .await
             }
         }
     }
@@ -577,7 +592,9 @@ impl ServiceSpawner {
                     tracing::error!("Service {} failed: {}", name_for_thread, e);
                 }
             })
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("thread spawn: {e}")))?;
+            .map_err(|e| {
+                hyprstream_rpc::error::RpcError::SpawnFailed(format!("thread spawn: {e}"))
+            })?;
 
         // Wait for ready signal (sent by service after socket binds)
         if ready_rx.await.is_err() {
@@ -613,8 +630,7 @@ impl ServiceSpawner {
             }
         };
 
-        let process_config =
-            ProcessConfig::new(&name, binary).args(["service", &name]);
+        let process_config = ProcessConfig::new(&name, binary).args(["service", &name]);
 
         let process = spawner.spawn(process_config).await?;
 
@@ -634,14 +650,10 @@ impl ServiceSpawner {
 
         Ok(SpawnedService {
             id: process.id.clone(),
-            kind: ServiceKind::Subprocess {
-                process,
-                pid_file,
-            },
+            kind: ServiceKind::Subprocess { process, pid_file },
             _registration: registration,
         })
     }
-
 }
 
 impl Default for ServiceSpawner {
@@ -699,10 +711,7 @@ impl SpawnedService {
     pub fn subprocess(id: String, process: SpawnedProcess, pid_file: PathBuf) -> Self {
         Self {
             id,
-            kind: ServiceKind::Subprocess {
-                process,
-                pid_file,
-            },
+            kind: ServiceKind::Subprocess { process, pid_file },
             _registration: None,
         }
     }
@@ -716,10 +725,7 @@ impl SpawnedService {
     ) -> Self {
         Self {
             id,
-            kind: ServiceKind::Thread {
-                handle,
-                shutdown,
-            },
+            kind: ServiceKind::Thread { handle, shutdown },
             _registration: registration,
         }
     }
@@ -732,9 +738,10 @@ impl SpawnedService {
     /// Check if the service is running.
     pub fn is_running(&self) -> bool {
         match &self.kind {
-            ServiceKind::TokioTask { handle } => {
-                handle.as_ref().map(hyprstream_rpc::service::ServiceHandle::is_running).unwrap_or(false)
-            }
+            ServiceKind::TokioTask { handle } => handle
+                .as_ref()
+                .map(hyprstream_rpc::service::ServiceHandle::is_running)
+                .unwrap_or(false),
             ServiceKind::Thread { handle, .. } => {
                 handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
             }
@@ -743,11 +750,8 @@ impl SpawnedService {
                 if let Ok(pid_str) = std::fs::read_to_string(pid_file) {
                     if let Ok(pid) = pid_str.trim().parse::<i32>() {
                         // Signal 0 checks if process exists without sending a signal
-                        return nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(pid),
-                            None,
-                        )
-                        .is_ok();
+                        return nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                            .is_ok();
                     }
                 }
                 false
@@ -778,7 +782,11 @@ impl SpawnedService {
                 // Read PID from file and send SIGTERM
                 if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
                     if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                        tracing::info!("Sending SIGTERM to subprocess {} (PID {})", process.id, pid);
+                        tracing::info!(
+                            "Sending SIGTERM to subprocess {} (PID {})",
+                            process.id,
+                            pid
+                        );
                         if let Err(e) = nix::sys::signal::kill(
                             nix::unistd::Pid::from_raw(pid),
                             nix::sys::signal::Signal::SIGTERM,
@@ -987,10 +995,10 @@ impl Spawnable for DualSpawnable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result as AnyhowResult;
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::prelude::SigningKey;
     use hyprstream_rpc::service::RequestService;
-    use anyhow::Result as AnyhowResult;
 
     /// Test service that includes infrastructure (new pattern)
     struct EchoService {
@@ -1000,7 +1008,10 @@ mod tests {
 
     impl EchoService {
         fn new(transport: TransportConfig, signing_key: SigningKey) -> Self {
-            Self { transport, signing_key }
+            Self {
+                transport,
+                signing_key,
+            }
         }
     }
 

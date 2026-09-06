@@ -30,7 +30,7 @@ use zeroize::Zeroizing;
 
 use crate::service::metadata::SchemaMetadataFn;
 use crate::service::spawner::Spawnable;
-use hyprstream_rpc::registry::{global as global_registry, SocketKind};
+use hyprstream_rpc::registry::{SocketKind, global as global_registry};
 use hyprstream_rpc::transport::TransportConfig;
 
 /// Complete, already-validated native announcement ready for publication.
@@ -79,11 +79,23 @@ impl NativeServiceAnnouncement {
             self.response_verifying_key == signer.verifying_key().to_bytes(),
             "admission signer is not the accepted current response key"
         );
-        Ok(hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof {
-            did: self.service_did.to_string(),
-            ed25519: signer.clone(),
-            ml_dsa_65: hyprstream_rpc::node_identity::derive_mesh_mldsa_key(signer),
-        })
+        Ok(
+            hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof {
+                did: self.service_did.to_string(),
+                ed25519: signer.clone(),
+                ml_dsa_65: hyprstream_rpc::node_identity::derive_mesh_mldsa_key(signer),
+                expected_server: hyprstream_rpc::stream_info::MoqlServerIdentity {
+                    did: self.service_did.to_string(),
+                    epoch: self.accepted_state_epoch,
+                    head_digest: self.accepted_state_digest.to_vec(),
+                    expires_at_unix_ms: self.accepted_state_expires_at_unix_ms,
+                    ed25519: self.response_verifying_key,
+                    ml_dsa65: hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(
+                        &hyprstream_rpc::node_identity::derive_mesh_mldsa_key(signer),
+                    ),
+                },
+            },
+        )
     }
     /// Project a complete native announcement from the opaque #1004 accepted
     /// state. The local service key must be the accepted current key and the
@@ -216,8 +228,7 @@ pub struct QuicSharedConfig {
         Option<Arc<hyprstream_rpc::transport::moql_admission::MoqlAdmissionAuthenticator>>,
     /// Native client's accepted-state-bound proof for authenticated Iroh `moql`
     /// dials. Quinn/WebTransport uses its distinct CONNECT authentication path.
-    pub moq_admission_proof:
-        Option<hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof>,
+    pub moq_admission_proof: Option<hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof>,
 }
 
 impl QuicSharedConfig {
@@ -238,7 +249,7 @@ impl QuicSharedConfig {
             });
             // Publish root pubkey for client-side trust pinning (TOFU)
             if let Some(ref vk) = self.jwt_verifying_key {
-                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
                 #[allow(clippy::unwrap_used)] // meta is always a JSON object
                 meta.as_object_mut().unwrap().insert(
                     "x_root_pubkey".to_owned(),
@@ -297,7 +308,7 @@ impl QuicSharedConfig {
                 if parts.len() != 3 {
                     return true;
                 }
-                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
                 if let Ok(payload) = URL_SAFE_NO_PAD.decode(parts[1]) {
                     if let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&payload) {
                         if let Some(exp) = claims["exp"].as_i64() {
@@ -318,7 +329,9 @@ impl QuicSharedConfig {
             let discovery_vk = discovery_verifying_key;
             let policy_vk = policy_verifying_key;
             let Some(accepted) = accepted else {
-                tracing::warn!("Refusing production network announcement for '{svc_name}': accepted native identity/KEM bundle is unavailable");
+                tracing::warn!(
+                    "Refusing production network announcement for '{svc_name}': accepted native identity/KEM bundle is unavailable"
+                );
                 return;
             };
             if let Err(error) = accepted.validate(&svc_name, &sk.verifying_key()) {
@@ -335,7 +348,9 @@ impl QuicSharedConfig {
                 let _ = policy_vk;
             }
             let Some(publish) = publisher.clone() else {
-                tracing::warn!("Refusing production network announcement for '{svc_name}': publisher is unavailable");
+                tracing::warn!(
+                    "Refusing production network announcement for '{svc_name}': publisher is unavailable"
+                );
                 return;
             };
             publish(NativeAnnouncementRequest {
@@ -435,7 +450,9 @@ impl ServiceContext {
     ) -> anyhow::Result<Option<hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof>> {
         self.native_announcements
             .get(service_name)
-            .map(|announcement| announcement.moql_admission_proof(&self.service_signing_key(service_name)))
+            .map(|announcement| {
+                announcement.moql_admission_proof(&self.service_signing_key(service_name))
+            })
             .transpose()
     }
     /// Create a new service context.
@@ -1105,9 +1122,11 @@ mod tests {
                 eks: Vec::new(),
             },
         };
-        assert!(announcement
-            .validate("model", &signer.verifying_key())
-            .is_err());
+        assert!(
+            announcement
+                .validate("model", &signer.verifying_key())
+                .is_err()
+        );
     }
 
     /// #1188 / #1183: a native service announcement projects from an accepted

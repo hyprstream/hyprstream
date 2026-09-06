@@ -207,6 +207,18 @@ struct IrohReach {
   relayUrl @2 :Text;                  # optional iroh relay; empty = direct/pkarr (#282).
 }
 
+# Resolver-verified public accepted-state witness for the server that signed
+# this StreamInfo. An empty witness is fail-closed for native Iroh admission and
+# remains irrelevant to browser/UDS paths.
+struct MoqlServerIdentity {
+  did @0 :Text;
+  epoch @1 :UInt64;
+  headDigest @2 :Data $fixedSize(64);
+  expiresAtUnixMs @3 :Int64;
+  ed25519 @4 :Data $fixedSize(32);
+  mlDsa65 @5 :Data;
+}
+
 # Stream metadata returned when starting a stream
 #
 # Contains everything the client needs to subscribe and derive keys.
@@ -232,6 +244,9 @@ struct StreamInfo {
   # derive the same stream keys. Supersedes the classical `dhPublic` (kept for the
   # legacy path until the S5 #556 fail-closed flip). Empty on the legacy path.
   kemCiphertexts @5 :Data;
+  # #1027: expected native-Iroh server identity, authenticated by the enclosing
+  # streaming RPC response and checked again in the mutual MoQL exchange.
+  moqlServerIdentity @6 :MoqlServerIdentity;
 }
 
 # Stream registration - wrapped in SignedEnvelope for authorization

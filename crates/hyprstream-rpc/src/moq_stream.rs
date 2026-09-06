@@ -129,6 +129,9 @@ pub struct NodeStreamReach {
 /// [`ProducerReachConfig::reach_with_relay`].
 #[derive(Clone, Debug, Default)]
 pub struct ProducerReachConfig {
+    /// Resolver-verified accepted-state witness for this service's signed
+    /// StreamInfo. Native Iroh subscribers require it for mutual admission.
+    pub moql_server_identity: Option<crate::stream_info::MoqlServerIdentity>,
     /// The node's own iroh `EndpointId` (Ed25519 public key, 32 bytes) when the
     /// iroh substrate is bound (#357). `None` → no iroh-direct reach advertised.
     pub iroh_node_id: Option<[u8; 32]>,
@@ -1005,6 +1008,28 @@ impl MoqStreamHandle {
         enc_key: [u8; 32],
         topic: String,
     ) -> Self {
+        Self::networked_with_server_identity(
+            reach,
+            qos,
+            broadcast_path,
+            mac_key,
+            enc_key,
+            topic,
+            crate::stream_info::MoqlServerIdentity::default(),
+        )
+    }
+
+    /// Native constructor that retains the server witness authenticated by the
+    /// streaming RPC response for the Iroh admission resolver.
+    pub fn networked_with_server_identity(
+        reach: Vec<crate::stream_info::Destination>,
+        qos: &crate::stream_info::StreamOpt,
+        broadcast_path: String,
+        mac_key: [u8; 32],
+        enc_key: [u8; 32],
+        topic: String,
+        server_identity: crate::stream_info::MoqlServerIdentity,
+    ) -> Self {
         // QoS-aware topology selection over the SERVICE-advertised reach (server
         // authority preserved: stable reorder, never an invented/forced reach).
         let reach = select_reach(&reach, qos);
@@ -1024,6 +1049,7 @@ impl MoqStreamHandle {
                 enc_key,
                 topic,
                 None,
+                server_identity,
                 tx,
                 cancel.clone(),
             ));
@@ -1084,6 +1110,7 @@ impl MoqStreamHandle {
                 enc_key,
                 topic,
                 Some(ratchet),
+                crate::stream_info::MoqlServerIdentity::default(),
                 tx,
                 cancel.clone(),
             ));
@@ -1442,6 +1469,19 @@ pub struct MoqReachConnection {
 pub async fn connect_moq_reach(
     reach: &[crate::stream_info::Destination],
 ) -> Result<MoqReachConnection> {
+    connect_moq_reach_with_server_identity(
+        reach,
+        &crate::stream_info::MoqlServerIdentity::default(),
+    )
+    .await
+}
+
+/// Resolve a stream reach with the server accepted-state witness authenticated
+/// by the enclosing streaming RPC response. Iroh is fail-closed without it.
+pub async fn connect_moq_reach_with_server_identity(
+    reach: &[crate::stream_info::Destination],
+    server_identity: &crate::stream_info::MoqlServerIdentity,
+) -> Result<MoqReachConnection> {
     use crate::transport::uds_session::{PLANE_MOQ, connect_uds};
     use moq_net::{Client as MoqClient, Origin};
 
@@ -1457,7 +1497,19 @@ pub async fn connect_moq_reach(
         };
         let dial = match (&cfg.endpoint, global_moq_admission_proof()) {
             (crate::transport::EndpointType::Iroh { .. }, Some(proof)) => {
-                crate::dial::dial_stream_authenticated(&cfg, proof).await
+                if server_identity.did.is_empty()
+                    || server_identity.epoch == 0
+                    || server_identity.head_digest.len() != 64
+                    || server_identity.ed25519.len() != 32
+                    || server_identity.ml_dsa65.is_empty()
+                    || server_identity.expires_at_unix_ms <= crate::envelope::current_timestamp()
+                {
+                    Err(anyhow!(
+                        "iroh moql reach lacks a live resolver-verified server witness"
+                    ))
+                } else {
+                    crate::dial::dial_stream_authenticated(&cfg, proof).await
+                }
             }
             (crate::transport::EndpointType::Iroh { .. }, None) => Err(anyhow::anyhow!(
                 "iroh moql reach requires an accepted-state admission proof"
@@ -1771,6 +1823,7 @@ async fn moq_stream_handle_task_networked(
     enc_key: [u8; 32],
     topic: String,
     epoch_ratchet: Option<crate::stream_epoch::StreamEpochRatchet>,
+    server_identity: crate::stream_info::MoqlServerIdentity,
     tx: tokio::sync::mpsc::Sender<anyhow::Result<crate::streaming::StreamPayload>>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -1779,7 +1832,7 @@ async fn moq_stream_handle_task_networked(
 
     // Resolve the producer's reach into a live moq connection via the single
     // shared resolver (networked-first, local-UDS fallback, fail-closed; #356).
-    let conn = match connect_moq_reach(&reach).await {
+    let conn = match connect_moq_reach_with_server_identity(&reach, &server_identity).await {
         Ok(c) => c,
         Err(e) => {
             let _ = tx
@@ -2952,6 +3005,7 @@ mod tests {
         });
         // A server with BOTH a direct (iroh) reach and a server-global relay.
         let cfg = ProducerReachConfig {
+            moql_server_identity: None,
             iroh_node_id: Some([3u8; 32]),
             quic_reach: None,
             relay: Some(relay_x.clone()),
@@ -3015,6 +3069,7 @@ mod tests {
             cert_hashes: vec![vec![2u8; 32]],
         });
         let cfg = ProducerReachConfig {
+            moql_server_identity: None,
             iroh_node_id: Some([4u8; 32]),
             quic_reach: None,
             relay: Some(server_relay.clone()),

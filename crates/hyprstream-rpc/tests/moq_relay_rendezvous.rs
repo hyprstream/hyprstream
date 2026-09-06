@@ -264,6 +264,7 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
     let iroh_node_id = [0x11u8; 32];
     let direct_addr: std::net::SocketAddr = "203.0.113.7:443".parse()?; // TEST-NET-3, unreachable
     let server_cfg = ProducerReachConfig {
+        moql_server_identity: None,
         iroh_node_id: Some(iroh_node_id),
         quic_reach: Some(NodeStreamReach {
             addr: direct_addr,

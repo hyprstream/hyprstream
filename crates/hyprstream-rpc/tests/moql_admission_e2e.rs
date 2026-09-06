@@ -97,6 +97,7 @@ fn proof(peer: &PeerFixture) -> MoqlAdmissionProof {
         did: peer.did.clone(),
         ed25519: peer.ed.clone(),
         ml_dsa_65: peer.pq.clone(),
+        expected_server: Default::default(),
     }
 }
 
