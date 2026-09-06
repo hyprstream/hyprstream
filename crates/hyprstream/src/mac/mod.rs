@@ -68,6 +68,11 @@ pub mod exchange;
 // S1 activation (#567): production genesis CONTENT + enumerator + composite
 // ObjectLabelResolver + boot-time coverage gate consumed by the active 9P PEP.
 pub mod genesis;
+// #1499: typed RPC dispatch labels — the declared (service, leaf/method)
+// object identity and deliberate service subject clearance the mandatory
+// dispatch PEP evaluates. Bare service domains never route through the VFS
+// object-label adapter.
+pub mod dispatch_labels;
 pub mod lattice;
 pub mod moq_audit;
 // #1319: audited MAC adapter at the tenant account-record read boundary.
@@ -112,10 +117,16 @@ pub use te::{
 /// Install the mandatory RPC-dispatch PEP in its activation-ready, floor-only
 /// state.  The coverage-gated operator control selects identity-aware contexts;
 /// installing this monitor does not perform that widening.
+///
+/// The object-label resolver is the typed dispatch table (#1499): declared
+/// `(service, leaf/method)` rows plus deliberate service subject clearances.
+/// Bare RPC service names are never mapped through the VFS object-label
+/// adapter (the genesis `CompositeObjectLabelResolver` now serves the VFS/9P
+/// plane only); unknown services, unknown leaves, and VFS-shaped aliases deny
+/// `UnlabeledObject` before handler entry.
 pub fn install_production_rpc_dispatch_pep() {
-    let resolver = GenesisGate::production().into_resolver();
     hyprstream_rpc::auth::mac::install_mac_dispatch_pep(std::sync::Arc::new(
-        hyprstream_rpc::auth::mac::DefaultMacDispatchPep::new(Box::new(resolver))
+        dispatch_labels::DeclaredDispatchPep::new(dispatch_labels::DeclaredDispatchTable::production())
             .with_activation_control(),
     ));
 }
@@ -152,6 +163,12 @@ pub use compiler::{
 pub use genesis::{
     floor_label, genesis_lattice, CompositeObjectLabelResolver, GeneratedNodeCoverage, GenesisGate,
     ManifestLabelSource, NamespaceEnumerator, NoManifests, SitePolicy,
+};
+// #1499: typed dispatch-plane labels + the production dispatch PEP over them.
+pub use dispatch_labels::{
+    policy_methods, DeclaredDispatchPep, DeclaredDispatchTable, DispatchMethodId,
+    DispatchMethodPolicy, ServiceSubjectClearance, BOOTSTRAP_SERVICE_CLEARANCE,
+    SERVICE_SUBJECT_PREFIX,
 };
 pub use moq_audit::{
     audited_moq_event_pep, production_moq_event_pep, MoqAuditSinkAdapter,

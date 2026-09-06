@@ -1,6 +1,6 @@
 # git2db - Git-native Repository Management
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](../../LICENSE-APACHE)
 
 git2db provides a high-level Rust interface for managing Git repositories as a database system, with advanced features like storage drivers for space-efficient worktrees and large file (XET) integration.
 
@@ -441,7 +441,7 @@ Contributions welcome! Please see the main project [CONTRIBUTING.md](../../CONTR
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) for details.
+Apache License 2.0 — see [LICENSE-APACHE](../../LICENSE-APACHE) for details.
 
 ---
 
