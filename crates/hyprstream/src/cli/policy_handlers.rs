@@ -27,14 +27,13 @@ use std::process::Command;
 
 /// Create a PolicyClient for RPC calls.
 ///
-/// Bootstrap: PolicyService key needed to create the PolicyClient for peer key resolution.
+/// The top-level CLI installs the authenticated production resolver before it
+/// dispatches policy commands. It resolves the policy service's same-host IPC
+/// endpoint and pinned response key from deployment trust. Do not use the
+/// process-local bootstrap registry here: a `podman exec` CLI is a distinct
+/// process and therefore cannot inherit the server process's registrations.
 fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
-    PolicyClient::for_local_bootstrap(
-        signing_key.clone(),
-        // Bootstrap: PolicyService uses the root key
-        signing_key.verifying_key(),
-        None,
-    )
+    PolicyClient::from_resolver(signing_key.clone(), None)
 }
 
 /// Handle `policy show` - Display the running policy via RPC
@@ -691,5 +690,23 @@ mod tests {
         let claims = hyprstream_rpc::auth::decode_unverified(&token)
             .expect("minted token must decode");
         assert_eq!(claims.sub, "alice");
+    }
+
+    #[test]
+    fn policy_cli_client_uses_authenticated_process_resolver() {
+        let source = include_str!("policy_handlers.rs");
+        let client_factory = source
+            .split("/// Handle `policy show`")
+            .next()
+            .expect("policy client factory precedes policy handlers");
+
+        assert!(
+            client_factory.contains("PolicyClient::from_resolver(signing_key.clone(), None)"),
+            "policy CLI must use the resolver installed by top-level bootstrap"
+        );
+        assert!(
+            !client_factory.contains("PolicyClient::for_local_bootstrap("),
+            "a distinct CLI process has no server-local endpoint registry"
+        );
     }
 }
