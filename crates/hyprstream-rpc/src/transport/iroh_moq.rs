@@ -371,6 +371,7 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
             }
         };
 
+        let session_conn = conn.clone();
         let session = Session::raw(conn);
         let server = Server::new()
             .with_publish(publish_consumer)
@@ -383,6 +384,14 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
             .await
             .map_err(AcceptError::from_err)?;
 
+        // Admission is stateful rather than a one-time capability. Poll the
+        // same daemon-owned authority used by the challenge exchange while the
+        // MoQ session is alive; expiry, an accepted-head advance, or a rotated
+        // key closes the carrier and drops the scoped session immediately.
+        let admission = self.inner.authz.admission.clone();
+        let admitted_for_session = admitted.clone();
+        let mut currentness = tokio::time::interval(std::time::Duration::from_millis(100));
+
         // Hold the session alive until either the connection closes or
         // shutdown is requested. Server::accept has already spawned the
         // session's pump tasks; dropping `moq_session` tears them down.
@@ -390,6 +399,19 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
             biased;
             _ = self.inner.shutdown.cancelled() => {
                 tracing::debug!("iroh-moq: shutdown signalled, dropping session");
+            }
+            _ = currentness.tick() => {
+                if let (Some(admission), Some(admitted)) =
+                    (admission.as_ref(), admitted_for_session.as_ref())
+                {
+                    if !admission.is_still_current(admitted) {
+                        tracing::warn!(
+                            subject = %admitted.peer.subject.as_deref().unwrap_or("?"),
+                            "iroh-moq: accepted state changed or expired; closing session"
+                        );
+                        session_conn.close(0u32.into(), b"moql accepted state no longer current");
+                    }
+                }
             }
             res = moq_session.closed() => {
                 tracing::debug!(result = ?res, "iroh-moq: session closed");

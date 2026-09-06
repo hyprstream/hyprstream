@@ -28,11 +28,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh::{EndpointAddr, TransportAddr};
@@ -41,16 +41,14 @@ use parking_lot::Mutex;
 use rand::RngCore;
 use web_transport_iroh::Session;
 
-use hyprstream_rpc::crypto::pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes, MlDsaSigningKey};
+use hyprstream_rpc::crypto::pq::{MlDsaSigningKey, ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes};
 use hyprstream_rpc::moq_authz::PeerIdentity;
-use hyprstream_rpc::transport::iroh_moq::{
-    IrohMoqProtocolHandler, MoqAuthzConfig,
-};
-use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, NoopHandler, ALPN_MOQ_LITE};
+use hyprstream_rpc::transport::iroh_moq::{IrohMoqProtocolHandler, MoqAuthzConfig};
+use hyprstream_rpc::transport::iroh_substrate::{ALPN_MOQ_LITE, IrohSubstrate, NoopHandler};
 use hyprstream_rpc::transport::moql_admission::{
-    admission_transcript, decode_challenge, encode_hello, encode_response, prove_moql_admission,
     AcceptedIdentityState, AcceptedStateAuthority, AcceptedSubjectKey, AdmissionHello,
-    AdmissionResponse, MoqlAdmissionAuthenticator, MoqlAdmissionProof,
+    AdmissionResponse, MoqlAdmissionAuthenticator, MoqlAdmissionProof, admission_transcript,
+    decode_challenge, encode_hello, encode_response, prove_moql_admission,
 };
 
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -160,9 +158,8 @@ async fn admission_server(
             .as_deref()
             .and_then(|sub| tenants.get(sub).cloned())
     });
-    let authenticator = Arc::new(
-        MoqlAdmissionAuthenticator::new(authority, resolver).with_timeout(timeout),
-    );
+    let authenticator =
+        Arc::new(MoqlAdmissionAuthenticator::new(authority, resolver).with_timeout(timeout));
     let handler = IrohMoqProtocolHandler::new()
         .with_authz(MoqAuthzConfig::default().with_admission(authenticator));
     let producer = handler.origin_producer().clone();
@@ -304,8 +301,9 @@ async fn replayed_response_on_a_fresh_challenge_is_rejected() -> Result<()> {
     let authority = Arc::new(FixtureAuthority::default());
     let alice = peer(3, "replaycid512");
     authority.set(&alice.did, accepted_state(&alice, 5, 11, None));
-    let tenants: HashMap<String, String> =
-        [(alice.did.clone(), "alice".to_owned())].into_iter().collect();
+    let tenants: HashMap<String, String> = [(alice.did.clone(), "alice".to_owned())]
+        .into_iter()
+        .collect();
     let server = admission_server(authority, tenants, ADMISSION_TIMEOUT).await?;
     let addr = direct_addr(&server.substrate);
 
@@ -326,7 +324,8 @@ async fn replayed_response_on_a_fresh_challenge_is_rejected() -> Result<()> {
             client_nonce: [0xAA; 32],
         };
         let hello_bytes = encode_hello(&hello);
-        send.write_all(&(hello_bytes.len() as u32).to_be_bytes()).await?;
+        send.write_all(&(hello_bytes.len() as u32).to_be_bytes())
+            .await?;
         send.write_all(&hello_bytes).await?;
         let mut len = [0u8; 4];
         recv.read_exact(&mut len).await?;
@@ -350,7 +349,8 @@ async fn replayed_response_on_a_fresh_challenge_is_rejected() -> Result<()> {
             pq_sig: hyprstream_rpc::crypto::pq::ml_dsa_sign(&proof.ml_dsa_65, &outer),
         };
         let response_bytes = encode_response(&response);
-        send.write_all(&(response_bytes.len() as u32).to_be_bytes()).await?;
+        send.write_all(&(response_bytes.len() as u32).to_be_bytes())
+            .await?;
         send.write_all(&response_bytes).await?;
         send.finish()?;
         // The server admits this one (verdict arrives); close without moq.
@@ -371,7 +371,8 @@ async fn replayed_response_on_a_fresh_challenge_is_rejected() -> Result<()> {
         client_nonce: [0xAA; 32], // identical hello: only the server nonce differs
     };
     let hello_bytes = encode_hello(&hello);
-    send.write_all(&(hello_bytes.len() as u32).to_be_bytes()).await?;
+    send.write_all(&(hello_bytes.len() as u32).to_be_bytes())
+        .await?;
     send.write_all(&hello_bytes).await?;
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await?;
@@ -382,7 +383,8 @@ async fn replayed_response_on_a_fresh_challenge_is_rejected() -> Result<()> {
         fresh_challenge.server_nonce, [0; 32],
         "each challenge must carry a fresh server nonce"
     );
-    send.write_all(&(captured.len() as u32).to_be_bytes()).await?;
+    send.write_all(&(captured.len() as u32).to_be_bytes())
+        .await?;
     send.write_all(&captured).await?;
     send.finish()?;
 
@@ -414,8 +416,9 @@ async fn expired_accepted_state_is_rejected() -> Result<()> {
     let alice = peer(4, "expiredcid512");
     let now = hyprstream_rpc::envelope::current_timestamp();
     authority.set(&alice.did, accepted_state(&alice, 7, 12, Some(now - 1_000)));
-    let tenants: HashMap<String, String> =
-        [(alice.did.clone(), "alice".to_owned())].into_iter().collect();
+    let tenants: HashMap<String, String> = [(alice.did.clone(), "alice".to_owned())]
+        .into_iter()
+        .collect();
     let server = admission_server(authority, tenants, ADMISSION_TIMEOUT).await?;
     let addr = direct_addr(&server.substrate);
 
@@ -425,6 +428,33 @@ async fn expired_accepted_state_is_rejected() -> Result<()> {
         "an expired accepted state must reject admission"
     );
 
+    server.substrate.shutdown().await?;
+    Ok(())
+}
+
+/// A session admitted while its accepted state is live cannot continue after
+/// that state expires; the server rechecks currentness for the tunnel lifetime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expiry_closes_an_already_admitted_session() -> Result<()> {
+    let authority = Arc::new(FixtureAuthority::default());
+    let alice = peer(14, "live-expiry-cid512");
+    let now = hyprstream_rpc::envelope::current_timestamp();
+    authority.set(
+        &alice.did,
+        accepted_state(&alice, 8, 13, Some(now.saturating_add(1_500))),
+    );
+    let tenants: HashMap<String, String> = [(alice.did.clone(), "alice".to_owned())]
+        .into_iter()
+        .collect();
+    let server = admission_server(Arc::clone(&authority), tenants, ADMISSION_TIMEOUT).await?;
+    let addr = direct_addr(&server.substrate);
+
+    let (client, session, _consumer) = admitted_client(&addr, &proof(&alice)).await?;
+    let _ = tokio::time::timeout(Duration::from_secs(5), session.closed())
+        .await
+        .map_err(|_| anyhow!("expired accepted state did not close live MoQ session"))?;
+
+    client.shutdown().await?;
     server.substrate.shutdown().await?;
     Ok(())
 }
@@ -449,12 +479,16 @@ async fn state_advance_invalidates_previous_keys() -> Result<()> {
     let _alice_broadcast = publish_frame(&server.producer, "alice/run-1", b"alice-tokens")?;
 
     // ── epoch 3: the proof admits ────────────────────────────────────────────
-    let (client1, _s1, _c1) = admitted_client(&addr, &proof(&alice_v1)).await?;
-    client1.shutdown().await?;
+    let (client1, s1, _c1) = admitted_client(&addr, &proof(&alice_v1)).await?;
 
     // ── state advance: epoch 4 publishes a rotated key set ──────────────────
     let alice_v2 = peer(6, "rotatecid512");
     authority.set(&alice_v1.did, accepted_state(&alice_v2, 4, 10, None));
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), s1.closed())
+        .await
+        .map_err(|_| anyhow!("state advance did not close already-admitted session"))?;
+    client1.shutdown().await?;
 
     // ── the previous proof is now rejected ───────────────────────────────────
     let result = admitted_client(&addr, &proof(&alice_v1)).await;
@@ -491,8 +525,9 @@ async fn nodeid_only_carrier_is_rejected() -> Result<()> {
     let authority = Arc::new(FixtureAuthority::default());
     let alice = peer(7, "nodeidcid512");
     authority.set(&alice.did, accepted_state(&alice, 1, 1, None));
-    let tenants: HashMap<String, String> =
-        [(alice.did.clone(), "alice".to_owned())].into_iter().collect();
+    let tenants: HashMap<String, String> = [(alice.did.clone(), "alice".to_owned())]
+        .into_iter()
+        .collect();
     let server = admission_server(authority, tenants, Duration::from_secs(2)).await?;
     let addr = direct_addr(&server.substrate);
 
@@ -533,8 +568,9 @@ async fn nodeid_dressed_as_did_key_is_rejected() -> Result<()> {
     let authority = Arc::new(FixtureAuthority::default());
     let alice = peer(8, "didkeycid512");
     authority.set(&alice.did, accepted_state(&alice, 1, 1, None));
-    let tenants: HashMap<String, String> =
-        [(alice.did.clone(), "alice".to_owned())].into_iter().collect();
+    let tenants: HashMap<String, String> = [(alice.did.clone(), "alice".to_owned())]
+        .into_iter()
+        .collect();
     let server = admission_server(authority, tenants, Duration::from_secs(2)).await?;
     let addr = direct_addr(&server.substrate);
 
@@ -554,7 +590,8 @@ async fn nodeid_dressed_as_did_key_is_rejected() -> Result<()> {
         client_nonce: [0xEE; 32],
     };
     let hello_bytes = encode_hello(&hello);
-    send.write_all(&(hello_bytes.len() as u32).to_be_bytes()).await?;
+    send.write_all(&(hello_bytes.len() as u32).to_be_bytes())
+        .await?;
     send.write_all(&hello_bytes).await?;
     send.finish()?;
 

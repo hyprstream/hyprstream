@@ -78,9 +78,9 @@ use rand::RngCore as _;
 use sha2::Digest as _;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::crypto::pq::{ml_dsa_sign, ml_dsa_verify, ml_dsa_vk_from_bytes, MlDsaSigningKey};
+use crate::crypto::pq::{MlDsaSigningKey, ml_dsa_sign, ml_dsa_verify, ml_dsa_vk_from_bytes};
 use crate::identity::DID_AT9P_PREFIX;
-use crate::moq_authz::{is_valid_tenant_segment, PeerIdentity};
+use crate::moq_authz::{PeerIdentity, is_valid_tenant_segment};
 use crate::transport::iroh_moq::PeerTenantResolver;
 
 /// Domain separation tag at the head of every admission transcript.
@@ -243,6 +243,10 @@ pub struct AdmittedMoqPeer {
     pub epoch: u64,
     /// Accepted-state head digest the proof was verified against.
     pub head_digest: [u8; 64],
+    /// The accepted current Ed25519 key that proved possession. Retained with
+    /// the tunnel witness so an active session can be invalidated if that key
+    /// is rotated out without changing the tenant mapping.
+    pub subject_ed25519: [u8; 32],
     /// The carrier NodeId, recorded as metadata only. Never an identity input.
     pub carrier_node_id: [u8; 32],
 }
@@ -588,8 +592,28 @@ impl MoqlAdmissionAuthenticator {
             tenant,
             epoch: state.epoch,
             head_digest: state.head_digest,
+            subject_ed25519: hello.ed25519_pub,
             carrier_node_id,
         })
+    }
+
+    /// Whether a previously admitted tunnel remains bound to the same live
+    /// accepted state. This deliberately re-reads the daemon-owned authority:
+    /// session admission is not a permanent capability after a state advance,
+    /// key rotation, expiry, or withdrawal.
+    pub fn is_still_current(&self, admitted: &AdmittedMoqPeer) -> bool {
+        let Some(current) = admitted
+            .peer
+            .subject
+            .as_deref()
+            .and_then(|did| self.authority.accepted_state(did))
+        else {
+            return false;
+        };
+        current.is_live(crate::envelope::current_timestamp())
+            && current.epoch == admitted.epoch
+            && current.head_digest == admitted.head_digest
+            && current.subject_key_for(&admitted.subject_ed25519).is_some()
     }
 
     /// The hello-time decision: identity class, currentness, expiry, and
@@ -693,7 +717,8 @@ impl MoqlAdmissionAuthenticator {
 
     fn is_consumed(&self, digest: &[u8; 32], now_unix_ms: i64) -> bool {
         let used = self.used.lock();
-        used.get(digest).is_some_and(|discard_after| now_unix_ms < *discard_after)
+        used.get(digest)
+            .is_some_and(|discard_after| now_unix_ms < *discard_after)
     }
 
     fn mark_consumed(&self, digest: [u8; 32], now_unix_ms: i64) {
@@ -815,7 +840,12 @@ mod tests {
         (ed, pq)
     }
 
-    fn state_with(ed: &SigningKey, pq: &MlDsaSigningKey, epoch: u64, tag: u8) -> AcceptedIdentityState {
+    fn state_with(
+        ed: &SigningKey,
+        pq: &MlDsaSigningKey,
+        epoch: u64,
+        tag: u8,
+    ) -> AcceptedIdentityState {
         AcceptedIdentityState {
             epoch,
             head_digest: [tag; 64],
@@ -831,17 +861,11 @@ mod tests {
         state: AcceptedIdentityState,
     ) -> (MoqlAdmissionAuthenticator, SigningKey, MlDsaSigningKey) {
         let (ed, pq) = keypair(7);
-        let authority: Arc<dyn AcceptedStateAuthority> = Arc::new(move |did: &str| {
-            (did == DID).then(|| state.clone())
-        });
-        let resolver: PeerTenantResolver = Arc::new(|peer: &PeerIdentity| {
-            peer.subject.as_deref().map(|_| "alice".to_owned())
-        });
-        (
-            MoqlAdmissionAuthenticator::new(authority, resolver),
-            ed,
-            pq,
-        )
+        let authority: Arc<dyn AcceptedStateAuthority> =
+            Arc::new(move |did: &str| (did == DID).then(|| state.clone()));
+        let resolver: PeerTenantResolver =
+            Arc::new(|peer: &PeerIdentity| peer.subject.as_deref().map(|_| "alice".to_owned()));
+        (MoqlAdmissionAuthenticator::new(authority, resolver), ed, pq)
     }
 
     fn sign_response(
@@ -896,25 +920,46 @@ mod tests {
             epoch: 42,
             head_digest: [4; 64],
         };
-        assert_eq!(decode_challenge(&encode_challenge(&challenge)).unwrap(), challenge);
+        assert_eq!(
+            decode_challenge(&encode_challenge(&challenge)).unwrap(),
+            challenge
+        );
 
         let response = AdmissionResponse {
             ed_sig: [5; 64],
             pq_sig: vec![6; 3309],
         };
-        assert_eq!(decode_response(&encode_response(&response)).unwrap(), response);
+        assert_eq!(
+            decode_response(&encode_response(&response)).unwrap(),
+            response
+        );
     }
 
     #[test]
     fn malformed_frames_reject() {
-        assert!(matches!(decode_hello(&[]), Err(MoqlAdmissionError::Malformed(_))));
-        assert!(matches!(decode_hello(&[2]), Err(MoqlAdmissionError::Malformed(_))));
-        assert!(matches!(decode_challenge(&[1, 2, 3]), Err(MoqlAdmissionError::Malformed(_))));
-        assert!(matches!(decode_response(&[1]), Err(MoqlAdmissionError::Malformed(_))));
+        assert!(matches!(
+            decode_hello(&[]),
+            Err(MoqlAdmissionError::Malformed(_))
+        ));
+        assert!(matches!(
+            decode_hello(&[2]),
+            Err(MoqlAdmissionError::Malformed(_))
+        ));
+        assert!(matches!(
+            decode_challenge(&[1, 2, 3]),
+            Err(MoqlAdmissionError::Malformed(_))
+        ));
+        assert!(matches!(
+            decode_response(&[1]),
+            Err(MoqlAdmissionError::Malformed(_))
+        ));
         // did length exceeding the cap
         let mut bad = vec![1u8];
         bad.extend_from_slice(&(MAX_DID_BYTES as u16 + 1).to_be_bytes());
-        assert!(matches!(decode_hello(&bad), Err(MoqlAdmissionError::Malformed(_))));
+        assert!(matches!(
+            decode_hello(&bad),
+            Err(MoqlAdmissionError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -939,7 +984,8 @@ mod tests {
         let challenge = challenge_for(&state);
         let response = sign_response(&ed, &pq, &hello, &challenge);
         let now = crate::envelope::current_timestamp();
-        auth.verify_response(&hello, &challenge, &response, now).unwrap();
+        auth.verify_response(&hello, &challenge, &response, now)
+            .unwrap();
         let err = auth
             .verify_response(&hello, &challenge, &response, now)
             .expect_err("the same transcript must be single-use");
@@ -1017,7 +1063,12 @@ mod tests {
         let (rogue_pq_sk, _) = ml_dsa_generate_keypair();
         response.pq_sig = ml_dsa_sign(&rogue_pq_sk, &outer);
         let err = auth
-            .verify_response(&hello, &challenge, &response, crate::envelope::current_timestamp())
+            .verify_response(
+                &hello,
+                &challenge,
+                &response,
+                crate::envelope::current_timestamp(),
+            )
             .expect_err("ML-DSA layer from a non-accepted key must reject");
         assert!(matches!(err, MoqlAdmissionError::BadSignature), "{err}");
         let _ = rogue_ed;
@@ -1041,7 +1092,12 @@ mod tests {
         let challenge = challenge_for(&old_state); // bound to epoch 3
         let response = sign_response(&ed, &pq, &hello, &challenge);
         let err = auth
-            .verify_response(&hello, &challenge, &response, crate::envelope::current_timestamp())
+            .verify_response(
+                &hello,
+                &challenge,
+                &response,
+                crate::envelope::current_timestamp(),
+            )
             .expect_err("a state advance mid-handshake must reject");
         assert!(matches!(err, MoqlAdmissionError::StateAdvanced(_)), "{err}");
     }
@@ -1079,13 +1135,21 @@ mod tests {
 
         let mut hello = hello_for(&ed);
         hello.did = "did:at9p:someoneelse".to_owned();
-        let err = auth.check_hello(&hello).expect_err("unknown DID must reject");
-        assert!(matches!(err, MoqlAdmissionError::UnknownIdentity(_)), "{err}");
+        let err = auth
+            .check_hello(&hello)
+            .expect_err("unknown DID must reject");
+        assert!(
+            matches!(err, MoqlAdmissionError::UnknownIdentity(_)),
+            "{err}"
+        );
 
         // A NodeId dressed as did:key is not an accepted-state identity.
         let mut hello = hello_for(&ed);
         hello.did = "did:key:z6MkNodeIdOnly".to_owned();
         let err = auth.check_hello(&hello).expect_err("did:key must reject");
-        assert!(matches!(err, MoqlAdmissionError::NotAcceptedIdentity(_)), "{err}");
+        assert!(
+            matches!(err, MoqlAdmissionError::NotAcceptedIdentity(_)),
+            "{err}"
+        );
     }
 }
