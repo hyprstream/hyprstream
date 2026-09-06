@@ -170,6 +170,20 @@ pub fn classify_pds_store_for_quic(ctx: &ServiceContext) -> anyhow::Result<PdsBo
     )
 }
 
+fn accepted_state_matches_service(
+    state: &hyprstream_pds::at9p_duplicity::AcceptedAt9pState,
+    service_name: &str,
+    verifying_key: &[u8; 32],
+) -> bool {
+    let service_id = format!("#{service_name}");
+    state.current.services.iter().any(|entry| entry.id == service_id)
+        && state
+            .current
+            .subject_keys
+            .iter()
+            .any(|key| key.ed25519_pub.as_slice() == verifying_key)
+}
+
 /// Populate every ordinary network service announcement from a fresh
 /// checkpoint-verifying PDS read. Missing or ambiguous state fails startup
 /// before any QUIC service can bind and advertise an incomplete bundle.
@@ -187,16 +201,7 @@ pub fn with_checkpointed_native_announcements(
     {
         let signer = ctx.service_signing_key(service_name);
         let mut matching = states.iter().filter(|state| {
-            state
-                .current
-                .services
-                .iter()
-                .any(|entry| entry.id == *service_name)
-                && state
-                    .current
-                    .subject_keys
-                    .iter()
-                    .any(|key| key.ed25519_pub.as_slice() == signer.verifying_key().as_bytes())
+            accepted_state_matches_service(state, service_name, signer.verifying_key().as_bytes())
         });
         let state = matching.next().ok_or_else(|| {
             anyhow::anyhow!(
@@ -2736,6 +2741,51 @@ fn compute_tls_endorsement(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpointed_service_selection_uses_canonical_id_and_current_signer() {
+        use hyprstream_pds::at9p::{
+            CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
+        };
+        use hyprstream_pds::at9p_duplicity::AcceptedAt9pState;
+        use hyprstream_pds::at9p_gate::verify_genesis_capsule;
+        use hyprstream_pds::at9p_sign::sign_capsule;
+        use hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes;
+
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signer);
+        let key = HybridKeyPair::new(
+            signer.verifying_key().to_bytes().to_vec(),
+            ml_dsa_sk_to_vk_bytes(&pq),
+        )
+        .unwrap();
+        let endpoint = ServiceEndpoint::new(
+            Transport::Iroh,
+            format!("iroh://{}", hex::encode([0x72; 32])),
+        )
+        .unwrap();
+        let service = ServiceEntry::new("#model", ServiceType::NinePExport, endpoint).unwrap();
+        let body = CapsuleBody::new(vec![key], vec![service]).unwrap();
+        let genesis = sign_capsule(body, &signer, &pq).unwrap();
+        let verified = verify_genesis_capsule(
+            &genesis.cid512().unwrap(),
+            &genesis.to_dag_cbor().unwrap(),
+        )
+        .unwrap();
+        let state = AcceptedAt9pState::from_verified_genesis(&verified).unwrap();
+        let key = signer.verifying_key().to_bytes();
+        assert!(accepted_state_matches_service(&state, "model", &key));
+        assert!(!accepted_state_matches_service(&state, "#model", &key));
+        assert!(!accepted_state_matches_service(&state, "registry", &key));
+        assert!(!accepted_state_matches_service(&state, "model", &[0x73; 32]));
+        // Selection does not weaken the separate bounded-successor gate.
+        let error = hyprstream_service::NativeServiceAnnouncement::from_accepted_state(
+            "model", &signer, &state,
+        )
+        .err()
+        .expect("genesis alone cannot authorize a production announcement");
+        assert!(error.to_string().contains("bounded production expiry"));
+    }
 
     #[test]
     fn at9p_verify_factory_uses_canonical_service_name() {
