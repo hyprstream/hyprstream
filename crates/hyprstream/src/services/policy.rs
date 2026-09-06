@@ -1353,11 +1353,24 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
-        // Apply the role assignment
-        self.policy_manager
-            .add_role_for_user_in_domain(&data.user, &data.role, &domain)
-            .await
-            .map_err(|e| anyhow!("Failed to add role: {}", e))?;
+        // Global bootstrap policy stores memberships in Casbin's global `g`
+        // relation; tenant-scoped memberships live in `g2`. Do not turn a
+        // global authority domain into a literal `g2(..., "*")` row.
+        let changed = if domain == "*" {
+            self.policy_manager.add_role_for_user(&data.user, &data.role).await
+        } else {
+            self.policy_manager
+                .add_role_for_user_in_domain(&data.user, &data.role, &domain)
+                .await
+        }
+        .map_err(|e| anyhow!("Failed to add role: {}", e))?;
+        if !changed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Role '{}' is already assigned to '{}'", data.role, data.user),
+                code: "NO_CHANGE".to_owned(),
+                details: "No policy update was committed.".to_owned(),
+            }));
+        }
 
         // Persist in-memory Casbin state to disk before staging
         self.policy_manager.save().await
@@ -1419,11 +1432,25 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
-        // Remove the role assignment
-        self.policy_manager
-            .remove_role_for_user_in_domain(&data.user, &data.role, &domain)
-            .await
-            .map_err(|e| anyhow!("Failed to remove role: {}", e))?;
+        // Match the grouping relation selected by role grant above. A global
+        // bootstrap membership is `g(user, role)`, not `g2(user, role, "*")`.
+        let changed = if domain == "*" {
+            self.policy_manager
+                .remove_role_for_user(&data.user, &data.role)
+                .await
+        } else {
+            self.policy_manager
+                .remove_role_for_user_in_domain(&data.user, &data.role, &domain)
+                .await
+        }
+        .map_err(|e| anyhow!("Failed to remove role: {}", e))?;
+        if !changed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Role '{}' is not assigned to '{}'", data.role, data.user),
+                code: "NOT_FOUND".to_owned(),
+                details: "No policy update was committed.".to_owned(),
+            }));
+        }
 
         // Persist in-memory Casbin state to disk before staging
         self.policy_manager.save().await
@@ -2491,32 +2518,82 @@ mod tests {
             "draft status",
             service.handle_get_draft_status(&context, 5).await,
         );
-        assert_not_missing_tenant(
-            "role grant",
+        let grouping = AddGrouping {
+            user: "bootstrap-user".to_owned(),
+            role: "viewer".to_owned(),
+        };
+        let granted = service
+            .handle_add_grouping(&context, 6, &grouping)
+            .await
+            .expect("global policy authority must grant a global role");
+        assert!(matches!(granted, PolicyResponseVariant::AddGroupingResult(_)));
+        assert!(
             service
-                .handle_add_grouping(
-                    &context,
-                    6,
-                    &AddGrouping {
-                        user: "bootstrap-user".to_owned(),
-                        role: "viewer".to_owned(),
-                    },
-                )
-                .await,
+                .policy_manager
+                .get_grouping_policy()
+                .await
+                .contains(&vec![grouping.user.clone(), grouping.role.clone()]),
+            "the wildcard bootstrap domain must use Casbin's global g relation"
         );
-        assert_not_missing_tenant(
-            "role revoke",
-            service
-                .handle_remove_grouping(
-                    &context,
-                    7,
-                    &RemoveGrouping {
-                        user: "bootstrap-user".to_owned(),
-                        role: "viewer".to_owned(),
-                    },
-                )
-                .await,
+        assert!(
+            !service
+                .policy_manager
+                .get_domain_grouping_policy()
+                .await
+                .contains(&vec![
+                    grouping.user.clone(),
+                    grouping.role.clone(),
+                    "*".to_owned(),
+                ]),
+            "the wildcard bootstrap domain must not create a g2 relation"
         );
+        let duplicate = service
+            .handle_add_grouping(&context, 7, &grouping)
+            .await
+            .expect("duplicate global role grant must return a policy response");
+        assert!(matches!(
+            duplicate,
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "NO_CHANGE"
+        ));
+
+        let revoked = service
+            .handle_remove_grouping(
+                &context,
+                8,
+                &RemoveGrouping {
+                    user: grouping.user.clone(),
+                    role: grouping.role.clone(),
+                },
+            )
+            .await
+            .expect("global policy authority must revoke a global role");
+        assert!(matches!(
+            revoked,
+            PolicyResponseVariant::RemoveGroupingResult(_)
+        ));
+        assert!(
+            !service
+                .policy_manager
+                .get_grouping_policy()
+                .await
+                .contains(&vec![grouping.user.clone(), grouping.role.clone()]),
+            "global role removal must remove the Casbin g relation"
+        );
+        let missing = service
+            .handle_remove_grouping(
+                &context,
+                9,
+                &RemoveGrouping {
+                    user: grouping.user,
+                    role: grouping.role,
+                },
+            )
+            .await
+            .expect("missing global role revoke must return a policy response");
+        assert!(matches!(
+            missing,
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "NOT_FOUND"
+        ));
     }
 
     #[tokio::test]
