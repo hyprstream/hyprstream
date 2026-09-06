@@ -165,13 +165,31 @@ impl hyprstream_rpc::auth::mac::MacDispatchPep for ProductionDispatchPep {
                         | policy_methods::REMOVE_GROUPING
                 )
             );
-        if is_local_policy_control_plane
-            && !(ctx.jwt_token().is_none()
+        if is_local_policy_control_plane {
+            if !(ctx.jwt_token().is_none()
                 && !ctx.subject().is_federated()
                 && ctx.subject().name() == Some("service:policy"))
-        {
-            return hyprstream_rpc::auth::mac::MacDecision::Deny(
-                hyprstream_rpc::auth::mac::MacDenyReason::NoClearance,
+            {
+                return hyprstream_rpc::auth::mac::MacDecision::Deny(
+                    hyprstream_rpc::auth::mac::MacDenyReason::NoClearance,
+                );
+            }
+
+            // This root-signed local bootstrap path intentionally carries no
+            // bearer claims. Keep its verified, declared policy-service
+            // context explicit so identity-aware activation does not turn the
+            // narrow control plane into `NoClearance` merely for being
+            // tokenless. The typed table and exact local-method guard still
+            // decide what it can reach.
+            let selected = SecurityContext::from_clearance(
+                BOOTSTRAP_SERVICE_CLEARANCE,
+                ctx.verified_key_material(),
+            );
+            return self.default.check_with_explicit_context(
+                ctx,
+                service_domain,
+                method,
+                selected,
             );
         }
         self.default.check(ctx, service_domain, method)
@@ -225,10 +243,18 @@ mod production_dispatch_tests {
             signer,
         );
         let pep = production_pep();
+        let no_activation = dispatch_labels::DeclaredDispatchPep::new(
+            dispatch_labels::DeclaredDispatchTable::production(),
+        );
 
         assert_eq!(
             pep.check(&policy, "policy", Some(policy_methods::APPLY_TEMPLATE)),
             MacDecision::Permit,
+        );
+        assert_eq!(
+            no_activation.check(&policy, "policy", Some(policy_methods::APPLY_TEMPLATE)),
+            MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::NoClearance),
+            "the production wrapper must supply the explicit verified bootstrap context",
         );
         assert_eq!(
             pep.check(&registry, "policy", Some(policy_methods::APPLY_TEMPLATE)),

@@ -293,6 +293,51 @@ impl DeclaredDispatchPep {
     pub fn table(&self) -> &'static DeclaredDispatchTable {
         self.table
     }
+
+    /// Evaluate an already-established subject context against the typed table.
+    ///
+    /// This remains crate-private so production callers cannot substitute an
+    /// arbitrary clearance for an unverified envelope. The local policy
+    /// bootstrap wrapper uses it only after proving its exact bearerless,
+    /// non-federated root authority and derives this context from the
+    /// authenticated service clearance.
+    pub(crate) fn check_with_explicit_context(
+        &self,
+        ctx: &EnvelopeContext,
+        service_domain: &str,
+        method: Option<u16>,
+        selected: SecurityContext,
+    ) -> MacDecision {
+        hyprstream_rpc::auth::mac::remember_verified_subject(ctx);
+        self.check_selected_context(ctx, service_domain, method, selected)
+    }
+
+    fn check_selected_context(
+        &self,
+        ctx: &EnvelopeContext,
+        service_domain: &str,
+        method: Option<u16>,
+        selected: SecurityContext,
+    ) -> MacDecision {
+        let Some(service_name) = declared_service_subject(ctx) else {
+            return MacDecision::Deny(MacDenyReason::NoClearance);
+        };
+        let Some(declared_clearance) = self.table.service_clearance(&service_name) else {
+            return MacDecision::Deny(MacDenyReason::NoClearance);
+        };
+        let service_ctx =
+            SecurityContext::from_clearance(declared_clearance, ctx.verified_key_material());
+
+        let Some(row) = self.table.resolve_row(service_domain, method) else {
+            return MacDecision::Deny(MacDenyReason::UnlabeledObject);
+        };
+
+        if selected.can_access(&row.label) && service_ctx.can_access(&row.label) {
+            MacDecision::Permit
+        } else {
+            MacDecision::Deny(MacDenyReason::FloorDeny)
+        }
+    }
 }
 
 /// Extract the canonical service name from a verified service subject.
@@ -338,27 +383,7 @@ impl MacDispatchPep for DeclaredDispatchPep {
         // 2. Deliberate declared service subject clearance. The assurance axis
         //    is clamped to the verified key material; the declaration cannot
         //    outrun the crypto.
-        let Some(service_name) = declared_service_subject(ctx) else {
-            return MacDecision::Deny(MacDenyReason::NoClearance);
-        };
-        let Some(declared_clearance) = self.table.service_clearance(&service_name) else {
-            return MacDecision::Deny(MacDenyReason::NoClearance);
-        };
-        let service_ctx =
-            SecurityContext::from_clearance(declared_clearance, ctx.verified_key_material());
-
-        // 3. Typed declared (service, leaf) object identity.
-        let Some(row) = self.table.resolve_row(service_domain, method) else {
-            return MacDecision::Deny(MacDenyReason::UnlabeledObject);
-        };
-
-        // 4. Intrinsic lattice floor: both the activation-selected context and
-        //    the deliberate declared-service context must dominate the label.
-        if selected.can_access(&row.label) && service_ctx.can_access(&row.label) {
-            MacDecision::Permit
-        } else {
-            MacDecision::Deny(MacDenyReason::FloorDeny)
-        }
+        self.check_selected_context(ctx, service_domain, method, selected)
     }
 }
 
