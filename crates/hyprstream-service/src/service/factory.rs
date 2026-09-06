@@ -68,6 +68,23 @@ pub struct NativeServiceAnnouncement {
 }
 
 impl NativeServiceAnnouncement {
+    /// Build the native Iroh `moql` admission proof from this exact
+    /// checkpoint-verified accepted-state projection. The caller's signer must
+    /// still be the accepted response key; no credential is synthesized.
+    pub fn moql_admission_proof(
+        &self,
+        signer: &SigningKey,
+    ) -> anyhow::Result<hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof> {
+        anyhow::ensure!(
+            self.response_verifying_key == signer.verifying_key().to_bytes(),
+            "admission signer is not the accepted current response key"
+        );
+        Ok(hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof {
+            did: self.service_did.to_string(),
+            ed25519: signer.clone(),
+            ml_dsa_65: hyprstream_rpc::node_identity::derive_mesh_mldsa_key(signer),
+        })
+    }
     /// Project a complete native announcement from the opaque #1004 accepted
     /// state. The local service key must be the accepted current key and the
     /// named service must be present in that exact state.
@@ -197,6 +214,10 @@ pub struct QuicSharedConfig {
     /// `moql` handler. `None` keeps the fail-closed anonymous posture.
     pub moq_admission:
         Option<Arc<hyprstream_rpc::transport::moql_admission::MoqlAdmissionAuthenticator>>,
+    /// Native client's accepted-state-bound proof for authenticated Iroh `moql`
+    /// dials. Quinn/WebTransport uses its distinct CONNECT authentication path.
+    pub moq_admission_proof:
+        Option<hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof>,
 }
 
 impl QuicSharedConfig {
@@ -242,6 +263,7 @@ impl QuicSharedConfig {
             // #1027: thread the daemon-owned moql admission authenticator
             // through so the spawner installs it on the iroh `moql` handler.
             moq_admission: self.moq_admission.clone(),
+            moq_admission_proof: self.moq_admission_proof.clone(),
         }
     }
 
@@ -405,6 +427,17 @@ pub struct ServiceContext {
 }
 
 impl ServiceContext {
+    /// Return an accepted-state-bound admission proof for a service that was
+    /// checkpoint-authorized for native network startup.
+    pub fn moql_admission_proof(
+        &self,
+        service_name: &str,
+    ) -> anyhow::Result<Option<hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof>> {
+        self.native_announcements
+            .get(service_name)
+            .map(|announcement| announcement.moql_admission_proof(&self.service_signing_key(service_name)))
+            .transpose()
+    }
     /// Create a new service context.
     pub fn new(
         signing_key: SigningKey,

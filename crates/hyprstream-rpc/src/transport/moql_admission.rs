@@ -702,6 +702,20 @@ impl MoqlAdmissionAuthenticator {
         if used.len() >= REPLAY_CACHE_MAX {
             used.retain(|_, discard_after| now_unix_ms < *discard_after);
         }
+        // A sustained stream of valid, distinct admissions can fill the whole
+        // replay horizon without making any entry expired. Bound resident state
+        // in that case too: retain the newest horizon of transcripts, evicting
+        // the entry that will expire first before admitting the new transcript.
+        while used.len() >= REPLAY_CACHE_MAX {
+            let Some(oldest) = used
+                .iter()
+                .min_by_key(|(_, discard_after)| *discard_after)
+                .map(|(digest, _)| *digest)
+            else {
+                break;
+            };
+            used.remove(&oldest);
+        }
         used.insert(digest, now_unix_ms.saturating_add(horizon_ms));
     }
 }
@@ -713,6 +727,7 @@ impl MoqlAdmissionAuthenticator {
 /// Client-side proof material for `moql` admission: the peer's accepted
 /// `did:at9p` identity and both private halves of one of its accepted current
 /// subject keys. The carrier (iroh secret key / NodeId) plays no part.
+#[derive(Clone)]
 pub struct MoqlAdmissionProof {
     /// The peer's `did:at9p` DID.
     pub did: String,
@@ -929,6 +944,20 @@ mod tests {
             .verify_response(&hello, &challenge, &response, now)
             .expect_err("the same transcript must be single-use");
         assert!(matches!(err, MoqlAdmissionError::Replay), "{err}");
+    }
+
+    #[test]
+    fn replay_cache_never_exceeds_capacity_when_horizon_is_full() {
+        let (ed, pq) = keypair(7);
+        let state = state_with(&ed, &pq, 3, 9);
+        let (auth, _, _) = fixture_authenticator(state);
+        let now = crate::envelope::current_timestamp();
+        for index in 0..=REPLAY_CACHE_MAX {
+            let mut digest = [0u8; 32];
+            digest[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            auth.mark_consumed(digest, now.saturating_add(index as i64));
+        }
+        assert_eq!(auth.used.lock().len(), REPLAY_CACHE_MAX);
     }
 
     #[test]

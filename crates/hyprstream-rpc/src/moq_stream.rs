@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, ensure};
 use bytes::Bytes;
 use moq_net::{BroadcastProducer, Group, OriginConsumer, OriginProducer, Track, TrackProducer};
 use parking_lot::{Mutex, RwLock};
@@ -67,6 +67,23 @@ use crate::streaming::{StreamContext, StreamPayloadData, StreamVerifier};
 static GLOBAL_MOQ_ORIGIN: OnceLock<MoqStreamOrigin> = OnceLock::new();
 /// The UDS socket path serving the moq plane (set by `serve_moq_uds_background`).
 static GLOBAL_MOQ_UDS_PATH: OnceLock<PathBuf> = OnceLock::new();
+/// Accepted-state-bound proof used for native Iroh `moql` client admission.
+/// Installed by the daemon's checkpointed service configuration; absent in
+/// browser, local, and test profiles.
+static GLOBAL_MOQ_ADMISSION_PROOF: OnceLock<crate::transport::moql_admission::MoqlAdmissionProof> =
+    OnceLock::new();
+
+/// Install this process's accepted-state-bound Iroh admission proof.
+pub fn init_global_moq_admission_proof(
+    proof: crate::transport::moql_admission::MoqlAdmissionProof,
+) -> bool {
+    GLOBAL_MOQ_ADMISSION_PROOF.set(proof).is_ok()
+}
+
+fn global_moq_admission_proof()
+-> Option<&'static crate::transport::moql_admission::MoqlAdmissionProof> {
+    GLOBAL_MOQ_ADMISSION_PROOF.get()
+}
 
 /// Register the process-global moq streaming origin.
 ///
@@ -298,7 +315,7 @@ pub fn relay_reach_from_decoded(
 ///
 /// Idempotent: a second call is a no-op (the first path wins).
 pub fn serve_moq_uds_background(origin: MoqStreamOrigin, path: PathBuf) {
-    use crate::transport::uds_session::{accept_uds, PLANE_MOQ};
+    use crate::transport::uds_session::{PLANE_MOQ, accept_uds};
     use moq_net::Server as MoqServer;
 
     // Remove stale socket from a previous run (best-effort).
@@ -1149,7 +1166,7 @@ async fn moq_stream_handle_task(
     cancel: tokio_util::sync::CancellationToken,
 ) {
     use crate::streaming::StreamVerifier;
-    use crate::transport::uds_session::{connect_uds, PLANE_MOQ};
+    use crate::transport::uds_session::{PLANE_MOQ, connect_uds};
     use moq_net::{Client as MoqClient, Origin, Track};
 
     let session = match connect_uds(&uds_path, PLANE_MOQ).await {
@@ -1425,7 +1442,7 @@ pub struct MoqReachConnection {
 pub async fn connect_moq_reach(
     reach: &[crate::stream_info::Destination],
 ) -> Result<MoqReachConnection> {
-    use crate::transport::uds_session::{connect_uds, PLANE_MOQ};
+    use crate::transport::uds_session::{PLANE_MOQ, connect_uds};
     use moq_net::{Client as MoqClient, Origin};
 
     let client_origin = Origin::random().produce();
@@ -1438,13 +1455,22 @@ pub async fn connect_moq_reach(
         let Some(cfg) = reach_to_transport_config(dest) else {
             continue;
         };
-        match crate::dial::dial_stream(&cfg).await {
+        let dial = match (&cfg.endpoint, global_moq_admission_proof()) {
+            (crate::transport::EndpointType::Iroh { .. }, Some(proof)) => {
+                crate::dial::dial_stream_authenticated(&cfg, proof).await
+            }
+            (crate::transport::EndpointType::Iroh { .. }, None) => Err(anyhow::anyhow!(
+                "iroh moql reach requires an accepted-state admission proof"
+            )),
+            _ => crate::dial::dial_stream(&cfg).await,
+        };
+        match dial {
             Ok(stream_session) => match stream_session.connect_moq(&moq_client).await {
                 Ok(session) => {
                     return Ok(MoqReachConnection {
                         consumer,
                         _session: session,
-                    })
+                    });
                 }
                 Err(e) => last_err = Some(format!("moq handshake: {e}")),
             },
@@ -1470,7 +1496,9 @@ pub async fn connect_moq_reach(
     // 3. Fail closed.
     Err(anyhow!(
         "no dialable reach in StreamInfo and no local moq UDS plane — cannot subscribe to broadcast{}",
-        last_err.map(|e| format!(" (last dial error: {e})")).unwrap_or_default()
+        last_err
+            .map(|e| format!(" (last dial error: {e})"))
+            .unwrap_or_default()
     ))
 }
 
@@ -1710,7 +1738,15 @@ pub async fn run_relay_announce_link(
         return Err(e);
     }
 
-    let stream_session = crate::dial::dial_stream(&cfg).await?;
+    let stream_session = match (&cfg.endpoint, global_moq_admission_proof()) {
+        (crate::transport::EndpointType::Iroh { .. }, Some(proof)) => {
+            crate::dial::dial_stream_authenticated(&cfg, proof).await?
+        }
+        (crate::transport::EndpointType::Iroh { .. }, None) => {
+            anyhow::bail!("iroh moql relay requires an accepted-state admission proof")
+        }
+        _ => crate::dial::dial_stream(&cfg).await?,
+    };
     // `with_origin` makes the link bidirectional: this node's broadcasts are
     // announced UP to the relay; the relay re-serves them to its subscribers.
     let moq_client = MoqClient::new().with_origin(producer.clone());
@@ -1944,10 +1980,10 @@ fn seal_payload(
     nonce: Option<[u8; 12]>,
     payload: &StreamPayloadData,
 ) -> Result<StreamPayloadData> {
-    use crate::crypto::event_crypto::{encrypt_event, encrypt_event_with_nonce, EventPrivacy};
+    use crate::crypto::event_crypto::{EventPrivacy, encrypt_event, encrypt_event_with_nonce};
     use crate::stream_consumer::{
-        stream_aead_aad, SEALED_KIND_COMPLETE, SEALED_KIND_DATA, SEALED_KIND_EPOCH_COMMIT,
-        SEALED_KIND_ERROR,
+        SEALED_KIND_COMPLETE, SEALED_KIND_DATA, SEALED_KIND_EPOCH_COMMIT, SEALED_KIND_ERROR,
+        stream_aead_aad,
     };
 
     let control_bytes = match payload {
@@ -2202,7 +2238,7 @@ mod tests {
     /// and traffic keys, and the relay-visible Group identity remains monotonic.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn identified_epoch_rekey_keeps_stock_moq_objects_opaque_and_immutable() -> Result<()> {
-        use crate::crypto::hybrid_kem::{generate_recipient, SuiteId};
+        use crate::crypto::hybrid_kem::{SuiteId, generate_recipient};
         use crate::crypto::key_exchange::client_identified_stream_epoch;
         use crate::stream_epoch::{
             IdentifiedStreamBinding, StreamAcceptedState, StreamCarrierProfile, StreamRouteRole,
@@ -3158,50 +3194,56 @@ mod tests {
 
         // Wrong key.
         let wrong = [0x99u8; 32];
-        assert!(crate::stream_consumer::open_sealed_payload(
-            &wrong,
-            topic,
-            epoch,
-            0,
-            0,
-            tag,
-            ct,
-            nonce,
-            key_commitment
-        )
-        .is_err());
+        assert!(
+            crate::stream_consumer::open_sealed_payload(
+                &wrong,
+                topic,
+                epoch,
+                0,
+                0,
+                tag,
+                ct,
+                nonce,
+                key_commitment
+            )
+            .is_err()
+        );
 
         // Wrong epoch (AAD mismatch) — anti-replay across epochs.
-        assert!(crate::stream_consumer::open_sealed_payload(
-            &enc_key,
-            topic,
-            2,
-            0,
-            0,
-            tag,
-            ct,
-            nonce,
-            key_commitment
-        )
-        .is_err());
+        assert!(
+            crate::stream_consumer::open_sealed_payload(
+                &enc_key,
+                topic,
+                2,
+                0,
+                0,
+                tag,
+                ct,
+                nonce,
+                key_commitment
+            )
+            .is_err()
+        );
 
         // Tampered ciphertext.
         let mut bad_ct = ct.clone();
         if let Some(b) = bad_ct.first_mut() {
             *b ^= 0xFF;
         }
-        assert!(crate::stream_consumer::open_sealed_payload(
-            &enc_key,
-            topic,
-            epoch,
-            0,
-            0,
-            tag,
-            &bad_ct,
-            nonce,
-            key_commitment
-        )
-        .is_err());
+        assert!(
+            crate::stream_consumer::open_sealed_payload(
+                &enc_key,
+                topic,
+                epoch,
+                0,
+                0,
+                tag,
+                &bad_ct,
+                nonce,
+                key_commitment
+            )
+            .is_err()
+        );
     }
 
     // ── #321 provenance over a published block ─────────────────────────────
@@ -3269,14 +3311,10 @@ mod tests {
         let empty = KeyedPqTrustStore::new();
         let none_enrolled = |_: &[u8; 32]| false;
         let mut v2 = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
-        assert!(verify_moq_frame_with_provenance(
-            &mut v2,
-            &topic,
-            &frames[0],
-            &empty,
-            &none_enrolled
-        )
-        .is_err());
+        assert!(
+            verify_moq_frame_with_provenance(&mut v2, &topic, &frames[0], &empty, &none_enrolled)
+                .is_err()
+        );
         Ok(())
     }
 }

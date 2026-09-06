@@ -222,6 +222,13 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     cb(service_name.clone(), advertise_addr, qc.server_name.clone());
                 }
 
+                // Install an accepted-state-bound proof before any native
+                // subscriber or relay dial. It is absent for browser/local
+                // profiles, where no Iroh admission is attempted.
+                if let Some(proof) = qc.moq_admission_proof.take() {
+                    let _ = hyprstream_rpc::moq_stream::init_global_moq_admission_proof(proof);
+                }
+
                 // Link a relay only to this service's scoped origin. The shared
                 // process origin would leak other services' broadcasts into it.
                 if let Some(relay) = qc.moq_relay.take() {

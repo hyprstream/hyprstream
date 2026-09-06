@@ -2726,6 +2726,17 @@ fn main() -> Result<()> {
                                             }
                                         }
                                     };
+                                    // #1542: a checkpointed native service has both an
+                                    // accepted did:at9p identity and its accepted current
+                                    // response signer. Use that existing state to prove Iroh
+                                    // `moql` admission; do not fabricate credentials or fall
+                                    // back to an anonymous Iroh handshake.
+                                    let moq_admission_proof = service_names
+                                        .iter()
+                                        .find_map(|service_name| {
+                                            ctx.moql_admission_proof(service_name).transpose()
+                                        })
+                                        .transpose()?;
                                     let shared = hyprstream_service::QuicSharedConfig {
                                         cert_chain,
                                         key_der,
@@ -2742,6 +2753,7 @@ fn main() -> Result<()> {
                                         // fail-closed anonymous posture until a deployment
                                         // installs an authenticator here.
                                         moq_admission: None,
+                                        moq_admission_proof,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             |request: hyprstream_service::NativeAnnouncementRequest| {
                                                 std::thread::spawn(move || {

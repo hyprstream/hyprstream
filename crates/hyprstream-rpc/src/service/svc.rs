@@ -1342,6 +1342,9 @@ pub struct QuicLoopConfig {
     #[cfg(not(target_arch = "wasm32"))]
     pub moq_admission:
         Option<Arc<crate::transport::moql_admission::MoqlAdmissionAuthenticator>>,
+    /// Native client proof for authenticated Iroh `moql` dials in this process.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_admission_proof: Option<crate::transport::moql_admission::MoqlAdmissionProof>,
 }
 
 /// Handle for a running service

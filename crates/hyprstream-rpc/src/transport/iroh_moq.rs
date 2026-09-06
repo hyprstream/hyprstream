@@ -34,11 +34,12 @@ use std::sync::Arc;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use moq_net::{Origin, OriginConsumer, OriginProducer, Server, StatsHandle};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use web_transport_iroh::Session;
 
 use crate::moq_authz::{
-    tenant_scoped_consumer, PeerIdentity, SharedSubscribeAuthorizer, SubscribeDecision,
+    PeerIdentity, SharedSubscribeAuthorizer, SubscribeDecision, tenant_scoped_consumer,
 };
 use crate::transport::moql_admission::MoqlAdmissionAuthenticator;
 
@@ -164,6 +165,9 @@ struct HandlerInner {
     /// #276 subscribe-authz + per-tenant announce scoping config. Defaults to
     /// "off" (open same-tenant subscribe preserved).
     authz: MoqAuthzConfig,
+    /// Caps accepted `moql` connections before their admission exchange. The
+    /// permit lives until the connection accept task exits.
+    connection_limit: Arc<Semaphore>,
     /// Triggered by `ProtocolHandler::shutdown` so accept handlers stop
     /// waiting for `Session::closed()` and exit promptly.
     shutdown: CancellationToken,
@@ -171,7 +175,8 @@ struct HandlerInner {
 
 impl std::fmt::Debug for IrohMoqProtocolHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IrohMoqProtocolHandler").finish_non_exhaustive()
+        f.debug_struct("IrohMoqProtocolHandler")
+            .finish_non_exhaustive()
     }
 }
 
@@ -190,6 +195,9 @@ impl IrohMoqProtocolHandler {
                 origin,
                 stats: StatsHandle::default(),
                 authz: MoqAuthzConfig::default(),
+                connection_limit: Arc::new(Semaphore::new(
+                    super::rpc_session::DEFAULT_CONNECTION_LIMIT,
+                )),
                 shutdown: CancellationToken::new(),
             }),
         }
@@ -207,6 +215,13 @@ impl IrohMoqProtocolHandler {
         self
     }
 
+    /// Override the server-wide accepted-connection cap. Connections beyond
+    /// the cap are dropped instead of waiting for admission.
+    pub fn with_connection_limit(mut self, connection_limit: usize) -> Self {
+        self.rebuild_inner(|i| i.connection_limit = Arc::new(Semaphore::new(connection_limit)));
+        self
+    }
+
     /// Mutate the inner config, cloning the shared `Arc<HandlerInner>` only when
     /// it is already shared (cloned handler) so builder calls compose without
     /// dropping previously-installed fields (authz / admission).
@@ -219,6 +234,7 @@ impl IrohMoqProtocolHandler {
                 origin: old.origin.clone(),
                 stats: old.stats.clone(),
                 authz: old.authz.clone(),
+                connection_limit: Arc::clone(&old.connection_limit),
                 shutdown: old.shutdown.clone(),
             };
             f(&mut cloned);
@@ -251,6 +267,19 @@ impl Default for IrohMoqProtocolHandler {
 
 impl ProtocolHandler for IrohMoqProtocolHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        // Iroh's Router creates an accept task per carrier connection. Acquire
+        // before awaiting the #1027 challenge/response so unauthenticated peers
+        // cannot retain unbounded tasks for the admission timeout. Keep this
+        // permit through the admitted session's lifetime.
+        let _connection_permit = match Arc::clone(&self.inner.connection_limit).try_acquire_owned()
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!("iroh-moq: connection cap reached, rejecting connection");
+                conn.close(0u32.into(), b"moql connection cap reached");
+                return Ok(());
+            }
+        };
         // #1027: with an admission authenticator installed, the peer must
         // complete the fresh inside-carrier Ed25519 + ML-DSA-65
         // challenge/response BEFORE any moq machinery runs. The exchange binds
@@ -377,9 +406,7 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::iroh_substrate::{
-        ALPN_MOQ_LITE, IrohSubstrate, NoopHandler,
-    };
+    use crate::transport::iroh_substrate::{ALPN_MOQ_LITE, IrohSubstrate, NoopHandler};
     use bytes::Bytes;
     use iroh::{EndpointAddr, TransportAddr};
     use moq_net::{Client, Group, Track};
@@ -406,8 +433,8 @@ mod tests {
     /// client origin, or reach the tenant resolver. Mutating the carrier NodeId
     /// cannot change that decision because it is never an application proof.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn anonymous_carrier_cannot_publish_subscribe_or_obtain_tenant_scope(
-    ) -> anyhow::Result<()> {
+    async fn anonymous_carrier_cannot_publish_subscribe_or_obtain_tenant_scope()
+    -> anyhow::Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let resolver_calls = Arc::new(AtomicUsize::new(0));
@@ -423,12 +450,9 @@ mod tests {
         let handler = IrohMoqProtocolHandler::new().with_authz(authz);
         let producer = handler.origin_producer().clone();
         let server_consumer = handler.origin_consumer().clone();
-        let server = IrohSubstrate::new_test(
-            fresh_key(),
-            handler,
-            NoopHandler::new("rpc-not-wired"),
-        )
-        .await?;
+        let server =
+            IrohSubstrate::new_test(fresh_key(), handler, NoopHandler::new("rpc-not-wired"))
+                .await?;
         let server_addr = direct_addr(&server);
 
         // A server-side broadcast would be exposed if anonymous subscribe were
@@ -459,7 +483,9 @@ mod tests {
         let mut attacker_group = attacker_track.create_group(Group::from(0u64))?;
         attacker_group.write_frame(Bytes::from_static(b"attacker-data"))?;
         drop(attacker_group);
-        let moq_client = Client::new().with_origin(client_origin.clone()).with_consume(client_origin);
+        let moq_client = Client::new()
+            .with_origin(client_origin.clone())
+            .with_consume(client_origin);
         let handshake = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             moq_client.connect(session),
@@ -499,4 +525,80 @@ mod tests {
         Ok(())
     }
 
+    /// The connection cap is acquired before #1027 admission awaits the peer's
+    /// first stream, is not queued for a saturated peer, and is returned when
+    /// the stalled carrier closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_connection_cap_saturates_and_releases() -> anyhow::Result<()> {
+        struct NoAcceptedState;
+
+        impl crate::transport::moql_admission::AcceptedStateAuthority for NoAcceptedState {
+            fn accepted_state(
+                &self,
+                _did: &str,
+            ) -> Option<crate::transport::moql_admission::AcceptedIdentityState> {
+                None
+            }
+        }
+
+        let admission = Arc::new(
+            crate::transport::moql_admission::MoqlAdmissionAuthenticator::new(
+                Arc::new(NoAcceptedState),
+                Arc::new(|_peer| None),
+            ),
+        );
+        let handler = IrohMoqProtocolHandler::new()
+            .with_authz(MoqAuthzConfig::default().with_admission(admission))
+            .with_connection_limit(1);
+        let server = IrohSubstrate::new_test(
+            fresh_key(),
+            handler.clone(),
+            NoopHandler::new("rpc-not-wired"),
+        )
+        .await?;
+        let server_addr = direct_addr(&server);
+        let client = IrohSubstrate::new_test(
+            fresh_key(),
+            NoopHandler::new("client-moq"),
+            NoopHandler::new("client-rpc"),
+        )
+        .await?;
+
+        // This carrier never opens the admission stream, leaving the server in
+        // the bounded admission wait while holding its one connection permit.
+        let first = client.connect(server_addr.clone(), ALPN_MOQ_LITE).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while handler.inner.connection_limit.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("first stalled admission did not acquire connection permit")
+        })?;
+
+        // A second connection reaches iroh's carrier handshake but cannot add a
+        // second admission task; the handler rejects it without queueing.
+        let second = client.connect(server_addr.clone(), ALPN_MOQ_LITE).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            handler.inner.connection_limit.available_permits(),
+            0,
+            "saturated admission must retain only the first connection permit"
+        );
+        second.close(0u32.into(), b"test complete");
+
+        first.close(0u32.into(), b"test complete");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while handler.inner.connection_limit.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("connection permit was not released after close"))?;
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
 }
