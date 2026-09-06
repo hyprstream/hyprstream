@@ -794,32 +794,44 @@ impl ValkeyStateStore {
         )
     }
 
-    fn announcement_revision_key(&self, service_name: &str) -> String {
-        format!(
-            "{}:announcement-revision:{}",
-            self.prefix,
-            Self::service_id(service_name)
-        )
-    }
-
     async fn revision(&self, key: String) -> Result<u64> {
         use fred::prelude::*;
         Ok(self.pool.get::<Option<u64>, _>(key).await?.unwrap_or(0))
     }
 
-    async fn announcement_revision(&self, service_name: &str) -> Result<u64> {
-        self.revision(self.announcement_revision_key(service_name))
+    // Persistent family-wide generations bound revision storage independently
+    // of identity churn. Never expire/reset these counters: recreating a scope
+    // must not reuse a revision still attached to another replica's L1 value.
+    async fn announcement_revision(&self) -> Result<u64> {
+        self.revision(self.key("announcement-global-revision"))
             .await
     }
 
-    async fn liveness_revision(&self, node: &Did) -> Result<u64> {
-        self.revision(format!(
-            "{}:liveness-revision:{}",
-            self.prefix,
-            Self::digest(node.as_str())
-        ))
-        .await
+    async fn liveness_revision(&self) -> Result<u64> {
+        self.revision(self.key("liveness-global-revision")).await
     }
+
+    // Reap values and ALL secondary metadata in the same transaction as the
+    // capacity check/read. The expiry index contains at most the live capacity
+    // plus the last expired cohort; no historical service-name scan is needed.
+    // All derived keys retain the deployment's cluster hash tag.
+    const REAP_ANNOUNCEMENTS: &str = r#"
+local function reap(expiry, services, names, revision, now)
+  local expired = redis.call('ZRANGEBYSCORE', expiry, '-inf', now)
+  if #expired > 0 then redis.call('INCR', revision) end
+  for _, key in ipairs(expired) do
+    local service = string.match(key, ':announcement:([^:]+):[^:]+$')
+    local index = string.gsub(key, ':announcement:[^:]+:[^:]+$', ':announcement-index:' .. service)
+    redis.call('DEL', key)
+    redis.call('SREM', index, key)
+    redis.call('ZREM', expiry, key)
+    if redis.call('SCARD', index) == 0 then
+      redis.call('SREM', services, service)
+      redis.call('HDEL', names, service)
+    end
+  end
+end
+"#;
 
     async fn entity_revision(&self, issuer: &str) -> Result<u64> {
         self.revision(format!(
@@ -850,6 +862,7 @@ impl ValkeyStateStore {
         // refresh the same key, so GET followed by a separate DEL/SREM can
         // delete its newer value or remove its live index membership.
         const LIST: &str = r#"
+reap(KEYS[4], KEYS[2], KEYS[3], KEYS[5], ARGV[1])
 local live = {}
 for _, key in ipairs(redis.call('SMEMBERS', KEYS[1])) do
   local encoded = redis.call('GET', key)
@@ -859,6 +872,7 @@ for _, key in ipairs(redis.call('SMEMBERS', KEYS[1])) do
     if tonumber(value.live_until_unix_ms) > tonumber(ARGV[1]) and tonumber(value.expires_at_unix_ms) > tonumber(ARGV[1]) then
       table.insert(live, encoded)
     else
+      redis.call('INCR', KEYS[5])
       redis.call('DEL', key)
       redis.call('SREM', KEYS[1], key)
       redis.call('ZREM', KEYS[4], key)
@@ -877,12 +891,13 @@ return live
         let encoded: Vec<String> = self
             .pool
             .eval(
-                LIST,
+                format!("{}{LIST}", Self::REAP_ANNOUNCEMENTS),
                 vec![
                     self.announcement_index(service_name),
                     self.key("services"),
                     self.key("service-names"),
                     self.key("announcement-expiry"),
+                    self.key("announcement-global-revision"),
                 ],
                 vec![now_unix_ms.to_string(), Self::service_id(service_name)],
             )
@@ -905,9 +920,9 @@ impl DiscoveryStateStore for ValkeyStateStore {
         use fred::prelude::*;
 
         const PUT: &str = r#"
+reap(KEYS[6], KEYS[3], KEYS[4], KEYS[5], ARGV[7])
 local current = redis.call('GET', KEYS[1])
-redis.call('ZREMRANGEBYSCORE', KEYS[7], '-inf', ARGV[7])
-if not current and redis.call('ZCARD', KEYS[7]) >= tonumber(ARGV[8]) then
+if not current and redis.call('ZCARD', KEYS[6]) >= tonumber(ARGV[8]) then
   return redis.error_reply('Discovery Valkey announcement capacity exhausted')
 end
 if current then
@@ -926,8 +941,7 @@ redis.call('SADD', KEYS[2], KEYS[1])
 redis.call('SADD', KEYS[3], ARGV[5])
 redis.call('HSET', KEYS[4], ARGV[5], ARGV[6])
 redis.call('INCR', KEYS[5])
-redis.call('INCR', KEYS[6])
-redis.call('ZADD', KEYS[7], ARGV[4], KEYS[1])
+redis.call('ZADD', KEYS[6], ARGV[4], KEYS[1])
 return 1
 "#;
         let service_id = Self::service_id(service_name);
@@ -935,13 +949,12 @@ return 1
         let stored: i64 = self
             .pool
             .eval(
-                PUT,
+                format!("{}{PUT}", Self::REAP_ANNOUNCEMENTS),
                 vec![
                     self.announcement_key(service_name, &endpoint.socket_kind),
                     self.announcement_index(service_name),
                     self.key("services"),
                     self.key("service-names"),
-                    self.announcement_revision_key(service_name),
                     self.key("announcement-global-revision"),
                     self.key("announcement-expiry"),
                 ],
@@ -949,7 +962,10 @@ return 1
                     encoded,
                     endpoint.accepted_state_epoch.to_string(),
                     endpoint.expires_at_unix_ms.to_string(),
-                    endpoint.live_until_unix_ms.to_string(),
+                    endpoint
+                        .live_until_unix_ms
+                        .min(endpoint.expires_at_unix_ms)
+                        .to_string(),
                     service_id,
                     service_name.to_owned(),
                     unix_millis_now().to_string(),
@@ -979,7 +995,13 @@ return 1
     ) -> Result<Vec<(String, Vec<AnnouncedEndpoint>)>> {
         use fred::prelude::*;
 
-        let service_ids: Vec<String> = self.pool.smembers(self.key("services")).await?;
+        // Reap before enumerating names, so listing work is bounded by current
+        // capacity rather than every identity that has ever announced.
+        let service_ids: Vec<String> = self.pool.eval(
+            format!("{}\nreap(KEYS[1], KEYS[2], KEYS[3], KEYS[4], ARGV[1])\nreturn redis.call('SMEMBERS', KEYS[2])", Self::REAP_ANNOUNCEMENTS),
+            vec![self.key("announcement-expiry"), self.key("services"), self.key("service-names"), self.key("announcement-global-revision")],
+            vec![now_unix_ms.to_string()],
+        ).await?;
         let mut all = Vec::with_capacity(service_ids.len());
         for service_id in service_ids {
             let service_name: Option<String> = self
@@ -1025,7 +1047,7 @@ return 1
                 PUT,
                 vec![
                     format!("{}:liveness:{node_id}", self.prefix),
-                    format!("{}:liveness-revision:{node_id}", self.prefix),
+                    self.key("liveness-global-revision"),
                     self.key("liveness-expiry"),
                 ],
                 vec![
@@ -1315,7 +1337,7 @@ impl DiscoveryStateStore for TieredStateStore {
     ) -> Result<Vec<AnnouncedEndpoint>> {
         let _operation = self.operation.lock().await;
         let scope = Self::scope("announcement", service_name);
-        let revision = self.valkey.announcement_revision(service_name).await?;
+        let revision = self.valkey.announcement_revision().await?;
         if self.is_observed(&scope, revision, now_unix_ms) {
             return self
                 .memory
@@ -1371,7 +1393,7 @@ impl DiscoveryStateStore for TieredStateStore {
     async fn liveness(&self, node: &Did, now_unix_ms: i64) -> Result<Option<LiveAllocatable>> {
         let _operation = self.operation.lock().await;
         let scope = Self::scope("liveness", node.as_str());
-        let revision = self.valkey.liveness_revision(node).await?;
+        let revision = self.valkey.liveness_revision().await?;
         if self.is_observed(&scope, revision, now_unix_ms) {
             return self.memory.liveness(node, now_unix_ms).await;
         }
@@ -2058,6 +2080,168 @@ mod tests {
         assert!(cache.envelope_keysets.len() <= 1);
         assert!(cache.expiry.len() <= 4);
         assert!(tier.observed.lock().len() <= 4);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_expired_identity_churn_bounds_metadata_and_listing_work() {
+        use fred::prelude::*;
+
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let mut config = valkey_config(url, "metadata-churn");
+        config.announcement_capacity = 4;
+        config.liveness_capacity = 4;
+        let store = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
+        let tier = TieredStateStore::new(
+            Arc::new(MemoryStateStore::new(4, 4, 4)),
+            store.clone(),
+            30_000,
+        );
+        let now = unix_millis_now();
+        let anchor = Did::new("did:web:anchor.example".to_owned());
+        store
+            .put_announcement("anchor", endpoint("iroh", 1, now + 30_000, now + 30_000))
+            .await
+            .unwrap();
+        store
+            .put_liveness(
+                &anchor,
+                LiveAllocatable {
+                    allocatable: vec![],
+                    load_fraction: 0.1,
+                    last_seen: now,
+                    live_until_unix_ms: now + 30_000,
+                },
+            )
+            .await
+            .unwrap();
+        tier.announcements_for("anchor", now).await.unwrap();
+        tier.liveness(&anchor, now).await.unwrap();
+        let announcement_generation = store.announcement_revision().await.unwrap();
+        let liveness_generation = store.liveness_revision().await.unwrap();
+
+        // No historical service is ever individually read. Each cohort expires
+        // server-side before the next one; 36 distinct identities exceed the
+        // live capacity nine times while the anchor's L1 snapshot stays warm.
+        for cohort in 0..12 {
+            let now = unix_millis_now();
+            for slot in 0..3 {
+                let name = format!("churn-{cohort}-{slot}");
+                store
+                    .put_announcement(&name, endpoint("iroh", 1, now + 100, now + 100))
+                    .await
+                    .unwrap();
+                store
+                    .put_liveness(
+                        &Did::new(format!("did:web:{name}.example")),
+                        LiveAllocatable {
+                            allocatable: vec![],
+                            load_fraction: 0.2,
+                            last_seen: now,
+                            live_until_unix_ms: now + 100,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            // Inspect the backing namespace BEFORE any listing can clean it.
+            // KEYS is test-only, confined to this test's unique prefix.
+            let counts: Vec<usize> = store.pool.eval(
+                "return {redis.call('SCARD', KEYS[1]), redis.call('HLEN', KEYS[2]), #redis.call('KEYS', ARGV[1]), #redis.call('KEYS', ARGV[2]), #redis.call('KEYS', ARGV[3])}",
+                vec![store.key("services"), store.key("service-names")],
+                vec![store.key("*"), store.key("announcement-index:*"), store.key("*revision*")],
+            ).await.unwrap();
+            // services is exactly the worklist consumed by all_announcements.
+            assert!(
+                counts[0] <= 4,
+                "global listing work grew with history: {counts:?}"
+            );
+            assert!(counts[1] <= 4, "service names leaked: {counts:?}");
+            assert!(counts[2] <= 3 * 4 + 6, "backend keys leaked: {counts:?}");
+            assert!(counts[3] <= 4, "per-service indexes leaked: {counts:?}");
+            assert_eq!(counts[4], 2, "only two global generations may persist");
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        let now = unix_millis_now();
+        let all = store.all_announcements(now).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "anchor");
+        assert_eq!(store.all_liveness(now).await.unwrap().len(), 1);
+        let count: usize = store.pool.scard(store.key("services")).await.unwrap();
+        assert_eq!(count, 1, "expired cohort must leave no listing work");
+        assert!(store.announcement_revision().await.unwrap() > announcement_generation);
+        assert!(store.liveness_revision().await.unwrap() > liveness_generation);
+
+        // Replace the still-cached anchor with a short-lived value on L2, then
+        // expire and recreate the SAME scopes. Revisions must not reset/ABA.
+        store
+            .put_announcement("anchor", endpoint("iroh", 2, now + 100, now + 100))
+            .await
+            .unwrap();
+        store
+            .put_liveness(
+                &anchor,
+                LiveAllocatable {
+                    allocatable: vec![],
+                    load_fraction: 0.5,
+                    last_seen: now,
+                    live_until_unix_ms: now + 100,
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let now = unix_millis_now();
+        assert!(store.all_announcements(now).await.unwrap().is_empty());
+        assert!(store.all_liveness(now).await.unwrap().is_empty());
+        let keys: Vec<String> = store
+            .pool
+            .eval(
+                "return redis.call('KEYS', ARGV[1])",
+                Vec::<String>::new(),
+                vec![store.key("*")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            keys.len(),
+            2,
+            "only persistent generations survive expiry: {keys:?}"
+        );
+        let expired_generation = store.announcement_revision().await.unwrap();
+        let expired_liveness_generation = store.liveness_revision().await.unwrap();
+        store
+            .put_announcement("anchor", endpoint("iroh", 3, now + 30_000, now + 30_000))
+            .await
+            .unwrap();
+        store
+            .put_liveness(
+                &anchor,
+                LiveAllocatable {
+                    allocatable: vec![],
+                    load_fraction: 0.9,
+                    last_seen: now,
+                    live_until_unix_ms: now + 30_000,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store.announcement_revision().await.unwrap() > expired_generation);
+        assert!(store.liveness_revision().await.unwrap() > expired_liveness_generation);
+        assert_eq!(
+            tier.announcements_for("anchor", now).await.unwrap()[0].accepted_state_epoch,
+            3
+        );
+        assert_eq!(
+            tier.liveness(&anchor, now)
+                .await
+                .unwrap()
+                .unwrap()
+                .load_fraction,
+            0.9
+        );
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]

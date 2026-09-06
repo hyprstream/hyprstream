@@ -1292,6 +1292,8 @@ pub trait RequestService: 'static {
 ///
 /// QUIC server configuration for the service loop.
 pub struct QuicLoopConfig {
+    /// Cancels all announcements owned by this bound service before teardown.
+    pub announcement_cancellation: tokio_util::sync::CancellationToken,
     /// DER-encoded certificate chain (leaf first, then intermediates/CA)
     pub cert_chain: Vec<Vec<u8>>,
     /// DER-encoded private key — zeroed on drop.

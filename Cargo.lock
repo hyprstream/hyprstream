@@ -7538,6 +7538,7 @@ dependencies = [
  "systemd",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid 1.18.1",
  "web-transport-quinn",
