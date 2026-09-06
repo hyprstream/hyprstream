@@ -882,7 +882,11 @@ impl PolicyHandler for PolicyService {
         data: &ApplyTemplate,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        // The colocated PolicyService authority bootstraps templates over the
+        // local IPC plane without a tenant-bearing user token. Keep that
+        // authority on the explicit global bootstrap domain, while ordinary
+        // tenantless callers remain denied by `request_domain`.
+        let domain = self.request_domain(ctx)?;
         let allowed = self.policy_manager.check_with_domain(
             &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
@@ -2409,6 +2413,31 @@ mod tests {
                 .expect("PolicyService bootstrap authority domain"),
             "*"
         );
+    }
+
+    #[tokio::test]
+    async fn tokenless_local_policy_authority_can_apply_a_template() {
+        let (service, _root) = test_service().await;
+        let context = EnvelopeContext::for_test_authenticated_subject(
+            Subject::new("service:policy"),
+            service.signing_key.verifying_key(),
+        );
+
+        let response = service
+            .handle_apply_template(
+                &context,
+                1,
+                &ApplyTemplate {
+                    name: "public-read".to_owned(),
+                },
+            )
+            .await
+            .expect("PolicyService must return a template response");
+
+        assert!(matches!(
+            response,
+            PolicyResponseVariant::ApplyTemplateResult(_)
+        ));
     }
 
     #[tokio::test]
