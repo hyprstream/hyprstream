@@ -66,6 +66,24 @@ pub const SERVICE_SUBJECT_PREFIX: &str = "service:";
 /// real serialized requests and pins these values to the schema; changing the
 /// union order fails CI rather than silently relabeling the dispatch plane.
 pub mod policy_methods {
+    /// `getPolicy` — read the local control-plane policy.
+    pub const GET_POLICY: u16 = 3;
+    /// `applyTemplate` — install a reviewed bootstrap template.
+    pub const APPLY_TEMPLATE: u16 = 4;
+    /// `applyDraft` — commit a local policy draft.
+    pub const APPLY_DRAFT: u16 = 5;
+    /// `rollback` — restore a local policy revision.
+    pub const ROLLBACK: u16 = 6;
+    /// `getHistory` — inspect local policy revisions.
+    pub const GET_HISTORY: u16 = 7;
+    /// `getDiff` — inspect a local policy draft.
+    pub const GET_DIFF: u16 = 8;
+    /// `getDraftStatus` — inspect local draft state.
+    pub const GET_DRAFT_STATUS: u16 = 9;
+    /// `addGrouping` — add a local role assignment.
+    pub const ADD_GROUPING: u16 = 10;
+    /// `removeGrouping` — remove a local role assignment.
+    pub const REMOVE_GROUPING: u16 = 11;
     /// `registerServiceKey` — a keyed service installs its identity with the
     /// CA. Bootstrap-critical: it precedes identity standing.
     pub const REGISTER_SERVICE_KEY: u16 = 18;
@@ -140,12 +158,12 @@ pub struct DeclaredDispatchTable {
 impl DeclaredDispatchTable {
     /// The production staging-bootstrap declarations (#1499).
     ///
-    /// Object rows cover exactly the dispatch calls the fresh-state
+    /// Object rows cover the fresh-state
     /// `service start --services event,policy,discovery,registry,model,oai,oauth` boot
-    /// graph makes: every keyed non-policy service registers its signing key
-    /// with the PolicyService CA at startup and renews that identity
-    /// hourly. Subject rows declare the deliberate caller clearance for all
-    /// seven bootstrap services.
+    /// graph plus the PolicyService authority's local policy-control-plane
+    /// commands. The production wrapper further restricts those local commands
+    /// to the verified, tokenless `service:policy` authority. Subject rows
+    /// declare the deliberate caller clearance for all seven bootstrap services.
     #[must_use]
     pub fn production() -> &'static Self {
         &PRODUCTION_TABLE
@@ -275,6 +293,51 @@ impl DeclaredDispatchPep {
     pub fn table(&self) -> &'static DeclaredDispatchTable {
         self.table
     }
+
+    /// Evaluate an already-established subject context against the typed table.
+    ///
+    /// This remains crate-private so production callers cannot substitute an
+    /// arbitrary clearance for an unverified envelope. The local policy
+    /// bootstrap wrapper uses it only after proving its exact bearerless,
+    /// non-federated root authority and derives this context from the
+    /// authenticated service clearance.
+    pub(crate) fn check_with_explicit_context(
+        &self,
+        ctx: &EnvelopeContext,
+        service_domain: &str,
+        method: Option<u16>,
+        selected: SecurityContext,
+    ) -> MacDecision {
+        hyprstream_rpc::auth::mac::remember_verified_subject(ctx);
+        self.check_selected_context(ctx, service_domain, method, selected)
+    }
+
+    fn check_selected_context(
+        &self,
+        ctx: &EnvelopeContext,
+        service_domain: &str,
+        method: Option<u16>,
+        selected: SecurityContext,
+    ) -> MacDecision {
+        let Some(service_name) = declared_service_subject(ctx) else {
+            return MacDecision::Deny(MacDenyReason::NoClearance);
+        };
+        let Some(declared_clearance) = self.table.service_clearance(&service_name) else {
+            return MacDecision::Deny(MacDenyReason::NoClearance);
+        };
+        let service_ctx =
+            SecurityContext::from_clearance(declared_clearance, ctx.verified_key_material());
+
+        let Some(row) = self.table.resolve_row(service_domain, method) else {
+            return MacDecision::Deny(MacDenyReason::UnlabeledObject);
+        };
+
+        if selected.can_access(&row.label) && service_ctx.can_access(&row.label) {
+            MacDecision::Permit
+        } else {
+            MacDecision::Deny(MacDenyReason::FloorDeny)
+        }
+    }
 }
 
 /// Extract the canonical service name from a verified service subject.
@@ -320,33 +383,67 @@ impl MacDispatchPep for DeclaredDispatchPep {
         // 2. Deliberate declared service subject clearance. The assurance axis
         //    is clamped to the verified key material; the declaration cannot
         //    outrun the crypto.
-        let Some(service_name) = declared_service_subject(ctx) else {
-            return MacDecision::Deny(MacDenyReason::NoClearance);
-        };
-        let Some(declared_clearance) = self.table.service_clearance(&service_name) else {
-            return MacDecision::Deny(MacDenyReason::NoClearance);
-        };
-        let service_ctx =
-            SecurityContext::from_clearance(declared_clearance, ctx.verified_key_material());
-
-        // 3. Typed declared (service, leaf) object identity.
-        let Some(row) = self.table.resolve_row(service_domain, method) else {
-            return MacDecision::Deny(MacDenyReason::UnlabeledObject);
-        };
-
-        // 4. Intrinsic lattice floor: both the activation-selected context and
-        //    the deliberate declared-service context must dominate the label.
-        if selected.can_access(&row.label) && service_ctx.can_access(&row.label) {
-            MacDecision::Permit
-        } else {
-            MacDecision::Deny(MacDenyReason::FloorDeny)
-        }
+        self.check_selected_context(ctx, service_domain, method, selected)
     }
 }
 
 // ── Production declarations (the staging bootstrap set, #1499) ─────────────
 
 static BOOTSTRAP_METHODS: &[DispatchMethodPolicy] = &[
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::GET_POLICY },
+        method_name: "getPolicy",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService control-plane read; only the tokenless policy authority reaches this row",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::APPLY_TEMPLATE },
+        method_name: "applyTemplate",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService installs a reviewed bootstrap template; the handler still enforces Casbin writeback",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::APPLY_DRAFT },
+        method_name: "applyDraft",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService commits a local draft; the handler still enforces Casbin writeback",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::ROLLBACK },
+        method_name: "rollback",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService restores a local revision; the handler still enforces Casbin writeback",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::GET_HISTORY },
+        method_name: "getHistory",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService control-plane history read; only the tokenless policy authority reaches this row",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::GET_DIFF },
+        method_name: "getDiff",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService control-plane draft inspection; only the tokenless policy authority reaches this row",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::GET_DRAFT_STATUS },
+        method_name: "getDraftStatus",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService draft-state inspection; only the tokenless policy authority reaches this row",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::ADD_GROUPING },
+        method_name: "addGrouping",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService role update; the handler still enforces Casbin writeback",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::REMOVE_GROUPING },
+        method_name: "removeGrouping",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService role removal; the handler still enforces Casbin writeback",
+    },
     DispatchMethodPolicy {
         id: DispatchMethodId {
             service: "policy",
@@ -408,9 +505,8 @@ static BOOTSTRAP_SERVICE_CLEARANCES: &[ServiceSubjectClearance] = &[
     ServiceSubjectClearance {
         service: "policy",
         clearance: BOOTSTRAP_SERVICE_CLEARANCE,
-        justification: "the CA itself; it makes no boot RPC calls, but its \
-             enrolled caller clearance is declared with the same deliberate \
-             value as the services it certifies",
+        justification: "the CA itself; its local control-plane rows are separately \
+             restricted to the verified tokenless service:policy authority",
     },
     ServiceSubjectClearance {
         service: "registry",
@@ -458,11 +554,19 @@ mod tests {
     fn every_declared_call_resolves_to_the_intended_typed_label_and_clearance() {
         let table = DeclaredDispatchTable::production();
 
-        // The fresh boot graph: discovery, registry, model, oai, and oauth each call
-        // policy.registerServiceKey on fresh state; renewal uses
-        // policy.refreshServiceToken. Every declared row resolves to the
-        // intended typed label — the lattice floor, deliberate and reviewed.
+        // The fresh boot graph declares the local PolicyService control-plane
+        // operations plus registration and renewal. Every declared row resolves
+        // to the intended typed label — the lattice floor, deliberate and reviewed.
         let expected: &[(u16, &str)] = &[
+            (policy_methods::GET_POLICY, "getPolicy"),
+            (policy_methods::APPLY_TEMPLATE, "applyTemplate"),
+            (policy_methods::APPLY_DRAFT, "applyDraft"),
+            (policy_methods::ROLLBACK, "rollback"),
+            (policy_methods::GET_HISTORY, "getHistory"),
+            (policy_methods::GET_DIFF, "getDiff"),
+            (policy_methods::GET_DRAFT_STATUS, "getDraftStatus"),
+            (policy_methods::ADD_GROUPING, "addGrouping"),
+            (policy_methods::REMOVE_GROUPING, "removeGrouping"),
             (policy_methods::REGISTER_SERVICE_KEY, "registerServiceKey"),
             (policy_methods::REFRESH_SERVICE_TOKEN, "refreshServiceToken"),
         ];
@@ -739,6 +843,145 @@ mod tests {
     #[test]
     fn declared_policy_discriminants_match_the_serialized_schema() {
         use capnp::message::Builder;
+
+        // getPolicy
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.set_get_policy(());
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::GET_POLICY,
+            "the declared getPolicy discriminant must match the schema union ordinal"
+        );
+
+        // applyTemplate
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_apply_template().set_name("public-read");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::APPLY_TEMPLATE,
+            "the declared applyTemplate discriminant must match the schema union ordinal"
+        );
+
+        // applyDraft
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_apply_draft();
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::APPLY_DRAFT,
+            "the declared applyDraft discriminant must match the schema union ordinal"
+        );
+
+        // rollback
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_rollback().set_git_ref("HEAD");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::ROLLBACK,
+            "the declared rollback discriminant must match the schema union ordinal"
+        );
+
+        // getHistory
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_get_history().set_count(1);
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::GET_HISTORY,
+            "the declared getHistory discriminant must match the schema union ordinal"
+        );
+
+        // getDiff
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_get_diff();
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::GET_DIFF,
+            "the declared getDiff discriminant must match the schema union ordinal"
+        );
+
+        // getDraftStatus
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.set_get_draft_status(());
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::GET_DRAFT_STATUS,
+            "the declared getDraftStatus discriminant must match the schema union ordinal"
+        );
+
+        // addGrouping
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            let mut call = req.reborrow().init_add_grouping();
+            call.set_user("bootstrap-user");
+            call.set_role("viewer");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::ADD_GROUPING,
+            "the declared addGrouping discriminant must match the schema union ordinal"
+        );
+
+        // removeGrouping
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            let mut call = req.reborrow().init_remove_grouping();
+            call.set_user("bootstrap-user");
+            call.set_role("viewer");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::REMOVE_GROUPING,
+            "the declared removeGrouping discriminant must match the schema union ordinal"
+        );
 
         // registerServiceKey
         let mut message = Builder::new_default();
