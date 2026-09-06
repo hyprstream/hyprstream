@@ -86,6 +86,8 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
             let processor: Arc<dyn IrohRequestProcessor> = Arc::new(bridge);
 
             if let Some(mut qc) = quic_config {
+                let announcement_cancellation = qc.announcement_cancellation.clone();
+                let _announcement_guard = announcement_cancellation.clone().drop_guard();
                 // web-transport-quinn has no per-builder provider hook and
                 // resolves rustls's process default. Install and validate it at
                 // the actual bind seam so task/thread/subprocess startup cannot
@@ -314,38 +316,55 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                 } else {
                     None
                 };
-                // Drain the iroh substrate on shutdown (parallel to quinn drain).
-                if let Some(substrate) = _iroh_substrate_guard {
-                    let iroh_shutdown = Arc::clone(&shutdown);
-                    tokio::spawn(async move {
-                        iroh_shutdown.notified().await;
-                        if let Err(e) = substrate.shutdown().await {
-                            tracing::warn!("iroh substrate shutdown error: {e}");
-                        }
-                    });
-                }
-
-                // Bridge the `Notify` shutdown to the server's graceful drain.
+                // One owner consumes the service shutdown notification. Multiple
+                // independent Notify waiters would race for notify_one's permit.
+                // Cancel publication before draining either carrier, including
+                // when a serving loop exits without an explicit stop request.
                 let drain_limit = rpc_server.stream_limit();
                 let drain_capacity = rpc_server.capacity();
                 let drain_token = rpc_server.shutdown_token();
-                let drain_shutdown = Arc::clone(&shutdown);
-                tokio::spawn(async move {
-                    drain_shutdown.notified().await;
-                    hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown(
-                        &drain_limit, drain_capacity, &drain_token,
-                    ).await;
-                });
-
+                let local_shutdown = Arc::new(tokio::sync::Notify::new());
                 let rep_fut = hyprstream_rpc::service::serve::serve_bridged(
                     &transport, Arc::clone(&processor), signing_key.clone(),
-                    Arc::clone(&shutdown), on_ready,
+                    Arc::clone(&local_shutdown), on_ready,
                 );
                 let quic_fut = rpc_server.run();
-                let (rep_result, quic_result) = tokio::join!(rep_fut, quic_fut);
-                if let Err(e) = quic_result {
-                    tracing::warn!("QUIC server loop ended with error: {e}");
+                tokio::pin!(rep_fut, quic_fut);
+                let completed_rep = tokio::select! {
+                    biased;
+                    _ = shutdown.notified() => None,
+                    result = &mut rep_fut => Some(result),
+                    result = &mut quic_fut => {
+                        if let Err(error) = result {
+                            tracing::warn!("QUIC server loop ended with error: {error}");
+                        }
+                        None
+                    }
+                    _ = async {
+                        loop {
+                            match _iroh_substrate_guard.as_ref() {
+                                Some(substrate) if substrate.router().is_shutdown()
+                                    || substrate.endpoint().is_closed() => break,
+                                Some(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        }
+                    } => None,
+                };
+                announcement_cancellation.cancel();
+                local_shutdown.notify_one();
+                if let Some(substrate) = _iroh_substrate_guard {
+                    if let Err(error) = substrate.shutdown().await {
+                        tracing::warn!("iroh substrate shutdown error: {error}");
+                    }
                 }
+                hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown(
+                    &drain_limit, drain_capacity, &drain_token,
+                ).await;
+                let rep_result = match completed_rep {
+                    Some(result) => result,
+                    None => rep_fut.await,
+                };
                 rep_result.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
             } else {
                 hyprstream_rpc::service::serve::serve_bridged(

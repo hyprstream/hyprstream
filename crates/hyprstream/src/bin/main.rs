@@ -1875,6 +1875,7 @@ fn install_session_pq_overlay() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeAnnouncementRefreshCompletion {
     Expired,
+    Cancelled,
 }
 
 async fn refresh_native_announcement<F, Fut, Error>(
@@ -1882,6 +1883,7 @@ async fn refresh_native_announcement<F, Fut, Error>(
     socket_kind: &str,
     endpoint: &str,
     refresh_expires_at_unix_ms: i64,
+    cancellation: tokio_util::sync::CancellationToken,
     mut announce: F,
 ) -> NativeAnnouncementRefreshCompletion
 where
@@ -1902,7 +1904,12 @@ where
             );
             return NativeAnnouncementRefreshCompletion::Expired;
         }
-        match announce().await {
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return NativeAnnouncementRefreshCompletion::Cancelled,
+            result = async { announce().await } => result,
+        };
+        match result {
             Ok(()) => {
                 tracing::info!(
                     service = service_name,
@@ -1925,7 +1932,11 @@ where
                     .max(RETRY_INITIAL);
             }
         }
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return NativeAnnouncementRefreshCompletion::Cancelled,
+            _ = tokio::time::sleep(delay) => {}
+        }
     }
 }
 
@@ -2857,6 +2868,7 @@ fn main() -> Result<()> {
                                                             &announcement.socket_kind,
                                                             &announcement.endpoint,
                                                             refresh_expires_at_unix_ms,
+                                                            request.cancellation,
                                                             || async {
                                                                 client.announce(&announcement).await.map(|_| ())
                                                             },
@@ -3634,6 +3646,7 @@ mod resolver_startup_controls {
                 "iroh",
                 "iroh://test-node",
                 chrono::Utc::now().timestamp_millis() + 60_000,
+                tokio_util::sync::CancellationToken::new(),
                 move || {
                     let publication = observed_publications.fetch_add(1, Ordering::SeqCst) + 1;
                     published_tx
@@ -3724,6 +3737,78 @@ mod resolver_startup_controls {
         panic!("expired production refresh loop attempted an announcement");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn native_announcement_refresh_loop_shutdown_cannot_overwrite_restart() {
+        use std::sync::Arc;
+        use parking_lot::Mutex;
+        let publications = Arc::new(Mutex::new(Vec::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let old_cancel = tokio_util::sync::CancellationToken::new();
+        let new_cancel = tokio_util::sync::CancellationToken::new();
+        let spawn = |endpoint: &'static str, cancellation| {
+            let publications = Arc::clone(&publications);
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                super::refresh_native_announcement(
+                    "model", "quic", endpoint, i64::MAX, cancellation,
+                    move || {
+                        publications.lock().push(endpoint);
+                        tx.send(endpoint).expect("publication receiver");
+                        async { Ok::<(), std::convert::Infallible>(()) }
+                    },
+                ).await
+            })
+        };
+        let old = spawn("quic://old:10001", old_cancel.clone());
+        assert_eq!(rx.recv().await, Some("quic://old:10001"));
+        old_cancel.cancel();
+        assert_eq!(old.await.expect("old task"), super::NativeAnnouncementRefreshCompletion::Cancelled);
+        let new = spawn("quic://new:10002", new_cancel.clone());
+        assert_eq!(rx.recv().await, Some("quic://new:10002"));
+        tokio::time::advance(std::time::Duration::from_secs(26)).await;
+        assert_eq!(rx.recv().await, Some("quic://new:10002"));
+        new_cancel.cancel();
+        assert_eq!(new.await.expect("new task"), super::NativeAnnouncementRefreshCompletion::Cancelled);
+        assert_eq!(
+            *publications.lock(),
+            vec!["quic://old:10001", "quic://new:10002", "quic://new:10002"],
+        );
+    }
+
+    #[tokio::test]
+    async fn native_announcement_refresh_loop_cancels_in_flight_publish() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let completed = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            let completed = Arc::clone(&completed);
+            let mut started_tx = Some(started_tx);
+            async move {
+                super::refresh_native_announcement(
+                    "model", "iroh", "iroh://test", i64::MAX, cancellation,
+                    move || {
+                        let started = started_tx.take();
+                        let completed = Arc::clone(&completed);
+                        async move {
+                            if let Some(started) = started { let _ = started.send(()); }
+                            std::future::pending::<()>().await;
+                            completed.store(true, Ordering::SeqCst);
+                            Ok::<(), std::convert::Infallible>(())
+                        }
+                    },
+                ).await
+            }
+        });
+        started_rx.await.expect("publish started");
+        cancellation.cancel();
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await.expect("cancellation must not wait for RPC completion").expect("task");
+        assert_eq!(completion, super::NativeAnnouncementRefreshCompletion::Cancelled);
+        assert!(!completed.load(Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn native_announcement_refresh_loop_stops_before_announce_after_absolute_expiry() {
         let completion = super::refresh_native_announcement(
@@ -3731,6 +3816,7 @@ mod resolver_startup_controls {
             "iroh",
             "iroh://test-node",
             chrono::Utc::now().timestamp_millis() - 1,
+            tokio_util::sync::CancellationToken::new(),
             expired_announcement_must_not_run,
         )
         .await;
