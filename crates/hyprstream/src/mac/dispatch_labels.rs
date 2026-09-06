@@ -66,26 +66,24 @@ pub const SERVICE_SUBJECT_PREFIX: &str = "service:";
 /// real serialized requests and pins these values to the schema; changing the
 /// union order fails CI rather than silently relabeling the dispatch plane.
 pub mod policy_methods {
-    /// `check` — inspect the local effective policy.
-    pub const CHECK: u16 = 1;
     /// `getPolicy` — read the local control-plane policy.
-    pub const GET_POLICY: u16 = 4;
+    pub const GET_POLICY: u16 = 3;
     /// `applyTemplate` — install a reviewed bootstrap template.
-    pub const APPLY_TEMPLATE: u16 = 5;
+    pub const APPLY_TEMPLATE: u16 = 4;
     /// `applyDraft` — commit a local policy draft.
-    pub const APPLY_DRAFT: u16 = 6;
+    pub const APPLY_DRAFT: u16 = 5;
     /// `rollback` — restore a local policy revision.
-    pub const ROLLBACK: u16 = 7;
+    pub const ROLLBACK: u16 = 6;
     /// `getHistory` — inspect local policy revisions.
-    pub const GET_HISTORY: u16 = 8;
+    pub const GET_HISTORY: u16 = 7;
     /// `getDiff` — inspect a local policy draft.
-    pub const GET_DIFF: u16 = 9;
+    pub const GET_DIFF: u16 = 8;
     /// `getDraftStatus` — inspect local draft state.
-    pub const GET_DRAFT_STATUS: u16 = 10;
+    pub const GET_DRAFT_STATUS: u16 = 9;
     /// `addGrouping` — add a local role assignment.
-    pub const ADD_GROUPING: u16 = 11;
+    pub const ADD_GROUPING: u16 = 10;
     /// `removeGrouping` — remove a local role assignment.
-    pub const REMOVE_GROUPING: u16 = 12;
+    pub const REMOVE_GROUPING: u16 = 11;
     /// `registerServiceKey` — a keyed service installs its identity with the
     /// CA. Bootstrap-critical: it precedes identity standing.
     pub const REGISTER_SERVICE_KEY: u16 = 18;
@@ -368,12 +366,6 @@ impl MacDispatchPep for DeclaredDispatchPep {
 
 static BOOTSTRAP_METHODS: &[DispatchMethodPolicy] = &[
     DispatchMethodPolicy {
-        id: DispatchMethodId { service: "policy", method: policy_methods::CHECK },
-        method_name: "check",
-        label: SecurityLabel::bottom(),
-        justification: "verified local PolicyService control-plane inspection; only the tokenless policy authority reaches this row",
-    },
-    DispatchMethodPolicy {
         id: DispatchMethodId { service: "policy", method: policy_methods::GET_POLICY },
         method_name: "getPolicy",
         label: SecurityLabel::bottom(),
@@ -541,7 +533,6 @@ mod tests {
         // operations plus registration and renewal. Every declared row resolves
         // to the intended typed label — the lattice floor, deliberate and reviewed.
         let expected: &[(u16, &str)] = &[
-            (policy_methods::CHECK, "check"),
             (policy_methods::GET_POLICY, "getPolicy"),
             (policy_methods::APPLY_TEMPLATE, "applyTemplate"),
             (policy_methods::APPLY_DRAFT, "applyDraft"),
@@ -827,6 +818,145 @@ mod tests {
     #[test]
     fn declared_policy_discriminants_match_the_serialized_schema() {
         use capnp::message::Builder;
+
+        // getPolicy
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.set_get_policy(());
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::GET_POLICY,
+            "the declared getPolicy discriminant must match the schema union ordinal"
+        );
+
+        // applyTemplate
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_apply_template().set_name("public-read");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::APPLY_TEMPLATE,
+            "the declared applyTemplate discriminant must match the schema union ordinal"
+        );
+
+        // applyDraft
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_apply_draft();
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::APPLY_DRAFT,
+            "the declared applyDraft discriminant must match the schema union ordinal"
+        );
+
+        // rollback
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_rollback().set_git_ref("HEAD");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::ROLLBACK,
+            "the declared rollback discriminant must match the schema union ordinal"
+        );
+
+        // getHistory
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_get_history().set_count(1);
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::GET_HISTORY,
+            "the declared getHistory discriminant must match the schema union ordinal"
+        );
+
+        // getDiff
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_get_diff();
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::GET_DIFF,
+            "the declared getDiff discriminant must match the schema union ordinal"
+        );
+
+        // getDraftStatus
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.set_get_draft_status(());
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::GET_DRAFT_STATUS,
+            "the declared getDraftStatus discriminant must match the schema union ordinal"
+        );
+
+        // addGrouping
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            let mut call = req.reborrow().init_add_grouping();
+            call.set_user("bootstrap-user");
+            call.set_role("viewer");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::ADD_GROUPING,
+            "the declared addGrouping discriminant must match the schema union ordinal"
+        );
+
+        // removeGrouping
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            let mut call = req.reborrow().init_remove_grouping();
+            call.set_user("bootstrap-user");
+            call.set_role("viewer");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::REMOVE_GROUPING,
+            "the declared removeGrouping discriminant must match the schema union ordinal"
+        );
 
         // registerServiceKey
         let mut message = Builder::new_default();

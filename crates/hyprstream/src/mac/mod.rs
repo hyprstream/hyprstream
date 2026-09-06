@@ -154,8 +154,7 @@ impl hyprstream_rpc::auth::mac::MacDispatchPep for ProductionDispatchPep {
             && matches!(
                 method,
                 Some(
-                    policy_methods::CHECK
-                        | policy_methods::GET_POLICY
+                    policy_methods::GET_POLICY
                         | policy_methods::APPLY_TEMPLATE
                         | policy_methods::APPLY_DRAFT
                         | policy_methods::ROLLBACK
@@ -238,6 +237,11 @@ mod production_dispatch_tests {
         assert_eq!(
             pep.check(&policy, "policy", Some(17)),
             MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject),
+        );
+        assert_eq!(
+            pep.check(&policy, "policy", Some(1)),
+            MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject),
+            "policy check must not report the root authority's access as another user's result",
         );
     }
 }
