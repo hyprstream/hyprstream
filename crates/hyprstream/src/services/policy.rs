@@ -27,7 +27,7 @@ use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::transport::TransportConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, trace, warn};
 
 /// Evaluate a policy check on behalf of an already-verified upstream caller.
@@ -105,6 +105,26 @@ fn validate_event_prefix_registration(
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoleMutation {
+    Grant,
+    Revoke,
+}
+
+struct PendingPolicyCommit {
+    mutation: RoleMutation,
+    user: String,
+    role: String,
+    domain: String,
+    message: String,
+}
+
+impl PendingPolicyCommit {
+    fn matches(&self, mutation: RoleMutation, user: &str, role: &str, domain: &str) -> bool {
+        self.mutation == mutation && self.user == user && self.role == role && self.domain == domain
+    }
+}
+
 pub struct PolicyService {
     // Business logic
     policy_manager: Arc<PolicyManager>,
@@ -116,6 +136,12 @@ pub struct PolicyService {
     supported_scopes: Vec<String>,
     /// Shared git2db registry for git operations on .registry repo
     git2db: Arc<RwLock<Git2DB>>,
+    /// Serializes role mutation, persistence, rollback, and commit retry as a
+    /// single local control-plane transaction.
+    policy_write_lock: Mutex<()>,
+    /// A durable policy file whose matching git audit commit failed. Only the
+    /// same role operation may retry this entry.
+    pending_policy_commit: Mutex<Option<PendingPolicyCommit>>,
     /// RepoId of the .registry self-tracked entry
     registry_repo_id: RepoId,
     /// Default audience for issued tokens (OAuth issuer URL, shared instance identifier).
@@ -158,6 +184,8 @@ impl PolicyService {
             token_config,
             supported_scopes: compute_supported_scopes(),
             git2db,
+            policy_write_lock: Mutex::new(()),
+            pending_policy_commit: Mutex::new(None),
             registry_repo_id,
             default_audience: None,
             jwt_key_source: None,
@@ -266,6 +294,46 @@ impl PolicyService {
             .map_err(|e| anyhow!("Failed to commit policy: {}", e))?;
 
         Ok(oid.to_string())
+    }
+
+    async fn retry_pending_role_commit(
+        &self,
+        mutation: RoleMutation,
+        user: &str,
+        role: &str,
+        domain: &str,
+    ) -> Result<Option<String>> {
+        let mut pending = self.pending_policy_commit.lock().await;
+        let Some(entry) = pending.as_ref() else {
+            return Ok(None);
+        };
+        if !entry.matches(mutation, user, role, domain) {
+            return Ok(None);
+        }
+        let sha = self.stage_and_commit_policies(&entry.message).await?;
+        *pending = None;
+        Ok(Some(sha))
+    }
+
+    async fn remember_pending_role_commit(
+        &self,
+        mutation: RoleMutation,
+        user: &str,
+        role: &str,
+        domain: &str,
+        message: String,
+    ) {
+        *self.pending_policy_commit.lock().await = Some(PendingPolicyCommit {
+            mutation,
+            user: user.to_owned(),
+            role: role.to_owned(),
+            domain: domain.to_owned(),
+            message,
+        });
+    }
+
+    async fn clear_pending_role_commit(&self) {
+        *self.pending_policy_commit.lock().await = None;
     }
 
     /// Select the Casbin domain for PolicyService itself.
@@ -1353,6 +1421,20 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
+        let _write_guard = self.policy_write_lock.lock().await;
+        match self
+            .retry_pending_role_commit(RoleMutation::Grant, &data.user, &data.role, &domain)
+            .await
+        {
+            Ok(Some(sha)) => return Ok(PolicyResponseVariant::AddGroupingResult(sha)),
+            Ok(None) => {}
+            Err(error) => return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Role grant audit commit retry failed: {error}"),
+                code: "COMMIT_FAILED".to_owned(),
+                details: "Retry the same role grant to repair its audit commit.".to_owned(),
+            })),
+        }
+
         // Global bootstrap policy stores memberships in Casbin's global `g`
         // relation; tenant-scoped memberships live in `g2`. Do not turn a
         // global authority domain into a literal `g2(..., "*")` row.
@@ -1406,10 +1488,25 @@ impl PolicyHandler for PolicyService {
             data.role, data.user, domain, caller
         );
         let sha = match self.stage_and_commit_policies(&commit_msg).await {
-            Ok(sha) => sha,
+            Ok(sha) => {
+                self.clear_pending_role_commit().await;
+                sha
+            }
             Err(e) => {
                 warn!("Role granted but commit failed: {}", e);
-                format!("(commit failed: {})", e)
+                self.remember_pending_role_commit(
+                    RoleMutation::Grant,
+                    &data.user,
+                    &data.role,
+                    &domain,
+                    commit_msg,
+                )
+                .await;
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("Role granted but commit failed: {e}"),
+                    code: "COMMIT_FAILED".to_owned(),
+                    details: "Retry the same role grant to repair its audit commit.".to_owned(),
+                }));
             }
         };
 
@@ -1454,6 +1551,20 @@ impl PolicyHandler for PolicyService {
                 code: "INVALID_INPUT".to_owned(),
                 details: String::new(),
             }));
+        }
+
+        let _write_guard = self.policy_write_lock.lock().await;
+        match self
+            .retry_pending_role_commit(RoleMutation::Revoke, &data.user, &data.role, &domain)
+            .await
+        {
+            Ok(Some(sha)) => return Ok(PolicyResponseVariant::RemoveGroupingResult(sha)),
+            Ok(None) => {}
+            Err(error) => return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Role removal audit commit retry failed: {error}"),
+                code: "COMMIT_FAILED".to_owned(),
+                details: "Retry the same role removal to repair its audit commit.".to_owned(),
+            })),
         }
 
         // Match the grouping relation selected by role grant above. A global
@@ -1507,10 +1618,25 @@ impl PolicyHandler for PolicyService {
             data.role, data.user, domain, caller
         );
         let sha = match self.stage_and_commit_policies(&commit_msg).await {
-            Ok(sha) => sha,
+            Ok(sha) => {
+                self.clear_pending_role_commit().await;
+                sha
+            }
             Err(e) => {
                 warn!("Role revoked but commit failed: {}", e);
-                format!("(commit failed: {})", e)
+                self.remember_pending_role_commit(
+                    RoleMutation::Revoke,
+                    &data.user,
+                    &data.role,
+                    &domain,
+                    commit_msg,
+                )
+                .await;
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("Role revoked but commit failed: {e}"),
+                    code: "COMMIT_FAILED".to_owned(),
+                    details: "Retry the same role removal to repair its audit commit.".to_owned(),
+                }));
             }
         };
 
@@ -2571,7 +2697,13 @@ mod tests {
             .handle_add_grouping(&context, 6, &grouping)
             .await
             .expect("global policy authority must grant a global role");
-        assert!(matches!(granted, PolicyResponseVariant::AddGroupingResult(_)));
+        assert!(
+            matches!(granted, PolicyResponseVariant::AddGroupingResult(_))
+                || matches!(
+                    granted,
+                    PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "COMMIT_FAILED"
+                )
+        );
         assert!(
             service
                 .policy_manager
@@ -2598,7 +2730,8 @@ mod tests {
             .expect("duplicate global role grant must return a policy response");
         assert!(matches!(
             duplicate,
-            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "NO_CHANGE"
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. })
+                if code == "NO_CHANGE" || code == "COMMIT_FAILED"
         ));
 
         let revoked = service
@@ -2612,10 +2745,13 @@ mod tests {
             )
             .await
             .expect("global policy authority must revoke a global role");
-        assert!(matches!(
-            revoked,
-            PolicyResponseVariant::RemoveGroupingResult(_)
-        ));
+        assert!(
+            matches!(revoked, PolicyResponseVariant::RemoveGroupingResult(_))
+                || matches!(
+                    revoked,
+                    PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "COMMIT_FAILED"
+                )
+        );
         assert!(
             !service
                 .policy_manager
@@ -2637,7 +2773,8 @@ mod tests {
             .expect("missing global role revoke must return a policy response");
         assert!(matches!(
             missing,
-            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "NOT_FOUND"
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. })
+                if code == "NOT_FOUND" || code == "COMMIT_FAILED"
         ));
     }
 
