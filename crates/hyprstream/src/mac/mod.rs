@@ -239,7 +239,7 @@ mod production_dispatch_tests {
             MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject),
         );
         assert_eq!(
-            pep.check(&policy, "policy", Some(1)),
+            pep.check(&policy, "policy", Some(0)),
             MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject),
             "policy check must not report the root authority's access as another user's result",
         );
