@@ -176,6 +176,14 @@ fn build_cli() -> ClapCommand {
                     .about("Initialize the checkpoint store for an explicitly provisioned fresh deployment"),
             )
             .subcommand(
+                ClapCommand::new("provision-services")
+                    .about("Admit existing local service identities before starting the registry")
+                    .arg(Arg::new("service").long("service").required(true)
+                        .action(clap::ArgAction::Append).value_delimiter(','))
+                    .arg(Arg::new("valid-for-seconds").long("valid-for-seconds")
+                        .value_parser(clap::value_parser!(i64)).default_value("86400")),
+            )
+            .subcommand(
                 ClapCommand::new("join")
                     .visible_alias("attach")
                     .about("Authorize and attach this host to one home PDS")
@@ -2367,6 +2375,15 @@ fn main() -> Result<()> {
                 println!("initialized empty deployment checkpoint store");
                 return Ok(());
             }
+            Some(("provision-services", provision_m)) => {
+                let services = provision_m.get_many::<String>("service")
+                    .context("service roster is required")?.cloned().collect::<Vec<_>>();
+                let lifetime = *provision_m.get_one::<i64>("valid-for-seconds")
+                    .context("service identity lifetime is required")?;
+                hyprstream_core::cli::deployment_bootstrap::provision_services(&services, lifetime)?;
+                println!("checkpoint-accepted service roster ready ({} services)", services.len());
+                return Ok(());
+            }
             Some(("join", join_m)) => {
                 let pds_url = join_m
                     .get_one::<String>("url")
@@ -2377,7 +2394,7 @@ fn main() -> Result<()> {
                     || hyprstream_core::cli::pds_handlers::handle_pds_join(&config, pds_url, scope),
                 );
             }
-            _ => anyhow::bail!("usage: hyprstream pds init-deployment-store | pds join <PDS_URL> [--scope <SCOPE>]"),
+            _ => anyhow::bail!("usage: hyprstream pds init-deployment-store | pds provision-services --service <NAMES> | pds join <PDS_URL> [--scope <SCOPE>]"),
         }
     }
 
@@ -3564,6 +3581,21 @@ fn main() -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod resolver_startup_controls {
+    #[test]
+    fn deployment_bootstrap_cli_requires_roster_and_parses_lifetime() {
+        let matches = super::build_cli().try_get_matches_from([
+            "hyprstream", "pds", "provision-services", "--service", "model,event",
+            "--valid-for-seconds", "3600",
+        ]).expect("bootstrap CLI");
+        let pds = matches.subcommand_matches("pds").expect("pds");
+        let provision = pds.subcommand_matches("provision-services").expect("provision");
+        assert_eq!(provision.get_many::<String>("service").expect("roster")
+            .map(String::as_str).collect::<Vec<_>>(), vec!["model", "event"]);
+        assert_eq!(provision.get_one::<i64>("valid-for-seconds"), Some(&3600));
+        assert!(super::build_cli().try_get_matches_from([
+            "hyprstream", "pds", "provision-services",
+        ]).is_err());
+    }
     const REFRESH_SCHEDULER_TURNS: usize = 32;
 
     async fn assert_publication_ready(

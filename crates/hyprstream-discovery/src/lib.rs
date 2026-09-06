@@ -149,6 +149,7 @@ pub use plc_directory::{
     SignedPlcDirectoryGenesis,
 };
 pub use service::{
+    authenticate_local_deployment_registry,
     bootstrap_deployment_process, deployment_registry_verifier, resolve_and_authenticate_did_anchors,
     AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
     production_browser_currentness_verifier, production_browser_provisioning,

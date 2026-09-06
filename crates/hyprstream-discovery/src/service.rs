@@ -1667,6 +1667,17 @@ pub fn deployment_registry_verifier() -> Result<RegistryDeploymentVerifier> {
         .ok_or_else(|| anyhow::anyhow!("deployment registry verifier is not installed"))
 }
 
+/// Authenticate the fixed, OS-owned deployment artifacts for an offline
+/// registry provisioning operation using the same role-specific trusted-file
+/// loader as startup. Returns verification-only evidence, not a raw-key
+/// authority constructor, and does not install a process resolver.
+pub fn authenticate_local_deployment_registry() -> Result<RegistryDeploymentVerifier> {
+    authenticate_registry_deployment_credentials(
+        load_trusted_registry_deployment_credentials()?,
+    )
+    .map(|identity| identity.verifier)
+}
+
 /// Non-cloneable proof privately minted from the fixed CA/JWT pair.
 struct AuthenticatedRegistryDeploymentIdentity {
     verifier: RegistryDeploymentVerifier,
