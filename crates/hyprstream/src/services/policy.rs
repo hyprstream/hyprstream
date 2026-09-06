@@ -105,26 +105,6 @@ fn validate_event_prefix_registration(
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RoleMutation {
-    Grant,
-    Revoke,
-}
-
-struct PendingPolicyCommit {
-    mutation: RoleMutation,
-    user: String,
-    role: String,
-    domain: String,
-    message: String,
-}
-
-impl PendingPolicyCommit {
-    fn matches(&self, mutation: RoleMutation, user: &str, role: &str, domain: &str) -> bool {
-        self.mutation == mutation && self.user == user && self.role == role && self.domain == domain
-    }
-}
-
 pub struct PolicyService {
     // Business logic
     policy_manager: Arc<PolicyManager>,
@@ -136,12 +116,9 @@ pub struct PolicyService {
     supported_scopes: Vec<String>,
     /// Shared git2db registry for git operations on .registry repo
     git2db: Arc<RwLock<Git2DB>>,
-    /// Serializes role mutation, persistence, rollback, and commit retry as a
+    /// Serializes role mutation, persistence, rollback, and audit commit as a
     /// single local control-plane transaction.
     policy_write_lock: Mutex<()>,
-    /// A durable policy file whose matching git audit commit failed. Only the
-    /// same role operation may retry this entry.
-    pending_policy_commit: Mutex<Option<PendingPolicyCommit>>,
     /// RepoId of the .registry self-tracked entry
     registry_repo_id: RepoId,
     /// Default audience for issued tokens (OAuth issuer URL, shared instance identifier).
@@ -185,7 +162,6 @@ impl PolicyService {
             supported_scopes: compute_supported_scopes(),
             git2db,
             policy_write_lock: Mutex::new(()),
-            pending_policy_commit: Mutex::new(None),
             registry_repo_id,
             default_audience: None,
             jwt_key_source: None,
@@ -294,46 +270,6 @@ impl PolicyService {
             .map_err(|e| anyhow!("Failed to commit policy: {}", e))?;
 
         Ok(oid.to_string())
-    }
-
-    async fn retry_pending_role_commit(
-        &self,
-        mutation: RoleMutation,
-        user: &str,
-        role: &str,
-        domain: &str,
-    ) -> Result<Option<String>> {
-        let mut pending = self.pending_policy_commit.lock().await;
-        let Some(entry) = pending.as_ref() else {
-            return Ok(None);
-        };
-        if !entry.matches(mutation, user, role, domain) {
-            return Ok(None);
-        }
-        let sha = self.stage_and_commit_policies(&entry.message).await?;
-        *pending = None;
-        Ok(Some(sha))
-    }
-
-    async fn remember_pending_role_commit(
-        &self,
-        mutation: RoleMutation,
-        user: &str,
-        role: &str,
-        domain: &str,
-        message: String,
-    ) {
-        *self.pending_policy_commit.lock().await = Some(PendingPolicyCommit {
-            mutation,
-            user: user.to_owned(),
-            role: role.to_owned(),
-            domain: domain.to_owned(),
-            message,
-        });
-    }
-
-    async fn clear_pending_role_commit(&self) {
-        *self.pending_policy_commit.lock().await = None;
     }
 
     /// Select the Casbin domain for PolicyService itself.
@@ -988,6 +924,10 @@ impl PolicyHandler for PolicyService {
             }
         };
 
+        // All writers stage the same policies/ tree, so keep the mutation,
+        // save, and commit together with role transactions.
+        let _write_guard = self.policy_write_lock.lock().await;
+
         // Apply template rules via the Casbin enforcer.
         // Base rules are always present (injected at init/reload), so templates
         // only add their own rules on top. The enforcer's save_policy() persists
@@ -1035,6 +975,10 @@ impl PolicyHandler for PolicyService {
                 details: String::new(),
             }));
         }
+
+        // Serialize the disk reload and its commit with all other policy
+        // writers, since they share one policies/ tree and Git index.
+        let _write_guard = self.policy_write_lock.lock().await;
 
         info!("Applying draft policy changes");
 
@@ -1105,6 +1049,10 @@ impl PolicyHandler for PolicyService {
                 }));
             }
         }
+
+        // Checkout, reload, and commit must not race a role transaction or
+        // another whole-tree policy writer.
+        let _write_guard = self.policy_write_lock.lock().await;
 
         // Use git2 escape hatch to checkout policies/ from the target ref
         let reg = self.git2db.read().await;
@@ -1422,19 +1370,6 @@ impl PolicyHandler for PolicyService {
         }
 
         let _write_guard = self.policy_write_lock.lock().await;
-        match self
-            .retry_pending_role_commit(RoleMutation::Grant, &data.user, &data.role, &domain)
-            .await
-        {
-            Ok(Some(sha)) => return Ok(PolicyResponseVariant::AddGroupingResult(sha)),
-            Ok(None) => {}
-            Err(error) => return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: format!("Role grant audit commit retry failed: {error}"),
-                code: "COMMIT_FAILED".to_owned(),
-                details: "Retry the same role grant to repair its audit commit.".to_owned(),
-            })),
-        }
-
         // Global bootstrap policy stores memberships in Casbin's global `g`
         // relation; tenant-scoped memberships live in `g2`. Do not turn a
         // global authority domain into a literal `g2(..., "*")` row.
@@ -1488,24 +1423,43 @@ impl PolicyHandler for PolicyService {
             data.role, data.user, domain, caller
         );
         let sha = match self.stage_and_commit_policies(&commit_msg).await {
-            Ok(sha) => {
-                self.clear_pending_role_commit().await;
-                sha
-            }
+            Ok(sha) => sha,
             Err(e) => {
-                warn!("Role granted but commit failed: {}", e);
-                self.remember_pending_role_commit(
-                    RoleMutation::Grant,
-                    &data.user,
-                    &data.role,
-                    &domain,
-                    commit_msg,
-                )
-                .await;
+                // A role grant is atomic with its audit commit. Keeping a
+                // successful policy save without an audit commit would leave
+                // a restart-unsafe, ambiguously attributable change behind.
+                let rollback = if domain == "*" {
+                    self.policy_manager
+                        .remove_role_for_user(&data.user, &data.role)
+                        .await
+                } else {
+                    self.policy_manager
+                        .remove_role_for_user_in_domain(&data.user, &data.role, &domain)
+                        .await
+                };
+                match rollback {
+                    Ok(true) => self.policy_manager.save().await.map_err(|rollback_error| {
+                        anyhow!(
+                            "Role grant audit commit failed: {}; rollback persistence failed: {}",
+                            e,
+                            rollback_error
+                        )
+                    })?,
+                    Ok(false) => return Err(anyhow!(
+                        "Role grant audit commit failed: {}; rollback was not applied",
+                        e
+                    )),
+                    Err(rollback_error) => return Err(anyhow!(
+                        "Role grant audit commit failed: {}; rollback failed: {}",
+                        e,
+                        rollback_error
+                    )),
+                }
+                warn!("Role grant rolled back after audit commit failed: {}", e);
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                    message: format!("Role granted but commit failed: {e}"),
+                    message: format!("Role grant was rolled back because its audit commit failed: {e}"),
                     code: "COMMIT_FAILED".to_owned(),
-                    details: "Retry the same role grant to repair its audit commit.".to_owned(),
+                    details: "No role change was retained; retry the role grant.".to_owned(),
                 }));
             }
         };
@@ -1554,19 +1508,6 @@ impl PolicyHandler for PolicyService {
         }
 
         let _write_guard = self.policy_write_lock.lock().await;
-        match self
-            .retry_pending_role_commit(RoleMutation::Revoke, &data.user, &data.role, &domain)
-            .await
-        {
-            Ok(Some(sha)) => return Ok(PolicyResponseVariant::RemoveGroupingResult(sha)),
-            Ok(None) => {}
-            Err(error) => return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: format!("Role removal audit commit retry failed: {error}"),
-                code: "COMMIT_FAILED".to_owned(),
-                details: "Retry the same role removal to repair its audit commit.".to_owned(),
-            })),
-        }
-
         // Match the grouping relation selected by role grant above. A global
         // bootstrap membership is `g(user, role)`, not `g2(user, role, "*")`.
         let changed = if domain == "*" {
@@ -1618,24 +1559,41 @@ impl PolicyHandler for PolicyService {
             data.role, data.user, domain, caller
         );
         let sha = match self.stage_and_commit_policies(&commit_msg).await {
-            Ok(sha) => {
-                self.clear_pending_role_commit().await;
-                sha
-            }
+            Ok(sha) => sha,
             Err(e) => {
-                warn!("Role revoked but commit failed: {}", e);
-                self.remember_pending_role_commit(
-                    RoleMutation::Revoke,
-                    &data.user,
-                    &data.role,
-                    &domain,
-                    commit_msg,
-                )
-                .await;
+                // A role revocation is atomic with its audit commit for the
+                // same reason as a grant: do not retain an unaudited policy
+                // transition across a process restart.
+                let rollback = if domain == "*" {
+                    self.policy_manager.add_role_for_user(&data.user, &data.role).await
+                } else {
+                    self.policy_manager
+                        .add_role_for_user_in_domain(&data.user, &data.role, &domain)
+                        .await
+                };
+                match rollback {
+                    Ok(true) => self.policy_manager.save().await.map_err(|rollback_error| {
+                        anyhow!(
+                            "Role revoke audit commit failed: {}; rollback persistence failed: {}",
+                            e,
+                            rollback_error
+                        )
+                    })?,
+                    Ok(false) => return Err(anyhow!(
+                        "Role revoke audit commit failed: {}; rollback was not applied",
+                        e
+                    )),
+                    Err(rollback_error) => return Err(anyhow!(
+                        "Role revoke audit commit failed: {}; rollback failed: {}",
+                        e,
+                        rollback_error
+                    )),
+                }
+                warn!("Role revoke rolled back after audit commit failed: {}", e);
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                    message: format!("Role revoked but commit failed: {e}"),
+                    message: format!("Role revoke was rolled back because its audit commit failed: {e}"),
                     code: "COMMIT_FAILED".to_owned(),
-                    details: "Retry the same role removal to repair its audit commit.".to_owned(),
+                    details: "No role change was retained; retry the role removal.".to_owned(),
                 }));
             }
         };
@@ -1671,6 +1629,10 @@ impl PolicyHandler for PolicyService {
                 details: String::new(),
             }));
         }
+
+        // Visibility rules are persisted into the same policies/ tree as role
+        // mutations, so keep this whole operation serialized through commit.
+        let _write_guard = self.policy_write_lock.lock().await;
 
         if data.public {
             // Make public: add wildcard infer+query rules
@@ -2697,20 +2659,19 @@ mod tests {
             .handle_add_grouping(&context, 6, &grouping)
             .await
             .expect("global policy authority must grant a global role");
-        assert!(
-            matches!(granted, PolicyResponseVariant::AddGroupingResult(_))
-                || matches!(
-                    granted,
-                    PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "COMMIT_FAILED"
-                )
-        );
+        let grant_committed = matches!(granted, PolicyResponseVariant::AddGroupingResult(_));
+        assert!(grant_committed || matches!(
+            granted,
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "COMMIT_FAILED"
+        ));
         assert!(
             service
                 .policy_manager
                 .get_grouping_policy()
                 .await
-                .contains(&vec![grouping.user.clone(), grouping.role.clone()]),
-            "the wildcard bootstrap domain must use Casbin's global g relation"
+                .contains(&vec![grouping.user.clone(), grouping.role.clone()])
+                == grant_committed,
+            "a failed audit commit must roll back the wildcard bootstrap role"
         );
         assert!(
             !service
@@ -2724,14 +2685,33 @@ mod tests {
                 ]),
             "the wildcard bootstrap domain must not create a g2 relation"
         );
+        if !grant_committed {
+            let retry = service
+                .handle_add_grouping(&context, 7, &grouping)
+                .await
+                .expect("a rolled-back grant must remain retryable");
+            assert!(matches!(
+                retry,
+                PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "COMMIT_FAILED"
+            ));
+            assert!(
+                !service
+                    .policy_manager
+                    .get_grouping_policy()
+                    .await
+                    .contains(&vec![grouping.user.clone(), grouping.role.clone()]),
+                "a failed retry must not retain the role"
+            );
+            return;
+        }
+
         let duplicate = service
             .handle_add_grouping(&context, 7, &grouping)
             .await
             .expect("duplicate global role grant must return a policy response");
         assert!(matches!(
             duplicate,
-            PolicyResponseVariant::Error(ErrorInfo { ref code, .. })
-                if code == "NO_CHANGE" || code == "COMMIT_FAILED"
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "NO_CHANGE"
         ));
 
         let revoked = service
@@ -2745,21 +2725,23 @@ mod tests {
             )
             .await
             .expect("global policy authority must revoke a global role");
-        assert!(
-            matches!(revoked, PolicyResponseVariant::RemoveGroupingResult(_))
-                || matches!(
-                    revoked,
-                    PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "COMMIT_FAILED"
-                )
-        );
+        let revoke_committed = matches!(revoked, PolicyResponseVariant::RemoveGroupingResult(_));
+        assert!(revoke_committed || matches!(
+            revoked,
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "COMMIT_FAILED"
+        ));
         assert!(
             !service
                 .policy_manager
                 .get_grouping_policy()
                 .await
-                .contains(&vec![grouping.user.clone(), grouping.role.clone()]),
-            "global role removal must remove the Casbin g relation"
+                .contains(&vec![grouping.user.clone(), grouping.role.clone()])
+                == revoke_committed,
+            "a failed audit commit must roll back the wildcard bootstrap role revoke"
         );
+        if !revoke_committed {
+            return;
+        }
         let missing = service
             .handle_remove_grouping(
                 &context,
@@ -2773,8 +2755,7 @@ mod tests {
             .expect("missing global role revoke must return a policy response");
         assert!(matches!(
             missing,
-            PolicyResponseVariant::Error(ErrorInfo { ref code, .. })
-                if code == "NOT_FOUND" || code == "COMMIT_FAILED"
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "NOT_FOUND"
         ));
     }
 
