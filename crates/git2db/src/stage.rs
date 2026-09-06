@@ -5,7 +5,7 @@
 use crate::errors::{Git2DBError, Git2DBResult};
 use crate::registry::{Git2DB, RepoId};
 use crate::repo_accessor::RepositoryAccessor;
-use git2::{IndexAddOption, Oid, Repository, Status, StatusOptions};
+use git2::{IndexAddOption, Repository, Status, StatusOptions};
 use std::path::{Path, PathBuf};
 
 /// Manager for repository staging area
@@ -122,55 +122,6 @@ impl<'a> StageManager<'a> {
                 .write()
                 .map_err(|e| Git2DBError::internal(format!("Failed to write index: {e}")))?;
 
-            Ok(())
-        })
-        .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
-    }
-
-    /// Snapshot the current index tree without changing the staging area.
-    ///
-    /// Callers that must make a worktree mutation atomic with a later commit
-    /// can restore this tree if committing the staged mutation fails.
-    pub async fn snapshot(&self) -> Git2DBResult<Oid> {
-        let repo_path = self.repo_path()?;
-
-        tokio::task::spawn_blocking(move || -> Git2DBResult<Oid> {
-            let repo = Repository::open(&repo_path).map_err(|e| {
-                Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}"))
-            })?;
-            let mut index = repo
-                .index()
-                .map_err(|e| Git2DBError::internal(format!("Failed to get index: {e}")))?;
-            index
-                .write_tree()
-                .map_err(|e| Git2DBError::internal(format!("Failed to snapshot index: {e}")))
-        })
-        .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
-    }
-
-    /// Restore a previously snapshotted index tree without changing the
-    /// working tree.
-    pub async fn restore(&self, snapshot: Oid) -> Git2DBResult<()> {
-        let repo_path = self.repo_path()?;
-
-        tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
-            let repo = Repository::open(&repo_path).map_err(|e| {
-                Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}"))
-            })?;
-            let tree = repo.find_tree(snapshot).map_err(|e| {
-                Git2DBError::internal(format!("Failed to read index snapshot: {e}"))
-            })?;
-            let mut index = repo
-                .index()
-                .map_err(|e| Git2DBError::internal(format!("Failed to get index: {e}")))?;
-            index
-                .read_tree(&tree)
-                .map_err(|e| Git2DBError::internal(format!("Failed to restore index: {e}")))?;
-            index
-                .write()
-                .map_err(|e| Git2DBError::internal(format!("Failed to write index: {e}")))?;
             Ok(())
         })
         .await
@@ -335,52 +286,4 @@ impl<'a> StageManager<'a> {
     pub async fn is_empty(&self) -> Git2DBResult<bool> {
         Ok(self.staged_files().await?.is_empty())
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{Git2DB, RepoId};
-
-    #[allow(clippy::expect_used)]
-    #[tokio::test]
-    async fn restore_returns_index_to_exact_snapshot_without_changing_worktree() {
-        let temp = tempfile::tempdir().expect("test registry directory");
-        let registry = Git2DB::open(temp.path())
-            .await
-            .expect("open test registry");
-        let repo_id = RepoId::from_uuid(crate::registry::registry_self_uuid());
-        let handle = registry.repo(&repo_id).expect("self-tracked registry handle");
-        let repo = handle.open_repo().expect("open self-tracked registry repository");
-        let workdir = repo.workdir().expect("registry worktree").to_path_buf();
-        let path = workdir.join("policy.csv");
-
-        std::fs::write(&path, "before\n").expect("write initial policy");
-        handle
-            .staging()
-            .add("policy.csv")
-            .await
-            .expect("stage initial policy");
-        handle.commit("test: initial policy").await.expect("commit initial policy");
-
-        let snapshot = handle.staging().snapshot().await.expect("snapshot index");
-        std::fs::write(&path, "rejected\n").expect("write rejected policy");
-        handle
-            .staging()
-            .add("policy.csv")
-            .await
-            .expect("stage rejected policy");
-
-        handle
-            .staging()
-            .restore(snapshot)
-            .await
-            .expect("restore index snapshot");
-
-        assert!(
-            handle.staging().is_empty().await.expect("staging status"),
-            "restoring the snapshot must remove the rejected staged change"
-        );
-        assert_eq!(std::fs::read_to_string(path).expect("read worktree"), "rejected\n");
-    }
-
 }
