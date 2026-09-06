@@ -1491,10 +1491,12 @@ pub async fn connect_moq_reach_with_server_identity(
 
     // 1. Networked reach (source of truth): dial the first reach we can resolve.
     let mut last_err: Option<String> = None;
+    let mut had_dialable_network_reach = false;
     for dest in reach {
         let Some(cfg) = reach_to_transport_config(dest) else {
             continue;
         };
+        had_dialable_network_reach = true;
         let dial = match (&cfg.endpoint, global_moq_admission_proof()) {
             (crate::transport::EndpointType::Iroh { .. }, Some(proof)) => {
                 if server_identity.did.is_empty()
@@ -1528,6 +1530,18 @@ pub async fn connect_moq_reach_with_server_identity(
             },
             Err(e) => last_err = Some(e.to_string()),
         }
+    }
+
+    // A producer-advertised network endpoint is authoritative. In particular,
+    // an authenticated Iroh rejection must not silently cross into this
+    // process's local plane: that could subscribe to an unrelated producer.
+    if had_dialable_network_reach {
+        return Err(anyhow!(
+            "all dialable network reaches failed; refusing local moq UDS fallback{}",
+            last_err
+                .map(|e| format!(" (last dial error: {e})"))
+                .unwrap_or_default()
+        ));
     }
 
     // 2. Local UDS fallback (same-host fast path, resolved from LOCAL config).
@@ -2804,6 +2818,41 @@ mod tests {
             reach.iter().any(|d| reach_to_transport_config(d).is_some()),
             "an iroh reach must resolve to a dialable TransportConfig"
         );
+    }
+
+    /// A dialable advertised Iroh destination remains authoritative even when
+    /// its admission check rejects it. Falling through to this process's UDS
+    /// plane would turn that rejection into an unauthenticated local fallback.
+    #[tokio::test]
+    async fn rejected_iroh_reach_never_falls_back_to_local_uds() -> Result<()> {
+        use crate::stream_info::{Destination, IrohReach, Role, TransportConfig as ReachTransport};
+
+        let reach = [Destination {
+            role: Role::Direct,
+            transport: ReachTransport::Iroh(IrohReach {
+                node_id: [0xCDu8; 32],
+                alpn: "moql".to_owned(),
+                relay_url: String::new(),
+            }),
+        }];
+
+        // No process-global admission proof means this fails before any network
+        // I/O. The resolver must return that network-path rejection, even if a
+        // test or daemon has installed a local UDS path in this process.
+        let err = match connect_moq_reach(&reach).await {
+            Ok(_) => panic!("Iroh reach without admission proof must be rejected"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("all dialable network reaches failed; refusing local moq UDS fallback"),
+            "dialable Iroh rejection must not fall back to local UDS: {message}"
+        );
+        assert!(
+            message.contains("iroh moql reach"),
+            "network admission rejection must be retained: {message}"
+        );
+        Ok(())
     }
 
     /// #275: the consumer dials the producer's networked reach even when this
