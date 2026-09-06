@@ -1394,7 +1394,6 @@ impl PolicyHandler for PolicyService {
         }
 
         let _write_guard = self.policy_write_lock.lock().await;
-        let index_snapshot = self.snapshot_policy_index().await?;
         // Global bootstrap policy stores memberships in Casbin's global `g`
         // relation; tenant-scoped memberships live in `g2`. Do not turn a
         // global authority domain into a literal `g2(..., "*")` row.
@@ -1414,6 +1413,36 @@ impl PolicyHandler for PolicyService {
                 details: "No policy update was committed.".to_owned(),
             }));
         }
+
+        let index_snapshot = match self.snapshot_policy_index().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let rollback = if domain == "*" {
+                    self.policy_manager
+                        .remove_role_for_user(&data.user, &data.role)
+                        .await
+                } else {
+                    self.policy_manager
+                        .remove_role_for_user_in_domain(&data.user, &data.role, &domain)
+                        .await
+                };
+                return match rollback {
+                    Ok(true) => Err(anyhow!(
+                        "Failed to snapshot policy index after role grant; mutation was rolled back: {}",
+                        error
+                    )),
+                    Ok(false) => Err(anyhow!(
+                        "Failed to snapshot policy index after role grant: {}; rollback was not applied",
+                        error
+                    )),
+                    Err(rollback_error) => Err(anyhow!(
+                        "Failed to snapshot policy index after role grant: {}; rollback failed: {}",
+                        error,
+                        rollback_error
+                    )),
+                };
+            }
+        };
 
         // Do not leave a failed persistence attempt active only in memory:
         // subsequent identical requests are legitimate retries and must still
@@ -1542,7 +1571,6 @@ impl PolicyHandler for PolicyService {
         }
 
         let _write_guard = self.policy_write_lock.lock().await;
-        let index_snapshot = self.snapshot_policy_index().await?;
         // Match the grouping relation selected by role grant above. A global
         // bootstrap membership is `g(user, role)`, not `g2(user, role, "*")`.
         let changed = if domain == "*" {
@@ -1563,6 +1591,34 @@ impl PolicyHandler for PolicyService {
                 details: "No policy update was committed.".to_owned(),
             }));
         }
+
+        let index_snapshot = match self.snapshot_policy_index().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let rollback = if domain == "*" {
+                    self.policy_manager.add_role_for_user(&data.user, &data.role).await
+                } else {
+                    self.policy_manager
+                        .add_role_for_user_in_domain(&data.user, &data.role, &domain)
+                        .await
+                };
+                return match rollback {
+                    Ok(true) => Err(anyhow!(
+                        "Failed to snapshot policy index after role revoke; mutation was rolled back: {}",
+                        error
+                    )),
+                    Ok(false) => Err(anyhow!(
+                        "Failed to snapshot policy index after role revoke: {}; rollback was not applied",
+                        error
+                    )),
+                    Err(rollback_error) => Err(anyhow!(
+                        "Failed to snapshot policy index after role revoke: {}; rollback failed: {}",
+                        error,
+                        rollback_error
+                    )),
+                };
+            }
+        };
 
         // Restore the in-memory edge when persistence fails so a later retry
         // remains a real mutation instead of silently reporting NOT_FOUND.
