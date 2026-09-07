@@ -68,6 +68,11 @@ pub mod exchange;
 // S1 activation (#567): production genesis CONTENT + enumerator + composite
 // ObjectLabelResolver + boot-time coverage gate consumed by the active 9P PEP.
 pub mod genesis;
+// #1499: typed RPC dispatch labels — the declared (service, leaf/method)
+// object identity and deliberate service subject clearance the mandatory
+// dispatch PEP evaluates. Bare service domains never route through the VFS
+// object-label adapter.
+pub mod dispatch_labels;
 pub mod lattice;
 pub mod moq_audit;
 // #1319: audited MAC adapter at the tenant account-record read boundary.
@@ -112,12 +117,83 @@ pub use te::{
 /// Install the mandatory RPC-dispatch PEP in its activation-ready, floor-only
 /// state.  The coverage-gated operator control selects identity-aware contexts;
 /// installing this monitor does not perform that widening.
+///
+/// The object-label resolver is the typed dispatch table (#1499): declared
+/// `(service, leaf/method)` rows plus deliberate service subject clearances.
+/// Bare RPC service names are never mapped through the VFS object-label
+/// adapter (the genesis `CompositeObjectLabelResolver` now serves the VFS/9P
+/// plane only); unknown services, unknown leaves, and VFS-shaped aliases deny
+/// `UnlabeledObject` before handler entry.
 pub fn install_production_rpc_dispatch_pep() {
-    let resolver = GenesisGate::production().into_resolver();
+    let default = dispatch_labels::DeclaredDispatchPep::new(
+        dispatch_labels::DeclaredDispatchTable::production(),
+    )
+    .with_activation_control();
     hyprstream_rpc::auth::mac::install_mac_dispatch_pep(std::sync::Arc::new(
-        hyprstream_rpc::auth::mac::DefaultMacDispatchPep::new(Box::new(resolver))
-            .with_activation_control(),
+        ProductionDispatchPep { default },
     ));
+}
+
+/// Production typed dispatch policy with a further restriction for the local
+/// PolicyService control plane. The table declares its exact method set; this
+/// wrapper makes those rows reachable only to the cryptographically verified,
+/// non-federated, bearerless `service:policy` authority. It can only add denies
+/// to the table PEP, never bypass a missing typed declaration.
+struct ProductionDispatchPep {
+    default: dispatch_labels::DeclaredDispatchPep,
+}
+
+impl hyprstream_rpc::auth::mac::MacDispatchPep for ProductionDispatchPep {
+    fn check(
+        &self,
+        ctx: &hyprstream_rpc::service::EnvelopeContext,
+        service_domain: &str,
+        method: Option<u16>,
+    ) -> hyprstream_rpc::auth::mac::MacDecision {
+        let is_local_policy_control_plane = service_domain == "policy"
+            && matches!(
+                method,
+                Some(
+                    policy_methods::GET_POLICY
+                        | policy_methods::APPLY_TEMPLATE
+                        | policy_methods::APPLY_DRAFT
+                        | policy_methods::ROLLBACK
+                        | policy_methods::GET_HISTORY
+                        | policy_methods::GET_DIFF
+                        | policy_methods::GET_DRAFT_STATUS
+                        | policy_methods::ADD_GROUPING
+                        | policy_methods::REMOVE_GROUPING
+                )
+            );
+        if is_local_policy_control_plane {
+            if !(ctx.jwt_token().is_none()
+                && !ctx.subject().is_federated()
+                && ctx.subject().name() == Some("service:policy"))
+            {
+                return hyprstream_rpc::auth::mac::MacDecision::Deny(
+                    hyprstream_rpc::auth::mac::MacDenyReason::NoClearance,
+                );
+            }
+
+            // This root-signed local bootstrap path intentionally carries no
+            // bearer claims. Keep its verified, declared policy-service
+            // context explicit so identity-aware activation does not turn the
+            // narrow control plane into `NoClearance` merely for being
+            // tokenless. The typed table and exact local-method guard still
+            // decide what it can reach.
+            let selected = SecurityContext::from_clearance(
+                BOOTSTRAP_SERVICE_CLEARANCE,
+                ctx.verified_key_material(),
+            );
+            return self.default.check_with_explicit_context(
+                ctx,
+                service_domain,
+                method,
+                selected,
+            );
+        }
+        self.default.check(ctx, service_domain, method)
+    }
 }
 
 /// Explicit permit fixture for unit tests that exercise service plumbing
@@ -140,6 +216,61 @@ pub(crate) fn install_explicit_test_dispatch_pep() {
 
     hyprstream_rpc::auth::mac::install_mac_dispatch_pep(std::sync::Arc::new(ExplicitTestPep));
 }
+
+#[cfg(test)]
+mod production_dispatch_tests {
+    use super::*;
+    use hyprstream_rpc::auth::mac::{MacDecision, MacDispatchPep};
+    use hyprstream_rpc::envelope::Subject;
+    use hyprstream_rpc::service::EnvelopeContext;
+
+    fn production_pep() -> ProductionDispatchPep {
+        ProductionDispatchPep {
+            default: dispatch_labels::DeclaredDispatchPep::new(
+                dispatch_labels::DeclaredDispatchTable::production(),
+            )
+            .with_activation_control(),
+        }
+    }
+
+    #[test]
+    fn local_policy_control_plane_requires_the_exact_tokenless_policy_authority() {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]).verifying_key();
+        let policy =
+            EnvelopeContext::for_test_authenticated_subject(Subject::new("service:policy"), signer);
+        let registry = EnvelopeContext::for_test_authenticated_subject(
+            Subject::new("service:registry"),
+            signer,
+        );
+        let pep = production_pep();
+        let no_activation = dispatch_labels::DeclaredDispatchPep::new(
+            dispatch_labels::DeclaredDispatchTable::production(),
+        );
+
+        assert_eq!(
+            pep.check(&policy, "policy", Some(policy_methods::APPLY_TEMPLATE)),
+            MacDecision::Permit,
+        );
+        assert_eq!(
+            no_activation.check(&policy, "policy", Some(policy_methods::APPLY_TEMPLATE)),
+            MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::NoClearance),
+            "the production wrapper must supply the explicit verified bootstrap context",
+        );
+        assert_eq!(
+            pep.check(&registry, "policy", Some(policy_methods::APPLY_TEMPLATE)),
+            MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::NoClearance),
+        );
+        assert_eq!(
+            pep.check(&policy, "policy", Some(17)),
+            MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject),
+        );
+        assert_eq!(
+            pep.check(&policy, "policy", Some(0)),
+            MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject),
+            "policy check must not report the root authority's access as another user's result",
+        );
+    }
+}
 // S5 (#571): the UCAN→TE policy compiler — compile a validated grant into a
 // CompiledPolicy, verify it grants no privilege beyond the grant, and sign it
 // (fail-closed). Lives here (not `hyprstream-rpc`) because it needs both the UCAN
@@ -152,6 +283,12 @@ pub use compiler::{
 pub use genesis::{
     floor_label, genesis_lattice, CompositeObjectLabelResolver, GeneratedNodeCoverage, GenesisGate,
     ManifestLabelSource, NamespaceEnumerator, NoManifests, SitePolicy,
+};
+// #1499: typed dispatch-plane labels + the production dispatch PEP over them.
+pub use dispatch_labels::{
+    policy_methods, DeclaredDispatchPep, DeclaredDispatchTable, DispatchMethodId,
+    DispatchMethodPolicy, ServiceSubjectClearance, BOOTSTRAP_SERVICE_CLEARANCE,
+    SERVICE_SUBJECT_PREFIX,
 };
 pub use moq_audit::{
     audited_moq_event_pep, production_moq_event_pep, MoqAuditSinkAdapter,

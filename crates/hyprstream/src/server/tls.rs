@@ -232,6 +232,7 @@ async fn init_acme_rustls_config(
         .map_err(|e| anyhow::anyhow!("cannot create ACME cache dir {:?}: {e}", cache_dir))?;
 
     let mut acme = AcmeConfig::new([domain])
+        .directory_lets_encrypt(true)
         .contact_push(contact)
         .cache_option(Some(rustls_acme::caches::DirCache::new(cache_dir)));
 
@@ -243,7 +244,7 @@ async fn init_acme_rustls_config(
         tls_config.acme_directory.as_deref().unwrap_or("Let's Encrypt"));
 
     let mut state = acme.state();
-    let rustls_server_config = state.challenge_rustls_config();
+    let rustls_server_config = acme_https_config(state.resolver());
 
     // Spawn the ACME event loop — handles challenge responses and renewals.
     tokio::spawn(async move {
@@ -262,7 +263,7 @@ async fn init_acme_rustls_config(
     });
 
     // Wrap the rustls ServerConfig in an axum-server RustlsConfig.
-    // rustls-acme updates the Arc<ServerConfig> in-place on renewal.
+    // rustls-acme updates the shared certificate resolver on renewal.
     let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_server_config);
     Ok(rustls_config)
 }
@@ -319,4 +320,97 @@ pub async fn serve_app(
 
     info!("{service_name} stopped");
     Ok(())
+}
+
+/// The shared listener must negotiate both HTTP and TLS-ALPN-01. The ACME
+/// resolver selects the challenge certificate only for an ACME ClientHello;
+/// ordinary clients receive the currently issued certificate.
+fn acme_https_config(
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+) -> Arc<rustls::ServerConfig> {
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()];
+    Arc::new(config)
+}
+
+#[cfg(test)]
+mod acme_tests {
+    use super::*;
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug)]
+    struct FixtureResolver {
+        key: Arc<rustls::sign::CertifiedKey>,
+        challenge_seen: AtomicBool,
+    }
+
+    impl rustls::server::ResolvesServerCert for FixtureResolver {
+        fn resolve(
+            &self,
+            hello: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            self.challenge_seen
+                .store(rustls_acme::is_tls_alpn_challenge(&hello), Ordering::SeqCst);
+            Some(self.key.clone())
+        }
+    }
+
+    /// Exercise the actual production config with real ClientHello negotiation.
+    /// Replacing its ALPN list with the old challenge-only list fails HTTP.
+    #[test]
+    fn acme_https_negotiates_http_and_challenge() -> anyhow::Result<()> {
+        hyprstream_rpc::transport::install_pq_crypto_provider()?;
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let cert = generated.cert.der().clone();
+        let private =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der()));
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .ok_or_else(|| anyhow::anyhow!("crypto provider missing"))?;
+        let key = Arc::new(rustls::sign::CertifiedKey::from_der(
+            vec![cert.clone()],
+            private,
+            provider,
+        )?);
+        for protocol in [b"h2".as_slice(), b"http/1.1", b"acme-tls/1"] {
+            let resolver = Arc::new(FixtureResolver {
+                key: key.clone(),
+                challenge_seen: AtomicBool::new(false),
+            });
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert.clone())?;
+            let mut client_config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            client_config.alpn_protocols = vec![protocol.to_vec()];
+            let mut client = rustls::ClientConnection::new(
+                Arc::new(client_config),
+                ServerName::try_from("localhost")?,
+            )?;
+            let mut server = rustls::ServerConnection::new(acme_https_config(resolver.clone()))?;
+            for _ in 0..16 {
+                let mut bytes = Vec::new();
+                client.write_tls(&mut bytes)?;
+                server.read_tls(&mut Cursor::new(bytes))?;
+                server.process_new_packets()?;
+                let mut bytes = Vec::new();
+                server.write_tls(&mut bytes)?;
+                client.read_tls(&mut Cursor::new(bytes))?;
+                client.process_new_packets()?;
+                if !client.is_handshaking() && !server.is_handshaking() {
+                    break;
+                }
+            }
+            assert!(!client.is_handshaking() && !server.is_handshaking());
+            assert_eq!(client.alpn_protocol(), Some(protocol));
+            assert_eq!(
+                resolver.challenge_seen.load(Ordering::SeqCst),
+                protocol == b"acme-tls/1"
+            );
+        }
+        Ok(())
+    }
 }

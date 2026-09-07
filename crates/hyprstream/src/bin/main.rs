@@ -57,6 +57,7 @@ use std::sync::Arc;
 // Unified service manager API
 use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
 use hyprstream_rpc::transport::TransportConfig;
+use hyprstream_rpc::registry::SocketKind;
 use hyprstream_rpc::{SigningKey, VerifyingKey};
 
 fn supports_tui() -> bool {
@@ -990,6 +991,7 @@ fn handle_quick_command(
                         };
                         handle_training_infer(
                             registry,
+                            hyprstream_rpc::registry::global().endpoint("policy", SocketKind::Rep),
                             &model,
                             &prompt_text,
                             image,
@@ -1024,6 +1026,7 @@ fn handle_quick_command(
                     } => {
                         handle_training_batch(
                             registry,
+                            hyprstream_rpc::registry::global().endpoint("policy", SocketKind::Rep),
                             &model,
                             input,
                             input_dir,
@@ -1595,6 +1598,10 @@ async fn install_process_production_resolver(
     signing_key: &SigningKey,
     config: &HyprConfig,
 ) -> Result<bool> {
+    let trust_source = hyprstream_discovery::DeploymentTrustSource::from_anchors(
+        config.cluster_at9p_did.as_deref(),
+        config.cluster_did_web.as_deref(),
+    )?;
     // Every service identity this node provisions is hybrid, so a classical
     // service entry means the node was provisioned by a pre-hybrid wizard and
     // its services can never be anchored for post-quantum verification. Fail
@@ -1608,6 +1615,19 @@ async fn install_process_production_resolver(
         let entries =
             hyprstream_core::auth::identity_store::load_bootstrap_pubkeys_hybrid(&secrets_dir)?;
         hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries)?;
+        // hyprstream#1562 H3: an OS-owned deployment must enroll its discovery/
+        // policy service keys into the ceremony signature chain — unsigned-TOFU
+        // bootstrap-pubkeys are refused. DID-anchored and wizard/dev
+        // deployments are unchanged.
+        if matches!(
+            trust_source,
+            hyprstream_discovery::DeploymentTrustSource::OsOwnedFiles
+        ) {
+            hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_enrolled(
+                &secrets_dir,
+                &entries,
+            )?;
+        }
     }
 
     // The bootstrap pins the discovery service key from the process trust
@@ -1615,10 +1635,6 @@ async fn install_process_production_resolver(
     // the node's own bootstrap-pubkeys (the same source resolve_service_vk
     // uses on first use) — a no-op when already populated or unprovisioned.
     let _ = resolve_service_vk("discovery");
-    let trust_source = hyprstream_discovery::DeploymentTrustSource::from_anchors(
-        config.cluster_at9p_did.as_deref(),
-        config.cluster_did_web.as_deref(),
-    )?;
     // Private-PKI deployments may terminate the did:web host with an internal
     // CA; the extra root is additive (never disables verification), and an
     // unreadable file is a hard configuration error, not a silent skip.
@@ -2256,6 +2272,26 @@ fn main() -> Result<()> {
         }
     }
 
+    // ── `service ensure-key` early dispatch ─────────────────────────────────
+    // Key materialization for provisioning/keygen units: it must work on a
+    // fresh install (before any bootstrap-pubkeys exist) and must not start
+    // any services, so dispatch before the registry bootstrap below — same
+    // rationale as `service repair`.
+    if let Some(("service", sub_m)) = matches.subcommand() {
+        if let Some(("ensure-key", ek_m)) = sub_m.subcommand() {
+            // `name` is a required positional; a missing value is a clap bug,
+            // not operator error, so fail loudly rather than guess.
+            let name = ek_m
+                .get_one::<String>("name")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("service ensure-key: missing required <name>"))?;
+            return hyprstream_core::cli::service_handlers::handle_service_ensure_key(
+                Some(&config),
+                &name,
+            );
+        }
+    }
+
     // Start registry service ONCE at CLI level
     let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2726,6 +2762,7 @@ fn main() -> Result<()> {
                                             }
                                         }
                                     };
+                                    let discovery_transport = ctx.transport("discovery", SocketKind::Rep);
                                     let shared = hyprstream_service::QuicSharedConfig {
                                         cert_chain,
                                         key_der,
@@ -2738,7 +2775,8 @@ fn main() -> Result<()> {
                                         // #358: producer-chosen relay rendezvous (None = direct-only).
                                         moq_relay,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
-                                            |request: hyprstream_service::NativeAnnouncementRequest| {
+                                            move |request: hyprstream_service::NativeAnnouncementRequest| {
+                                                let discovery_transport = discovery_transport.clone();
                                                 std::thread::spawn(move || {
                                                     let runtime = match tokio::runtime::Builder::new_current_thread()
                                                         .enable_all()
@@ -2751,7 +2789,8 @@ fn main() -> Result<()> {
                                                         }
                                                     };
                                                     runtime.block_on(async move {
-                                                        let client = match hyprstream_discovery::DiscoveryClient::for_local_bootstrap(
+                                                        let client = match hyprstream_discovery::DiscoveryClient::for_local_transport_bootstrap(
+                                                            &discovery_transport,
                                                             request.signing_key,
                                                             request.discovery_verifying_key,
                                                             None,
@@ -2930,11 +2969,20 @@ fn main() -> Result<()> {
                                 if !hyprstream_rpc::events::event_authz_installed() {
                                     let audit_stream =
                                         format!("moq-event-{}", service_names.join("-"));
+                                    // Declared MoQ/event track policy (v16 §10 /
+                                    // #1510). The generated dispatch inventory
+                                    // (WS-D / #1505) is the end-state producer of
+                                    // these rows; until it lands the empty table
+                                    // is the honest state and every unlisted
+                                    // track/prefix denies.
+                                    let track_policy =
+                                        hyprstream_rpc::auth::mac::MoqEventPolicyTable::empty();
                                     let pep =
                                         hyprstream_core::mac::production_moq_event_pep(
                                             signing_key.clone(),
                                             &config.oauth,
                                             &audit_stream,
+                                            track_policy,
                                         )
                                         .await
                                         .context(
@@ -3109,6 +3157,16 @@ fn main() -> Result<()> {
                         || async move {
                             hyprstream_core::cli::service_handlers::run_repair_checks(&models_dir, verbose).await
                         },
+                    )?;
+                }
+
+                ServiceAction::EnsureKey { name } => {
+                    // Normally handled by the early dispatch above (before any
+                    // services start). Defense-in-depth fallback if that
+                    // dispatch is ever bypassed.
+                    hyprstream_core::cli::service_handlers::handle_service_ensure_key(
+                        Some(ctx.config()),
+                        &name,
                     )?;
                 }
             }

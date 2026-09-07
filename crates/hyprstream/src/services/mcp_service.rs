@@ -151,6 +151,9 @@ pub struct McpConfig {
     pub signing_key: SigningKey,
     /// RPC transport for control plane
     pub transport: TransportConfig,
+    /// Policy RPC transport resolved by the factory. This is an IPC socket when
+    /// MCP runs in its own rootless Quadlet process.
+    pub policy_transport: TransportConfig,
     /// Service context for client construction (optional for backward compat)
     pub ctx: Option<Arc<ServiceContext>>,
     /// PolicyService verifying key — used to create the internal PolicyClient
@@ -936,7 +939,8 @@ impl McpService {
             tool_reg.by_uuid.len(),
         );
 
-        let policy_client = PolicyClient::for_local_bootstrap(
+        let policy_client = PolicyClient::for_local_transport_bootstrap(
+            &config.policy_transport,
             config.signing_key.clone(),
             config.policy_verifying_key,
             None,
@@ -1502,6 +1506,26 @@ mod tests {
 
     fn signing_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// MCP must be constructible before any in-process endpoint registry has
+    /// been populated: rootless Quadlets reach Policy through the shared IPC
+    /// socket selected by the factory.
+    #[test]
+    fn mcp_accepts_unregistered_ipc_policy_transport() {
+        let signing_key = signing_key(0x51);
+        let config = McpConfig {
+            verifying_key: signing_key.verifying_key(),
+            signing_key: signing_key.clone(),
+            transport: TransportConfig::ipc("/run/hyprstream/mcp.sock"),
+            policy_transport: TransportConfig::ipc("/run/hyprstream/policy.sock"),
+            ctx: None,
+            policy_verifying_key: signing_key.verifying_key(),
+            expected_audience: None,
+            jwt_key_source: None,
+        };
+
+        assert!(McpService::new(config).is_ok());
     }
 
     /// #989: workflow tools must be advertised to MCP clients. Proves both that

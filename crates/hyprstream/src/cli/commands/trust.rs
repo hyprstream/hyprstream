@@ -1,4 +1,5 @@
 use clap::{Args, Subcommand};
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 
 #[cfg(test)]
@@ -22,6 +23,9 @@ pub enum TrustCommand {
     DelegateRegistrySigner(DelegateRegistrySignerArgs),
     /// Mint the one-hour registry deployment credential.
     MintRegistryJwt(MintRegistryJwtArgs),
+    /// Attest a discovery/policy service's live hybrid public key into the
+    /// deployment trust chain (hyprstream#1562).
+    EnrollServiceKey(EnrollServiceKeyArgs),
     /// Verify deployment artifacts through the production verifier.
     VerifyDeployment(VerifyDeploymentArgs),
     /// Add or replace an authority key through the signed rotation log.
@@ -217,6 +221,10 @@ pub struct DelegateRegistrySignerArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group = clap::ArgGroup::new("delegated_signer")
+    .args(["via_delegated_signer", "via_delegated_signer_fd"])
+    .multiple(false)
+    .conflicts_with("root"))]
 pub struct MintRegistryJwtArgs {
     /// Raw 1984-byte public deployment root.
     #[arg(long, default_value = "deployment-ca.hybrid")]
@@ -227,8 +235,18 @@ pub struct MintRegistryJwtArgs {
     pub authority_key: PathBuf,
 
     /// Age identity file. Repeatable for native or plugin identities.
-    #[arg(long = "identity", value_name = "AGE_IDENTITY_FILE")]
+    #[arg(
+        long = "identity",
+        value_name = "AGE_IDENTITY_FILE",
+        conflicts_with = "identity_fds"
+    )]
     pub identities: Vec<PathBuf>,
+
+    /// Inherited FD carrying an age identity (systemd LoadCredentialEncrypted /
+    /// podman --preserve-fds); plaintext never touches a filesystem path.
+    /// Repeatable; mutually exclusive with --identity.
+    #[arg(long = "identity-fd", value_name = "FD", value_parser = clap::value_parser!(RawFd).range(0..))]
+    pub identity_fds: Vec<RawFd>,
 
     /// age-plugin-yubikey identity file. Repeatable; decryption requires the token.
     #[arg(long = "yubikey-identity", value_name = "AGE_YUBIKEY_IDENTITY_FILE")]
@@ -239,20 +257,17 @@ pub struct MintRegistryJwtArgs {
     pub software_recovery: bool,
 
     /// Common path: decrypt this scoped online signer.
-    #[arg(
-        long,
-        value_name = "DELEGATED_KEY.age",
-        conflicts_with = "root",
-        required_unless_present = "root"
-    )]
+    #[arg(long, value_name = "DELEGATED_KEY.age")]
     pub via_delegated_signer: Option<PathBuf>,
 
-    /// Delegation authorizing --via-delegated-signer.
-    #[arg(
-        long,
-        value_name = "DELEGATION.json",
-        requires = "via_delegated_signer"
-    )]
+    /// Inherited FD carrying the age-encrypted scoped online signer (systemd
+    /// LoadCredentialEncrypted / podman --preserve-fds). Mutually exclusive
+    /// with --via-delegated-signer and --root.
+    #[arg(long, value_name = "FD", value_parser = clap::value_parser!(RawFd).range(0..))]
+    pub via_delegated_signer_fd: Option<RawFd>,
+
+    /// Delegation authorizing the selected delegated signer.
+    #[arg(long, value_name = "DELEGATION.json", requires = "delegated_signer")]
     pub delegation: Option<PathBuf>,
 
     /// Installed/current public authority log. Required for every credential.
@@ -264,7 +279,9 @@ pub struct MintRegistryJwtArgs {
     pub authority_checkpoint: PathBuf,
 
     /// Rare/bootstrap path: sign directly with the deployment authority.
-    #[arg(long, conflicts_with = "via_delegated_signer")]
+    /// Required unless a delegated signer (path or inherited-FD form) is
+    /// selected; conflicts with both via the `delegated_signer` group.
+    #[arg(long, required_unless_present = "delegated_signer")]
     pub root: bool,
 
     /// Raw 32-byte Ed25519 registry-service public key for the cnf claim.
@@ -282,6 +299,82 @@ pub struct MintRegistryJwtArgs {
     /// Out-of-band cloud-secret publisher manifest (never pass its values to Terraform).
     #[arg(long, default_value = "deployment-trust.contract.json")]
     pub contract: PathBuf,
+
+    /// Replace existing output files.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(group = clap::ArgGroup::new("delegated_signer")
+    .args(["via_delegated_signer", "via_delegated_signer_fd"])
+    .required(true)
+    .multiple(false))]
+pub struct EnrollServiceKeyArgs {
+    /// Raw 1984-byte public deployment root.
+    #[arg(long, default_value = "deployment-ca.hybrid")]
+    pub public_ca: PathBuf,
+
+    /// Installed/current public authority log.
+    #[arg(long, default_value = "deployment-authority.log.json")]
+    pub authority_log: PathBuf,
+
+    /// Independently trusted expected authority-log head.
+    #[arg(long, default_value = "deployment-authority.head.json")]
+    pub authority_checkpoint: PathBuf,
+
+    /// Age identity file. Repeatable for native or plugin identities.
+    #[arg(
+        long = "identity",
+        value_name = "AGE_IDENTITY_FILE",
+        conflicts_with = "identity_fds"
+    )]
+    pub identities: Vec<PathBuf>,
+
+    /// Inherited FD carrying an age identity (systemd LoadCredentialEncrypted /
+    /// podman --preserve-fds); plaintext never touches a filesystem path.
+    /// Repeatable; mutually exclusive with --identity.
+    #[arg(long = "identity-fd", value_name = "FD", value_parser = clap::value_parser!(RawFd).range(0..))]
+    pub identity_fds: Vec<RawFd>,
+
+    /// age-plugin-yubikey identity file. Repeatable; decryption requires the token.
+    #[arg(long = "yubikey-identity", value_name = "AGE_YUBIKEY_IDENTITY_FILE")]
+    pub yubikey_identities: Vec<PathBuf>,
+
+    /// Break-glass: use the age-wrapped recovery copy of a PIV Ed25519 key.
+    #[arg(long)]
+    pub software_recovery: bool,
+
+    /// Age-encrypted delegated online signer carrying the enrollment scope.
+    #[arg(long, value_name = "DELEGATED_KEY.age")]
+    pub via_delegated_signer: Option<PathBuf>,
+
+    /// Inherited FD carrying the age-encrypted delegated signer (systemd
+    /// LoadCredentialEncrypted / podman --preserve-fds). Mutually exclusive
+    /// with --via-delegated-signer.
+    #[arg(long, value_name = "FD", value_parser = clap::value_parser!(RawFd).range(0..))]
+    pub via_delegated_signer_fd: Option<RawFd>,
+
+    /// Two-capability delegation authorizing --via-delegated-signer.
+    #[arg(long, value_name = "DELEGATION.json")]
+    pub delegation: PathBuf,
+
+    /// Service whose key is enrolled (fixed allowlist, hyprstream#1562).
+    #[arg(long, value_parser = ["discovery", "policy"])]
+    pub service: String,
+
+    /// Raw 1984-byte hybrid service public key (`service-pubkey.hybrid`:
+    /// 32-byte Ed25519 followed by 1952-byte ML-DSA-65).
+    #[arg(long, value_name = "PATH")]
+    pub service_public_key: PathBuf,
+
+    /// Attestation lifetime in seconds; the capability caps this at one hour.
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u32).range(1..=3600))]
+    pub ttl_seconds: u32,
+
+    /// Service-key enrollment attestation output (public, 0644).
+    #[arg(long, default_value = "service-key-enrollment.json")]
+    pub attestation: PathBuf,
 
     /// Replace existing output files.
     #[arg(long)]
@@ -429,4 +522,12 @@ pub struct VerifyDeploymentArgs {
     /// Optional contract whose public artifacts must match the files.
     #[arg(long)]
     pub contract: Option<PathBuf>,
+
+    /// Service-key enrollment attestation to verify against the deployment
+    /// trust chain (hyprstream#1562). Repeatable; every attestation must
+    /// verify against the same root, authority log, and checkpoint — any
+    /// missing, malformed, expired, or out-of-scope attestation fails the
+    /// command.
+    #[arg(long = "service-key-attestation", value_name = "ATTESTATION_FILE")]
+    pub service_key_attestations: Vec<PathBuf>,
 }
