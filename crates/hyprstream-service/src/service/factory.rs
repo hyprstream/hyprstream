@@ -81,6 +81,7 @@ fn lowercase_hex(bytes: &[u8]) -> String {
 
 /// Complete, already-validated native announcement ready for publication.
 pub struct NativeAnnouncementRequest {
+    pub cancellation: tokio_util::sync::CancellationToken,
     pub service_name: String,
     pub reach: NativeAnnouncementReach,
     pub signing_key: SigningKey,
@@ -102,6 +103,7 @@ pub type NativeAnnouncementPublisher =
 #[allow(clippy::too_many_arguments)]
 fn publish_native_announcement(
     publisher: Option<NativeAnnouncementPublisher>,
+    cancellation: tokio_util::sync::CancellationToken,
     service_name: String,
     reach: NativeAnnouncementReach,
     signing_key: SigningKey,
@@ -147,6 +149,7 @@ fn publish_native_announcement(
         );
     };
     publish(NativeAnnouncementRequest {
+        cancellation,
         service_name,
         reach,
         signing_key,
@@ -331,6 +334,7 @@ impl QuicSharedConfig {
             meta.to_string().into_bytes()
         });
         hyprstream_rpc::service::QuicLoopConfig {
+            announcement_cancellation: tokio_util::sync::CancellationToken::new(),
             cert_chain: self.cert_chain.clone(),
             key_der: Zeroizing::new((*self.key_der).clone()),
             bind_addr,
@@ -368,9 +372,11 @@ impl QuicSharedConfig {
         let quic_signing_key = signing_key.clone();
         let quic_jwt = service_jwt.clone();
         let quic_accepted = accepted.clone();
+        let quic_cancellation = config.announcement_cancellation.clone();
         config.on_quic_bound = Some(Box::new(move |svc_name, addr, sn| {
             if let Err(error) = publish_native_announcement(
                 publisher.clone(),
+                quic_cancellation,
                 svc_name,
                 NativeAnnouncementReach::Quic {
                     address: addr,
@@ -386,9 +392,11 @@ impl QuicSharedConfig {
             }
         }));
         let iroh_publisher = self.native_announcement_publisher.clone();
+        let iroh_cancellation = config.announcement_cancellation.clone();
         config.on_iroh_bound = Some(Box::new(move |svc_name, node_id| {
             publish_native_announcement(
                 iroh_publisher.clone(),
+                iroh_cancellation,
                 svc_name,
                 NativeAnnouncementReach::Iroh { node_id },
                 signing_key.clone(),
@@ -941,7 +949,9 @@ impl ServiceContext {
                     let policy_vk = trust
                         .resolve_one("policy")
                         .unwrap_or_else(|| panic!("trust store has no policy key"));
-                    let discovery_vk = self.service_signing_key("discovery").verifying_key();
+                    let discovery_vk = trust
+                        .resolve_one("discovery")
+                        .unwrap_or_else(|| panic!("trust store has no discovery key"));
                     if !trust.is_authorized(&discovery_vk, "discovery") {
                         panic!("trust store has no discovery key");
                     }
@@ -1167,6 +1177,65 @@ mod tests {
             signer.verifying_key(),
             accepted,
         )
+    }
+
+    struct SeparateService {
+        key: SigningKey,
+        transport: hyprstream_rpc::transport::TransportConfig,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl hyprstream_rpc::service::RequestService for SeparateService {
+        async fn handle_request(
+            &self,
+            _ctx: &hyprstream_rpc::service::EnvelopeContext,
+            payload: &[u8],
+        ) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
+            Ok((payload.to_vec(), None))
+        }
+        fn name(&self) -> &str { "model" }
+        fn transport(&self) -> &hyprstream_rpc::transport::TransportConfig { &self.transport }
+        fn signing_key(&self) -> SigningKey { self.key.clone() }
+    }
+
+    #[test]
+    fn separate_service_announcement_needs_only_discovery_public_key() {
+        const CHILD: &str = "HYPRSTREAM_TEST_SEPARATE_ANNOUNCEMENT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("service::factory::tests::separate_service_announcement_needs_only_discovery_public_key")
+                .env(CHILD, "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let own_key = SigningKey::from_bytes(&[0x75; 32]);
+        let trust = crate::global_trust_store();
+        for (name, seed) in [("policy", 0x76), ("discovery", 0x77)] {
+            let public_key = SigningKey::from_bytes(&[seed; 32]).verifying_key();
+            trust.insert(public_key, crate::Attestation {
+                scopes: [name.to_owned()].into_iter().collect(),
+                subject: None, jwt: None, expires_at: 0, attested_by: None,
+            });
+        }
+        let models = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new(
+            own_key.clone(), own_key.verifying_key(), true, models.path().to_owned(),
+        ).with_service_key("model", own_key.clone()).with_quic(QuicSharedConfig {
+            cert_chain: Vec::new(), key_der: Zeroizing::new(Vec::new()),
+            base_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            server_name: "model.example.test".to_owned(),
+            oauth_issuer_url: None, jwt_verifying_key: None,
+            iroh_enabled: true, iroh_required: false,
+            moq_relay: None, native_announcement_publisher: None,
+        });
+        assert!(!ctx.service_keys.contains_key("discovery"));
+        let service = SeparateService {
+            key: own_key,
+            transport: hyprstream_rpc::transport::TransportConfig::inproc("separate-service"),
+        };
+        let _spawnable = ctx.into_spawnable_quic(service, None);
     }
 
     #[test]

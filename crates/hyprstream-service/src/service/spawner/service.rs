@@ -61,14 +61,15 @@ fn validate_required_iroh_enabled(
 /// first Iroh reach, while the compatibility profile deliberately logs and
 /// continues on publication failure.
 fn announce_iroh_bound(
-    config: &mut hyprstream_rpc::service::QuicLoopConfig,
+    callback: Option<Box<dyn FnOnce(String, [u8; 32]) -> anyhow::Result<()> + Send>>,
+    required: bool,
     service_name: &str,
     node_id: [u8; 32],
 ) -> Result<()> {
-    match config.on_iroh_bound.take() {
+    match callback {
         Some(callback) => match callback(service_name.to_owned(), node_id) {
             Ok(()) => Ok(()),
-            Err(error) if config.iroh_required => {
+            Err(error) if required => {
                 Err(hyprstream_rpc::error::RpcError::SpawnFailed(format!(
                     "network-iroh-required initial Iroh announcement failed: {error}"
                 )))
@@ -78,10 +79,43 @@ fn announce_iroh_bound(
                 Ok(())
             }
         },
-        None if config.iroh_required => Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+        None if required => Err(hyprstream_rpc::error::RpcError::SpawnFailed(
             "network-iroh-required has no initial Iroh announcement callback".to_owned(),
         )),
         None => Ok(()),
+    }
+}
+
+/// The publisher's first-result handshake is synchronous. Keep it off this
+/// service's current-thread runtime so shutdown can cancel an in-flight first
+/// publication instead of waiting for the readiness barrier to finish.
+async fn announce_iroh_bound_until_shutdown(
+    config: &mut hyprstream_rpc::service::QuicLoopConfig,
+    service_name: &str,
+    node_id: [u8; 32],
+    shutdown: &Notify,
+) -> Result<()> {
+    let callback = config.on_iroh_bound.take();
+    let required = config.iroh_required;
+    let cancellation = config.announcement_cancellation.clone();
+    let service_name = service_name.to_owned();
+    let publication = tokio::task::spawn_blocking(move || {
+        announce_iroh_bound(callback, required, &service_name, node_id)
+    });
+    tokio::select! {
+        biased;
+        _ = shutdown.notified() => {
+            cancellation.cancel();
+            Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                "service stopped before initial Iroh announcement completed".to_owned(),
+            ))
+        }
+        _ = cancellation.cancelled() => Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+            "initial Iroh announcement cancelled before readiness".to_owned(),
+        )),
+        result = publication => result.map_err(|error| {
+            hyprstream_rpc::error::RpcError::SpawnFailed(format!("initial Iroh announcement task: {error}"))
+        })?,
     }
 }
 
@@ -126,6 +160,8 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
             let processor: Arc<dyn IrohRequestProcessor> = Arc::new(bridge);
 
             if let Some(mut qc) = quic_config {
+                let announcement_cancellation = qc.announcement_cancellation.clone();
+                let _announcement_guard = announcement_cancellation.clone().drop_guard();
                 validate_required_iroh_enabled(&qc)?;
                 // web-transport-quinn has no per-builder provider hook and
                 // resolves rustls's process default. Install and validate it at
@@ -332,7 +368,7 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                             }
                             // Advertise iroh reachability only now that the carrier
                             // is bound; EndpointId is never application authority.
-                            announce_iroh_bound(&mut qc, &service_name, node_id)?;
+                            announce_iroh_bound_until_shutdown(&mut qc, &service_name, node_id, &shutdown).await?;
                             tracing::info!(
                                 service = %service_name,
                                 node_id = %hex_short(&node_id),
@@ -359,38 +395,56 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     validate_required_iroh_enabled(&qc)?;
                     None
                 };
-                // Drain the iroh substrate on shutdown (parallel to quinn drain).
-                if let Some(substrate) = _iroh_substrate_guard {
-                    let iroh_shutdown = Arc::clone(&shutdown);
-                    tokio::spawn(async move {
-                        iroh_shutdown.notified().await;
-                        if let Err(e) = substrate.shutdown().await {
-                            tracing::warn!("iroh substrate shutdown error: {e}");
-                        }
-                    });
-                }
-
-                // Bridge the `Notify` shutdown to the server's graceful drain.
+                // One owner consumes the service shutdown notification. Multiple
+                // independent Notify waiters would race for notify_one's permit.
+                // Cancel publication before draining either carrier, including
+                // when a serving loop exits without an explicit stop request.
                 let drain_limit = rpc_server.stream_limit();
                 let drain_capacity = rpc_server.capacity();
                 let drain_token = rpc_server.shutdown_token();
-                let drain_shutdown = Arc::clone(&shutdown);
-                tokio::spawn(async move {
-                    drain_shutdown.notified().await;
-                    hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown(
-                        &drain_limit, drain_capacity, &drain_token,
-                    ).await;
-                });
-
+                let local_shutdown = Arc::new(tokio::sync::Notify::new());
                 let rep_fut = hyprstream_rpc::service::serve::serve_bridged(
                     &transport, Arc::clone(&processor), signing_key.clone(),
-                    Arc::clone(&shutdown), on_ready,
+                    Arc::clone(&local_shutdown), on_ready,
                 );
                 let quic_fut = rpc_server.run();
-                let (rep_result, quic_result) = tokio::join!(rep_fut, quic_fut);
-                if let Err(e) = quic_result {
-                    tracing::warn!("QUIC server loop ended with error: {e}");
+                tokio::pin!(rep_fut, quic_fut);
+                let completed_rep = tokio::select! {
+                    biased;
+                    _ = shutdown.notified() => None,
+                    _ = announcement_cancellation.cancelled() => None,
+                    result = &mut rep_fut => Some(result),
+                    result = &mut quic_fut => {
+                        if let Err(error) = result {
+                            tracing::warn!("QUIC server loop ended with error: {error}");
+                        }
+                        None
+                    }
+                    _ = async {
+                        loop {
+                            match _iroh_substrate_guard.as_ref() {
+                                Some(substrate) if substrate.router().is_shutdown()
+                                    || substrate.endpoint().is_closed() => break,
+                                Some(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        }
+                    } => None,
+                };
+                announcement_cancellation.cancel();
+                local_shutdown.notify_one();
+                if let Some(substrate) = _iroh_substrate_guard {
+                    if let Err(error) = substrate.shutdown().await {
+                        tracing::warn!("iroh substrate shutdown error: {error}");
+                    }
                 }
+                hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown(
+                    &drain_limit, drain_capacity, &drain_token,
+                ).await;
+                let rep_result = match completed_rep {
+                    Some(result) => result,
+                    None => rep_fut.await,
+                };
                 rep_result.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
             } else {
                 hyprstream_rpc::service::serve::serve_bridged(
@@ -1058,6 +1112,7 @@ mod tests {
         on_iroh_bound: Option<Box<dyn FnOnce(String, [u8; 32]) -> anyhow::Result<()> + Send>>,
     ) -> hyprstream_rpc::service::QuicLoopConfig {
         hyprstream_rpc::service::QuicLoopConfig {
+            announcement_cancellation: tokio_util::sync::CancellationToken::new(),
             cert_chain: Vec::new(),
             key_der: zeroize::Zeroizing::new(Vec::new()),
             bind_addr: "127.0.0.1:0"
@@ -1120,7 +1175,7 @@ mod tests {
     #[test]
     fn required_profile_requires_announcement_while_compatibility_continues() {
         let mut required = loop_config(true, true, None);
-        let error = match announce_iroh_bound(&mut required, "echo", [0x11; 32]) {
+        let error = match announce_iroh_bound(required.on_iroh_bound.take(), required.iroh_required, "echo", [0x11; 32]) {
             Ok(()) => panic!("required profile accepted a missing announcement callback"),
             Err(error) => error,
         };
@@ -1138,9 +1193,35 @@ mod tests {
                 }
             })),
         );
-        if let Err(error) = announce_iroh_bound(&mut compatibility, "echo", [0x22; 32]) {
+        if let Err(error) = announce_iroh_bound(compatibility.on_iroh_bound.take(), compatibility.iroh_required, "echo", [0x22; 32]) {
             panic!("compatibility profile did not continue after announcement failure: {error}");
         }
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn required_profile_stop_cancels_pending_first_publication() {
+        let mut config = loop_config(true, true, None);
+        let cancellation = config.announcement_cancellation.clone();
+        let callback_cancellation = cancellation.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        config.on_iroh_bound = Some(Box::new(move |_, _| {
+            let _ = started_tx.send(());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !callback_cancellation.is_cancelled() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            anyhow::bail!("first publication cancelled")
+        }));
+        let shutdown = Notify::new();
+        let (result, ()) = tokio::join!(
+            announce_iroh_bound_until_shutdown(&mut config, "echo", [0x11; 32], &shutdown),
+            async {
+                assert!(started_rx.await.is_ok(), "first callback entered");
+                shutdown.notify_one();
+            },
+        );
+        assert!(result.is_err(), "cancelled first publication cannot permit readiness");
+        assert!(cancellation.is_cancelled(), "shutdown must reach the blocked publication");
     }
 }
