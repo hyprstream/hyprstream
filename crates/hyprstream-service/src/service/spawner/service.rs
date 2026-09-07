@@ -336,7 +336,7 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                                 )
                             })?;
                             admission
-                                .install_server_identity(server_identity)
+                                .install_server_identity(server_identity, node_id)
                                 .map_err(|error| {
                                     hyprstream_rpc::error::RpcError::SpawnFailed(format!(
                                         "MoQ server confirmation identity: {error}"

@@ -16,6 +16,13 @@
 //!   captured valid response replayed verbatim against a new challenge is
 //!   rejected (the transcript binds the fresh server nonce); the consumed-
 //!   transcript single-use rule is unit-tested in the module.
+//! - **live relay** —
+//!   `live_relay_of_a_genuine_proof_is_rejected_on_the_second_connection`: a
+//!   relay terminating two connections and forwarding every admission frame
+//!   in real time (hello, fresh challenge, genuinely signed response) is
+//!   rejected, because the transcript binds the locally observed endpoint
+//!   pair of each connection; the direct control admission on the first
+//!   connection stays live.
 //! - **expiry** — `expired_accepted_state_is_rejected`.
 //! - **rotation / state advance** — `state_advance_invalidates_previous_keys`:
 //!   admission succeeds at epoch N, then the accepted state advances to
@@ -204,15 +211,19 @@ async fn admission_server_with_identity(
         },
     );
     let public_server_identity = server_identity.identity.clone();
+    let server_carrier_secret = fresh_node_key();
+    let server_carrier_node_id = *iroh::SecretKey::from_bytes(&server_carrier_secret)
+        .public()
+        .as_bytes();
     let authenticator = Arc::new(
         MoqlAdmissionAuthenticator::new(authority, resolver)
-            .with_server_identity(server_identity)
+            .with_server_identity_and_carrier(server_identity, server_carrier_node_id)
             .with_timeout(timeout),
     );
     let handler = IrohMoqProtocolHandler::new()
         .with_authz(MoqAuthzConfig::default().with_admission(authenticator));
     let producer = handler.origin_producer().clone();
-    let substrate = IrohSubstrate::new(fresh_node_key(), handler, NoopHandler::new("rpc")).await?;
+    let substrate = IrohSubstrate::new(server_carrier_secret, handler, NoopHandler::new("rpc")).await?;
     Ok(AdmissionServer {
         substrate,
         producer,
@@ -260,7 +271,7 @@ async fn admitted_client(
     )
     .await?;
     let conn = client.connect(server_addr.clone(), ALPN_MOQ_LITE).await?;
-    prove_moql_admission(&conn, proof, ADMISSION_TIMEOUT)
+    prove_moql_admission(&conn, proof, *client.endpoint_id().as_bytes(), ADMISSION_TIMEOUT)
         .await
         .map_err(|e| anyhow!("admission rejected: {e}"))?;
     let session = Session::raw(conn);
@@ -446,13 +457,16 @@ async fn replayed_response_on_a_fresh_challenge_is_rejected() -> Result<()> {
         let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
         recv.read_exact(&mut buf).await?;
         let challenge = decode_challenge(&buf)?;
-        // Sign the valid response for THIS challenge, then capture the bytes.
+        // Sign the valid response for THIS challenge over the pair observed on
+        // this connection, then capture the bytes.
         let t = admission_transcript(
             &hello.did,
             &hello.client_nonce,
             &challenge.server_nonce,
             challenge.epoch,
             &challenge.head_digest,
+            client.endpoint_id().as_bytes(),
+            conn.remote_id().as_bytes(),
         );
         use ed25519_dalek::Signer as _;
         let ed_sig: [u8; 64] = proof.ed25519.sign(&t).to_bytes();
@@ -514,6 +528,215 @@ async fn replayed_response_on_a_fresh_challenge_is_rejected() -> Result<()> {
     );
 
     client.shutdown().await?;
+    server.substrate.shutdown().await?;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// channel binding: two-connection live relay
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A carrier-level live relay on the `moql` ALPN: terminates the client's
+/// connection, dials the real server on a second connection, and forwards the
+/// admission frames in real time (hello → fresh challenge → response →
+/// confirmation). Every forwarded byte is genuine and freshly produced; the
+/// one thing the relay cannot forward is the endpoint pair, because each
+/// terminated connection authenticates its own peer NodeId.
+#[derive(Clone, Debug)]
+struct LiveRelayHandler {
+    upstream: EndpointAddr,
+    endpoint: Arc<std::sync::OnceLock<iroh::Endpoint>>,
+}
+
+impl iroh::protocol::ProtocolHandler for LiveRelayHandler {
+    async fn accept(
+        &self,
+        client_conn: iroh::endpoint::Connection,
+    ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+        let endpoint = self
+            .endpoint
+            .get()
+            .expect("relay endpoint installed before accept")
+            .clone();
+        let upstream = endpoint
+            .connect(self.upstream.clone(), ALPN_MOQ_LITE)
+            .await
+            .map_err(iroh::protocol::AcceptError::from_err)?;
+        let (mut client_send, mut client_recv) = client_conn
+            .accept_bi()
+            .await
+            .map_err(iroh::protocol::AcceptError::from_err)?;
+        let (mut server_send, mut server_recv) = upstream
+            .open_bi()
+            .await
+            .map_err(iroh::protocol::AcceptError::from_err)?;
+        // Four live frame relays. For a relayed proof the last one never
+        // completes: the server rejects at the response and closes the
+        // second connection, which closes the client's connection here.
+        for _ in 0..4 {
+            let mut len = [0u8; 4];
+            client_recv
+                .read_exact(&mut len)
+                .await
+                .map_err(iroh::protocol::AcceptError::from_err)?;
+            let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+            client_recv
+                .read_exact(&mut buf)
+                .await
+                .map_err(iroh::protocol::AcceptError::from_err)?;
+            server_send
+                .write_all(&len)
+                .await
+                .map_err(iroh::protocol::AcceptError::from_err)?;
+            server_send
+                .write_all(&buf)
+                .await
+                .map_err(iroh::protocol::AcceptError::from_err)?;
+            let mut len = [0u8; 4];
+            server_recv
+                .read_exact(&mut len)
+                .await
+                .map_err(iroh::protocol::AcceptError::from_err)?;
+            let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+            server_recv
+                .read_exact(&mut buf)
+                .await
+                .map_err(iroh::protocol::AcceptError::from_err)?;
+            client_send
+                .write_all(&len)
+                .await
+                .map_err(iroh::protocol::AcceptError::from_err)?;
+            client_send
+                .write_all(&buf)
+                .await
+                .map_err(iroh::protocol::AcceptError::from_err)?;
+        }
+        Ok(())
+    }
+}
+
+/// #1027 P1 channel binding: the signed admission transcript and the mutual
+/// server confirmation bind the locally observed Iroh endpoint pair. A live
+/// relay that terminates two connections and forwards every frame in real
+/// time — hello, fresh challenge, genuinely signed response — cannot relay
+/// the endpoint pair: the response is rejected on the second connection even
+/// though it is a fresh, validly signed hybrid proof over that very challenge.
+/// Causality: the only difference between the admitted control connection and
+/// the relayed one is the endpoint pair each side observed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_relay_of_a_genuine_proof_is_rejected_on_the_second_connection() -> Result<()> {
+    use ed25519_dalek::Signer as _;
+    let authority = Arc::new(FixtureAuthority::default());
+    let alice = peer(9, "relaycid512");
+    authority.set(&alice.did, accepted_state(&alice, 4, 6, None));
+    let tenants: HashMap<String, String> = [(alice.did.clone(), "alice".to_owned())]
+        .into_iter()
+        .collect();
+    let server = admission_server(authority, tenants, ADMISSION_TIMEOUT).await?;
+    let server_addr = direct_addr(&server.substrate);
+
+    // ── control: the same proof admits directly; pair binding breaks nothing ──
+    let (control, control_session, _consumer) =
+        admitted_client(&server_addr, &proof(&alice, server.server_identity.clone())).await?;
+    let resolved = server.resolver_calls.load(Ordering::SeqCst);
+    assert!(resolved >= 1, "direct admission must reach the tenant resolver");
+
+    // ── the relay: two terminated connections, admission frames forwarded live ─
+    let relay_endpoint = Arc::new(std::sync::OnceLock::new());
+    let relay = IrohSubstrate::new(
+        fresh_node_key(),
+        LiveRelayHandler {
+            upstream: server_addr.clone(),
+            endpoint: Arc::clone(&relay_endpoint),
+        },
+        NoopHandler::new("relay-rpc"),
+    )
+    .await?;
+    let _ = relay_endpoint.set(relay.endpoint().clone());
+    let relay_addr = direct_addr(&relay);
+
+    // ── genuine client signs the transcript over the pair IT observes ─────────
+    // Its connection terminates at the relay, so the observed pair is
+    // (genuine, relay). The server, on the second connection, observes
+    // (relay, server): the relay cannot make these equal.
+    let genuine = IrohSubstrate::new(
+        fresh_node_key(),
+        NoopHandler::new("genuine-moq"),
+        NoopHandler::new("genuine-rpc"),
+    )
+    .await?;
+    let conn = genuine.connect(relay_addr, ALPN_MOQ_LITE).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let hello = AdmissionHello {
+        did: alice.did.clone(),
+        ed25519_pub: alice.ed.verifying_key().to_bytes(),
+        client_nonce: [0x5A; 32],
+    };
+    let hello_bytes = encode_hello(&hello);
+    send.write_all(&(hello_bytes.len() as u32).to_be_bytes())
+        .await?;
+    send.write_all(&hello_bytes).await?;
+    let mut len = [0u8; 4];
+    recv.read_exact(&mut len).await?;
+    let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+    recv.read_exact(&mut buf).await?;
+    let challenge = decode_challenge(&buf)?;
+    let t = admission_transcript(
+        &hello.did,
+        &hello.client_nonce,
+        &challenge.server_nonce,
+        challenge.epoch,
+        &challenge.head_digest,
+        genuine.endpoint_id().as_bytes(),
+        conn.remote_id().as_bytes(),
+    );
+    let ed_sig: [u8; 64] = alice.ed.sign(&t).to_bytes();
+    let mut outer = t;
+    outer.extend_from_slice(&ed_sig);
+    let response = AdmissionResponse {
+        ed_sig,
+        pq_sig: hyprstream_rpc::crypto::pq::ml_dsa_sign(&alice.pq, &outer),
+    };
+    let response_bytes = encode_response(&response);
+    send.write_all(&(response_bytes.len() as u32).to_be_bytes())
+        .await?;
+    send.write_all(&response_bytes).await?;
+    send.finish()?;
+
+    // ── rejection on the second connection: no confirmation, carrier closes ───
+    let closed = tokio::time::timeout(ADMISSION_TIMEOUT, conn.closed()).await;
+    assert!(
+        closed.is_ok(),
+        "a live-relayed genuine proof must be rejected: the relayed connection must close"
+    );
+    let session = Session::raw(conn);
+    let client_origin = Origin::random().produce();
+    let moq_client = Client::new().with_consume(client_origin);
+    let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, moq_client.connect(session)).await;
+    assert!(
+        matches!(handshake, Ok(Err(_)) | Err(_)),
+        "the relayed carrier must not complete the moq handshake"
+    );
+
+    // ── the direct admission is untouched by the rejected relay attempt ───────
+    let still_open = tokio::time::timeout(CROSS_TENANT_GRACE, control_session.closed()).await;
+    assert!(
+        still_open.is_err(),
+        "the genuine direct session must remain live after the relay rejection"
+    );
+    // The server is not wedged by the rejection: the same proof still admits
+    // directly afterwards.
+    let (after, _after_session, _after_consumer) =
+        admitted_client(&server_addr, &proof(&alice, server.server_identity.clone())).await?;
+    assert!(
+        server.resolver_calls.load(Ordering::SeqCst) > resolved,
+        "a direct admission after the relay rejection must reach the resolver"
+    );
+
+    genuine.shutdown().await?;
+    control.shutdown().await?;
+    after.shutdown().await?;
+    relay.shutdown().await?;
     server.substrate.shutdown().await?;
     Ok(())
 }

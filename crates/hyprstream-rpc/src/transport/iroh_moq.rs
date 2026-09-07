@@ -664,6 +664,8 @@ mod tests {
             "did:at9p:other-producer" => Some(other_state.clone()),
             _ => None,
         });
+        let relay_secret = fresh_key();
+        let relay_carrier = *iroh::SecretKey::from_bytes(&relay_secret).public().as_bytes();
         let admission = Arc::new(crate::transport::moql_admission::MoqlAdmissionAuthenticator::new(
             authority,
             Arc::new(|peer| match peer.subject.as_deref() {
@@ -671,9 +673,9 @@ mod tests {
                 Some("did:at9p:other-producer") => Some("bob".to_owned()),
                 _ => None,
             }),
-        ).with_server_identity(MoqlServerIdentityProof {
+        ).with_server_identity_and_carrier(MoqlServerIdentityProof {
             identity: server_identity.clone(), ed25519: server_ed, ml_dsa_65: server_pq,
-        }));
+        }, relay_carrier));
         let handler = IrohMoqProtocolHandler::new().with_authz(
             MoqAuthzConfig::default()
                 .with_admission(admission)
@@ -683,7 +685,7 @@ mod tests {
                 })),
         );
         let relay_consumer = handler.origin_consumer().clone();
-        let relay = IrohSubstrate::new_test(fresh_key(), handler, NoopHandler::new("rpc-not-wired")).await?;
+        let relay = IrohSubstrate::new_test(relay_secret, handler, NoopHandler::new("rpc-not-wired")).await?;
         let producer = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("producer-moq"), NoopHandler::new("producer-rpc")).await?;
         let subscriber = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("subscriber-moq"), NoopHandler::new("subscriber-rpc")).await?;
         let other = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("other-moq"), NoopHandler::new("other-rpc")).await?;
@@ -692,7 +694,7 @@ mod tests {
         prove_moql_admission(&producer_conn, &MoqlAdmissionProof {
             did: "did:at9p:producer".to_owned(), ed25519: producer_ed, ml_dsa_65: producer_pq,
             expected_server: server_identity.clone(),
-        }, std::time::Duration::from_secs(2)).await?;
+        }, *producer.endpoint_id().as_bytes(), std::time::Duration::from_secs(2)).await?;
         let producer_origin: OriginProducer = Origin::random().produce();
         let producer_session = Client::new().with_origin(producer_origin.clone()).connect(Session::raw(producer_conn)).await?;
 
@@ -700,7 +702,7 @@ mod tests {
         prove_moql_admission(&subscriber_conn, &MoqlAdmissionProof {
             did: "did:at9p:subscriber".to_owned(), ed25519: subscriber_ed, ml_dsa_65: subscriber_pq,
             expected_server: server_identity.clone(),
-        }, std::time::Duration::from_secs(2)).await?;
+        }, *subscriber.endpoint_id().as_bytes(), std::time::Duration::from_secs(2)).await?;
         let subscriber_origin: OriginProducer = Origin::random().produce();
         let subscriber_consumer = subscriber_origin.consume();
         let subscriber_session = Client::new()
@@ -735,7 +737,7 @@ mod tests {
         prove_moql_admission(&other_conn, &MoqlAdmissionProof {
             did: "did:at9p:other-producer".to_owned(), ed25519: other_ed, ml_dsa_65: other_pq,
             expected_server: server_identity,
-        }, std::time::Duration::from_secs(2)).await?;
+        }, *other.endpoint_id().as_bytes(), std::time::Duration::from_secs(2)).await?;
         let other_origin: OriginProducer = Origin::random().produce();
         let other_consumer = other_origin.consume();
         let other_session = Client::new()
@@ -795,22 +797,24 @@ mod tests {
         let authority: Arc<dyn crate::transport::moql_admission::AcceptedStateAuthority> =
             Arc::new(move |did: &str| (did == server_did).then(|| accepted_server.clone()));
 
+        let server_secret = fresh_key();
+        let server_carrier = *iroh::SecretKey::from_bytes(&server_secret).public().as_bytes();
         let admission = Arc::new(
             crate::transport::moql_admission::MoqlAdmissionAuthenticator::new(
                 authority,
                 Arc::new(|_peer| None),
             )
-            .with_server_identity(MoqlServerIdentityProof {
+            .with_server_identity_and_carrier(MoqlServerIdentityProof {
                 identity: server_identity,
                 ed25519: server_ed,
                 ml_dsa_65: server_pq,
-            }),
+            }, server_carrier),
         );
         let handler = IrohMoqProtocolHandler::new()
             .with_authz(MoqAuthzConfig::default().with_admission(admission))
             .with_connection_limit(1);
         let server = IrohSubstrate::new_test(
-            fresh_key(),
+            server_secret,
             handler.clone(),
             NoopHandler::new("rpc-not-wired"),
         )

@@ -512,11 +512,13 @@ pub async fn dial_stream_authenticated(
                      install_iroh_client_endpoint() at startup before dialing iroh streams"
                 )
             })?;
+            let client_carrier_node_id = *endpoint.id().as_bytes();
             let conn =
                 dial_iroh_moq_from_endpoint(endpoint, node_id, direct_addrs, relay_url).await?;
             crate::transport::moql_admission::prove_moql_admission(
                 &conn,
                 proof,
+                client_carrier_node_id,
                 crate::transport::moql_admission::DEFAULT_ADMISSION_TIMEOUT,
             )
             .await

@@ -90,9 +90,9 @@ use crate::transport::iroh_moq::PeerTenantResolver;
 /// Domain separation tag at the head of every admission transcript.
 pub const MOQL_ADMISSION_DOMAIN: &[u8] = b"hyprstream/moql-admission/v1";
 
-/// Wire format version byte. Version 2 adds the accepted server identity to
-/// the challenge and a hybrid server confirmation over the completed exchange.
-const WIRE_VERSION: u8 = 2;
+/// Wire format version byte. Version 3 binds both locally-observed Iroh
+/// endpoint IDs into the hybrid proof and mutual server confirmation.
+const WIRE_VERSION: u8 = 3;
 
 /// Maximum DID length accepted on the wire (DIDs are short identifiers; a
 /// longer field is a parse error, not a truncation).
@@ -409,9 +409,11 @@ pub fn admission_transcript(
     server_nonce: &[u8; 32],
     epoch: u64,
     head_digest: &[u8; 64],
+    client_carrier_node_id: &[u8; 32],
+    server_carrier_node_id: &[u8; 32],
 ) -> Vec<u8> {
     let mut t = Vec::with_capacity(
-        MOQL_ADMISSION_DOMAIN.len() + 1 + 4 + 1 + 2 + did.len() + 32 + 32 + 8 + 64,
+        MOQL_ADMISSION_DOMAIN.len() + 1 + 4 + 1 + 2 + did.len() + 32 + 32 + 8 + 64 + 32 + 32,
     );
     t.extend_from_slice(MOQL_ADMISSION_DOMAIN);
     t.push(0);
@@ -423,6 +425,8 @@ pub fn admission_transcript(
     t.extend_from_slice(server_nonce);
     t.extend_from_slice(&epoch.to_be_bytes());
     t.extend_from_slice(head_digest);
+    t.extend_from_slice(client_carrier_node_id);
+    t.extend_from_slice(server_carrier_node_id);
     t
 }
 
@@ -434,6 +438,8 @@ pub fn mutual_confirmation_transcript(
     hello: &AdmissionHello,
     challenge: &AdmissionChallenge,
     response: &AdmissionResponse,
+    client_carrier_node_id: &[u8; 32],
+    server_carrier_node_id: &[u8; 32],
 ) -> Vec<u8> {
     let client = admission_transcript(
         &hello.did,
@@ -441,6 +447,8 @@ pub fn mutual_confirmation_transcript(
         &challenge.server_nonce,
         challenge.epoch,
         &challenge.head_digest,
+        client_carrier_node_id,
+        server_carrier_node_id,
     );
     let server = encode_server_identity(&challenge.server_identity);
     let response = encode_response(response);
@@ -697,8 +705,16 @@ impl MoqlServerIdentityProof {
         hello: &AdmissionHello,
         challenge: &AdmissionChallenge,
         response: &AdmissionResponse,
+        client_carrier_node_id: &[u8; 32],
+        server_carrier_node_id: &[u8; 32],
     ) -> AdmissionConfirmation {
-        let transcript = mutual_confirmation_transcript(hello, challenge, response);
+        let transcript = mutual_confirmation_transcript(
+            hello,
+            challenge,
+            response,
+            client_carrier_node_id,
+            server_carrier_node_id,
+        );
         let ed_sig: [u8; 64] = self.ed25519.sign(&transcript).to_bytes();
         let mut outer = transcript;
         outer.extend_from_slice(&ed_sig);
@@ -719,6 +735,9 @@ pub struct MoqlAdmissionAuthenticator {
     /// The server's private accepted identity for the mutual confirmation.
     /// Absence is fail-closed on every admission exchange.
     server_identity: Mutex<Option<MoqlServerIdentityProof>>,
+    /// Locally observed Iroh endpoint ID for this server. This is carrier
+    /// binding only, never application identity or policy authority.
+    server_carrier_node_id: Mutex<Option<[u8; 32]>>,
 }
 
 impl std::fmt::Debug for MoqlAdmissionAuthenticator {
@@ -741,6 +760,7 @@ impl MoqlAdmissionAuthenticator {
             timeout: DEFAULT_ADMISSION_TIMEOUT,
             used: Mutex::new(HashMap::new()),
             server_identity: Mutex::new(None),
+            server_carrier_node_id: Mutex::new(None),
         }
     }
 
@@ -748,8 +768,13 @@ impl MoqlAdmissionAuthenticator {
     /// frames. A bare authenticator remains useful for unit decision tests but
     /// cannot admit a network tunnel.
     #[must_use]
-    pub fn with_server_identity(mut self, server_identity: MoqlServerIdentityProof) -> Self {
+    pub fn with_server_identity_and_carrier(
+        mut self,
+        server_identity: MoqlServerIdentityProof,
+        server_carrier_node_id: [u8; 32],
+    ) -> Self {
         self.server_identity = Mutex::new(Some(server_identity));
+        self.server_carrier_node_id = Mutex::new(Some(server_carrier_node_id));
         self
     }
 
@@ -760,6 +785,7 @@ impl MoqlAdmissionAuthenticator {
     pub fn install_server_identity(
         &self,
         server_identity: MoqlServerIdentityProof,
+        server_carrier_node_id: [u8; 32],
     ) -> Result<(), MoqlAdmissionError> {
         let mut installed = self.server_identity.lock();
         match installed.as_ref() {
@@ -769,6 +795,7 @@ impl MoqlAdmissionAuthenticator {
             Some(_) => Ok(()),
             None => {
                 *installed = Some(server_identity);
+                *self.server_carrier_node_id.lock() = Some(server_carrier_node_id);
                 Ok(())
             }
         }
@@ -793,6 +820,12 @@ impl MoqlAdmissionAuthenticator {
 
     async fn exchange(&self, conn: &Connection) -> Result<AdmittedMoqPeer, MoqlAdmissionError> {
         let carrier_node_id = *conn.remote_id().as_bytes();
+        let server_carrier_node_id = self
+            .server_carrier_node_id
+            .lock()
+            .as_ref()
+            .copied()
+            .ok_or(MoqlAdmissionError::ServerIdentityUnavailable)?;
         let server_identity = self
             .server_identity
             .lock()
@@ -822,7 +855,14 @@ impl MoqlAdmissionAuthenticator {
         // ── Response ─────────────────────────────────────────────────────────
         let response = decode_response(&read_frame(&mut recv).await?)?;
         let now = crate::envelope::current_timestamp();
-        self.verify_response(&hello, &challenge, &response, now)?;
+        self.verify_response_bound(
+            &hello,
+            &challenge,
+            &response,
+            now,
+            &carrier_node_id,
+            &server_carrier_node_id,
+        )?;
         // The server witness is a live authorization fact too. Re-read it
         // after the client response so an expiry or state advance while this
         // exchange was in flight cannot receive a valid confirmation.
@@ -840,7 +880,13 @@ impl MoqlAdmissionAuthenticator {
         // Only after client proof verification does the server prove possession
         // of the resolver-pinned server identity over the *entire* exchange.
         // A bare verdict would be forgeable by an on-path wrong server.
-        let confirmation = server_identity.sign(&hello, &challenge, &response);
+        let confirmation = server_identity.sign(
+            &hello,
+            &challenge,
+            &response,
+            &carrier_node_id,
+            &server_carrier_node_id,
+        );
         write_frame(&mut send, &encode_confirmation(&confirmation)).await?;
         send.finish()
             .map_err(|e| MoqlAdmissionError::Carrier(format!("finish: {e}")))?;
@@ -933,13 +979,27 @@ impl MoqlAdmissionAuthenticator {
 
     /// The response-time decision: currentness re-check, replay, then the
     /// hybrid signature. Factored from the I/O path so each rejection class is
-    /// unit-testable without a carrier.
+    /// unit-testable without a carrier. The unbound shim is only for those
+    /// unit decision tests; the I/O path always uses `verify_response_bound`.
+    #[cfg(test)]
     fn verify_response(
         &self,
         hello: &AdmissionHello,
         challenge: &AdmissionChallenge,
         response: &AdmissionResponse,
         now_unix_ms: i64,
+    ) -> Result<(), MoqlAdmissionError> {
+        self.verify_response_bound(hello, challenge, response, now_unix_ms, &[0; 32], &[1; 32])
+    }
+
+    fn verify_response_bound(
+        &self,
+        hello: &AdmissionHello,
+        challenge: &AdmissionChallenge,
+        response: &AdmissionResponse,
+        now_unix_ms: i64,
+        client_carrier_node_id: &[u8; 32],
+        server_carrier_node_id: &[u8; 32],
     ) -> Result<(), MoqlAdmissionError> {
         // Currentness re-check: the authority must still report exactly the
         // epoch/head the challenge bound. A state advance mid-handshake
@@ -974,6 +1034,8 @@ impl MoqlAdmissionAuthenticator {
             &challenge.server_nonce,
             challenge.epoch,
             &challenge.head_digest,
+            client_carrier_node_id,
+            server_carrier_node_id,
         );
         let digest = transcript_digest(&t);
         if self.is_consumed(&digest, now_unix_ms) {
@@ -1081,12 +1143,20 @@ fn verify_server_confirmation(
     challenge: &AdmissionChallenge,
     response: &AdmissionResponse,
     confirmation: &AdmissionConfirmation,
+    client_carrier_node_id: &[u8; 32],
+    server_carrier_node_id: &[u8; 32],
 ) -> Result<(), MoqlAdmissionError> {
     let ed_vk = VerifyingKey::from_bytes(&expected.ed25519)
         .map_err(|_| MoqlAdmissionError::ServerUnconfirmed)?;
     let pq_vk = ml_dsa_vk_from_bytes(&expected.ml_dsa65)
         .map_err(|_| MoqlAdmissionError::ServerUnconfirmed)?;
-    let transcript = mutual_confirmation_transcript(hello, challenge, response);
+    let transcript = mutual_confirmation_transcript(
+        hello,
+        challenge,
+        response,
+        client_carrier_node_id,
+        server_carrier_node_id,
+    );
     ed_vk
         .verify(&transcript, &Signature::from_bytes(&confirmation.ed_sig))
         .map_err(|_| MoqlAdmissionError::ServerUnconfirmed)?;
@@ -1103,9 +1173,10 @@ fn verify_server_confirmation(
 pub async fn prove_moql_admission(
     conn: &Connection,
     proof: &MoqlAdmissionProof,
+    client_carrier_node_id: [u8; 32],
     timeout: Duration,
 ) -> Result<(), MoqlAdmissionError> {
-    match tokio::time::timeout(timeout, prove_exchange(conn, proof)).await {
+    match tokio::time::timeout(timeout, prove_exchange(conn, proof, client_carrier_node_id)).await {
         Ok(res) => res,
         Err(_) => Err(MoqlAdmissionError::Timeout),
     }
@@ -1114,6 +1185,7 @@ pub async fn prove_moql_admission(
 async fn prove_exchange(
     conn: &Connection,
     proof: &MoqlAdmissionProof,
+    client_carrier_node_id: [u8; 32],
 ) -> Result<(), MoqlAdmissionError> {
     let (mut send, mut recv) = conn
         .open_bi()
@@ -1134,6 +1206,8 @@ async fn prove_exchange(
         &challenge.server_nonce,
         challenge.epoch,
         &challenge.head_digest,
+        &client_carrier_node_id,
+        conn.remote_id().as_bytes(),
     );
     let ed_sig: [u8; 64] = proof.ed25519.sign(&t).to_bytes();
     let mut outer = t;
@@ -1159,6 +1233,8 @@ async fn prove_exchange(
         &challenge,
         &AdmissionResponse { ed_sig, pq_sig },
         &confirmation,
+        &client_carrier_node_id,
+        conn.remote_id().as_bytes(),
     )
 }
 
@@ -1216,6 +1292,8 @@ mod tests {
             &challenge.server_nonce,
             challenge.epoch,
             &challenge.head_digest,
+            &[0; 32],
+            &[1; 32],
         );
         let ed_sig: [u8; 64] = ed.sign(&t).to_bytes();
         let mut outer = t;
@@ -1410,6 +1488,8 @@ mod tests {
             &challenge.server_nonce,
             challenge.epoch,
             &challenge.head_digest,
+            &[0; 32],
+            &[1; 32],
         );
         let mut outer = t.clone();
         outer.extend_from_slice(&response.ed_sig);
@@ -1499,8 +1579,9 @@ mod tests {
             expires_at_unix_ms: crate::envelope::current_timestamp() + 60_000,
             ed25519: ed.verifying_key().to_bytes(), ml_dsa65: crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq),
         };
-        let auth = MoqlAdmissionAuthenticator::new(authority, resolver).with_server_identity(
+        let auth = MoqlAdmissionAuthenticator::new(authority, resolver).with_server_identity_and_carrier(
             MoqlServerIdentityProof { identity, ed25519: ed.clone(), ml_dsa_65: pq },
+            [1; 32],
         );
         let admitted = AdmittedMoqPeer {
             peer: PeerIdentity::authenticated(DID.to_owned()), tenant: "alice".to_owned(),
