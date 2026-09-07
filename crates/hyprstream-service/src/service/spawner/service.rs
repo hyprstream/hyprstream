@@ -549,19 +549,31 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     } => None,
                 };
                 announcement_cancellation.cancel();
+                // All carriers and the independent bridge consume one grace.
+                // Publishing the deadline starts the bridge drain immediately;
+                // the final shutdown below still joins its owned thread/result.
+                let deadline = bridge.begin_shutdown(
+                    tokio::time::Instant::now() + hyprstream_rpc::transport::rpc_session::DRAIN_TIMEOUT,
+                );
                 local_shutdown.notify_one();
-                if let Some(substrate) = _iroh_substrate_guard {
-                    if let Err(error) = substrate.shutdown().await {
-                        tracing::warn!("iroh substrate shutdown error: {error}");
+                drain_token.cancel();
+                let substrate_drain = async {
+                    if let Some(substrate) = _iroh_substrate_guard {
+                        if let Err(error) = substrate.shutdown().await {
+                            tracing::warn!("iroh substrate shutdown error: {error}");
+                        }
                     }
-                }
-                hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown(
-                    &drain_limit, drain_capacity, &drain_token,
-                ).await;
-                let rep_result = match completed_rep {
-                    Some(result) => result,
-                    None => rep_fut.await,
                 };
+                let quinn_drain = hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown_until(
+                    &drain_limit, drain_capacity, &drain_token, deadline,
+                );
+                let rep_drain = async {
+                    match completed_rep {
+                        Some(result) => result,
+                        None => rep_fut.await,
+                    }
+                };
+                let (_, (), rep_result) = tokio::join!(substrate_drain, quinn_drain, rep_drain);
                 rep_result.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
             } else {
                 hyprstream_rpc::service::serve::serve_bridged(

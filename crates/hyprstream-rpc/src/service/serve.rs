@@ -104,14 +104,17 @@ async fn run_uds(
     signing_key: SigningKey,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
-    let server = UdsRpcServer::with_capacity(listener, processor, signing_key, DEFAULT_STREAM_LIMIT);
+    let server = UdsRpcServer::with_capacity(listener, Arc::clone(&processor), signing_key, DEFAULT_STREAM_LIMIT);
     let token = server.shutdown_token();
     let limit = server.stream_limit();
     let cap = server.capacity();
     tokio::select! {
         r = server.run() => r,
         _ = shutdown.notified() => {
-            UdsRpcServer::shutdown(&limit, cap, &token).await;
+            let deadline = processor.begin_shutdown(
+                tokio::time::Instant::now() + crate::transport::rpc_session::DRAIN_TIMEOUT,
+            );
+            UdsRpcServer::shutdown_until(&limit, cap, &token, deadline).await;
             Ok(())
         }
     }

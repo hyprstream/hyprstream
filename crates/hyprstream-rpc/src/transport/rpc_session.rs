@@ -180,7 +180,16 @@ pub(crate) mod sealed {
 pub trait IrohRequestProcessor: sealed::Sealed + Send + Sync + 'static {
     /// Close service admission before removing an in-process endpoint. The
     /// owning bridge performs the bounded drain and join separately.
-    fn close_admission(&self) {}
+    fn close_admission(&self) {
+        self.begin_shutdown(tokio::time::Instant::now() + DRAIN_TIMEOUT);
+    }
+
+    /// Close admission and establish one absolute request-drain deadline. A
+    /// bridge returns its first deadline so later carrier/owner calls cannot
+    /// restart the grace period. Joining remains the service owner's duty.
+    fn begin_shutdown(&self, deadline: tokio::time::Instant) -> tokio::time::Instant {
+        deadline
+    }
 
     fn process(
         &self,

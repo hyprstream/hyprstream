@@ -124,8 +124,17 @@ impl UdsRpcServer {
     /// [`DRAIN_TIMEOUT`]) for every in-flight stream to release its permit, then
     /// close the semaphore. Mirrors [`QuinnRpcServer::shutdown`](super::quinn_transport::QuinnRpcServer::shutdown).
     pub async fn shutdown(stream_limit: &Arc<Semaphore>, capacity: u32, token: &CancellationToken) {
+        Self::shutdown_until(stream_limit, capacity, token,
+            tokio::time::Instant::now() + super::rpc_session::DRAIN_TIMEOUT).await;
+    }
+
+    /// Drain against the owner's shared deadline, without starting a new grace.
+    pub async fn shutdown_until(
+        stream_limit: &Arc<Semaphore>, capacity: u32, token: &CancellationToken,
+        deadline: tokio::time::Instant,
+    ) {
         token.cancel();
-        match tokio::time::timeout(DRAIN_TIMEOUT, stream_limit.acquire_many(capacity)).await {
+        match tokio::time::timeout_at(deadline, stream_limit.acquire_many(capacity)).await {
             Ok(Ok(permits)) => {
                 permits.forget();
                 stream_limit.close();

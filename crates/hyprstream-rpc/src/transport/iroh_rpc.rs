@@ -208,13 +208,16 @@ impl ProtocolHandler for IrohRpcProtocolHandler {
         // even if cancel() lands between iterations, the next time the
         // loop hits `cancelled().await` it returns immediately.
         self.inner.shutdown.cancel();
+        let deadline = self.inner.processor.begin_shutdown(
+            tokio::time::Instant::now() + super::rpc_session::DRAIN_TIMEOUT,
+        );
         // Wait for all in-flight streams to release their permits.
         // `acquire_many` succeeds only once every permit is returned. Bounded
         // (#159) so a wedged processor/transport can't hang shutdown forever;
         // on timeout we close() and proceed (remaining tasks die with the conn).
         let cap = self.inner.stream_limit_capacity;
-        match tokio::time::timeout(
-            super::rpc_session::DRAIN_TIMEOUT,
+        match tokio::time::timeout_at(
+            deadline,
             self.inner.stream_limit.acquire_many(cap),
         )
         .await
@@ -343,7 +346,7 @@ pub struct LocalServiceBridge {
     tx: tokio::sync::mpsc::Sender<BridgeMessage>,
     shutdown: CancellationToken,
     thread: Arc<BridgeThread>,
-    admission: parking_lot::Mutex<()>,
+    admission: Arc<parking_lot::Mutex<Option<tokio::time::Instant>>>,
 }
 
 /// Stable terminal outcome shared by all explicit shutdown waiters.
@@ -409,6 +412,7 @@ async fn finish_bridge_local_set(
     dispatch: tokio::task::JoinHandle<BridgeShutdownResult>,
     shutdown: CancellationToken,
     grace: std::time::Duration,
+    admission: Arc<parking_lot::Mutex<Option<tokio::time::Instant>>>,
 ) -> BridgeShutdownResult {
     let result = {
         // Await the dispatch task (which owns every accepted RPC), not the
@@ -420,7 +424,8 @@ async fn finish_bridge_local_set(
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
-                tokio::time::timeout(grace, &mut run).await
+                let deadline = admission.lock().unwrap_or_else(|| tokio::time::Instant::now() + grace);
+                tokio::time::timeout_at(deadline, &mut run).await
                     .unwrap_or(Err(BridgeShutdownError::DrainTimedOut))
             }
             result = &mut run => result,
@@ -461,6 +466,8 @@ impl LocalServiceBridge {
 
         let shutdown = CancellationToken::new();
         let stopped = shutdown.clone();
+        let admission = Arc::new(parking_lot::Mutex::new(None));
+        let thread_admission = Arc::clone(&admission);
         let thread = std::thread::Builder::new()
             .name(format!("iroh-rpc-bridge:{service_name}"))
             .spawn(move || {
@@ -481,14 +488,14 @@ impl LocalServiceBridge {
                     stopped.clone(),
                 ));
                 let result = rt.block_on(finish_bridge_local_set(
-                    local, dispatch, stopped, super::rpc_session::DRAIN_TIMEOUT,
+                    local, dispatch, stopped, super::rpc_session::DRAIN_TIMEOUT, thread_admission,
                 ));
                 drop(rt);
                 result
             })
             .map_err(|e| anyhow::anyhow!("spawn iroh-rpc bridge thread: {e}"))?;
 
-        Ok(Self { tx, shutdown, thread: Arc::new(BridgeThread::new(thread)), admission: parking_lot::Mutex::new(()) })
+        Ok(Self { tx, shutdown, thread: Arc::new(BridgeThread::new(thread)), admission })
     }
 
     /// Like [`LocalServiceBridge::spawn`], but constructs the service ON the
@@ -520,6 +527,8 @@ impl LocalServiceBridge {
 
         let shutdown = CancellationToken::new();
         let stopped = shutdown.clone();
+        let admission = Arc::new(parking_lot::Mutex::new(None));
+        let thread_admission = Arc::clone(&admission);
         let thread = std::thread::Builder::new()
             .name(format!("rpc-bridge:{thread_name}"))
             .spawn(move || {
@@ -557,21 +566,28 @@ impl LocalServiceBridge {
                     run_bridge_dispatch_loop(service, rx, nonce_cache, dispatch_shutdown).await
                 });
                 let result = rt.block_on(finish_bridge_local_set(
-                    local, dispatch, stopped, super::rpc_session::DRAIN_TIMEOUT,
+                    local, dispatch, stopped, super::rpc_session::DRAIN_TIMEOUT, thread_admission,
                 ));
                 drop(rt);
                 result
             })
             .map_err(|e| anyhow::anyhow!("spawn rpc bridge thread: {e}"))?;
 
-        Ok((Self { tx, shutdown, thread: Arc::new(BridgeThread::new(thread)), admission: parking_lot::Mutex::new(()) }, ready_rx))
+        Ok((Self { tx, shutdown, thread: Arc::new(BridgeThread::new(thread)), admission }, ready_rx))
     }
 }
 
 impl LocalServiceBridge {
     fn close_admission(&self) {
-        let _admission = self.admission.lock();
+        self.begin_shutdown(tokio::time::Instant::now() + super::rpc_session::DRAIN_TIMEOUT);
+    }
+
+    /// Begin draining immediately; subsequent callers reuse the first deadline.
+    pub fn begin_shutdown(&self, deadline: tokio::time::Instant) -> tokio::time::Instant {
+        let mut admission = self.admission.lock();
+        let deadline = *admission.get_or_insert(deadline);
         self.shutdown.cancel();
+        deadline
     }
 
     /// Close admission, drain accepted work, and wait for service/runtime destruction.
@@ -601,6 +617,10 @@ impl Drop for LocalServiceBridge {
 
 impl IrohRequestProcessor for LocalServiceBridge {
     fn close_admission(&self) { LocalServiceBridge::close_admission(self); }
+
+    fn begin_shutdown(&self, deadline: tokio::time::Instant) -> tokio::time::Instant {
+        LocalServiceBridge::begin_shutdown(self, deadline)
+    }
 
     fn process(
         &self,
@@ -902,7 +922,7 @@ mod tests {
         let dispatch = local.spawn_local(run_bridge_dispatch_loop(
             std::rc::Rc::new(service), rx, Arc::new(crate::envelope::InMemoryNonceCache::new()), stopped.clone(),
         ));
-        let drain = finish_bridge_local_set(local, dispatch, stopped, super::super::rpc_session::DRAIN_TIMEOUT);
+        let drain = finish_bridge_local_set(local, dispatch, stopped, super::super::rpc_session::DRAIN_TIMEOUT, Arc::new(parking_lot::Mutex::new(None)));
         let coordinate = async {
             tokio::time::timeout(Duration::from_secs(5), entered.acquire_many(2)).await??.forget();
             assert!(tx.is_closed(), "new admissions remained open during grace");
@@ -930,7 +950,7 @@ mod tests {
             tx,
             shutdown: CancellationToken::new(),
             thread: Arc::new(BridgeThread::new(worker)),
-            admission: parking_lot::Mutex::new(()),
+            admission: Arc::new(parking_lot::Mutex::new(None)),
         });
         let (first, second) = tokio::join!(bridge.shutdown(), bridge.shutdown());
         assert_eq!(first, Err(BridgeShutdownError::ThreadPanicked));
@@ -982,10 +1002,10 @@ mod tests {
             let dispatch = local.spawn_local(run_bridge_dispatch_loop(
                 std::rc::Rc::new(service), rx, Arc::new(crate::envelope::InMemoryNonceCache::new()), thread_stopped.clone(),
             ));
-            rt.block_on(finish_bridge_local_set(local, dispatch, thread_stopped, super::super::rpc_session::DRAIN_TIMEOUT))
+            rt.block_on(finish_bridge_local_set(local, dispatch, thread_stopped, super::super::rpc_session::DRAIN_TIMEOUT, Arc::new(parking_lot::Mutex::new(None))))
         });
         let bridge = LocalServiceBridge {
-            tx, shutdown: stopped, thread: Arc::new(BridgeThread::new(thread)), admission: parking_lot::Mutex::new(()),
+            tx, shutdown: stopped, thread: Arc::new(BridgeThread::new(thread)), admission: Arc::new(parking_lot::Mutex::new(None)),
         };
         tokio::time::timeout(Duration::from_secs(5), entered.acquire()).await??.forget();
         let (first, second) = tokio::join!(bridge.shutdown(), bridge.shutdown());
@@ -994,6 +1014,216 @@ mod tests {
         assert_eq!(bridge.shutdown().await, first);
         assert!(response.await.is_err(), "forced deadline retained the accepted response sender");
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        Ok(())
+    }
+
+    fn deadline_test_identity() -> Result<SigningKey> {
+        let key = fresh_signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&key);
+        let mut store = crate::envelope::KeyedPqTrustStore::new();
+        store.bind(key.verifying_key().to_bytes(), &crate::crypto::pq::ml_dsa_sk_to_vk(&pq));
+        crate::envelope::install_verify_config(crate::envelope::EnvelopeVerifyConfig {
+            policy: crate::crypto::CryptoPolicy::Hybrid, pq_store: Some(Arc::new(store)),
+        })?;
+        Ok(key)
+    }
+
+    fn deadline_test_bridge(key: &SigningKey) -> Result<(
+        Arc<LocalServiceBridge>, Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>,
+        Arc<std::sync::atomic::AtomicBool>,
+    )> {
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut service = BridgeEcho::new(key.clone());
+        service.request_gate = Some((entered.clone(), release.clone()));
+        let (drop_entered, _) = std::sync::mpsc::channel();
+        let (drop_release, released) = std::sync::mpsc::channel();
+        drop_release.send(())?;
+        service.drop_probe = Some(BridgeDropProbe {
+            entered: drop_entered, release: released, completed: dropped.clone(),
+        });
+        let bridge = Arc::new(LocalServiceBridge::spawn(
+            service, Arc::new(crate::envelope::InMemoryNonceCache::new()), 0,
+        )?);
+        Ok((bridge, entered, release, dropped))
+    }
+
+    async fn exercise_transport_bridge_deadline<T, F, D>(
+        transport: T, key: &SigningKey, bridge: Arc<LocalServiceBridge>,
+        entered: Arc<tokio::sync::Semaphore>, release: Arc<tokio::sync::Semaphore>,
+        dropped: Arc<std::sync::atomic::AtomicBool>, forced: bool, drain: D,
+    ) -> Result<()>
+    where
+        T: crate::transport::Transport + 'static,
+        F: Future<Output = Result<()>> + Send + 'static,
+        D: FnOnce(tokio::time::Instant) -> F,
+    {
+        let mut kem = crate::crypto::hybrid_kem::KeyedKemTrustStore::new();
+        kem.bind(key.verifying_key().to_bytes(), crate::node_identity::derive_mesh_kem_recipient(key)?.public());
+        let pq = crate::node_identity::derive_mesh_mldsa_key(key);
+        let mut response_trust = crate::envelope::KeyedPqTrustStore::new();
+        response_trust.bind(key.verifying_key().to_bytes(), &crate::crypto::pq::ml_dsa_sk_to_vk(&pq));
+        let client = Arc::new(crate::rpc_client::RpcClientImpl::new(
+            crate::signer::LocalSigner::new(key.clone()), transport, Some(key.verifying_key()),
+        ).with_request_kem_store(Arc::new(kem)).with_response_pq_store(Arc::new(response_trust)));
+        // Release on assertion/error too: a regression must fail, not strand
+        // the real worker behind its fixture gate during test unwinding.
+        struct ReleaseOnDrop(Arc<tokio::sync::Semaphore>);
+        impl Drop for ReleaseOnDrop { fn drop(&mut self) { self.0.add_permits(1); } }
+        let _cleanup = ReleaseOnDrop(release.clone());
+        let caller = client.clone();
+        let response = tokio::spawn(async move {
+            caller.call_for_service("bridge-echo", b"held".to_vec()).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.acquire()).await??.forget();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert_eq!(bridge.begin_shutdown(deadline), deadline);
+        assert_eq!(bridge.begin_shutdown(deadline + Duration::from_secs(40)), deadline,
+            "later carrier shutdown must not extend the first grace");
+        assert!(bridge.process(Bytes::new(), crate::transport::carrier::CarrierContext::inproc()).await.is_err());
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        let carrier = tokio::spawn(drain(deadline));
+        if !forced {
+            release.add_permits(1);
+            let payload = tokio::time::timeout(Duration::from_secs(2), response).await???;
+            assert_eq!(payload, crate::service::dispatch::DISPATCH_DENIED.as_bytes());
+        } else {
+            // The accepted RPC is still held: neither a caller cancellation
+            // nor an already-finished request can make the deadline test pass.
+            assert!(!response.is_finished());
+            assert!(tokio::time::timeout(Duration::from_secs(3), response).await??.is_err(), "held request must be cancelled at deadline");
+        }
+        tokio::time::timeout(Duration::from_secs(3), carrier).await???;
+        // Deliberately join AFTER the transport drain too: this must reuse the
+        // established deadline/result, never grant the bridge another 40s.
+        let result = tokio::time::timeout(Duration::from_secs(1), bridge.shutdown()).await?;
+        if forced {
+            assert_eq!(result, Err(BridgeShutdownError::DrainTimedOut));
+        } else {
+            result?;
+            assert!(tokio::time::Instant::now() < deadline, "released request did not drain during grace");
+        }
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "join returned before destructor despite retained client");
+        assert_eq!(bridge.begin_shutdown(tokio::time::Instant::now() + Duration::from_secs(40)), deadline);
+        // Keep the actual network client alive through the completed join.
+        drop(client);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn irohrpc_bridge_shared_deadline_replies_or_forces_join() -> Result<()> {
+        let key = deadline_test_identity()?;
+        for forced in [false, true] {
+            let (bridge, entered, release, dropped) = deadline_test_bridge(&key)?;
+            let server = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("moq"),
+                IrohRpcProtocolHandler::with_stream_limit(bridge.clone(), key.clone(), DEFAULT_STREAM_LIMIT)).await?;
+            let client = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("client moq"), NoopHandler::new("client rpc")).await?;
+            let connection = client.connect(direct_addr(&server), ALPN_HYPRSTREAM_RPC).await?;
+            exercise_transport_bridge_deadline(
+                crate::transport::iroh_transport::IrohTransport::new(connection), &key,
+                bridge, entered, release, dropped, forced, move |_| async move { server.shutdown().await },
+            ).await?;
+            client.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quinnrpc_bridge_shared_deadline_replies_or_forces_join() -> Result<()> {
+        use crate::transport::quinn_transport::{QuinnRpcServer, QuinnTransport, connect_pinned};
+        crate::transport::pq_provider::install_pq_crypto_provider()?;
+        let key = deadline_test_identity()?;
+        for forced in [false, true] {
+            let (bridge, entered, release, dropped) = deadline_test_bridge(&key)?;
+            let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+            let cert_der = certificate.cert.der().to_vec();
+            let private = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der()),
+            );
+            let server = web_transport_quinn::ServerBuilder::new()
+                .with_addr("127.0.0.1:0".parse()?)
+                .with_certificate(vec![rustls::pki_types::CertificateDer::from(cert_der.clone())], private)?;
+            let address = server.local_addr()?;
+            let rpc = QuinnRpcServer::with_capacity(server, bridge.clone(), key.clone(), DEFAULT_STREAM_LIMIT);
+            let limit = rpc.stream_limit();
+            let capacity = rpc.capacity();
+            let token = rpc.shutdown_token();
+            let task = tokio::spawn(rpc.run());
+            let session = connect_pinned(address, &cert_der).await?;
+            exercise_transport_bridge_deadline(QuinnTransport::new(session), &key,
+                bridge, entered, release, dropped, forced, move |deadline| async move {
+                    QuinnRpcServer::shutdown_until(&limit, capacity, &token, deadline).await;
+                    task.await??;
+                    Ok(())
+                },
+            ).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn udsrpc_bridge_shared_deadline_replies_or_forces_join() -> Result<()> {
+        let key = deadline_test_identity()?;
+        for forced in [false, true] {
+            let (bridge, entered, release, dropped) = deadline_test_bridge(&key)?;
+            let directory = std::env::temp_dir().join(format!("hyprstream-r3-{}", hex::encode(&fresh_key()[..8])));
+            std::fs::create_dir(&directory)?;
+            let path = directory.join("rpc.sock");
+            let config = crate::transport::TransportConfig::ipc(path.clone());
+            let shutdown = Arc::new(tokio::sync::Notify::new());
+            struct StopOnDrop(Arc<tokio::sync::Notify>);
+            impl Drop for StopOnDrop { fn drop(&mut self) { self.0.notify_one(); } }
+            let _stop = StopOnDrop(shutdown.clone());
+            let (ready, readiness) = tokio::sync::oneshot::channel();
+            let processor = bridge.clone();
+            let signing_key = key.clone();
+            let stopped = shutdown.clone();
+            let task = tokio::spawn(async move {
+                crate::service::serve::serve_bridged(&config, processor, signing_key, stopped, Some(ready)).await
+            });
+            tokio::time::timeout(Duration::from_secs(5), readiness).await??;
+            exercise_transport_bridge_deadline(
+                crate::transport::lazy_uds::LazyUdsTransport::new(path), &key,
+                bridge, entered, release, dropped, forced, move |_| async move {
+                    shutdown.notify_one();
+                    task.await??;
+                    Ok(())
+                },
+            ).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_shared_deadline_does_not_reset_for_held_response_permits() -> Result<()> {
+        // Hold real drain permits independently of bridge completion, as a
+        // stuck response write can do. A later carrier cannot get a new 40s.
+        let quinn_limit = Arc::new(Semaphore::new(1));
+        let uds_limit = Arc::new(Semaphore::new(1));
+        let _quinn_permit = quinn_limit.clone().acquire_owned().await?;
+        let _uds_permit = uds_limit.clone().acquire_owned().await?;
+        let deadline = tokio::time::Instant::now() + super::super::rpc_session::DRAIN_TIMEOUT;
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let quinn_token = CancellationToken::new();
+        let uds_token = CancellationToken::new();
+        let quinn_stopped = quinn_token.clone();
+        let uds_stopped = uds_token.clone();
+        let task = tokio::spawn(async move {
+            tokio::join!(
+                crate::transport::quinn_transport::QuinnRpcServer::shutdown_until(&quinn_limit, 1, &quinn_stopped, deadline),
+                crate::transport::uds_server::UdsRpcServer::shutdown_until(&uds_limit, 1, &uds_stopped, deadline),
+            );
+            assert!(quinn_limit.is_closed() && uds_limit.is_closed());
+        });
+        quinn_token.cancelled().await;
+        uds_token.cancelled().await;
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(!task.is_finished(), "drain expired before the shared deadline");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(task.is_finished(), "carrier started a fresh grace instead of using the owner's remaining budget");
+        task.await?;
         Ok(())
     }
 
