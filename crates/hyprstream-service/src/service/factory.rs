@@ -954,12 +954,30 @@ impl ServiceContext {
         service: S,
         quic_port: Option<u16>,
     ) -> Box<dyn Spawnable> {
+        self.into_spawnable_quic_with_publisher(service, quic_port, None)
+    }
+
+    /// Supply an owned publication path for a service that cannot RPC itself
+    /// before readiness. Binding/cancellation still belong to the spawner.
+    pub fn into_spawnable_quic_with_publisher<
+        S: hyprstream_rpc::service::RequestService + Send + Sync + 'static,
+    >(
+        &self,
+        service: S,
+        quic_port: Option<u16>,
+        publisher: Option<NativeAnnouncementPublisher>,
+    ) -> Box<dyn Spawnable> {
         let quic = match &self.quic_shared {
             Some(shared) => {
+                let mut shared = shared.clone();
+                let owned = publisher.is_some();
+                if let Some(publisher) = publisher {
+                    shared.native_announcement_publisher = Some(publisher);
+                }
                 let port = quic_port.unwrap_or(0);
                 // Use announce callback for all services except discovery itself
                 // (discovery can't announce to itself)
-                if service.name() == "discovery" {
+                if service.name() == "discovery" && !owned {
                     Some(shared.for_service(service.name(), port))
                 } else {
                     // Bind the announcement JWT to the exact signer. A

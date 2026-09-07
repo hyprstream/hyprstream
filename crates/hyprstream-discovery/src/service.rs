@@ -3,6 +3,10 @@
 //! Allows remote clients to discover registered services, their endpoints,
 //! socket kinds, and schemas via the standard REQ/REP transport.
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "network_bootstrap_tests.rs"]
+mod network_bootstrap_tests;
+
 use async_trait::async_trait;
 use hyprstream_rpc::browser_provisioning::{
     BrowserCarrierProfile, BrowserCurrentnessVerifier, BrowserProvisioningDocument,
@@ -589,6 +593,10 @@ pub(super) trait AcceptedStateSource: Send + Sync {
         &self,
         did: &str,
     ) -> Result<Option<hyprstream_pds::at9p_duplicity::AcceptedAt9pState>>;
+
+    fn bootstrap_endpoints(&self, _service_name: &str) -> Result<Option<Vec<AnnouncedEndpoint>>> {
+        Ok(None)
+    }
 }
 
 /// Opaque production authority minted only while holding the checkpoint/PDS
@@ -760,7 +768,222 @@ pub struct DiscoveryService {
     transport: TransportConfig,
 }
 
+/// Owned publisher sharing Discovery's actual state and verification sources.
+pub struct DiscoverySelfAnnouncer {
+    validator: DiscoveryService,
+}
+
+impl DiscoverySelfAnnouncer {
+    pub async fn publish(&self, announcement: &ServiceAnnouncement) -> Result<()> {
+        anyhow::ensure!(announcement.service_name == "discovery", "self publication is only for Discovery");
+        anyhow::ensure!(announcement.service_did.is_did_at9p(), "self publication requires an accepted identity");
+        let mut ctx = EnvelopeContext::from_callback_service(0, "discovery");
+        ctx.cnf = self.validator.signing_key.verifying_key().to_bytes();
+        self.validator.store_announcement(&ctx, announcement).await?;
+        Ok(())
+    }
+}
+
 impl DiscoveryService {
+    pub fn self_announcer(&self) -> Result<DiscoverySelfAnnouncer> {
+        let source = self.accepted_state_source.clone()
+            .ok_or_else(|| anyhow::anyhow!("self publication requires accepted-state authority"))?;
+        let mut validator = Self::new(self.signing_key.clone(), self.jwt_verifying_key, self.transport.clone());
+        validator.state_store = self.state_store.clone();
+        validator.accepted_state_source = Some(source);
+        validator.jwt_key_source = self.jwt_key_source.clone();
+        validator.expected_audience = self.expected_audience.clone();
+        Ok(DiscoverySelfAnnouncer { validator })
+    }
+
+    async fn store_announcement(&self, ctx: &EnvelopeContext, data: &ServiceAnnouncement) -> Result<DiscoveryResponseVariant> {
+        info!(
+            "Discovery: service '{}' announced {} endpoint: {} (from {})",
+            data.service_name,
+            data.socket_kind,
+            data.endpoint,
+            ctx.subject()
+        );
+
+        let svc_name = data.service_name.clone();
+        let sock_kind = data.socket_kind.clone();
+        let endpoint = data.endpoint.clone();
+        let service_jwt = data.service_jwt.clone().unwrap_or_default();
+        let identity_bound = !data.service_did.as_str().is_empty()
+            || !data.accepted_state_digest.is_empty()
+            || !data.request_kem_recipient.is_empty();
+        if identity_bound {
+            anyhow::ensure!(
+                !service_jwt.is_empty(),
+                "identity-bound announcement requires a verified service JWT"
+            );
+            anyhow::ensure!(
+                data.service_did.is_did_at9p()
+                    && data.accepted_state_digest.len() == 64
+                    && !data.capabilities.is_empty()
+                    && data
+                        .response_key_id
+                        .starts_with(&format!("{}#", data.service_did))
+                    && data
+                        .request_kem_key_id
+                        .starts_with(&format!("{}#", data.service_did))
+                    && data.expires_at_unix_ms > unix_millis_now(),
+                "identity-bound announcement metadata is incomplete or expired"
+            );
+            let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(
+                &data.request_kem_recipient,
+            )?;
+            anyhow::ensure!(
+                recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
+                    && recipient.eks.len() == recipient.suite_id.components().len(),
+                "identity-bound announcement requires suite-complete hybrid KEM material"
+            );
+            match data.socket_kind.as_str() {
+                "quic" => {
+                    parse_announced_quic(&data.endpoint)?;
+                }
+                "iroh" => {
+                    parse_announced_iroh(&data.endpoint)?;
+                }
+                _ => {
+                    anyhow::bail!("identity-bound network announcement requires QUIC or Iroh reach")
+                }
+            }
+        }
+
+        // R3: Verify service JWT signature + subject matches serviceName.
+        // Full JWT verification (not decode_unverified) to prevent forged identities.
+        if !service_jwt.is_empty() {
+            // Service JWTs are minted hybrid (ML-DSA-65-Ed25519); the composite
+            // kid resolves through the key source (ledger pairs + the CA
+            // composite pair). Classical EdDSA remains accepted here for
+            // tokens minted before the hybrid cutover.
+            let is_composite = hyprstream_rpc::auth::jwt::header_alg(&service_jwt)
+                .ok()
+                .flatten()
+                .is_some_and(|alg| alg == "ML-DSA-65-Ed25519");
+            let verified = if is_composite {
+                let dispatch =
+                    hyprstream_rpc::auth::jwt::parse_composite_dispatch(&service_jwt, &["wit+jwt"])
+                        .map_err(|e| {
+                            tracing::warn!("Service JWT dispatch failed in announce: {}", e);
+                            anyhow::anyhow!("Invalid service JWT in announce: {}", e)
+                        })?;
+                let pair = self
+                    .jwt_key_source
+                    .as_ref()
+                    .and_then(|ks| ks.composite_pair(dispatch.kid()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Invalid service JWT in announce: unknown composite kid")
+                    })?;
+                // Signing-domain separation: announcements assert a service
+                // identity, which is certified by the Policy/CA domain only —
+                // the ledger's Policy slot and the derived CA pair (registered
+                // under the Policy role). The OAuth-role pair signs browser
+                // and workload WITs and must not be able to certify a service
+                // announcement.
+                anyhow::ensure!(
+                    pair.role() == hyprstream_rpc::auth::CompositePairRole::Policy,
+                    "Invalid service JWT in announce: composite pair role is not authorized \
+                     for service certification"
+                );
+                hyprstream_rpc::auth::jwt::decode_composite(
+                    &service_jwt,
+                    pair.ml_dsa(),
+                    pair.ed25519(),
+                    self.expected_audience.as_deref(),
+                    &dispatch,
+                )
+                .map_err(|e| {
+                    tracing::warn!("Service JWT verification failed in announce: {}", e);
+                    anyhow::anyhow!("Invalid service JWT in announce: {}", e)
+                })?
+            } else {
+                hyprstream_rpc::auth::jwt::decode_with_key(
+                    &service_jwt,
+                    &self.jwt_verifying_key,
+                    self.expected_audience.as_deref(),
+                )
+                .map_err(|e| {
+                    tracing::warn!("Service JWT verification failed in announce: {}", e);
+                    anyhow::anyhow!("Invalid service JWT in announce: {}", e)
+                })?
+            };
+            // Check that sub matches "service:{serviceName}"
+            let expected_sub = format!("service:{}", svc_name);
+            if verified.sub != expected_sub {
+                anyhow::bail!(
+                    "Service JWT subject mismatch: expected '{}', got '{}'",
+                    expected_sub,
+                    verified.sub
+                );
+            }
+            anyhow::ensure!(
+                verified.cnf_key_bytes() == Some(ctx.cnf),
+                "service JWT confirmation key does not match verified announcement signer"
+            );
+        }
+
+        let now_unix_ms = unix_millis_now();
+        let heartbeat_expiry = now_unix_ms.saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64);
+        // Legacy clients omit identity expiry (Cap'n Proto defaults it to 0).
+        // Only identity-bound announcements carry a signed expiry constraint.
+        let expires_at_unix_ms = if identity_bound {
+            data.expires_at_unix_ms
+        } else {
+            heartbeat_expiry
+        };
+        let mut live_until_unix_ms = expires_at_unix_ms.min(heartbeat_expiry);
+        if identity_bound {
+            if let Some(source) = &self.accepted_state_source {
+                let state = source
+                    .accepted_state(data.service_did.as_str())?
+                    .ok_or_else(|| anyhow::anyhow!("announcement DID has no accepted-current state"))?;
+                anyhow::ensure!(state.current.subject_keys.iter().any(|key| key.ed25519_pub == ctx.cnf),
+                    "announcement signer is not an accepted current subject key");
+                let service = state.current.services.iter().find(|entry| entry.id == format!("#{svc_name}"))
+                    .ok_or_else(|| anyhow::anyhow!("announcement service is not accepted"))?;
+                if let Some(kem) = &service.endpoint.request_kem {
+                    anyhow::ensure!(kem == &data.request_kem_recipient, "announcement KEM differs from accepted service");
+                    if data.socket_kind == "iroh" {
+                        anyhow::ensure!(service.endpoint.address == data.endpoint, "announcement reach differs from accepted service");
+                    }
+                }
+                anyhow::ensure!(
+                    state.epoch == data.accepted_state_epoch
+                        && state.head_digest.as_slice() == data.accepted_state_digest.as_slice(),
+                    "announcement does not match accepted-current state"
+                );
+                live_until_unix_ms = live_until_unix_ms.min(accepted_expiry_unix_ms(&state)?);
+            }
+        }
+        anyhow::ensure!(
+            live_until_unix_ms > now_unix_ms,
+            "announcement effective lifetime is already expired"
+        );
+
+        let replacement = AnnouncedEndpoint {
+            socket_kind: sock_kind.clone(),
+            endpoint: endpoint.clone(),
+            service_jwt: service_jwt.clone(),
+            service_did: data.service_did.clone(),
+            capabilities: data.capabilities.iter().cloned().collect(),
+            accepted_state_digest: data.accepted_state_digest.clone(),
+            accepted_state_epoch: data.accepted_state_epoch,
+            response_key_id: data.response_key_id.clone(),
+            request_kem_key_id: data.request_kem_key_id.clone(),
+            request_kem_recipient: data.request_kem_recipient.clone(),
+            expires_at_unix_ms,
+            source_signer: ctx.cnf,
+            live_until_unix_ms,
+        };
+        self.state_store
+            .put_announcement(&svc_name, replacement)
+            .await?;
+
+        Ok(DiscoveryResponseVariant::AnnounceResult)
+    }
+
     /// Populate this replica's verified placement projection for an admitted
     /// shared live node. Failed/absent repos use the existing bounded retry gate.
     async fn ensure_placement_ingested(&self, node: &Did) {
@@ -1042,7 +1265,7 @@ impl DiscoveryService {
                 crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
                     &authority.store_path,
                     identity,
-                )?,
+                )?.with_network_bootstrap(authority.network_required),
             ),
             #[cfg(test)]
             ProcessAcceptanceIdentity::Test(identity) => Arc::new(
@@ -1055,6 +1278,8 @@ impl DiscoveryService {
         PROCESS_ACCEPTED_STATE_SOURCE
             .set(Arc::clone(&source))
             .map_err(|_| anyhow::anyhow!("process Discovery authority is already consumed"))?;
+        PROCESS_NATIVE_NETWORK_REQUIRED.set(authority.network_required)
+            .map_err(|_| anyhow::anyhow!("process native profile is already installed"))?;
         if let Some(identity) = deployment_identity {
             PROCESS_REGISTRY_VERIFIER.set(identity).map_err(|_| {
                 anyhow::anyhow!("deployment registry verifier is already installed")
@@ -1132,6 +1357,48 @@ fn accepted_expiry_unix_ms(
         .timestamp_millis())
 }
 
+/// Fixed bootstrap roles use only checkpoint-authenticated capsule contents.
+/// Carrier addresses and caller-provided public keys never mint authority.
+pub(super) fn project_bootstrap_endpoint(
+    states: &[hyprstream_pds::at9p_duplicity::AcceptedAt9pState],
+    service_name: &str,
+    key: &VerifyingKey,
+) -> Result<AnnouncedEndpoint> {
+    anyhow::ensure!(matches!(service_name, "discovery" | "policy"), "not a fixed bootstrap role");
+    let service_id = format!("#{service_name}");
+    let mut matching = states.iter().filter(|state| {
+        state.current.services.iter().any(|entry| entry.id == service_id)
+            && state.current.subject_keys.iter().any(|subject| subject.ed25519_pub == key.as_bytes())
+    });
+    let state = matching.next().ok_or_else(|| anyhow::anyhow!("no accepted bootstrap identity for {service_name}"))?;
+    anyhow::ensure!(matching.next().is_none(), "ambiguous accepted bootstrap identity for {service_name}");
+    let expiry = accepted_expiry_unix_ms(state)?;
+    anyhow::ensure!(state.epoch > 0 && expiry > unix_millis_now(), "bootstrap identity is unbounded or expired");
+    let entry = state.current.services.iter().find(|entry| entry.id == service_id)
+        .ok_or_else(|| anyhow::anyhow!("bootstrap service disappeared"))?;
+    anyhow::ensure!(entry.endpoint.transport == hyprstream_pds::at9p::Transport::Iroh,
+        "bootstrap service requires signed Iroh reach");
+    parse_announced_iroh(&entry.endpoint.address)?;
+    let kem = entry.endpoint.request_kem.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("bootstrap service lacks signed request KEM; reprovision service identity"))?;
+    let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(kem)?;
+    recipient.validate()?;
+    anyhow::ensure!(recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        "bootstrap requires hybrid KEM");
+    let subject_key = state.current.subject_keys.iter().find(|subject| subject.ed25519_pub == key.as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("bootstrap response key disappeared"))?;
+    hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&subject_key.mldsa65_pub)?;
+    Ok(AnnouncedEndpoint {
+        socket_kind: "iroh".to_owned(), endpoint: entry.endpoint.address.clone(),
+        service_jwt: String::new(), service_did: Did::from(state.did.clone()),
+        capabilities: ["hyprstream-rpc/1".to_owned()].into_iter().collect(),
+        accepted_state_digest: state.head_digest.to_vec(), accepted_state_epoch: state.epoch,
+        response_key_id: format!("{}#response", state.did),
+        request_kem_key_id: format!("{}#mesh-kem", state.did), request_kem_recipient: kem.clone(),
+        expires_at_unix_ms: expiry, source_signer: key.to_bytes(), live_until_unix_ms: expiry,
+    })
+}
+
 impl DiscoveryServiceResolver {
     #[cfg(test)]
     async fn resolve_service(&self, query: ServiceQuery) -> Result<ResolvedService> {
@@ -1148,7 +1415,12 @@ impl DiscoveryServiceResolver {
     }
 
     async fn acquire_candidates(&self, query: &ServiceQuery) -> Result<Vec<ServiceCandidate>> {
-        let entries = if let Some(client) = &self.discovery_client {
+        let bootstrap = if query.profile == ResolverProfile::NativeIrohRequired {
+            self.accepted_state_source.bootstrap_endpoints(&query.service_name)?
+        } else { None };
+        let entries = if let Some(entries) = bootstrap {
+            entries
+        } else if let Some(client) = &self.discovery_client {
             client
                 .get_endpoints(&query.service_name)
                 .await?
@@ -1485,6 +1757,14 @@ static PRODUCTION_RESOLVER: std::sync::OnceLock<Arc<DiscoveryServiceResolver>> =
     std::sync::OnceLock::new();
 static PROCESS_REGISTRY_VERIFIER: std::sync::OnceLock<RegistryDeploymentVerifier> =
     std::sync::OnceLock::new();
+static PROCESS_NATIVE_NETWORK_REQUIRED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+#[cfg(not(target_arch = "wasm32"))]
+static PROCESS_BOOTSTRAP_CARRIER: std::sync::OnceLock<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate> = std::sync::OnceLock::new();
+
+/// Transport profile selected by authenticated process bootstrap.
+pub fn native_network_required() -> bool {
+    PROCESS_NATIVE_NETWORK_REQUIRED.get().copied().unwrap_or(false)
+}
 
 const DEPLOYMENT_CA_ROOT_PATH: &str = "/etc/hyprstream/trust/deployment-ca.hybrid";
 const DEPLOYMENT_AUTHORITY_LOG_PATH: &str = "/etc/hyprstream/trust/deployment-authority.log.json";
@@ -1665,6 +1945,17 @@ pub fn deployment_registry_verifier() -> Result<RegistryDeploymentVerifier> {
         .get()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("deployment registry verifier is not installed"))
+}
+
+/// Authenticate the fixed, OS-owned deployment artifacts for an offline
+/// registry provisioning operation using the same role-specific trusted-file
+/// loader as startup. Returns verification-only evidence, not a raw-key
+/// authority constructor, and does not install a process resolver.
+pub fn authenticate_local_deployment_registry() -> Result<RegistryDeploymentVerifier> {
+    authenticate_registry_deployment_credentials(
+        load_trusted_registry_deployment_credentials()?,
+    )
+    .map(|identity| identity.verifier)
 }
 
 /// Non-cloneable proof privately minted from the fixed CA/JWT pair.
@@ -2644,6 +2935,7 @@ fn authenticate_registry_deployment_credentials(
 struct ProcessBootstrapAuthority {
     store_path: std::path::PathBuf,
     acceptance_identity: ProcessAcceptanceIdentity,
+    network_required: bool,
 }
 
 enum ProcessAcceptanceIdentity {
@@ -2729,13 +3021,15 @@ pub async fn bootstrap_deployment_process(
     signing_key: SigningKey,
     trust_source: crate::DeploymentTrustSource,
     remote_node: bool,
+    network_required: bool,
 ) -> Result<()> {
     let discovery_vk = hyprstream_service::global_trust_store()
         .resolve_one("discovery")
         .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated discovery key"))?;
     let (authority, discovery_client) = match trust_source {
         crate::DeploymentTrustSource::OsOwnedFiles => {
-            let authority = authenticate_deployment_bootstrap()?;
+            let mut authority = authenticate_deployment_bootstrap()?;
+            authority.network_required = network_required;
             // Lazy local discovery client — see `install_local_discovery_client`:
             // the default discovery socket is resolved via `try_endpoint` (not
             // the eager registered_endpoint path), and `dial` connects on first use,
@@ -2743,10 +3037,50 @@ pub async fn bootstrap_deployment_process(
             // process. Trust is not weakened — the checkpoint was already
             // verified by `authenticate_deployment_bootstrap()`, and
             // `discovery_vk` authenticates every lazy response.
-            let discovery_client = install_local_discovery_client(signing_key, discovery_vk)?;
+            let discovery_client = if network_required {
+                #[cfg(not(test))]
+                let ProcessAcceptanceIdentity::Deployment(verifier) = &authority.acceptance_identity;
+                #[cfg(test)]
+                let verifier = match &authority.acceptance_identity {
+                    ProcessAcceptanceIdentity::Deployment(verifier) => verifier,
+                    #[cfg(test)]
+                    ProcessAcceptanceIdentity::Test(_) => anyhow::bail!("native bootstrap requires deployment authority"),
+                };
+                let source = Arc::new(crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
+                    &authority.store_path, verifier.clone(),
+                )?.with_network_bootstrap(true));
+                // Authenticate the fixed bootstrap roles now, but defer I/O:
+                // Discovery and Policy have not necessarily bound yet.
+                source.bootstrap_endpoints("discovery")?;
+                source.bootstrap_endpoints("policy")?;
+                // CLI callers also need an outbound carrier, before any service
+                // binds. Keep this distinct from the service's inbound address.
+                use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, RefuseHandler};
+                let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
+                    &signing_key, "hyprstream-bootstrap-client-transport-v1",
+                );
+                let carrier = IrohSubstrate::new(transport_key.to_bytes(),
+                    RefuseHandler::new("outbound bootstrap only"),
+                    RefuseHandler::new("outbound bootstrap only"),
+                ).await?;
+                let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(carrier.owned_client_endpoint());
+                PROCESS_BOOTSTRAP_CARRIER.set(carrier)
+                    .map_err(|_| anyhow::anyhow!("bootstrap carrier already installed"))?;
+                let resolver = Arc::new(DiscoveryServiceResolver {
+                    state_store: MemoryStateStore::production_default(),
+                    accepted_state_source: source,
+                    discovery_client: None,
+                });
+                crate::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
+                    "discovery", "discovery", None, signing_key, None, resolver,
+                )?))
+            } else {
+                install_local_discovery_client(signing_key, discovery_vk)?
+            };
             (authority, discovery_client)
         }
         crate::DeploymentTrustSource::DidAnchored(anchors) => {
+            anyhow::ensure!(!network_required, "required native bootstrap needs provisioned OS-owned accepted service state");
             let (authority, discovery_transport, mesh_kem_recipient, ml_dsa_65_keys) =
                 authenticate_did_anchored_bootstrap(&anchors).await?;
             let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
@@ -2832,13 +3166,12 @@ fn seal_process_bootstrap_authority() -> Result<()> {
 #[cfg(not(target_arch = "wasm32"))]
 fn authenticate_deployment_bootstrap() -> Result<ProcessBootstrapAuthority> {
     seal_process_bootstrap_authority()?;
-    let witness = authenticate_registry_deployment_credentials(
-        load_trusted_registry_deployment_credentials()?,
-    )?;
+    let verifier = authenticate_local_deployment_registry()?;
     let store_path = hyprstream_service::deployment_data_dir()?.join("pds-store");
     Ok(ProcessBootstrapAuthority {
         store_path,
-        acceptance_identity: ProcessAcceptanceIdentity::Deployment(witness.verifier),
+        acceptance_identity: ProcessAcceptanceIdentity::Deployment(verifier),
+        network_required: false,
     })
 }
 
@@ -2861,6 +3194,7 @@ async fn authenticate_did_anchored_bootstrap(
     let authority = ProcessBootstrapAuthority {
         store_path: hyprstream_service::deployment_data_dir()?.join("pds-store"),
         acceptance_identity: ProcessAcceptanceIdentity::Deployment(verifier),
+        network_required: false,
     };
     Ok((
         authority,
@@ -2916,6 +3250,7 @@ fn authenticate_discovery_bootstrap_identity(
     Ok(ProcessBootstrapAuthority {
         store_path: hyprstream_service::deployment_data_dir()?.join("pds-store"),
         acceptance_identity: ProcessAcceptanceIdentity::Test(acceptance_identity),
+        network_required: false,
     })
 }
 
@@ -3021,6 +3356,11 @@ struct ProductionRpcClient {
     request_id: std::sync::atomic::AtomicU64,
 }
 
+fn production_service_query(service_name: &str, required: bool) -> Result<ServiceQuery> {
+    ServiceQuery::new(service_name, ["hyprstream-rpc/1".to_owned()],
+        if required { ResolverProfile::NativeIrohRequired } else { ResolverProfile::NetworkDiscovery }, 3)
+}
+
 impl ProductionRpcClient {
     fn new(
         resolution_service_name: &str,
@@ -3053,7 +3393,7 @@ impl ProductionRpcClient {
         })
     }
     async fn snapshots(&self) -> Result<Vec<ResolvedService>> {
-        let query = ServiceQuery::network(self.resolution_service_name.clone())?;
+        let query = production_service_query(&self.resolution_service_name, native_network_required())?;
         let max_attempts = query.max_attempts;
         let mut snapshots = self.resolver.resolve_service_candidates(query).await?;
         let authority = snapshots
@@ -4287,7 +4627,7 @@ mod resolver_tests {
             .next()
             .expect("authentication body");
         assert!(authentication.contains("hyprstream_service::deployment_data_dir()"));
-        assert!(authentication.contains("load_trusted_registry_deployment_credentials()"));
+        assert!(authentication.contains("authenticate_local_deployment_registry()"));
         assert!(authentication.contains("authenticate_registry_deployment_credentials("));
         assert!(!authentication.contains("global_trust_store()"));
         assert!(!authentication.contains("resolve_one("));
@@ -4497,6 +4837,21 @@ mod resolver_tests {
             .ensure_current(&resolved)
             .await
             .unwrap_or_else(|e| panic!("unchanged accepted state rejected: {e}"));
+    }
+
+    #[tokio::test]
+    async fn production_profile_preserves_compatibility_quic_without_local_fallback() {
+        let (resolver, _) = production_fixture(false);
+        assert!(resolver.resolve_service(production_service_query("model", false).expect("query")).await.is_ok());
+        assert!(resolver.resolve_service(production_service_query("model", true).expect("query")).await.is_err());
+        let (resolver, _) = native_production_fixture(false);
+        for required in [false, true] {
+            assert!(resolver.resolve_service(production_service_query("model", required).expect("query")).await.is_ok());
+        }
+        let (resolver, _) = production_fixture(true);
+        for required in [false, true] {
+            assert!(resolver.resolve_service(production_service_query("model", required).expect("query")).await.is_err());
+        }
     }
 
     fn owned_browser_request() -> BrowserProvisioningRequest {
@@ -6070,181 +6425,7 @@ impl DiscoveryHandler for DiscoveryService {
         _request_id: u64,
         data: &ServiceAnnouncement,
     ) -> Result<DiscoveryResponseVariant> {
-        info!(
-            "Discovery: service '{}' announced {} endpoint: {} (from {})",
-            data.service_name,
-            data.socket_kind,
-            data.endpoint,
-            ctx.subject()
-        );
-
-        let svc_name = data.service_name.clone();
-        let sock_kind = data.socket_kind.clone();
-        let endpoint = data.endpoint.clone();
-        let service_jwt = data.service_jwt.clone().unwrap_or_default();
-        let identity_bound = !data.service_did.as_str().is_empty()
-            || !data.accepted_state_digest.is_empty()
-            || !data.request_kem_recipient.is_empty();
-        if identity_bound {
-            anyhow::ensure!(
-                !service_jwt.is_empty(),
-                "identity-bound announcement requires a verified service JWT"
-            );
-            anyhow::ensure!(
-                data.service_did.is_did_at9p()
-                    && data.accepted_state_digest.len() == 64
-                    && !data.capabilities.is_empty()
-                    && data
-                        .response_key_id
-                        .starts_with(&format!("{}#", data.service_did))
-                    && data
-                        .request_kem_key_id
-                        .starts_with(&format!("{}#", data.service_did))
-                    && data.expires_at_unix_ms > unix_millis_now(),
-                "identity-bound announcement metadata is incomplete or expired"
-            );
-            let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(
-                &data.request_kem_recipient,
-            )?;
-            anyhow::ensure!(
-                recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
-                    && recipient.eks.len() == recipient.suite_id.components().len(),
-                "identity-bound announcement requires suite-complete hybrid KEM material"
-            );
-            match data.socket_kind.as_str() {
-                "quic" => {
-                    parse_announced_quic(&data.endpoint)?;
-                }
-                "iroh" => {
-                    parse_announced_iroh(&data.endpoint)?;
-                }
-                _ => {
-                    anyhow::bail!("identity-bound network announcement requires QUIC or Iroh reach")
-                }
-            }
-        }
-
-        // R3: Verify service JWT signature + subject matches serviceName.
-        // Full JWT verification (not decode_unverified) to prevent forged identities.
-        if !service_jwt.is_empty() {
-            // Service JWTs are minted hybrid (ML-DSA-65-Ed25519); the composite
-            // kid resolves through the key source (ledger pairs + the CA
-            // composite pair). Classical EdDSA remains accepted here for
-            // tokens minted before the hybrid cutover.
-            let is_composite = hyprstream_rpc::auth::jwt::header_alg(&service_jwt)
-                .ok()
-                .flatten()
-                .is_some_and(|alg| alg == "ML-DSA-65-Ed25519");
-            let verified = if is_composite {
-                let dispatch =
-                    hyprstream_rpc::auth::jwt::parse_composite_dispatch(&service_jwt, &["wit+jwt"])
-                        .map_err(|e| {
-                            tracing::warn!("Service JWT dispatch failed in announce: {}", e);
-                            anyhow::anyhow!("Invalid service JWT in announce: {}", e)
-                        })?;
-                let pair = self
-                    .jwt_key_source
-                    .as_ref()
-                    .and_then(|ks| ks.composite_pair(dispatch.kid()))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Invalid service JWT in announce: unknown composite kid")
-                    })?;
-                // Signing-domain separation: announcements assert a service
-                // identity, which is certified by the Policy/CA domain only —
-                // the ledger's Policy slot and the derived CA pair (registered
-                // under the Policy role). The OAuth-role pair signs browser
-                // and workload WITs and must not be able to certify a service
-                // announcement.
-                anyhow::ensure!(
-                    pair.role() == hyprstream_rpc::auth::CompositePairRole::Policy,
-                    "Invalid service JWT in announce: composite pair role is not authorized \
-                     for service certification"
-                );
-                hyprstream_rpc::auth::jwt::decode_composite(
-                    &service_jwt,
-                    pair.ml_dsa(),
-                    pair.ed25519(),
-                    self.expected_audience.as_deref(),
-                    &dispatch,
-                )
-                .map_err(|e| {
-                    tracing::warn!("Service JWT verification failed in announce: {}", e);
-                    anyhow::anyhow!("Invalid service JWT in announce: {}", e)
-                })?
-            } else {
-                hyprstream_rpc::auth::jwt::decode_with_key(
-                    &service_jwt,
-                    &self.jwt_verifying_key,
-                    self.expected_audience.as_deref(),
-                )
-                .map_err(|e| {
-                    tracing::warn!("Service JWT verification failed in announce: {}", e);
-                    anyhow::anyhow!("Invalid service JWT in announce: {}", e)
-                })?
-            };
-            // Check that sub matches "service:{serviceName}"
-            let expected_sub = format!("service:{}", svc_name);
-            if verified.sub != expected_sub {
-                anyhow::bail!(
-                    "Service JWT subject mismatch: expected '{}', got '{}'",
-                    expected_sub,
-                    verified.sub
-                );
-            }
-            anyhow::ensure!(
-                verified.cnf_key_bytes() == Some(ctx.cnf),
-                "service JWT confirmation key does not match verified announcement signer"
-            );
-        }
-
-        let now_unix_ms = unix_millis_now();
-        let heartbeat_expiry = now_unix_ms.saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64);
-        // Legacy clients omit identity expiry (Cap'n Proto defaults it to 0).
-        // Only identity-bound announcements carry a signed expiry constraint.
-        let expires_at_unix_ms = if identity_bound {
-            data.expires_at_unix_ms
-        } else {
-            heartbeat_expiry
-        };
-        let mut live_until_unix_ms = expires_at_unix_ms.min(heartbeat_expiry);
-        if identity_bound {
-            if let Some(source) = &self.accepted_state_source {
-                let state = source
-                    .accepted_state(data.service_did.as_str())?
-                    .ok_or_else(|| anyhow::anyhow!("announcement DID has no accepted-current state"))?;
-                anyhow::ensure!(
-                    state.epoch == data.accepted_state_epoch
-                        && state.head_digest.as_slice() == data.accepted_state_digest.as_slice(),
-                    "announcement does not match accepted-current state"
-                );
-                live_until_unix_ms = live_until_unix_ms.min(accepted_expiry_unix_ms(&state)?);
-            }
-        }
-        anyhow::ensure!(
-            live_until_unix_ms > now_unix_ms,
-            "announcement effective lifetime is already expired"
-        );
-
-        let replacement = AnnouncedEndpoint {
-            socket_kind: sock_kind.clone(),
-            endpoint: endpoint.clone(),
-            service_jwt: service_jwt.clone(),
-            service_did: data.service_did.clone(),
-            capabilities: data.capabilities.iter().cloned().collect(),
-            accepted_state_digest: data.accepted_state_digest.clone(),
-            accepted_state_epoch: data.accepted_state_epoch,
-            response_key_id: data.response_key_id.clone(),
-            request_kem_key_id: data.request_kem_key_id.clone(),
-            request_kem_recipient: data.request_kem_recipient.clone(),
-            expires_at_unix_ms,
-            source_signer: ctx.cnf,
-            live_until_unix_ms,
-        };
-        self.state_store
-            .put_announcement(&svc_name, replacement)
-            .await?;
-
-        Ok(DiscoveryResponseVariant::AnnounceResult)
+        self.store_announcement(ctx, data).await
     }
 
     // ────────────────────────────────────────────────────────────────────

@@ -28,7 +28,10 @@ use std::process::Command;
 /// Create a PolicyClient for RPC calls.
 ///
 /// Bootstrap: PolicyService key needed to create the PolicyClient for peer key resolution.
-fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
+pub(crate) fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
+    if hyprstream_discovery::native_network_required() {
+        return PolicyClient::from_resolver(signing_key.clone(), None);
+    }
     PolicyClient::for_local_bootstrap(
         signing_key.clone(),
         // Bootstrap: PolicyService uses the root key
