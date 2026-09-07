@@ -636,7 +636,7 @@ mod tests {
             .filter(|identifier| *identifier != "with_no_client_auth")
             .collect::<Vec<_>>()
             .join(" ");
-        for needle in ["client_auth", "ClientCert", "client_ca"] {
+        for needle in ["client_auth", "client_cert", "ClientCert", "client_ca"] {
             assert!(
                 !src.contains(needle),
                 "server/tls.rs now references `{needle}`: mTLS client-cert verification is being \
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "mTLS client-cert verification")]
     fn mtls_guard_rejects_client_verifier() {
-        assert_no_mtls_verifier("builder.with_client_cert_verifier(ClientCertVerifier)");
+        assert_no_mtls_verifier("builder.with_client_cert_verifier(verifier)");
     }
 
     #[test]
