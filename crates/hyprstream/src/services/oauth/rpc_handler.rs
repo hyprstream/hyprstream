@@ -279,12 +279,22 @@ impl OauthHandler for OAuthRpcHandler {
 
 #[async_trait(?Send)]
 impl RequestService for OAuthRpcHandler {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        // The ONE bounded decode (v16 §5.2): the generated decoder derives
+        // the full method leaf and returns the decoded message that policy,
+        // MAC, and dispatch below all consume.
+        crate::services::generated::oauth_client::decode_oauth_request_body(signed_body)
+    }
+
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
-        dispatch_oauth(self, ctx, payload).await
+        dispatch_oauth(self, ctx, body).await
     }
 
     fn name(&self) -> &str {

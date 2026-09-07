@@ -512,11 +512,17 @@ mod tests {
         async fn handle_request(
             &self,
             _ctx: &crate::service::EnvelopeContext,
-            payload: &[u8],
+            body: &crate::service::DecodedRequestBody,
         ) -> Result<(Vec<u8>, Option<crate::service::Continuation>)> {
             let mut out = vec![0xBE];
-            out.extend_from_slice(payload);
+            out.extend_from_slice(body.bytes());
             Ok((out, None))
+        }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> Result<crate::service::DecodedRequestBody> {
+            Ok(crate::service::DecodedRequestBody::opaque(signed_body.to_vec()))
         }
         fn name(&self) -> &str {
             &self.name
