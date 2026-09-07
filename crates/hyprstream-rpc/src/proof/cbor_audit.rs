@@ -18,11 +18,17 @@
 
 use anyhow::{bail, Result};
 
+// Keep raw-audit recursion aligned with the bounded Cap'n Proto decoders used
+// by the proof path. The audit runs before ciborium builds its value tree, so
+// this bound rejects deeply nested attacker input before either decoder can
+// consume unbounded stack.
+const MAX_CBOR_AUDIT_DEPTH: usize = 64;
+
 /// Audit a complete CBOR byte string for deterministic-encoding compliance.
 /// Rejects trailing data.
 pub fn audit_deterministic(bytes: &[u8]) -> Result<()> {
     let mut pos = 0;
-    let consumed = audit_one(bytes, &mut pos)?;
+    let consumed = audit_one(bytes, &mut pos, 0)?;
     if consumed != bytes.len() {
         bail!(
             "deterministic CBOR: trailing data: consumed {consumed} of {} bytes",
@@ -33,7 +39,11 @@ pub fn audit_deterministic(bytes: &[u8]) -> Result<()> {
 }
 
 /// Audit one CBOR data item starting at `*pos`. Returns the end position.
-fn audit_one(bytes: &[u8], pos: &mut usize) -> Result<usize> {
+fn audit_one(bytes: &[u8], pos: &mut usize, depth: usize) -> Result<usize> {
+    if depth > MAX_CBOR_AUDIT_DEPTH {
+        bail!("deterministic CBOR: nesting exceeds depth {MAX_CBOR_AUDIT_DEPTH}");
+    }
+
     let start = *pos;
     if *pos >= bytes.len() {
         bail!("deterministic CBOR: unexpected end of input");
@@ -87,30 +97,36 @@ fn audit_one(bytes: &[u8], pos: &mut usize) -> Result<usize> {
         }
         2 | 3 => {
             // Byte string / text string.
-            let len = read_arg(bytes, pos, info, initial)? as usize;
-            if *pos + len > bytes.len() {
+            let len = read_usize_arg(bytes, pos, info, initial, "string length")?;
+            let end = pos.checked_add(len).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "deterministic CBOR: {} string length {len} overflows input position at byte {start}",
+                    if major == 2 { "byte" } else { "text" }
+                )
+            })?;
+            if end > bytes.len() {
                 bail!(
                     "deterministic CBOR: {} string length {len} exceeds remaining input at byte {start}",
                     if major == 2 { "byte" } else { "text" }
                 );
             }
-            *pos += len;
+            *pos = end;
         }
         4 => {
             // Array.
-            let count = read_arg(bytes, pos, info, initial)? as usize;
+            let count = read_usize_arg(bytes, pos, info, initial, "array length")?;
             for _ in 0..count {
-                audit_one(bytes, pos)?;
+                audit_one(bytes, pos, depth + 1)?;
             }
         }
         5 => {
             // Map.
-            let count = read_arg(bytes, pos, info, initial)? as usize;
+            let count = read_usize_arg(bytes, pos, info, initial, "map length")?;
             let mut prev_key: Option<Vec<u8>> = None;
             for _ in 0..count {
                 // Record the key bytes for canonical ordering check.
                 let key_start = *pos;
-                audit_one(bytes, pos)?;
+                audit_one(bytes, pos, depth + 1)?;
                 let key_bytes = bytes[key_start..*pos].to_vec();
 
                 // Check canonical key ordering.
@@ -125,7 +141,7 @@ fn audit_one(bytes: &[u8], pos: &mut usize) -> Result<usize> {
                 prev_key = Some(key_bytes);
 
                 // Audit the value.
-                audit_one(bytes, pos)?;
+                audit_one(bytes, pos, depth + 1)?;
             }
         }
         7 => {
@@ -157,6 +173,26 @@ fn audit_one(bytes: &[u8], pos: &mut usize) -> Result<usize> {
     }
 
     Ok(*pos)
+}
+
+/// Read a CBOR argument that is used as an in-memory length or item count.
+///
+/// CBOR arguments are `u64`, while slices and loop bounds use `usize`.
+/// Refuse values that cannot be represented on this platform rather than
+/// truncating them before checking the remaining input.
+fn read_usize_arg(
+    bytes: &[u8],
+    pos: &mut usize,
+    info: u8,
+    initial: u8,
+    description: &str,
+) -> Result<usize> {
+    let value = read_arg(bytes, pos, info, initial)?;
+    usize::try_from(value).map_err(|_| {
+        anyhow::anyhow!(
+            "deterministic CBOR: {description} {value} does not fit this platform's address space"
+        )
+    })
 }
 
 /// Read the argument value for a CBOR head byte.
@@ -247,4 +283,39 @@ fn check_int_minimal(info: u8, arg: u64, start: usize, _bytes: &[u8]) -> Result<
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{audit_deterministic, MAX_CBOR_AUDIT_DEPTH};
+
+    fn nested_arrays(depth: usize) -> Vec<u8> {
+        let mut bytes = vec![0x81; depth];
+        bytes.push(0x00);
+        bytes
+    }
+
+    #[test]
+    fn cbor_audit_enforces_a_bounded_nesting_depth() {
+        // The configured boundary remains valid for legitimate deeply nested
+        // CBOR, while one more container is rejected before ciborium runs.
+        assert!(audit_deterministic(&nested_arrays(MAX_CBOR_AUDIT_DEPTH)).is_ok());
+
+        assert!(audit_deterministic(&nested_arrays(MAX_CBOR_AUDIT_DEPTH + 1)).is_err());
+    }
+
+    #[test]
+    fn cbor_audit_rejects_unrepresentable_string_lengths() {
+        // Small definite strings remain valid controls.
+        assert!(audit_deterministic(&[0x42, 0xaa, 0xbb]).is_ok());
+        assert!(audit_deterministic(&[0x62, b'o', b'k']).is_ok());
+
+        // A declared u64::MAX length must fail without wrapping either the
+        // usize conversion (on narrower targets) or the input-position add.
+        for initial in [0x5b, 0x7b] {
+            let mut malformed = vec![initial];
+            malformed.extend_from_slice(&u64::MAX.to_be_bytes());
+            assert!(audit_deterministic(&malformed).is_err());
+        }
+    }
 }
