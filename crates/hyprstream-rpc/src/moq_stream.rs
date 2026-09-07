@@ -1537,18 +1537,20 @@ pub async fn connect_moq_reach_with_server_identity(
             continue;
         };
         had_dialable_network_reach = true;
-        // A relay is an independently operated server.  It may never borrow
-        // the producer witness attached to the enclosing StreamInfo; only a
-        // direct destination retains that narrowly-scoped legacy fallback.
-        let expected_server = match destination_server_identity(dest, server_identity) {
-            Ok(identity) => identity,
-            Err(error) => {
-                last_err = Some(error.to_string());
-                continue;
-            }
-        };
         let dial = match (&cfg.endpoint, global_moq_admission_proof()) {
             (crate::transport::EndpointType::Iroh { .. }, Some(proof)) => {
+                // A relay is an independently operated Iroh server. It may
+                // never borrow the producer witness attached to the enclosing
+                // StreamInfo; only a direct destination retains that narrowly
+                // scoped legacy fallback. QUIC authenticates its own pinned
+                // transport path and does not require a MoQL witness.
+                let expected_server = match destination_server_identity(dest, server_identity) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        last_err = Some(error.to_string());
+                        continue;
+                    }
+                };
                 match expected_server {
                     None => Err(anyhow!(
                         "iroh moql reach lacks a live resolver-verified server witness"
@@ -3131,12 +3133,20 @@ mod tests {
     }
 
     /// A live enclosing producer witness authenticates only a direct legacy
-    /// destination.  An independently operated relay with no own witness is
-    /// rejected before any carrier dial is attempted.
+    /// Iroh destination. An independently operated Iroh relay with no own
+    /// witness is rejected before its authenticated carrier dial.
     #[test]
     fn relay_without_witness_cannot_borrow_live_producer_authority() {
         let producer = accepted_server_identity("did:at9p:producer", 0x11);
-        let relay = relay_quic("127.0.0.1:4433");
+        let relay = Destination {
+            role: Role::Relay,
+            transport: ReachTransport::Iroh(IrohReach {
+                node_id: [0x22; 32],
+                alpn: "moql".to_owned(),
+                relay_url: String::new(),
+            }),
+            moql_server_identity: Default::default(),
+        };
         let error = destination_server_identity(&relay, &producer)
             .expect_err("relay without its own resolver witness must reject");
         assert!(error.to_string().contains("relay witness"));

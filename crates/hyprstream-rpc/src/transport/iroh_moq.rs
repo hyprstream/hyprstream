@@ -38,7 +38,9 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use web_transport_iroh::Session;
 
-use crate::moq_authz::{PeerIdentity, SharedSubscribeAuthorizer, SubscribeDecision, tenant_prefix};
+use crate::moq_authz::{
+    PeerIdentity, SharedSubscribeAuthorizer, SubscribeDecision, tenant_prefix,
+};
 use crate::transport::moql_admission::MoqlAdmissionAuthenticator;
 
 /// Resolves the tenant for an independently authenticated application peer.
@@ -47,6 +49,26 @@ use crate::transport::moql_admission::MoqlAdmissionAuthenticator;
 /// [`MoqlAdmissionAuthenticator`] installed, the resolver runs inside the
 /// admission exchange over the *verified* subject.
 pub type PeerTenantResolver = Arc<dyn Fn(&PeerIdentity) -> Option<String> + Send + Sync>;
+
+/// Trusted decision for granting an admitted peer ingress into a tenant's
+/// shared origin. Admission proves the peer identity and tenant only; it does
+/// not imply that the peer may publish. The default is therefore deny.
+pub trait IngressAuthorizer: Send + Sync {
+    /// Whether this already-admitted `peer` may publish to the supplied tenant.
+    fn authorize_ingress(&self, peer: &PeerIdentity, tenant: &str) -> bool;
+}
+
+impl<F> IngressAuthorizer for F
+where
+    F: Fn(&PeerIdentity, &str) -> bool + Send + Sync,
+{
+    fn authorize_ingress(&self, peer: &PeerIdentity, tenant: &str) -> bool {
+        self(peer, tenant)
+    }
+}
+
+/// Shareable ingress authorization hook supplied by the owning service policy.
+pub type SharedIngressAuthorizer = Arc<dyn IngressAuthorizer>;
 
 /// #276 authorization config for a moq accept path: an optional subscribe
 /// authorizer and an optional peer→tenant resolver for per-tenant announce
@@ -64,6 +86,9 @@ pub struct MoqAuthzConfig {
     pub authorizer: Option<SharedSubscribeAuthorizer>,
     /// Maps a peer identity to its tenant for per-tenant announce scoping.
     pub tenant_resolver: Option<PeerTenantResolver>,
+    /// Explicit trusted producer/relay decision. Its absence is a deliberate
+    /// deny: an admitted peer is a read-only subscriber, never a publisher.
+    pub ingress_authorizer: Option<SharedIngressAuthorizer>,
     /// #1027 inside-carrier admission authenticator. When set, every accepted
     /// `moql` connection must prove an accepted current Ed25519 + ML-DSA-65
     /// identity before the moq handshake; the carrier NodeId alone is refused.
@@ -80,6 +105,22 @@ impl MoqAuthzConfig {
     pub fn with_authorizer(mut self, authorizer: SharedSubscribeAuthorizer) -> Self {
         self.authorizer = Some(authorizer);
         self
+    }
+
+    /// Install the service-owned trusted ingress decision. This hook is kept
+    /// separate from tenant admission: a subject→tenant row is not a producer
+    /// role grant.
+    pub fn with_ingress_authorizer(mut self, authorizer: SharedIngressAuthorizer) -> Self {
+        self.ingress_authorizer = Some(authorizer);
+        self
+    }
+
+    /// Whether the admitted peer has an explicit trusted ingress grant.
+    /// Missing configuration fails closed to read-only delivery.
+    pub fn authorizes_ingress(&self, peer: &PeerIdentity, tenant: &str) -> bool {
+        self.ingress_authorizer
+            .as_ref()
+            .is_some_and(|authorizer| authorizer.authorize_ingress(peer, tenant))
     }
 
     /// Install the #1027 inside-carrier admission authenticator. The
@@ -363,24 +404,38 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
             }
         };
 
-        // A relay must receive an Origin, not merely a consumer: otherwise a
-        // producer's `with_origin` announcements are dropped at this Iroh hop.
-        // Scope the writable origin to the admission-derived tenant first, so
-        // bidirectional ingestion cannot cross tenant boundaries.
+        // An admitted session is a tenant-scoped *subscriber* by default.
+        // Admission proves identity and tenant; it is not a producer/relay
+        // capability. Only a separate service-owned ingress decision may hand
+        // the peer a scoped writable origin. This keeps an ordinary subscriber
+        // from colliding with a producer's broadcast names.
         let prefix = match self.inner.origin_scope_suffix {
             Some(suffix) => format!("{}/{suffix}", tenant_prefix(&tenant).trim_end_matches('/')),
             None => tenant_prefix(&tenant),
         };
-        let path = moq_net::Path::new(&prefix);
-        let Some(scoped_origin) = self.inner.origin.producer.scope(&[path]) else {
-            tracing::debug!(%tenant, "iroh-moq: tenant has no visible relay scope");
-            return Ok(());
-        };
+        let server = if self.inner.authz.authorizes_ingress(&peer, &tenant) {
+            let path = moq_net::Path::new(&prefix);
+            let Some(scoped_origin) = self.inner.origin.producer.scope(&[path]) else {
+                tracing::debug!(%tenant, "iroh-moq: tenant has no visible relay scope");
+                return Ok(());
+            };
+            tracing::debug!(
+                subject = %peer.subject.as_deref().unwrap_or("?"),
+                %tenant,
+                "iroh-moq: admitting explicitly authorized ingress"
+            );
+            Server::new().with_origin(scoped_origin)
+        } else {
+            let path = moq_net::Path::new(&prefix);
+            let Some(scoped_consumer) = self.inner.origin.consumer().scope(&[path]) else {
+                tracing::debug!(%tenant, "iroh-moq: tenant has no visible subscriber scope");
+                return Ok(());
+            };
+            Server::new().with_publish(scoped_consumer)
+        }
+        .with_stats(self.inner.stats.clone());
         let session_conn = conn.clone();
         let session = Session::raw(conn);
-        let server = Server::new()
-            .with_origin(scoped_origin)
-            .with_stats(self.inner.stats.clone());
         let moq_session = server
             .accept(session)
             .await
@@ -475,6 +530,7 @@ mod tests {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Some("alice".to_owned())
             })),
+            ingress_authorizer: None,
             admission: None,
         };
         let handler = IrohMoqProtocolHandler::new().with_authz(authz);
@@ -555,18 +611,24 @@ mod tests {
         Ok(())
     }
 
-    /// A real mutually admitted Iroh Event session ingests a producer origin
-    /// and re-serves Event broadcasts on the same fixed `local/events` scope.
+    /// A real mutually admitted producer, relay, and distinct subscriber carry
+    /// a frame end-to-end. The subscriber is read-only, while trusted ingress
+    /// remains both subject- and tenant-scoped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn authenticated_iroh_event_origin_ingests_and_serves() -> anyhow::Result<()> {
+    async fn trusted_ingress_relays_to_distinct_subscriber_and_scopes_tenants()
+    -> anyhow::Result<()> {
         use crate::crypto::pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes};
         use crate::stream_info::MoqlServerIdentity;
         use crate::transport::moql_admission::{AcceptedIdentityState, AcceptedSubjectKey, MoqlAdmissionProof, MoqlServerIdentityProof, prove_moql_admission};
 
         let server_ed = SigningKey::from_bytes(&[0x71; 32]);
         let server_pq = ml_dsa_sk_from_seed(&[0x72; 32]);
-        let client_ed = SigningKey::from_bytes(&[0x73; 32]);
-        let client_pq = ml_dsa_sk_from_seed(&[0x74; 32]);
+        let producer_ed = SigningKey::from_bytes(&[0x73; 32]);
+        let producer_pq = ml_dsa_sk_from_seed(&[0x74; 32]);
+        let subscriber_ed = SigningKey::from_bytes(&[0x77; 32]);
+        let subscriber_pq = ml_dsa_sk_from_seed(&[0x78; 32]);
+        let other_ed = SigningKey::from_bytes(&[0x79; 32]);
+        let other_pq = ml_dsa_sk_from_seed(&[0x7A; 32]);
         let expiry = crate::envelope::current_timestamp() + 60_000;
         let server_identity = MoqlServerIdentity {
             did: "did:at9p:relay".to_owned(), epoch: 1, head_digest: vec![0x75; 64],
@@ -577,52 +639,118 @@ mod tests {
             epoch: 1, head_digest: [0x75; 64], expires_at_unix_ms: Some(expiry),
             subject_keys: vec![AcceptedSubjectKey { ed25519: server_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&server_pq) }],
         };
-        let client_state = AcceptedIdentityState {
+        let producer_state = AcceptedIdentityState {
             epoch: 1, head_digest: [0x76; 64], expires_at_unix_ms: Some(expiry),
-            subject_keys: vec![AcceptedSubjectKey { ed25519: client_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&client_pq) }],
+            subject_keys: vec![AcceptedSubjectKey { ed25519: producer_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&producer_pq) }],
+        };
+        let subscriber_state = AcceptedIdentityState {
+            epoch: 1, head_digest: [0x77; 64], expires_at_unix_ms: Some(expiry),
+            subject_keys: vec![AcceptedSubjectKey { ed25519: subscriber_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&subscriber_pq) }],
+        };
+        let other_state = AcceptedIdentityState {
+            epoch: 1, head_digest: [0x78; 64], expires_at_unix_ms: Some(expiry),
+            subject_keys: vec![AcceptedSubjectKey { ed25519: other_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&other_pq) }],
         };
         let authority: Arc<dyn crate::transport::moql_admission::AcceptedStateAuthority> = Arc::new(move |did: &str| match did {
             "did:at9p:relay" => Some(server_state.clone()),
-            "did:at9p:producer" => Some(client_state.clone()),
+            "did:at9p:producer" => Some(producer_state.clone()),
+            "did:at9p:subscriber" => Some(subscriber_state.clone()),
+            "did:at9p:other-producer" => Some(other_state.clone()),
             _ => None,
         });
         let admission = Arc::new(crate::transport::moql_admission::MoqlAdmissionAuthenticator::new(
             authority,
-            Arc::new(|peer| (peer.subject.as_deref() == Some("did:at9p:producer")).then(|| "local".to_owned())),
+            Arc::new(|peer| match peer.subject.as_deref() {
+                Some("did:at9p:producer") | Some("did:at9p:subscriber") => Some("alice".to_owned()),
+                Some("did:at9p:other-producer") => Some("bob".to_owned()),
+                _ => None,
+            }),
         ).with_server_identity(MoqlServerIdentityProof {
             identity: server_identity.clone(), ed25519: server_ed, ml_dsa_65: server_pq,
         }));
         let handler = IrohMoqProtocolHandler::new()
             .with_origin_scope_suffix("events")
-            .with_authz(MoqAuthzConfig::default().with_admission(admission));
+            .with_authz(
+                MoqAuthzConfig::default()
+                    .with_admission(admission)
+                    .with_ingress_authorizer(Arc::new(|peer: &PeerIdentity, tenant: &str| {
+                        matches!(peer.subject.as_deref(), Some("did:at9p:producer") | Some("did:at9p:other-producer"))
+                            && matches!(tenant, "alice" | "bob")
+                    })),
+            );
         let relay_consumer = handler.origin_consumer().clone();
-        let relay_producer = handler.origin_producer().clone();
         let relay = IrohSubstrate::new_test(fresh_key(), handler, NoopHandler::new("rpc-not-wired")).await?;
-        let client = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("client-moq"), NoopHandler::new("client-rpc")).await?;
-        let conn = client.connect(direct_addr(&relay), ALPN_MOQ_LITE).await?;
-        prove_moql_admission(&conn, &MoqlAdmissionProof {
-            did: "did:at9p:producer".to_owned(), ed25519: client_ed, ml_dsa_65: client_pq,
+        let producer = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("producer-moq"), NoopHandler::new("producer-rpc")).await?;
+        let subscriber = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("subscriber-moq"), NoopHandler::new("subscriber-rpc")).await?;
+        let other = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("other-moq"), NoopHandler::new("other-rpc")).await?;
+
+        let producer_conn = producer.connect(direct_addr(&relay), ALPN_MOQ_LITE).await?;
+        prove_moql_admission(&producer_conn, &MoqlAdmissionProof {
+            did: "did:at9p:producer".to_owned(), ed25519: producer_ed, ml_dsa_65: producer_pq,
+            expected_server: server_identity.clone(),
+        }, std::time::Duration::from_secs(2)).await?;
+        let producer_origin: OriginProducer = Origin::random().produce();
+        let producer_session = Client::new().with_origin(producer_origin.clone()).connect(Session::raw(producer_conn)).await?;
+
+        let subscriber_conn = subscriber.connect(direct_addr(&relay), ALPN_MOQ_LITE).await?;
+        prove_moql_admission(&subscriber_conn, &MoqlAdmissionProof {
+            did: "did:at9p:subscriber".to_owned(), ed25519: subscriber_ed, ml_dsa_65: subscriber_pq,
+            expected_server: server_identity.clone(),
+        }, std::time::Duration::from_secs(2)).await?;
+        let subscriber_origin: OriginProducer = Origin::random().produce();
+        let subscriber_consumer = subscriber_origin.consume();
+        let subscriber_session = Client::new()
+            .with_origin(subscriber_origin.clone())
+            .with_consume(subscriber_origin.clone())
+            .connect(Session::raw(subscriber_conn))
+            .await?;
+
+        let broadcast_name = "alice/events/from-producer";
+        let mut producer_broadcast = producer_origin.create_broadcast(broadcast_name).ok_or_else(|| anyhow::anyhow!("create producer broadcast"))?;
+        let mut producer_track = producer_broadcast.create_track(Track::new("tokens"))?;
+        let mut producer_group = producer_track.create_group(Group::from(0u64))?;
+        producer_group.write_frame(Bytes::from_static(b"producer frame"))?;
+        drop(producer_group);
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay_consumer.announced_broadcast(broadcast_name)).await?.ok_or_else(|| anyhow::anyhow!("relay did not ingest trusted producer origin"))?;
+
+        let broadcast = tokio::time::timeout(std::time::Duration::from_secs(2), subscriber_consumer.announced_broadcast(broadcast_name)).await?.ok_or_else(|| anyhow::anyhow!("distinct subscriber did not receive relay announcement"))?;
+        let track = broadcast.subscribe_track(&Track::new("tokens"))?;
+        let mut group = tokio::time::timeout(std::time::Duration::from_secs(2), track.get_group(0)).await??.ok_or_else(|| anyhow::anyhow!("subscriber track ended before producer frame"))?;
+        assert_eq!(group.read_frame().await?, Some(Bytes::from_static(b"producer frame")));
+
+        // An authenticated subscriber is read-only even when it offers an
+        // origin: it cannot inject a same-tenant broadcast into the relay.
+        let _subscriber_injection = subscriber_origin
+            .create_broadcast("alice/events/subscriber-injected")
+            .ok_or_else(|| anyhow::anyhow!("create subscriber injection"))?;
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(300), relay_consumer.announced_broadcast("alice/events/subscriber-injected")).await.is_err());
+
+        // A separately trusted bob producer can connect, but its scoped origin
+        // cannot ingest into alice and its scoped consumer cannot observe alice.
+        let other_conn = other.connect(direct_addr(&relay), ALPN_MOQ_LITE).await?;
+        prove_moql_admission(&other_conn, &MoqlAdmissionProof {
+            did: "did:at9p:other-producer".to_owned(), ed25519: other_ed, ml_dsa_65: other_pq,
             expected_server: server_identity,
         }, std::time::Duration::from_secs(2)).await?;
-        let client_origin: OriginProducer = Origin::random().produce();
-        let client_consumer = client_origin.consume();
-        let session = Client::new().with_origin(client_origin.clone()).connect(Session::raw(conn)).await?;
+        let other_origin: OriginProducer = Origin::random().produce();
+        let other_consumer = other_origin.consume();
+        let other_session = Client::new()
+            .with_origin(other_origin.clone())
+            .with_consume(other_origin.clone())
+            .connect(Session::raw(other_conn))
+            .await?;
+        let _cross_tenant_injection = other_origin
+            .create_broadcast("alice/events/cross-tenant-injected")
+            .ok_or_else(|| anyhow::anyhow!("create cross-tenant injection"))?;
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(300), relay_consumer.announced_broadcast("alice/events/cross-tenant-injected")).await.is_err());
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(300), other_consumer.announced_broadcast(broadcast_name)).await.is_err());
 
-        let mut client_broadcast = client_origin.create_broadcast("local/events/from-client").ok_or_else(|| anyhow::anyhow!("create client broadcast"))?;
-        let mut client_track = client_broadcast.create_track(Track::new("tokens"))?;
-        let mut client_group = client_track.create_group(Group::from(0u64))?;
-        client_group.write_frame(Bytes::from_static(b"up"))?;
-        drop(client_group);
-        tokio::time::timeout(std::time::Duration::from_secs(2), relay_consumer.announced_broadcast("local/events/from-client")).await?.ok_or_else(|| anyhow::anyhow!("Event carrier did not ingest authenticated origin"))?;
-
-        let mut relay_broadcast = relay_producer.create_broadcast("local/events/from-relay").ok_or_else(|| anyhow::anyhow!("create Event broadcast"))?;
-        let mut relay_track = relay_broadcast.create_track(Track::new("tokens"))?;
-        let mut relay_group = relay_track.create_group(Group::from(0u64))?;
-        relay_group.write_frame(Bytes::from_static(b"down"))?;
-        drop(relay_group);
-        tokio::time::timeout(std::time::Duration::from_secs(2), client_consumer.announced_broadcast("local/events/from-relay")).await?.ok_or_else(|| anyhow::anyhow!("client did not consume Event origin"))?;
-        drop(session);
-        client.shutdown().await?;
+        drop(other_session);
+        drop(subscriber_session);
+        drop(producer_session);
+        other.shutdown().await?;
+        subscriber.shutdown().await?;
+        producer.shutdown().await?;
         relay.shutdown().await?;
         Ok(())
     }
