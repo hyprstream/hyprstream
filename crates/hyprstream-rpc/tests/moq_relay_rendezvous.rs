@@ -138,6 +138,9 @@ async fn moq_relay_rendezvous() -> Result<()> {
     let reach = vec![Destination {
         role: Role::Relay,
         transport: relay_reach.clone(),
+        // A production pinned-QUIC relay has transport authentication but no
+        // MoQL accepted-state witness. It must remain dialable; only Iroh
+        // selects and verifies a MoQL witness.
         moql_server_identity: Default::default(),
     }];
 
