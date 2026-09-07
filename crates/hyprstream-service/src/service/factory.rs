@@ -97,6 +97,29 @@ pub struct NativeAnnouncementRequest {
     pub expires_at_unix_ms: i64,
 }
 
+impl NativeAnnouncementRequest {
+    /// Re-project the complete authority bundle, retaining this bound service's
+    /// identity, signer and reach. A successor may renew authority but cannot
+    /// silently switch the running service to a different identity.
+    pub fn refresh_from_accepted_state(
+        &mut self,
+        state: &hyprstream_pds::at9p_duplicity::AcceptedAt9pState,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(state.did == self.service_did.to_string(), "announcement identity changed");
+        let accepted = NativeServiceAnnouncement::from_accepted_state(
+            &self.service_name, &self.signing_key, state,
+        )?;
+        self.capabilities = accepted.capabilities;
+        self.accepted_state_digest = accepted.accepted_state_digest.to_vec();
+        self.accepted_state_epoch = accepted.accepted_state_epoch;
+        self.response_key_id = accepted.response_key_id;
+        self.request_kem_key_id = accepted.request_kem_key_id;
+        self.request_kem_recipient = accepted.request_kem_recipient.encode();
+        self.expires_at_unix_ms = accepted.accepted_state_expires_at_unix_ms;
+        Ok(())
+    }
+}
+
 pub type NativeAnnouncementPublisher =
     Arc<dyn Fn(NativeAnnouncementRequest) -> anyhow::Result<()> + Send + Sync + 'static>;
 
@@ -1511,6 +1534,60 @@ mod tests {
                 .contains("not one of the accepted current response keys"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn native_announcement_refresh_reprojects_successor_and_rejects_identity_changes() {
+        use hyprstream_pds::at9p::{CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport};
+        use hyprstream_pds::at9p_duplicity::AcceptedAt9pState;
+        use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
+        let signer = SigningKey::from_bytes(&[0x75; 32]);
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signer);
+        let pair = HybridKeyPair::new(signer.verifying_key().to_bytes().to_vec(),
+            hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq)).unwrap();
+        let service = ServiceEntry::new("#model", ServiceType::NinePExport,
+            ServiceEndpoint::new(Transport::Iroh, "iroh://test").unwrap()).unwrap();
+        let mut body = CapsuleBody::new(vec![pair.clone()], vec![service]).unwrap();
+        body.next_key_commitments = vec![pair.commitment_digest()];
+        let genesis = sign_capsule(body.clone(), &signer, &pq).unwrap();
+        let state = AcceptedAt9pState::from_persisted_genesis(&genesis.to_dag_cbor().unwrap()).unwrap();
+        let mut request = NativeAnnouncementRequest {
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            service_name: "model".into(),
+            reach: NativeAnnouncementReach::Iroh { node_id: [0x76; 32] },
+            signing_key: signer.clone(), service_jwt: None,
+            discovery_verifying_key: signer.verifying_key(),
+            service_did: state.did.clone().into(), capabilities: Vec::new(),
+            accepted_state_digest: Vec::new(), accepted_state_epoch: 0,
+            response_key_id: String::new(), request_kem_key_id: String::new(),
+            request_kem_recipient: Vec::new(), expires_at_unix_ms: 0,
+        };
+        let reach = request.reach.endpoint();
+        let now = chrono::Utc::now();
+        let update = sign_update_record(state.subject_cid512.clone(), 1, state.head_digest,
+            body.clone(), (now + chrono::Duration::seconds(60)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true), &signer, &pq).unwrap();
+        let first = AcceptedAt9pState::from_persisted_update(&update.to_dag_cbor().unwrap()).unwrap();
+        request.refresh_from_accepted_state(&first).unwrap();
+        let old_deadline = request.expires_at_unix_ms;
+        let successor = sign_update_record(first.subject_cid512.clone(), 2, first.head_digest,
+            body.clone(), (now + chrono::Duration::seconds(600)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true), &signer, &pq).unwrap();
+        let second = AcceptedAt9pState::from_persisted_update(&successor.to_dag_cbor().unwrap()).unwrap();
+        request.refresh_from_accepted_state(&second).unwrap();
+        assert_eq!(request.accepted_state_epoch, 2);
+        assert_eq!(request.accepted_state_digest, second.head_digest.to_vec());
+        assert!(request.expires_at_unix_ms > old_deadline);
+        assert_eq!(request.reach.endpoint(), reach);
+        assert!(!request.request_kem_recipient.is_empty());
+        let expired = sign_update_record(second.subject_cid512.clone(), 3, second.head_digest,
+            body, (now - chrono::Duration::seconds(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true), &signer, &pq).unwrap();
+        let expired = AcceptedAt9pState::from_persisted_update(&expired.to_dag_cbor().unwrap()).unwrap();
+        assert!(request.refresh_from_accepted_state(&expired).is_err());
+        assert_eq!(request.accepted_state_epoch, 2, "failed projection must not mutate authority");
+        request.service_did = "did:at9p:other".into();
+        assert!(request.refresh_from_accepted_state(&second).is_err());
+        request.service_did = second.did.clone().into();
+        request.signing_key = SigningKey::from_bytes(&[0x77; 32]);
+        assert!(request.refresh_from_accepted_state(&second).is_err());
     }
 
     #[test]

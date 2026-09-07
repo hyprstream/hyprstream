@@ -1909,7 +1909,7 @@ where
             _ = cancellation.cancelled() => return NativeAnnouncementRefreshCompletion::Cancelled,
             result = async { announce().await } => result,
         };
-        match result {
+        let sleep_delay = match result {
             Ok(()) => {
                 tracing::info!(
                     service = service_name,
@@ -1917,7 +1917,8 @@ where
                     endpoint,
                     "Announced native endpoint to DiscoveryService"
                 );
-                delay = ANNOUNCEMENT_REFRESH;
+                delay = RETRY_INITIAL;
+                ANNOUNCEMENT_REFRESH
             }
             Err(error) => {
                 tracing::warn!(
@@ -1925,17 +1926,19 @@ where
                     socket_kind,
                     "Failed to announce native endpoint: {error}"
                 );
+                let sleep_delay = delay;
                 delay = delay
                     .checked_mul(2)
                     .unwrap_or(ANNOUNCEMENT_REFRESH)
                     .min(ANNOUNCEMENT_REFRESH)
                     .max(RETRY_INITIAL);
+                sleep_delay
             }
-        }
+        };
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => return NativeAnnouncementRefreshCompletion::Cancelled,
-            _ = tokio::time::sleep(delay) => {}
+            _ = tokio::time::sleep(sleep_delay) => {}
         }
     }
 }
@@ -1948,6 +1951,30 @@ type NativeAnnouncementFirstResult =
 /// can report the result of the first announcement.
 type NativeAnnouncementFirstTx =
     Option<std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<NativeAnnouncementFirstResult>>>>>;
+
+/// The required first result covers both fresh-authority projection and the
+/// Discovery publication. An authority error must not bypass the handshake.
+async fn publish_native_announcement_attempt<F, Fut>(
+    announcement: anyhow::Result<hyprstream_discovery::ServiceAnnouncement>,
+    announce_tx: NativeAnnouncementFirstTx,
+    publish: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(hyprstream_discovery::ServiceAnnouncement) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let result = match announcement {
+        Ok(announcement) => publish(announcement).await,
+        Err(error) => Err(error),
+    };
+    if let Some(tx) = announce_tx {
+        if let Some(tx) = tx.lock().take() {
+            let report = result.as_ref().map(|_| ()).map_err(std::string::ToString::to_string);
+            let _ = tx.send(report);
+        }
+    }
+    result
+}
 
 /// Spawn the native-announcement refresh loop on its own current-thread Tokio
 /// runtime and return a channel for the first announcement result.
@@ -2939,22 +2966,12 @@ fn main() -> Result<()> {
                                                     require_initial_iroh,
                                                     request.cancellation.clone(),
                                                     move |announce_tx| async move {
+                                                        let mut request = request;
                                                         let socket_kind = request.reach.socket_kind().to_owned();
                                                         let endpoint = request.reach.endpoint();
                                                         let service_name = request.service_name.clone();
-                                                        let jwt_expires_at_unix_ms = request.service_jwt.as_deref().and_then(|jwt| {
-                                                            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-                                                            let payload = jwt.split('.').nth(1)?;
-                                                            let claims = URL_SAFE_NO_PAD.decode(payload).ok()
-                                                                .and_then(|payload| serde_json::from_slice::<serde_json::Value>(&payload).ok())?;
-                                                            claims["exp"].as_i64()?.checked_mul(1_000)
-                                                        });
-                                                        let refresh_expires_at_unix_ms = jwt_expires_at_unix_ms
-                                                            .map_or(request.expires_at_unix_ms, |jwt_expiry| {
-                                                                request.expires_at_unix_ms.min(jwt_expiry)
-                                                            });
                                                         let client = match hyprstream_discovery::DiscoveryClient::for_local_bootstrap(
-                                                            request.signing_key,
+                                                            request.signing_key.clone(),
                                                             request.discovery_verifying_key,
                                                             None,
                                                         ) {
@@ -2969,40 +2986,21 @@ fn main() -> Result<()> {
                                                                 return;
                                                             }
                                                         };
-                                                        let announcement = hyprstream_discovery::ServiceAnnouncement {
-                                                            service_name,
-                                                            socket_kind,
-                                                            endpoint,
-                                                            service_jwt: request.service_jwt,
-                                                            service_did: request.service_did,
-                                                            capabilities: request.capabilities,
-                                                            accepted_state_digest: request.accepted_state_digest,
-                                                            accepted_state_epoch: request.accepted_state_epoch,
-                                                            response_key_id: request.response_key_id,
-                                                            request_kem_key_id: request.request_kem_key_id,
-                                                            request_kem_recipient: request.request_kem_recipient,
-                                                            expires_at_unix_ms: request.expires_at_unix_ms,
-                                                        };
                                                         let _completion = refresh_native_announcement(
-                                                            &announcement.service_name,
-                                                            &announcement.socket_kind,
-                                                            &announcement.endpoint,
-                                                            refresh_expires_at_unix_ms,
-                                                            request.cancellation,
+                                                            &service_name,
+                                                            &socket_kind,
+                                                            &endpoint,
+                                                            // Authority/JWT expiry is rechecked for each attempt.
+                                                            // Never retain the original deadline after renewal.
+                                                            i64::MAX,
+                                                            request.cancellation.clone(),
                                                             || {
+                                                                let announcement = hyprstream_core::services::factories::current_native_announcement(&mut request);
                                                                 let announce_tx = announce_tx.as_ref().map(std::sync::Arc::clone);
                                                                 let client = &client;
-                                                                let announcement = &announcement;
-                                                                async move {
-                                                                    let result = client.announce(announcement).await.map(|_| ());
-                                                                    if let Some(tx) = announce_tx {
-                                                                        if let Some(tx) = tx.lock().take() {
-                                                                            let report = result.as_ref().map(|_| ()).map_err(std::string::ToString::to_string);
-                                                                            let _ = tx.send(report);
-                                                                        }
-                                                                    }
-                                                                    result
-                                                                }
+                                                                publish_native_announcement_attempt(announcement, announce_tx, move |announcement| async move {
+                                                                    client.announce(&announcement).await.map(|_| ())
+                                                                })
                                                             },
                                                         )
                                                         .await;
@@ -3953,6 +3951,38 @@ mod resolver_startup_controls {
         assert!(!completed.load(Ordering::SeqCst));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn native_announcement_refresh_loop_backoff_starts_at_five_and_resets_after_success() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            let mut attempt = 0;
+            async move {
+                super::refresh_native_announcement(
+                    "model", "iroh", "iroh://test", i64::MAX, cancellation,
+                    move || {
+                        attempt += 1;
+                        sent.send(tokio::time::Instant::now()).expect("receiver live");
+                        let success = attempt == 5;
+                        async move { if success { Ok(()) } else { Err("retry fixture") } }
+                    },
+                ).await
+            }
+        });
+        let mut previous = received.recv().await.expect("initial attempt");
+        for seconds in [5, 10, 20, 25, 25, 5, 10] {
+            let current = received.recv().await.expect("next attempt");
+            let elapsed = current.duration_since(previous);
+            let expected = std::time::Duration::from_secs(seconds);
+            assert!(elapsed >= expected && elapsed <= expected + std::time::Duration::from_millis(1),
+                "expected {expected:?} retry interval, got {elapsed:?}");
+            previous = current;
+        }
+        cancellation.cancel();
+        assert_eq!(task.await.expect("refresh task"), super::NativeAnnouncementRefreshCompletion::Cancelled);
+    }
+
     #[tokio::test]
     async fn native_announcement_refresh_loop_stops_before_announce_after_absolute_expiry() {
         let completion = super::refresh_native_announcement(
@@ -3996,10 +4026,30 @@ mod native_announcement_wiring {
             let cycle_tx = cycle_tx.clone();
             async move {
                 for i in 0..3 {
-                    cycle_tx.send(i).expect("test receiver is live");
-                    if i == 0 {
-                        send_first_result(&announce_tx, Ok(()));
-                    }
+                    let announcement = hyprstream_discovery::ServiceAnnouncement {
+                        service_name: "model".to_owned(),
+                        socket_kind: "iroh".to_owned(),
+                        endpoint: "iroh://bound-node".to_owned(),
+                        service_jwt: Some(format!("jwt-{i}")),
+                        service_did: "did:at9p:fixture".into(),
+                        capabilities: vec!["model".to_owned()],
+                        accepted_state_digest: vec![i as u8; 64],
+                        accepted_state_epoch: i,
+                        response_key_id: "#response".to_owned(),
+                        request_kem_key_id: "#kem".to_owned(),
+                        request_kem_recipient: vec![i as u8],
+                        expires_at_unix_ms: 1000 + i as i64,
+                    };
+                    let cycle_tx = cycle_tx.clone();
+                    super::publish_native_announcement_attempt(
+                        Ok(announcement), announce_tx.as_ref().map(std::sync::Arc::clone),
+                        move |announcement| async move {
+                            assert_eq!(announcement.service_jwt, Some(format!("jwt-{i}")));
+                            assert_eq!(announcement.expires_at_unix_ms, 1000 + i as i64);
+                            cycle_tx.send(announcement.accepted_state_epoch).expect("test receiver is live");
+                            Ok(())
+                        },
+                    ).await.expect("publication succeeds");
                     tokio::task::yield_now().await;
                 }
             }
@@ -4105,5 +4155,35 @@ mod native_announcement_wiring {
             cycle_rx.recv_timeout(Duration::from_millis(200)).is_err(),
             "loop must abort after first failure; extra cycle observed"
         );
+    }
+
+    #[test]
+    fn required_path_reports_first_authority_failure_without_publication() {
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = published.clone();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let initial = super::spawn_native_announcement_loop(
+            true, cancellation.clone(), move |announce_tx| async move {
+                super::refresh_native_announcement(
+                    "model", "iroh", "iroh://test", i64::MAX, cancellation,
+                    || {
+                        let tx = announce_tx.as_ref().map(std::sync::Arc::clone);
+                        let published = published.clone();
+                        super::publish_native_announcement_attempt(
+                            Err(anyhow::anyhow!("fresh checkpoint unavailable")), tx,
+                            move |_| async move {
+                                published.store(true, std::sync::atomic::Ordering::SeqCst);
+                                Ok(())
+                            },
+                        )
+                    },
+                ).await;
+            },
+        ).expect("required handshake");
+        let error = initial.recv_timeout(Duration::from_secs(2))
+            .expect("authority failure must complete first handshake").expect_err("startup must fail");
+        assert!(error.contains("fresh checkpoint unavailable"));
+        assert!(!observed.load(std::sync::atomic::Ordering::SeqCst),
+            "failed authority projection must never publish stale reach");
     }
 }
