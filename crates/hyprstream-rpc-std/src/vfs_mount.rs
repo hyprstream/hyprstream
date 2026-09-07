@@ -101,7 +101,7 @@ pub enum ServiceDispatchResult {
     /// COSE-verified upstream, carried typed — NOT a JSON string to re-parse,
     /// #468) + ephemeral keypair for ECDH.
     Stream {
-        info: hyprstream_rpc::stream_info::StreamInfo,
+        info: Box<hyprstream_rpc::stream_info::StreamInfo>,
         /// 64 bytes: [secret(32) | pubkey(32)]
         ephemeral_keypair: Vec<u8>,
     },
@@ -291,7 +291,7 @@ impl Mount for GenericServiceMount {
                 // Open verified stream handle via RpcClient
                 let handle = self
                     .client
-                    .open_stream_from_info(info.clone(), secret_32, pubkey_32)
+                    .open_stream_from_info(*info.clone(), secret_32, pubkey_32)
                     .await
                     .map_err(|e| MountError::Io(format!("open stream: {e}")))?;
 
@@ -639,7 +639,7 @@ macro_rules! impl_service_dispatch {
                 Ok(match result {
                     svc::DispatchResult::Response(json) => ServiceDispatchResult::Response(json),
                     svc::DispatchResult::Stream(info) => ServiceDispatchResult::Stream {
-                        info,
+                        info: Box::new(info),
                         ephemeral_keypair: keypair,
                     },
                 })

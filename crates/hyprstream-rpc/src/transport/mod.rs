@@ -27,6 +27,10 @@ pub mod iroh_transport;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_moq;
 #[cfg(not(target_arch = "wasm32"))]
+/// Inside-carrier Ed25519 + ML-DSA-65 challenge/response admission for the
+/// iroh `moql` ALPN (#1027).
+pub mod moql_admission;
+#[cfg(not(target_arch = "wasm32"))]
 /// CONNECT-time authentication + tenant binding for the `/moq` WebTransport
 /// plane (#1153).
 pub mod moq_connect_auth;

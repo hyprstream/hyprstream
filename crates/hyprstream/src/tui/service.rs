@@ -1575,7 +1575,12 @@ impl TuiService {
             connect.set_viewer_id(viewer_id);
             connect.set_session_id(session_id);
 
-            let reach = self.reach_config.read().reach();
+            let reach_config = self.reach_config.read();
+            let reach = reach_config.reach();
+            let moql_server_identity = reach_config
+                .moql_server_identity
+                .clone()
+                .unwrap_or_default();
 
             // FD-indexed streams: [0]=stdin (input relay), [1]=stdout (frames)
             let mut stream_list = connect.reborrow().init_streams(streams.len() as u32);
@@ -1584,6 +1589,8 @@ impl TuiService {
                 si.set_topic(topic);
                 si.set_mac_key(*mac_key);
                 si.set_broadcast_path(broadcast_path);
+                let mut witness = si.reborrow().init_moql_server_identity();
+                hyprstream_rpc::capnp::ToCapnp::write_to(&moql_server_identity, &mut witness);
                 // Encode the networked reach via the shared generated ToCapnp impl
                 // (Destination::write_to), so the wire bytes match the inference
                 // StreamInfo's `announcedAt` 1:1.
@@ -2454,7 +2461,17 @@ mod tests {
         use hyprstream_rpc::moq_stream::{NodeStreamReach, ProducerReachConfig};
 
         let addr: std::net::SocketAddr = "127.0.0.1:4433".parse().expect("addr");
+        let server_identity = hyprstream_rpc::stream_info::MoqlServerIdentity {
+            did: "did:at9p:tui".to_owned(),
+            epoch: 7,
+            head_digest: vec![0x22; 64],
+            expires_at_unix_ms: hyprstream_rpc::envelope::current_timestamp() + 60_000,
+            ed25519: [0x23; 32],
+            ml_dsa65: vec![0x24; 1952],
+        };
         let reach = ProducerReachConfig {
+            moql_server_identity: Some(server_identity.clone()),
+            relay_moql_server_identity: None,
             iroh_node_id: None,
             quic_reach: Some(NodeStreamReach {
                 addr,
@@ -2475,6 +2492,8 @@ mod tests {
             si.set_topic("deadbeef");
             si.set_mac_key(&[7u8; 32]);
             si.set_broadcast_path("local/streams/deadbeef");
+            let mut witness = si.reborrow().init_moql_server_identity();
+            hyprstream_rpc::capnp::ToCapnp::write_to(&server_identity, &mut witness);
             let mut reach_list = si.reborrow().init_announced_at(reach.len() as u32);
             for (j, dest) in reach.iter().enumerate() {
                 let mut db = reach_list.reborrow().get(j as u32);
@@ -2503,6 +2522,10 @@ mod tests {
         assert_eq!(
             decoded.announced_at, reach,
             "decoded StreamInfo.announcedAt must round-trip the producer reach exactly"
+        );
+        assert_eq!(
+            decoded.moql_server_identity, server_identity,
+            "decoded TUI StreamInfo must retain its resolver-verified server witness"
         );
         match &decoded.announced_at[0].transport {
             hyprstream_rpc::stream_info::TransportConfig::Quic(q) => {

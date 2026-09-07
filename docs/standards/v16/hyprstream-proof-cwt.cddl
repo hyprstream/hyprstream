@@ -1,0 +1,703 @@
+; Canonical CDDL (RFC 8610) for the Hyprstream RPC request-proof profile
+; `hs-rpc-proof-v1`: the proof CWT claims set, the response-binding structure,
+; the canonical signature plan, and the private-use COSE header parameters.
+;
+; Status: FROZEN by the accepted Gate-2 vote (v16 §19, operator disposition
+; 2026-08-19). This file is the normative wire structure for the RPC
+; request-proof profile. It is NOT production-closed: the two vnd.hyprstream
+; media types still require IANA vendor-tree registration, and the private-use
+; ML-KEM-768 identifier -70200 stays project-private until a registered COSE
+; PQ/T KEM value supersedes it in an incompatible profile revision.
+;
+; Encoding: RFC 8949 core deterministic encoding, restricted further by this
+; profile — definite lengths only, deterministically ordered unique map keys,
+; integer timestamps, no floating-point values anywhere, no tags (including the
+; CWT and COSE object tags), and no duplicate claim keys. The claim set is
+; closed: an unknown claim key denies rather than being ignored.
+;
+; Every value below is frozen by the Gate-2 vote; where the vote amended a
+; value from the original proposal, the amendment number (Gate-2 §19) is cited
+; in the comment above it. No value in this file is PROPOSED any longer.
+;
+; The `external_aad` of every `Sig_structure` in this profile is zero-length:
+; the signed body protected headers are self-describing, so no separately
+; supplied bytes participate in verification.
+
+; ==========================================================================
+; 1. Profile constants
+; ==========================================================================
+
+; Media types (RFC 6838 vendor tree, `+cwt` suffix per RFC 9782). Registration
+; in the IANA media types registry is REQUIRED before the production freeze.
+proof-typ          = "application/vnd.hyprstream.proof+cwt"
+response-proof-typ = "application/vnd.hyprstream.response-proof+cwt"
+
+; Application cryptographic domain separators, carried in every Sig_structure.
+request-proof-domain  = "hs-rpc-request-proof-v1"
+response-proof-domain = "hs-rpc-response-proof-v1"
+
+; Versioned suite registry identifiers.
+suite-classical = "hs-cose-sign-ed25519-v1"              ; exactly Ed25519 (-19)
+suite-hybrid    = "hs-cose-sign-ed25519-mldsa65-wns-v1"  ; Ed25519 (-19) + ML-DSA-65 (-49)
+suite-id        = suite-classical / suite-hybrid
+
+; Fully specified COSE algorithms (RFC 9864). The deprecated polymorphic
+; `EdDSA` (-8) is not part of this profile and denies.
+alg-ed25519   = -19
+alg-ml-dsa-65 = -49
+profile-alg   = alg-ed25519 / alg-ml-dsa-65
+
+; Project-private ML-KEM-768 identifier for the encrypted-response KEM recipient
+; (Gate-2 §19 amendment 5). Allocated in the COSE Algorithms private-use range
+; and versioned as `hs-kem-ml-kem-768-v1`; see the private-label registry. This
+; exact value is REQUIRED; a future registered COSE PQ/T KEM identifier is an
+; incompatible profile revision, never a silent substitution.
+alg-hs-kem-ml-kem-768-v1 = -70200
+
+; ==========================================================================
+; 2. proof-v1 caps
+; ==========================================================================
+;
+; These caps are exact. Raising one after the profile freeze is an
+; incompatible profile revision; implementations MUST NOT silently accept a
+; larger value.
+;
+;   signer groups per plan .................. 1..8
+;   components per signer group ............. exactly per suite (classical 1,
+;                                             hybrid 2) — bound to the suite_id
+;   signature entries per proof ............. 1..16 (groups x components)
+;   suite_id ................................ closed set (§6): the two known
+;                                             suite literals only
+;   kid ..................................... 1..64 bytes
+;   cti (request_id) ........................ exactly 16 bytes
+;   credential_hash ......................... exactly 32 bytes (SHA-256)
+;   Nonce (server challenge) ................ 16..64 bytes
+;   aud (canonical service domain) .......... 1..128 bytes      (Gate-2 §19 #7)
+;   capnp body bytes ........................ 0..1048576 bytes (1 MiB)
+;   total encoded COSE object ............... <= 2097152 bytes (2 MiB)
+;   crit array entries ...................... 1..4 (exact sets, §5)
+;   unattributed key-set elements ........... 1..2 (= plan components)
+;
+; The `capnp body bytes` (1 MiB) and total-object (2 MiB) caps are the profile
+; ceiling; a transport or deployment MAY impose a smaller frame limit.
+;
+; The `aud` cap is the shared canonical service-domain ceiling
+; MAX_SERVICE_DOMAIN_BYTES = 128 (Gate-2 §19 amendment 7). `aud` carries the
+; same canonical service domain the transport already validates through
+; `validate_service_domain` (crates/hyprstream-rpc/src/envelope.rs): the
+; profile reuses that one canonicalization rule and does NOT define a second
+; identity or canonicalization rule for the audience.
+
+max-kid-bytes    = 64
+max-suite-bytes  = 64
+max-body-bytes   = 1048576   ; 1 MiB
+; Shared with MAX_SERVICE_DOMAIN_BYTES (envelope.rs); not a second rule.
+max-aud-bytes    = 128
+
+; ==========================================================================
+; 3. Proof CWT claims sets
+; ==========================================================================
+;
+; Presence versus null: every listed claim is always present. A claim whose
+; value is inapplicable is encoded as CBOR `null`. An absent listed claim, like
+; an unknown claim key, denies. `Nonce` is the single exception: it is present
+; exactly when the profile requires a challenge and absent otherwise.
+
+; Authenticated (credential-bound) request proofs. The server challenge is
+; OPTIONAL here (§4.7: for authenticated proofs the challenge is a deployment
+; option). An authenticated proof is credential-bound, so `credential_hash` is
+; the REQUIRED 32-byte SHA-256 — never null: a null hash means "no credential",
+; which is the unattributed case (a key set is then REQUIRED). Reserving null to
+; the unattributed rule closes the shape where an authenticated object carries
+; neither a credential-bound key source nor an embedded key set (B5).
+; Unattributed proofs use the stricter rule below, which REQUIRES the challenge.
+hyprstream-proof-claims = {
+  3  => canonical-service-domain,   ; aud   — intended recipient service
+  4  => timestamp,                  ; exp   — proof expiry
+  6  => timestamp,                  ; iat   — proof issuance
+  7  => request-id,                 ; cti   — the request identifier
+  ? 10 => server-challenge,         ; Nonce — RFC 9711; optional (authenticated)
+  -70001 => credential-hash,        ; REQUIRED 32-byte hash (never null; null is unattributed-only)
+  -70002 => capnp-schema-id,
+  -70003 => capnp-body-bytes,
+  -70004 => response-binding / null,
+}
+
+; Proof freshness (W1; mac-1499-design-v16.md §4.5). CDDL cannot express clock-
+; relative bounds, so `exp`/`iat` are typed as timestamps here and the verifier
+; enforces freshness at the injected verifier clock. All three bounds are
+; VERIFIER-CLOCK bounds, never the issued lifetime `exp - iat`:
+;   * |iat - verifier_now| <= max_clock_skew_secs   (clock skew, BOTH sides),
+;   * verifier_now < exp                            (not expired), and
+;   * exp - verifier_now <= the disposition maximum (remaining lifetime),
+; with the landed C dispatch constants: max_clock_skew_secs = 30, and the
+; per-disposition maximum remaining lifetime = Authenticated 300s / Unattributed
+; 30s. The constants are pinned in every fixture's metadata
+; (max_clock_skew_secs, proof_max_remaining_lifetime_secs) and enforced by
+; validate_profile.py (gate W1) and check_proof_vectors.py; negatives
+; N-54..N-57 exercise the four axes.
+
+; Unattributed request proofs (no credential). The server challenge (Nonce) is
+; REQUIRED (§4.7: it is denied before any replay-store insertion), so claim 10
+; is a MANDATORY key here — not optional as in the authenticated set — and the
+; N-16 no-Nonce shape fails structural validation. An unattributed proof has no
+; credential, so credential_hash is exactly null.
+hyprstream-unattributed-proof-claims = {
+  3  => canonical-service-domain,   ; aud
+  4  => timestamp,                  ; exp
+  6  => timestamp,                  ; iat
+  7  => request-id,                 ; cti
+  10 => server-challenge,           ; Nonce — REQUIRED for unattributed proofs
+  -70001 => null,                   ; never credential-bound
+  -70002 => capnp-schema-id,
+  -70003 => capnp-body-bytes,
+  -70004 => response-binding / null,
+}
+
+; The response proof reuses the same four private-use claim keys (Gate-2 value 2,
+; PASSED as written) — the protected `typ` and `hs_domain` separate the profiles —
+; but the response overlay is stricter than the request set and is expressed as
+; its own closed rule, not an alias, so the invariants are structural:
+;
+;   3  aud   — the same canonical service domain the request was bound to. This
+;              is a CONTEXTUAL binding to the originating request that CDDL cannot
+;              express (it only checks lexical validity), so validate_profile.py
+;              asserts response.aud == originating-request.aud alongside cti,
+;              response_binding, and -70002 (D2). A response for another service
+;              domain (N-43) denies.
+;   7  cti   — the request_id of the request being answered (binding, not a
+;              new identifier); a mismatched cti denies
+;   10 Nonce — ALWAYS ABSENT: the Nonce claim key is not permitted in the closed
+;              response claims map, so a response proof carrying one denies
+;   -70001   — ALWAYS null: a response proof is never credential-bound
+;   -70002   — the Cap'n Proto 64-bit type ID of the response root type. When
+;              -70004 (response_binding) is non-null, -70002 MUST equal the
+;              realized binding's root_type_id (key 1): the two denote the same
+;              response schema commitment. CDDL cannot express this cross-field
+;              equality of two free uints, so it is a NORMATIVE rule enforced
+;              mechanically by validate_profile.py and check_proof_vectors.py
+;              (bound response fixtures must satisfy it; N-31 changes only -70002
+;              and denies by this rule, not by a signature failure).
+;   -70003   — the exact Cap'n Proto response body bytes
+;   -70004   — the realized response binding, or null for an unbound response
+hyprstream-response-proof-claims = {
+  3  => canonical-service-domain,   ; aud
+  4  => timestamp,                  ; exp
+  6  => timestamp,                  ; iat
+  7  => request-id,                 ; cti — echoes the request_id
+  -70001 => null,                   ; never credential-bound (not bstr/null: exactly null)
+  -70002 => capnp-schema-id,        ; == response_binding.root_type_id when -70004 non-null
+  -70003 => capnp-body-bytes,
+  -70004 => response-binding / null,
+}
+
+; aud reuses the shared canonical service-domain rule; the 1..128 cap is
+; MAX_SERVICE_DOMAIN_BYTES (envelope.rs), not a second identity rule (§19 #7).
+; The lexical syntax is the SAME as validate_service_domain (envelope.rs): the
+; first byte is a lowercase ASCII letter or digit, and every byte is a lowercase
+; ASCII letter, digit, '.', '_', '-', or '/'. The `.regexp` control encodes that
+; syntax normatively; because the pinned pycddl does not enforce `.regexp`,
+; validate_profile.py enforces the identical syntax over every fixture and via
+; causal negatives (N-29 uppercase, N-30 illegal first byte).
+canonical-service-domain = tstr .size (1..128) .regexp "[a-z0-9][a-z0-9._/-]*"
+timestamp                = uint                  ; integer Unix seconds
+request-id               = bstr .size 16         ; 128 bits of CSPRNG output
+server-challenge         = bstr .size (16..64)
+credential-hash          = bstr .size 32         ; SHA-256 of the exact token bytes
+capnp-schema-id          = uint                  ; Cap'n Proto 64-bit type ID
+capnp-body-bytes         = bstr .size (0..1048576)   ; 1 MiB body cap
+
+; ==========================================================================
+; 4. Response binding
+; ==========================================================================
+;
+; Frozen structure (Gate-2 §19 amendments 3 and 4). The response binding binds
+; the response schema domain, the shape of the response, its confidentiality,
+; and — for an encrypted response — the request's signed KEM recipient material.
+;
+; In a request proof the map is the client's commitment to how the response
+; must be produced. It is null when the response is neither encrypted nor
+; streamed. In a response proof it is the realized binding and MUST equal the
+; request's map field-for-field where both are present.
+;
+; The map has exactly four keys:
+;   1  root_type_id     — response root type ID (response schema domain)
+;   2  response_kind     — the orthogonal shape axis (§19 #4)
+;   3  protection_mode   — the orthogonal confidentiality axis (§19 #4)
+;   4  kem_recipient     — recipient material, or null
+;
+; The two axes are independent (amendment 4): the shape of the response
+; (unary vs stream setup) and its confidentiality (cleartext vs encrypted) do
+; not overload one another. The "recipient non-null iff encrypted" relation is
+; expressed structurally, not as prose, as the choice of two protection shapes:
+; protection_mode 1 (cleartext) pairs with a null recipient, protection_mode 2
+; (encrypted) pairs with a present kem-recipient.
+;
+; The presence rule is also structural (canonical single encoding): the
+; `response_binding` claim is null EXACTLY when the response is neither
+; encrypted nor streamed. A cleartext UNARY response is neither, so it uses the
+; null encoding, NOT a map — the cleartext map alternative is therefore
+; restricted to `response_kind = 2` (stream_setup). The encrypted alternative
+; carries either kind, since an encrypted response is non-null regardless of
+; shape.
+
+response-binding = response-binding-cleartext / response-binding-encrypted
+
+; Cleartext binding: streamed-but-not-encrypted only. response_kind is fixed to
+; stream_setup (2); cleartext unary is encoded as a null response_binding, so a
+; cleartext-unary map has no valid encoding here and denies.
+response-binding-cleartext = {
+  1 => capnp-schema-id,   ; response root type ID (response schema domain)
+  2 => 2,                 ; response_kind = stream_setup (cleartext unary is null)
+  3 => 1,                 ; protection_mode = cleartext
+  4 => null,              ; no KEM recipient in the clear
+}
+
+; Encrypted binding: unary or stream_setup, always non-null with a recipient.
+response-binding-encrypted = {
+  1 => capnp-schema-id,   ; response root type ID (response schema domain)
+  2 => response-kind,
+  3 => 2,                 ; protection_mode = encrypted
+  4 => kem-recipient,     ; ML-KEM-768 recipient material, non-null
+}
+
+; Orthogonal axes. Each is a closed enum; a value outside it denies.
+response-kind   = 1 / 2        ; 1 = unary, 2 = stream_setup
+protection-mode = 1 / 2        ; 1 = cleartext, 2 = encrypted
+
+; ML-KEM-768 recipient material for an encrypted response. The `alg` slot
+; carries the profile's KEM identifier `hs-kem-ml-kem-768-v1` = -70200, the
+; project-private value frozen by Gate-2 §19 amendment 5. This exact value is
+; REQUIRED; any other value denies. A future registered COSE PQ/T KEM value is
+; an incompatible profile revision (`draft-ietf-cose-hpke-pq-pqt` is a recorded
+; watch item; nothing in this profile depends on the draft).
+kem-recipient = {
+  1 => alg-hs-kem-ml-kem-768-v1,   ; exactly -70200
+  2 => bstr .size 1184,            ; ML-KEM-768 encapsulation key
+  3 => kid,                        ; kid of the recipient key (1..64 bytes)
+}
+
+; ==========================================================================
+; 5. Private-use COSE header parameters
+; ==========================================================================
+;
+;   -70100  hs_domain                 tstr
+;   -70101  hs_signature_plan         signature-plan
+;   -70102  hs_logical_signer_group   uint
+;   -70103  hs_unattributed_key_set   COSE_KeySet (RFC 9052 §7)
+;
+; Placement is normative and differs by structure. `typ` and `hs_domain` are
+; deliberately redundant: `typ` types the complete COSE object and rejects
+; object-type confusion, `hs_domain` is the application cryptographic domain
+; separator inside every Sig_structure. Both are protected; both must match —
+; and they are PAIRED, not independent choices: `typ` and `hs_domain` are
+; bound together so the request-typ × response-domain cross-product (the N-4
+; domain-confusion shape) cannot validate. A request proof carries exactly
+; (proof-typ, request-proof-domain); a response proof exactly
+; (response-proof-typ, response-proof-domain).
+
+; ---- COSE_Sign body protected headers -------------------------------------
+
+proof-sign-body-protected = proof-sign-body-authenticated
+                          / proof-sign-body-unattributed
+
+; Authenticated body bucket: request and response are separate paired shapes.
+proof-sign-body-authenticated = proof-sign-body-request
+                              / proof-sign-body-response
+
+proof-sign-body-request = {
+  2  => [-70101, -70100],            ; crit, exact
+  16 => proof-typ,                   ; paired with the request domain below
+  -70100 => request-proof-domain,
+  -70101 => signature-plan,
+}
+
+proof-sign-body-response = {
+  2  => [-70101, -70100],            ; crit, exact
+  16 => response-proof-typ,          ; paired with the response domain below
+  -70100 => response-proof-domain,
+  -70101 => signature-plan,
+}
+
+proof-sign-body-unattributed = {
+  2  => [-70103, -70101, -70100],    ; crit, exact
+  16 => proof-typ,                   ; never the response-proof type
+  -70100 => request-proof-domain,
+  -70101 => signature-plan,
+  -70103 => unattributed-key-set,
+}
+
+; ---- COSE_Sign per-signature protected headers ----------------------------
+
+proof-sign-signature-protected = {
+  1  => profile-alg,
+  2  => [-70102],                    ; crit, exact
+  4  => kid,
+  -70102 => logical-signer-group,
+}
+
+; ---- COSE_Sign1 merged protected bucket -----------------------------------
+
+proof-sign1-protected = proof-sign1-authenticated / proof-sign1-unattributed
+
+; Authenticated merged bucket: request and response are separate paired shapes
+; (typ bound to its matching domain), so the N-4 cross-product cannot validate.
+proof-sign1-authenticated = proof-sign1-request / proof-sign1-response
+
+proof-sign1-request = {
+  1  => profile-alg,
+  2  => [-70102, -70101, -70100],    ; crit, exact
+  4  => kid,
+  16 => proof-typ,                   ; paired with the request domain below
+  -70100 => request-proof-domain,
+  -70101 => signature-plan,
+  -70102 => logical-signer-group,
+}
+
+proof-sign1-response = {
+  1  => profile-alg,
+  2  => [-70102, -70101, -70100],    ; crit, exact
+  4  => kid,
+  16 => response-proof-typ,          ; paired with the response domain below
+  -70100 => response-proof-domain,
+  -70101 => signature-plan,
+  -70102 => logical-signer-group,
+}
+
+proof-sign1-unattributed = {
+  1  => profile-alg,
+  2  => [-70103, -70102, -70101, -70100],   ; crit, exact
+  4  => kid,
+  16 => proof-typ,
+  -70100 => request-proof-domain,
+  -70101 => signature-plan,
+  -70102 => logical-signer-group,
+  -70103 => unattributed-key-set,
+}
+
+; `crit` entries are exact sets in ascending numeric-label order, unique, and
+; every listed label MUST occur in the same protected bucket. A missing, extra,
+; duplicate, unknown, or misplaced entry denies before claims or signatures
+; establish authority. The unprotected header bucket carries nothing that
+; establishes authority; a profile verifier requires it to be empty.
+
+kid                   = bstr .size (1..64)
+logical-signer-group  = uint .le 255       ; frozen ceiling (Gate-2 value 6)
+
+; ==========================================================================
+; 6. Signature plan
+; ==========================================================================
+;
+; The plan is the signed, canonical description of every logical signer group
+; and every component expected from that group. It is the complete set of
+; groups that actually sign: no plan group may lack its complete signatures and
+; no signature may sit outside the plan.
+;
+; Group IDs are unique and STRICTLY ASCENDING across the plan (so two logical
+; groups can never collapse to one group_id, and order is canonical). Component
+; order is the exact order declared by the versioned suite registry, and every
+; (alg, kid) pair is unique across the complete plan — regardless of group ID:
+; one key MUST NOT sign under two logical groups, or a single signer could
+; satisfy a multi-party (k-of-n / all) policy. CDDL cannot express either the
+; strictly-ascending-unique group_id ordering (B6) or uniqueness of a computed
+; (alg, kid) tuple (B2) across array elements, so both are NORMATIVE rules
+; enforced mechanically by validate_profile.py and check_proof_vectors.py (whose
+; duplicate-component key is (alg, kid), NOT (group, alg, kid)). N-33 repeats one
+; (alg, kid) across two groups; N-40 repeats a group_id and N-41 is out of
+; ascending order; each denies by these rules.
+
+signature-plan = [ 1*8 signer-group ]
+
+; Each signer group binds its suite_id to that suite's EXACT ordered algorithms
+; and EXACT component count — the suite_id and the component list are NOT
+; independent fields. A hybrid group therefore cannot be downgraded to a single
+; Ed25519 component, and an unknown suite_id denies (the closed choice admits
+; only the two known suites). group_id is the shared logical-signer-group key.
+
+signer-group = signer-group-classical / signer-group-hybrid
+
+; hs-cose-sign-ed25519-v1: exactly one Ed25519 (-19) component.
+signer-group-classical = {
+  1 => logical-signer-group,               ; group_id
+  2 => suite-classical,                    ; "hs-cose-sign-ed25519-v1" (literal)
+  3 => [ signature-component-ed25519 ],    ; exactly one component
+}
+
+; hs-cose-sign-ed25519-mldsa65-wns-v1: exactly two components, Ed25519 (-19)
+; then ML-DSA-65 (-49), in this exact order.
+signer-group-hybrid = {
+  1 => logical-signer-group,               ; group_id
+  2 => suite-hybrid,                        ; "hs-cose-sign-ed25519-mldsa65-wns-v1"
+  3 => [ signature-component-ed25519, signature-component-mldsa65 ],   ; exactly two, ordered
+}
+
+signature-component-ed25519 = {
+  1 => alg-ed25519,                    ; -19, fully specified
+  2 => kid,
+}
+
+signature-component-mldsa65 = {
+  1 => alg-ml-dsa-65,                  ; -49, fully specified
+  2 => kid,
+}
+
+; The suite registry is closed: `suite-id` (top of file) is the only accepted
+; set of suite identifiers, and each is bound to its exact component plan above.
+; An unknown suite_id, a wrong component count, a wrong component algorithm, or
+; wrong component order denies before signatures establish authority.
+
+; Suite registry (versioned, checked in with this profile):
+;
+;   hs-cose-sign-ed25519-v1
+;     components: [ Ed25519 (-19) ]
+;     key types:  OKP / Ed25519
+;     rule:       exactly one component; the single signature authenticates the
+;                 logical signer.
+;
+;   hs-cose-sign-ed25519-mldsa65-wns-v1
+;     components: [ Ed25519 (-19), ML-DSA-65 (-49) ] in this exact order
+;     key types:  OKP / Ed25519, then AKP / ML-DSA-65
+;     rule:       exactly two components in one logical signer group; both MUST
+;                 verify; the pair counts as one logical signer, never two
+;                 approvals. Weakly non-separable per RFC 9955: the components
+;                 are distinct signature objects bound to this suite by the
+;                 signed plan covered by every Sig_structure.
+;
+; A component key enrolled for the hybrid suite MUST NOT be simultaneously
+; enrolled for a standalone suite, another hybrid construction, another
+; protocol/domain separator, or a different logical signer group.
+;
+; Watch item: `draft-ietf-jose-pq-composite-sigs` defines the fused
+; `COMPSIG-MLDSA65-Ed25519-SHA512` algorithm. Adopting it is an incompatible
+; profile revision (new typ, new key enrollment, new vectors), not a suite-table
+; substitution. Nothing in this profile depends on that draft.
+
+; ==========================================================================
+; 7. Unattributed key set
+; ==========================================================================
+;
+; The standard `COSE_KeySet` structure of RFC 9052 §7 (an array of COSE_Key
+; values), carried in the body protected headers of an unattributed proof and
+; forbidden everywhere else — with a credential presented, and in every
+; response proof.
+;
+; This closed profile is stricter than RFC 9052's element processing: every
+; element MUST parse, be understood, and match exactly one plan component by
+; kid, algorithm, key type, and curve or parameter set, in the plan's component
+; order. A malformed, unknown, duplicate, surplus, private, reordered, or
+; mismatched key denies the complete proof; it is never ignored while the
+; remaining keys establish authority. Private key material is forbidden.
+;
+; The self-asserted key set proves only internal proof consistency. It grants
+; no identity, role, clearance, tenant, or assurance.
+
+unattributed-key-set = [ 1*2 unattributed-key ]
+
+unattributed-key = cose-key-okp-ed25519 / cose-key-akp-ml-dsa-65
+
+cose-key-okp-ed25519 = {
+  1  => 1,                 ; kty: OKP
+  2  => kid,
+  3  => alg-ed25519,
+  -1 => 6,                 ; crv: Ed25519
+  -2 => bstr .size 32,     ; x: public key
+}
+
+cose-key-akp-ml-dsa-65 = {
+  1  => 7,                 ; kty: AKP (RFC 9964)
+  2  => kid,
+  3  => alg-ml-dsa-65,
+  -1 => bstr .size 1952,   ; pub: ML-DSA-65 public key (RFC 9964)
+}
+
+; See §7.1 for the unattributed replay-namespace thumbprint derivation.
+
+; ==========================================================================
+; 7.1 Replay-namespace thumbprints (frozen byte-level derivation)
+; ==========================================================================
+;
+; A verifier selects exactly one replay key per accepted proof (design §4.6):
+;   Reusable credential:  (authenticated primary signer-suite thumbprint, cti)
+;   Unattributed proof:   (unattributed proof-key-set thumbprint, cti)
+; The thumbprints below are frozen to bytes so replay state shared across
+; verifier instances derives the SAME namespace for one signer — otherwise two
+; nodes could admit a replay of one signer under different namespaces (C1).
+;
+; Both are a SHA-256 over the RFC 8949 core-deterministic encoding of a CBOR
+; array whose FIRST element is the domain-separator text (the "under the …
+; domain separator" binding), so no ambiguous byte concatenation is involved.
+; The two separators are distinct literal text strings:
+
+replay-domain-authenticated = "hs-rpc-replay-primary-suite-v1"
+replay-domain-key-set       = "hs-rpc-replay-key-set-v1"
+
+; Authenticated primary signer-suite thumbprint (design §4.5/§4.6):
+;   SHA-256( enc_cbor([
+;     replay-domain-authenticated,        ; tstr, domain separator (first)
+;     suite_id,                           ; tstr, the PRIMARY group's suite ID
+;     [ pub_component_1, pub_component_2 ],; ordered PUBLIC component keys of the
+;                                         ;   primary group (Ed25519 x = 32 bytes;
+;                                         ;   ML-DSA-65 pub = 1952 bytes), in the
+;                                         ;   suite's exact component order
+;     enrollment_epoch,                   ; uint, from the cnf-resolved record
+;   ]) )
+; Approver groups are EXCLUDED, so any allowed approver subset for the same
+; primary-signed request stays in one replay namespace.
+;
+; thumbprint-preimage-authenticated = [
+;   replay-domain-authenticated,
+;   suite-id,
+;   [ 1*2 bstr ],   ; ordered primary-group public component keys
+;   uint,           ; enrollment epoch
+; ]
+;
+; Unattributed proof-key-set thumbprint (design §4.7 / §7) — CONTENT-BOUND (M1):
+;   SHA-256( enc_cbor([
+;     replay-domain-key-set,              ; tstr, domain separator (first)
+;     [ * [ suite_id, [ * bstr ] ] ],     ; per signer group, CANONICALLY SORTED:
+;                                         ;   each record is the group's suite_id
+;                                         ;   and its PUBLIC keys in component order
+;                                         ;   (Ed25519 x = 32 bytes; ML-DSA-65 pub =
+;                                         ;   1952 bytes); the group RECORDS are then
+;                                         ;   sorted by their RFC 8949 deterministic-
+;                                         ;   CBOR encoding as unsigned byte strings
+;                                         ;   (R1), never by group_id/kid/plan order
+;   ]) )
+; The attacker-chosen labels `hs_logical_signer_group` (group_id) and each `kid`
+; are NORMALIZED OUT (M1), exactly as the authenticated derivation excludes them,
+; AND the signer groups are CANONICALLY ORDERED by content (R1): a SELF-ASSERTED
+; unattributed signer MUST NOT be able to mint a fresh replay namespace by
+; permuting a group_id/kid OR reordering the same signer groups over identical
+; ordered public keys — the same signer set and `cti` must land in ONE replay
+; namespace so the second use is rejected as replay. Component keys INSIDE each
+; group keep their suite-plan order, and a different suite_id, public-key byte, or
+; group multiset yields a different thumbprint (distinct cryptographic identities
+; are never over-collapsed; no single component thumbprint can alias a hybrid
+; signer).
+;
+; thumbprint-preimage-key-set = [
+;   replay-domain-key-set,
+;   [ * [ suite-id, [ 1*2 bstr ] ] ],    ; per group: suite + ordered public keys
+; ]
+;
+; Cross-implementation expected-thumbprint vectors are in
+; vectors/proof-v1-thumbprints.json (validate_profile.py and
+; check_proof_vectors.py recompute and assert them).
+
+; ==========================================================================
+; 8. Complete objects
+; ==========================================================================
+;
+; Untagged COSE structures per RFC 9052; object typing is performed by the
+; protected `typ` header, not by a CBOR tag. The payload is embedded (never
+; detached) and is the deterministic encoding of the claims set.
+;
+; Each complete object binds its header profile to the matching claims rule:
+; a response object pairs the response header profile (response-proof-typ +
+; response-proof-domain) with the strict `hyprstream-response-proof-claims`
+; (Nonce forbidden, credential_hash null); request and unattributed objects use
+; the request claims set. This closes both the typ×domain cross-product (F1) and
+; the vacuous response alias (F3) at the object level: a response header cannot
+; carry request claims and vice versa.
+
+hyprstream-proof-sign1 = request-proof-sign1
+                       / response-proof-sign1
+                       / unattributed-proof-sign1
+
+request-proof-sign1 = [
+  protected   : bstr .cbor proof-sign1-request,
+  unprotected : {},
+  payload     : bstr .cbor hyprstream-proof-claims,
+  signature   : bstr,
+]
+
+response-proof-sign1 = [
+  protected   : bstr .cbor proof-sign1-response,
+  unprotected : {},
+  payload     : bstr .cbor hyprstream-response-proof-claims,
+  signature   : bstr,
+]
+
+unattributed-proof-sign1 = [
+  protected   : bstr .cbor proof-sign1-unattributed,
+  unprotected : {},
+  payload     : bstr .cbor hyprstream-unattributed-proof-claims,
+  signature   : bstr,
+]
+
+hyprstream-proof-sign = request-proof-sign
+                      / response-proof-sign
+                      / unattributed-proof-sign
+
+request-proof-sign = [
+  protected   : bstr .cbor proof-sign-body-request,
+  unprotected : {},
+  payload     : bstr .cbor hyprstream-proof-claims,
+  signatures  : [ 1*16 hyprstream-proof-signature ],
+]
+
+response-proof-sign = [
+  protected   : bstr .cbor proof-sign-body-response,
+  unprotected : {},
+  payload     : bstr .cbor hyprstream-response-proof-claims,
+  signatures  : [ 1*16 hyprstream-proof-signature ],
+]
+
+; A hybrid unattributed proof has two component signatures in its one logical
+; signer group, so it is a COSE_Sign; it uses the unattributed claims rule
+; (server challenge REQUIRED).
+unattributed-proof-sign = [
+  protected   : bstr .cbor proof-sign-body-unattributed,
+  unprotected : {},
+  payload     : bstr .cbor hyprstream-unattributed-proof-claims,
+  signatures  : [ 1*16 hyprstream-proof-signature ],
+]
+
+hyprstream-proof-signature = [
+  protected   : bstr .cbor proof-sign-signature-protected,
+  unprotected : {},
+  signature   : bstr,
+]
+
+; COSE_Sign1 is used when one signature entry suffices; COSE_Sign when the
+; cryptographic suite or authorization policy requires several entries. Each
+; signature entry matches exactly one component in the signed plan by protected
+; group, alg, and kid. A missing component, duplicate component, extra
+; signature, reordered or malformed plan, group/suite mismatch, or key outside
+; the applicable anchored record or unattributed key set denies.
+;
+; Signer-group independence is CONTENT-based, not label-based (S1). Beyond the
+; whole-plan (alg, kid) label uniqueness, a resolved cryptographic public-key
+; IDENTITY — (algorithm, raw public-key bytes), never kid / group_id / enrollment
+; label / plan position — MUST participate in at most ONE logical signer group in
+; a proof, checked AFTER key resolution for both unattributed embedded-key proofs
+; and credential/enrollment-bound proofs. One public key re-published under two
+; kids in two groups therefore cannot satisfy a two-logical-group policy. Different
+; algorithms are distinct identities, so a hybrid group (Ed25519 + ML-DSA-65) and
+; the ordered components inside one suite group remain valid. (CDDL cannot express
+; this content constraint; validate_profile.py and check_proof_vectors.py enforce
+; it, and vector N-53 exercises it.)
+
+; ===========================================================================
+; Credential clearance wire grammar (Gate-2 value 11) — H2
+; ===========================================================================
+; The credential `clearance` claim (JWT text name `clearance`; CWT integer key
+; -70006) carries the Level and Compartments axes ONLY. Assurance is
+; STRUCTURALLY ABSENT from the credential wire: it is derived from verified key
+; material at credential admission and clamps the resulting runtime security
+; context; it is never issuer-asserted. The value is the same semantic two-
+; element array in both encodings.
+;
+; `compartments` is the credential wire projection of the versioned
+; InitialLabelMap: an array of compartment BIT INDICES (0..63) into the
+; CompartmentSet(u64) — NOT a list of names and NOT a bitmask integer — strictly
+; ascending and unique (empty allowed). Unknown levels, out-of-range or
+; duplicate or non-ascending compartments, a bitmask, names, extra array
+; elements, or any assurance field/value deny. (The outer shape and the level
+; and compartment DOMAINS are fixed here; strict-ascending order and uniqueness
+; are enforced numerically by validate_profile.py, which the pinned pycddl
+; cannot express.)
+credential-clearance    = [ clearance-level, clearance-compartments ]
+clearance-level         = 0 / 1 / 2 / 3   ; Public / Internal / Confidential / Secret
+clearance-compartments  = [ * compartment-index ]
+compartment-index       = uint .le 63
