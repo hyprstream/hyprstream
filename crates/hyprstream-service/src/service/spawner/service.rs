@@ -18,6 +18,19 @@ use hyprstream_rpc::transport::TransportConfig;
 // Import anyhow! macro for error creation in ServiceManager impl
 use anyhow::anyhow;
 
+/// Build the exact MoQL authorization configuration installed on the Iroh
+/// handler. Keeping this at the production seam makes it impossible for a
+/// shared-config field to be silently dropped between service setup and the
+/// handler; absence of a service-owned ingress grant remains deny-by-default.
+fn production_moq_authz(
+    admission: Arc<hyprstream_rpc::transport::moql_admission::MoqlAdmissionAuthenticator>,
+    ingress_authorizer: Option<hyprstream_rpc::transport::iroh_moq::SharedIngressAuthorizer>,
+) -> hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig {
+    hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig::default()
+        .with_admission(admission)
+        .with_ingress_authorizer_option(ingress_authorizer)
+}
+
 // Re-export Spawnable trait from hyprstream-rpc (where it's defined so
 // types in that crate can implement it without circular deps).
 pub use hyprstream_rpc::service::Spawnable;
@@ -405,11 +418,9 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                                     hyprstream_rpc::error::RpcError::SpawnFailed(format!(
                                         "MoQ server confirmation identity: {error}"
                                     ))
-                                })?;
+                            })?;
                             moq_handler.with_authz(
-                                hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig::default()
-                                    .with_admission(admission)
-                                    .with_ingress_authorizer_option(moq_ingress_authorizer),
+                                production_moq_authz(admission, moq_ingress_authorizer),
                             )
                         }
                         None => moq_handler,
@@ -1143,6 +1154,37 @@ mod tests {
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::prelude::SigningKey;
     use hyprstream_rpc::service::RequestService;
+
+    #[test]
+    fn production_moq_handler_preserves_explicit_ingress_and_defaults_to_denial() {
+        let admission = Arc::new(
+            hyprstream_rpc::transport::moql_admission::MoqlAdmissionAuthenticator::new(
+                Arc::new(|_: &str| None),
+                Arc::new(|_: &hyprstream_rpc::moq_authz::PeerIdentity| None),
+            ),
+        );
+        let producer = hyprstream_rpc::moq_authz::PeerIdentity::authenticated("did:at9p:producer");
+        let authorizer = Arc::new(
+            |peer: &hyprstream_rpc::moq_authz::PeerIdentity, tenant: &str| {
+                peer.subject.as_deref() == Some("did:at9p:producer") && tenant == "local"
+            },
+        );
+
+        let granted = hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new()
+            .with_authz(production_moq_authz(
+                Arc::clone(&admission),
+                Some(authorizer),
+            ));
+        assert!(granted.authorizes_ingress(&producer, "local"));
+        assert!(!granted.authorizes_ingress(&producer, "other"));
+
+        let absent = hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new()
+            .with_authz(production_moq_authz(admission, None));
+        assert!(
+            !absent.authorizes_ingress(&producer, "local"),
+            "an admission-only production handler must remain read-only"
+        );
+    }
 
     /// Test service that includes infrastructure (new pattern)
     struct EchoService {
