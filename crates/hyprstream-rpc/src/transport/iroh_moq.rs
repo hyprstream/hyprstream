@@ -419,7 +419,8 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
         // capability. Only a separate service-owned ingress decision may hand
         // the peer a scoped writable origin. This keeps an ordinary subscriber
         // from colliding with a producer's broadcast names.
-        let server = if self.inner.authz.authorizes_ingress(&peer, &tenant) {
+        let ingress_granted = self.inner.authz.authorizes_ingress(&peer, &tenant);
+        let server = if ingress_granted {
             let prefix = tenant_prefix(&tenant);
             let path = moq_net::Path::new(&prefix);
             let Some(scoped_origin) = self.inner.origin.producer.scope(&[path]) else {
@@ -477,6 +478,18 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
                             session_conn.close(0u32.into(), b"moql accepted state no longer current");
                             break;
                         }
+                    }
+                    // Ingress is live deployment authority, not a one-time
+                    // capability: a revoked grant must not keep announcing on
+                    // the writable scoped origin this session already holds.
+                    if ingress_granted && !self.inner.authz.authorizes_ingress(&peer, &tenant) {
+                        tracing::warn!(
+                            subject = %peer.subject.as_deref().unwrap_or("?"),
+                            %tenant,
+                            "iroh-moq: ingress grant revoked; closing session"
+                        );
+                        session_conn.close(0u32.into(), b"moql ingress grant revoked");
+                        break;
                     }
                 }
                 res = moq_session.closed() => {
@@ -756,6 +769,111 @@ mod tests {
         drop(producer_session);
         other.shutdown().await?;
         subscriber.shutdown().await?;
+        producer.shutdown().await?;
+        relay.shutdown().await?;
+        Ok(())
+    }
+
+    /// Ingress is live deployment authority, not a one-time capability: when
+    /// the grant is revoked mid-session, the currentness watchdog closes the
+    /// session that already holds the writable scoped origin, so no further
+    /// announcement is carried on that connection without any reconnect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revoked_ingress_closes_live_producer_session() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::crypto::pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes};
+        use crate::stream_info::MoqlServerIdentity;
+        use crate::transport::moql_admission::{AcceptedIdentityState, AcceptedSubjectKey, MoqlAdmissionProof, MoqlServerIdentityProof, prove_moql_admission};
+
+        let server_ed = SigningKey::from_bytes(&[0x81; 32]);
+        let server_pq = ml_dsa_sk_from_seed(&[0x82; 32]);
+        let producer_ed = SigningKey::from_bytes(&[0x83; 32]);
+        let producer_pq = ml_dsa_sk_from_seed(&[0x84; 32]);
+        let expiry = crate::envelope::current_timestamp() + 60_000;
+        let server_identity = MoqlServerIdentity {
+            did: "did:at9p:relay".to_owned(), epoch: 1, head_digest: vec![0x85; 64],
+            expires_at_unix_ms: expiry, ed25519: server_ed.verifying_key().to_bytes(),
+            ml_dsa65: ml_dsa_sk_to_vk_bytes(&server_pq),
+        };
+        let server_state = AcceptedIdentityState {
+            epoch: 1, head_digest: [0x85; 64], expires_at_unix_ms: Some(expiry),
+            subject_keys: vec![AcceptedSubjectKey { ed25519: server_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&server_pq) }],
+        };
+        let producer_state = AcceptedIdentityState {
+            epoch: 1, head_digest: [0x86; 64], expires_at_unix_ms: Some(expiry),
+            subject_keys: vec![AcceptedSubjectKey { ed25519: producer_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&producer_pq) }],
+        };
+        let authority: Arc<dyn crate::transport::moql_admission::AcceptedStateAuthority> = Arc::new(move |did: &str| match did {
+            "did:at9p:relay" => Some(server_state.clone()),
+            "did:at9p:producer" => Some(producer_state.clone()),
+            _ => None,
+        });
+        let relay_secret = fresh_key();
+        let relay_carrier = *iroh::SecretKey::from_bytes(&relay_secret).public().as_bytes();
+        let admission = Arc::new(crate::transport::moql_admission::MoqlAdmissionAuthenticator::new(
+            authority,
+            Arc::new(|peer| (peer.subject.as_deref() == Some("did:at9p:producer")).then(|| "alice".to_owned())),
+        ).with_server_identity_and_carrier(MoqlServerIdentityProof {
+            identity: server_identity.clone(), ed25519: server_ed, ml_dsa_65: server_pq,
+        }, relay_carrier));
+        // Mutable policy backing the ingress decision; the test flips
+        // `grant` mid-session to model a grant revocation.
+        let grant = Arc::new(AtomicBool::new(true));
+        let grant_for_authz = Arc::clone(&grant);
+        let handler = IrohMoqProtocolHandler::new().with_authz(
+            MoqAuthzConfig::default()
+                .with_admission(admission)
+                .with_ingress_authorizer(Arc::new(move |peer: &PeerIdentity, tenant: &str| {
+                    grant_for_authz.load(Ordering::SeqCst)
+                        && peer.subject.as_deref() == Some("did:at9p:producer")
+                        && tenant == "alice"
+                })),
+        );
+        let relay_consumer = handler.origin_consumer().clone();
+        let relay = IrohSubstrate::new_test(relay_secret, handler, NoopHandler::new("rpc-not-wired")).await?;
+        let producer = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("producer-moq"), NoopHandler::new("producer-rpc")).await?;
+
+        let producer_conn = producer.connect(direct_addr(&relay), ALPN_MOQ_LITE).await?;
+        prove_moql_admission(&producer_conn, &MoqlAdmissionProof {
+            did: "did:at9p:producer".to_owned(), ed25519: producer_ed, ml_dsa_65: producer_pq,
+            expected_server: server_identity.clone(),
+        }, *producer.endpoint_id().as_bytes(), std::time::Duration::from_secs(2)).await?;
+        let producer_origin: OriginProducer = Origin::random().produce();
+        let producer_session = Client::new().with_origin(producer_origin.clone()).connect(Session::raw(producer_conn)).await?;
+
+        // Granted: the producer's announce is carried end-to-end.
+        let mut first = producer_origin
+            .create_broadcast("alice/first")
+            .ok_or_else(|| anyhow::anyhow!("create first broadcast"))?;
+        let mut track = first.create_track(Track::new("tokens"))?;
+        let mut group = track.create_group(Group::from(0u64))?;
+        group.write_frame(Bytes::from_static(b"first frame"))?;
+        drop(group);
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay_consumer.announced_broadcast("alice/first"))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("relay did not ingest the granted producer origin"))?;
+
+        // Revoke the grant. The writable scoped origin is already in the
+        // peer's hands; only the live-session recheck can stop it.
+        grant.store(false, Ordering::SeqCst);
+
+        // The same connection's session is closed by the watchdog; the peer
+        // cannot carry any further announcement on it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), producer_session.closed())
+            .await
+            .map_err(|_| anyhow::anyhow!("revoked ingress did not close the live producer session"))?
+            .map_err(|e| anyhow::anyhow!("producer session closed with error: {e}"))?;
+        let _late = producer_origin
+            .create_broadcast("alice/after-revoke")
+            .ok_or_else(|| anyhow::anyhow!("create post-revocation broadcast"))?;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), relay_consumer.announced_broadcast("alice/after-revoke")).await.is_err(),
+            "a revoked producer must not announce further broadcasts on the same connection"
+        );
+
+        drop(first);
+        drop(track);
+        drop(producer_session);
         producer.shutdown().await?;
         relay.shutdown().await?;
         Ok(())
