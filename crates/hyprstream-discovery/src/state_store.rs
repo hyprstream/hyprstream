@@ -428,7 +428,7 @@ impl MemoryStateStore {
         }
     }
 
-    #[cfg(any(test, feature = "test-fixtures"))]
+    #[cfg(test)]
     pub(crate) fn put_announcement_sync(
         &self,
         service_name: &str,
@@ -528,7 +528,7 @@ impl MemoryStateStore {
             .collect()
     }
 
-    #[cfg(any(feature = "valkey", test, feature = "test-fixtures"))]
+    #[cfg(feature = "valkey")]
     pub(crate) fn clear_announcements_sync(&self, service_name: &str) {
         let mut inner = self.inner.lock();
         let Some(socket_kinds) = inner.service_index.remove(service_name) else {

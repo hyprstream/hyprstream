@@ -3628,6 +3628,132 @@ pub mod test_fixtures {
         request_kem_recipient: hyprstream_rpc::crypto::hybrid_kem::RecipientPublic,
     }
 
+    /// Multi-endpoint announcement backend for the fixture. The production
+    /// [`MemoryStateStore`] deliberately keeps one live announcement per
+    /// (service, socket kind) — the single-replica lease model — while
+    /// production retry sets with several same-authority reaches are served
+    /// from the remote Discovery `get_endpoints` fan-out. A resolver fixture
+    /// runs client-less, so it needs a backend that keeps every announced
+    /// endpoint to express those sets.
+    #[derive(Default)]
+    struct FixtureAnnouncementStore {
+        services: parking_lot::Mutex<HashMap<String, Vec<AnnouncedEndpoint>>>,
+    }
+
+    impl FixtureAnnouncementStore {
+        fn put_announcement_sync(&self, service_name: &str, endpoint: AnnouncedEndpoint) {
+            let mut services = self.services.lock();
+            let endpoints = services.entry(service_name.to_owned()).or_default();
+            endpoints.retain(|existing| existing.endpoint != endpoint.endpoint);
+            endpoints.push(endpoint);
+        }
+
+        fn announcements_for_sync(&self, service_name: &str, now_unix_ms: i64) -> Vec<AnnouncedEndpoint> {
+            self.services
+                .lock()
+                .get(service_name)
+                .into_iter()
+                .flatten()
+                .filter(|entry| entry.is_live_at(now_unix_ms))
+                .cloned()
+                .collect()
+        }
+
+        fn clear_announcements_sync(&self, service_name: &str) {
+            self.services.lock().remove(service_name);
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    impl DiscoveryStateStore for FixtureAnnouncementStore {
+        async fn put_announcement(
+            &self,
+            service_name: &str,
+            endpoint: AnnouncedEndpoint,
+        ) -> Result<PutResult> {
+            self.put_announcement_sync(service_name, endpoint);
+            Ok(PutResult::Stored)
+        }
+
+        async fn announcements_for(
+            &self,
+            service_name: &str,
+            now_unix_ms: i64,
+        ) -> Result<Vec<AnnouncedEndpoint>> {
+            Ok(self.announcements_for_sync(service_name, now_unix_ms))
+        }
+
+        async fn all_announcements(
+            &self,
+            now_unix_ms: i64,
+        ) -> Result<Vec<(String, Vec<AnnouncedEndpoint>)>> {
+            Ok(self
+                .services
+                .lock()
+                .iter()
+                .map(|(service_name, endpoints)| {
+                    (
+                        service_name.clone(),
+                        endpoints
+                            .iter()
+                            .filter(|entry| entry.is_live_at(now_unix_ms))
+                            .cloned()
+                            .collect(),
+                    )
+                })
+                .collect())
+        }
+
+        // The resolver fixture exercises only the announcement plane; the
+        // remaining store surface belongs to the Discovery daemon backends and
+        // fails closed here rather than pretending to track it.
+        async fn put_liveness(&self, _node: &Did, _value: LiveAllocatable) -> Result<PutResult> {
+            anyhow::bail!("fixture announcement store does not track liveness")
+        }
+
+        #[cfg(test)]
+        async fn liveness(&self, _node: &Did, _now_unix_ms: i64) -> Result<Option<LiveAllocatable>> {
+            anyhow::bail!("fixture announcement store does not track liveness")
+        }
+
+        async fn all_liveness(&self, _now_unix_ms: i64) -> Result<Vec<(Did, LiveAllocatable)>> {
+            anyhow::bail!("fixture announcement store does not track liveness")
+        }
+
+        async fn put_entity_statement(
+            &self,
+            _issuer: &str,
+            _value: CachedEntityStatement,
+        ) -> Result<()> {
+            anyhow::bail!("fixture announcement store does not track entity statements")
+        }
+
+        async fn entity_statement(&self, _issuer: &str) -> Result<Option<CachedEntityStatement>> {
+            anyhow::bail!("fixture announcement store does not track entity statements")
+        }
+
+        async fn known_issuers(&self) -> Result<Vec<String>> {
+            anyhow::bail!("fixture announcement store does not track entity statements")
+        }
+
+        async fn known_issuer_count(&self) -> Result<usize> {
+            anyhow::bail!("fixture announcement store does not track entity statements")
+        }
+
+        async fn put_envelope_keyset(
+            &self,
+            _service_did: &str,
+            _value: CachedEnvelopeKeyset,
+        ) -> Result<()> {
+            anyhow::bail!("fixture announcement store does not track envelope keysets")
+        }
+
+        async fn envelope_keyset(&self, _service_did: &str) -> Result<Option<CachedEnvelopeKeyset>> {
+            anyhow::bail!("fixture announcement store does not track envelope keysets")
+        }
+    }
+
     /// Mutable handle for one process-global, model-free production resolver
     /// fixture. The resolver and dial hook are installed once; individual tests
     /// reset only the accepted-state and announcement data behind that fixed
@@ -3635,7 +3761,7 @@ pub mod test_fixtures {
     #[derive(Clone)]
     pub struct ProductionInferenceFixture {
         service_name: String,
-        announced: Arc<MemoryStateStore>,
+        announced: Arc<FixtureAnnouncementStore>,
         states: Arc<FixtureAcceptedStates>,
         primary: FixtureAuthority,
         foreign: FixtureAuthority,
@@ -3726,7 +3852,7 @@ pub mod test_fixtures {
                 self.announced.put_announcement_sync(
                     &self.service_name,
                     announcement(&self.primary, transport, Instant::now())?,
-                )?;
+                );
             }
             Ok(())
         }
@@ -3738,8 +3864,7 @@ pub mod test_fixtures {
                 .announcements_for_sync(&self.service_name, unix_millis_now())
             {
                 endpoint.live_until_unix_ms = unix_millis_now() - 1;
-                let _ = self
-                    .announced
+                self.announced
                     .put_announcement_sync(&self.service_name, endpoint);
             }
         }
@@ -3753,7 +3878,7 @@ pub mod test_fixtures {
             self.announced.put_announcement_sync(
                 &self.service_name,
                 announcement(&self.foreign, transport, Instant::now())?,
-            )?;
+            );
             Ok(())
         }
     }
@@ -3774,7 +3899,7 @@ pub mod test_fixtures {
         let states = Arc::new(FixtureAcceptedStates(parking_lot::Mutex::new(
             HashMap::new(),
         )));
-        let announced = Arc::new(MemoryStateStore::default());
+        let announced = Arc::new(FixtureAnnouncementStore::default());
         let fixture = ProductionInferenceFixture {
             service_name: service_name.to_owned(),
             announced: Arc::clone(&announced),
