@@ -328,8 +328,9 @@ fn register_service_key(
     service_name: &str,
     signing_key: &SigningKey,
 ) -> anyhow::Result<()> {
-    // PolicyService doesn't register — it IS the CA.
-    if service_name == "policy" {
+    // Required Policy publication still needs its provisioned service JWT,
+    // although Policy never registers its own key through an RPC.
+    if service_name == "policy" && !ctx.iroh_required() {
         return Ok(());
     }
 
@@ -368,6 +369,10 @@ fn register_service_key(
         att.jwt = Some(jwt.clone());
         att.expires_at = expires_at;
         trust.insert(vk, att);
+    }
+
+    if service_name == "policy" {
+        return Ok(());
     }
 
     if ctx.iroh_required() {
@@ -892,6 +897,7 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 #[service_factory("policy", schema = "../../../hyprstream-rpc-std/schema/policy.capnp", metadata = crate::services::generated::policy_client::schema_metadata)]
 fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating PolicyService");
+    register_service_key(ctx, "policy", &ctx.service_signing_key("policy"))?;
 
     let policies_dir = ctx.models_dir().join(".registry").join("policies");
 
@@ -3006,6 +3012,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn required_startup_uses_discovery_before_policy_from_real_inventory() {
+        use hyprstream_service::service::ordering::startup_stages_for_profile;
+        let roster = ["discovery", "policy", "registry", "model"];
+        for required in [false, true] {
+            let stages = startup_stages_for_profile(&roster, required);
+            let stage = |name: &str| stages.iter().position(|items| items.iter().any(|item| item == name)).expect("registered service");
+            assert_eq!(stage("discovery") < stage("policy"), required);
+            assert!(stage("registry") > stage("discovery"));
+            assert!(stage("model") > stage("policy"));
+        }
+    }
+
     /// The Phase-0 namespace skeleton mounts `/bin`, `/env`, `/out` for the
     /// runner (amend-#989 §2). Smoke-check the three directories exist as direct
     /// children of the synthetic root before the namespace is handed off.
@@ -3073,6 +3092,40 @@ mod tests {
             msg.contains("cannot register its signing key"),
             "error names the real cause: {msg}",
         );
+    }
+
+    #[test]
+    fn required_policy_loads_provisioned_jwt_without_self_rpc() -> anyhow::Result<()> {
+        const CHILD: &str = "HYPRSTREAM_POLICY_REGISTRATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "services::factories::tests::required_policy_loads_provisioned_jwt_without_self_rpc", "--nocapture"])
+                .env(CHILD, "1").status()?;
+            anyhow::ensure!(status.success(), "isolated Policy credential test failed");
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        std::env::set_var("HYPRSTREAM__SECRETS__PATH", dir.path());
+        std::env::remove_var(crate::auth::identity_store::SECRETS_PROFILE_ENV);
+        let signer = SigningKey::from_bytes(&[0x69; 32]);
+        let ctx = ServiceContext::new(signer.clone(), signer.verifying_key(), true, dir.path().to_owned())
+            .with_quic(hyprstream_service::QuicSharedConfig {
+                cert_chain: Vec::new(), key_der: zeroize::Zeroizing::new(Vec::new()),
+                base_ip: std::net::Ipv4Addr::LOCALHOST.into(), server_name: "policy.test".to_owned(),
+                oauth_issuer_url: None, jwt_verifying_key: None, iroh_enabled: true, iroh_required: true,
+                moq_relay: None, native_announcement_publisher: None,
+            });
+        assert!(register_service_key(&ctx, "policy", &signer).is_err());
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new("service:policy".to_owned(), now, now + 3600)
+            .with_cnf_jwk(signer.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &signer);
+        crate::auth::identity_store::write_service_jwt(dir.path(), "policy", &jwt)?;
+        // No runtime, resolver or RPC endpoint exists in this child.
+        register_service_key(&ctx, "policy", &signer)?;
+        assert_eq!(hyprstream_service::global_trust_store().get(&signer.verifying_key())
+            .and_then(|attestation| attestation.jwt), Some(jwt));
+        Ok(())
     }
 
     /// A JWT already present in the trust store is used directly (no disk read).

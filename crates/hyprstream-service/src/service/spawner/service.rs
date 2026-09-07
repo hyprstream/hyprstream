@@ -407,7 +407,12 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     if qc.iroh_required {
                         // Iroh bind and first publication have completed. Local
                         // sockets do not gate readiness or serve required RPCs.
-                        if let Some(ready) = on_ready { let _ = ready.send(()); }
+                        // This future may first be polled while draining after
+                        // shutdown won the outer select. Never notify in that case.
+                        if !announcement_cancellation.is_cancelled() {
+                            let _ = hyprstream_rpc::notify::ready();
+                            if let Some(ready) = on_ready { let _ = ready.send(()); }
+                        }
                         local_shutdown.notified().await;
                         Ok(())
                     } else {
@@ -1180,6 +1185,90 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("rejects iroh = false"));
+    }
+
+    /// Exercise actual carrier bind and the publication barrier with a real
+    /// lifecycle socket. Each outcome runs in its own process (env/singletons).
+    #[cfg(all(unix, feature = "systemd"))]
+    #[test]
+    fn required_profile_systemd_ready_follows_bind_and_publication() -> AnyhowResult<()> {
+        use std::os::unix::net::UnixDatagram;
+        use std::time::Duration;
+        const CHILD: &str = "HYPRSTREAM_REQUIRED_NOTIFY_TEST";
+        let Ok(outcome) = std::env::var(CHILD) else {
+            for outcome in ["success", "failure", "cancel"] {
+                let status = std::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", "service::spawner::service::tests::required_profile_systemd_ready_follows_bind_and_publication", "--nocapture"])
+                    .env(CHILD, outcome).status()?;
+                anyhow::ensure!(status.success(), "notification case {outcome} failed");
+            }
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let socket_path = dir.path().join("notify.sock");
+        let socket = UnixDatagram::bind(&socket_path)?;
+        socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+        // Isolated child; set before creating any runtime or service threads.
+        std::env::set_var("NOTIFY_SOCKET", &socket_path);
+        let rpc_path = dir.path().join("echo.sock");
+        let (signing_key, _) = generate_signing_keypair();
+        let service = EchoService::new(TransportConfig::ipc(&rpc_path), signing_key);
+        let mut config = loop_config(true, true, None);
+        let certified = rcgen::generate_simple_self_signed(vec!["service.test".to_owned()])?;
+        config.cert_chain = vec![certified.cert.der().to_vec()];
+        config.key_der = zeroize::Zeroizing::new(certified.key_pair.serialize_der());
+        let cancellation = config.announcement_cancellation.clone();
+        let callback_cancellation = cancellation.clone();
+        let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel(1);
+        let (publication_tx, publication_rx) = std::sync::mpsc::sync_channel(1);
+        config.on_iroh_bound = Some(Box::new(move |name, node| {
+            anyhow::ensure!(name == "echo" && node != [0; 32], "actual bound carrier");
+            bound_tx.send(())?;
+            loop {
+                if callback_cancellation.is_cancelled() { anyhow::bail!("publication cancelled"); }
+                match publication_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => anyhow::bail!("publication rejected"),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }));
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_service = Arc::clone(&shutdown);
+        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = Box::new(UnifiedServiceConfig::new(service, Some(config)))
+                .run(shutdown_service, Some(ready_tx));
+            let _ = done_tx.send(result);
+        });
+        bound_rx.recv_timeout(Duration::from_secs(20))?;
+        let mut message = [0; 128];
+        assert!(socket.recv(&mut message).is_err(), "no READY while publication pending");
+        assert!(matches!(ready_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert!(!rpc_path.exists(), "required RPC never binds IPC");
+        match outcome.as_str() {
+            "success" => {
+                publication_tx.send(true)?;
+                socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+                let size = socket.recv(&mut message)?;
+                assert_eq!(&message[..size], b"READY=1");
+                ready_rx.blocking_recv()?;
+                shutdown.notify_one();
+            }
+            "failure" => publication_tx.send(false)?,
+            "cancel" => shutdown.notify_one(),
+            _ => anyhow::bail!("unknown case"),
+        }
+        let result = done_rx.recv_timeout(Duration::from_secs(20))?;
+        worker.join().map_err(|_| anyhow::anyhow!("service thread panicked"))?;
+        assert_eq!(result.is_ok(), outcome == "success");
+        assert!(cancellation.is_cancelled());
+        assert!(!rpc_path.exists());
+        socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+        assert!(socket.recv(&mut message).is_err(), "failure/cancellation cannot emit READY");
+        Ok(())
     }
 
     #[test]

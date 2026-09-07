@@ -60,6 +60,7 @@ fn required_network_bootstrap_real_checkpoint_and_iroh() -> Result<()> {
         anyhow::ensure!(status.success(), "isolated Iroh bootstrap regression failed");
         return Ok(());
     }
+    PROCESS_NATIVE_NETWORK_REQUIRED.set(true).expect("isolated required profile");
     tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?
         .block_on(network_roundtrip())
 }

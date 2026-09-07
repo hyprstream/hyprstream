@@ -3356,6 +3356,11 @@ struct ProductionRpcClient {
     request_id: std::sync::atomic::AtomicU64,
 }
 
+fn production_service_query(service_name: &str, required: bool) -> Result<ServiceQuery> {
+    ServiceQuery::new(service_name, ["hyprstream-rpc/1".to_owned()],
+        if required { ResolverProfile::NativeIrohRequired } else { ResolverProfile::NetworkDiscovery }, 3)
+}
+
 impl ProductionRpcClient {
     fn new(
         resolution_service_name: &str,
@@ -3388,7 +3393,7 @@ impl ProductionRpcClient {
         })
     }
     async fn snapshots(&self) -> Result<Vec<ResolvedService>> {
-        let query = ServiceQuery::network(self.resolution_service_name.clone())?;
+        let query = production_service_query(&self.resolution_service_name, native_network_required())?;
         let max_attempts = query.max_attempts;
         let mut snapshots = self.resolver.resolve_service_candidates(query).await?;
         let authority = snapshots
@@ -4832,6 +4837,21 @@ mod resolver_tests {
             .ensure_current(&resolved)
             .await
             .unwrap_or_else(|e| panic!("unchanged accepted state rejected: {e}"));
+    }
+
+    #[tokio::test]
+    async fn production_profile_preserves_compatibility_quic_without_local_fallback() {
+        let (resolver, _) = production_fixture(false);
+        assert!(resolver.resolve_service(production_service_query("model", false).expect("query")).await.is_ok());
+        assert!(resolver.resolve_service(production_service_query("model", true).expect("query")).await.is_err());
+        let (resolver, _) = native_production_fixture(false);
+        for required in [false, true] {
+            assert!(resolver.resolve_service(production_service_query("model", required).expect("query")).await.is_ok());
+        }
+        let (resolver, _) = production_fixture(true);
+        for required in [false, true] {
+            assert!(resolver.resolve_service(production_service_query("model", required).expect("query")).await.is_err());
+        }
     }
 
     fn owned_browser_request() -> BrowserProvisioningRequest {

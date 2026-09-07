@@ -271,6 +271,8 @@ mod tests {
         let first = provision_one(&store, &ingest, "model", &key, now, 86400)?;
         assert_eq!(first.epoch, 1);
         assert!(!first.terminal);
+        assert_eq!(first.current.services[0].endpoint.request_kem.as_deref(),
+            Some(hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&key)?.public().encode().as_slice()));
         hyprstream_service::NativeServiceAnnouncement::from_accepted_state("model", &key, &first)?;
         let retry = provision_one(
             &store,
