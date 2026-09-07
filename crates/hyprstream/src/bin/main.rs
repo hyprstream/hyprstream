@@ -1540,6 +1540,49 @@ fn resolve_moq_relay_reach(
         .ok_or_else(|| anyhow::anyhow!("relay URI is not a network-routable transport"))
 }
 
+/// A QUIC process currently owns one native MoQ dialer and its admission-proof
+/// slot. Sharing that slot across separately checkpointed services would make a
+/// later service dial as the first service's DID. Refuse that topology until the
+/// dialer is service-scoped; checkpointed services must run separately.
+fn select_single_process_moql_admission_proof<T>(
+    proofs: impl IntoIterator<Item = (String, Option<T>)>,
+) -> Result<Option<T>> {
+    let proofs: Vec<_> = proofs.into_iter().collect();
+    let authenticated: Vec<_> = proofs
+        .iter()
+        .filter_map(|(service, proof)| proof.as_ref().map(|_| service.as_str()))
+        .collect();
+
+    if authenticated.is_empty() {
+        return Ok(None);
+    }
+    if proofs.len() != 1 {
+        anyhow::bail!(
+            "native MoQ admission proofs are service-scoped, but this QUIC process contains \
+             checkpointed service(s) [{}] with {} total services; run each checkpointed service \
+             in a separate process",
+            authenticated.join(", "),
+            proofs.len(),
+        );
+    }
+
+    Ok(proofs.into_iter().next().and_then(|(_, proof)| proof))
+}
+
+/// Quinn's CONNECT path has no process-global MoQL proof slot. Defer proof
+/// collection itself to an enabled Iroh profile so Quinn-only multi-service
+/// startup does not inherit Iroh's one-service dialer restriction.
+fn select_iroh_moql_admission_proof<T>(
+    iroh_enabled: bool,
+    proofs: impl FnOnce() -> Result<Vec<(String, Option<T>)>>,
+) -> Result<Option<T>> {
+    if iroh_enabled {
+        select_single_process_moql_admission_proof(proofs()?)
+    } else {
+        Ok(None)
+    }
+}
+
 fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
     let trust = hyprstream_service::global_trust_store();
     // Fast path: already populated (service startup seeded it)
@@ -1880,6 +1923,82 @@ fn install_session_pq_overlay() {
              No approve/promote/revoke surface exists yet: a refused rebinding requires \
              a daemon restart to clear."
         );
+    }
+}
+
+/// The only native-announcement refresh path used by the production publisher.
+///
+/// The operation is injected so the production cadence and terminal-expiry
+/// behavior can be exercised without a live Discovery service. The production
+/// caller still supplies [`hyprstream_discovery::DiscoveryClient::announce`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeAnnouncementRefreshCompletion {
+    Expired,
+    Cancelled,
+}
+
+async fn refresh_native_announcement<F, Fut, Error>(
+    service_name: &str,
+    socket_kind: &str,
+    endpoint: &str,
+    refresh_expires_at_unix_ms: i64,
+    cancellation: tokio_util::sync::CancellationToken,
+    mut announce: F,
+) -> NativeAnnouncementRefreshCompletion
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), Error>>,
+    Error: std::fmt::Display,
+{
+    const ANNOUNCEMENT_REFRESH: std::time::Duration = std::time::Duration::from_secs(25);
+    const RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let mut delay = RETRY_INITIAL;
+    loop {
+        if chrono::Utc::now().timestamp_millis() >= refresh_expires_at_unix_ms {
+            tracing::warn!(
+                service = service_name,
+                socket_kind,
+                "Stopping native announcement refresh: accepted-state/JWT material expired"
+            );
+            return NativeAnnouncementRefreshCompletion::Expired;
+        }
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return NativeAnnouncementRefreshCompletion::Cancelled,
+            result = async { announce().await } => result,
+        };
+        let sleep_delay = match result {
+            Ok(()) => {
+                tracing::info!(
+                    service = service_name,
+                    socket_kind,
+                    endpoint,
+                    "Announced native endpoint to DiscoveryService"
+                );
+                delay = RETRY_INITIAL;
+                ANNOUNCEMENT_REFRESH
+            }
+            Err(error) => {
+                tracing::warn!(
+                    service = service_name,
+                    socket_kind,
+                    "Failed to announce native endpoint: {error}"
+                );
+                let sleep_delay = delay;
+                delay = delay
+                    .checked_mul(2)
+                    .unwrap_or(ANNOUNCEMENT_REFRESH)
+                    .min(ANNOUNCEMENT_REFRESH)
+                    .max(RETRY_INITIAL);
+                sleep_delay
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return NativeAnnouncementRefreshCompletion::Cancelled,
+            _ = tokio::time::sleep(sleep_delay) => {}
+        }
     }
 }
 
@@ -2762,6 +2881,23 @@ fn main() -> Result<()> {
                                             }
                                         }
                                     };
+                                    // #1542: a checkpointed native service has both an
+                                    // accepted did:at9p identity and its accepted current
+                                    // response signer. Use that existing state to prove Iroh
+                                    // `moql` admission; do not fabricate credentials or fall
+                                    // back to an anonymous Iroh handshake.
+                                    let moq_admission_proof = select_iroh_moql_admission_proof(
+                                        qc.iroh,
+                                        || {
+                                            service_names
+                                                .iter()
+                                                .map(|service_name| {
+                                                    ctx.moql_admission_proof(service_name)
+                                                        .map(|proof| (service_name.clone(), proof))
+                                                })
+                                                .collect::<Result<Vec<_>>>()
+                                        },
+                                    )?;
                                     let discovery_transport = ctx.transport("discovery", SocketKind::Rep);
                                     let shared = hyprstream_service::QuicSharedConfig {
                                         cert_chain,
@@ -2774,6 +2910,17 @@ fn main() -> Result<()> {
                                         iroh_enabled: qc.iroh,
                                         // #358: producer-chosen relay rendezvous (None = direct-only).
                                         moq_relay,
+                                        // A relay's accepted-state witness must be supplied by a
+                                        // verified resolver result; the URI alone is reachability,
+                                        // never an application identity.
+                                        moq_relay_server_identity: None,
+                                        // #1027: no moql admission material is provisioned at
+                                        // daemon bootstrap yet; the accept path stays in its
+                                        // fail-closed anonymous posture until a deployment
+                                        // installs an authenticator here.
+                                        moq_admission: None,
+                                        moq_ingress_authorizer: None,
+                                        moq_admission_proof,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             move |request: hyprstream_service::NativeAnnouncementRequest| {
                                                 let discovery_transport = discovery_transport.clone();
@@ -2789,9 +2936,13 @@ fn main() -> Result<()> {
                                                         }
                                                     };
                                                     runtime.block_on(async move {
+                                                        let mut request = request;
+                                                        let socket_kind = request.reach.socket_kind().to_owned();
+                                                        let endpoint = request.reach.endpoint();
+                                                        let service_name = request.service_name.clone();
                                                         let client = match hyprstream_discovery::DiscoveryClient::for_local_transport_bootstrap(
                                                             &discovery_transport,
-                                                            request.signing_key,
+                                                            request.signing_key.clone(),
                                                             request.discovery_verifying_key,
                                                             None,
                                                         ) {
@@ -2801,24 +2952,24 @@ fn main() -> Result<()> {
                                                                 return;
                                                             }
                                                         };
-                                                        let announcement = hyprstream_discovery::ServiceAnnouncement {
-                                                            service_name: request.service_name,
-                                                            socket_kind: "quic".to_owned(),
-                                                            endpoint: request.endpoint,
-                                                            service_jwt: request.service_jwt,
-                                                            service_did: request.service_did,
-                                                            capabilities: request.capabilities,
-                                                            accepted_state_digest: request.accepted_state_digest,
-                                                            accepted_state_epoch: request.accepted_state_epoch,
-                                                            response_key_id: request.response_key_id,
-                                                            request_kem_key_id: request.request_kem_key_id,
-                                                            request_kem_recipient: request.request_kem_recipient,
-                                                            expires_at_unix_ms: request.expires_at_unix_ms,
-                                                        };
-                                                        match client.announce(&announcement).await {
-                                                            Ok(_) => tracing::info!("Announced QUIC endpoint to DiscoveryService"),
-                                                            Err(error) => tracing::warn!("Failed to announce QUIC endpoint: {error}"),
-                                                        }
+                                                        let _completion = refresh_native_announcement(
+                                                            &service_name,
+                                                            &socket_kind,
+                                                            &endpoint,
+                                                            // Authority/JWT expiry is rechecked for each attempt.
+                                                            // Never retain the original deadline after renewal.
+                                                            i64::MAX,
+                                                            request.cancellation.clone(),
+                                                            || {
+                                                                let announcement = hyprstream_core::services::factories::current_native_announcement(&mut request);
+                                                                let client = &client;
+                                                                async move {
+                                                                    let announcement = announcement?;
+                                                                    client.announce(&announcement).await.map(|_| ())
+                                                                }
+                                                            },
+                                                        )
+                                                        .await;
                                                     });
                                                 });
                                             },
@@ -3424,6 +3575,99 @@ fn main() -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod resolver_startup_controls {
+    const REFRESH_SCHEDULER_TURNS: usize = 32;
+
+    async fn assert_publication_ready(
+        published_rx: &mut tokio::sync::mpsc::UnboundedReceiver<usize>,
+        expected: usize,
+        label: &str,
+    ) {
+        for _ in 0..REFRESH_SCHEDULER_TURNS {
+            match published_rx.try_recv() {
+                Ok(publication) => {
+                    assert_eq!(publication, expected, "{label}");
+                    return;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("{label}: production refresh task exited before publishing");
+                }
+            }
+        }
+        panic!("{label}: publication was not ready after bounded scheduler turns");
+    }
+
+    async fn publication_ready(
+        published_rx: &mut tokio::sync::mpsc::UnboundedReceiver<usize>,
+        label: &str,
+    ) -> Option<usize> {
+        for _ in 0..REFRESH_SCHEDULER_TURNS {
+            match published_rx.try_recv() {
+                Ok(publication) => return Some(publication),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("{label}: production refresh task exited before publishing");
+                }
+            }
+        }
+        None
+    }
+
+    async fn assert_no_publication_ready(
+        published_rx: &mut tokio::sync::mpsc::UnboundedReceiver<usize>,
+        label: &str,
+    ) {
+        for _ in 0..REFRESH_SCHEDULER_TURNS {
+            match published_rx.try_recv() {
+                Ok(publication) => panic!("{label}: unexpected publication {publication}"),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("{label}: production refresh task exited unexpectedly");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checkpointed_moq_services_cannot_share_a_process_dial_proof() {
+        let err = super::select_single_process_moql_admission_proof(vec![
+            ("inference".to_owned(), Some(1_u8)),
+            ("registry".to_owned(), Some(2_u8)),
+        ])
+        .expect_err("different checkpointed services need separate dialers");
+        assert!(err.to_string().contains("separate process"));
+
+        let err = super::select_single_process_moql_admission_proof(vec![
+            ("inference".to_owned(), Some(1_u8)),
+            ("metrics".to_owned(), None),
+        ])
+        .expect_err("a proof cannot be inherited by an unauthenticated service");
+        assert!(err.to_string().contains("service-scoped"));
+
+        assert_eq!(
+            super::select_single_process_moql_admission_proof(vec![
+                ("inference".to_owned(), Some(7_u8)),
+            ])
+            .expect("one service has one scoped proof"),
+            Some(7),
+        );
+    }
+
+    #[test]
+    fn quinn_only_multi_service_startup_never_selects_an_iroh_proof() {
+        let selected = super::select_iroh_moql_admission_proof::<u8>(false, || {
+            panic!("Quinn-only startup must not inspect Iroh admission proofs")
+        })
+        .expect("Quinn-only profile does not need an Iroh proof");
+        assert_eq!(selected, None);
+    }
+
     #[test]
     fn command_and_service_processes_install_before_consumers() {
         let source = include_str!("main.rs");
@@ -3531,4 +3775,243 @@ mod resolver_startup_controls {
             2
         );
     }
+
+    #[tokio::test]
+    async fn native_announcement_refresh_loop_publishes_immediately_and_after_two_intervals() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use std::time::Duration;
+
+        tokio::time::pause();
+        // Tokio's timer wheel rounds an unaligned sleep deadline up to its next
+        // millisecond tick. Align before establishing the cadence baseline;
+        // each refresh then has an explicit one-tick observation window.
+        tokio::time::sleep(Duration::ZERO).await;
+        let initial_time = tokio::time::Instant::now();
+        let just_before_refresh = Duration::from_secs(24) + Duration::from_millis(999);
+        let timer_tick = Duration::from_millis(1);
+        let publications = Arc::new(AtomicUsize::new(0));
+        let (published_tx, mut published_rx) = tokio::sync::mpsc::unbounded_channel();
+        let observed_publications = Arc::clone(&publications);
+        let task = tokio::spawn(async move {
+            super::refresh_native_announcement(
+                "model",
+                "iroh",
+                "iroh://test-node",
+                chrono::Utc::now().timestamp_millis() + 60_000,
+                tokio_util::sync::CancellationToken::new(),
+                move || {
+                    let publication = observed_publications.fetch_add(1, Ordering::SeqCst) + 1;
+                    published_tx
+                        .send(publication)
+                        .expect("test receiver remains live");
+                    async { Ok::<(), std::convert::Infallible>(()) }
+                },
+            )
+            .await
+        });
+
+        assert_publication_ready(&mut published_rx, 1, "initial production publish").await;
+        assert_no_publication_ready(&mut published_rx, "duplicate immediate publish").await;
+        assert_eq!(tokio::time::Instant::now(), initial_time);
+
+        tokio::time::advance(just_before_refresh).await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            initial_time + just_before_refresh
+        );
+        assert_no_publication_ready(&mut published_rx, "refresh before 25 virtual seconds").await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            initial_time + just_before_refresh
+        );
+        tokio::time::advance(timer_tick).await;
+        let first_nominal_wake = initial_time + Duration::from_secs(25);
+        let second_wake =
+            match publication_ready(&mut published_rx, "25-second production refresh").await {
+                Some(publication) => {
+                    assert_eq!(publication, 2, "25-second production refresh");
+                    tokio::time::Instant::now()
+                }
+                None => {
+                    tokio::time::advance(timer_tick).await;
+                    assert_publication_ready(&mut published_rx, 2, "25-second production refresh")
+                        .await;
+                    tokio::time::Instant::now()
+                }
+            };
+        assert!(
+            second_wake >= first_nominal_wake && second_wake <= first_nominal_wake + timer_tick,
+            "production refresh must occur at its 25-second cadence or within one Tokio timer tick"
+        );
+        assert_no_publication_ready(&mut published_rx, "duplicate 25-second refresh").await;
+        assert_eq!(tokio::time::Instant::now(), second_wake);
+
+        tokio::time::advance(just_before_refresh).await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            second_wake + just_before_refresh
+        );
+        assert_no_publication_ready(&mut published_rx, "refresh before 50 virtual seconds").await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            second_wake + just_before_refresh
+        );
+        tokio::time::advance(timer_tick).await;
+        let second_nominal_wake = second_wake + Duration::from_secs(25);
+        let third_wake =
+            match publication_ready(&mut published_rx, "50-second production refresh").await {
+                Some(publication) => {
+                    assert_eq!(publication, 3, "50-second production refresh");
+                    tokio::time::Instant::now()
+                }
+                None => {
+                    tokio::time::advance(timer_tick).await;
+                    assert_publication_ready(&mut published_rx, 3, "50-second production refresh")
+                        .await;
+                    tokio::time::Instant::now()
+                }
+            };
+        assert!(
+            third_wake >= second_nominal_wake && third_wake <= second_nominal_wake + timer_tick,
+            "next production refresh must use the prior actual wake and stay within one Tokio timer tick"
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            third_wake
+        );
+        assert_eq!(publications.load(Ordering::SeqCst), 3);
+
+        task.abort();
+        assert!(task.await.expect_err("refresh task is cancelled").is_cancelled());
+    }
+
+    async fn expired_announcement_must_not_run() -> Result<(), std::convert::Infallible> {
+        panic!("expired production refresh loop attempted an announcement");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_announcement_refresh_loop_shutdown_cannot_overwrite_restart() {
+        use std::sync::Arc;
+        use parking_lot::Mutex;
+        let publications = Arc::new(Mutex::new(Vec::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let old_cancel = tokio_util::sync::CancellationToken::new();
+        let new_cancel = tokio_util::sync::CancellationToken::new();
+        let spawn = |endpoint: &'static str, cancellation| {
+            let publications = Arc::clone(&publications);
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                super::refresh_native_announcement(
+                    "model", "quic", endpoint, i64::MAX, cancellation,
+                    move || {
+                        publications.lock().push(endpoint);
+                        tx.send(endpoint).expect("publication receiver");
+                        async { Ok::<(), std::convert::Infallible>(()) }
+                    },
+                ).await
+            })
+        };
+        let old = spawn("quic://old:10001", old_cancel.clone());
+        assert_eq!(rx.recv().await, Some("quic://old:10001"));
+        old_cancel.cancel();
+        assert_eq!(old.await.expect("old task"), super::NativeAnnouncementRefreshCompletion::Cancelled);
+        let new = spawn("quic://new:10002", new_cancel.clone());
+        assert_eq!(rx.recv().await, Some("quic://new:10002"));
+        tokio::time::advance(std::time::Duration::from_secs(26)).await;
+        assert_eq!(rx.recv().await, Some("quic://new:10002"));
+        new_cancel.cancel();
+        assert_eq!(new.await.expect("new task"), super::NativeAnnouncementRefreshCompletion::Cancelled);
+        assert_eq!(
+            *publications.lock(),
+            vec!["quic://old:10001", "quic://new:10002", "quic://new:10002"],
+        );
+    }
+
+    #[tokio::test]
+    async fn native_announcement_refresh_loop_cancels_in_flight_publish() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let completed = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            let completed = Arc::clone(&completed);
+            let mut started_tx = Some(started_tx);
+            async move {
+                super::refresh_native_announcement(
+                    "model", "iroh", "iroh://test", i64::MAX, cancellation,
+                    move || {
+                        let started = started_tx.take();
+                        let completed = Arc::clone(&completed);
+                        async move {
+                            if let Some(started) = started { let _ = started.send(()); }
+                            std::future::pending::<()>().await;
+                            completed.store(true, Ordering::SeqCst);
+                            Ok::<(), std::convert::Infallible>(())
+                        }
+                    },
+                ).await
+            }
+        });
+        started_rx.await.expect("publish started");
+        cancellation.cancel();
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await.expect("cancellation must not wait for RPC completion").expect("task");
+        assert_eq!(completion, super::NativeAnnouncementRefreshCompletion::Cancelled);
+        assert!(!completed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_announcement_refresh_loop_backoff_starts_at_five_and_resets_after_success() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            let mut attempt = 0;
+            async move {
+                super::refresh_native_announcement(
+                    "model", "iroh", "iroh://test", i64::MAX, cancellation,
+                    move || {
+                        attempt += 1;
+                        sent.send(tokio::time::Instant::now()).expect("receiver live");
+                        let success = attempt == 5;
+                        async move { if success { Ok(()) } else { Err("retry fixture") } }
+                    },
+                ).await
+            }
+        });
+        let mut previous = received.recv().await.expect("initial attempt");
+        for seconds in [5, 10, 20, 25, 25, 5, 10] {
+            let current = received.recv().await.expect("next attempt");
+            let elapsed = current.duration_since(previous);
+            let expected = std::time::Duration::from_secs(seconds);
+            assert!(elapsed >= expected && elapsed <= expected + std::time::Duration::from_millis(1),
+                "expected {expected:?} retry interval, got {elapsed:?}");
+            previous = current;
+        }
+        cancellation.cancel();
+        assert_eq!(task.await.expect("refresh task"), super::NativeAnnouncementRefreshCompletion::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn native_announcement_refresh_loop_stops_before_announce_after_absolute_expiry() {
+        let completion = super::refresh_native_announcement(
+            "model",
+            "iroh",
+            "iroh://test-node",
+            chrono::Utc::now().timestamp_millis() - 1,
+            tokio_util::sync::CancellationToken::new(),
+            expired_announcement_must_not_run,
+        )
+        .await;
+
+        assert_eq!(
+            completion,
+            super::NativeAnnouncementRefreshCompletion::Expired
+        );
+    }
+
 }

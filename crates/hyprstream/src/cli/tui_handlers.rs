@@ -124,7 +124,15 @@ async fn run_attach_loop(
     // `mac_key`+`topic` out of band), so the transport enc_key is never exercised
     // here — derive a stable one from mac_key purely to satisfy the consumer API.
     let enc_key = *hyprstream_rpc::crypto::StreamKeys::new(topic.clone(), mac_key).enc_key;
-    let mut handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, enc_key, topic);
+    let mut handle = MoqStreamHandle::networked_with_server_identity(
+        reach,
+        &qos,
+        broadcast_path,
+        mac_key,
+        enc_key,
+        topic,
+        stream_info.moql_server_identity.clone(),
+    );
     let recv_handle = tokio::spawn(async move {
         loop {
             match handle.recv_next().await {
