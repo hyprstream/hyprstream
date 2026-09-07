@@ -3183,8 +3183,8 @@ impl PolicyHandler for PolicyService {
         }
 
         // ── 5. Existing delegation chain must be bounded and fully labeled ──
-        // (well-formedness only — the source's top-level clearance is already
-        // the prior-hop meet, so intermediate act clearances are NOT re-folded).
+        // Reserve one hop for the terminal actor appended by this exchange.
+        // Every existing actor must be labeled; step 6 folds their clearances.
         const MAX_DELEGATION_HOPS: usize = 8;
         {
             let mut hop = source.act.as_ref();
@@ -3197,10 +3197,10 @@ impl PolicyHandler for PolicyService {
                     ));
                 }
                 depth += 1;
-                if depth > MAX_DELEGATION_HOPS {
+                if depth >= MAX_DELEGATION_HOPS {
                     return Ok(deny(
                         "MALFORMED_ACTOR_CHAIN",
-                        "source delegation chain exceeds the maximum hop depth",
+                        "delegation chain has no room for the terminal actor",
                     ));
                 }
                 hop = actor.act.as_deref();
@@ -6028,6 +6028,55 @@ mod exchange_delegated_tests {
                 matches!(resp, PolicyResponseVariant::ExchangeDelegatedResult(_)),
                 "two-hop source cnf must resolve against act.sub, got {resp:?}"
             );
+        }
+
+        /// The bound applies to the minted chain, including the new actor.
+        #[tokio::test]
+        async fn delegated_mint_reserves_terminal_actor_hop() {
+            ensure_revocation_store();
+            let now = chrono::Utc::now().timestamp();
+            register_active_sid(now).await;
+            let fx = fixture(Some(allow_authorizer()), None).await;
+            let actor_hs = hyprstream_rpc::auth::service_signer_suite_b64(
+                &fx.actor_ed.verifying_key().to_bytes(), None,
+            );
+            for existing_hops in [7, 8] {
+                let mut chain = None;
+                for index in 0..existing_hops {
+                    chain = Some(Box::new(hyprstream_rpc::auth::ActClaim {
+                        sub: if index == existing_hops - 1 {
+                            "service:mcp".to_owned()
+                        } else {
+                            format!("service:prior-{index}")
+                        },
+                        clearance: Some(CredentialClearance::from_label(label())),
+                        act: chain,
+                    }));
+                }
+                let claims = user_source_claims(&fx, now)
+                    .with_act(*chain.expect("nonempty source chain"))
+                    .with_cnf_jwk(&fx.actor_ed.verifying_key().to_bytes())
+                    .with_cnf_hs_signer_suite(actor_hs.clone());
+                let response = fx.service.handle_exchange_delegated(
+                    &actor_ctx(&fx, now), 1, &request(sign_source(&fx, &claims)),
+                ).await.expect("exchange returns a response");
+                if existing_hops == 8 {
+                    assert_eq!(err_code(&response), Some("MALFORMED_ACTOR_CHAIN"));
+                } else {
+                    let PolicyResponseVariant::ExchangeDelegatedResult(info) = response else {
+                        panic!("seven existing actors must permit one final actor");
+                    };
+                    let minted = hyprstream_rpc::auth::decode_unverified(&info.token)
+                        .expect("issued token parses");
+                    let mut depth = 0;
+                    let mut actor = minted.act.as_ref();
+                    while let Some(hop) = actor {
+                        depth += 1;
+                        actor = hop.act.as_deref();
+                    }
+                    assert_eq!(depth, 8, "issued chain includes the new terminal actor");
+                }
+            }
         }
 
         /// A user source whose primary is UNKNOWN to the resolver denies.
