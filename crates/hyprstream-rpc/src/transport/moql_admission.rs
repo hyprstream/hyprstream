@@ -764,6 +764,12 @@ impl MoqlAdmissionAuthenticator {
         }
     }
 
+    /// Share live authority, isolating each service's carrier identity and replay cache.
+    pub fn for_server(&self) -> Self {
+        Self::new(Arc::clone(&self.authority), Arc::clone(&self.tenant_resolver))
+            .with_timeout(self.timeout)
+    }
+
     /// Install the local accepted-state identity that signs server confirmation
     /// frames. A bare authenticator remains useful for unit decision tests but
     /// cannot admit a network tunnel.

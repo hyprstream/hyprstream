@@ -1080,7 +1080,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     // RegistryService publishes clone-progress streams via StreamChannel::run_stream
     // (which fails loudly if no moq origin is registered in this process).
     // Initialize this process's local moq plane. Idempotent.
-    init_local_moq_stream_plane("registry");
+    init_local_moq_stream_plane("registry", ctx.iroh_required());
 
     let config = load_config();
     let sk = ctx.service_signing_key("registry");
@@ -1209,8 +1209,8 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
 /// service, and stream-publisher services such as `tui`/`notification`/`registry`/
 /// `metrics`/`model`) needs its OWN moq plane in-process: the process-global
 /// [`MoqStreamOrigin`] that `StreamChannel::publisher()` appends into, plus a
-/// per-PID UDS moq server so a co-located client can connect directly to the
-/// path returned in the publisher's response.
+/// compatibility per-PID UDS server. Native required profiles initialize the
+/// process plane without sockets; each publisher is served by its own Iroh origin.
 ///
 /// In a multi-process (systemd one-process-per-service) deployment, only the
 /// `streams` factory used to do this, so other publisher processes had a `None`
@@ -1222,7 +1222,10 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
 /// without double-initializing the origin or double-serving the UDS. This lets
 /// it compose with the `streams` factory and with multiple publisher factories
 /// co-located in one process.
-fn init_local_moq_stream_plane(service_name: &str) {
+fn init_local_moq_stream_plane(service_name: &str, iroh_required: bool) {
+    if iroh_required {
+        hyprstream_rpc::moq_stream::require_native_iroh();
+    }
     // Guard: a moq origin already exists in this process — nothing to do.
     if hyprstream_rpc::moq_stream::global_moq_origin().is_some() {
         return;
@@ -1252,6 +1255,10 @@ fn init_local_moq_stream_plane(service_name: &str) {
         return;
     }
 
+    // Native publishers are served by their service-owned Iroh handler.
+    if hyprstream_rpc::moq_stream::native_iroh_required() {
+        return;
+    }
     let moq_uds_path = {
         let dir = std::env::temp_dir().join(format!("hyprstream-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -1267,15 +1274,17 @@ fn init_local_moq_stream_plane(service_name: &str) {
 
 /// Factory for the moq stream origin (#138 N4 — ZMQ StreamService removed).
 ///
-/// Builds the process-global `MoqStreamOrigin`, registers it, and starts the
-/// UDS moq server so cross-process subscribers (e.g. `tui attach`) can
-/// subscribe over moq without any ZMQ sockets.
+/// Compatibility serves a local UDS plane. Required native mode owns an
+/// authenticated Iroh rendezvous origin and announces only its MoQ capability.
 #[service_factory("streams")]
-fn create_streams_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating moq stream origin (ZMQ StreamService removed)");
 
-    init_local_moq_stream_plane("streams");
+    init_local_moq_stream_plane("streams", ctx.iroh_required());
 
+    if ctx.iroh_required() {
+        return Ok(Box::new(crate::services::stream_network::StreamsNetworkService::new(ctx)?));
+    }
     Ok(Box::new(MoqStreamBarrierService::new()))
 }
 
@@ -1340,7 +1349,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     // ModelService spawns InferenceService instances in-process, which publish
     // generation streams via StreamChannel::run_stream (fails loudly without a
     // moq origin). Initialize this process's local moq plane. Idempotent.
-    init_local_moq_stream_plane("model");
+    init_local_moq_stream_plane("model", ctx.iroh_required());
 
     use crate::services::{ModelService, ModelServiceConfig};
 
@@ -2614,7 +2623,7 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     // StreamChannel::publisher(), and returns its per-PID moq UDS path to the
     // client. In a per-process deployment this process has no moq plane unless
     // we initialize one here. Idempotent — no-op if already set.
-    init_local_moq_stream_plane("tui");
+    init_local_moq_stream_plane("tui", ctx.iroh_required());
 
     let config = load_config();
     let tui_config = &config.tui;
@@ -2897,7 +2906,7 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     // MetricsService publishes query-result streams via StreamChannel::run_stream
     // (fails loudly without a moq origin). Initialize this process's local moq
     // plane. Idempotent.
-    init_local_moq_stream_plane("metrics");
+    init_local_moq_stream_plane("metrics", ctx.iroh_required());
 
     use crate::services::MetricsService;
     use hyprstream_metrics::query::QueryOrchestrator;
@@ -3380,6 +3389,24 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn required_stream_initializer_never_serves_uds() -> anyhow::Result<()> {
+        const CHILD: &str = "HYPRSTREAM_NATIVE_STREAM_INIT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "services::factories::tests::required_stream_initializer_never_serves_uds", "--nocapture"])
+                .env(CHILD, "1").status()?;
+            anyhow::ensure!(status.success(), "isolated native stream initializer failed");
+            return Ok(());
+        }
+        init_local_moq_stream_plane("model", true);
+        init_local_moq_stream_plane("registry", false);
+        assert!(hyprstream_rpc::moq_stream::global_moq_origin().is_some());
+        assert!(hyprstream_rpc::moq_stream::global_moq_uds_path().is_none());
+        assert!(hyprstream_rpc::moq_stream::native_iroh_required());
+        Ok(())
+    }
+
     /// `init_local_moq_stream_plane` sets both process-global moq state
     /// (`global_moq_origin` + `global_moq_uds_path`) and is idempotent: a second
     /// call is a no-op and must not panic (composes with the streams factory and
@@ -3394,7 +3421,7 @@ mod tests {
         use hyprstream_rpc::moq_stream::{global_moq_origin, global_moq_uds_path};
 
         // First call (or pre-set by another test) → plane is initialized.
-        init_local_moq_stream_plane("test");
+        init_local_moq_stream_plane("test", false);
         assert!(
             global_moq_origin().is_some(),
             "origin must be set after init_local_moq_stream_plane",
@@ -3407,7 +3434,7 @@ mod tests {
         let path_after_first = uds.map(std::path::Path::to_path_buf);
 
         // Second call must be a no-op (idempotent) — no panic, no change.
-        init_local_moq_stream_plane("test");
+        init_local_moq_stream_plane("test", false);
         assert!(global_moq_origin().is_some());
         assert_eq!(
             global_moq_uds_path().map(std::path::Path::to_path_buf),
