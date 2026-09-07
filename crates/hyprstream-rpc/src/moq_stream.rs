@@ -1513,18 +1513,23 @@ pub async fn connect_moq_reach_with_server_identity(
             continue;
         };
         had_dialable_network_reach = true;
-        let expected_server = if destination_identity_is_live(&dest.moql_server_identity) {
-            &dest.moql_server_identity
-        } else {
-            server_identity
+        // A relay is an independently operated server.  It may never borrow
+        // the producer witness attached to the enclosing StreamInfo; only a
+        // direct destination retains that narrowly-scoped legacy fallback.
+        let expected_server = match destination_server_identity(dest, server_identity) {
+            Ok(identity) => identity,
+            Err(error) => {
+                last_err = Some(error.to_string());
+                continue;
+            }
         };
         let dial = match (&cfg.endpoint, global_moq_admission_proof()) {
             (crate::transport::EndpointType::Iroh { .. }, Some(proof)) => {
-                if !destination_identity_is_live(expected_server) {
-                    Err(anyhow!(
+                match expected_server {
+                    None => Err(anyhow!(
                         "iroh moql reach lacks a live resolver-verified server witness"
-                    ))
-                } else {
+                    )),
+                    Some(expected_server) => {
                     // The process-global proof is this client's local accepted
                     // identity. The signed StreamInfo supplies the *remote*
                     // server witness for this particular dial; never reuse the
@@ -1532,6 +1537,7 @@ pub async fn connect_moq_reach_with_server_identity(
                     let mut proof = proof.clone();
                     proof.expected_server = expected_server.clone();
                     crate::dial::dial_stream_authenticated(&cfg, &proof).await
+                    }
                 }
             }
             (crate::transport::EndpointType::Iroh { .. }, None) => Err(anyhow::anyhow!(
@@ -1587,6 +1593,23 @@ pub async fn connect_moq_reach_with_server_identity(
             .map(|e| format!(" (last dial error: {e})"))
             .unwrap_or_default()
     ))
+}
+
+/// Select the server accepted-state witness for exactly one destination.
+/// Direct legacy entries may use the authenticated enclosing producer witness;
+/// relays must carry their own current witness because their carrier endpoint
+/// is not the producer's application identity.
+fn destination_server_identity<'a>(
+    destination: &'a crate::stream_info::Destination,
+    enclosing: &'a crate::stream_info::MoqlServerIdentity,
+) -> Result<Option<&'a crate::stream_info::MoqlServerIdentity>> {
+    if destination_identity_is_live(&destination.moql_server_identity) {
+        return Ok(Some(&destination.moql_server_identity));
+    }
+    if destination.role == crate::stream_info::Role::Relay {
+        anyhow::bail!("relay moql reach lacks a live resolver-verified relay witness");
+    }
+    Ok(destination_identity_is_live(enclosing).then_some(enclosing))
 }
 
 fn destination_identity_is_live(identity: &crate::stream_info::MoqlServerIdentity) -> bool {
@@ -3081,6 +3104,34 @@ mod tests {
             independent_relay.moql_server_identity.did.is_empty(),
             "an independent relay without resolver evidence must fail closed, not borrow \
              the server-default relay witness"
+        );
+    }
+
+    /// A live enclosing producer witness authenticates only a direct legacy
+    /// destination.  An independently operated relay with no own witness is
+    /// rejected before any carrier dial is attempted.
+    #[test]
+    fn relay_without_witness_cannot_borrow_live_producer_authority() {
+        let producer = accepted_server_identity("did:at9p:producer", 0x11);
+        let relay = relay_quic("127.0.0.1:4433");
+        let error = destination_server_identity(&relay, &producer)
+            .expect_err("relay without its own resolver witness must reject");
+        assert!(error.to_string().contains("relay witness"));
+
+        let direct = Destination {
+            role: Role::Direct,
+            transport: ReachTransport::Quic(QuicReach {
+                addr: "127.0.0.1:4434".to_owned(),
+                server_name: "producer".to_owned(),
+                cert_hashes: vec![vec![0u8; 32]],
+            }),
+            moql_server_identity: Default::default(),
+        };
+        assert_eq!(
+            destination_server_identity(&direct, &producer)
+                .expect("direct legacy fallback remains valid")
+                .expect("live producer witness"),
+            &producer,
         );
     }
 
