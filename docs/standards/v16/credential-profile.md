@@ -278,7 +278,10 @@ backed by an idempotency/result ledger whose lookup binds the retrying principal
   by trusting any stored value. A conforming verifier admits an approver group only
   when its enrollment resolves to an **active, unexpired** record with the
   **`approver` role**, a `tenant` coherent with the credential, and an enrollment
-  epoch; an unknown, tampered, key/suite-mismatched, inactive, expired,
+  epoch. Each record must identify a non-empty `principal`, distinct from the
+  credential's terminal primary principal and every other approver principal;
+  distinct keys owned by one principal cannot satisfy a two-principal policy.
+  An unknown, tampered, key/suite-mismatched, inactive, expired,
   cross-tenant, or wrong-role enrollment denies. Being merely *different from `cnf`*
   is insufficient — an unenrolled group is not an authorized approver.
 - **Primary enrollment authority (T1).** The `cnf`-bound primary group is itself

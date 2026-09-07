@@ -76,6 +76,7 @@ from check_proof_vectors import (  # noqa: E402
     validate_signer_suite_confirmation,
     cwt_revocation_control_errors,
     validate_classical_cwt, decode_proof_object,
+    credential_metadata_errors, parse_proof_suite,
 )
 
 # ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
@@ -686,6 +687,25 @@ def gate_caps(cddl: str, positives, negatives) -> None:
     # N-52 is the SEPARATE suite_id size-boundary (O1); N-12 is now registry-only.
     over_cap("N-52", lambda h: max((len(s.encode()) for s in kids_and_suites(h)[1]), default=0),
              SUITE_KID_MAX, "suite_id")
+    # N-52 is unknown as well as oversized. Prove the actual parser rejects at
+    # size admission before registry lookup can mask a missing byte limit.
+    from unittest.mock import patch
+    suite52 = kids_and_suites(by_id["N-52"]["cbor_hex"])[1][0]
+    with patch("check_proof_vectors.registered_proof_suite",
+               side_effect=AssertionError("registry reached before suite-size rejection")):
+        for suite in (suite52, "", "é" * 33):
+            try:
+                parse_proof_suite(suite)
+                check(False, "invalid suite size admitted")
+            except StrictError as exc:
+                check(str(exc) == "proof suite ID must contain 1..64 UTF-8 bytes",
+                      f"suite-size control must reject before registry lookup: {exc}")
+    with patch("check_proof_vectors.registered_proof_suite", side_effect=lambda suite: suite) as registry:
+        for suite in ("h", "h" * 64, "é" * 32):
+            check(parse_proof_suite(suite) == suite, "within-bound suite must reach registry")
+        check(registry.call_count == 3, "suite-size boundary controls must reach registry")
+    for suite in (SUITE_CLASSICAL, SUITE_HYBRID):
+        check(parse_proof_suite(suite) == suite, "registered suite positive must admit")
     over_cap("N-13", lambda h: max((len(k) for k in kids_and_suites(h)[0]), default=0),
              SUITE_KID_MAX, "kid")
     over_cap("N-26", lambda h: len(claims_of(h)[C_AUD].encode()),
@@ -2057,7 +2077,13 @@ def _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=None, ex
 
 
 def _load_credentials():
-    return json.loads((VECTORS_DIR / "proof-v1-credentials.json").read_text())
+    creds = json.loads((VECTORS_DIR / "proof-v1-credentials.json").read_text())
+    errors = credential_metadata_errors(creds)
+    if errors:
+        for error in errors:
+            print(f"FAIL: {error}")
+        raise SystemExit(1)  # Never let unsigned metadata supply a request context.
+    return creds
 
 
 def _keymaps():
@@ -2170,6 +2196,14 @@ def gate_verifier_clock(positives, negatives) -> None:
 def gate_response_signer(positives, negatives) -> None:
     section("Z1. Audience-bound response-signer authorization")
     creds = _load_credentials()
+    from copy import deepcopy
+    # Only unsigned metadata changes; the compact signed credential is intact.
+    metadata_swap = deepcopy(creds)
+    metadata_swap["credentials"]["classical"]["claims"]["tenant"] = "tenant-beta"
+    check(any("metadata claims differ" in e for e in credential_metadata_errors(metadata_swap)),
+          "unsigned response tenant swap must deny before any context is consumed")
+    metadata_swap["credentials"]["classical"]["claims"]["tenant"] = creds["credentials"]["classical"]["claims"]["tenant"]
+    check(not credential_metadata_errors(metadata_swap), "corrected metadata must admit unchanged credentials")
     now = creds["verifier_now"]
     ed_by_kid, ml_by_kid = _keymaps()
 
@@ -2656,11 +2690,16 @@ def gate_credential_context(positives, negatives) -> None:
     plan5 = decode(obj5[0]).get(H_PLAN) or []
     approver_groups = [g for g in plan5 if group_thumbprint(g) != cnf_classical]
     check(approver_groups, "P-5 must carry at least one additional (approver) signer group")
+    primary_principal, errors = terminal_signer_principal(creds["credentials"]["classical"]["claims"])
+    check(not errors, f"P-5 terminal principal must be valid: {errors}")
+    occupied_principals = {primary_principal}
     for grp in approver_groups:
         tpb = _b64u(group_thumbprint(grp))
         rec = resolve_approver_enrollment(creds, tpb)
-        e = validate_approver_enrollment(rec, tpb, cred_tenant, now)
+        e = validate_approver_enrollment(rec, tpb, cred_tenant, now, occupied_principals)
         check(not e, f"P-5 approver group (group_id {grp[1]}) must resolve a valid enrollment: {e}")
+        if rec is not None and isinstance(rec.get("principal"), str):
+            occupied_principals.add(rec["principal"])
     print(f"   Q1 P-5 approver group(s) validated against the authoritative approver enrollment "
           f"(content-recomputed; role/tenant/status/expiry/epoch); cnf resolves to the primary only")
 
@@ -2670,12 +2709,19 @@ def gate_credential_context(positives, negatives) -> None:
     base_rec = resolve_approver_enrollment(creds, approver_tp)
 
     def enroll_red(label, rec, req=approver_tp):
-        e = validate_approver_enrollment(rec, req, cred_tenant, now)
+        e = validate_approver_enrollment(rec, req, cred_tenant, now, {primary_principal})
         check(bool(e), f"Q1 approver counter '{label}' must deny but validated clean")
         if e:
             print(f"   Q1 approver counter '{label}' denies: {e[0]}")
 
     enroll_red("unknown enrollment", None)
+    enroll_red("missing principal", {k: v for k, v in base_rec.items() if k != "principal"})
+    enroll_red("empty principal", {**base_rec, "principal": ""})
+    enroll_red("same principal as primary with distinct enrolled keys", {**base_rec, "principal": primary_principal})
+    duplicate_errors = validate_approver_enrollment(base_rec, approver_tp, cred_tenant, now,
+                                                   {primary_principal, base_rec["principal"]})
+    check(any("differ from" in e for e in duplicate_errors),
+          "a second approver owned by an already occupied principal must deny")
     enroll_red("tampered thumbprint_b64", {**base_rec, "thumbprint_b64": _b64u(b"\x00" * 32)})
     enroll_red("inactive status", {**base_rec, "status": "inactive"})
     enroll_red("revoked status", {**base_rec, "status": "revoked"})

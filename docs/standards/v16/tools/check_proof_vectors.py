@@ -264,7 +264,8 @@ def resolve_approver_enrollment(creds_doc, requested_thumbprint_b64):
     return None
 
 
-def validate_approver_enrollment(rec, requested_thumbprint_b64, expected_tenant, now):
+def validate_approver_enrollment(rec, requested_thumbprint_b64, expected_tenant, now,
+                                occupied_principals):
     """Q1: an additional (approver) signer group MUST resolve to an authoritative
     enrollment (credential-profile §5) whose OWN suite/keys recompute to the
     requested content thumbprint (record integrity + key/suite binding), that is an
@@ -275,6 +276,11 @@ def validate_approver_enrollment(rec, requested_thumbprint_b64, expected_tenant,
     if rec is None:
         return ["no authoritative approver enrollment for this signer-suite record"]
     errs = []
+    principal = rec.get("principal")
+    if not isinstance(principal, str) or not principal.strip():
+        errs.append("approver enrollment principal must be non-empty text")
+    elif principal in occupied_principals:
+        errs.append("approver principal must differ from the primary and every other approver")
     recomputed = _enrollment_thumbprint(rec)
     if recomputed is None:
         return ["approver enrollment record has a malformed suite_id / public keys"]
@@ -747,6 +753,38 @@ def configured_issuer(creds_doc):
     return (creds_doc.get("issuer") or {}).get("iss")
 
 
+def credential_metadata_errors(creds_doc):
+    """Unsigned fixture claim copies must equal the signed payload before use.
+
+    Compare canonical JSON bytes so bool/int equality cannot hide a type change.
+    Actual signature/profile verification remains mandatory in both callers.
+    """
+    errors = []
+    for name, credential in creds_doc["credentials"].items():
+        try:
+            _, payload, _ = credential["token"].split(".")
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            canonical = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"))
+            if not isinstance(claims, dict) or canonical(claims) != canonical(credential["claims"]):
+                errors.append(f"credential {name}: metadata claims differ from signed payload")
+        except (ValueError, TypeError, KeyError):
+            errors.append(f"credential {name}: malformed signed payload or claim metadata")
+    return errors
+
+
+def registered_proof_suite(suite):
+    if suite not in ("hs-cose-sign-ed25519-v1", "hs-cose-sign-ed25519-mldsa65-wns-v1"):
+        raise StrictError("unknown proof suite")
+    return suite
+
+
+def parse_proof_suite(suite):
+    """Enforce the wire byte bound before the closed suite registry lookup."""
+    if not isinstance(suite, str) or not 1 <= len(suite.encode()) <= 64:
+        raise StrictError("proof suite ID must contain 1..64 UTF-8 bytes")
+    return registered_proof_suite(suite)
+
+
 def is_credential_revoked(creds_doc, iss, identifier, *, kind="jti"):
     """Exact typed identity: issuer + JWT jti text OR CWT cti raw bytes.
 
@@ -1087,6 +1125,11 @@ def main() -> None:
         if plan is None:
             fail(f"{vec['id']}: no signature_plan in the body protected headers")
             continue
+        for group in plan:
+            try:
+                parse_proof_suite(group.get(2))
+            except StrictError as exc:
+                fail(f"{vec['id']}: {exc}")
         components = plan_components(plan)
         # B2: every (alg, kid) pair is unique across the whole plan, regardless
         # of group ID — one key must not sign under two logical groups.
@@ -1307,6 +1350,12 @@ def main() -> None:
         fail("proof-v1-credentials.json is missing (F2 authenticated credential context)")
     else:
         cd = json.loads(cred_path.read_text())
+        metadata_errors = credential_metadata_errors(cd)
+        if metadata_errors:
+            for error in metadata_errors:
+                fail(error)
+                print(f"FAIL: {error}")
+            raise SystemExit(1)  # No context may consume an unbound claim copy.
         for error in cwt_revocation_control_errors(cd, negative):
             fail(error)
         now = cd.get("verifier_now")
@@ -1512,6 +1561,7 @@ def main() -> None:
             # primary cnf group — must validate against an authoritative approver
             # enrollment record (§5).
             cred_tenant = cred_claims.get("tenant")
+            occupied_principals = {c_princ}
             for grp in plan:
                 pubs, ok = [], True
                 for comp in grp[3]:
@@ -1526,8 +1576,10 @@ def main() -> None:
                 if gtp == cred_claims["cnf"]["hs_signer_suite"]:
                     continue  # the primary cnf group
                 rec = resolve_approver_enrollment(cd, gtp)
-                for e in validate_approver_enrollment(rec, gtp, cred_tenant, now):
+                for e in validate_approver_enrollment(rec, gtp, cred_tenant, now, occupied_principals):
                     fail(f"{pid} approver group_id {grp[1]}: {e}")
+                if rec is not None and isinstance(rec.get("principal"), str):
+                    occupied_principals.add(rec["principal"])
             # K1: proof exp <= credential exp, and for a sid-bearing credential also
             # <= the authoritative session exp. B1: the credential exp must be a valid
             # NumericDate before the comparison (a bad type is a clean denial, never a

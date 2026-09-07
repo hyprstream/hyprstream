@@ -2717,6 +2717,7 @@ def main() -> None:
                 "component_public_keys_hex": [approver_ed_pub.hex()],
                 "thumbprint_b64": b64u(signer_suite_thumbprint(SUITE_CLASSICAL, [approver_ed_pub])),
                 "role": "approver",
+                "principal": "approver-1",
                 "tenant": CREDENTIAL_TENANT,
                 "status": "active",
                 # Authoritative validity window checked against the injected
