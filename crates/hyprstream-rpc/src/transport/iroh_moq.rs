@@ -266,6 +266,13 @@ impl IrohMoqProtocolHandler {
         self
     }
 
+    /// Query the installed ingress decision. This is intentionally the same
+    /// decision the accept path uses when choosing its scoped writable origin.
+    /// It keeps service-spawner wiring testable without exposing handler state.
+    pub fn authorizes_ingress(&self, peer: &PeerIdentity, tenant: &str) -> bool {
+        self.inner.authz.authorizes_ingress(peer, tenant)
+    }
+
     /// Override the server-wide accepted-connection cap. Connections beyond
     /// the cap are dropped instead of waiting for admission.
     pub fn with_connection_limit(mut self, connection_limit: usize) -> Self {
