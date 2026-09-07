@@ -74,7 +74,7 @@ from check_proof_vectors import (  # noqa: E402
     resolve_response_signer_enrollments, validate_response_signer_enrollment,
     response_context_bindings,
     validate_signer_suite_confirmation,
-    cwt_revocation_control_errors,
+    cwt_revocation_control_errors, cwt_workload_session_control_errors,
     validate_classical_cwt, decode_proof_object,
     credential_metadata_errors, parse_proof_suite,
 )
@@ -2604,8 +2604,16 @@ def gate_credential_context(positives, negatives) -> None:
                                             "act": {"sub": "svc-0", "clearance": [3, [5, 7, 9]]}}})
     check(not e2 and meet2 == [1, [5]],
           f"X3 a higher-clearance inner hop must not widen the meet, got {meet2} {e2}")
+    # X3: an explicit JSON-null hop clearance is PRESENT, not absent (presence is
+    # the key test) — a malformed signed hop must fail closed and compose nothing,
+    # never bypass clearance meet composition by collapsing to absence.
+    rejected_single("X3 null act hop clearance",
+                    _make_jwt(hdr, {**base_claims, "act": {"sub": "svc-1", "clearance": None}}, sk_i), "act")
+    _eff, null_errs = validate_act_chain({**base_claims, "act": {"sub": "svc-1", "clearance": None}})
+    check(bool(null_errs),
+          f"X3 a present-null hop clearance must error, never collapse to absence: {null_errs}")
     print("   X3 delegated-chain clearance meet narrows (min level, intersect compartments); "
-          "inner hops cannot widen")
+          "inner hops cannot widen; present-null hop clearance denies")
     # Z2: iat/exp must be integer NumericDate (Unix seconds; bool excluded). A boolean,
     # string, null, or float timestamp denies CLEANLY (no exception, no incidental
     # time-window failure) — each single-cause on that claim.
@@ -2628,6 +2636,12 @@ def gate_credential_context(positives, negatives) -> None:
     cwt_errors = cwt_revocation_control_errors(creds, negatives)
     check(not cwt_errors, f"typed CWT revocation controls must pass: {cwt_errors}")
     print("   CWT revocation: signed byte-cti credential denies, record-only correction admits; JWT/issuer namespaces stay distinct")
+    # 6d. Y1/Y2 on the CWT layer: a classical CWT carrying the permitted -70007
+    #     workload-session claim must resolve its authoritative workload session —
+    #     it is never silently treated as sessionless.
+    cwt_ws_errors = cwt_workload_session_control_errors(creds)
+    check(not cwt_ws_errors, f"signed CWT workload-session controls must pass: {cwt_ws_errors}")
+    print("   CWT workload sessions: valid -70007 admits; revoked/expired/wrong-kind/cross-tenant/present-null deny, each single-field repair admits")
     #     whose (iss, jti) is listed in the authoritative revocation store, prove it
     #     passes signature/profile validation, then prove the (iss, jti) lookup
     #     denies it (it would pass a verifier that ignored the normative rule).

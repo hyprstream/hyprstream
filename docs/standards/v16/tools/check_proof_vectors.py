@@ -21,6 +21,7 @@ Usage:  python3 check_proof_vectors.py [vectors_dir]
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import subprocess
@@ -476,10 +477,12 @@ def validate_act_chain(claims):
     effective clearance meet (credential-profile.md: "each hop composes into the
     clearance meet"). The top-level `act` is the terminal/current actor; each nested
     `act` inside it is a prior actor (RFC 8693 §4.1). EVERY hop MUST be an object with
-    a non-empty (non-whitespace) string `sub`; every hop's `clearance`, when present,
-    MUST be a valid clearance and is composed by meet into the effective clearance,
-    starting from the credential's own clearance. Returns (effective_clearance_or_None,
-    errors); any malformed hop fails closed. v16 validates EVERY hop (not single-hop)."""
+    a non-empty (non-whitespace) string `sub`; every hop's `clearance`, when present
+    (presence is the KEY test — an explicit JSON null is present and malformed, never
+    absent), MUST be a valid clearance and is composed by meet into the effective
+    clearance, starting from the credential's own clearance. Returns
+    (effective_clearance_or_None, errors); any malformed hop fails closed. v16
+    validates EVERY hop (not single-hop)."""
     errs = []
     base = claims.get("clearance") if isinstance(claims, dict) else None
     eff = base if isinstance(base, list) else None
@@ -501,8 +504,11 @@ def validate_act_chain(claims):
         s = hop.get("sub")
         if not isinstance(s, str) or not s or s.strip() == "":
             errs.append(f"act hop {depth} sub must be a non-empty string, got {s!r}")
-        hc = hop.get("clearance")
-        if hc is not None:
+        # Presence is the KEY test, never the value: an explicit JSON-null hop
+        # clearance is a PRESENT malformed claim, not an absent one — it fails
+        # closed and composes nothing, never silently skips the meet.
+        if "clearance" in hop:
+            hc = hop["clearance"]
             hce = validate_clearance_shape(hc)
             if hce:
                 errs.extend(f"act hop {depth} clearance: {e}" for e in hce)
@@ -851,6 +857,24 @@ def validate_classical_cwt(raw, creds_doc, expected_aud):
     errors = validate_tenant(claims[-70005]) + validate_clearance_shape(claims[-70006])
     if -70008 in claims:
         errors.append("CWT must not carry the deferred credential use-profile claim")
+    # §3.3/Y1/Y2: a present -70007 workload-session claim is never ignored. The
+    # credential must resolve its authoritative session in the disjoint
+    # (iss, workload_session_id) namespace — kind 'workload', active, non-expired,
+    # created-coherent, (iss/sub/tenant)-bound, clearance_epoch'd — or deny. A
+    # credential with NO such claim is sessionless; a PRESENT claim (even JSON
+    # null) must type-check first (Y2), never silently degrade to sessionless.
+    if -70007 in claims:
+        ws = claims[-70007]
+        if not isinstance(ws, str) or not ws.strip():
+            errors.append("CWT workload_session_id (-70007) must be a non-empty opaque string when present")
+        else:
+            _s, ws_errs = validate_session(creds_doc, {
+                "iss": claims[1],
+                "sub": claims[2],
+                "tenant": claims[-70005],
+                "workload_session_id": ws,
+            }, now)
+            errors.extend(f"workload session (-70007): {e}" for e in ws_errs)
     cnf = claims[8]
     key = cnf.get(1) if isinstance(cnf, dict) and set(cnf) == {1} else None
     if (not isinstance(key, dict) or not {1, -1, -2} <= key.keys()
@@ -905,6 +929,59 @@ def cwt_revocation_control_errors(creds_doc, negatives):
                 errors.append("CWT revocation must not cross issuer namespaces")
         elif not is_credential_revoked(creds_doc, claims[1], claims[7].decode(), kind="jti"):
             errors.append("live CWT bytes must remain distinct from the revoked same-spelling JWT jti")
+    return errors
+
+
+def cwt_workload_session_control_errors(creds_doc):
+    """Signed CWT workload-session controls (§3.3/Y1/Y2): the valid -70007
+    credential resolves its authoritative workload session and admits; each defect
+    control (revoked / expired / wrong-kind / cross-tenant session record, or a
+    present-null claim) denies on that sole cause. For every store-state defect,
+    repairing ONLY the defective session field must admit the unchanged signed
+    credential — the session record, not the credential, carried the cause."""
+    controls = creds_doc.get("cwt_workload_session_controls", [])
+    expected = ["valid", "revoked", "expired", "wrong_kind", "cross_tenant", "present_null"]
+    if [c.get("expect") for c in controls] != expected:
+        return ["CWT workload-session controls must be the full valid/defect set"]
+    errors = []
+    expected_aud = creds_doc["credentials"]["classical"]["claims"]["aud"]
+    sole_cause = {
+        "revoked": "not active (revoked)",
+        "expired": "not active at verifier_now",
+        "wrong_kind": "session_kind",
+        "cross_tenant": "tenant",
+        "present_null": "must be a non-empty opaque string",
+    }
+    field_repairs = {
+        "revoked": {"status": "active"},
+        "expired": {"expiry": creds_doc["verifier_now"] + 1},
+        "wrong_kind": {"session_kind": "workload"},
+    }
+    for control in controls:
+        errs = validate_classical_cwt(bytes.fromhex(control["cbor_hex"]), creds_doc, expected_aud)[1]
+        if control["expect"] == "valid":
+            if errs:
+                errors.append(f"valid workload-session control must admit: {errs}")
+            continue
+        needle = sole_cause[control["expect"]]
+        if not errs or not all(needle in e for e in errs):
+            errors.append(f"{control['expect']} workload-session control must deny solely on that defect: {errs}")
+            continue
+        if control["expect"] == "present_null":
+            continue  # claim-typed defect: sole-cause attribution IS the causality
+        signed_claims = decode(bytes.fromhex(control["cbor_hex"]))[2]
+        ws = decode(signed_claims)[-70007]
+        repaired = copy.deepcopy(creds_doc)
+        for s in repaired["sessions"]:
+            if s.get("workload_session_id") == ws:
+                if control["expect"] == "cross_tenant":
+                    s["tenant"] = decode(signed_claims)[-70005]
+                else:
+                    s.update(field_repairs[control["expect"]])
+        _, repair_errs = validate_classical_cwt(bytes.fromhex(control["cbor_hex"]), repaired, expected_aud)
+        if repair_errs:
+            errors.append(f"{control['expect']} workload-session control must admit when only that "
+                          f"session field is repaired: {repair_errs}")
     return errors
 
 

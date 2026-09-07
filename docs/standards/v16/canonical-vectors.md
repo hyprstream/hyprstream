@@ -199,6 +199,21 @@ Removing only the CWT revocation admits the unchanged credential, and a differen
 issuer does not match. JSON `cti_hex` is only a lossless representation of raw
 bytes in the authority fixture; it never becomes a JWT identifier.
 
+**CWT workload-session resolution (Y1 on the CWT layer).** A classical CWT
+carrying the permitted `-70007` workload-session claim is **never** treated as
+sessionless: the verifier resolves the authoritative session in the disjoint
+`(iss, workload_session_id)` namespace and requires it active, non-expired,
+`created`-coherent, `(iss/sub/tenant)`-bound, epoch-bearing, and `workload`-kind
+(credential-profile §3.3). The context ships issuer-signed controls, all binding
+the same workload-family claims and workload primary key and differing only in
+the `-70007` value (or its null type): the valid control resolves the shipped
+workload session and **admits**; the revoked, expired, wrong-kind, and
+cross-tenant controls each **deny** solely on that session record — repairing
+only that one field admits the unchanged signed credential — and a present-null
+`-70007` (Y2: presence is the key test, present-null is not absence) denies on
+the claim type itself. A credential with no `-70007` claim at all is the shipped
+N-1: sessionless by absence, not by a claim the verifier declined to read.
+
 **Encoding matrix (G1).** `cnf.hs_signer_suite` is a **JWT** confirmation method and
 binds a signer-suite record of any component count. A **CWT** `cnf` is a single
 RFC 8747 `COSE_Key` (claim 8) — it can pin exactly one key, so it binds a

@@ -196,6 +196,15 @@ SESSION_EXP = 1786000020
 WORKLOAD_SESSION_ID = "ws-family-3d90c1a7"
 WORKLOAD_SESSION_EXP = 1786000022
 WORKLOAD_SUBJECT = "workload-1"
+# Y1: signed-CWT-control sessions — each resolves EXACTLY ONE
+# cwt_workload_session_controls entry and is defective in exactly one field
+# (revoked / expired / wrong-kind / cross-tenant, §3.3), so that control's sole
+# denial cause and its store repair are both pinned. Distinct ids keep the one
+# shared session store from cross-contaminating controls.
+WORKLOAD_SESSION_REVOKED_ID = "ws-ctl-revoked-4c81"
+WORKLOAD_SESSION_EXPIRED_ID = "ws-ctl-expired-9d02"
+WORKLOAD_SESSION_WRONG_KIND_ID = "ws-ctl-kind-7a33"
+WORKLOAD_SESSION_CROSS_TENANT_ID = "ws-ctl-tenant-5e88"
 # W1: proof freshness at the frozen verifier clock (mac-1499-design-v16.md §4.5;
 # matches the landed C dispatch constants). All three bounds are VERIFIER-CLOCK
 # bounds, NOT issued-lifetime (`exp - iat`). A proof is fresh iff
@@ -1088,6 +1097,36 @@ def main() -> None:
         for ident, revoked in ((b"cred-revoked-1", False), (b"\xffcwt-revoked-1", True)):
             raw, _, _ = sign1(n1_protected, {**n1_claims, C_CTI: ident}, sk_i_ed)
             cwt_revocation_controls.append({"cbor_hex": raw.hex(), "expect_revoked": revoked})
+        # Y1: signed CWT workload-session controls (§3.3). Every control binds the
+        # same workload-family claims (sub workload-1, tenant-alpha, the workload
+        # cnf key) and differs ONLY in the -70007 session id (or the claim's null
+        # type), so each defect denies on that sole cause and its store repair
+        # admits. The valid control resolves the shipped workload session; a
+        # credential with NO -70007 claim at all is the shipped N-1 (sessionless).
+        workload_ws_claims = {
+            1: ISSUER_ISS,
+            2: WORKLOAD_SUBJECT,
+            C_AUD: SERVICE_DOMAIN,
+            C_EXP: EXP,
+            C_IAT: IAT,
+            C_CTI: bytes.fromhex("b7c1d2e3f405162738495a6b7c8d9e0f"),
+            8: {1: cose_key_okp_ed25519(
+                KID_CLIENT_ED_WL, sk_c_ed_wl.public_key().public_bytes_raw()
+            )},
+            -70005: CREDENTIAL_TENANT,
+            -70006: CREDENTIAL_CLEARANCE,
+        }
+        cwt_workload_session_controls = []
+        for ws_id, expect in (
+            (WORKLOAD_SESSION_ID, "valid"),
+            (WORKLOAD_SESSION_REVOKED_ID, "revoked"),
+            (WORKLOAD_SESSION_EXPIRED_ID, "expired"),
+            (WORKLOAD_SESSION_WRONG_KIND_ID, "wrong_kind"),
+            (WORKLOAD_SESSION_CROSS_TENANT_ID, "cross_tenant"),
+            (None, "present_null"),
+        ):
+            raw, _, _ = sign1(n1_protected, {**workload_ws_claims, -70007: ws_id}, sk_i_ed)
+            cwt_workload_session_controls.append({"cbor_hex": raw.hex(), "expect": expect})
         record(
             negatives,
             "N-1",
@@ -2681,6 +2720,55 @@ def main() -> None:
                 "status": "active",
                 "clearance_epoch": 4,
             },
+            {
+                # Y1 signed-CWT-control sessions (§3.3): each resolves exactly one
+                # cwt_workload_session_controls entry and is defective in exactly
+                # one field, so that control denies solely on that cause and a
+                # single-field repair admits the unchanged credential. Expired:
+                # created < expiry but expiry <= verifier_now.
+                "iss": ISSUER_ISS,
+                "workload_session_id": WORKLOAD_SESSION_REVOKED_ID,
+                "sub": WORKLOAD_SUBJECT,
+                "tenant": CREDENTIAL_TENANT,
+                "session_kind": "workload",
+                "created": IAT,
+                "expiry": WORKLOAD_SESSION_EXP,
+                "status": "revoked",
+                "clearance_epoch": 4,
+            },
+            {
+                "iss": ISSUER_ISS,
+                "workload_session_id": WORKLOAD_SESSION_EXPIRED_ID,
+                "sub": WORKLOAD_SUBJECT,
+                "tenant": CREDENTIAL_TENANT,
+                "session_kind": "workload",
+                "created": IAT,
+                "expiry": IAT + 1,
+                "status": "active",
+                "clearance_epoch": 4,
+            },
+            {
+                "iss": ISSUER_ISS,
+                "workload_session_id": WORKLOAD_SESSION_WRONG_KIND_ID,
+                "sub": WORKLOAD_SUBJECT,
+                "tenant": CREDENTIAL_TENANT,
+                "session_kind": "interactive",
+                "created": IAT,
+                "expiry": WORKLOAD_SESSION_EXP,
+                "status": "active",
+                "clearance_epoch": 4,
+            },
+            {
+                "iss": ISSUER_ISS,
+                "workload_session_id": WORKLOAD_SESSION_CROSS_TENANT_ID,
+                "sub": WORKLOAD_SUBJECT,
+                "tenant": "tenant-beta",
+                "session_kind": "workload",
+                "created": IAT,
+                "expiry": WORKLOAD_SESSION_EXP,
+                "status": "active",
+                "clearance_epoch": 4,
+            },
         ],
         "approver_enrollment_model": {
             "note": (
@@ -2792,6 +2880,7 @@ def main() -> None:
             {"iss": ISSUER_ISS, "kind": "cti", "cti_hex": b"\xffcwt-revoked-1".hex()},
         ],
         "cwt_revocation_controls": cwt_revocation_controls,
+        "cwt_workload_session_controls": cwt_workload_session_controls,
         "positive_to_credential": {
             "P-2": "hybrid",
             "P-4": "classical",
