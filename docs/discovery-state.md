@@ -126,9 +126,15 @@ They do not perform network round trips per service or populate point-cache L1.
 Announcement writes, point reads, listings, and tiered revision checks take
 Valkey TIME inside the same transaction as reaping/live checks. Replica wall
 clocks cannot delete globally live entries or keep an expired L1 entry alive.
-PXAT remains the earlier absolute signed/accepted-state and effective lease
-expiry; shared receipt time never renews that authority ceiling. Already-expired
-writes are ignored before value/index admission.
+The handler supplies the independent signed/current-state authority ceiling;
+Valkey computes the effective lease as TIME plus 90 seconds, capped by that
+ceiling. Encoded lifetime, PXAT, and expiry-index score are identical. Only the
+effective lifetime and the legacy application expiry are computed in Lua;
+all other payload values and array types retain Rust's encoding. Memory-only
+publication uses its own receipt time. Tiered L1 copies the already-derived
+lease and uses shared time for insertion/reaping; it never renews that lease.
+Expired or superseded writes return an error from announce instead of a false
+successful publication. Shared receipt time never renews expired authority.
 
 Heartbeat `last_seen` is the admitted server receipt time; the node's `ts` cannot
 poison ordering after future skew or clock rollback. Shared writes take Valkey

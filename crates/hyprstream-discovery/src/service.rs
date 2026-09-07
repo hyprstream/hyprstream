@@ -29,7 +29,8 @@ use crate::placement_index::PlacementIndex;
 use crate::scheduling;
 use crate::state_store::{
     unix_millis_now, AnnouncedEndpoint, CachedEntityStatement, CachedEnvelopeKeyset,
-    DiscoveryState, DiscoveryStateStore, LiveAllocatable, MemoryStateStore,
+    DiscoveryState, DiscoveryStateStore, LiveAllocatable, MemoryStateStore, PutResult,
+    ANNOUNCED_ENDPOINT_TTL,
 };
 
 use anyhow::{Context, Result};
@@ -63,7 +64,6 @@ const LIVENESS_CACHE_REAP_BUDGET: usize = 32;
 const PLACEMENT_INGEST_RETRY_TTL: Duration = Duration::from_secs(300);
 const CANDIDATE_QUERY_CONCURRENCY: usize = 16;
 const CANDIDATE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
-const ANNOUNCED_ENDPOINT_TTL: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PlacementIngestStatus {
@@ -1222,8 +1222,9 @@ impl DiscoveryServiceResolver {
 
         let mut candidates = Vec::new();
         for entry in entries {
-            if !entry.is_live_at(unix_millis_now())
-                || entry.service_did.as_str().is_empty()
+            // The backend/remote Discovery already checked the volatile lease
+            // on its receipt clock. Signed/current authority is checked below.
+            if entry.service_did.as_str().is_empty()
                 || entry.accepted_state_digest.len() != 64
             {
                 continue;
@@ -3645,8 +3646,7 @@ impl DiscoveryService {
             .await?;
         let Some(endpoint) = endpoints
             .iter()
-            .filter(|ep| ep.socket_kind == wanted)
-            .find(|ep| ep.is_live_at(unix_millis_now()))
+            .find(|ep| ep.socket_kind == wanted)
         else {
             return Ok(None);
         };
@@ -4384,6 +4384,10 @@ mod resolver_tests {
     }
 
     fn accepted_state(tag: u8) -> (AcceptedAt9pState, SigningKey) {
+        accepted_state_with_expiry(tag, "2099-01-01T00:00:00Z")
+    }
+
+    fn accepted_state_with_expiry(tag: u8, expiry: &str) -> (AcceptedAt9pState, SigningKey) {
         let signing = SigningKey::from_bytes(&[tag; 32]);
         let pq_signing = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signing);
         let keys = HybridKeyPair::new(
@@ -4407,7 +4411,7 @@ mod resolver_tests {
             1,
             [1; 64],
             body,
-            "2099-01-01T00:00:00Z".to_owned(),
+            expiry.to_owned(),
             &signing,
             &pq_signing,
         )
@@ -4758,6 +4762,116 @@ mod resolver_tests {
             .await
             .expect("ordinary announcement must resolve");
         assert_eq!(resolved.evidence().accepted_state_digest, state.head_digest);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_announcement_handler_lease_and_result_follow_shared_time() {
+        use crate::state_store::tests::ReplicaClock;
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else { return; };
+        for backend in [crate::DiscoveryStateBackend::Valkey, crate::DiscoveryStateBackend::Tiered] {
+            let config = crate::DiscoveryStateConfig {
+                backend, active_active: true,
+                valkey: crate::ValkeyStateConfig {
+                    url: url.clone(),
+                    key_prefix: format!("hs-handler-lease-{}-{}-{backend:?}", std::process::id(), unix_millis_now()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (state, signing) = accepted_state(12);
+            let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(state.clone()))));
+            let root = SigningKey::from_bytes(&[0x61; 32]);
+            let service = DiscoveryService::new(Arc::new(root.clone()), root.verifying_key(), TransportConfig::inproc("lease-handler-test"))
+                .with_accepted_state_source(source.clone())
+                .with_state(DiscoveryState::connect(&config).await.unwrap());
+            let claims = hyprstream_rpc::auth::Claims::new("service:model".to_owned(),
+                chrono::Utc::now().timestamp(), chrono::Utc::now().timestamp() + 7_200)
+                .with_cnf_jwk(signing.verifying_key().as_bytes());
+            let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signing);
+            let envelope = hyprstream_rpc::SignedEnvelope::new_signed_hybrid(
+                hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()), &signing, &pq);
+            let ctx = EnvelopeContext::from_verified_as_system(&envelope);
+            let kem = hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&signing).unwrap();
+            let now = unix_millis_now();
+            let mut request = ServiceAnnouncement {
+                service_name: "model".to_owned(), socket_kind: "quic".to_owned(),
+                endpoint: "quic://localhost:127.0.0.1:9".to_owned(),
+                service_jwt: Some(hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &root)),
+                service_did: Did::from(state.did.clone()), capabilities: vec!["hyprstream-rpc/1".to_owned()],
+                accepted_state_digest: state.head_digest.to_vec(), accepted_state_epoch: state.epoch,
+                response_key_id: format!("{}#response-current", state.did),
+                request_kem_key_id: format!("{}#kem-current", state.did),
+                request_kem_recipient: kem.public().encode(), expires_at_unix_ms: now + 7_200_000,
+            };
+            for skew in [3_600_000, -3_600_000] {
+                let _clock = ReplicaClock::at(now + skew);
+                assert!(matches!(service.handle_announce(&ctx, 1, &request).await.unwrap(), DiscoveryResponseVariant::AnnounceResult));
+                let rows = service.state_store.announcements_for("model", now + skew).await.unwrap();
+                assert_eq!(rows.len(), 1, "successful response requires a stored publication");
+                assert!((now + 89_000..=now + 91_000).contains(&rows[0].live_until_unix_ms));
+                assert_eq!(rows[0].expires_at_unix_ms, request.expires_at_unix_ms);
+                assert_eq!(rows[0].request_kem_recipient, request.request_kem_recipient);
+                assert_eq!(rows[0].service_jwt, request.service_jwt.clone().unwrap());
+                // Repeated reads exercise populated L1, not only its first fill.
+                assert!(service.resolve_announced_endpoint("model", SocketKind::Quic).await.unwrap().is_some());
+                assert_eq!(service.state_store.all_announcements(now + skew).await.unwrap().len(), 1);
+                service.production_resolver().unwrap().resolve_service(ServiceQuery::network("model").unwrap()).await.unwrap();
+            }
+            // Legacy publication has no signed expiry, but receives the same
+            // bounded backend lease on both initial publication and refresh.
+            let mut legacy = request.clone();
+            legacy.service_name = "legacy".to_owned();
+            legacy.service_jwt = None;
+            legacy.service_did = Did::default();
+            legacy.capabilities.clear();
+            legacy.accepted_state_digest.clear();
+            legacy.accepted_state_epoch = 0;
+            legacy.response_key_id.clear();
+            legacy.request_kem_key_id.clear();
+            legacy.request_kem_recipient.clear();
+            legacy.expires_at_unix_ms = 0;
+            for skew in [3_600_000, -3_600_000] {
+                let _clock = ReplicaClock::at(now + skew);
+                assert!(matches!(service.handle_announce(&ctx, 1, &legacy).await.unwrap(), DiscoveryResponseVariant::AnnounceResult));
+                let rows = service.state_store.announcements_for("legacy", now + skew).await.unwrap();
+                assert_eq!(rows.len(), 1);
+                assert!((now + 89_000..=now + 91_000).contains(&rows[0].live_until_unix_ms));
+                assert_eq!(rows[0].expires_at_unix_ms, rows[0].live_until_unix_ms);
+            }
+
+            // Signed expiry is still an independent ceiling. A shorter valid
+            // signed deadline with the same epoch is an ignored older write;
+            // the handler must not claim it was published.
+            request.expires_at_unix_ms = now + 20_000;
+            assert!(service.handle_announce(&ctx, 2, &request).await.unwrap_err().to_string().contains("not stored"));
+
+            // Updated signed accepted-state evidence supplies a shorter current-state
+            // ceiling; the backend must not extend it to the receipt TTL.
+            let accepted_limit = (now / 1_000) * 1_000 + 20_000;
+            let accepted_expiry = chrono::DateTime::from_timestamp_millis(accepted_limit).unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let (bounded, _) = accepted_state_with_expiry(12, &accepted_expiry);
+            *source.0.lock() = Some(bounded.clone());
+            request.expires_at_unix_ms = now + 7_200_000;
+            request.accepted_state_digest = bounded.head_digest.to_vec();
+            assert!(matches!(service.handle_announce(&ctx, 3, &request).await.unwrap(), DiscoveryResponseVariant::AnnounceResult));
+            let values = service.state_store.announcements_for("model", now).await.unwrap();
+            assert_eq!(values[0].live_until_unix_ms, accepted_limit);
+
+            // Both signed and accepted expiry reject under a behind clock, and
+            // neither rejection is reported as AnnounceResult.
+            let _clock = ReplicaClock::at(now - 3_600_000);
+            request.expires_at_unix_ms = now - 1;
+            assert!(service.handle_announce(&ctx, 4, &request).await.unwrap_err().to_string().contains("not stored"));
+            let expired_text = chrono::DateTime::from_timestamp_millis(now - 1).unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let (expired, _) = accepted_state_with_expiry(12, &expired_text);
+            *source.0.lock() = Some(expired.clone());
+            request.expires_at_unix_ms = now + 7_200_000;
+            request.accepted_state_digest = expired.head_digest.to_vec();
+            assert!(service.handle_announce(&ctx, 5, &request).await.unwrap_err().to_string().contains("not stored"));
+        }
     }
 
     #[tokio::test]
@@ -5526,14 +5640,18 @@ mod resolver_tests {
     #[tokio::test]
     async fn stale_or_expired_production_evidence_is_rejected() {
         let (resolver, _) = production_fixture(false);
-        mutate_endpoint(&resolver, "model", "quic", |endpoint| {
-            endpoint.live_until_unix_ms = unix_millis_now() - 1;
-        })
-        .await;
-        assert!(resolver
-            .resolve_service(ServiceQuery::network("model").expect("query"))
-            .await
-            .is_err());
+        let expiry = resolver.state_store.announcements_for("model", unix_millis_now())
+            .await.unwrap()[0].live_until_unix_ms;
+        {
+            // Expired writes now correctly leave a prior valid value intact.
+            // Advance this memory backend's clock to expire the real lease
+            // instead of attempting to overwrite it with a rejected write.
+            let _clock = crate::state_store::tests::ReplicaClock::at(expiry);
+            assert!(resolver
+                .resolve_service(ServiceQuery::network("model").expect("query"))
+                .await
+                .is_err());
+        }
 
         let (resolver, source) = production_fixture(false);
         source.0.lock().as_mut().expect("fixture state").expires_at =
@@ -6037,7 +6155,7 @@ impl DiscoveryHandler for DiscoveryService {
                     && data
                         .request_kem_key_id
                         .starts_with(&format!("{}#", data.service_did))
-                    && data.expires_at_unix_ms > unix_millis_now(),
+                    && data.expires_at_unix_ms > 0,
                 "identity-bound announcement metadata is incomplete or expired"
             );
             let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(
@@ -6134,16 +6252,15 @@ impl DiscoveryHandler for DiscoveryService {
             );
         }
 
-        let now_unix_ms = unix_millis_now();
-        let heartbeat_expiry = now_unix_ms.saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64);
         // Legacy clients omit identity expiry (Cap'n Proto defaults it to 0).
-        // Only identity-bound announcements carry a signed expiry constraint.
+        // Only identity-bound announcements carry a signed expiry constraint;
+        // backend receipt time sets the legacy application expiry and lease.
         let expires_at_unix_ms = if identity_bound {
             data.expires_at_unix_ms
         } else {
-            heartbeat_expiry
+            0
         };
-        let mut live_until_unix_ms = expires_at_unix_ms.min(heartbeat_expiry);
+        let mut live_until_unix_ms = if identity_bound { expires_at_unix_ms } else { i64::MAX };
         if identity_bound {
             if let Some(source) = &self.accepted_state_source {
                 let state = source
@@ -6157,10 +6274,6 @@ impl DiscoveryHandler for DiscoveryService {
                 live_until_unix_ms = live_until_unix_ms.min(accepted_expiry_unix_ms(&state)?);
             }
         }
-        anyhow::ensure!(
-            live_until_unix_ms > now_unix_ms,
-            "announcement effective lifetime is already expired"
-        );
 
         let replacement = AnnouncedEndpoint {
             socket_kind: sock_kind.clone(),
@@ -6177,9 +6290,11 @@ impl DiscoveryHandler for DiscoveryService {
             source_signer: ctx.cnf,
             live_until_unix_ms,
         };
-        self.state_store
+        let stored = self.state_store
             .put_announcement(&svc_name, replacement)
             .await?;
+        anyhow::ensure!(stored == PutResult::Stored,
+            "announcement was not stored: authority expired or publication superseded");
 
         Ok(DiscoveryResponseVariant::AnnounceResult)
     }

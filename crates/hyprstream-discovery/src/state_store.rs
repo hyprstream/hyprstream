@@ -14,6 +14,8 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, HashMap};
 use std::sync::Arc;
 
+pub(crate) const ANNOUNCED_ENDPOINT_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DiscoveryStateBackend {
@@ -172,15 +174,27 @@ pub(crate) struct AnnouncedEndpoint {
     pub(crate) response_key_id: String,
     pub(crate) request_kem_key_id: String,
     pub(crate) request_kem_recipient: Vec<u8>,
-    /// Signed/application expiry carried by the announcement.
+    /// Signed/application expiry carried by the announcement. Zero on a
+    /// legacy write requests a backend-receipt-bounded application expiry.
     pub(crate) expires_at_unix_ms: i64,
     pub(crate) source_signer: [u8; 32],
-    /// Effective cache lifetime: no later than heartbeat, signed artifact, and
-    /// accepted-current-state expiry.
+    /// On write: independently verified signed/current-state authority ceiling.
+    /// On read: effective lifetime, also capped by the backend's receipt + TTL.
     pub(crate) live_until_unix_ms: i64,
 }
 
 impl AnnouncedEndpoint {
+    fn receipt_lease(mut self, now: i64) -> Option<Self> {
+        let heartbeat_expiry = now.saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64);
+        if self.expires_at_unix_ms == 0 {
+            self.expires_at_unix_ms = heartbeat_expiry;
+        }
+        self.live_until_unix_ms = heartbeat_expiry
+            .min(self.expires_at_unix_ms)
+            .min(self.live_until_unix_ms);
+        self.is_live_at(now).then_some(self)
+    }
+
     pub(crate) fn is_live_at(&self, now_unix_ms: i64) -> bool {
         now_unix_ms < self.live_until_unix_ms && now_unix_ms < self.expires_at_unix_ms
     }
@@ -414,13 +428,23 @@ impl MemoryStateStore {
         }
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub(crate) fn put_announcement_sync(
         &self,
         service_name: &str,
         endpoint: AnnouncedEndpoint,
     ) -> Result<PutResult> {
+        self.put_announcement_at(service_name, endpoint, unix_millis_now())
+    }
+
+    fn put_announcement_at(
+        &self,
+        service_name: &str,
+        endpoint: AnnouncedEndpoint,
+        now_unix_ms: i64,
+    ) -> Result<PutResult> {
         let mut inner = self.inner.lock();
-        Self::reap(&mut inner, unix_millis_now());
+        Self::reap(&mut inner, now_unix_ms);
         let key = AnnouncementKey {
             service_name: service_name.to_owned(),
             socket_kind: endpoint.socket_kind.clone(),
@@ -551,7 +575,11 @@ impl DiscoveryStateStore for MemoryStateStore {
         service_name: &str,
         endpoint: AnnouncedEndpoint,
     ) -> Result<PutResult> {
-        self.put_announcement_sync(service_name, endpoint)
+        let now = unix_millis_now();
+        let Some(endpoint) = endpoint.receipt_lease(now) else {
+            return Ok(PutResult::IgnoredOlder);
+        };
+        self.put_announcement_at(service_name, endpoint, now)
     }
 
     async fn announcements_for(
@@ -960,7 +988,11 @@ impl DiscoveryStateStore for ValkeyStateStore {
 
         const PUT: &str = r#"
 reap(KEYS[6], KEYS[3], KEYS[4], KEYS[5])
-if tonumber(ARGV[4]) <= now then return 0 end
+local signed_expiry = tonumber(ARGV[3])
+local heartbeat_expiry = now + tonumber(ARGV[8])
+if signed_expiry == 0 then signed_expiry = heartbeat_expiry end
+local expiry = math.min(heartbeat_expiry, signed_expiry, tonumber(ARGV[4]))
+if expiry <= now then return 0 end
 local current = redis.call('GET', KEYS[1])
 if not current and redis.call('ZCARD', KEYS[6]) >= tonumber(ARGV[7]) then
   return redis.error_reply('Discovery Valkey announcement capacity exhausted')
@@ -971,21 +1003,35 @@ if current then
   local old_epoch = tonumber(decoded.accepted_state_epoch) or 0
   local old_exp = tonumber(decoded.expires_at_unix_ms) or 0
   local new_epoch = tonumber(ARGV[2])
-  local new_exp = tonumber(ARGV[3])
+  local new_exp = signed_expiry
   if old_epoch > new_epoch or (old_epoch == new_epoch and old_exp > new_exp) then
     return 0
   end
 end
-redis.call('SET', KEYS[1], ARGV[1], 'PXAT', ARGV[4])
+-- Only the effective lease (and legacy application expiry) is computed here.
+-- Preserve all other JSON fields/arrays exactly as encoded by Rust, not cjson.
+local encoded = string.sub(ARGV[1], 1, -2) .. ',"live_until_unix_ms":' .. string.format('%.0f', expiry)
+if tonumber(ARGV[3]) == 0 then
+  encoded = encoded .. ',"expires_at_unix_ms":' .. string.format('%.0f', signed_expiry)
+end
+encoded = encoded .. '}'
+redis.call('SET', KEYS[1], encoded, 'PXAT', expiry)
 redis.call('SADD', KEYS[2], KEYS[1])
 redis.call('SADD', KEYS[3], ARGV[5])
 redis.call('HSET', KEYS[4], ARGV[5], ARGV[6])
 redis.call('INCR', KEYS[5])
-redis.call('ZADD', KEYS[6], ARGV[4], KEYS[1])
+redis.call('ZADD', KEYS[6], expiry, KEYS[1])
 return 1
 "#;
         let service_id = Self::service_id(service_name);
-        let encoded = serde_json::to_string(&endpoint)?;
+        let mut payload = serde_json::to_value(&endpoint)?;
+        let fields = payload.as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("announcement must encode as an object"))?;
+        fields.remove("live_until_unix_ms");
+        if endpoint.expires_at_unix_ms == 0 {
+            fields.remove("expires_at_unix_ms");
+        }
+        let encoded = serde_json::to_string(&payload)?;
         let stored: i64 = self
             .pool
             .eval(
@@ -1002,13 +1048,11 @@ return 1
                     encoded,
                     endpoint.accepted_state_epoch.to_string(),
                     endpoint.expires_at_unix_ms.to_string(),
-                    endpoint
-                        .live_until_unix_ms
-                        .min(endpoint.expires_at_unix_ms)
-                        .to_string(),
+                    endpoint.live_until_unix_ms.to_string(),
                     service_id,
                     service_name.to_owned(),
                     self.announcement_capacity.to_string(),
+                    ANNOUNCED_ENDPOINT_TTL.as_millis().to_string(),
                 ],
             )
             .await?;
@@ -1422,11 +1466,11 @@ impl DiscoveryStateStore for TieredStateStore {
         for value in &values {
             if self
                 .memory
-                .put_announcement(
+                .put_announcement_at(
                     service_name,
                     self.l1_announcement(value.clone(), now_unix_ms),
+                    now_unix_ms,
                 )
-                .await
                 .is_err()
             {
                 self.memory.clear_announcements_sync(service_name);
@@ -1570,7 +1614,7 @@ pub(crate) fn unix_millis_now() -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
     use super::*;
@@ -2133,12 +2177,10 @@ mod tests {
         }
     }
 
-    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
-    struct ReplicaClock;
+    pub(crate) struct ReplicaClock;
 
-    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
     impl ReplicaClock {
-        fn at(now: i64) -> Self {
+        pub(crate) fn at(now: i64) -> Self {
             TEST_REPLICA_TIME.with(|clock| {
                 assert!(clock.replace(Some(now)).is_none());
             });
@@ -2146,10 +2188,43 @@ mod tests {
         }
     }
 
-    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
     impl Drop for ReplicaClock {
         fn drop(&mut self) {
             TEST_REPLICA_TIME.with(|clock| clock.set(None));
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_announcement_lease_uses_receipt_and_preserves_payload() {
+        use fred::prelude::*;
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else { return; };
+        let store = ValkeyStateStore::connect(&valkey_config(url, "announcement-write-lease")).await.unwrap();
+        let now: i64 = store.pool.eval(
+            "local t = redis.call('TIME'); return tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)",
+            Vec::<String>::new(), Vec::<String>::new(),
+        ).await.unwrap();
+        for skew in [-3_600_000, 3_600_000] {
+            let name = format!("lease-{skew}");
+            let mut value = endpoint("iroh", 1, now + 7_200_000, now + 7_200_000);
+            value.capabilities.clear();
+            value.service_jwt = "payload with \"live_until_unix_ms\":123 and λ".to_owned();
+            value.source_signer = [255; 32];
+            let mut expected = serde_json::to_value(&value).unwrap();
+            expected.as_object_mut().unwrap().remove("live_until_unix_ms");
+            let _clock = ReplicaClock::at(now + skew);
+            assert_eq!(store.put_announcement(&name, value).await.unwrap(), PutResult::Stored);
+            let rows: (String, i64, i64, i64) = store.pool.eval(
+                "local t = redis.call('TIME'); return {redis.call('GET', KEYS[1]), redis.call('PEXPIRETIME', KEYS[1]), tonumber(redis.call('ZSCORE', KEYS[2], KEYS[1])), tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)}",
+                vec![store.announcement_key(&name, "iroh"), store.key("announcement-expiry")], Vec::<String>::new(),
+            ).await.unwrap();
+            let mut actual: serde_json::Value = serde_json::from_str(&rows.0).unwrap();
+            let encoded_expiry = actual.as_object_mut().unwrap().remove("live_until_unix_ms").unwrap().as_i64().unwrap();
+            assert_eq!(actual, expected, "only the effective lease field may change");
+            assert_eq!(encoded_expiry, rows.1);
+            assert_eq!(encoded_expiry, rows.2);
+            assert!((89_000..=90_000).contains(&(encoded_expiry - rows.3)), "bounded shared receipt lease, independent of replica skew");
+            assert_eq!(store.announcements_for(&name, now + skew).await.unwrap().len(), 1);
         }
     }
 
