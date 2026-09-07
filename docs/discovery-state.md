@@ -68,7 +68,10 @@ Do not clear shared generations with running replicas, or touch the separate
 checkpointed PDS identity store as part of this volatile-state reset.
 
 The Valkey URL has no implicit loopback default and must be configured
-explicitly whenever `valkey` or `tiered` is selected.
+explicitly whenever `valkey` or `tiered` is selected. Native Valkey builds enable
+Fred's Rustls backend: `rediss://` uses TLS and rejects a plaintext server.
+The connection initializes the existing external-interoperability TLS provider;
+Valkey and its TLS dependencies remain excluded from the WASM target.
 
 All keys for one configured prefix share a Valkey cluster hash tag so atomic
 Lua updates remain in one slot. Use a deployment-specific prefix when multiple
@@ -80,9 +83,30 @@ startup and commands fail closed on connection errors, with bounded timeouts.
 
 Candidate queries enumerate the shared, capacity-bounded liveness index. A
 replica then ingests missing placement records through the existing verified
-repository resolver and bounded retry gate. Nodes without verified placement
-facts, query authorization, or a still-live heartbeat are excluded. Shared
+repository resolver and bounded retry gate. Authorization, ingestion, and live
+point reads run with at most 16 concurrent node operations per query; final
+authorization is also concurrent. Native queries have a five-second deadline
+covering enumeration through final authorization. A deadline or still-pending
+ingest returns an error requiring retry, never a successful partial candidate
+set or understated `totalMatching`. Completed verified records remain available
+for the retry; cancelled ingests are retryable and are not cached as absence.
+The WASM memory path uses the same concurrency bound and checks elapsed time
+between operations, without pulling in a native timer or socket backend.
+Nodes without verified placement facts, query authorization, or a still-live
+heartbeat are excluded. Shared
 liveness never grants identity, placement labels, or policy authority.
+
+Cross-service announcement listings read names and values in one Lua operation
+over the capacity-bounded expiry index, together with atomic metadata cleanup.
+They do not perform network round trips per service or populate point-cache L1.
+
+Heartbeat `last_seen` is the admitted server receipt time; the node's `ts` cannot
+poison ordering after future skew or clock rollback. Stores accept a newer
+receipt even if it shortens lifetime; a newer receipt-derived lifetime also
+supersedes legacy client-clock skew. A write with an older receipt and no newer
+lifetime cannot replace fresher state. This changes no identity authority:
+signed/accepted announcement expiry
+is independently enforced, and refreshing liveness does not renew it.
 
 Identity-bound announcements remain limited by signed and accepted-state
 expiry. Legacy non-identity-bound announcements use the heartbeat TTL when the

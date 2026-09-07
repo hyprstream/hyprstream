@@ -194,6 +194,7 @@ impl AnnouncedEndpoint {
 pub(crate) struct LiveAllocatable {
     pub(crate) allocatable: Vec<(String, String)>,
     pub(crate) load_fraction: f32,
+    /// Server receipt time, never the reporting node's clock.
     pub(crate) last_seen: i64,
     pub(crate) live_until_unix_ms: i64,
 }
@@ -571,7 +572,12 @@ impl DiscoveryStateStore for MemoryStateStore {
         Self::reap(&mut inner, unix_millis_now());
         let node = node.as_str().to_owned();
         if let Some(existing) = inner.liveness.get(&node) {
-            if existing.value.last_seen > value.last_seen {
+            // Both fields derive from receipt time. A newer receipt may
+            // shorten lifetime; a newer lifetime also supersedes legacy
+            // client-clock skew without waiting for the old value to expire.
+            if existing.value.last_seen > value.last_seen
+                && existing.value.live_until_unix_ms >= value.live_until_unix_ms
+            {
                 return Ok(PutResult::IgnoredOlder);
             }
         } else if inner.liveness.len() >= self.liveness_capacity {
@@ -698,6 +704,9 @@ impl ValkeyStateStore {
                 && config.artifact_capacity > 0,
             "Discovery Valkey capacities must be positive"
         );
+        // Fred's URL parser constructs a rustls config. Initialize the existing
+        // external TLS policy first, including in standalone state-store use.
+        hyprstream_rpc::transport::pq_provider::install_pq_crypto_provider()?;
         let redis = RedisConfig::from_url(&config.url).context("invalid Discovery Valkey URL")?;
         let mut builder = Builder::from_config(redis);
         builder.with_performance_config(|performance| {
@@ -995,30 +1004,44 @@ return 1
     ) -> Result<Vec<(String, Vec<AnnouncedEndpoint>)>> {
         use fred::prelude::*;
 
-        // Reap before enumerating names, so listing work is bounded by current
-        // capacity rather than every identity that has ever announced.
-        let service_ids: Vec<String> = self.pool.eval(
-            format!("{}\nreap(KEYS[1], KEYS[2], KEYS[3], KEYS[4], ARGV[1])\nreturn redis.call('SMEMBERS', KEYS[2])", Self::REAP_ANNOUNCEMENTS),
-            vec![self.key("announcement-expiry"), self.key("services"), self.key("service-names"), self.key("announcement-global-revision")],
-            vec![now_unix_ms.to_string()],
-        ).await?;
-        let mut all = Vec::with_capacity(service_ids.len());
-        for service_id in service_ids {
-            let service_name: Option<String> = self
-                .pool
-                .hget(self.key("service-names"), &service_id)
-                .await?;
-            let Some(service_name) = service_name else {
-                continue;
-            };
-            let entries = self
-                .announcements_for_inner(&service_name, now_unix_ms)
-                .await?;
-            if !entries.is_empty() {
-                all.push((service_name, entries));
+        // One transaction returns names and values from the capacity-bounded
+        // expiry index. Reap and refresh still serialize, and a listing never
+        // labels an L1 snapshot or performs round trips per service.
+        const LIST: &str = r#"
+reap(KEYS[1], KEYS[2], KEYS[3], KEYS[4], ARGV[1])
+local values = {}
+for _, key in ipairs(redis.call('ZRANGE', KEYS[1], 0, -1)) do
+  local value = redis.call('GET', key)
+  if value then
+    local service = string.match(key, ':announcement:([^:]+):[^:]+$')
+    local name = redis.call('HGET', KEYS[3], service)
+    if not name then return redis.error_reply('missing Discovery service name') end
+    table.insert(values, {name, value})
+  end
+end
+return values
+"#;
+        let encoded: Vec<(String, String)> = self
+            .pool
+            .eval(
+                format!("{}{LIST}", Self::REAP_ANNOUNCEMENTS),
+                vec![
+                    self.key("announcement-expiry"),
+                    self.key("services"),
+                    self.key("service-names"),
+                    self.key("announcement-global-revision"),
+                ],
+                vec![now_unix_ms.to_string()],
+            )
+            .await?;
+        let mut all: HashMap<String, Vec<AnnouncedEndpoint>> = HashMap::new();
+        for (name, value) in encoded {
+            let endpoint: AnnouncedEndpoint = serde_json::from_str(&value)?;
+            if endpoint.is_live_at(now_unix_ms) {
+                all.entry(name).or_default().push(endpoint);
             }
         }
-        Ok(all)
+        Ok(all.into_iter().collect())
     }
 
     async fn put_liveness(&self, node: &Did, value: LiveAllocatable) -> Result<PutResult> {
@@ -1033,7 +1056,8 @@ end
 if current then
   local ok, decoded = pcall(cjson.decode, current)
   if not ok then return redis.error_reply('corrupt Discovery liveness') end
-  if (tonumber(decoded.last_seen) or 0) > tonumber(ARGV[2]) then return 0 end
+  if (tonumber(decoded.last_seen) or 0) > tonumber(ARGV[2]) and
+     (tonumber(decoded.live_until_unix_ms) or 0) >= tonumber(ARGV[3]) then return 0 end
 end
 redis.call('SET', KEYS[1], ARGV[1], 'PXAT', ARGV[3])
 redis.call('INCR', KEYS[2])
@@ -1563,6 +1587,172 @@ mod tests {
     #[tokio::test]
     async fn memory_satisfies_announcement_backend_contract() {
         assert_announcement_backend_contract(&MemoryStateStore::new(1, 1, 1)).await;
+    }
+
+    async fn assert_receipt_ordered_liveness(store: &dyn DiscoveryStateStore) {
+        let node = Did::new("did:web:clock-rollback.example".to_owned());
+        let now = unix_millis_now();
+        let mut value = LiveAllocatable {
+            allocatable: vec![("cpu".to_owned(), "1".to_owned())],
+            load_fraction: 0.9,
+            // Legacy client-clock record must not poison subsequent receipts.
+            last_seen: now + 86_400_000,
+            live_until_unix_ms: now + 100,
+        };
+        store.put_liveness(&node, value.clone()).await.unwrap();
+        value.last_seen = now;
+        value.load_fraction = 0.2;
+        value.allocatable[0].1 = "8".to_owned();
+        value.live_until_unix_ms = now + 500;
+        assert_eq!(
+            store.put_liveness(&node, value.clone()).await.unwrap(),
+            PutResult::Stored
+        );
+        assert_eq!(
+            store.liveness(&node, now + 200).await.unwrap(),
+            Some(value.clone())
+        );
+        let mut delayed = value.clone();
+        delayed.last_seen = now - 1;
+        delayed.live_until_unix_ms = now + 300;
+        delayed.load_fraction = 1.0;
+        assert_eq!(
+            store.put_liveness(&node, delayed).await.unwrap(),
+            PutResult::IgnoredOlder
+        );
+        assert_eq!(store.liveness(&node, now + 200).await.unwrap(), Some(value));
+        assert!(store.liveness(&node, now + 501).await.unwrap().is_none());
+
+        // Liveness refreshes do not renew a signed announcement's authority.
+        store
+            .put_announcement("clock", endpoint("iroh", 1, now + 50, now + 500))
+            .await
+            .unwrap();
+        assert!(store
+            .announcements_for("clock", now + 51)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_heartbeat_receipt_survives_clock_rollback() {
+        assert_receipt_ordered_liveness(&MemoryStateStore::new(8, 8, 8)).await;
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_heartbeat_receipt_survives_clock_rollback() {
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let shared = Arc::new(
+            ValkeyStateStore::connect(&valkey_config(url, "rollback"))
+                .await
+                .unwrap(),
+        );
+        let tiered = TieredStateStore::new(Arc::new(MemoryStateStore::new(8, 8, 8)), shared, 1000);
+        assert_receipt_ordered_liveness(&tiered).await;
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn rediss_uses_tls_and_rejects_plaintext_valkey() {
+        use fred::prelude::RedisConfig;
+        hyprstream_rpc::transport::install_pq_crypto_provider().unwrap();
+        assert!(RedisConfig::from_url("rediss://localhost:6379")
+            .unwrap()
+            .tls
+            .is_some());
+        assert!(RedisConfig::from_url("redis://localhost:6379")
+            .unwrap()
+            .tls
+            .is_none());
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let mut config = valkey_config(url.clone(), "tls");
+        let plaintext = ValkeyStateStore::connect(&config).await.unwrap();
+        assert!(plaintext
+            .all_announcements(unix_millis_now())
+            .await
+            .unwrap()
+            .is_empty());
+        config.url = url.replacen("redis://", "rediss://", 1);
+        let start = std::time::Instant::now();
+        assert!(
+            ValkeyStateStore::connect(&config).await.is_err(),
+            "TLS must not downgrade to plaintext"
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_batched_listing_preserves_names_values_and_cleanup() {
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let mut config = valkey_config(url, "batched-list");
+        config.announcement_capacity = 512;
+        let writer = ValkeyStateStore::connect(&config).await.unwrap();
+        let reader = TieredStateStore::new(
+            Arc::new(MemoryStateStore::new(1, 1, 1)),
+            Arc::new(ValkeyStateStore::connect(&config).await.unwrap()),
+            10_000,
+        );
+        let now = unix_millis_now();
+        for i in 0..256 {
+            let name = format!("service:{i}:λ");
+            for kind in ["iroh", "quic"] {
+                writer
+                    .put_announcement(&name, endpoint(kind, 1, now + 60_000, now + 60_000))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            reader
+                .announcements_for("service:0:λ", now)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        let entries = reader.all_announcements(now).await.unwrap();
+        assert_eq!(entries.len(), 256);
+        assert!(entries
+            .iter()
+            .all(|(name, values)| name.starts_with("service:") && values.len() == 2));
+        writer
+            .put_announcement(
+                "service:0:λ",
+                endpoint("iroh", 2, now + 90_000, now + 90_000),
+            )
+            .await
+            .unwrap();
+        let remaining = reader.all_announcements(now + 60_001).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "service:0:λ");
+        assert_eq!(remaining[0].1.len(), 1);
+        assert_eq!(remaining[0].1[0].accepted_state_epoch, 2);
+        // Reaping restores live capacity and cannot populate/poison point L1.
+        writer
+            .put_announcement("new", endpoint("iroh", 1, now + 90_000, now + 90_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader
+                .announcements_for("service:0:λ", now + 60_001)
+                .await
+                .unwrap()[0]
+                .accepted_state_epoch,
+            2
+        );
+        assert_eq!(
+            reader.all_announcements(now + 60_001).await.unwrap().len(),
+            2
+        );
     }
 
     #[tokio::test]

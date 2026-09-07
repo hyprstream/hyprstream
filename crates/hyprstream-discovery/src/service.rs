@@ -61,7 +61,27 @@ const LIVENESS_CACHE_REAP_BUDGET: usize = 32;
 /// not yet contain a node record. This prevents heartbeat-rate resolver polls
 /// while allowing eventual recovery when a placement record is later published.
 const PLACEMENT_INGEST_RETRY_TTL: Duration = Duration::from_secs(300);
+const CANDIDATE_QUERY_CONCURRENCY: usize = 16;
+const CANDIDATE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const ANNOUNCED_ENDPOINT_TTL: Duration = Duration::from_secs(90);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlacementIngestStatus {
+    Pending,
+    Complete,
+    Cancelled,
+}
+
+struct PlacementIngestGuard(Arc<parking_lot::Mutex<PlacementIngestStatus>>);
+
+impl Drop for PlacementIngestGuard {
+    fn drop(&mut self) {
+        let mut status = self.0.lock();
+        if *status == PlacementIngestStatus::Pending {
+            *status = PlacementIngestStatus::Cancelled;
+        }
+    }
+}
 
 /// Default bound applied to `queryCandidates` when the caller passes
 /// `maxCandidates == 0` (unspecified) — keeps an unscoped query from returning
@@ -739,7 +759,7 @@ pub struct DiscoveryService {
     /// Bounded retry gate for first-seen placement repository polls. A DID is
     /// marked before resolver access, so absent/invalid/non-node repos cannot
     /// turn heartbeat frequency into unbounded work.
-    placement_ingest_attempts: TtlCache<Did, ()>,
+    placement_ingest_attempts: TtlCache<Did, Arc<parking_lot::Mutex<PlacementIngestStatus>>>,
     // Infrastructure (for Spawnable)
     transport: TransportConfig,
 }
@@ -747,28 +767,49 @@ pub struct DiscoveryService {
 impl DiscoveryService {
     /// Populate this replica's verified placement projection for an admitted
     /// shared live node. Failed/absent repos use the existing bounded retry gate.
-    async fn ensure_placement_ingested(&self, node: &Did) {
-        if self.placement_index.record_uri(node.as_str()).is_none()
-            && self.placement_ingest_attempts.insert_if_absent(
-                node.clone(),
-                (),
-                PLACEMENT_INGEST_RETRY_TTL,
-            )
-        {
-            if let Some(resolver) = &self.record_resolver {
-                if let Err(e) = self
-                    .placement_index
-                    .ingest_did(resolver.as_ref(), node.as_str())
-                    .await
-                {
-                    tracing::warn!(
-                        node = %node,
-                        error = %e,
-                        "placement directory ingestion failed for live node (liveness still recorded)"
-                    );
+    async fn ensure_placement_ingested(&self, node: &Did) -> bool {
+        if self.placement_index.record_uri(node.as_str()).is_some() {
+            return true;
+        }
+        let attempt = Arc::new(parking_lot::Mutex::new(PlacementIngestStatus::Pending));
+        let attempt = if self.placement_ingest_attempts.insert_if_absent(
+            node.clone(),
+            Arc::clone(&attempt),
+            PLACEMENT_INGEST_RETRY_TTL,
+        ) {
+            attempt
+        } else {
+            let Some(existing) = self.placement_ingest_attempts.get(node) else {
+                return false;
+            };
+            {
+                let mut status = existing.lock();
+                match *status {
+                    PlacementIngestStatus::Complete => return true,
+                    PlacementIngestStatus::Pending => return false,
+                    PlacementIngestStatus::Cancelled => *status = PlacementIngestStatus::Pending,
                 }
             }
+            existing
+        };
+        // A cancelled query must not turn an unfinished ingest into a cached
+        // absence. Its next query can retry; concurrent queries fail closed.
+        let _guard = PlacementIngestGuard(Arc::clone(&attempt));
+        if let Some(resolver) = &self.record_resolver {
+            if let Err(e) = self
+                .placement_index
+                .ingest_did(resolver.as_ref(), node.as_str())
+                .await
+            {
+                tracing::warn!(
+                    node = %node,
+                    error = %e,
+                    "placement directory ingestion failed for live node (liveness still recorded)"
+                );
+            }
         }
+        *attempt.lock() = PlacementIngestStatus::Complete;
+        true
     }
 
     /// Create a new discovery service with infrastructure.
@@ -6451,158 +6492,201 @@ impl DiscoveryHandler for DiscoveryService {
         _request_id: u64,
         data: &QueryCandidatesRequest,
     ) -> Result<DiscoveryResponseVariant> {
-        struct Candidate {
-            did: String,
-            record_uri: String,
-            load_fraction: f32,
-            allocatable: Vec<(String, String)>,
-            last_seen: i64,
-            labels: Vec<(String, String)>,
-        }
+        use futures::{stream, StreamExt, TryStreamExt};
+        let query = async {
+            let started = Instant::now();
+            struct Candidate {
+                did: String,
+                record_uri: String,
+                load_fraction: f32,
+                allocatable: Vec<(String, String)>,
+                last_seen: i64,
+                labels: Vec<(String, String)>,
+            }
 
-        let selectors: Vec<scheduling::LabelSelector> = data
-            .selectors
-            .iter()
-            .map(|s| {
-                scheduling::LabelSelector::new(s.key.clone(), to_scheduling_op(s.op), s.values.clone())
-            })
-            .collect();
-        let resources: Vec<scheduling::ResourceRequest> = data
-            .resources
-            .iter()
-            .map(|r| scheduling::ResourceRequest::new(r.name.clone(), r.min_quantity.clone()))
-            .collect();
+            let selectors: Vec<scheduling::LabelSelector> = data
+                .selectors
+                .iter()
+                .map(|s| {
+                    scheduling::LabelSelector::new(
+                        s.key.clone(),
+                        to_scheduling_op(s.op),
+                        s.values.clone(),
+                    )
+                })
+                .collect();
+            let resources: Vec<scheduling::ResourceRequest> = data
+                .resources
+                .iter()
+                .map(|r| scheduling::ResourceRequest::new(r.name.clone(), r.min_quantity.clone()))
+                .collect();
 
-        // Hard liveness exclusion (decision #1): only nodes with a live,
-        // unexpired `reportNodeLiveness` entry become candidates at all.
-        let mut candidates: Vec<Candidate> = Vec::new();
-        for (node, _) in self.state_store.all_liveness(unix_millis_now()).await? {
-            let did = node.as_str().to_owned();
-            // Authorize before a query can trigger resolver work on this
-            // replica. Liveness is shared, but placement facts still come only
-            // from the verified repository ingestion path.
-            if self
-                .authorize(ctx, &format!("placement:candidate:{did}"), "query")
+            // Hard liveness exclusion (decision #1): only nodes with a live,
+            // unexpired `reportNodeLiveness` entry become candidates at all.
+            let live_nodes = self.state_store.all_liveness(unix_millis_now()).await?;
+            let candidates: Vec<Candidate> = stream::iter(live_nodes)
+                .map(|(node, _)| async move {
+                    anyhow::ensure!(
+                        started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
+                        "candidate query deadline exceeded; retry"
+                    );
+                    let did = node.as_str().to_owned();
+                    // Authorize before a query can trigger resolver work on this
+                    // replica. Liveness is shared, but placement facts still come only
+                    // from the verified repository ingestion path.
+                    if self
+                        .authorize(ctx, &format!("placement:candidate:{did}"), "query")
+                        .await
+                        .is_err()
+                    {
+                        return Ok(None);
+                    }
+                    anyhow::ensure!(
+                        self.ensure_placement_ingested(&node).await,
+                        "candidate projection ingestion is pending; retry"
+                    );
+                    let Some(record_uri) = self.placement_index.record_uri(&did) else {
+                        return Ok(None);
+                    };
+                    // Repository ingestion can take time; never return a node whose
+                    // heartbeat expired while this replica was loading its facts.
+                    let Some(live) = self.state_store.liveness(&node, unix_millis_now()).await?
+                    else {
+                        return Ok(None);
+                    };
+                    let labels = self.placement_index.effective_labels(&did);
+                    Ok::<_, anyhow::Error>(Some(Candidate {
+                        did,
+                        record_uri,
+                        load_fraction: live.load_fraction,
+                        allocatable: live.allocatable,
+                        last_seen: live.last_seen,
+                        labels,
+                    }))
+                })
+                .buffer_unordered(CANDIDATE_QUERY_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await?
+                .into_iter()
+                .flatten()
+                .collect();
+
+            let predicates: Vec<scheduling::Predicate<Candidate>> = vec![
+                Box::new({
+                    let selectors = selectors.clone();
+                    move |c: &Candidate| {
+                        for sel in &selectors {
+                            if !sel.matches(&c.labels) {
+                                return Some(scheduling::RejectionReason(format!(
+                                    "label selector on {:?} did not match",
+                                    sel.key
+                                )));
+                            }
+                        }
+                        None
+                    }
+                }),
+                Box::new({
+                    let resources = resources.clone();
+                    move |c: &Candidate| {
+                        for req in &resources {
+                            let satisfied = c
+                                .allocatable
+                                .iter()
+                                .find(|(name, _)| name == &req.name)
+                                .is_some_and(|(_, quantity)| req.satisfied_by(quantity));
+                            if !satisfied {
+                                return Some(scheduling::RejectionReason(format!(
+                                    "resource {:?} not satisfied",
+                                    req.name
+                                )));
+                            }
+                        }
+                        None
+                    }
+                }),
+            ];
+
+            let outcomes = scheduling::filter(&candidates, &predicates);
+            let survivors: Vec<&Candidate> = outcomes
+                .iter()
+                .filter(|o| o.passed())
+                .map(|o| o.candidate)
+                .collect();
+
+            // Per-candidate fail-closed authz — async, so it runs as its own pass
+            // rather than inside a (sync) `scheduling::Predicate` closure. A denied
+            // node is silently dropped, never surfaced as an error.
+            let authorized: Vec<&Candidate> = stream::iter(survivors)
+                .map(|c| async move {
+                    let resource = format!("placement:candidate:{}", c.did);
+                    if self.authorize(ctx, &resource, "query").await.is_ok() {
+                        Some(c)
+                    } else {
+                        None
+                    }
+                })
+                .buffer_unordered(CANDIDATE_QUERY_CONCURRENCY)
+                .collect::<Vec<_>>()
                 .await
-                .is_err()
-            {
-                continue;
-            }
-            self.ensure_placement_ingested(&node).await;
-            let Some(record_uri) = self.placement_index.record_uri(&did) else {
-                continue;
-            };
-            // Repository ingestion can take time; never return a node whose
-            // heartbeat expired while this replica was loading its facts.
-            let Some(live) = self.state_store.liveness(&node, unix_millis_now()).await? else {
-                continue;
-            };
-            let labels = self.placement_index.effective_labels(&did);
-            candidates.push(Candidate {
-                did,
-                record_uri,
-                load_fraction: live.load_fraction,
-                allocatable: live.allocatable,
-                last_seen: live.last_seen,
-                labels,
+                .into_iter()
+                .flatten()
+                .collect();
+            anyhow::ensure!(
+                started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
+                "candidate query deadline exceeded; retry"
+            );
+
+            // Post-filter, post-authz, pre-bound — so callers can tell truncation
+            // apart from "that's really all of them".
+            let total_matching = authorized.len() as u32;
+
+            let ranked = scheduling::rank(authorized, |a, b| {
+                a.load_fraction
+                    .partial_cmp(&b.load_fraction)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.did.cmp(&b.did))
             });
-        }
 
-        let predicates: Vec<scheduling::Predicate<Candidate>> = vec![
-            Box::new({
-                let selectors = selectors.clone();
-                move |c: &Candidate| {
-                    for sel in &selectors {
-                        if !sel.matches(&c.labels) {
-                            return Some(scheduling::RejectionReason(format!(
-                                "label selector on {:?} did not match",
-                                sel.key
-                            )));
-                        }
-                    }
-                    None
-                }
-            }),
-            Box::new({
-                let resources = resources.clone();
-                move |c: &Candidate| {
-                    for req in &resources {
-                        let satisfied = c
-                            .allocatable
-                            .iter()
-                            .find(|(name, _)| name == &req.name)
-                            .is_some_and(|(_, quantity)| req.satisfied_by(quantity));
-                        if !satisfied {
-                            return Some(scheduling::RejectionReason(format!(
-                                "resource {:?} not satisfied",
-                                req.name
-                            )));
-                        }
-                    }
-                    None
-                }
-            }),
-        ];
+            let max = if data.max_candidates == 0 {
+                DEFAULT_MAX_CANDIDATES
+            } else {
+                data.max_candidates as usize
+            };
+            let candidates_out: Vec<PlacementCandidate> = ranked
+                .into_iter()
+                .take(max)
+                .map(|c| PlacementCandidate {
+                    node: c.did.clone(),
+                    record_uri: c.record_uri.clone(),
+                    load_fraction: c.load_fraction,
+                    allocatable: c
+                        .allocatable
+                        .iter()
+                        .map(|(name, quantity)| Resource {
+                            name: name.clone(),
+                            quantity: quantity.clone(),
+                        })
+                        .collect(),
+                    last_seen: c.last_seen,
+                })
+                .collect();
 
-        let outcomes = scheduling::filter(&candidates, &predicates);
-        let survivors: Vec<&Candidate> = outcomes
-            .iter()
-            .filter(|o| o.passed())
-            .map(|o| o.candidate)
-            .collect();
-
-        // Per-candidate fail-closed authz — async, so it runs as its own pass
-        // rather than inside a (sync) `scheduling::Predicate` closure. A denied
-        // node is silently dropped, never surfaced as an error.
-        let mut authorized: Vec<&Candidate> = Vec::with_capacity(survivors.len());
-        for c in survivors {
-            let resource = format!("placement:candidate:{}", c.did);
-            if self.authorize(ctx, &resource, "query").await.is_ok() {
-                authorized.push(c);
-            }
-        }
-
-        // Post-filter, post-authz, pre-bound — so callers can tell truncation
-        // apart from "that's really all of them".
-        let total_matching = authorized.len() as u32;
-
-        let ranked = scheduling::rank(authorized, |a, b| {
-            a.load_fraction
-                .partial_cmp(&b.load_fraction)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.did.cmp(&b.did))
-        });
-
-        let max = if data.max_candidates == 0 {
-            DEFAULT_MAX_CANDIDATES
-        } else {
-            data.max_candidates as usize
+            Ok(DiscoveryResponseVariant::QueryCandidatesResult(
+                PlacementCandidateSet {
+                    candidates: candidates_out,
+                    total_matching,
+                },
+            ))
         };
-        let candidates_out: Vec<PlacementCandidate> = ranked
-            .into_iter()
-            .take(max)
-            .map(|c| PlacementCandidate {
-                node: c.did.clone(),
-                record_uri: c.record_uri.clone(),
-                load_fraction: c.load_fraction,
-                allocatable: c
-                    .allocatable
-                    .iter()
-                    .map(|(name, quantity)| Resource {
-                        name: name.clone(),
-                        quantity: quantity.clone(),
-                    })
-                    .collect(),
-                last_seen: c.last_seen,
-            })
-            .collect();
-
-        Ok(DiscoveryResponseVariant::QueryCandidatesResult(
-            PlacementCandidateSet {
-                candidates: candidates_out,
-                total_matching,
-            },
-        ))
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            tokio::time::timeout(CANDIDATE_QUERY_TIMEOUT, query)
+                .await
+                .map_err(|_| anyhow::anyhow!("candidate query deadline exceeded; retry"))?
+        }
+        #[cfg(target_arch = "wasm32")]
+        query.await
     }
 
     /// #524 P1 — node liveness heartbeat. The auto-generated dispatch gate
@@ -6646,6 +6730,7 @@ impl DiscoveryHandler for DiscoveryService {
             }));
         }
 
+        let received_at = unix_millis_now();
         let live = LiveAllocatable {
             allocatable: data
                 .allocatable
@@ -6653,13 +6738,10 @@ impl DiscoveryHandler for DiscoveryService {
                 .map(|r| (r.name.clone(), r.quantity.clone()))
                 .collect(),
             load_fraction: data.load_fraction,
-            last_seen: if data.ts != 0 {
-                data.ts
-            } else {
-                unix_millis_now()
-            },
-            live_until_unix_ms: unix_millis_now()
-                .saturating_add(LIVENESS_TTL.as_millis() as i64),
+            // Client clocks can move backwards or be arbitrarily future
+            // skewed. Freshness and ordering describe this admitted receipt.
+            last_seen: received_at,
+            live_until_unix_ms: received_at.saturating_add(LIVENESS_TTL.as_millis() as i64),
         };
         self.state_store.put_liveness(&data.node, live).await?;
 
@@ -7211,6 +7293,223 @@ mod query_candidates_tests {
         )
         .with_auth_provider(auth)
         .with_record_resolver(Arc::new(FixedRepoResolver { repos }))
+    }
+
+    struct ConcurrentRepoResolver {
+        inner: FixedRepoResolver,
+        barrier: Option<tokio::sync::Barrier>,
+        stall: std::sync::atomic::AtomicBool,
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        resolved: parking_lot::Mutex<Vec<String>>,
+    }
+
+    struct ActiveResolution<'a>(&'a std::sync::atomic::AtomicUsize);
+    impl Drop for ActiveResolution<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl RecordResolver for ConcurrentRepoResolver {
+        async fn resolve_record(
+            &self,
+            _did: &str,
+            _collection: &str,
+            _rkey: &str,
+        ) -> Result<Option<RecordCarData>> {
+            Ok(None)
+        }
+        async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.resolved.lock().push(did.to_owned());
+            let active = self.active.fetch_add(1, SeqCst) + 1;
+            let _guard = ActiveResolution(&self.active);
+            self.peak.fetch_max(active, SeqCst);
+            if self.stall.load(SeqCst) {
+                futures::future::pending::<()>().await;
+            }
+            if let Some(barrier) = &self.barrier {
+                barrier.wait().await;
+            }
+            self.inner.resolve_repo(did).await
+        }
+        async fn resolve_verifying_key(&self, did: &str) -> Result<Option<P256VerifyingKey>> {
+            self.inner.resolve_verifying_key(did).await
+        }
+    }
+
+    async fn assert_cold_query_concurrency(state: DiscoveryState) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let mut repos = HashMap::new();
+        let now = unix_millis_now();
+        for i in 0..33 {
+            let did = format!("did:web:cold-{i}.example");
+            repos.insert(
+                did.clone(),
+                node_repo_car(&did, &sample_node_record(&did, vec![])),
+            );
+            state
+                .clone()
+                .into_inner()
+                .put_liveness(
+                    &Did::new(did),
+                    LiveAllocatable {
+                        allocatable: vec![],
+                        load_fraction: 0.1,
+                        last_seen: now,
+                        live_until_unix_ms: now + 45_000,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let resolver = Arc::new(ConcurrentRepoResolver {
+            inner: FixedRepoResolver { repos },
+            // A sequential implementation cannot complete even one batch.
+            barrier: Some(tokio::sync::Barrier::new(CANDIDATE_QUERY_CONCURRENCY)),
+            stall: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            resolved: parking_lot::Mutex::new(vec![]),
+        });
+        let denied = "did:web:cold-32.example";
+        let svc = service_with(Box::new(DenyNode(denied.to_owned())), HashMap::new())
+            .with_record_resolver(resolver.clone())
+            .with_state(state);
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(1)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let result = as_set(result);
+        assert_eq!(
+            result.total_matching, 32,
+            "maxCandidates must not hide incomplete hydration"
+        );
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(resolver.peak.load(SeqCst), CANDIDATE_QUERY_CONCURRENCY);
+        assert_eq!(resolver.active.load(SeqCst), 0);
+        assert_eq!(resolver.resolved.lock().len(), 32);
+        assert!(!resolver.resolved.lock().iter().any(|did| did == denied));
+    }
+
+    #[tokio::test]
+    async fn cold_candidate_query_hydrates_concurrently_without_truncation() {
+        let state = DiscoveryState::connect(&crate::DiscoveryStateConfig::default())
+            .await
+            .unwrap();
+        assert_cold_query_concurrency(state).await;
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_cold_candidate_query_hydrates_concurrently_without_truncation() {
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let config = crate::DiscoveryStateConfig {
+            backend: crate::DiscoveryStateBackend::Tiered,
+            active_active: true,
+            valkey: crate::ValkeyStateConfig {
+                url,
+                key_prefix: format!("cold-query-{}-{}", std::process::id(), unix_millis_now()),
+                ..crate::ValkeyStateConfig::default()
+            },
+            ..crate::DiscoveryStateConfig::default()
+        };
+        assert_cold_query_concurrency(DiscoveryState::connect(&config).await.unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn cold_candidate_deadline_cancels_ingest_and_retry_is_complete() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let did = "did:web:stalled.example";
+        let resolver = Arc::new(ConcurrentRepoResolver {
+            inner: FixedRepoResolver {
+                repos: HashMap::from([(
+                    did.to_owned(),
+                    node_repo_car(did, &sample_node_record(did, vec![])),
+                )]),
+            },
+            barrier: None,
+            stall: AtomicBool::new(true),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            resolved: parking_lot::Mutex::new(vec![]),
+        });
+        let svc =
+            service_with(Box::new(AllowAll), HashMap::new()).with_record_resolver(resolver.clone());
+        let now = unix_millis_now();
+        svc.state_store
+            .put_liveness(
+                &Did::new(did.to_owned()),
+                LiveAllocatable {
+                    allocatable: vec![],
+                    load_fraction: 0.1,
+                    last_seen: now,
+                    live_until_unix_ms: now + 45_000,
+                },
+            )
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(
+            CANDIDATE_QUERY_TIMEOUT + Duration::from_secs(2),
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(1)),
+        )
+        .await
+        .unwrap()
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert_eq!(
+            resolver.active.load(SeqCst),
+            0,
+            "deadline must drop outstanding repository work"
+        );
+        resolver.stall.store(false, SeqCst);
+        let result = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(1))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            result.total_matching, 1,
+            "cancelled ingest must not be cached as absence"
+        );
+        assert_eq!(resolver.resolved.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_uses_receipt_time_after_client_clock_rollback() {
+        let svc = service_with(Box::new(AllowAll), HashMap::new());
+        let node = Did::new("did:web:rollback.example".to_owned());
+        let start = unix_millis_now();
+        for ts in [start + 86_400_000, start - 86_400_000] {
+            let req = NodeLiveness {
+                node: node.clone(),
+                allocatable: vec![],
+                load_fraction: 0.2,
+                ts,
+            };
+            svc.handle_report_node_liveness(&test_ctx(), 1, &req)
+                .await
+                .unwrap();
+            let value = svc
+                .state_store
+                .liveness(&node, unix_millis_now())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(value.last_seen >= start && value.last_seen <= unix_millis_now());
+            assert_eq!(
+                value.live_until_unix_ms,
+                value.last_seen + LIVENESS_TTL.as_millis() as i64
+            );
+        }
     }
 
     fn test_ctx() -> EnvelopeContext {
