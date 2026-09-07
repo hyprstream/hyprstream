@@ -278,13 +278,36 @@ async fn run_bridge_dispatch_loop<S>(
     service: std::rc::Rc<S>,
     mut rx: tokio::sync::mpsc::Receiver<BridgeMessage>,
     nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
-) where
+    shutdown: CancellationToken,
+) -> BridgeShutdownResult
+where
     S: crate::service::RequestService + 'static,
 {
-    while let Some(msg) = rx.recv().await {
+    let mut requests = tokio::task::JoinSet::new();
+    let mut result = Ok(());
+    // Closing the receiver rejects new sends but preserves the accepted queue.
+    // The dispatch owner joins every spawned request before returning.
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = shutdown.cancelled(), if !rx.is_closed() => {
+                rx.close();
+                continue;
+            }
+            joined = requests.join_next(), if !requests.is_empty() => {
+                if matches!(joined, Some(Err(_))) {
+                    result = Err(BridgeShutdownError::ThreadPanicked);
+                }
+                continue;
+            }
+            msg = rx.recv() => match msg {
+                Some(msg) => msg,
+                None => break,
+            },
+        };
         let service = std::rc::Rc::clone(&service);
         let nonce_cache = Arc::clone(&nonce_cache);
-        tokio::task::spawn_local(async move {
+        requests.spawn_local(async move {
             let signing_key = service.signing_key();
             let result = crate::service::dispatch::process_request(
                 msg.request.as_ref(),
@@ -299,6 +322,10 @@ async fn run_bridge_dispatch_loop<S>(
             let _ = msg.respond.send(result);
         });
     }
+    while let Some(joined) = requests.join_next().await {
+        if joined.is_err() { result = Err(BridgeShutdownError::ThreadPanicked); }
+    }
+    result
 }
 
 /// Adapt a [`crate::service::RequestService`] to [`IrohRequestProcessor`].
@@ -308,59 +335,100 @@ async fn run_bridge_dispatch_loop<S>(
 /// and `!Send` services like inference); requests arriving on the iroh accept
 /// loop are forwarded via an `mpsc` channel and awaited via `oneshot`.
 ///
-/// **Lifecycle**: in-flight requests are drained when the
-/// [`IrohRpcProtocolHandler`] holding this bridge is shut down via
-/// `Router::shutdown` (each in-flight handler task holds a semaphore permit;
-/// the handler's drain waits for all permits to return, which only happens
-/// once the bridge has produced each response). After that, the
-/// service owner calls `shutdown().await` to cancel remaining local work and
-/// join the bridge thread, including service/runtime destructors. Final-handle
-/// drop provides synchronous cleanup if the owner did not explicitly close it.
-/// A drop originating on the bridge thread signals cancellation without self-join.
+/// **Lifecycle**: shutdown closes admission, drains queued and running requests
+/// within the same grace period as network RPC, then destroys residual LocalSet
+/// tasks and joins the thread. A retained client cannot pin the service. Final
+/// handle drop provides synchronous cleanup; explicit owners use async shutdown.
 pub struct LocalServiceBridge {
     tx: tokio::sync::mpsc::Sender<BridgeMessage>,
     shutdown: CancellationToken,
     thread: Arc<BridgeThread>,
+    admission: parking_lot::Mutex<()>,
 }
+
+/// Stable terminal outcome shared by all explicit shutdown waiters.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BridgeShutdownError {
+    #[error("bridge thread panicked")]
+    ThreadPanicked,
+    #[error("bridge request drain timed out")]
+    DrainTimedOut,
+    #[error("bridge runtime initialization failed: {0}")]
+    Runtime(String),
+    #[error("cannot join bridge from its own thread")]
+    SelfJoin,
+    #[error("bridge join task failed: {0}")]
+    JoinTask(String),
+}
+
+type BridgeShutdownResult = std::result::Result<(), BridgeShutdownError>;
 
 /// Join ownership survives cancellation of an async shutdown waiter.
 struct BridgeThread {
     id: std::thread::ThreadId,
-    handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
-    completed: parking_lot::Mutex<bool>,
+    handle: parking_lot::Mutex<Option<std::thread::JoinHandle<BridgeShutdownResult>>>,
+    completed: parking_lot::Mutex<Option<BridgeShutdownResult>>,
     completion: parking_lot::Condvar,
 }
 
 impl BridgeThread {
-    fn new(handle: std::thread::JoinHandle<()>) -> Self {
+    fn new(handle: std::thread::JoinHandle<BridgeShutdownResult>) -> Self {
         Self {
             id: handle.thread().id(),
             handle: parking_lot::Mutex::new(Some(handle)),
-            completed: parking_lot::Mutex::new(false),
+            completed: parking_lot::Mutex::new(None),
             completion: parking_lot::Condvar::new(),
         }
     }
 
-    fn join(&self) {
+    fn join(&self) -> BridgeShutdownResult {
         if self.id == std::thread::current().id() {
-            // Self-owned shutdown only requests cancellation; never self-join.
-            return;
+            return Err(BridgeShutdownError::SelfJoin);
         }
         let handle = self.handle.lock().take();
         if let Some(handle) = handle {
             // No lock needed by any caller or service destructor is held here.
-            if handle.join().is_err() {
-                tracing::error!("bridge thread panicked");
-            }
-            *self.completed.lock() = true;
+            let result = handle.join().unwrap_or(Err(BridgeShutdownError::ThreadPanicked));
+            *self.completed.lock() = Some(result.clone());
             self.completion.notify_all();
+            result
         } else {
             let mut completed = self.completed.lock();
-            while !*completed {
+            loop {
+                if let Some(result) = &*completed {
+                    return result.clone();
+                }
                 self.completion.wait(&mut completed);
             }
         }
     }
+}
+
+async fn finish_bridge_local_set(
+    local: tokio::task::LocalSet,
+    dispatch: tokio::task::JoinHandle<BridgeShutdownResult>,
+    shutdown: CancellationToken,
+    grace: std::time::Duration,
+) -> BridgeShutdownResult {
+    let result = {
+        // Await the dispatch task (which owns every accepted RPC), not the
+        // whole LocalSet: streaming continuations are residual background work.
+        let run = local.run_until(async move {
+            dispatch.await.unwrap_or(Err(BridgeShutdownError::ThreadPanicked))
+        });
+        tokio::pin!(run);
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                tokio::time::timeout(grace, &mut run).await
+                    .unwrap_or(Err(BridgeShutdownError::DrainTimedOut))
+            }
+            result = &mut run => result,
+        }
+    };
+    // Entered runtime remains alive while residual tasks/services are destroyed.
+    drop(local);
+    result
 }
 
 impl crate::transport::rpc_session::sealed::Sealed for LocalServiceBridge {
@@ -402,30 +470,25 @@ impl LocalServiceBridge {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        tracing::error!(error = ?e, "bridge: failed to build runtime");
-                        return;
+                        return Err(BridgeShutdownError::Runtime(e.to_string()));
                     }
                 };
-                let mut local = tokio::task::LocalSet::new();
-                local.spawn_local(run_bridge_dispatch_loop(
+                let local = tokio::task::LocalSet::new();
+                let dispatch = local.spawn_local(run_bridge_dispatch_loop(
                     std::rc::Rc::new(service),
                     rx,
                     nonce_cache,
+                    stopped.clone(),
                 ));
-                rt.block_on(async move {
-                    tokio::select! {
-                        biased;
-                        _ = stopped.cancelled() => {}
-                        _ = &mut local => {}
-                    }
-                    // Destroy local tasks/services with their runtime still entered.
-                    drop(local);
-                });
+                let result = rt.block_on(finish_bridge_local_set(
+                    local, dispatch, stopped, super::rpc_session::DRAIN_TIMEOUT,
+                ));
                 drop(rt);
+                result
             })
             .map_err(|e| anyhow::anyhow!("spawn iroh-rpc bridge thread: {e}"))?;
 
-        Ok(Self { tx, shutdown, thread: Arc::new(BridgeThread::new(thread)) })
+        Ok(Self { tx, shutdown, thread: Arc::new(BridgeThread::new(thread)), admission: parking_lot::Mutex::new(()) })
     }
 
     /// Like [`LocalServiceBridge::spawn`], but constructs the service ON the
@@ -467,69 +530,78 @@ impl LocalServiceBridge {
                     Ok(rt) => rt,
                     Err(e) => {
                         let _ = ready_tx.send(Err(anyhow::anyhow!("bridge runtime: {e}")));
-                        return;
+                        return Err(BridgeShutdownError::Runtime(e.to_string()));
                     }
                 };
-                let mut local = tokio::task::LocalSet::new();
-                local.spawn_local(async move {
+                let local = tokio::task::LocalSet::new();
+                let dispatch_shutdown = stopped.clone();
+                let dispatch = local.spawn_local(async move {
                     // Build on-thread; a failure (e.g. GPU init) is reported via
                     // the readiness channel and the bridge thread exits.
-                    let service = match build().await {
+                    let built = tokio::select! {
+                        biased;
+                        _ = dispatch_shutdown.cancelled() => return Ok(()),
+                        built = build() => built,
+                    };
+                    let service = match built {
                         Ok(s) => std::rc::Rc::new(s),
                         Err(e) => {
                             let _ = ready_tx.send(Err(e));
-                            return;
+                            return Ok(());
                         }
                     };
                     if ready_tx.send(Ok(())).is_err() {
                         // Caller gave up waiting; no point serving.
-                        return;
+                        return Ok(());
                     }
-                    run_bridge_dispatch_loop(service, rx, nonce_cache).await;
+                    run_bridge_dispatch_loop(service, rx, nonce_cache, dispatch_shutdown).await
                 });
-                rt.block_on(async move {
-                    tokio::select! {
-                        biased;
-                        _ = stopped.cancelled() => {}
-                        _ = &mut local => {}
-                    }
-                    // Destroy local tasks/services with their runtime still entered.
-                    drop(local);
-                });
+                let result = rt.block_on(finish_bridge_local_set(
+                    local, dispatch, stopped, super::rpc_session::DRAIN_TIMEOUT,
+                ));
                 drop(rt);
+                result
             })
             .map_err(|e| anyhow::anyhow!("spawn rpc bridge thread: {e}"))?;
 
-        Ok((Self { tx, shutdown, thread: Arc::new(BridgeThread::new(thread)) }, ready_rx))
+        Ok((Self { tx, shutdown, thread: Arc::new(BridgeThread::new(thread)), admission: parking_lot::Mutex::new(()) }, ready_rx))
     }
 }
 
 impl LocalServiceBridge {
-    /// End the bridge after transport drain and wait for service/runtime destruction.
-    /// Joining runs off the caller's runtime; no thread lock is held while waiting.
-    /// Concurrent close calls share the same completion barrier.
-    pub async fn shutdown(&self) {
+    fn close_admission(&self) {
+        let _admission = self.admission.lock();
         self.shutdown.cancel();
+    }
+
+    /// Close admission, drain accepted work, and wait for service/runtime destruction.
+    /// Joining runs off the caller's runtime; no thread lock is held while waiting.
+    /// Concurrent close calls share the same terminal result.
+    pub async fn shutdown(&self) -> BridgeShutdownResult {
+        self.close_admission();
         if self.thread.id == std::thread::current().id() {
-            return;
+            return Err(BridgeShutdownError::SelfJoin);
         }
         let thread = Arc::clone(&self.thread);
-        if let Err(error) = tokio::task::spawn_blocking(move || thread.join()).await {
-            tracing::error!(?error, "bridge thread join task failed");
-        }
+        tokio::task::spawn_blocking(move || thread.join()).await
+            .map_err(|error| BridgeShutdownError::JoinTask(error.to_string()))?
     }
 }
 
 impl Drop for LocalServiceBridge {
     fn drop(&mut self) {
-        self.shutdown.cancel();
+        self.close_admission();
         // Explicit async shutdown is the service-owner path. Final-handle drop
         // also owns teardown, including failed or cancelled spawn_with builders.
-        self.thread.join();
+        if let Err(error) = self.thread.join() {
+            tracing::error!(%error, "bridge drop teardown failed");
+        }
     }
 }
 
 impl IrohRequestProcessor for LocalServiceBridge {
+    fn close_admission(&self) { LocalServiceBridge::close_admission(self); }
+
     fn process(
         &self,
         request: Bytes,
@@ -538,13 +610,20 @@ impl IrohRequestProcessor for LocalServiceBridge {
         let tx = self.tx.clone();
         Box::pin(async move {
             let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
-            tx.send(BridgeMessage {
-                request,
-                carrier,
-                respond: respond_tx,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("iroh-rpc bridge: channel closed"))?;
+            let permit = tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => anyhow::bail!("iroh-rpc bridge: admission closed"),
+                reserved = tx.reserve() => {
+                    reserved.map_err(|_| anyhow::anyhow!("iroh-rpc bridge: channel closed"))?
+                }
+            };
+            {
+                // Linearize successful enqueue against shutdown, without holding
+                // any lock across queue backpressure, dispatch, or thread join.
+                let _admission = self.admission.lock();
+                anyhow::ensure!(!self.shutdown.is_cancelled(), "iroh-rpc bridge: admission closed");
+                permit.send(BridgeMessage { request, carrier, respond: respond_tx });
+            }
             respond_rx
                 .await
                 .map_err(|_| anyhow::anyhow!("iroh-rpc bridge: response dropped"))?
@@ -589,6 +668,7 @@ mod tests {
         transport: crate::transport::TransportConfig,
         signing_key: SigningKey,
         drop_probe: Option<BridgeDropProbe>,
+        request_gate: Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>,
     }
 
     struct BridgeDropProbe {
@@ -609,6 +689,7 @@ mod tests {
         fn new(signing_key: SigningKey) -> Self {
             Self {
                 drop_probe: None,
+                request_gate: None,
                 name: "bridge-echo".to_owned(),
                 transport: crate::transport::TransportConfig::inproc("bridge-echo-unused"),
                 signing_key,
@@ -625,6 +706,16 @@ mod tests {
             let mut out = vec![0xBE];
             out.extend_from_slice(payload);
             Ok((out, None))
+        }
+        async fn verify_claims(&self, _ctx: &mut crate::service::EnvelopeContext) -> Result<()> {
+            if let Some((entered, release)) = &self.request_gate {
+                entered.add_permits(1);
+                release.acquire().await?.forget();
+            }
+            anyhow::bail!("gated claims denial")
+        }
+        fn build_error_payload(&self, _request_id: u64, error: &str) -> Vec<u8> {
+            error.as_bytes().to_vec()
         }
         fn name(&self) -> &str {
             &self.name
@@ -692,15 +783,16 @@ mod tests {
         let (returned_tx, returned_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             if let Ok(owner) = owner_rx.recv() {
-                owner.join();
+                assert_eq!(owner.join(), Err(BridgeShutdownError::SelfJoin));
                 let _ = returned_tx.send(());
             }
+            Ok(())
         });
         let owner = Arc::new(BridgeThread::new(worker));
         owner_tx.send(Arc::clone(&owner))?;
         returned_rx.recv_timeout(Duration::from_secs(5))?;
-        owner.join();
-        assert!(*owner.completed.lock());
+        owner.join()?;
+        assert_eq!(*owner.completed.lock(), Some(Ok(())));
         Ok(())
     }
 
@@ -723,7 +815,7 @@ mod tests {
         let _ = first.await;
         let premature = tokio::time::timeout(Duration::from_millis(100), bridge.shutdown()).await.is_ok();
         release_tx.send(())?;
-        tokio::time::timeout(Duration::from_secs(5), bridge.shutdown()).await?;
+        tokio::time::timeout(Duration::from_secs(5), bridge.shutdown()).await??;
         assert!(!premature, "cancelled waiter lost the in-progress thread join");
         assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
         Ok(())
@@ -752,13 +844,149 @@ mod tests {
         let bridge = Arc::new(bridge);
         let retained = Arc::clone(&bridge);
         tokio::time::timeout(Duration::from_secs(5), entered_rx).await??;
-        tokio::time::timeout(Duration::from_secs(5), bridge.shutdown()).await?;
+        tokio::time::timeout(Duration::from_secs(5), bridge.shutdown()).await??;
         assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
         assert!(ready.await.is_err());
         assert!(retained.process(Bytes::new(),
             crate::transport::carrier::CarrierContext::iroh()).await.is_err());
         // Completion is idempotent while another owner still retains the bridge.
-        bridge.shutdown().await;
+        bridge.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_shutdown_drains_accepted_queue_before_residual_cancellation() -> Result<()> {
+        use crate::ToCapnp;
+        let key = fresh_signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&key);
+        let mut store = crate::envelope::KeyedPqTrustStore::new();
+        store.bind(key.verifying_key().to_bytes(), &crate::crypto::pq::ml_dsa_sk_to_vk(&pq));
+        let store = Arc::new(store);
+        crate::envelope::install_verify_config(crate::envelope::EnvelopeVerifyConfig {
+            policy: crate::crypto::CryptoPolicy::Hybrid, pq_store: Some(store.clone()),
+        })?;
+        crate::envelope::install_response_verify_config(crate::envelope::ResponseVerifyConfig {
+            policy: crate::crypto::CryptoPolicy::Hybrid, pq_store: Some(store),
+        })?;
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut service = BridgeEcho::new(key.clone());
+        service.request_gate = Some((entered.clone(), release.clone()));
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let mut responses = Vec::new();
+        for payload in [b"one", b"two"] {
+            let envelope = crate::envelope::SignedEnvelope::new_signed_hybrid(
+                crate::envelope::RequestEnvelope::new(payload.to_vec()), &key, &pq,
+            );
+            let mut message = capnp::message::Builder::new_default();
+            envelope.write_to(&mut message.init_root::<crate::common_capnp::signed_envelope::Builder>());
+            let mut wire = Vec::new();
+            capnp::serialize::write_message(&mut wire, &message)?;
+            let (respond, response) = tokio::sync::oneshot::channel();
+            tx.try_send(BridgeMessage {
+                request: Bytes::from(wire), carrier: crate::transport::carrier::CarrierContext::inproc(), respond,
+            }).map_err(|_| anyhow::anyhow!("queue admission failed"))?;
+            responses.push(response);
+        }
+        // Both requests are queued BEFORE shutdown, before dispatch is polled.
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        let local = tokio::task::LocalSet::new();
+        let dispatch = local.spawn_local(run_bridge_dispatch_loop(
+            std::rc::Rc::new(service), rx, Arc::new(crate::envelope::InMemoryNonceCache::new()), stopped.clone(),
+        ));
+        let drain = finish_bridge_local_set(local, dispatch, stopped, super::super::rpc_session::DRAIN_TIMEOUT);
+        let coordinate = async {
+            tokio::time::timeout(Duration::from_secs(5), entered.acquire_many(2)).await??.forget();
+            assert!(tx.is_closed(), "new admissions remained open during grace");
+            release.add_permits(2);
+            for response in responses {
+                let wire = response.await??;
+                let (_, payload) = crate::envelope::unwrap_response(&wire, Some(&key.verifying_key()))?;
+                assert_eq!(payload, b"gated claims denial");
+            }
+            anyhow::Ok(())
+        };
+        let (drained, coordinated) = tokio::join!(drain, coordinate);
+        drained?;
+        coordinated?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_panicked_thread_result_is_shared_by_shutdown_waiters() -> Result<()> {
+        let worker = std::thread::spawn(|| -> BridgeShutdownResult {
+            panic!("causal bridge thread panic");
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let bridge = Arc::new(LocalServiceBridge {
+            tx,
+            shutdown: CancellationToken::new(),
+            thread: Arc::new(BridgeThread::new(worker)),
+            admission: parking_lot::Mutex::new(()),
+        });
+        let (first, second) = tokio::join!(bridge.shutdown(), bridge.shutdown());
+        assert_eq!(first, Err(BridgeShutdownError::ThreadPanicked));
+        assert_eq!(second, first);
+        assert_eq!(bridge.shutdown().await, first);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_drain_timeout_cancels_accepted_request_and_shares_error() -> Result<()> {
+        use crate::ToCapnp;
+        let key = fresh_signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&key);
+        let mut store = crate::envelope::KeyedPqTrustStore::new();
+        store.bind(key.verifying_key().to_bytes(), &crate::crypto::pq::ml_dsa_sk_to_vk(&pq));
+        crate::envelope::install_verify_config(crate::envelope::EnvelopeVerifyConfig {
+            policy: crate::crypto::CryptoPolicy::Hybrid, pq_store: Some(Arc::new(store)),
+        })?;
+        let envelope = crate::envelope::SignedEnvelope::new_signed_hybrid(
+            crate::envelope::RequestEnvelope::new(b"held".to_vec()), &key, &pq,
+        );
+        let mut message = capnp::message::Builder::new_default();
+        envelope.write_to(&mut message.init_root::<crate::common_capnp::signed_envelope::Builder>());
+        let mut wire = Vec::new();
+        capnp::serialize::write_message(&mut wire, &message)?;
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut service = BridgeEcho::new(key);
+        service.request_gate = Some((entered.clone(), Arc::new(tokio::sync::Semaphore::new(0))));
+        let (drop_entered, _) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        release.send(())?;
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        service.drop_probe = Some(BridgeDropProbe {
+            entered: drop_entered, release: released, completed: dropped.clone(),
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (respond, response) = tokio::sync::oneshot::channel();
+        tx.try_send(BridgeMessage {
+            request: Bytes::from(wire), carrier: crate::transport::carrier::CarrierContext::inproc(), respond,
+        }).map_err(|_| anyhow::anyhow!("queue admission failed"))?;
+        let stopped = CancellationToken::new();
+        let thread_stopped = stopped.clone();
+        let thread = std::thread::spawn(move || {
+            // Real dispatch/queue/destructor, with only the runtime clock made
+            // virtual: exercise the unchanged production 40-second bound.
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all()
+                .start_paused(true).build().map_err(|e| BridgeShutdownError::Runtime(e.to_string()))?;
+            let local = tokio::task::LocalSet::new();
+            let dispatch = local.spawn_local(run_bridge_dispatch_loop(
+                std::rc::Rc::new(service), rx, Arc::new(crate::envelope::InMemoryNonceCache::new()), thread_stopped.clone(),
+            ));
+            rt.block_on(finish_bridge_local_set(local, dispatch, thread_stopped, super::super::rpc_session::DRAIN_TIMEOUT))
+        });
+        let bridge = LocalServiceBridge {
+            tx, shutdown: stopped, thread: Arc::new(BridgeThread::new(thread)), admission: parking_lot::Mutex::new(()),
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.acquire()).await??.forget();
+        let (first, second) = tokio::join!(bridge.shutdown(), bridge.shutdown());
+        assert_eq!(first, Err(BridgeShutdownError::DrainTimedOut));
+        assert_eq!(second, first);
+        assert_eq!(bridge.shutdown().await, first);
+        assert!(response.await.is_err(), "forced deadline retained the accepted response sender");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
         Ok(())
     }
 

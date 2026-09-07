@@ -89,8 +89,12 @@ impl<S: RequestService + Send + Sync> Spawnable for S {
             let result = crate::service::serve::serve_bridged(&transport, processor, signing_key, shutdown, on_ready)
                 .await
                 .map_err(|e| RpcError::SpawnFailed(e.to_string()));
-            bridge.shutdown().await;
-            result
+            let teardown = bridge.shutdown().await.map_err(|error| {
+                tracing::error!(%error, "bridge shutdown failed");
+                RpcError::SpawnFailed(error.to_string())
+            });
+            // Always join, while retaining the earlier serving error if both fail.
+            result.and(teardown)
         })
     }
 }

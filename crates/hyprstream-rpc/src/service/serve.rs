@@ -53,8 +53,9 @@ pub async fn serve_bridged(
             crate::dial::register_inproc(endpoint.clone(), &processor);
             signal_ready(on_ready);
             shutdown.notified().await;
+            processor.close_admission();
             crate::dial::unregister_inproc(endpoint);
-            // Drop the strong Arc → bridge thread exits its receive loop.
+            // The service owner drains and joins, even with retained clients.
             drop(processor);
             Ok(())
         }
