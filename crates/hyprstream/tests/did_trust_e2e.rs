@@ -204,6 +204,10 @@ async fn build_fixture() -> Fixture {
         iroh_enabled: false,
         on_iroh_bound: None,
         moq_relay: None,
+        moq_relay_server_identity: None,
+        moq_admission: None,
+        moq_ingress_authorizer: None,
+        moq_admission_proof: None,
     };
     let service =
         hyprstream_service::UnifiedServiceConfig::new(discovery_service, Some(quic_config));

@@ -30,7 +30,7 @@ use zeroize::Zeroizing;
 
 use crate::service::metadata::SchemaMetadataFn;
 use crate::service::spawner::Spawnable;
-use hyprstream_rpc::registry::{global as global_registry, SocketKind};
+use hyprstream_rpc::registry::{SocketKind, global as global_registry};
 use hyprstream_rpc::transport::TransportConfig;
 
 /// Complete, already-validated native announcement ready for publication.
@@ -68,6 +68,33 @@ pub struct NativeServiceAnnouncement {
 }
 
 impl NativeServiceAnnouncement {
+    /// Build the native Iroh `moql` admission proof from this exact
+    /// checkpoint-verified accepted-state projection. The caller's signer must
+    /// still be the accepted response key; no credential is synthesized.
+    pub fn moql_admission_proof(
+        &self,
+        signer: &SigningKey,
+    ) -> anyhow::Result<hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof> {
+        anyhow::ensure!(
+            self.response_verifying_key == signer.verifying_key().to_bytes(),
+            "admission signer is not the accepted current response key"
+        );
+        let ml_dsa_65 = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(signer);
+        let ml_dsa65 = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&ml_dsa_65);
+        Ok(hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof {
+                did: self.service_did.to_string(),
+                ed25519: signer.clone(),
+                ml_dsa_65,
+                expected_server: hyprstream_rpc::stream_info::MoqlServerIdentity {
+                    did: self.service_did.to_string(),
+                    epoch: self.accepted_state_epoch,
+                    head_digest: self.accepted_state_digest.to_vec(),
+                    expires_at_unix_ms: self.accepted_state_expires_at_unix_ms,
+                    ed25519: self.response_verifying_key,
+                    ml_dsa65,
+                },
+            })
+    }
     /// Project a complete native announcement from the opaque #1004 accepted
     /// state. The local service key must be the accepted current key and the
     /// named service must be present in that exact state.
@@ -88,13 +115,15 @@ impl NativeServiceAnnouncement {
         // signer must be *one of* the accepted current response keys, not
         // positionally `first()`. An overlap-rotating identity publishes several
         // usable keys at once; a service holding any of them is authorized.
+        let derived_ml_dsa65 = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(
+            &hyprstream_rpc::node_identity::derive_mesh_mldsa_key(signer),
+        );
         anyhow::ensure!(
-            state
-                .current
-                .subject_keys
-                .iter()
-                .any(|key| key.ed25519_pub.as_slice() == signer.verifying_key().as_bytes()),
-            "service signer is not one of the accepted current response keys"
+            state.current.subject_keys.iter().any(|key| {
+                key.ed25519_pub.as_slice() == signer.verifying_key().as_bytes()
+                    && key.mldsa65_pub == derived_ml_dsa65
+            }),
+            "service signer is not an accepted current hybrid response key"
         );
         let expires_at = state.expires_at.as_deref().ok_or_else(|| {
             anyhow::anyhow!("genesis-only accepted state has no bounded production expiry")
@@ -187,9 +216,27 @@ pub struct QuicSharedConfig {
     /// service's [`QuicLoopConfig`] so the spawner advertises a `Role::Relay` reach
     /// and links the origin UP to the relay.
     pub moq_relay: Option<hyprstream_rpc::stream_info::TransportConfig>,
+    /// Resolver-verified identity of the independently operated relay. It is
+    /// intentionally not inferred from the producing service's proof.
+    pub moq_relay_server_identity: Option<hyprstream_rpc::stream_info::MoqlServerIdentity>,
     /// Application-owned publisher. Keeping this callback here avoids making
     /// orchestration depend on the Discovery implementation crate.
     pub native_announcement_publisher: Option<NativeAnnouncementPublisher>,
+    /// #1027: optional inside-carrier `moql` admission authenticator holding
+    /// the daemon-owned accepted-state/currentness authority and the
+    /// operator-controlled subject→tenant resolver. Threaded unchanged into
+    /// every service's `QuicLoopConfig`; the spawner installs it on the iroh
+    /// `moql` handler. `None` keeps the fail-closed anonymous posture.
+    pub moq_admission:
+        Option<Arc<hyprstream_rpc::transport::moql_admission::MoqlAdmissionAuthenticator>>,
+    /// Optional service-owned decision for remote MoQL ingress. Admission and
+    /// tenant resolution never imply this producer/relay role; `None` leaves
+    /// every admitted peer read-only.
+    pub moq_ingress_authorizer:
+        Option<hyprstream_rpc::transport::iroh_moq::SharedIngressAuthorizer>,
+    /// Native client's accepted-state-bound proof for authenticated Iroh `moql`
+    /// dials. Quinn/WebTransport uses its distinct CONNECT authentication path.
+    pub moq_admission_proof: Option<hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof>,
 }
 
 impl QuicSharedConfig {
@@ -210,7 +257,7 @@ impl QuicSharedConfig {
             });
             // Publish root pubkey for client-side trust pinning (TOFU)
             if let Some(ref vk) = self.jwt_verifying_key {
-                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
                 #[allow(clippy::unwrap_used)] // meta is always a JSON object
                 meta.as_object_mut().unwrap().insert(
                     "x_root_pubkey".to_owned(),
@@ -232,6 +279,12 @@ impl QuicSharedConfig {
             // #358: thread the producer-chosen relay through so the spawner
             // advertises a Role::Relay reach + links the origin up to the relay.
             moq_relay: self.moq_relay.clone(),
+            moq_relay_server_identity: self.moq_relay_server_identity.clone(),
+            // #1027: thread the daemon-owned moql admission authenticator
+            // through so the spawner installs it on the iroh `moql` handler.
+            moq_admission: self.moq_admission.clone(),
+            moq_ingress_authorizer: self.moq_ingress_authorizer.clone(),
+            moq_admission_proof: self.moq_admission_proof.clone(),
         }
     }
 
@@ -265,7 +318,7 @@ impl QuicSharedConfig {
                 if parts.len() != 3 {
                     return true;
                 }
-                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
                 if let Ok(payload) = URL_SAFE_NO_PAD.decode(parts[1]) {
                     if let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&payload) {
                         if let Some(exp) = claims["exp"].as_i64() {
@@ -286,7 +339,9 @@ impl QuicSharedConfig {
             let discovery_vk = discovery_verifying_key;
             let policy_vk = policy_verifying_key;
             let Some(accepted) = accepted else {
-                tracing::warn!("Refusing production network announcement for '{svc_name}': accepted native identity/KEM bundle is unavailable");
+                tracing::warn!(
+                    "Refusing production network announcement for '{svc_name}': accepted native identity/KEM bundle is unavailable"
+                );
                 return;
             };
             if let Err(error) = accepted.validate(&svc_name, &sk.verifying_key()) {
@@ -303,7 +358,9 @@ impl QuicSharedConfig {
                 let _ = policy_vk;
             }
             let Some(publish) = publisher.clone() else {
-                tracing::warn!("Refusing production network announcement for '{svc_name}': publisher is unavailable");
+                tracing::warn!(
+                    "Refusing production network announcement for '{svc_name}': publisher is unavailable"
+                );
                 return;
             };
             publish(NativeAnnouncementRequest {
@@ -395,6 +452,19 @@ pub struct ServiceContext {
 }
 
 impl ServiceContext {
+    /// Return an accepted-state-bound admission proof for a service that was
+    /// checkpoint-authorized for native network startup.
+    pub fn moql_admission_proof(
+        &self,
+        service_name: &str,
+    ) -> anyhow::Result<Option<hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof>> {
+        self.native_announcements
+            .get(service_name)
+            .map(|announcement| {
+                announcement.moql_admission_proof(&self.service_signing_key(service_name))
+            })
+            .transpose()
+    }
     /// Create a new service context.
     pub fn new(
         signing_key: SigningKey,
@@ -1036,6 +1106,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quic_shared_config_preserves_optional_moq_ingress_authority() {
+        let authority = Arc::new(
+            |peer: &hyprstream_rpc::moq_authz::PeerIdentity, tenant: &str| {
+                peer.subject.as_deref() == Some("did:at9p:producer") && tenant == "local"
+            },
+        );
+        let shared = QuicSharedConfig {
+            cert_chain: Vec::new(),
+            key_der: Zeroizing::new(Vec::new()),
+            base_ip: "127.0.0.1".parse().expect("loopback"),
+            server_name: "test".to_owned(),
+            oauth_issuer_url: None,
+            jwt_verifying_key: None,
+            iroh_enabled: true,
+            moq_relay: None,
+            moq_relay_server_identity: None,
+            native_announcement_publisher: None,
+            moq_admission: None,
+            moq_ingress_authorizer: Some(authority),
+            moq_admission_proof: None,
+        };
+
+        let wired = shared.for_service("event", 0);
+        assert!(wired
+            .moq_ingress_authorizer
+            .as_ref()
+            .is_some_and(|authorizer| authorizer.authorize_ingress(
+                &hyprstream_rpc::moq_authz::PeerIdentity::authenticated("did:at9p:producer"),
+                "local",
+            )));
+
+        let default = QuicSharedConfig {
+            moq_ingress_authorizer: None,
+            ..shared
+        }
+        .for_service("event", 0);
+        assert!(
+            default.moq_ingress_authorizer.is_none(),
+            "absence must stay read-only"
+        );
+    }
+
+    #[test]
     fn test_service_factory_creation() {
         fn dummy_factory(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
             Err(anyhow::anyhow!("dummy"))
@@ -1062,9 +1175,11 @@ mod tests {
                 eks: Vec::new(),
             },
         };
-        assert!(announcement
-            .validate("model", &signer.verifying_key())
-            .is_err());
+        assert!(
+            announcement
+                .validate("model", &signer.verifying_key())
+                .is_err()
+        );
     }
 
     /// #1188 / #1183: a native service announcement projects from an accepted
@@ -1103,7 +1218,7 @@ mod tests {
         let endpoint = ServiceEndpoint::new(Transport::Iroh, "iroh://reach").unwrap();
         let service = ServiceEntry::new("#model", ServiceType::NinePExport, endpoint).unwrap();
         // k1 FIRST, k2 second; self-certify with k1.
-        let body = CapsuleBody::new(vec![kp1, kp2], vec![service]).unwrap();
+        let body = CapsuleBody::new(vec![kp1.clone(), kp2], vec![service.clone()]).unwrap();
         let genesis = sign_capsule(body, &k1, &pq1).unwrap();
         let bytes = genesis.to_dag_cbor().unwrap();
         let cid = genesis.cid512().unwrap();
@@ -1127,7 +1242,7 @@ mod tests {
              the genesis expiry gate; got: {msg}"
         );
         assert!(
-            !msg.contains("not one of the accepted current response keys"),
+            !msg.contains("not an accepted current hybrid response key"),
             "the second published subject key must be accepted as a member; got: {msg}"
         );
 
@@ -1139,9 +1254,31 @@ mod tests {
         };
         assert!(
             err.to_string()
-                .contains("not one of the accepted current response keys"),
+                .contains("not an accepted current hybrid response key"),
             "unexpected error: {err}"
         );
+
+        // The accepted pair must contain the exact derived ML-DSA half too;
+        // matching Ed25519 alone would advertise a proof that cannot answer
+        // the hybrid admission challenge.
+        let mismatched = HybridKeyPair::new(
+            k2.verifying_key().to_bytes().to_vec(),
+            ml_dsa_sk_to_vk_bytes(&pq1),
+        )
+        .unwrap();
+        let body = CapsuleBody::new(vec![kp1, mismatched], vec![service]).unwrap();
+        let genesis = sign_capsule(body, &k1, &pq1).unwrap();
+        let bytes = genesis.to_dag_cbor().unwrap();
+        let cid = genesis.cid512().unwrap();
+        let mismatched_state = AcceptedAt9pState::from_verified_genesis(
+            &verify_genesis_capsule(&cid, &bytes).unwrap(),
+        )
+        .unwrap();
+        let err = match NativeServiceAnnouncement::from_accepted_state("model", &signer2, &mismatched_state) {
+            Ok(_) => panic!("mismatched accepted PQ half must reject before projection"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("accepted current hybrid response key"), "unexpected error: {err}");
     }
 
     #[test]

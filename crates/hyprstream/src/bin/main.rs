@@ -1540,6 +1540,49 @@ fn resolve_moq_relay_reach(
         .ok_or_else(|| anyhow::anyhow!("relay URI is not a network-routable transport"))
 }
 
+/// A QUIC process currently owns one native MoQ dialer and its admission-proof
+/// slot. Sharing that slot across separately checkpointed services would make a
+/// later service dial as the first service's DID. Refuse that topology until the
+/// dialer is service-scoped; checkpointed services must run separately.
+fn select_single_process_moql_admission_proof<T>(
+    proofs: impl IntoIterator<Item = (String, Option<T>)>,
+) -> Result<Option<T>> {
+    let proofs: Vec<_> = proofs.into_iter().collect();
+    let authenticated: Vec<_> = proofs
+        .iter()
+        .filter_map(|(service, proof)| proof.as_ref().map(|_| service.as_str()))
+        .collect();
+
+    if authenticated.is_empty() {
+        return Ok(None);
+    }
+    if proofs.len() != 1 {
+        anyhow::bail!(
+            "native MoQ admission proofs are service-scoped, but this QUIC process contains \
+             checkpointed service(s) [{}] with {} total services; run each checkpointed service \
+             in a separate process",
+            authenticated.join(", "),
+            proofs.len(),
+        );
+    }
+
+    Ok(proofs.into_iter().next().and_then(|(_, proof)| proof))
+}
+
+/// Quinn's CONNECT path has no process-global MoQL proof slot. Defer proof
+/// collection itself to an enabled Iroh profile so Quinn-only multi-service
+/// startup does not inherit Iroh's one-service dialer restriction.
+fn select_iroh_moql_admission_proof<T>(
+    iroh_enabled: bool,
+    proofs: impl FnOnce() -> Result<Vec<(String, Option<T>)>>,
+) -> Result<Option<T>> {
+    if iroh_enabled {
+        select_single_process_moql_admission_proof(proofs()?)
+    } else {
+        Ok(None)
+    }
+}
+
 fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
     let trust = hyprstream_service::global_trust_store();
     // Fast path: already populated (service startup seeded it)
@@ -2762,6 +2805,23 @@ fn main() -> Result<()> {
                                             }
                                         }
                                     };
+                                    // #1542: a checkpointed native service has both an
+                                    // accepted did:at9p identity and its accepted current
+                                    // response signer. Use that existing state to prove Iroh
+                                    // `moql` admission; do not fabricate credentials or fall
+                                    // back to an anonymous Iroh handshake.
+                                    let moq_admission_proof = select_iroh_moql_admission_proof(
+                                        qc.iroh,
+                                        || {
+                                            service_names
+                                                .iter()
+                                                .map(|service_name| {
+                                                    ctx.moql_admission_proof(service_name)
+                                                        .map(|proof| (service_name.clone(), proof))
+                                                })
+                                                .collect::<Result<Vec<_>>>()
+                                        },
+                                    )?;
                                     let discovery_transport = ctx.transport("discovery", SocketKind::Rep);
                                     let shared = hyprstream_service::QuicSharedConfig {
                                         cert_chain,
@@ -2774,6 +2834,17 @@ fn main() -> Result<()> {
                                         iroh_enabled: qc.iroh,
                                         // #358: producer-chosen relay rendezvous (None = direct-only).
                                         moq_relay,
+                                        // A relay's accepted-state witness must be supplied by a
+                                        // verified resolver result; the URI alone is reachability,
+                                        // never an application identity.
+                                        moq_relay_server_identity: None,
+                                        // #1027: no moql admission material is provisioned at
+                                        // daemon bootstrap yet; the accept path stays in its
+                                        // fail-closed anonymous posture until a deployment
+                                        // installs an authenticator here.
+                                        moq_admission: None,
+                                        moq_ingress_authorizer: None,
+                                        moq_admission_proof,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             move |request: hyprstream_service::NativeAnnouncementRequest| {
                                                 let discovery_transport = discovery_transport.clone();
@@ -3409,6 +3480,40 @@ fn main() -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod resolver_startup_controls {
+    #[test]
+    fn checkpointed_moq_services_cannot_share_a_process_dial_proof() {
+        let err = super::select_single_process_moql_admission_proof(vec![
+            ("inference".to_owned(), Some(1_u8)),
+            ("registry".to_owned(), Some(2_u8)),
+        ])
+        .expect_err("different checkpointed services need separate dialers");
+        assert!(err.to_string().contains("separate process"));
+
+        let err = super::select_single_process_moql_admission_proof(vec![
+            ("inference".to_owned(), Some(1_u8)),
+            ("metrics".to_owned(), None),
+        ])
+        .expect_err("a proof cannot be inherited by an unauthenticated service");
+        assert!(err.to_string().contains("service-scoped"));
+
+        assert_eq!(
+            super::select_single_process_moql_admission_proof(vec![
+                ("inference".to_owned(), Some(7_u8)),
+            ])
+            .expect("one service has one scoped proof"),
+            Some(7),
+        );
+    }
+
+    #[test]
+    fn quinn_only_multi_service_startup_never_selects_an_iroh_proof() {
+        let selected = super::select_iroh_moql_admission_proof::<u8>(false, || {
+            panic!("Quinn-only startup must not inspect Iroh admission proofs")
+        })
+        .expect("Quinn-only profile does not need an Iroh proof");
+        assert_eq!(selected, None);
+    }
+
     #[test]
     fn command_and_service_processes_install_before_consumers() {
         let source = include_str!("main.rs");
