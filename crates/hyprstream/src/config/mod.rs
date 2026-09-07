@@ -17,6 +17,7 @@ use crate::runtime::generation_metrics::GenerationQualityMetrics;
 use crate::storage::paths::StoragePaths;
 use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -408,6 +409,14 @@ fn default_tls_server_name() -> String { "localhost".to_owned() }
 /// cert_path = ""
 /// key_path = ""
 /// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeNetworkProfile {
+    #[default]
+    Compatibility,
+    NetworkIrohRequired,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicConfig {
     /// Whether QUIC/WebTransport is enabled (defaults to true)
@@ -439,6 +448,19 @@ pub struct QuicConfig {
     #[serde(default = "default_iroh_enabled")]
     pub iroh: bool,
 
+    /// Explicit native deployment profile. `network-iroh-required` forbids a
+    /// native QUIC/local fallback but does not disable the browser edge.
+    #[serde(default)]
+    pub native_network_profile: NativeNetworkProfile,
+
+    /// Operator-owned bindings from checkpoint-verified `did:at9p` subjects to
+    /// one tenant path segment for native MoQL admission.  This is deliberately
+    /// not derived from a carrier NodeId, a remote claim, or a local default.
+    /// Required-native startup requires rows for every locally started service
+    /// identity that may open the Event plane.
+    #[serde(default)]
+    pub moql_subject_tenants: BTreeMap<String, String>,
+
     /// #358: the producer-chosen moq RELAY this node rendezvouses through, as a
     /// dialable URI (`https://host:port` for the relay's WebTransport `/moq`
     /// endpoint, or an iroh node URI). Empty = direct-only (the baseline). When
@@ -459,12 +481,32 @@ impl Default for QuicConfig {
             cert_path: String::new(),
             key_path: String::new(),
             iroh: default_iroh_enabled(),
+            native_network_profile: NativeNetworkProfile::Compatibility,
+            moql_subject_tenants: BTreeMap::new(),
             relay: String::new(),
         }
     }
 }
 
 impl QuicConfig {
+    pub fn iroh_required(&self) -> bool {
+        self.native_network_profile == NativeNetworkProfile::NetworkIrohRequired
+    }
+
+    pub fn validate_native_network_profile(&self) -> anyhow::Result<()> {
+        if self.iroh_required() {
+            anyhow::ensure!(
+                self.enabled,
+                "network-iroh-required requires [quic] enabled = true so native Iroh can bind"
+            );
+            anyhow::ensure!(
+                self.iroh,
+                "network-iroh-required rejects [quic] iroh = false"
+            );
+        }
+        Ok(())
+    }
+
     /// Parse bind_addr into a SocketAddr.
     pub fn socket_addr(&self) -> anyhow::Result<std::net::SocketAddr> {
         self.bind_addr.parse().map_err(|e| anyhow::anyhow!("invalid quic.bind_addr '{}': {}", self.bind_addr, e))
@@ -571,6 +613,7 @@ impl QuicConfig {
             serde_json::to_vec(&meta).unwrap_or_default()
         });
         Ok(hyprstream_rpc::service::QuicLoopConfig {
+            announcement_cancellation: tokio_util::sync::CancellationToken::new(),
             cert_chain,
             key_der,
             bind_addr: addr,
@@ -580,7 +623,8 @@ impl QuicConfig {
             // #410: iroh is the primary production transport (on by default).
             // This minimal builder mirrors the daemon bootstrap default; the
             // full `QuicSharedConfig` path in `main.rs` honours `[quic] iroh`.
-            iroh_enabled: default_iroh_enabled(),
+            iroh_enabled: self.iroh,
+            iroh_required: self.iroh_required(),
             on_iroh_bound: None,
             // #358: relay rendezvous is provisioned by the daemon bootstrap
             // (`QuicSharedConfig`), not this minimal builder. Direct-only here.
@@ -1779,6 +1823,10 @@ pub struct DiscoveryServiceConfig {
     /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
     #[serde(default)]
     pub quic_port: Option<u16>,
+    /// Volatile Discovery state. Memory is the single-process/WASM default;
+    /// active-active deployments must select Valkey or tiered memory+Valkey.
+    #[serde(default)]
+    pub state: hyprstream_discovery::DiscoveryStateConfig,
 }
 
 /// TUI display server configuration.
@@ -3122,6 +3170,46 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn network_iroh_required_is_serialized_and_rejects_iroh_disabled() -> anyhow::Result<()> {
+        let mut config = QuicConfig::default();
+        config.native_network_profile = NativeNetworkProfile::NetworkIrohRequired;
+        config.iroh = false;
+        assert!(config.validate_native_network_profile().is_err());
+
+        config.iroh = true;
+        config.validate_native_network_profile()?;
+        let serialized = toml::to_string(&config)?;
+        assert!(serialized.contains("native_network_profile = \"network-iroh-required\""));
+        let decoded: QuicConfig = toml::from_str(&serialized)?;
+        assert!(decoded.iroh_required());
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_state_documentation_configures_root_backend() {
+        let doc = include_str!("../../../../docs/discovery-state.md");
+        let example = doc
+            .split_once("```toml\n")
+            .unwrap_or_else(|| panic!("TOML example"))
+            .1
+            .split_once("```")
+            .unwrap_or_else(|| panic!("closed TOML example"))
+            .0;
+        let config: HyprConfig = toml::from_str(example).unwrap_or_else(|e| panic!("{e}"));
+        let state = config.discovery.state;
+        assert_eq!(
+            state.backend,
+            hyprstream_discovery::DiscoveryStateBackend::Tiered
+        );
+        assert!(state.active_active);
+        assert_eq!(state.memory.announcement_capacity, 16_384);
+        assert_eq!(state.valkey.announcement_capacity, 65_536);
+        assert_eq!(state.valkey.key_prefix, "production");
+        assert_eq!(state.valkey.url, "rediss://discovery-state.example:6379");
+        assert_eq!(state.tiered.l1_max_ttl_ms, 1_000);
+    }
+
     #[test]
     fn credentials_backend_default_matches_build_profile() {
         let config: CredentialsConfig =

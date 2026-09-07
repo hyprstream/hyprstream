@@ -56,32 +56,6 @@ fn service_token(signing_key: &SigningKey) -> Option<String> {
         .and_then(|att| att.jwt)
 }
 
-/// Construct a Policy client through the service context's resolved transport.
-///
-/// `for_local_bootstrap` reads only the process-local endpoint registry. That
-/// is appropriate for co-located services, but a rootless Quadlet starts each
-/// service in a separate process. `ServiceContext::transport` preserves the
-/// in-process endpoint when applicable and resolves the shared IPC socket when
-/// `--ipc` is selected.
-fn policy_client_for_context(
-    ctx: &ServiceContext,
-    signing_key: SigningKey,
-    policy_vk: hyprstream_rpc::crypto::VerifyingKey,
-    token: Option<String>,
-) -> anyhow::Result<PolicyClient> {
-    let transport = ctx.transport("policy", SocketKind::Rep);
-    PolicyClient::for_local_transport_bootstrap(&transport, signing_key, policy_vk, token)
-}
-
-fn policy_client_for_transport(
-    transport: &hyprstream_rpc::transport::TransportConfig,
-    signing_key: SigningKey,
-    policy_vk: hyprstream_rpc::crypto::VerifyingKey,
-    token: Option<String>,
-) -> anyhow::Result<PolicyClient> {
-    PolicyClient::for_local_transport_bootstrap(transport, signing_key, policy_vk, token)
-}
-
 /// Shared Git2DB registry instance. Lazily initialized by the first factory
 /// that needs it. Both PolicyService and RegistryService share this instance.
 static SHARED_GIT2DB: std::sync::OnceLock<Arc<RwLock<Git2DB>>> = std::sync::OnceLock::new();
@@ -196,6 +170,67 @@ pub fn classify_pds_store_for_quic(ctx: &ServiceContext) -> anyhow::Result<PdsBo
     )
 }
 
+fn accepted_state_matches_service(
+    state: &hyprstream_pds::at9p_duplicity::AcceptedAt9pState,
+    service_name: &str,
+    verifying_key: &[u8; 32],
+) -> bool {
+    let service_id = format!("#{service_name}");
+    state.current.services.iter().any(|entry| entry.id == service_id)
+        && state
+            .current
+            .subject_keys
+            .iter()
+            .any(|key| key.ed25519_pub.as_slice() == verifying_key)
+}
+
+/// Rebuild one running service's announcement from a fresh checkpoint read
+/// and the latest registered JWT. No stale authority is returned on failure.
+pub fn current_native_announcement(
+    request: &mut hyprstream_service::NativeAnnouncementRequest,
+) -> anyhow::Result<hyprstream_discovery::ServiceAnnouncement> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let verifier = hyprstream_discovery::deployment_registry_verifier()?;
+    let store = crate::services::discovery::PdsRecordStore::open_readonly(
+        &hyprstream_service::deployment_data_dir()?.join("pds-store"),
+    )?.with_at9p_deployment_verifier(verifier);
+    let now = chrono::Utc::now();
+    let state = store.accepted_at9p_state(&request.service_did.to_string(), Some(&now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)))?
+        .ok_or_else(|| anyhow::anyhow!("native announcement accepted state is unavailable"))?;
+    request.refresh_from_accepted_state(&state)?;
+    let service_jwt = hyprstream_service::global_trust_store()
+        .get(&request.signing_key.verifying_key())
+        .and_then(|attestation| attestation.jwt)
+        .or_else(|| request.service_jwt.clone());
+    if let Some(jwt) = service_jwt.as_deref() {
+        let payload = jwt.split('.').nth(1)
+            .ok_or_else(|| anyhow::anyhow!("native announcement JWT is malformed"))?;
+        // Do not include token/claims in diagnostics. Signature verification is
+        // still performed by Discovery; this check bounds local publication.
+        let claims: serde_json::Value = URL_SAFE_NO_PAD.decode(payload).ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or_else(|| anyhow::anyhow!("native announcement JWT is malformed"))?;
+        let expiry = claims["exp"].as_i64()
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .ok_or_else(|| anyhow::anyhow!("native announcement JWT has no bounded expiry"))?;
+        anyhow::ensure!(expiry > now.timestamp_millis(), "native announcement JWT expired");
+    }
+    Ok(hyprstream_discovery::ServiceAnnouncement {
+        service_name: request.service_name.clone(),
+        socket_kind: request.reach.socket_kind().to_owned(),
+        endpoint: request.reach.endpoint(),
+        service_jwt,
+        service_did: request.service_did.clone(),
+        capabilities: request.capabilities.clone(),
+        accepted_state_digest: request.accepted_state_digest.clone(),
+        accepted_state_epoch: request.accepted_state_epoch,
+        response_key_id: request.response_key_id.clone(),
+        request_kem_key_id: request.request_kem_key_id.clone(),
+        request_kem_recipient: request.request_kem_recipient.clone(),
+        expires_at_unix_ms: request.expires_at_unix_ms,
+    })
+}
+
 /// Populate every ordinary network service announcement from a fresh
 /// checkpoint-verifying PDS read. Missing or ambiguous state fails startup
 /// before any QUIC service can bind and advertise an incomplete bundle.
@@ -207,22 +242,10 @@ pub fn with_checkpointed_native_announcements(
     let store = crate::services::discovery::PdsRecordStore::open_readonly(&pds_store_dir(&ctx)?)?
         .with_at9p_deployment_verifier(acceptance_identity);
     let states = store.accepted_at9p_states()?;
-    for service_name in service_names
-        .iter()
-        .filter(|name| name.as_str() != "discovery")
-    {
+    for service_name in service_names {
         let signer = ctx.service_signing_key(service_name);
         let mut matching = states.iter().filter(|state| {
-            state
-                .current
-                .services
-                .iter()
-                .any(|entry| entry.id == *service_name)
-                && state
-                    .current
-                    .subject_keys
-                    .iter()
-                    .any(|key| key.ed25519_pub.as_slice() == signer.verifying_key().as_bytes())
+            accepted_state_matches_service(state, service_name, signer.verifying_key().as_bytes())
         });
         let state = matching.next().ok_or_else(|| {
             anyhow::anyhow!(
@@ -347,16 +370,16 @@ fn register_service_key(
         trust.insert(vk, att);
     }
 
+    if ctx.iroh_required() {
+        schedule_network_service_key_registration(service_name, signing_key.clone(), jwt.clone());
+        spawn_jwt_renewal_task(service_name, signing_key.clone(), creds_dir, secrets_profile, true);
+        return Ok(());
+    }
+
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_transport = ctx.transport("policy", SocketKind::Rep);
-    let policy_client = policy_client_for_transport(
-        &policy_transport,
-        signing_key.clone(),
-        policy_vk,
-        Some(jwt.clone()),
-    )?;
+    let policy_client = legacy_policy_client(signing_key.clone(), policy_vk, Some(jwt.clone()))?;
 
     let request = RegisterServiceKey {
         service_name: service_name.to_owned(),
@@ -381,10 +404,60 @@ fn register_service_key(
         signing_key.clone(),
         creds_dir,
         secrets_profile,
-        policy_transport,
+        false,
     );
 
     Ok(())
+}
+
+fn policy_client_for_deployment(
+    ctx: &ServiceContext,
+    signing_key: SigningKey,
+    policy_verifying_key: VerifyingKey,
+    token: Option<String>,
+) -> anyhow::Result<PolicyClient> {
+    if ctx.iroh_required() {
+        PolicyClient::from_resolver(signing_key, token)
+    } else {
+        legacy_policy_client(signing_key, policy_verifying_key, token)
+    }
+}
+
+fn legacy_policy_client(
+    signing_key: SigningKey,
+    policy_verifying_key: VerifyingKey,
+    token: Option<String>,
+) -> anyhow::Result<PolicyClient> {
+    PolicyClient::for_local_bootstrap(signing_key, policy_verifying_key, token)
+}
+
+fn schedule_network_service_key_registration(
+    service_name: &str,
+    signing_key: SigningKey,
+    service_jwt: String,
+) {
+    let service_name = service_name.to_owned();
+    tokio::spawn(async move {
+        let mut delay = std::time::Duration::from_secs(2);
+        loop {
+            let attempt = async {
+                let client = PolicyClient::from_resolver(signing_key.clone(), Some(service_jwt.clone()))?;
+                client.register_service_key(&RegisterServiceKey {
+                    service_name: service_name.clone(),
+                    verifying_key: signing_key.verifying_key().as_bytes().to_vec(),
+                    service_jwt: service_jwt.clone(),
+                }).await.map_err(|error| anyhow::anyhow!(error))
+            }.await;
+            match attempt {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(service = %service_name, "Policy registration over production resolver is not ready; retrying: {error}");
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(std::time::Duration::from_secs(30));
+                }
+            }
+        }
+    });
 }
 
 /// Decode the `exp` claim from a JWT without verifying the signature.
@@ -411,7 +484,7 @@ fn spawn_jwt_renewal_task(
     signing_key: SigningKey,
     credentials_dir: std::path::PathBuf,
     secrets_profile: crate::auth::identity_store::SecretsProfile,
-    policy_transport: hyprstream_rpc::transport::TransportConfig,
+    iroh_required: bool,
 ) {
     let service_name = service_name.to_owned();
     tokio::spawn(async move {
@@ -469,12 +542,11 @@ fn spawn_jwt_renewal_task(
                 (vk, svc_jwt)
             };
 
-            let policy_client = match policy_client_for_transport(
-                &policy_transport,
-                signing_key.clone(),
-                policy_vk,
-                Some(current_jwt),
-            ) {
+            let policy_client = match if iroh_required {
+                PolicyClient::from_resolver(signing_key.clone(), Some(current_jwt))
+            } else {
+                legacy_policy_client(signing_key.clone(), policy_vk, Some(current_jwt))
+            } {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(service = service_name, error = %e, "failed to create PolicyClient; skipping JWT renewal");
@@ -563,25 +635,71 @@ fn create_event_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let origin = MoqEventOrigin::new();
     hyprstream_rpc::moq_event::init_global_moq_event_origin(origin.clone());
 
-    // #275: serve the event-bus origin over the well-known cross-process UDS path
-    // so OTHER service processes (worker, model, ...) can publish/subscribe events
-    // to this shared bus. In the same-process (InprocManager) deployment every
-    // service shares this global origin directly; this UDS plane is the bridge
-    // for the systemd / --ipc deployment where each service is its own process.
-    let event_moq_path = hyprstream_rpc::paths::event_socket();
-    hyprstream_rpc::moq_event::serve_event_moq_uds_background(origin, event_moq_path);
+    let native = if ctx.iroh_required() {
+        let shared = ctx.quic_shared().ok_or_else(|| {
+            anyhow::anyhow!("network-iroh-required Event service has no shared QUIC configuration")
+        })?;
+        let admission = shared.moq_admission.clone().ok_or_else(|| {
+            anyhow::anyhow!("network-iroh-required Event service has no MoQL admission authenticator")
+        })?;
+        let proof = ctx.moql_admission_proof("event")?.ok_or_else(|| {
+            anyhow::anyhow!("network-iroh-required Event service has no checkpointed MoQL proof")
+        })?;
+        let identity = hyprstream_rpc::transport::moql_admission::MoqlServerIdentityProof::from_local_admission_proof(&proof)
+            .context("construct Event server accepted-state witness")?;
+        admission.install_server_identity(identity).map_err(|error| {
+            anyhow::anyhow!("install Event server confirmation identity: {error}")
+        })?;
+        let shared_origin = hyprstream_rpc::transport::iroh_moq::OriginShared::from_pair(
+            origin.producer().clone(),
+            origin.consumer().clone(),
+        );
+        let handler = hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::with_origin(shared_origin)
+            .with_authz(
+                hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig::default()
+                    .with_admission(admission),
+            );
+        let signing_key = ctx.service_signing_key("event");
+        let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
+            &signing_key,
+            "hyprstream-iroh-transport-v1",
+        );
+        Some(EventIrohRuntime {
+            secret: transport_key.to_bytes(),
+            node_id: transport_key.verifying_key().to_bytes(),
+            handler,
+            announce: ctx.native_iroh_announcement_callback("event")?,
+        })
+    } else {
+        // Compatibility retains UDS. Required-native does not create it, so a
+        // rejected network admission cannot acquire a same-host fallback.
+        hyprstream_rpc::moq_event::serve_event_moq_uds_background(
+            origin,
+            hyprstream_rpc::paths::event_socket(),
+        );
+        None
+    };
 
-    Ok(Box::new(MoqEventBarrierService::new()))
+    Ok(Box::new(MoqEventBarrierService::new(native)))
 }
 
 /// Minimal `Spawnable` that satisfies the service lifecycle contract for the
 /// moq event bus. The bus itself is a process-global `MoqEventOrigin` with no
 /// dedicated thread; this service just waits for shutdown.
-struct MoqEventBarrierService;
+struct EventIrohRuntime {
+    secret: [u8; 32],
+    node_id: [u8; 32],
+    handler: hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler,
+    announce: Arc<dyn Fn(tokio_util::sync::CancellationToken, [u8; 32]) -> anyhow::Result<()> + Send + Sync>,
+}
+
+struct MoqEventBarrierService {
+    native: Option<EventIrohRuntime>,
+}
 
 impl MoqEventBarrierService {
-    fn new() -> Self {
-        Self
+    fn new(native: Option<EventIrohRuntime>) -> Self {
+        Self { native }
     }
 }
 
@@ -604,22 +722,59 @@ impl Spawnable for MoqEventBarrierService {
         shutdown: std::sync::Arc<tokio::sync::Notify>,
         on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> hyprstream_rpc::error::Result<()> {
-        if let Some(ready) = on_ready {
-            let _ = ready.send(());
-        }
         // systemd Type=notify: send READY=1 so the unit reaches `active` rather
         // than timing out (~45s) and restart-looping. These moq barrier services
         // don't go through the RPC serve path (serve.rs::signal_ready) that
         // normally notifies systemd, so they must signal readiness themselves —
-        // the moq origin/event-bus is already initialized in the factory before
-        // run() is called, so the service is genuinely ready here.
-        let _ = hyprstream_rpc::notify::ready();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| hyprstream_rpc::error::RpcError::Other(e.to_string()))?;
-        rt.block_on(shutdown.notified());
-        Ok(())
+        rt.block_on(async move {
+            if let Some(native) = self.native {
+                let substrate = hyprstream_rpc::transport::iroh_substrate::IrohSubstrate::new(
+                    native.secret,
+                    native.handler,
+                    hyprstream_rpc::transport::iroh_substrate::RefuseHandler::new(
+                        "Event provides only authenticated moql",
+                    ),
+                )
+                .await
+                .map_err(|error| hyprstream_rpc::error::RpcError::SpawnFailed(
+                    format!("network-iroh-required Event bind failed: {error}"),
+                ))?;
+                let cancellation = tokio_util::sync::CancellationToken::new();
+                let announce = Arc::clone(&native.announce);
+                let announcement_cancellation = cancellation.clone();
+                let node_id = native.node_id;
+                tokio::select! {
+                    result = tokio::task::spawn_blocking(move || announce(announcement_cancellation, node_id)) => {
+                        result
+                            .map_err(|error| hyprstream_rpc::error::RpcError::SpawnFailed(format!("Event announcement task: {error}")))?
+                            .map_err(|error| hyprstream_rpc::error::RpcError::SpawnFailed(format!("network-iroh-required Event initial announcement failed: {error}")))?;
+                    }
+                    _ = shutdown.notified() => {
+                        cancellation.cancel();
+                        let _ = substrate.shutdown().await;
+                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                            "Event stopped before initial Iroh announcement completed".to_owned(),
+                        ));
+                    }
+                }
+                if let Some(ready) = on_ready { let _ = ready.send(()); }
+                let _ = hyprstream_rpc::notify::ready();
+                shutdown.notified().await;
+                cancellation.cancel();
+                substrate.shutdown().await.map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!("Event Iroh shutdown: {error}"))
+                })?;
+            } else {
+                if let Some(ready) = on_ready { let _ = ready.send(()); }
+                let _ = hyprstream_rpc::notify::ready();
+                shutdown.notified().await;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -954,7 +1109,8 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // #910a — the registry service is the sole PDS-record writer AND the sole
     // holder of the `#atproto` private key: it opens the durable store
@@ -1215,7 +1371,8 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // Create registry client
     let registry_client: RegistryClient =
@@ -1468,7 +1625,12 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client = policy_client_for_deployment(
+        ctx,
+        sk.clone(),
+        policy_vk,
+        service_token(&sk),
+    )?;
     worker_service.set_authorize_fn(super::worker::build_authorize_fn(policy_client));
     if let Some(issuer) = ctx.oauth_issuer_url() {
         worker_service.set_expected_audience(issuer.to_owned());
@@ -1543,7 +1705,12 @@ fn create_workflow_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client = policy_client_for_deployment(
+        ctx,
+        sk.clone(),
+        policy_vk,
+        service_token(&sk),
+    )?;
     workflow_service.set_authorize_fn(crate::services::worker::build_authorize_fn(policy_client));
     if let Some(issuer) = ctx.oauth_issuer_url() {
         workflow_service.set_expected_audience(issuer.to_owned());
@@ -1630,7 +1797,8 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // Create registry client
     let registry_client: RegistryClient =
@@ -1733,7 +1901,8 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     let federation_resolver = Arc::new(
         crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
             .with_policy_client(Arc::new(policy_client)),
@@ -1828,7 +1997,8 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     let federation_resolver = Arc::new(
         crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
             .with_policy_client(Arc::new(policy_client.clone())),
@@ -1992,7 +2162,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         if let Some(fed) = federation_key_source {
             fed
         } else {
-            let fallback_policy_client = std::sync::Arc::new(policy_client_for_context(
+            let fallback_policy_client = std::sync::Arc::new(policy_client_for_deployment(
                 ctx,
                 ctx.service_signing_key("mcp"),
                 policy_vk,
@@ -2429,7 +2599,8 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // Build the direct-VFS PEP before exposing the namespace. Failure to open
     // its signed WAL aborts construction; there is no unarmed fallback.
@@ -2521,7 +2692,8 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     let auth_provider = crate::services::discovery::PolicyAuthProvider::new(policy_client);
 
     // #431 — record resolver backing getRecord/getRepo, over the durable
@@ -2567,6 +2739,20 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
         ctx.jwt_verifying_key(),
         ctx.transport("discovery", SocketKind::Rep),
     )
+    .with_state({
+        // Shared backends retain their own driver runtime after this temporary
+        // bootstrap runtime exits; service state owns its shutdown lifetime.
+        let state_config = config.discovery.state.clone();
+        std::thread::spawn(move || -> anyhow::Result<hyprstream_discovery::DiscoveryState> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("build Discovery state bootstrap runtime")?;
+            runtime.block_on(hyprstream_discovery::DiscoveryState::connect(&state_config))
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("Discovery state bootstrap thread panicked"))??
+    })
     .with_auth_provider(Box::new(auth_provider))
     .with_record_resolver(std::sync::Arc::clone(&record_resolver)
         as std::sync::Arc<dyn hyprstream_discovery::RecordResolver>);
@@ -2605,7 +2791,60 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     // TODO: DiscoveryService federation key source support
     // (federation_key_source not yet implemented on DiscoveryService)
 
-    Ok(ctx.into_spawnable_quic(discovery_service, config.discovery.quic_port))
+    let publisher = if ctx.iroh_required() {
+        Some(discovery_self_publisher(discovery_service.self_announcer()?))
+    } else { None };
+    Ok(ctx.into_spawnable_quic_with_publisher(discovery_service, config.discovery.quic_port, publisher))
+}
+
+fn discovery_self_publisher(owner: hyprstream_discovery::DiscoverySelfAnnouncer) -> hyprstream_service::NativeAnnouncementPublisher {
+    let owner = Arc::new(owner);
+    Arc::new(move |mut request| {
+        let owner = owner.clone();
+        let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime,
+                Err(error) => { let _ = first_tx.send(Err(error.to_string())); return; }
+            };
+            runtime.block_on(async move {
+                let mut first_tx = Some(first_tx);
+                let mut delay = std::time::Duration::from_secs(5);
+                let cancellation = request.cancellation.clone();
+                loop {
+                    let result = tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err(anyhow::anyhow!("Discovery self publication cancelled")),
+                        result = async {
+                            let announcement = current_native_announcement(&mut request)?;
+                            owner.publish(&announcement).await
+                        } => result,
+                    };
+                    if let Some(tx) = first_tx.take() {
+                        let _ = tx.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                        if result.is_err() { return; }
+                    }
+                    if cancellation.is_cancelled() { return; }
+                    let wait = match result {
+                        Ok(()) => { delay = std::time::Duration::from_secs(5); std::time::Duration::from_secs(25) }
+                        Err(error) => {
+                            tracing::warn!("Discovery self publication refresh failed: {error}");
+                            let wait = delay;
+                            delay = delay.saturating_mul(2).min(std::time::Duration::from_secs(25));
+                            wait
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => return,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                }
+            });
+        });
+        first_rx.recv().map_err(|_| anyhow::anyhow!("Discovery self publication ended before readiness"))?
+            .map_err(anyhow::Error::msg)
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2664,7 +2903,8 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     let mut metrics_service = MetricsService::new(
         orchestrator,
@@ -2747,26 +2987,70 @@ fn compute_tls_endorsement(
 mod tests {
     use super::*;
 
-    /// Rootless Quadlets run each service in a distinct process, so the
-    /// process-local endpoint registry cannot resolve Policy for Discovery or
-    /// its downstream peers. The typed IPC transport remains lazy: creating a
-    /// client for the shared socket must not require a co-located registration.
     #[test]
-    fn policy_client_accepts_unregistered_ipc_transport() {
-        let signing_key = SigningKey::from_bytes(&[0x63; 32]);
-        let transport =
-            hyprstream_rpc::transport::TransportConfig::ipc("/run/hyprstream/policy.sock");
+    fn checkpointed_service_selection_uses_canonical_id_and_current_signer() {
+        use hyprstream_pds::at9p::{
+            CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
+        };
+        use hyprstream_pds::at9p_duplicity::AcceptedAt9pState;
+        use hyprstream_pds::at9p_gate::verify_genesis_capsule;
+        use hyprstream_pds::at9p_sign::sign_capsule;
+        use hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes;
 
-        let client = policy_client_for_transport(
-            &transport,
-            signing_key.clone(),
-            signing_key.verifying_key(),
-            None,
-        );
-        assert!(
-            client.is_ok(),
-            "IPC policy client must be lazy at first boot"
-        );
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signer);
+        let key = HybridKeyPair::new(
+            signer.verifying_key().to_bytes().to_vec(),
+            ml_dsa_sk_to_vk_bytes(&pq),
+        )
+        .unwrap();
+        let endpoint = ServiceEndpoint::new(
+            Transport::Iroh,
+            format!("iroh://{}", hex::encode([0x72; 32])),
+        )
+        .unwrap();
+        let service = ServiceEntry::new("#model", ServiceType::NinePExport, endpoint).unwrap();
+        let body = CapsuleBody::new(vec![key], vec![service]).unwrap();
+        let genesis = sign_capsule(body, &signer, &pq).unwrap();
+        let verified = verify_genesis_capsule(
+            &genesis.cid512().unwrap(),
+            &genesis.to_dag_cbor().unwrap(),
+        )
+        .unwrap();
+        let state = AcceptedAt9pState::from_verified_genesis(&verified).unwrap();
+        let key = signer.verifying_key().to_bytes();
+        assert!(accepted_state_matches_service(&state, "model", &key));
+        assert!(!accepted_state_matches_service(&state, "#model", &key));
+        assert!(!accepted_state_matches_service(&state, "registry", &key));
+        assert!(!accepted_state_matches_service(&state, "model", &[0x73; 32]));
+        // Selection does not weaken the separate bounded-successor gate.
+        let error = hyprstream_service::NativeServiceAnnouncement::from_accepted_state(
+            "model", &signer, &state,
+        )
+        .err()
+        .expect("genesis alone cannot authorize a production announcement");
+        assert!(error.to_string().contains("bounded production expiry"));
+    }
+
+    #[test]
+    fn native_deployment_chain_has_no_local_policy_bootstrap() {
+        let source = include_str!("factories.rs");
+        for function in [
+            "fn register_service_key(",
+            "fn create_registry_service(",
+            "fn create_model_service(",
+            "fn create_oai_service(",
+        ] {
+            let start = source.find(function).expect("production factory function");
+            let rest = &source[start..];
+            let end = rest.find("\nfn ").unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                !body.contains("for_local_bootstrap"),
+                "{function} must not construct a local Policy client in the deployed chain"
+            );
+        }
+        assert!(source.contains("PolicyClient::from_resolver"));
     }
 
     #[test]

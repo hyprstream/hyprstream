@@ -55,8 +55,19 @@ impl ServiceQuery {
         Self::new(
             service_name,
             ["hyprstream-rpc/1".to_owned()],
-            ResolverProfile::NetworkDiscovery,
+            ResolverProfile::NativeIrohRequired,
             3,
+        )
+    }
+
+    /// Construct the explicit browser/public-edge query. Browser clients use
+    /// WebTransport over QUIC; Iroh is deliberately not a browser carrier.
+    pub fn browser(service_name: impl Into<String>) -> anyhow::Result<Self> {
+        Self::new(
+            service_name,
+            ["hyprstream-rpc/1".to_owned()],
+            ResolverProfile::BrowserWebTransport,
+            1,
         )
     }
 
@@ -555,6 +566,16 @@ fn network_reach(transport: &TransportConfig) -> bool {
 }
 
 #[cfg(test)]
+fn native_iroh_reach(transport: &TransportConfig) -> bool {
+    matches!(transport.endpoint, EndpointType::Iroh { .. })
+}
+
+#[cfg(test)]
+fn browser_webtransport_reach(transport: &TransportConfig) -> bool {
+    matches!(transport.endpoint, EndpointType::Quic { .. })
+}
+
+#[cfg(test)]
 fn transport_fingerprint(transport: &TransportConfig) -> String {
     let bytes = format!("{transport:?}");
     blake3::hash(bytes.as_bytes()).to_hex().to_string()
@@ -649,6 +670,14 @@ fn rejection_reason(
     match query.profile {
         ResolverProfile::NetworkDiscovery if !network_reach(&candidate.transport) => {
             return Some("local-reach-for-network-profile");
+        }
+        ResolverProfile::NativeIrohRequired if !native_iroh_reach(&candidate.transport) => {
+            return Some("non-iroh-reach-for-native-profile");
+        }
+        ResolverProfile::BrowserWebTransport
+            if !browser_webtransport_reach(&candidate.transport) =>
+        {
+            return Some("non-quic-reach-for-browser-profile");
         }
         ResolverProfile::LocalInproc
             if !matches!(candidate.transport.endpoint, EndpointType::Inproc { .. }) =>
@@ -879,6 +908,10 @@ pub enum ResolverProfile {
     Ipc,
     /// Multi-host production profile backed by DiscoveryService/PDS records.
     NetworkDiscovery,
+    /// Native production service traffic. Only Iroh reach is eligible.
+    NativeIrohRequired,
+    /// Public browser edge. Only QUIC/WebTransport reach is eligible.
+    BrowserWebTransport,
 }
 
 /// Network profile wrapper for a DiscoveryService/PDS-backed resolver.
@@ -906,7 +939,10 @@ impl Resolver for NetworkDiscoveryResolver {
             | EndpointType::SystemdFd { .. } => Err(anyhow!(
                 "network-discovery resolver returned same-host endpoint for service '{name}' ({kind:?})"
             )),
-            EndpointType::Quic { .. } | EndpointType::Iroh { .. } => Ok(transport),
+            EndpointType::Iroh { .. } => Ok(transport),
+            EndpointType::Quic { .. } => Err(anyhow!(
+                "native Iroh resolver returned QUIC/WebTransport reach for service '{name}' ({kind:?})"
+            )),
         }
     }
 }
@@ -1323,18 +1359,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn network_discovery_resolver_accepts_quic_reach() {
+    async fn native_iroh_resolver_rejects_quic_reach() {
         let addr = "127.0.0.1:9443"
             .parse()
             .unwrap_or_else(|err| panic!("test socket address must parse: {err}"));
         let quic = TransportConfig::quic(addr, "policy.local");
         let resolver = NetworkDiscoveryResolver::new(Arc::new(StaticResolver(quic.clone())));
 
-        let endpoint = resolver
+        let error = resolver
             .resolve("policy", SocketKind::Rep)
             .await
-            .unwrap_or_else(|err| panic!("network resolver rejected QUIC endpoint: {err}"));
-        assert_eq!(endpoint.endpoint_string(), quic.endpoint_string());
+            .expect_err("native Iroh resolver must reject QUIC/WebTransport reach");
+        assert!(error.to_string().contains("QUIC/WebTransport"));
     }
 
     #[tokio::test]

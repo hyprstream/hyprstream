@@ -1036,6 +1036,24 @@ pub fn resolve_service_signing_key(
     }
 }
 
+/// Load a provisioned service identity without ever generating a replacement.
+pub fn load_existing_service_signing_key(
+    secrets_dir: &std::path::Path,
+    service_name: &str,
+    profile: SecretsProfile,
+) -> Result<SigningKey> {
+    validate_service_name(service_name)?;
+    let directory = match (profile, service_name) {
+        (_, "policy") | (SecretsProfile::PerServiceScoped, _) => secrets_dir.to_owned(),
+        (SecretsProfile::SharedDirectory, _) => secrets_dir.join(service_name),
+    };
+    let bytes = Zeroizing::new(read_secret(&directory, "signing-key")?
+        .ok_or_else(|| anyhow!("provisioned signing key is missing for service {service_name}"))?);
+    let seed = Zeroizing::new(<[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| anyhow!("service {service_name} signing-key must be 32 bytes"))?);
+    Ok(SigningKey::from_bytes(&seed))
+}
+
 // The `#atproto` commit-signing key is NOT loaded here. It is the *active* key
 // of the shared `Es256SigningKeyStore` (`auth::key_rotation`), the same P-256
 // key `oauth::did_document` publishes as the `#atproto` verification method —

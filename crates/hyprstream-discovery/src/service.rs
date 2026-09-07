@@ -3,6 +3,10 @@
 //! Allows remote clients to discover registered services, their endpoints,
 //! socket kinds, and schemas via the standard REQ/REP transport.
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "network_bootstrap_tests.rs"]
+mod network_bootstrap_tests;
+
 use async_trait::async_trait;
 use hyprstream_rpc::browser_provisioning::{
     BrowserCarrierProfile, BrowserCurrentnessVerifier, BrowserProvisioningDocument,
@@ -27,13 +31,18 @@ use crate::generated::discovery_client::{
 };
 use crate::placement_index::PlacementIndex;
 use crate::scheduling;
+use crate::state_store::{
+    unix_millis_now, AnnouncedEndpoint, CachedEntityStatement, CachedEnvelopeKeyset,
+    DiscoveryState, DiscoveryStateStore, LiveAllocatable, MemoryStateStore,
+};
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyprstream_rpc::identity::Did;
 use hyprstream_util::ttl_cache::TtlCache;
-use parking_lot::RwLock;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+#[cfg(any(test, feature = "test-fixtures"))]
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -62,26 +71,6 @@ const ANNOUNCED_ENDPOINT_TTL: Duration = Duration::from_secs(90);
 /// `maxCandidates == 0` (unspecified) — keeps an unscoped query from returning
 /// the entire fleet in one response.
 const DEFAULT_MAX_CANDIDATES: usize = 100;
-
-/// One node's live allocatable capacity + load, as reported via
-/// `reportNodeLiveness`. Stored in a `TtlCache<Did, _>` — absence (never
-/// reported, or expired) hard-excludes the node from `queryCandidates`.
-#[derive(Clone, Debug)]
-struct LiveAllocatable {
-    /// resource name -> k8s-quantity, free right now.
-    allocatable: Vec<(String, String)>,
-    load_fraction: f32,
-    /// unix millis of this snapshot.
-    last_seen: i64,
-}
-
-fn unix_millis_now() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
 
 /// Private checkpoint-bound projection used only while Discovery validates an
 /// announcement against the daemon-owned accepted-state source.
@@ -242,6 +231,14 @@ fn network_reach(transport: &TransportConfig) -> bool {
     )
 }
 
+fn native_iroh_reach(transport: &TransportConfig) -> bool {
+    matches!(transport.endpoint, EndpointType::Iroh { .. })
+}
+
+fn browser_webtransport_reach(transport: &TransportConfig) -> bool {
+    matches!(transport.endpoint, EndpointType::Quic { .. })
+}
+
 fn transport_fingerprint(transport: &TransportConfig) -> String {
     blake3::hash(format!("{transport:?}").as_bytes())
         .to_hex()
@@ -334,6 +331,14 @@ fn rejection_reason(
     match query.profile {
         ResolverProfile::NetworkDiscovery if !network_reach(&candidate.transport) => {
             return Some("local-reach-for-network-profile");
+        }
+        ResolverProfile::NativeIrohRequired if !native_iroh_reach(&candidate.transport) => {
+            return Some("non-iroh-reach-for-native-profile");
+        }
+        ResolverProfile::BrowserWebTransport
+            if !browser_webtransport_reach(&candidate.transport) =>
+        {
+            return Some("non-quic-reach-for-browser-profile");
         }
         ResolverProfile::LocalInproc
             if !matches!(candidate.transport.endpoint, EndpointType::Inproc { .. }) =>
@@ -581,28 +586,6 @@ pub trait RecordResolver: Send + Sync {
 // DiscoveryService
 // ============================================================================
 
-/// Endpoint data stored per announced entry.
-#[derive(Clone)]
-struct AnnouncedEndpoint {
-    /// Socket kind (e.g. "quic", "rep")
-    socket_kind: String,
-    /// Endpoint string (e.g. "quic://localhost:0.0.0.0:4433")
-    endpoint: String,
-    /// Service JWT attesting to the service's identity and pubkey
-    service_jwt: String,
-    service_did: Did,
-    capabilities: BTreeSet<String>,
-    accepted_state_digest: Vec<u8>,
-    accepted_state_epoch: u64,
-    response_key_id: String,
-    request_kem_key_id: String,
-    request_kem_recipient: Vec<u8>,
-    expires_at_unix_ms: i64,
-    source_signer: [u8; 32],
-    /// Last heartbeat timestamp (Instant)
-    last_heartbeat: Instant,
-}
-
 /// Checkpoint-verifying accepted-current-state read used by production
 /// resolution. Implemented by the daemon-owned PDS reader from #1004.
 pub(super) trait AcceptedStateSource: Send + Sync {
@@ -610,6 +593,10 @@ pub(super) trait AcceptedStateSource: Send + Sync {
         &self,
         did: &str,
     ) -> Result<Option<hyprstream_pds::at9p_duplicity::AcceptedAt9pState>>;
+
+    fn bootstrap_endpoints(&self, _service_name: &str) -> Result<Option<Vec<AnnouncedEndpoint>>> {
+        Ok(None)
+    }
 }
 
 /// Opaque production authority minted only while holding the checkpoint/PDS
@@ -709,25 +696,9 @@ impl StreamHandle for CurrentStreamHandle {
 
 /// Cloneable production resolver installed after Discovery bootstrap.
 struct DiscoveryServiceResolver {
-    announced_endpoints: Arc<RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>>,
+    state_store: Arc<dyn DiscoveryStateStore>,
     accepted_state_source: Arc<dyn AcceptedStateSource>,
     discovery_client: Option<crate::DiscoveryClient>,
-}
-
-/// Phase 0.5 Stage D — cached signed OIDF entity statement.
-struct CachedEntityStatement {
-    /// Signed OpenID Federation 1.0 entity statement (compact JWS).
-    jwt: String,
-    /// Unix seconds when this was registered (set on push from issuer).
-    fetched_at: i64,
-}
-
-/// Phase 0.5 Stage D — cached envelope COSE_KeySet.
-struct CachedEnvelopeKeyset {
-    /// CBOR-encoded COSE_KeySet (RFC 9052 §7).
-    cose_keyset_cbor: Vec<u8>,
-    /// Unix seconds when this was registered.
-    fetched_at: i64,
 }
 
 /// Parse an `at://<did>/<collection>/<rkey>` URI into its three components.
@@ -777,17 +748,9 @@ pub struct DiscoveryService {
     /// so getRecord/getRepo report NOT_FOUND for everything.
     record_resolver: Option<Arc<dyn RecordResolver>>,
     accepted_state_source: Option<Arc<dyn AcceptedStateSource>>,
-    /// Endpoints announced by other services (cross-process).
-    /// Maps service_name → Vec<AnnouncedEndpoint>.
-    announced_endpoints: Arc<RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>>,
-    /// Phase 0.5 Stage D — cached signed OIDF entity statements per issuer URL.
-    /// Pushed by IdPService/OAuth at startup + on every signing-key rotation.
-    /// Consumed by FederationKeyResolver before falling back to HTTPS.
-    entity_statements: RwLock<HashMap<String, CachedEntityStatement>>,
-    /// Phase 0.5 Stage D — cached envelope COSE_KeySets per service did:web.
-    /// Pushed by each service at startup + rotation. Consumed by RequestService
-    /// receivers verifying COSE_Sign1 envelope signatures.
-    envelope_keysets: RwLock<HashMap<String, CachedEnvelopeKeyset>>,
+    /// Backend-neutral volatile state. Memory is the safe single-process/WASM
+    /// default; configured native deployments may install shared/tiered stores.
+    state_store: Arc<dyn DiscoveryStateStore>,
     /// Pre-computed TLS endorsement: Sign(tls_key, ed25519_pubkey || domain).
     /// Empty when TLS endorsement is not available (e.g. self-signed certs).
     tls_endorsement: Vec<u8>,
@@ -801,15 +764,252 @@ pub struct DiscoveryService {
     /// marked before resolver access, so absent/invalid/non-node repos cannot
     /// turn heartbeat frequency into unbounded work.
     placement_ingest_attempts: TtlCache<Did, ()>,
-    /// #524 P1 — live allocatable capacity + load per node, TTL'd
-    /// (`LIVENESS_TTL`). Backs the hard-exclusion-on-staleness rule in
-    /// `queryCandidates`.
-    liveness: TtlCache<Did, LiveAllocatable>,
     // Infrastructure (for Spawnable)
     transport: TransportConfig,
 }
 
+/// Owned publisher sharing Discovery's actual state and verification sources.
+pub struct DiscoverySelfAnnouncer {
+    validator: DiscoveryService,
+}
+
+impl DiscoverySelfAnnouncer {
+    pub async fn publish(&self, announcement: &ServiceAnnouncement) -> Result<()> {
+        anyhow::ensure!(announcement.service_name == "discovery", "self publication is only for Discovery");
+        anyhow::ensure!(announcement.service_did.is_did_at9p(), "self publication requires an accepted identity");
+        let mut ctx = EnvelopeContext::from_callback_service(0, "discovery");
+        ctx.cnf = self.validator.signing_key.verifying_key().to_bytes();
+        self.validator.store_announcement(&ctx, announcement).await?;
+        Ok(())
+    }
+}
+
 impl DiscoveryService {
+    pub fn self_announcer(&self) -> Result<DiscoverySelfAnnouncer> {
+        let source = self.accepted_state_source.clone()
+            .ok_or_else(|| anyhow::anyhow!("self publication requires accepted-state authority"))?;
+        let mut validator = Self::new(self.signing_key.clone(), self.jwt_verifying_key, self.transport.clone());
+        validator.state_store = self.state_store.clone();
+        validator.accepted_state_source = Some(source);
+        validator.jwt_key_source = self.jwt_key_source.clone();
+        validator.expected_audience = self.expected_audience.clone();
+        Ok(DiscoverySelfAnnouncer { validator })
+    }
+
+    async fn store_announcement(&self, ctx: &EnvelopeContext, data: &ServiceAnnouncement) -> Result<DiscoveryResponseVariant> {
+        info!(
+            "Discovery: service '{}' announced {} endpoint: {} (from {})",
+            data.service_name,
+            data.socket_kind,
+            data.endpoint,
+            ctx.subject()
+        );
+
+        let svc_name = data.service_name.clone();
+        let sock_kind = data.socket_kind.clone();
+        let endpoint = data.endpoint.clone();
+        let service_jwt = data.service_jwt.clone().unwrap_or_default();
+        let identity_bound = !data.service_did.as_str().is_empty()
+            || !data.accepted_state_digest.is_empty()
+            || !data.request_kem_recipient.is_empty();
+        if identity_bound {
+            anyhow::ensure!(
+                !service_jwt.is_empty(),
+                "identity-bound announcement requires a verified service JWT"
+            );
+            anyhow::ensure!(
+                data.service_did.is_did_at9p()
+                    && data.accepted_state_digest.len() == 64
+                    && !data.capabilities.is_empty()
+                    && data
+                        .response_key_id
+                        .starts_with(&format!("{}#", data.service_did))
+                    && data
+                        .request_kem_key_id
+                        .starts_with(&format!("{}#", data.service_did))
+                    && data.expires_at_unix_ms > unix_millis_now(),
+                "identity-bound announcement metadata is incomplete or expired"
+            );
+            let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(
+                &data.request_kem_recipient,
+            )?;
+            anyhow::ensure!(
+                recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
+                    && recipient.eks.len() == recipient.suite_id.components().len(),
+                "identity-bound announcement requires suite-complete hybrid KEM material"
+            );
+            match data.socket_kind.as_str() {
+                "quic" => {
+                    parse_announced_quic(&data.endpoint)?;
+                }
+                "iroh" => {
+                    parse_announced_iroh(&data.endpoint)?;
+                }
+                _ => {
+                    anyhow::bail!("identity-bound network announcement requires QUIC or Iroh reach")
+                }
+            }
+        }
+
+        // R3: Verify service JWT signature + subject matches serviceName.
+        // Full JWT verification (not decode_unverified) to prevent forged identities.
+        if !service_jwt.is_empty() {
+            // Service JWTs are minted hybrid (ML-DSA-65-Ed25519); the composite
+            // kid resolves through the key source (ledger pairs + the CA
+            // composite pair). Classical EdDSA remains accepted here for
+            // tokens minted before the hybrid cutover.
+            let is_composite = hyprstream_rpc::auth::jwt::header_alg(&service_jwt)
+                .ok()
+                .flatten()
+                .is_some_and(|alg| alg == "ML-DSA-65-Ed25519");
+            let verified = if is_composite {
+                let dispatch =
+                    hyprstream_rpc::auth::jwt::parse_composite_dispatch(&service_jwt, &["wit+jwt"])
+                        .map_err(|e| {
+                            tracing::warn!("Service JWT dispatch failed in announce: {}", e);
+                            anyhow::anyhow!("Invalid service JWT in announce: {}", e)
+                        })?;
+                let pair = self
+                    .jwt_key_source
+                    .as_ref()
+                    .and_then(|ks| ks.composite_pair(dispatch.kid()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Invalid service JWT in announce: unknown composite kid")
+                    })?;
+                // Signing-domain separation: announcements assert a service
+                // identity, which is certified by the Policy/CA domain only —
+                // the ledger's Policy slot and the derived CA pair (registered
+                // under the Policy role). The OAuth-role pair signs browser
+                // and workload WITs and must not be able to certify a service
+                // announcement.
+                anyhow::ensure!(
+                    pair.role() == hyprstream_rpc::auth::CompositePairRole::Policy,
+                    "Invalid service JWT in announce: composite pair role is not authorized \
+                     for service certification"
+                );
+                hyprstream_rpc::auth::jwt::decode_composite(
+                    &service_jwt,
+                    pair.ml_dsa(),
+                    pair.ed25519(),
+                    self.expected_audience.as_deref(),
+                    &dispatch,
+                )
+                .map_err(|e| {
+                    tracing::warn!("Service JWT verification failed in announce: {}", e);
+                    anyhow::anyhow!("Invalid service JWT in announce: {}", e)
+                })?
+            } else {
+                hyprstream_rpc::auth::jwt::decode_with_key(
+                    &service_jwt,
+                    &self.jwt_verifying_key,
+                    self.expected_audience.as_deref(),
+                )
+                .map_err(|e| {
+                    tracing::warn!("Service JWT verification failed in announce: {}", e);
+                    anyhow::anyhow!("Invalid service JWT in announce: {}", e)
+                })?
+            };
+            // Check that sub matches "service:{serviceName}"
+            let expected_sub = format!("service:{}", svc_name);
+            if verified.sub != expected_sub {
+                anyhow::bail!(
+                    "Service JWT subject mismatch: expected '{}', got '{}'",
+                    expected_sub,
+                    verified.sub
+                );
+            }
+            anyhow::ensure!(
+                verified.cnf_key_bytes() == Some(ctx.cnf),
+                "service JWT confirmation key does not match verified announcement signer"
+            );
+        }
+
+        let now_unix_ms = unix_millis_now();
+        let heartbeat_expiry = now_unix_ms.saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64);
+        // Legacy clients omit identity expiry (Cap'n Proto defaults it to 0).
+        // Only identity-bound announcements carry a signed expiry constraint.
+        let expires_at_unix_ms = if identity_bound {
+            data.expires_at_unix_ms
+        } else {
+            heartbeat_expiry
+        };
+        let mut live_until_unix_ms = expires_at_unix_ms.min(heartbeat_expiry);
+        if identity_bound {
+            if let Some(source) = &self.accepted_state_source {
+                let state = source
+                    .accepted_state(data.service_did.as_str())?
+                    .ok_or_else(|| anyhow::anyhow!("announcement DID has no accepted-current state"))?;
+                anyhow::ensure!(state.current.subject_keys.iter().any(|key| key.ed25519_pub == ctx.cnf),
+                    "announcement signer is not an accepted current subject key");
+                let service = state.current.services.iter().find(|entry| entry.id == format!("#{svc_name}"))
+                    .ok_or_else(|| anyhow::anyhow!("announcement service is not accepted"))?;
+                if let Some(kem) = &service.endpoint.request_kem {
+                    anyhow::ensure!(kem == &data.request_kem_recipient, "announcement KEM differs from accepted service");
+                    if data.socket_kind == "iroh" {
+                        anyhow::ensure!(service.endpoint.address == data.endpoint, "announcement reach differs from accepted service");
+                    }
+                }
+                anyhow::ensure!(
+                    state.epoch == data.accepted_state_epoch
+                        && state.head_digest.as_slice() == data.accepted_state_digest.as_slice(),
+                    "announcement does not match accepted-current state"
+                );
+                live_until_unix_ms = live_until_unix_ms.min(accepted_expiry_unix_ms(&state)?);
+            }
+        }
+        anyhow::ensure!(
+            live_until_unix_ms > now_unix_ms,
+            "announcement effective lifetime is already expired"
+        );
+
+        let replacement = AnnouncedEndpoint {
+            socket_kind: sock_kind.clone(),
+            endpoint: endpoint.clone(),
+            service_jwt: service_jwt.clone(),
+            service_did: data.service_did.clone(),
+            capabilities: data.capabilities.iter().cloned().collect(),
+            accepted_state_digest: data.accepted_state_digest.clone(),
+            accepted_state_epoch: data.accepted_state_epoch,
+            response_key_id: data.response_key_id.clone(),
+            request_kem_key_id: data.request_kem_key_id.clone(),
+            request_kem_recipient: data.request_kem_recipient.clone(),
+            expires_at_unix_ms,
+            source_signer: ctx.cnf,
+            live_until_unix_ms,
+        };
+        self.state_store
+            .put_announcement(&svc_name, replacement)
+            .await?;
+
+        Ok(DiscoveryResponseVariant::AnnounceResult)
+    }
+
+    /// Populate this replica's verified placement projection for an admitted
+    /// shared live node. Failed/absent repos use the existing bounded retry gate.
+    async fn ensure_placement_ingested(&self, node: &Did) {
+        if self.placement_index.record_uri(node.as_str()).is_none()
+            && self.placement_ingest_attempts.insert_if_absent(
+                node.clone(),
+                (),
+                PLACEMENT_INGEST_RETRY_TTL,
+            )
+        {
+            if let Some(resolver) = &self.record_resolver {
+                if let Err(e) = self
+                    .placement_index
+                    .ingest_did(resolver.as_ref(), node.as_str())
+                    .await
+                {
+                    tracing::warn!(
+                        node = %node,
+                        error = %e,
+                        "placement directory ingestion failed for live node (liveness still recorded)"
+                    );
+                }
+            }
+        }
+    }
+
     /// Create a new discovery service with infrastructure.
     ///
     /// `signing_key` is used for envelope signing (should be the per-service key
@@ -830,9 +1030,7 @@ impl DiscoveryService {
             auth_provider: None,
             record_resolver: None,
             accepted_state_source: None,
-            announced_endpoints: Arc::new(RwLock::new(HashMap::new())),
-            entity_statements: RwLock::new(HashMap::new()),
-            envelope_keysets: RwLock::new(HashMap::new()),
+            state_store: MemoryStateStore::production_default(),
             tls_endorsement: Vec::new(),
             tls_domain: String::new(),
             placement_index: PlacementIndex::new(),
@@ -840,9 +1038,14 @@ impl DiscoveryService {
                 LIVENESS_CACHE_MAX_ENTRIES,
                 LIVENESS_CACHE_REAP_BUDGET,
             ),
-            liveness: TtlCache::new(LIVENESS_CACHE_MAX_ENTRIES, LIVENESS_CACHE_REAP_BUDGET),
             transport,
         }
+    }
+
+    /// Install the configured volatile-state backend before the service is shared.
+    pub fn with_state(mut self, state: DiscoveryState) -> Self {
+        self.state_store = state.into_inner();
+        self
     }
 
     /// Set the pre-computed TLS endorsement and domain.
@@ -1062,7 +1265,7 @@ impl DiscoveryService {
                 crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
                     &authority.store_path,
                     identity,
-                )?,
+                )?.with_network_bootstrap(authority.network_required),
             ),
             #[cfg(test)]
             ProcessAcceptanceIdentity::Test(identity) => Arc::new(
@@ -1075,6 +1278,8 @@ impl DiscoveryService {
         PROCESS_ACCEPTED_STATE_SOURCE
             .set(Arc::clone(&source))
             .map_err(|_| anyhow::anyhow!("process Discovery authority is already consumed"))?;
+        PROCESS_NATIVE_NETWORK_REQUIRED.set(authority.network_required)
+            .map_err(|_| anyhow::anyhow!("process native profile is already installed"))?;
         if let Some(identity) = deployment_identity {
             PROCESS_REGISTRY_VERIFIER.set(identity).map_err(|_| {
                 anyhow::anyhow!("deployment registry verifier is already installed")
@@ -1082,7 +1287,7 @@ impl DiscoveryService {
         }
         PRODUCTION_RESOLVER
             .set(Arc::new(DiscoveryServiceResolver {
-                announced_endpoints: Arc::new(RwLock::new(HashMap::new())),
+                state_store: MemoryStateStore::production_default(),
                 accepted_state_source: source,
                 discovery_client: Some(discovery_client),
             }))
@@ -1104,7 +1309,7 @@ impl DiscoveryService {
     #[cfg(test)]
     fn production_resolver(&self) -> Result<DiscoveryServiceResolver> {
         Ok(DiscoveryServiceResolver {
-            announced_endpoints: Arc::clone(&self.announced_endpoints),
+            state_store: Arc::clone(&self.state_store),
             accepted_state_source: self.accepted_state_source.clone().ok_or_else(|| {
                 anyhow::anyhow!("Discovery accepted-state source is not installed")
             })?,
@@ -1125,7 +1330,7 @@ impl DiscoveryService {
 #[async_trait]
 impl Resolver for DiscoveryService {
     async fn resolve(&self, name: &str, kind: SocketKind) -> anyhow::Result<TransportConfig> {
-        if let Some(transport) = self.resolve_announced_endpoint(name, kind)? {
+        if let Some(transport) = self.resolve_announced_endpoint(name, kind).await? {
             return Ok(transport);
         }
 
@@ -1152,6 +1357,48 @@ fn accepted_expiry_unix_ms(
         .timestamp_millis())
 }
 
+/// Fixed bootstrap roles use only checkpoint-authenticated capsule contents.
+/// Carrier addresses and caller-provided public keys never mint authority.
+pub(super) fn project_bootstrap_endpoint(
+    states: &[hyprstream_pds::at9p_duplicity::AcceptedAt9pState],
+    service_name: &str,
+    key: &VerifyingKey,
+) -> Result<AnnouncedEndpoint> {
+    anyhow::ensure!(matches!(service_name, "discovery" | "policy"), "not a fixed bootstrap role");
+    let service_id = format!("#{service_name}");
+    let mut matching = states.iter().filter(|state| {
+        state.current.services.iter().any(|entry| entry.id == service_id)
+            && state.current.subject_keys.iter().any(|subject| subject.ed25519_pub == key.as_bytes())
+    });
+    let state = matching.next().ok_or_else(|| anyhow::anyhow!("no accepted bootstrap identity for {service_name}"))?;
+    anyhow::ensure!(matching.next().is_none(), "ambiguous accepted bootstrap identity for {service_name}");
+    let expiry = accepted_expiry_unix_ms(state)?;
+    anyhow::ensure!(state.epoch > 0 && expiry > unix_millis_now(), "bootstrap identity is unbounded or expired");
+    let entry = state.current.services.iter().find(|entry| entry.id == service_id)
+        .ok_or_else(|| anyhow::anyhow!("bootstrap service disappeared"))?;
+    anyhow::ensure!(entry.endpoint.transport == hyprstream_pds::at9p::Transport::Iroh,
+        "bootstrap service requires signed Iroh reach");
+    parse_announced_iroh(&entry.endpoint.address)?;
+    let kem = entry.endpoint.request_kem.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("bootstrap service lacks signed request KEM; reprovision service identity"))?;
+    let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(kem)?;
+    recipient.validate()?;
+    anyhow::ensure!(recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        "bootstrap requires hybrid KEM");
+    let subject_key = state.current.subject_keys.iter().find(|subject| subject.ed25519_pub == key.as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("bootstrap response key disappeared"))?;
+    hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&subject_key.mldsa65_pub)?;
+    Ok(AnnouncedEndpoint {
+        socket_kind: "iroh".to_owned(), endpoint: entry.endpoint.address.clone(),
+        service_jwt: String::new(), service_did: Did::from(state.did.clone()),
+        capabilities: ["hyprstream-rpc/1".to_owned()].into_iter().collect(),
+        accepted_state_digest: state.head_digest.to_vec(), accepted_state_epoch: state.epoch,
+        response_key_id: format!("{}#response", state.did),
+        request_kem_key_id: format!("{}#mesh-kem", state.did), request_kem_recipient: kem.clone(),
+        expires_at_unix_ms: expiry, source_signer: key.to_bytes(), live_until_unix_ms: expiry,
+    })
+}
+
 impl DiscoveryServiceResolver {
     #[cfg(test)]
     async fn resolve_service(&self, query: ServiceQuery) -> Result<ResolvedService> {
@@ -1168,7 +1415,12 @@ impl DiscoveryServiceResolver {
     }
 
     async fn acquire_candidates(&self, query: &ServiceQuery) -> Result<Vec<ServiceCandidate>> {
-        let entries = if let Some(client) = &self.discovery_client {
+        let bootstrap = if query.profile == ResolverProfile::NativeIrohRequired {
+            self.accepted_state_source.bootstrap_endpoints(&query.service_name)?
+        } else { None };
+        let entries = if let Some(entries) = bootstrap {
+            entries
+        } else if let Some(client) = &self.discovery_client {
             client
                 .get_endpoints(&query.service_name)
                 .await?
@@ -1189,21 +1441,21 @@ impl DiscoveryServiceResolver {
                         request_kem_recipient: endpoint.request_kem_recipient,
                         expires_at_unix_ms: endpoint.expires_at_unix_ms,
                         source_signer,
-                        last_heartbeat: Instant::now(),
+                        live_until_unix_ms: endpoint
+                            .expires_at_unix_ms
+                            .min(unix_millis_now() + ANNOUNCED_ENDPOINT_TTL.as_millis() as i64),
                     })
                 })
                 .collect()
         } else {
-            self.announced_endpoints
-                .read()
-                .get(&query.service_name)
-                .cloned()
-                .unwrap_or_default()
+            self.state_store
+                .announcements_for(&query.service_name, unix_millis_now())
+                .await?
         };
 
         let mut candidates = Vec::new();
         for entry in entries {
-            if entry.last_heartbeat.elapsed() > ANNOUNCED_ENDPOINT_TTL
+            if !entry.is_live_at(unix_millis_now())
                 || entry.service_did.as_str().is_empty()
                 || entry.accepted_state_digest.len() != 64
             {
@@ -1335,7 +1587,7 @@ impl DiscoveryServiceResolver {
         let query = ServiceQuery::new(
             request.service_name.clone(),
             [request.capability.clone()],
-            ResolverProfile::NetworkDiscovery,
+            ResolverProfile::BrowserWebTransport,
             1,
         )?;
         let resolved = self
@@ -1505,6 +1757,57 @@ static PRODUCTION_RESOLVER: std::sync::OnceLock<Arc<DiscoveryServiceResolver>> =
     std::sync::OnceLock::new();
 static PROCESS_REGISTRY_VERIFIER: std::sync::OnceLock<RegistryDeploymentVerifier> =
     std::sync::OnceLock::new();
+static PROCESS_NATIVE_NETWORK_REQUIRED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+#[cfg(not(target_arch = "wasm32"))]
+static PROCESS_BOOTSTRAP_CARRIER: std::sync::OnceLock<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate> = std::sync::OnceLock::new();
+
+/// Transport profile selected by authenticated process bootstrap.
+pub fn native_network_required() -> bool {
+    PROCESS_NATIVE_NETWORK_REQUIRED.get().copied().unwrap_or(false)
+}
+
+/// Project the process-pinned checkpoint authority for the native `moql`
+/// admission gate.  The returned adapter re-reads the verified checkpoint for
+/// every decision; malformed, absent, or unreadable state becomes no state and
+/// is therefore rejected by the authenticator.  It deliberately exposes no
+/// raw checkpoint handle to callers.
+pub fn production_moql_accepted_state_authority(
+) -> Result<Arc<dyn hyprstream_rpc::transport::moql_admission::AcceptedStateAuthority>> {
+    let source = PROCESS_ACCEPTED_STATE_SOURCE
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("checkpoint-backed production resolver is not installed"))?;
+    Ok(Arc::new(move |did: &str| {
+        let state = source.accepted_state(did).ok().flatten()?;
+        let expires_at_unix_ms = state
+            .expires_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.timestamp_millis());
+        let subject_keys = state
+            .current
+            .subject_keys
+            .iter()
+            .map(|key| {
+                let ed25519: [u8; 32] = key.ed25519_pub.as_slice().try_into().ok()?;
+                (!key.mldsa65_pub.is_empty()).then(|| {
+                    hyprstream_rpc::transport::moql_admission::AcceptedSubjectKey {
+                        ed25519,
+                        ml_dsa_65: key.mldsa65_pub.clone(),
+                    }
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (!subject_keys.is_empty()).then_some(
+            hyprstream_rpc::transport::moql_admission::AcceptedIdentityState {
+                epoch: state.epoch,
+                head_digest: state.head_digest,
+                subject_keys,
+                expires_at_unix_ms,
+            },
+        )
+    }))
+}
 
 const DEPLOYMENT_CA_ROOT_PATH: &str = "/etc/hyprstream/trust/deployment-ca.hybrid";
 const DEPLOYMENT_AUTHORITY_LOG_PATH: &str = "/etc/hyprstream/trust/deployment-authority.log.json";
@@ -1764,6 +2067,17 @@ pub fn deployment_registry_verifier() -> Result<RegistryDeploymentVerifier> {
         .get()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("deployment registry verifier is not installed"))
+}
+
+/// Authenticate the fixed, OS-owned deployment artifacts for an offline
+/// registry provisioning operation using the same role-specific trusted-file
+/// loader as startup. Returns verification-only evidence, not a raw-key
+/// authority constructor, and does not install a process resolver.
+pub fn authenticate_local_deployment_registry() -> Result<RegistryDeploymentVerifier> {
+    authenticate_registry_deployment_credentials(
+        load_trusted_registry_deployment_credentials()?,
+    )
+    .map(|identity| identity.verifier)
 }
 
 /// Non-cloneable proof privately minted from the fixed CA/JWT pair.
@@ -3079,6 +3393,7 @@ fn authenticate_registry_deployment_credentials(
 struct ProcessBootstrapAuthority {
     store_path: std::path::PathBuf,
     acceptance_identity: ProcessAcceptanceIdentity,
+    network_required: bool,
 }
 
 enum ProcessAcceptanceIdentity {
@@ -3164,13 +3479,15 @@ pub async fn bootstrap_deployment_process(
     signing_key: SigningKey,
     trust_source: crate::DeploymentTrustSource,
     remote_node: bool,
+    network_required: bool,
 ) -> Result<()> {
     let discovery_vk = hyprstream_service::global_trust_store()
         .resolve_one("discovery")
         .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated discovery key"))?;
     let (authority, discovery_client) = match trust_source {
         crate::DeploymentTrustSource::OsOwnedFiles => {
-            let authority = authenticate_deployment_bootstrap()?;
+            let mut authority = authenticate_deployment_bootstrap()?;
+            authority.network_required = network_required;
             // Lazy local discovery client — see `install_local_discovery_client`:
             // the default discovery socket is resolved via `try_endpoint` (not
             // the eager registered_endpoint path), and `dial` connects on first use,
@@ -3178,10 +3495,50 @@ pub async fn bootstrap_deployment_process(
             // process. Trust is not weakened — the checkpoint was already
             // verified by `authenticate_deployment_bootstrap()`, and
             // `discovery_vk` authenticates every lazy response.
-            let discovery_client = install_local_discovery_client(signing_key, discovery_vk)?;
+            let discovery_client = if network_required {
+                #[cfg(not(test))]
+                let ProcessAcceptanceIdentity::Deployment(verifier) = &authority.acceptance_identity;
+                #[cfg(test)]
+                let verifier = match &authority.acceptance_identity {
+                    ProcessAcceptanceIdentity::Deployment(verifier) => verifier,
+                    #[cfg(test)]
+                    ProcessAcceptanceIdentity::Test(_) => anyhow::bail!("native bootstrap requires deployment authority"),
+                };
+                let source = Arc::new(crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
+                    &authority.store_path, verifier.clone(),
+                )?.with_network_bootstrap(true));
+                // Authenticate the fixed bootstrap roles now, but defer I/O:
+                // Discovery and Policy have not necessarily bound yet.
+                source.bootstrap_endpoints("discovery")?;
+                source.bootstrap_endpoints("policy")?;
+                // CLI callers also need an outbound carrier, before any service
+                // binds. Keep this distinct from the service's inbound address.
+                use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, RefuseHandler};
+                let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
+                    &signing_key, "hyprstream-bootstrap-client-transport-v1",
+                );
+                let carrier = IrohSubstrate::new(transport_key.to_bytes(),
+                    RefuseHandler::new("outbound bootstrap only"),
+                    RefuseHandler::new("outbound bootstrap only"),
+                ).await?;
+                let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(carrier.owned_client_endpoint());
+                PROCESS_BOOTSTRAP_CARRIER.set(carrier)
+                    .map_err(|_| anyhow::anyhow!("bootstrap carrier already installed"))?;
+                let resolver = Arc::new(DiscoveryServiceResolver {
+                    state_store: MemoryStateStore::production_default(),
+                    accepted_state_source: source,
+                    discovery_client: None,
+                });
+                crate::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
+                    "discovery", "discovery", None, signing_key, None, resolver,
+                )?))
+            } else {
+                install_local_discovery_client(signing_key, discovery_vk)?
+            };
             (authority, discovery_client)
         }
         crate::DeploymentTrustSource::DidAnchored(anchors) => {
+            anyhow::ensure!(!network_required, "required native bootstrap needs provisioned OS-owned accepted service state");
             let (authority, discovery_transport, mesh_kem_recipient, ml_dsa_65_keys) =
                 authenticate_did_anchored_bootstrap(&anchors).await?;
             let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
@@ -3267,13 +3624,12 @@ fn seal_process_bootstrap_authority() -> Result<()> {
 #[cfg(not(target_arch = "wasm32"))]
 fn authenticate_deployment_bootstrap() -> Result<ProcessBootstrapAuthority> {
     seal_process_bootstrap_authority()?;
-    let witness = authenticate_registry_deployment_credentials(
-        load_trusted_registry_deployment_credentials()?,
-    )?;
+    let verifier = authenticate_local_deployment_registry()?;
     let store_path = hyprstream_service::deployment_data_dir()?.join("pds-store");
     Ok(ProcessBootstrapAuthority {
         store_path,
-        acceptance_identity: ProcessAcceptanceIdentity::Deployment(witness.verifier),
+        acceptance_identity: ProcessAcceptanceIdentity::Deployment(verifier),
+        network_required: false,
     })
 }
 
@@ -3296,6 +3652,7 @@ async fn authenticate_did_anchored_bootstrap(
     let authority = ProcessBootstrapAuthority {
         store_path: hyprstream_service::deployment_data_dir()?.join("pds-store"),
         acceptance_identity: ProcessAcceptanceIdentity::Deployment(verifier),
+        network_required: false,
     };
     Ok((
         authority,
@@ -3351,6 +3708,7 @@ fn authenticate_discovery_bootstrap_identity(
     Ok(ProcessBootstrapAuthority {
         store_path: hyprstream_service::deployment_data_dir()?.join("pds-store"),
         acceptance_identity: ProcessAcceptanceIdentity::Test(acceptance_identity),
+        network_required: false,
     })
 }
 
@@ -3615,7 +3973,7 @@ pub mod test_fixtures {
     #[derive(Clone)]
     pub struct ProductionInferenceFixture {
         service_name: String,
-        announced: Arc<RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>>,
+        announced: Arc<MemoryStateStore>,
         states: Arc<FixtureAcceptedStates>,
         primary: FixtureAuthority,
         foreign: FixtureAuthority,
@@ -3664,12 +4022,13 @@ pub mod test_fixtures {
         transport: &TransportConfig,
         last_heartbeat: Instant,
     ) -> Result<AnnouncedEndpoint> {
-        anyhow::ensure!(
-            matches!(&transport.endpoint, EndpointType::Quic { .. }),
-            "production inference fixture advertises only QUIC candidates"
-        );
+        let socket_kind = match &transport.endpoint {
+            EndpointType::Quic { .. } => "quic",
+            EndpointType::Iroh { .. } => "iroh",
+            _ => anyhow::bail!("production inference fixture advertises only network candidates"),
+        };
         Ok(AnnouncedEndpoint {
-            socket_kind: "quic".to_owned(),
+            socket_kind: socket_kind.to_owned(),
             endpoint: transport.endpoint_string(),
             service_jwt: "fixture-verified".to_owned(),
             service_did: Did::from(authority.state.did.clone()),
@@ -3683,7 +4042,13 @@ pub mod test_fixtures {
             request_kem_recipient: authority.request_kem_recipient.encode(),
             expires_at_unix_ms: 4_070_908_800_000,
             source_signer: authority.signing.verifying_key().to_bytes(),
-            last_heartbeat,
+            live_until_unix_ms: unix_millis_now()
+                .saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64)
+                .saturating_sub(
+                    Instant::now()
+                        .saturating_duration_since(last_heartbeat)
+                        .as_millis() as i64,
+                ),
         })
     }
 
@@ -3695,23 +4060,26 @@ pub mod test_fixtures {
                 states.clear();
                 states.insert(self.primary.state.did.clone(), self.primary.state.clone());
             }
-            let endpoints = transports
-                .iter()
-                .map(|transport| announcement(&self.primary, transport, Instant::now()))
-                .collect::<Result<Vec<_>>>()?;
-            self.announced
-                .write()
-                .insert(self.service_name.clone(), endpoints);
+            self.announced.clear_announcements_sync(&self.service_name);
+            for transport in transports {
+                self.announced.put_announcement_sync(
+                    &self.service_name,
+                    announcement(&self.primary, transport, Instant::now())?,
+                )?;
+            }
             Ok(())
         }
 
         /// Age every announcement beyond the production freshness bound.
         pub fn mark_stale(&self) {
-            if let Some(endpoints) = self.announced.write().get_mut(&self.service_name) {
-                for endpoint in endpoints {
-                    endpoint.last_heartbeat =
-                        Instant::now() - ANNOUNCED_ENDPOINT_TTL - Duration::from_secs(1);
-                }
+            for mut endpoint in self
+                .announced
+                .announcements_for_sync(&self.service_name, unix_millis_now())
+            {
+                endpoint.live_until_unix_ms = unix_millis_now() - 1;
+                let _ = self
+                    .announced
+                    .put_announcement_sync(&self.service_name, endpoint);
             }
         }
 
@@ -3721,11 +4089,10 @@ pub mod test_fixtures {
                 .0
                 .lock()
                 .insert(self.foreign.state.did.clone(), self.foreign.state.clone());
-            self.announced
-                .write()
-                .entry(self.service_name.clone())
-                .or_default()
-                .push(announcement(&self.foreign, transport, Instant::now())?);
+            self.announced.put_announcement_sync(
+                &self.service_name,
+                announcement(&self.foreign, transport, Instant::now())?,
+            )?;
             Ok(())
         }
     }
@@ -3746,7 +4113,7 @@ pub mod test_fixtures {
         let states = Arc::new(FixtureAcceptedStates(parking_lot::Mutex::new(
             HashMap::new(),
         )));
-        let announced = Arc::new(RwLock::new(HashMap::new()));
+        let announced = Arc::new(MemoryStateStore::default());
         let fixture = ProductionInferenceFixture {
             service_name: service_name.to_owned(),
             announced: Arc::clone(&announced),
@@ -3760,7 +4127,7 @@ pub mod test_fixtures {
         })?;
         PRODUCTION_RESOLVER
             .set(Arc::new(DiscoveryServiceResolver {
-                announced_endpoints: announced,
+                state_store: announced,
                 accepted_state_source: states,
                 discovery_client: None,
             }))
@@ -4021,21 +4388,20 @@ impl RpcClient for ProductionRpcClient {
 }
 
 impl DiscoveryService {
-    fn resolve_announced_endpoint(
+    async fn resolve_announced_endpoint(
         &self,
         name: &str,
         kind: SocketKind,
     ) -> anyhow::Result<Option<TransportConfig>> {
         let wanted = socket_kind_to_string(kind);
-        let announced = self.announced_endpoints.read();
-        let Some(endpoints) = announced.get(name) else {
-            return Ok(None);
-        };
-
+        let endpoints = self
+            .state_store
+            .announcements_for(name, unix_millis_now())
+            .await?;
         let Some(endpoint) = endpoints
             .iter()
             .filter(|ep| ep.socket_kind == wanted)
-            .find(|ep| ep.last_heartbeat.elapsed() <= ANNOUNCED_ENDPOINT_TTL)
+            .find(|ep| ep.is_live_at(unix_millis_now()))
         else {
             return Ok(None);
         };
@@ -4714,7 +5080,7 @@ mod resolver_tests {
             .next()
             .expect("authentication body");
         assert!(authentication.contains("hyprstream_service::deployment_data_dir()"));
-        assert!(authentication.contains("load_trusted_registry_deployment_credentials()"));
+        assert!(authentication.contains("authenticate_local_deployment_registry()"));
         assert!(authentication.contains("authenticate_registry_deployment_credentials("));
         assert!(!authentication.contains("global_trust_store()"));
         assert!(!authentication.contains("resolve_one("));
@@ -4749,6 +5115,12 @@ mod resolver_tests {
         endpoint: &str,
         last_heartbeat: Instant,
     ) -> AnnouncedEndpoint {
+        let age_ms = Instant::now()
+            .saturating_duration_since(last_heartbeat)
+            .as_millis() as i64;
+        let live_until_unix_ms = unix_millis_now()
+            .saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64)
+            .saturating_sub(age_ms);
         AnnouncedEndpoint {
             socket_kind: socket_kind.to_owned(),
             endpoint: endpoint.to_owned(),
@@ -4760,9 +5132,9 @@ mod resolver_tests {
             response_key_id: String::new(),
             request_kem_key_id: String::new(),
             request_kem_recipient: Vec::new(),
-            expires_at_unix_ms: 0,
+            expires_at_unix_ms: i64::MAX,
             source_signer: [0; 32],
-            last_heartbeat,
+            live_until_unix_ms,
         }
     }
 
@@ -4814,6 +5186,19 @@ mod resolver_tests {
     fn production_fixture(
         local_reach: bool,
     ) -> (DiscoveryServiceResolver, Arc<MutableAcceptedState>) {
+        production_fixture_with_transport(local_reach, false)
+    }
+
+    fn native_production_fixture(
+        local_reach: bool,
+    ) -> (DiscoveryServiceResolver, Arc<MutableAcceptedState>) {
+        production_fixture_with_transport(local_reach, true)
+    }
+
+    fn production_fixture_with_transport(
+        local_reach: bool,
+        native_iroh: bool,
+    ) -> (DiscoveryServiceResolver, Arc<MutableAcceptedState>) {
         let (state, signing) = accepted_state(11);
         let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
             hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
@@ -4821,13 +5206,24 @@ mod resolver_tests {
         .unwrap_or_else(|e| panic!("test KEM generation failed: {e}"));
         let endpoint = if local_reach {
             "inproc://hyprstream/model".to_owned()
+        } else if native_iroh {
+            format!("iroh://{}", hex::encode([0x51; 32]))
         } else {
             "quic://localhost:127.0.0.1:9".to_owned()
         };
-        let announced = Arc::new(RwLock::new(HashMap::from([(
-            "model".to_owned(),
-            vec![AnnouncedEndpoint {
-                socket_kind: if local_reach { "rep" } else { "quic" }.to_owned(),
+        let state_store = Arc::new(MemoryStateStore::default());
+        state_store
+            .put_announcement_sync(
+                "model",
+                AnnouncedEndpoint {
+                socket_kind: if local_reach {
+                    "rep"
+                } else if native_iroh {
+                    "iroh"
+                } else {
+                    "quic"
+                }
+                .to_owned(),
                 endpoint,
                 service_jwt: "verified-by-handler".to_owned(),
                 service_did: Did::from(state.did.clone()),
@@ -4841,13 +5237,15 @@ mod resolver_tests {
                 request_kem_recipient: kem.public().encode(),
                 expires_at_unix_ms: 4_070_908_800_000,
                 source_signer: signing.verifying_key().to_bytes(),
-                last_heartbeat: Instant::now(),
-            }],
-        )])));
+                live_until_unix_ms: unix_millis_now()
+                    + ANNOUNCED_ENDPOINT_TTL.as_millis() as i64,
+            },
+            )
+            .expect("seed announcement");
         let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(state))));
         (
             DiscoveryServiceResolver {
-                announced_endpoints: announced,
+                state_store,
                 accepted_state_source: Arc::clone(&source) as Arc<dyn AcceptedStateSource>,
                 discovery_client: None,
             },
@@ -4855,9 +5253,31 @@ mod resolver_tests {
         )
     }
 
+    async fn mutate_endpoint(
+        resolver: &DiscoveryServiceResolver,
+        service_name: &str,
+        socket_kind: &str,
+        mutate: impl FnOnce(&mut AnnouncedEndpoint),
+    ) {
+        let mut endpoint = resolver
+            .state_store
+            .announcements_for(service_name, unix_millis_now())
+            .await
+            .expect("read fixture announcement")
+            .into_iter()
+            .find(|entry| entry.socket_kind == socket_kind)
+            .expect("fixture announcement");
+        mutate(&mut endpoint);
+        resolver
+            .state_store
+            .put_announcement(service_name, endpoint)
+            .await
+            .expect("replace fixture announcement");
+    }
+
     #[tokio::test]
     async fn production_resolver_joins_announcement_to_current_pds_state() {
-        let (resolver, _) = production_fixture(false);
+        let (resolver, _) = native_production_fixture(false);
         let resolved = resolver
             .resolve_service(ServiceQuery::network("model").expect("query"))
             .await
@@ -4904,6 +5324,26 @@ mod resolver_tests {
     }
 
     #[tokio::test]
+    async fn network_iroh_profile_rejects_quic_and_browser_profile_rejects_iroh() {
+        let (resolver, _) = production_fixture(false);
+        let native = match resolver
+            .resolve_service(ServiceQuery::network("model").expect("native query"))
+            .await
+        {
+            Ok(_) => panic!("native Iroh profile accepted a valid QUIC candidate"),
+            Err(error) => error,
+        };
+        assert!(native.to_string().contains("no validated"));
+
+        let (resolver, _) = native_production_fixture(false);
+        let browser = resolver
+            .browser_provisioning(owned_browser_request())
+            .await
+            .expect_err("browser provisioning must reject Iroh reach");
+        assert!(browser.to_string().contains("no validated"));
+    }
+
+    #[tokio::test]
     async fn browser_projection_rejects_state_advance_revocation_and_cross_service() {
         let (resolver, source) = production_fixture(false);
         source.0.lock().as_mut().expect("fixture state").epoch += 1;
@@ -4913,13 +5353,10 @@ mod resolver_tests {
             .is_err());
 
         let (resolver, _) = production_fixture(false);
-        resolver
-            .announced_endpoints
-            .write()
-            .get_mut("model")
-            .and_then(|entries| entries.first_mut())
-            .expect("fixture announcement")
-            .request_kem_recipient = vec![0x01];
+        mutate_endpoint(&resolver, "model", "quic", |endpoint| {
+            endpoint.request_kem_recipient = vec![0x01];
+        })
+        .await;
         assert!(resolver
             .browser_provisioning(owned_browser_request())
             .await
@@ -5030,45 +5467,36 @@ mod resolver_tests {
 
         let (resolver, _) = production_fixture(false);
         let route_binding = binding_for(&resolver).await;
-        resolver
-            .announced_endpoints
-            .write()
-            .get_mut("model")
-            .and_then(|entries| entries.first_mut())
-            .expect("fixture route")
-            .endpoint = "quic://localhost:127.0.0.1:10".to_owned();
+        mutate_endpoint(&resolver, "model", "quic", |endpoint| {
+            endpoint.endpoint = "quic://localhost:127.0.0.1:10".to_owned();
+        })
+        .await;
         assert!(resolver
             .verify_browser_binding(&route_binding)
             .await
             .is_err());
 
         let (resolver, _) = production_fixture(false);
-        resolver
-            .announced_endpoints
-            .write()
-            .get_mut("model")
-            .and_then(|entries| entries.first_mut())
-            .expect("fixture pin")
-            .endpoint = format!(
-            "quic://localhost:127.0.0.1:9#{}",
-            URL_SAFE_NO_PAD.encode([0x51; 32])
-        );
+        mutate_endpoint(&resolver, "model", "quic", |endpoint| {
+            endpoint.endpoint = format!(
+                "quic://localhost:127.0.0.1:9#{}",
+                URL_SAFE_NO_PAD.encode([0x51; 32])
+            );
+        })
+        .await;
         let pin_binding = binding_for(&resolver).await;
-        resolver
-            .announced_endpoints
-            .write()
-            .get_mut("model")
-            .and_then(|entries| entries.first_mut())
-            .expect("fixture pin rotation")
-            .endpoint = format!(
-            "quic://localhost:127.0.0.1:9#{}",
-            URL_SAFE_NO_PAD.encode([0x52; 32])
-        );
+        mutate_endpoint(&resolver, "model", "quic", |endpoint| {
+            endpoint.endpoint = format!(
+                "quic://localhost:127.0.0.1:9#{}",
+                URL_SAFE_NO_PAD.encode([0x52; 32])
+            );
+        })
+        .await;
         assert!(resolver.verify_browser_binding(&pin_binding).await.is_err());
     }
 
     #[tokio::test]
-    async fn ordinary_announcement_handler_populates_production_resolver() {
+    async fn ordinary_iroh_announcement_handler_populates_production_resolver() {
         let (state, service_signing) = accepted_state(12);
         let root = SigningKey::from_bytes(&[0x61; 32]);
         let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
@@ -5105,8 +5533,8 @@ mod resolver_tests {
                 1,
                 &ServiceAnnouncement {
                     service_name: "model".to_owned(),
-                    socket_kind: "quic".to_owned(),
-                    endpoint: "quic://localhost:127.0.0.1:9".to_owned(),
+                    socket_kind: "iroh".to_owned(),
+                    endpoint: format!("iroh://{}", hex::encode([0x7a; 32])),
                     service_jwt: Some(jwt),
                     service_did: Did::from(state.did.clone()),
                     capabilities: vec!["hyprstream-rpc/1".to_owned()],
@@ -5127,11 +5555,70 @@ mod resolver_tests {
             .await
             .expect("ordinary announcement must resolve");
         assert_eq!(resolved.evidence().accepted_state_digest, state.head_digest);
+        assert!(matches!(
+            &resolved.transport().endpoint,
+            EndpointType::Iroh {
+                node_id,
+                direct_addrs,
+                relay_url: None,
+            } if *node_id == [0x7a; 32] && direct_addrs.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_get_endpoints_omits_stale_and_fetch_cannot_refresh_it() {
+        hyprstream_rpc::registry::init(
+            hyprstream_rpc::registry::EndpointMode::Inproc,
+            None,
+        );
+        let service = service();
+        let name = "stale-remote-reach";
+        service
+            .state_store
+            .put_announcement(
+                name,
+                legacy_endpoint(
+                    "iroh",
+                    &format!("iroh://{}", hex::encode([0x73; 32])),
+                    Instant::now() - ANNOUNCED_ENDPOINT_TTL - Duration::from_secs(1),
+                ),
+            )
+            .await
+            .expect("install stale endpoint fixture");
+        let signer = SigningKey::from_bytes(&[0x74; 32]);
+        let pq_signer = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signer);
+        let signed = hyprstream_rpc::SignedEnvelope::new_signed_hybrid(
+            hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()),
+            &signer,
+            &pq_signer,
+        );
+        let ctx = EnvelopeContext::from_verified_as_system(&signed);
+
+        let response = service
+            .handle_get_endpoints(&ctx, 1, name)
+            .await
+            .expect("remote getEndpoints handler");
+        assert!(matches!(response, DiscoveryResponseVariant::Error(_)));
+        assert!(service
+            .state_store
+            .announcements_for(name, unix_millis_now())
+            .await
+            .expect("inspect state after fetch")
+            .is_empty());
+
+        let listed = service
+            .handle_list_services(&ctx, 2)
+            .await
+            .expect("remote listServices handler");
+        let DiscoveryResponseVariant::ListServicesResult(services) = listed else {
+            panic!("listServices must return service summaries");
+        };
+        assert!(services.services.iter().all(|summary| summary.name != name));
     }
 
     #[tokio::test]
     async fn accepted_state_advance_between_selection_and_dial_refuses() {
-        let (resolver, source) = production_fixture(false);
+        let (resolver, source) = native_production_fixture(false);
         let resolved = resolver
             .resolve_service(ServiceQuery::network("model").expect("query"))
             .await
@@ -5173,7 +5660,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn live_stream_continuation_fails_closed_after_snapshot_advance() {
-        let (resolver, source) = production_fixture(false);
+        let (resolver, source) = native_production_fixture(false);
         let resolver = Arc::new(resolver);
         let snapshot = resolver
             .resolve_service_candidates(ServiceQuery::network("model").expect("query"))
@@ -5213,7 +5700,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn router_selected_reach_must_match_current_authorized_candidate() {
-        let (resolver, _) = production_fixture(false);
+        let (resolver, _) = native_production_fixture(false);
         let expected = resolver
             .resolve_service_candidates(ServiceQuery::network("model").expect("query"))
             .await
@@ -5235,7 +5722,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn router_selected_reach_rejects_unadvertised_transport_and_wrong_domain() {
-        let (resolver, _) = production_fixture(false);
+        let (resolver, _) = native_production_fixture(false);
         let client = ProductionRpcClient::new(
             "model",
             "inference",
@@ -5261,14 +5748,17 @@ mod resolver_tests {
     async fn generated_client_uses_ordinary_identity_bound_resolver_path() {
         let (resolver, _) = production_fixture(false);
         let entries = resolver
-            .announced_endpoints
-            .write()
-            .remove("model")
+            .state_store
+            .announcements_for("model", unix_millis_now())
+            .await
             .expect("fixture announcement");
-        resolver
-            .announced_endpoints
-            .write()
-            .insert("discovery".to_owned(), entries);
+        for endpoint in entries {
+            resolver
+                .state_store
+                .put_announcement("discovery", endpoint)
+                .await
+                .expect("seed discovery announcement");
+        }
         let resolver = Arc::new(resolver);
         let _ = PRODUCTION_RESOLVER.set(resolver);
         let client_signing = SigningKey::from_bytes(&[0x44; 32]);
@@ -5917,20 +6407,17 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn stale_or_expired_production_evidence_is_rejected() {
-        let (resolver, _) = production_fixture(false);
-        resolver
-            .announced_endpoints
-            .write()
-            .get_mut("model")
-            .and_then(|entries| entries.first_mut())
-            .expect("fixture service")
-            .last_heartbeat = Instant::now() - ANNOUNCED_ENDPOINT_TTL - Duration::from_secs(1);
+        let (resolver, _) = native_production_fixture(false);
+        mutate_endpoint(&resolver, "model", "iroh", |endpoint| {
+            endpoint.live_until_unix_ms = unix_millis_now() - 1;
+        })
+        .await;
         assert!(resolver
             .resolve_service(ServiceQuery::network("model").expect("query"))
             .await
             .is_err());
 
-        let (resolver, source) = production_fixture(false);
+        let (resolver, source) = native_production_fixture(false);
         source.0.lock().as_mut().expect("fixture state").expires_at =
             Some("2000-01-01T00:00:00Z".to_owned());
         assert!(resolver
@@ -5941,16 +6428,23 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn malformed_candidate_does_not_poison_valid_alternative() {
-        let (resolver, _) = production_fixture(false);
-        {
-            let mut endpoints = resolver.announced_endpoints.write();
-            let entries = endpoints.get_mut("model").expect("fixture service");
-            let mut malformed = entries.first().expect("fixture endpoint").clone();
-            malformed.request_kem_recipient = vec![0xff];
-            malformed.socket_kind = "quic".to_owned();
-            malformed.endpoint = "quic://missing-port".to_owned();
-            entries.insert(0, malformed);
-        }
+        let (resolver, _) = native_production_fixture(false);
+        let mut malformed = resolver
+            .state_store
+            .announcements_for("model", unix_millis_now())
+            .await
+            .expect("fixture service")
+            .into_iter()
+            .next()
+            .expect("fixture endpoint");
+        malformed.request_kem_recipient = vec![0xff];
+        malformed.socket_kind = "quic".to_owned();
+        malformed.endpoint = "quic://missing-port".to_owned();
+        resolver
+            .state_store
+            .put_announcement("model", malformed)
+            .await
+            .expect("seed malformed alternative");
 
         let resolved = resolver
             .resolve_service(ServiceQuery::network("model").expect("query"))
@@ -5969,13 +6463,10 @@ mod resolver_tests {
             .is_err());
 
         let (resolver, _) = production_fixture(false);
-        resolver
-            .announced_endpoints
-            .write()
-            .get_mut("model")
-            .and_then(|entries| entries.first_mut())
-            .expect("fixture service")
-            .accepted_state_digest = vec![0x77; 64];
+        mutate_endpoint(&resolver, "model", "quic", |endpoint| {
+            endpoint.accepted_state_digest = vec![0x77; 64];
+        })
+        .await;
         assert!(resolver
             .resolve_service(ServiceQuery::network("model").expect("query"))
             .await
@@ -5985,14 +6476,17 @@ mod resolver_tests {
     #[tokio::test]
     async fn resolver_uses_fresh_announced_quic_endpoint() {
         let svc = service();
-        svc.announced_endpoints.write().insert(
-            "model".to_owned(),
-            vec![legacy_endpoint(
+        svc.state_store
+            .put_announcement(
+                "model",
+                legacy_endpoint(
                 "quic",
                 "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433",
                 Instant::now(),
-            )],
-        );
+                ),
+            )
+            .await
+            .expect("seed announcement");
 
         let transport = match svc.resolve("model", SocketKind::Quic).await {
             Ok(transport) => transport,
@@ -6025,14 +6519,17 @@ mod resolver_tests {
     #[tokio::test]
     async fn resolver_rejects_stale_announced_quic_endpoint() {
         let svc = service();
-        svc.announced_endpoints.write().insert(
-            "model".to_owned(),
-            vec![legacy_endpoint(
+        svc.state_store
+            .put_announcement(
+                "model",
+                legacy_endpoint(
                 "quic",
                 "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433",
                 Instant::now() - (ANNOUNCED_ENDPOINT_TTL + Duration::from_secs(1)),
-            )],
-        );
+                ),
+            )
+            .await
+            .expect("seed stale announcement");
 
         let err = match svc.resolve("model", SocketKind::Quic).await {
             Ok(transport) => panic!("stale announced QUIC endpoint resolved to {transport:?}"),
@@ -6144,10 +6641,10 @@ impl DiscoveryHandler for DiscoveryService {
             .collect();
         drop(reg);
 
-        // Merge announced endpoints from other processes
-        let announced = self.announced_endpoints.read();
+        // Merge live announcements from the configured state backend.
+        let announced = self.state_store.all_announcements(unix_millis_now()).await?;
         let local_names: Vec<String> = summaries.iter().map(|s| s.name.clone()).collect();
-        for (name, endpoints) in announced.iter() {
+        for (name, endpoints) in &announced {
             if local_names.iter().any(|n| n == name) {
                 // Service exists locally — add announced socket kinds
                 if let Some(summary) = summaries.iter_mut().find(|s| s.name == *name) {
@@ -6211,29 +6708,29 @@ impl DiscoveryHandler for DiscoveryService {
             None => Vec::new(),
         };
 
-        // Merge announced endpoints from other processes (carry service JWT)
-        let announced = self.announced_endpoints.read();
-        if let Some(announced_eps) = announced.get(service_name) {
-            for ep in announced_eps {
-                // Don't duplicate if already present from local registry
-                if !endpoints.iter().any(|e| e.socket_kind == ep.socket_kind) {
-                    endpoints.push(EndpointInfo {
-                        socket_kind: ep.socket_kind.clone(),
-                        endpoint: ep.endpoint.clone(),
-                        service_jwt: ep.service_jwt.clone(),
-                        tls_endorsement: self.tls_endorsement.clone(),
-                        tls_domain: self.tls_domain.clone(),
-                        service_did: ep.service_did.clone(),
-                        capabilities: ep.capabilities.iter().cloned().collect(),
-                        accepted_state_digest: ep.accepted_state_digest.clone(),
-                        accepted_state_epoch: ep.accepted_state_epoch,
-                        response_key_id: ep.response_key_id.clone(),
-                        request_kem_key_id: ep.request_kem_key_id.clone(),
-                        request_kem_recipient: ep.request_kem_recipient.clone(),
-                        expires_at_unix_ms: ep.expires_at_unix_ms,
-                        source_signer: ep.source_signer.to_vec(),
-                    });
-                }
+        // Merge announced endpoints from other processes (carry service JWT).
+        for ep in self
+            .state_store
+            .announcements_for(service_name, unix_millis_now())
+            .await?
+        {
+            if !endpoints.iter().any(|e| e.socket_kind == ep.socket_kind) {
+                endpoints.push(EndpointInfo {
+                    socket_kind: ep.socket_kind,
+                    endpoint: ep.endpoint,
+                    service_jwt: ep.service_jwt,
+                    tls_endorsement: self.tls_endorsement.clone(),
+                    tls_domain: self.tls_domain.clone(),
+                    service_did: ep.service_did,
+                    capabilities: ep.capabilities.into_iter().collect(),
+                    accepted_state_digest: ep.accepted_state_digest,
+                    accepted_state_epoch: ep.accepted_state_epoch,
+                    response_key_id: ep.response_key_id,
+                    request_kem_key_id: ep.request_kem_key_id,
+                    request_kem_recipient: ep.request_kem_recipient,
+                    expires_at_unix_ms: ep.expires_at_unix_ms,
+                    source_signer: ep.source_signer.to_vec(),
+                });
             }
         }
 
@@ -6392,160 +6889,7 @@ impl DiscoveryHandler for DiscoveryService {
         _request_id: u64,
         data: &ServiceAnnouncement,
     ) -> Result<DiscoveryResponseVariant> {
-        info!(
-            "Discovery: service '{}' announced {} endpoint: {} (from {})",
-            data.service_name,
-            data.socket_kind,
-            data.endpoint,
-            ctx.subject()
-        );
-
-        let svc_name = data.service_name.clone();
-        let sock_kind = data.socket_kind.clone();
-        let endpoint = data.endpoint.clone();
-        let service_jwt = data.service_jwt.clone().unwrap_or_default();
-        let identity_bound = !data.service_did.as_str().is_empty()
-            || !data.accepted_state_digest.is_empty()
-            || !data.request_kem_recipient.is_empty();
-        if identity_bound {
-            anyhow::ensure!(
-                !service_jwt.is_empty(),
-                "identity-bound announcement requires a verified service JWT"
-            );
-            anyhow::ensure!(
-                data.service_did.is_did_at9p()
-                    && data.accepted_state_digest.len() == 64
-                    && !data.capabilities.is_empty()
-                    && data
-                        .response_key_id
-                        .starts_with(&format!("{}#", data.service_did))
-                    && data
-                        .request_kem_key_id
-                        .starts_with(&format!("{}#", data.service_did))
-                    && data.expires_at_unix_ms > unix_millis_now(),
-                "identity-bound announcement metadata is incomplete or expired"
-            );
-            let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(
-                &data.request_kem_recipient,
-            )?;
-            anyhow::ensure!(
-                recipient.suite_id
-                    == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
-                    && recipient.eks.len() == recipient.suite_id.components().len(),
-                "identity-bound announcement requires suite-complete hybrid KEM material"
-            );
-            match data.socket_kind.as_str() {
-                "quic" => {
-                    parse_announced_quic(&data.endpoint)?;
-                }
-                "iroh" => {
-                    parse_announced_iroh(&data.endpoint)?;
-                }
-                _ => {
-                    anyhow::bail!("identity-bound network announcement requires QUIC or Iroh reach")
-                }
-            }
-        }
-
-        // R3: Verify service JWT signature + subject matches serviceName.
-        // Full JWT verification (not decode_unverified) to prevent forged identities.
-        if !service_jwt.is_empty() {
-            // Service JWTs are minted hybrid (ML-DSA-65-Ed25519); the composite
-            // kid resolves through the key source (ledger pairs + the CA
-            // composite pair). Classical EdDSA remains accepted here for
-            // tokens minted before the hybrid cutover.
-            let is_composite = hyprstream_rpc::auth::jwt::header_alg(&service_jwt)
-                .ok()
-                .flatten()
-                .is_some_and(|alg| alg == "ML-DSA-65-Ed25519");
-            let verified = if is_composite {
-                let dispatch =
-                    hyprstream_rpc::auth::jwt::parse_composite_dispatch(&service_jwt, &["wit+jwt"])
-                        .map_err(|e| {
-                            tracing::warn!("Service JWT dispatch failed in announce: {}", e);
-                            anyhow::anyhow!("Invalid service JWT in announce: {}", e)
-                        })?;
-                let pair = self
-                    .jwt_key_source
-                    .as_ref()
-                    .and_then(|ks| ks.composite_pair(dispatch.kid()))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Invalid service JWT in announce: unknown composite kid")
-                    })?;
-                // Signing-domain separation: announcements assert a service
-                // identity, which is certified by the Policy/CA domain only —
-                // the ledger's Policy slot and the derived CA pair (registered
-                // under the Policy role). The OAuth-role pair signs browser
-                // and workload WITs and must not be able to certify a service
-                // announcement.
-                anyhow::ensure!(
-                    pair.role() == hyprstream_rpc::auth::CompositePairRole::Policy,
-                    "Invalid service JWT in announce: composite pair role is not authorized \
-                     for service certification"
-                );
-                hyprstream_rpc::auth::jwt::decode_composite(
-                    &service_jwt,
-                    pair.ml_dsa(),
-                    pair.ed25519(),
-                    self.expected_audience.as_deref(),
-                    &dispatch,
-                )
-                .map_err(|e| {
-                    tracing::warn!("Service JWT verification failed in announce: {}", e);
-                    anyhow::anyhow!("Invalid service JWT in announce: {}", e)
-                })?
-            } else {
-                hyprstream_rpc::auth::jwt::decode_with_key(
-                    &service_jwt,
-                    &self.jwt_verifying_key,
-                    self.expected_audience.as_deref(),
-                )
-                .map_err(|e| {
-                    tracing::warn!("Service JWT verification failed in announce: {}", e);
-                    anyhow::anyhow!("Invalid service JWT in announce: {}", e)
-                })?
-            };
-            // Check that sub matches "service:{serviceName}"
-            let expected_sub = format!("service:{}", svc_name);
-            if verified.sub != expected_sub {
-                anyhow::bail!(
-                    "Service JWT subject mismatch: expected '{}', got '{}'",
-                    expected_sub,
-                    verified.sub
-                );
-            }
-            anyhow::ensure!(
-                verified.cnf_key_bytes() == Some(ctx.cnf),
-                "service JWT confirmation key does not match verified announcement signer"
-            );
-        }
-
-        let replacement = AnnouncedEndpoint {
-            socket_kind: sock_kind.clone(),
-            endpoint: endpoint.clone(),
-            service_jwt: service_jwt.clone(),
-            service_did: data.service_did.clone(),
-            capabilities: data.capabilities.iter().cloned().collect(),
-            accepted_state_digest: data.accepted_state_digest.clone(),
-            accepted_state_epoch: data.accepted_state_epoch,
-            response_key_id: data.response_key_id.clone(),
-            request_kem_key_id: data.request_kem_key_id.clone(),
-            request_kem_recipient: data.request_kem_recipient.clone(),
-            expires_at_unix_ms: data.expires_at_unix_ms,
-            source_signer: ctx.cnf,
-            last_heartbeat: Instant::now(),
-        };
-
-        let mut endpoints = self.announced_endpoints.write();
-        let entry = endpoints.entry(svc_name).or_default();
-        // Replace existing endpoint for the same socket kind, or add new
-        if let Some(existing) = entry.iter_mut().find(|e| e.socket_kind == sock_kind) {
-            *existing = replacement;
-        } else {
-            entry.push(replacement);
-        }
-
-        Ok(DiscoveryResponseVariant::AnnounceResult)
+        self.store_announcement(ctx, data).await
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -6587,10 +6931,10 @@ impl DiscoveryHandler for DiscoveryService {
             jwt: data.jwt.clone(),
             fetched_at: unix_seconds_now(),
         };
-        let mut map = self.entity_statements.write();
-        map.insert(data.issuer.clone(), cached);
-        let total = map.len();
-        drop(map);
+        self.state_store
+            .put_entity_statement(&data.issuer, cached)
+            .await?;
+        let total = self.state_store.known_issuers().await?.len();
 
         info!(
             issuer = %data.issuer,
@@ -6608,14 +6952,13 @@ impl DiscoveryHandler for DiscoveryService {
         data: &str,
     ) -> Result<DiscoveryResponseVariant> {
         let issuer = data;
-        let map = self.entity_statements.read();
-        match map.get(issuer) {
+        match self.state_store.entity_statement(issuer).await? {
             Some(cached) => {
                 trace!(issuer = %issuer, "Discovery: entity statement cache hit");
                 Ok(DiscoveryResponseVariant::GetEntityStatementResult(
                     EntityStatement {
                         issuer: issuer.to_owned(),
-                        jwt: cached.jwt.clone(),
+                        jwt: cached.jwt,
                         fetched_at: cached.fetched_at,
                     },
                 ))
@@ -6653,15 +6996,13 @@ impl DiscoveryHandler for DiscoveryService {
             cose_keyset_cbor: data.cose_keyset_cbor.clone(),
             fetched_at: unix_seconds_now(),
         };
-        let mut map = self.envelope_keysets.write();
-        map.insert(data.service_did.as_str().to_owned(), cached);
-        let total = map.len();
-        drop(map);
+        self.state_store
+            .put_envelope_keyset(data.service_did.as_str(), cached)
+            .await?;
 
         info!(
             service_did = %data.service_did,
             caller = %ctx.subject(),
-            total_cached = total,
             "Discovery: envelope keyset registered"
         );
         Ok(DiscoveryResponseVariant::RegisterEnvelopeKeysetResult)
@@ -6674,14 +7015,13 @@ impl DiscoveryHandler for DiscoveryService {
         data: &str,
     ) -> Result<DiscoveryResponseVariant> {
         let service_did = data;
-        let map = self.envelope_keysets.read();
-        match map.get(service_did) {
+        match self.state_store.envelope_keyset(service_did).await? {
             Some(cached) => {
                 trace!(service_did = %service_did, "Discovery: envelope keyset cache hit");
                 Ok(DiscoveryResponseVariant::GetEnvelopeKeysetResult(
                     EnvelopeKeyset {
                         service_did: hyprstream_rpc::identity::Did::new(service_did.to_owned()),
-                        cose_keyset_cbor: cached.cose_keyset_cbor.clone(),
+                        cose_keyset_cbor: cached.cose_keyset_cbor,
                         fetched_at: cached.fetched_at,
                     },
                 ))
@@ -6713,8 +7053,7 @@ impl DiscoveryHandler for DiscoveryService {
                 details: String::new(),
             }));
         }
-        let map = self.entity_statements.read();
-        let issuers: Vec<String> = map.keys().cloned().collect();
+        let issuers = self.state_store.known_issuers().await?;
         Ok(DiscoveryResponseVariant::ListKnownIssuersResult(
             IssuerList { issuers },
         ))
@@ -6888,11 +7227,7 @@ impl DiscoveryHandler for DiscoveryService {
             .selectors
             .iter()
             .map(|s| {
-                scheduling::LabelSelector::new(
-                    s.key.clone(),
-                    to_scheduling_op(s.op),
-                    s.values.clone(),
-                )
+                scheduling::LabelSelector::new(s.key.clone(), to_scheduling_op(s.op), s.values.clone())
             })
             .collect();
         let resources: Vec<scheduling::ResourceRequest> = data
@@ -6903,24 +7238,38 @@ impl DiscoveryHandler for DiscoveryService {
 
         // Hard liveness exclusion (decision #1): only nodes with a live,
         // unexpired `reportNodeLiveness` entry become candidates at all.
-        let candidates: Vec<Candidate> = self
-            .placement_index
-            .known_node_dids()
-            .into_iter()
-            .filter_map(|did| {
-                let live = self.liveness.get(&Did::new(did.clone()))?;
-                let labels = self.placement_index.effective_labels(&did);
-                let record_uri = self.placement_index.record_uri(&did).unwrap_or_default();
-                Some(Candidate {
-                    did,
-                    record_uri,
-                    load_fraction: live.load_fraction,
-                    allocatable: live.allocatable,
-                    last_seen: live.last_seen,
-                    labels,
-                })
-            })
-            .collect();
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for (node, _) in self.state_store.all_liveness(unix_millis_now()).await? {
+            let did = node.as_str().to_owned();
+            // Authorize before a query can trigger resolver work on this
+            // replica. Liveness is shared, but placement facts still come only
+            // from the verified repository ingestion path.
+            if self
+                .authorize(ctx, &format!("placement:candidate:{did}"), "query")
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            self.ensure_placement_ingested(&node).await;
+            let Some(record_uri) = self.placement_index.record_uri(&did) else {
+                continue;
+            };
+            // Repository ingestion can take time; never return a node whose
+            // heartbeat expired while this replica was loading its facts.
+            let Some(live) = self.state_store.liveness(&node, unix_millis_now()).await? else {
+                continue;
+            };
+            let labels = self.placement_index.effective_labels(&did);
+            candidates.push(Candidate {
+                did,
+                record_uri,
+                load_fraction: live.load_fraction,
+                allocatable: live.allocatable,
+                last_seen: live.last_seen,
+                labels,
+            });
+        }
 
         let predicates: Vec<scheduling::Predicate<Candidate>> = vec![
             Box::new({
@@ -7072,30 +7421,12 @@ impl DiscoveryHandler for DiscoveryService {
             } else {
                 unix_millis_now()
             },
+            live_until_unix_ms: unix_millis_now()
+                .saturating_add(LIVENESS_TTL.as_millis() as i64),
         };
-        self.liveness.insert(data.node.clone(), live, LIVENESS_TTL);
+        self.state_store.put_liveness(&data.node, live).await?;
 
-        if self.placement_index.record_uri(&node_did).is_none()
-            && self.placement_ingest_attempts.insert_if_absent(
-                data.node.clone(),
-                (),
-                PLACEMENT_INGEST_RETRY_TTL,
-            )
-        {
-            if let Some(resolver) = &self.record_resolver {
-                if let Err(e) = self
-                    .placement_index
-                    .ingest_did(resolver.as_ref(), &node_did)
-                    .await
-                {
-                    tracing::warn!(
-                        node = %node_did,
-                        error = %e,
-                        "placement directory ingestion failed for heartbeating node (liveness still recorded)"
-                    );
-                }
-            }
-        }
+        self.ensure_placement_ingested(&data.node).await;
 
         Ok(DiscoveryResponseVariant::ReportNodeLivenessResult)
     }
@@ -7677,6 +8008,172 @@ mod query_candidates_tests {
         ));
     }
 
+    async fn assert_cross_replica_candidates(a: DiscoveryState, b: DiscoveryState) {
+        let did = "did:web:shared-node.example";
+        let rec = sample_node_record(did, vec![("zone", "shared")]);
+        let repos = HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]);
+        let replica_a = service_with(Box::new(AllowAll), repos.clone()).with_state(a);
+        let replica_b = service_with(Box::new(AllowAll), repos.clone()).with_state(b.clone());
+        heartbeat(&replica_a, did, vec![("cpu", "8")], 0.25).await;
+        assert!(replica_b.placement_index.known_node_dids().is_empty());
+        let req = QueryCandidatesRequest {
+            selectors: vec![LabelSelector {
+                key: "zone".to_owned(),
+                op: SelectorOp::In,
+                values: vec!["shared".to_owned()],
+            }],
+            resources: vec![ResourceRequest {
+                name: "cpu".to_owned(),
+                min_quantity: "4".to_owned(),
+            }],
+            max_candidates: 0,
+        };
+        let result = as_set(
+            replica_b
+                .handle_query_candidates(&test_ctx(), 1, &req)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result.total_matching, 1);
+        assert_eq!(result.candidates[0].node, did);
+        assert_eq!(
+            result.candidates[0].record_uri,
+            format!("at://{did}/{}/3a", node::COLLECTION_NSID)
+        );
+        // A restarted replica and a policy-denied replica start without local
+        // placement state too. Only an authorized verified node is surfaced.
+        let restarted = service_with(Box::new(AllowAll), repos.clone()).with_state(b.clone());
+        assert_eq!(
+            as_set(
+                restarted
+                    .handle_query_candidates(&test_ctx(), 1, &req)
+                    .await
+                    .unwrap()
+            )
+            .total_matching,
+            1
+        );
+        let denied = service_with(Box::new(DenyNode(did.to_owned())), repos).with_state(b.clone());
+        assert_eq!(
+            as_set(
+                denied
+                    .handle_query_candidates(&test_ctx(), 1, &empty_query(0))
+                    .await
+                    .unwrap()
+            )
+            .total_matching,
+            0
+        );
+        assert!(denied.placement_index.known_node_dids().is_empty());
+        let missing_repo = service_with(Box::new(AllowAll), HashMap::new()).with_state(b);
+        assert_eq!(
+            as_set(
+                missing_repo
+                    .handle_query_candidates(&test_ctx(), 1, &empty_query(0))
+                    .await
+                    .unwrap()
+            )
+            .total_matching,
+            0
+        );
+        // Expiring the shared record excludes it even from populated indexes.
+        replica_a
+            .state_store
+            .all_liveness(unix_millis_now() + LIVENESS_TTL.as_millis() as i64 + 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            as_set(
+                replica_b
+                    .handle_query_candidates(&test_ctx(), 1, &req)
+                    .await
+                    .unwrap()
+            )
+            .total_matching,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_liveness_seeds_replica_without_local_placement() {
+        let state = DiscoveryState::connect(&crate::DiscoveryStateConfig::default())
+            .await
+            .unwrap();
+        assert_cross_replica_candidates(state.clone(), state).await;
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_shared_liveness_seeds_other_replica_and_restart() {
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        for backend in [
+            crate::DiscoveryStateBackend::Valkey,
+            crate::DiscoveryStateBackend::Tiered,
+        ] {
+            let config = crate::DiscoveryStateConfig {
+                backend,
+                active_active: true,
+                valkey: crate::ValkeyStateConfig {
+                    url: url.clone(),
+                    key_prefix: format!(
+                        "pr1560-candidates-{}-{}-{backend:?}",
+                        std::process::id(),
+                        unix_millis_now()
+                    ),
+                    pool_size: 2,
+                    ..crate::ValkeyStateConfig::default()
+                },
+                ..crate::DiscoveryStateConfig::default()
+            };
+            let a = DiscoveryState::connect(&config).await.unwrap();
+            let b = DiscoveryState::connect(&config).await.unwrap();
+            assert_cross_replica_candidates(a, b).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_announcement_without_identity_expiry_uses_heartbeat_ttl() {
+        let svc = service_with(Box::new(AllowAll), HashMap::new());
+        let request = ServiceAnnouncement {
+            service_name: "legacy".to_owned(),
+            socket_kind: "rep".to_owned(),
+            endpoint: "inproc://legacy".to_owned(),
+            service_jwt: None,
+            service_did: Did::new(String::new()),
+            capabilities: vec![],
+            accepted_state_digest: vec![],
+            accepted_state_epoch: 0,
+            response_key_id: String::new(),
+            request_kem_key_id: String::new(),
+            request_kem_recipient: vec![],
+            expires_at_unix_ms: 0,
+        };
+        let now = unix_millis_now();
+        assert!(matches!(
+            svc.handle_announce(&test_ctx(), 1, &request).await.unwrap(),
+            DiscoveryResponseVariant::AnnounceResult
+        ));
+        let entries = svc
+            .state_store
+            .announcements_for("legacy", now)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].live_until_unix_ms >= now + ANNOUNCED_ENDPOINT_TTL.as_millis() as i64);
+        assert_eq!(entries[0].expires_at_unix_ms, entries[0].live_until_unix_ms);
+        assert!(svc
+            .state_store
+            .announcements_for("legacy", entries[0].live_until_unix_ms)
+            .await
+            .unwrap()
+            .is_empty());
+        let mut bound = request;
+        bound.service_did = Did::new("did:at9p:identity-bound".to_owned());
+        assert!(svc.handle_announce(&test_ctx(), 1, &bound).await.is_err());
+    }
+
     /// A denied heartbeat must not create a volatile liveness entry or trigger
     /// a first-seen repository poll, even if the caller passed the generic
     /// reportNodeLiveness dispatch gate.
@@ -7713,7 +8210,11 @@ mod query_candidates_tests {
             DiscoveryResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "UNAUTHORIZED"
         ));
         assert!(
-            svc.liveness.get(&Did::new(did.to_owned())).is_none(),
+            svc.state_store
+                .liveness(&Did::new(did.to_owned()), unix_millis_now())
+                .await
+                .expect("read liveness")
+                .is_none(),
             "denied DID must not receive a liveness entry"
         );
         assert!(
@@ -7753,8 +8254,10 @@ mod query_candidates_tests {
             "two heartbeats before retry expiry must produce one repo poll"
         );
         let live = svc
-            .liveness
-            .get(&Did::new(did.to_owned()))
+            .state_store
+            .liveness(&Did::new(did.to_owned()), unix_millis_now())
+            .await
+            .expect("read liveness")
             .expect("admitted heartbeat must still refresh liveness");
         assert!((live.load_fraction - 0.1).abs() < f32::EPSILON);
         assert_eq!(live.allocatable, vec![("cpu".to_owned(), "8".to_owned())]);
