@@ -1106,6 +1106,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quic_shared_config_preserves_optional_moq_ingress_authority() {
+        let authority = Arc::new(
+            |peer: &hyprstream_rpc::moq_authz::PeerIdentity, tenant: &str| {
+                peer.subject.as_deref() == Some("did:at9p:producer") && tenant == "local"
+            },
+        );
+        let shared = QuicSharedConfig {
+            cert_chain: Vec::new(),
+            key_der: Zeroizing::new(Vec::new()),
+            base_ip: "127.0.0.1".parse().expect("loopback"),
+            server_name: "test".to_owned(),
+            oauth_issuer_url: None,
+            jwt_verifying_key: None,
+            iroh_enabled: true,
+            moq_relay: None,
+            moq_relay_server_identity: None,
+            native_announcement_publisher: None,
+            moq_admission: None,
+            moq_ingress_authorizer: Some(authority),
+            moq_admission_proof: None,
+        };
+
+        let wired = shared.for_service("event", 0);
+        assert!(wired
+            .moq_ingress_authorizer
+            .as_ref()
+            .is_some_and(|authorizer| authorizer.authorize_ingress(
+                &hyprstream_rpc::moq_authz::PeerIdentity::authenticated("did:at9p:producer"),
+                "local",
+            )));
+
+        let default = QuicSharedConfig {
+            moq_ingress_authorizer: None,
+            ..shared
+        }
+        .for_service("event", 0);
+        assert!(
+            default.moq_ingress_authorizer.is_none(),
+            "absence must stay read-only"
+        );
+    }
+
+    #[test]
     fn test_service_factory_creation() {
         fn dummy_factory(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
             Err(anyhow::anyhow!("dummy"))
