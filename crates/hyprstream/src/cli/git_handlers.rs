@@ -10,8 +10,7 @@ use crate::runtime::GenerationRequest;
 use crate::services::generated::inference_client::ChatMessage;
 use crate::services::generated::model_client::ChatTemplateRequest;
 use hyprstream_rpc::events::EventSubscriber;
-use hyprstream_rpc::moq_event::ensure_event_client_origin;
-use hyprstream_rpc::paths;
+use crate::services::event_network::ensure_event_origin_for_profile;
 use crate::services::generated::registry_client::{
     BranchRequest, CheckoutRequest, CloneRequest, CreateWorktreeRequest,
     RemoveWorktreeRequest, UpdateRequest,
@@ -1522,7 +1521,7 @@ pub async fn handle_load(
     // plaintext-plane `AllowAllTerminalAuthz` and no group-key join is needed.
     if let Some(timeout_secs) = wait {
         println!("Waiting for model to load (timeout: {}s)...", timeout_secs);
-        ensure_event_client_origin(paths::event_socket());
+        ensure_event_origin_for_profile()?;
         let mut subscriber = EventSubscriber::new()?;
         subscriber.subscribe("model")?;
 
@@ -1632,6 +1631,9 @@ pub async fn handle_notify_command(
     use crate::cli::quick::NotifyCommand;
 
     match command {
+        NotifyCommand::Probe { timeout } => {
+            crate::services::event_network::probe_event_network(std::time::Duration::from_secs(timeout)).await
+        }
         NotifyCommand::Subscribe { pattern, json, timeout, count } => {
             handle_notify_subscribe(&pattern, json, timeout, count, signing_key).await
         }
@@ -1653,7 +1655,7 @@ async fn handle_notify_subscribe(
     // flip deferred to #555); the per-publish unlinkability of the old NotificationService
     // is consciously dropped per the epic's group-level-confidentiality decision.
     // notify subscribe is now a streaming subscribe (not a one-shot deliver).
-    ensure_event_client_origin(paths::event_socket());
+    ensure_event_origin_for_profile()?;
     let mut subscriber = EventSubscriber::new()?;
     subscriber.subscribe(pattern)?;
 

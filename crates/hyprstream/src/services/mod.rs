@@ -185,3 +185,6 @@ pub fn discovery_client_for_process(
 pub use mcp_service::{McpConfig, McpService};
 #[cfg(feature = "metrics")]
 pub use metrics::MetricsService;
+
+/// Authenticated Event transport and profile-aware initialization.
+pub mod event_network;

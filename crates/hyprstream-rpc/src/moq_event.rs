@@ -462,6 +462,28 @@ pub fn ensure_event_client_origin(path: std::path::PathBuf) {
     connect_event_moq_uds_background(origin, path);
 }
 
+/// Install a client origin without opening any local socket.
+pub fn install_event_network_client_origin() -> Option<MoqEventOrigin> {
+    if global_moq_event_origin().is_some() { return None; }
+    let origin = MoqEventOrigin::new();
+    init_global_moq_event_origin(origin.clone()).then_some(origin)
+}
+
+/// One authenticated network link. Target identity must accompany a fresh
+/// checkpoint-resolved Iroh transport; callers re-resolve before reconnecting.
+pub async fn run_event_network_link(
+    origin: &MoqEventOrigin,
+    transport: &crate::transport::TransportConfig,
+    proof: &crate::transport::moql_admission::MoqlAdmissionProof,
+) -> Result<()> {
+    anyhow::ensure!(matches!(transport.endpoint, crate::transport::EndpointType::Iroh { .. }), "Event network link requires Iroh");
+    let stream = crate::dial::dial_stream_authenticated(transport, proof).await?;
+    let client = moq_net::Client::new().with_origin(origin.producer());
+    let session = stream.connect_moq(&client).await?;
+    let _ = session.closed().await;
+    anyhow::bail!("authenticated Event link closed")
+}
+
 /// Connect a local event origin to the event service's UDS plane (#275).
 ///
 /// Spawns a background task that connects a `moq_net::Client` (built with
