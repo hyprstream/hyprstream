@@ -215,23 +215,21 @@ impl NativeServiceAnnouncement {
             self.response_verifying_key == signer.verifying_key().to_bytes(),
             "admission signer is not the accepted current response key"
         );
-        Ok(
-            hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof {
+        let ml_dsa_65 = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(signer);
+        let ml_dsa65 = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&ml_dsa_65);
+        Ok(hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof {
                 did: self.service_did.to_string(),
                 ed25519: signer.clone(),
-                ml_dsa_65: hyprstream_rpc::node_identity::derive_mesh_mldsa_key(signer),
+                ml_dsa_65,
                 expected_server: hyprstream_rpc::stream_info::MoqlServerIdentity {
                     did: self.service_did.to_string(),
                     epoch: self.accepted_state_epoch,
                     head_digest: self.accepted_state_digest.to_vec(),
                     expires_at_unix_ms: self.accepted_state_expires_at_unix_ms,
                     ed25519: self.response_verifying_key,
-                    ml_dsa65: hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(
-                        &hyprstream_rpc::node_identity::derive_mesh_mldsa_key(signer),
-                    ),
+                    ml_dsa65,
                 },
-            },
-        )
+            })
     }
     /// Project a complete native announcement from the opaque #1004 accepted
     /// state. The local service key must be the accepted current key and the
@@ -253,13 +251,15 @@ impl NativeServiceAnnouncement {
         // signer must be *one of* the accepted current response keys, not
         // positionally `first()`. An overlap-rotating identity publishes several
         // usable keys at once; a service holding any of them is authorized.
+        let derived_ml_dsa65 = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(
+            &hyprstream_rpc::node_identity::derive_mesh_mldsa_key(signer),
+        );
         anyhow::ensure!(
-            state
-                .current
-                .subject_keys
-                .iter()
-                .any(|key| key.ed25519_pub.as_slice() == signer.verifying_key().as_bytes()),
-            "service signer is not one of the accepted current response keys"
+            state.current.subject_keys.iter().any(|key| {
+                key.ed25519_pub.as_slice() == signer.verifying_key().as_bytes()
+                    && key.mldsa65_pub == derived_ml_dsa65
+            }),
+            "service signer is not an accepted current hybrid response key"
         );
         let expires_at = state.expires_at.as_deref().ok_or_else(|| {
             anyhow::anyhow!("genesis-only accepted state has no bounded production expiry")
@@ -1628,7 +1628,7 @@ mod tests {
         let endpoint = ServiceEndpoint::new(Transport::Iroh, "iroh://reach").unwrap();
         let service = ServiceEntry::new("#model", ServiceType::NinePExport, endpoint).unwrap();
         // k1 FIRST, k2 second; self-certify with k1.
-        let body = CapsuleBody::new(vec![kp1, kp2], vec![service]).unwrap();
+        let body = CapsuleBody::new(vec![kp1.clone(), kp2], vec![service.clone()]).unwrap();
         let genesis = sign_capsule(body, &k1, &pq1).unwrap();
         let bytes = genesis.to_dag_cbor().unwrap();
         let cid = genesis.cid512().unwrap();
@@ -1652,7 +1652,7 @@ mod tests {
              the genesis expiry gate; got: {msg}"
         );
         assert!(
-            !msg.contains("not one of the accepted current response keys"),
+            !msg.contains("not an accepted current hybrid response key"),
             "the second published subject key must be accepted as a member; got: {msg}"
         );
 
@@ -1664,9 +1664,31 @@ mod tests {
         };
         assert!(
             err.to_string()
-                .contains("not one of the accepted current response keys"),
+                .contains("not an accepted current hybrid response key"),
             "unexpected error: {err}"
         );
+
+        // The accepted pair must contain the exact derived ML-DSA half too;
+        // matching Ed25519 alone would advertise a proof that cannot answer
+        // the hybrid admission challenge.
+        let mismatched = HybridKeyPair::new(
+            k2.verifying_key().to_bytes().to_vec(),
+            ml_dsa_sk_to_vk_bytes(&pq1),
+        )
+        .unwrap();
+        let body = CapsuleBody::new(vec![kp1, mismatched], vec![service]).unwrap();
+        let genesis = sign_capsule(body, &k1, &pq1).unwrap();
+        let bytes = genesis.to_dag_cbor().unwrap();
+        let cid = genesis.cid512().unwrap();
+        let mismatched_state = AcceptedAt9pState::from_verified_genesis(
+            &verify_genesis_capsule(&cid, &bytes).unwrap(),
+        )
+        .unwrap();
+        let err = match NativeServiceAnnouncement::from_accepted_state("model", &signer2, &mismatched_state) {
+            Ok(_) => panic!("mismatched accepted PQ half must reject before projection"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("accepted current hybrid response key"), "unexpected error: {err}");
     }
 
     #[test]

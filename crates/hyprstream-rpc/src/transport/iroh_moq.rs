@@ -38,9 +38,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use web_transport_iroh::Session;
 
-use crate::moq_authz::{
-    PeerIdentity, SharedSubscribeAuthorizer, SubscribeDecision, tenant_scoped_consumer,
-};
+use crate::moq_authz::{PeerIdentity, SharedSubscribeAuthorizer, SubscribeDecision, tenant_prefix};
 use crate::transport::moql_admission::MoqlAdmissionAuthenticator;
 
 /// Resolves the tenant for an independently authenticated application peer.
@@ -342,28 +340,8 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
             Some(a) => Some(a.tenant.clone()),
             None => self.inner.authz.tenant_for(&peer),
         };
-        let publish_consumer = match resolved_tenant {
-            Some(tenant) => {
-                // `scope` returns None when the tenant prefix is outside the
-                // origin's allowed prefixes — serve that peer nothing rather
-                // than falling back to the unscoped consumer (fail-closed for
-                // cross-tenant enumeration).
-                match tenant_scoped_consumer(&self.inner.origin.consumer, &tenant) {
-                    Some(scoped) => {
-                        tracing::debug!(peer = %peer.subject.as_deref().unwrap_or("?"), %tenant, "iroh-moq: tenant-scoped consumer");
-                        scoped
-                    }
-                    None => {
-                        tracing::debug!(%tenant, "iroh-moq: tenant has no visible broadcasts; serving empty scope");
-                        // An empty scope: a fresh consumer cursor over a prefix
-                        // with no broadcasts. Re-scope to a sentinel under the
-                        // tenant so the peer sees nothing it isn't entitled to.
-                        // Falling through to a clone would leak cross-tenant
-                        // names, so we instead drop the session.
-                        return Ok(());
-                    }
-                }
-            }
+        let tenant = match resolved_tenant {
+            Some(tenant) => tenant,
             None => {
                 tracing::warn!("iroh-moq: authenticated peer has no tenant scope; refusing");
                 conn.close(0u32.into(), b"tenant scope required");
@@ -371,13 +349,20 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
             }
         };
 
+        // A relay must receive an Origin, not merely a consumer: otherwise a
+        // producer's `with_origin` announcements are dropped at this Iroh hop.
+        // Scope the writable origin to the admission-derived tenant first, so
+        // bidirectional ingestion cannot cross tenant boundaries.
+        let prefix = tenant_prefix(&tenant);
+        let path = moq_net::Path::new(&prefix);
+        let Some(scoped_origin) = self.inner.origin.producer.scope(&[path]) else {
+            tracing::debug!(%tenant, "iroh-moq: tenant has no visible relay scope");
+            return Ok(());
+        };
         let session_conn = conn.clone();
         let session = Session::raw(conn);
         let server = Server::new()
-            .with_publish(publish_consumer)
-            // Subscribe slot is None for v1 — we only serve broadcasts;
-            // accepting remote announces (cross-instance fan-out) lands
-            // in Phase 3 part N (#142).
+            .with_origin(scoped_origin)
             .with_stats(self.inner.stats.clone());
         let moq_session = server
             .accept(session)
@@ -550,6 +535,76 @@ mod tests {
 
         client.shutdown().await?;
         server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A real mutually admitted Iroh session ingests a producer origin at the
+    /// relay and re-serves relay broadcasts on the same tenant-scoped link.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authenticated_iroh_origin_ingests_and_serves_tenant_scope() -> anyhow::Result<()> {
+        use crate::crypto::pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes};
+        use crate::stream_info::MoqlServerIdentity;
+        use crate::transport::moql_admission::{AcceptedIdentityState, AcceptedSubjectKey, MoqlAdmissionProof, MoqlServerIdentityProof, prove_moql_admission};
+
+        let server_ed = SigningKey::from_bytes(&[0x71; 32]);
+        let server_pq = ml_dsa_sk_from_seed(&[0x72; 32]);
+        let client_ed = SigningKey::from_bytes(&[0x73; 32]);
+        let client_pq = ml_dsa_sk_from_seed(&[0x74; 32]);
+        let expiry = crate::envelope::current_timestamp() + 60_000;
+        let server_identity = MoqlServerIdentity {
+            did: "did:at9p:relay".to_owned(), epoch: 1, head_digest: vec![0x75; 64],
+            expires_at_unix_ms: expiry, ed25519: server_ed.verifying_key().to_bytes(),
+            ml_dsa65: ml_dsa_sk_to_vk_bytes(&server_pq),
+        };
+        let server_state = AcceptedIdentityState {
+            epoch: 1, head_digest: [0x75; 64], expires_at_unix_ms: Some(expiry),
+            subject_keys: vec![AcceptedSubjectKey { ed25519: server_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&server_pq) }],
+        };
+        let client_state = AcceptedIdentityState {
+            epoch: 1, head_digest: [0x76; 64], expires_at_unix_ms: Some(expiry),
+            subject_keys: vec![AcceptedSubjectKey { ed25519: client_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&client_pq) }],
+        };
+        let authority: Arc<dyn crate::transport::moql_admission::AcceptedStateAuthority> = Arc::new(move |did: &str| match did {
+            "did:at9p:relay" => Some(server_state.clone()),
+            "did:at9p:producer" => Some(client_state.clone()),
+            _ => None,
+        });
+        let admission = Arc::new(crate::transport::moql_admission::MoqlAdmissionAuthenticator::new(
+            authority,
+            Arc::new(|peer| (peer.subject.as_deref() == Some("did:at9p:producer")).then(|| "alice".to_owned())),
+        ).with_server_identity(MoqlServerIdentityProof {
+            identity: server_identity.clone(), ed25519: server_ed, ml_dsa_65: server_pq,
+        }));
+        let handler = IrohMoqProtocolHandler::new().with_authz(MoqAuthzConfig::default().with_admission(admission));
+        let relay_consumer = handler.origin_consumer().clone();
+        let relay_producer = handler.origin_producer().clone();
+        let relay = IrohSubstrate::new_test(fresh_key(), handler, NoopHandler::new("rpc-not-wired")).await?;
+        let client = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("client-moq"), NoopHandler::new("client-rpc")).await?;
+        let conn = client.connect(direct_addr(&relay), ALPN_MOQ_LITE).await?;
+        prove_moql_admission(&conn, &MoqlAdmissionProof {
+            did: "did:at9p:producer".to_owned(), ed25519: client_ed, ml_dsa_65: client_pq,
+            expected_server: server_identity,
+        }, std::time::Duration::from_secs(2)).await?;
+        let client_origin: OriginProducer = Origin::random().produce();
+        let client_consumer = client_origin.consume();
+        let session = Client::new().with_origin(client_origin.clone()).connect(Session::raw(conn)).await?;
+
+        let mut client_broadcast = client_origin.create_broadcast("alice/from-client").ok_or_else(|| anyhow::anyhow!("create client broadcast"))?;
+        let mut client_track = client_broadcast.create_track(Track::new("tokens"))?;
+        let mut client_group = client_track.create_group(Group::from(0u64))?;
+        client_group.write_frame(Bytes::from_static(b"up"))?;
+        drop(client_group);
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay_consumer.announced_broadcast("alice/from-client")).await?.ok_or_else(|| anyhow::anyhow!("relay did not ingest authenticated origin"))?;
+
+        let mut relay_broadcast = relay_producer.create_broadcast("alice/from-relay").ok_or_else(|| anyhow::anyhow!("create relay broadcast"))?;
+        let mut relay_track = relay_broadcast.create_track(Track::new("tokens"))?;
+        let mut relay_group = relay_track.create_group(Group::from(0u64))?;
+        relay_group.write_frame(Bytes::from_static(b"down"))?;
+        drop(relay_group);
+        tokio::time::timeout(std::time::Duration::from_secs(2), client_consumer.announced_broadcast("alice/from-relay")).await?.ok_or_else(|| anyhow::anyhow!("client did not consume relay origin"))?;
+        drop(session);
+        client.shutdown().await?;
+        relay.shutdown().await?;
         Ok(())
     }
 

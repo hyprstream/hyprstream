@@ -29,7 +29,7 @@ use rand::RngCore;
 
 use hyprstream_rpc::moq_stream::{
     connect_moq_reach_for_qos, run_relay_announce_link, MoqStreamOrigin, ProducerReachConfig,
-    RelayChoice, NodeStreamReach, STREAM_TRACK,
+    RelayChoice, RelayTarget, NodeStreamReach, STREAM_TRACK,
 };
 use hyprstream_rpc::stream_info::{
     Destination, QuicReach, Role, StreamOpt, TransportConfig as ReachTransport,
@@ -297,7 +297,17 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
         )),
         "the iroh-direct reach must be built from ProducerReachConfig.iroh_node_id: {default_reach:?}"
     );
-    let only_reach = server_cfg.reach_with_relay(RelayChoice::Only(relay_reach.clone()));
+    let only_reach = server_cfg.reach_with_relay(RelayChoice::Only(RelayTarget::new(
+        relay_reach.clone(),
+        hyprstream_rpc::stream_info::MoqlServerIdentity {
+            did: "did:at9p:test-relay".to_owned(),
+            epoch: 1,
+            head_digest: vec![0x42; 64],
+            expires_at_unix_ms: hyprstream_rpc::envelope::current_timestamp() + 60_000,
+            ed25519: [0x42; 32],
+            ml_dsa65: vec![0x42; 1952],
+        },
+    )));
     assert!(
         only_reach.iter().all(|d| d.role == Role::Relay),
         "RelayChoice::Only must omit ALL direct reaches (anonymized): {only_reach:?}"
