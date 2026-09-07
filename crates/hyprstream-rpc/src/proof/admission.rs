@@ -20,8 +20,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
-use anyhow::{bail, Result};
-use sha2::{Digest, Sha256};
+use anyhow::Result;
 
 use super::{ProofDisposition, RequestId};
 
@@ -109,7 +108,7 @@ impl<K: std::hash::Hash + Eq + Clone> ExpiryMap<K> {
 /// The replay admission key: (signer namespace thumbprint, request_id).
 ///
 /// The thumbprint is the credential-bound primary signer-suite thumbprint for
-/// authenticated proofs and the (plan, key set) thumbprint for unattributed
+/// authenticated proofs and the content-bound key-set thumbprint for unattributed
 /// ones. It is produced by verification, never taken from the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProofReplayKey {
@@ -370,52 +369,10 @@ pub fn global_challenge_manager() -> Option<&'static super::challenge::Challenge
 // Helper: compute unattributed replay thumbprint from proof
 // ---------------------------------------------------------------------------
 
-/// Compute the SHA-256 thumbprint of the canonical (plan, key_set) tuple
-/// for unattributed proof replay keying.
+/// Compute the frozen CDDL §7.1 content-bound unattributed replay namespace.
+/// This bounded structural helper does not verify signatures or grant admission.
 pub fn unattributed_thumbprint(protected_bytes: &[u8]) -> Result<[u8; 32]> {
-    let protected: ciborium::Value =
-        ciborium::de::from_reader(&mut std::io::Cursor::new(protected_bytes))
-            .map_err(|e| anyhow::anyhow!("protected header decode: {e}"))?;
-
-    let map = match &protected {
-        ciborium::Value::Map(m) => m,
-        _ => bail!("protected header not a map"),
-    };
-
-    let plan_val = map
-        .iter()
-        .find(|(k, _)| {
-            matches!(k,
-                ciborium::Value::Integer(i)
-                if i128::from(*i) == super::HEADER_HS_SIGNATURE_PLAN as i128
-            )
-        })
-        .map(|(_, v)| v)
-        .ok_or_else(|| anyhow::anyhow!("no hs_signature_plan"))?;
-
-    let key_set_val = map
-        .iter()
-        .find(|(k, _)| {
-            matches!(k,
-                ciborium::Value::Integer(i)
-                if i128::from(*i) == super::HEADER_HS_UNATTRIBUTED_KEY_SET as i128
-            )
-        })
-        .map(|(_, v)| v)
-        .ok_or_else(|| anyhow::anyhow!("no hs_unattributed_key_set"))?;
-
-    let tuple = ciborium::Value::Array(vec![plan_val.clone(), key_set_val.clone()]);
-    let mut tuple_bytes = Vec::new();
-    ciborium::ser::into_writer(&tuple, &mut tuple_bytes)
-        .map_err(|e| anyhow::anyhow!("tuple encode: {e}"))?;
-
-    let mut hasher = Sha256::new();
-    hasher.update(b"hs-proof-key-set-replay-v1");
-    hasher.update(&tuple_bytes);
-    let result = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
-    Ok(out)
+    super::thumbprint::unattributed(protected_bytes)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

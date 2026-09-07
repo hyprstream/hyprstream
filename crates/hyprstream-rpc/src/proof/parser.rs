@@ -261,75 +261,14 @@ impl ParsedProof {
         })
     }
 
-    /// Compute the SHA-256 replay namespace thumbprint for an unattributed
-    /// proof: SHA-256 of the canonical encoding of `(signature_plan,
-    /// unattributed_key_set)` under the proof-key-set domain separator.
-    ///
-    /// Returns `None` for authenticated proofs — the authenticated thumbprint
-    /// requires the credential-bound primary signer-suite record (suite ID,
-    /// ordered public component keys, enrollment epoch) resolved by the
-    /// verifier from the credential `cnf`, which is outside the parser's
-    /// scope.
-    /// Compute the SHA-256 replay namespace thumbprint for an unattributed
-    /// proof: SHA-256 of the canonical encoding of `(signature_plan,
-    /// unattributed_key_set)` under the proof-key-set domain separator.
-    ///
-    /// The frozen profile specifies the exact tuple, not a superset hash of
-    /// the protected headers. We extract the two values from the protected
-    /// header CBOR and serialize them as a canonical CBOR array for hashing.
-    ///
-    /// Returns `None` for authenticated proofs — the authenticated thumbprint
-    /// requires the credential-bound primary signer-suite record resolved by
-    /// the verifier from the credential `cnf`, which is outside the parser's
-    /// scope.
+    /// Frozen CDDL §7.1 content-bound replay namespace. Labels and plan order
+    /// do not create fresh namespaces. Authenticated proofs instead use their
+    /// credential-resolved primary enrollment record.
     pub fn unattributed_replay_thumbprint(&self) -> Option<[u8; 32]> {
         if self.disposition != ProofDisposition::Unattributed {
             return None;
         }
-
-        // Re-decode the protected header to extract the exact plan and
-        // key_set values.
-        let protected: CborValue =
-            ciborium::de::from_reader(&mut std::io::Cursor::new(&self.protected_bytes)).ok()?;
-        let pmap = match &protected {
-            CborValue::Map(m) => m,
-            _ => return None,
-        };
-
-        let plan_val = pmap
-            .iter()
-            .find(|(k, _)| {
-                matches!(k,
-                    CborValue::Integer(i)
-                    if i128::from(*i) == HEADER_HS_SIGNATURE_PLAN as i128
-                )
-            })
-            .map(|(_, v)| v)?;
-        let key_set_val = pmap
-            .iter()
-            .find(|(k, _)| {
-                matches!(k,
-                    CborValue::Integer(i)
-                    if i128::from(*i) == HEADER_HS_UNATTRIBUTED_KEY_SET as i128
-                )
-            })
-            .map(|(_, v)| v)?;
-
-        // Serialize the canonical tuple [plan, key_set] for hashing.
-        let tuple = CborValue::Array(vec![plan_val.clone(), key_set_val.clone()]);
-        let mut tuple_bytes = Vec::new();
-        if ciborium::ser::into_writer(&tuple, &mut tuple_bytes).is_err() {
-            return None;
-        }
-
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"hs-proof-key-set-replay-v1");
-        hasher.update(&tuple_bytes);
-        let result = hasher.finalize();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&result);
-        Some(out)
+        super::admission::unattributed_thumbprint(&self.protected_bytes).ok()
     }
 }
 
@@ -473,7 +412,7 @@ fn validate_signatures_against_plan(
 /// by kid, algorithm, key type, and curve/parameters, in the plan's component
 /// order. Private key material is forbidden. A malformed, unknown, duplicate,
 /// surplus, reordered, or mismatched key denies the complete proof (finding 3).
-fn validate_unattributed_key_set(ks_val: &CborValue, plan: &SignaturePlan) -> Result<()> {
+pub(super) fn validate_unattributed_key_set(ks_val: &CborValue, plan: &SignaturePlan) -> Result<()> {
     let arr = match ks_val {
         CborValue::Array(a) => a,
         _ => bail!("proof: hs_unattributed_key_set must be array"),

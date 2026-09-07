@@ -33,6 +33,7 @@ pub mod plan;
 pub mod policy;
 pub mod response;
 pub mod verify;
+mod thumbprint;
 
 #[cfg(test)]
 mod tests;

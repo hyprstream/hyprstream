@@ -26,12 +26,8 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use anyhow::{bail, Result};
-use sha2::{Digest, Sha256};
 
 use super::{ALG_ED25519, ALG_ML_DSA_65};
-
-/// Domain separator for the authenticated-proof replay namespace thumbprint.
-const AUTHENTICATED_THUMBPRINT_DOMAIN: &[u8] = b"hs-proof-authenticated-replay-v1";
 
 // ---------------------------------------------------------------------------
 // Pinned component keys
@@ -208,19 +204,8 @@ impl SignerSuiteRecord {
     /// Approver groups are deliberately excluded, so every allowed approver
     /// subset for the same primary-signed request stays in one namespace.
     pub fn replay_thumbprint(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(AUTHENTICATED_THUMBPRINT_DOMAIN);
-        hasher.update((self.suite_id.len() as u64).to_be_bytes());
-        hasher.update(self.suite_id.as_bytes());
-        hasher.update((self.components.len() as u64).to_be_bytes());
-        for c in &self.components {
-            let encoded = c.key.encoded();
-            hasher.update(c.alg.to_be_bytes());
-            hasher.update((encoded.len() as u64).to_be_bytes());
-            hasher.update(&encoded);
-        }
-        hasher.update(self.epoch.to_be_bytes());
-        hasher.finalize().into()
+        let keys = self.components.iter().map(|c| c.key.encoded()).collect::<Vec<_>>();
+        super::thumbprint::authenticated(&self.suite_id, &keys, self.epoch)
     }
 }
 
