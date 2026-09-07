@@ -148,12 +148,12 @@ impl hyprstream_rpc::auth::mac::MacDispatchPep for ProductionDispatchPep {
         &self,
         ctx: &hyprstream_rpc::service::EnvelopeContext,
         service_domain: &str,
-        method: Option<u16>,
+        method: Option<&[u16]>,
     ) -> hyprstream_rpc::auth::mac::MacDecision {
         let is_local_policy_control_plane = service_domain == "policy"
             && matches!(
                 method,
-                Some(
+                Some([
                     policy_methods::GET_POLICY
                         | policy_methods::APPLY_TEMPLATE
                         | policy_methods::APPLY_DRAFT
@@ -163,7 +163,7 @@ impl hyprstream_rpc::auth::mac::MacDispatchPep for ProductionDispatchPep {
                         | policy_methods::GET_DRAFT_STATUS
                         | policy_methods::ADD_GROUPING
                         | policy_methods::REMOVE_GROUPING
-                )
+                ])
             );
         if is_local_policy_control_plane {
             if !(ctx.jwt_token().is_none()
@@ -208,7 +208,7 @@ pub(crate) fn install_explicit_test_dispatch_pep() {
             &self,
             _ctx: &hyprstream_rpc::service::EnvelopeContext,
             _service_domain: &str,
-            _method: Option<u16>,
+            _method: Option<&[u16]>,
         ) -> hyprstream_rpc::auth::mac::MacDecision {
             hyprstream_rpc::auth::mac::MacDecision::Permit
         }
@@ -248,24 +248,24 @@ mod production_dispatch_tests {
         );
 
         assert_eq!(
-            pep.check(&policy, "policy", Some(policy_methods::APPLY_TEMPLATE)),
+            pep.check(&policy, "policy", Some(&[policy_methods::APPLY_TEMPLATE])),
             MacDecision::Permit,
         );
         assert_eq!(
-            no_activation.check(&policy, "policy", Some(policy_methods::APPLY_TEMPLATE)),
+            no_activation.check(&policy, "policy", Some(&[policy_methods::APPLY_TEMPLATE])),
             MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::NoClearance),
             "the production wrapper must supply the explicit verified bootstrap context",
         );
         assert_eq!(
-            pep.check(&registry, "policy", Some(policy_methods::APPLY_TEMPLATE)),
+            pep.check(&registry, "policy", Some(&[policy_methods::APPLY_TEMPLATE])),
             MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::NoClearance),
         );
         assert_eq!(
-            pep.check(&policy, "policy", Some(17)),
+            pep.check(&policy, "policy", Some(&[17])),
             MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject),
         );
         assert_eq!(
-            pep.check(&policy, "policy", Some(0)),
+            pep.check(&policy, "policy", Some(&[0])),
             MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject),
             "policy check must not report the root authority's access as another user's result",
         );

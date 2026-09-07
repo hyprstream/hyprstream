@@ -204,12 +204,14 @@ impl DeclaredDispatchTable {
     pub fn resolve_row(
         &self,
         service_domain: &str,
-        method: Option<u16>,
+        method: Option<&[u16]>,
     ) -> Option<&DispatchMethodPolicy> {
-        let method = method?;
+        // Existing declarations name top-level leaves only. A nested path must
+        // not inherit the row of either its first or last discriminant.
+        let [method] = method? else { return None; };
         self.methods
             .iter()
-            .find(|row| row.id.service == service_domain && row.id.method == method)
+            .find(|row| row.id.service == service_domain && row.id.method == *method)
     }
 
     /// The deliberate clearance declared for a service caller, if any.
@@ -230,7 +232,7 @@ impl RpcObjectLabelResolver for DeclaredDispatchTable {
     /// Typed dispatch-plane resolution. No path splitting, no prefix
     /// matching, no VFS adapter: an exact declared `(service, leaf)` row or
     /// `None` (deny).
-    fn resolve(&self, service_domain: &str, method: Option<u16>) -> Option<SecurityLabel> {
+    fn resolve(&self, service_domain: &str, method: Option<&[u16]>) -> Option<SecurityLabel> {
         self.resolve_row(service_domain, method)
             .map(|row| row.label)
     }
@@ -305,7 +307,7 @@ impl DeclaredDispatchPep {
         &self,
         ctx: &EnvelopeContext,
         service_domain: &str,
-        method: Option<u16>,
+        method: Option<&[u16]>,
         selected: SecurityContext,
     ) -> MacDecision {
         hyprstream_rpc::auth::mac::remember_verified_subject(ctx);
@@ -316,7 +318,7 @@ impl DeclaredDispatchPep {
         &self,
         ctx: &EnvelopeContext,
         service_domain: &str,
-        method: Option<u16>,
+        method: Option<&[u16]>,
         selected: SecurityContext,
     ) -> MacDecision {
         let Some(service_name) = declared_service_subject(ctx) else {
@@ -361,7 +363,7 @@ impl MacDispatchPep for DeclaredDispatchPep {
         &self,
         ctx: &EnvelopeContext,
         service_domain: &str,
-        method: Option<u16>,
+        method: Option<&[u16]>,
     ) -> MacDecision {
         // Preserve the verified context for the direct VFS/CAS/MoQ PEPs, whose
         // low-level APIs carry Subject but not the full verified envelope.
@@ -573,7 +575,7 @@ mod tests {
         assert_eq!(table.methods().len(), expected.len());
         for (method, name) in expected {
             let row = table
-                .resolve_row("policy", Some(*method))
+                .resolve_row("policy", Some(&[*method]))
                 .unwrap_or_else(|| panic!("declared row for policy.{name} must resolve"));
             assert_eq!(row.method_name, *name);
             assert_eq!(row.id.service, "policy");
@@ -652,14 +654,14 @@ mod tests {
 
         // Unknown service, even with a declared method number.
         assert!(table
-            .resolve_row("ghost", Some(policy_methods::REGISTER_SERVICE_KEY))
+            .resolve_row("ghost", Some(&[policy_methods::REGISTER_SERVICE_KEY]))
             .is_none());
         // Unknown leaf on a known service: resolveServiceKey (17) is a real
         // policy method but NOT declared — declaration, not schema, is the
         // authority.
-        assert!(table.resolve_row("policy", Some(17)).is_none());
+        assert!(table.resolve_row("policy", Some(&[17])).is_none());
         // Out-of-schema leaf on a known service.
-        assert!(table.resolve_row("policy", Some(u16::MAX)).is_none());
+        assert!(table.resolve_row("policy", Some(&[u16::MAX])).is_none());
         // No committed method identity (a payload without a canonical
         // discriminant) matches no declared row, even on a known service.
         assert!(table.resolve_row("policy", None).is_none());
@@ -667,17 +669,17 @@ mod tests {
         for alias in ["/srv/policy", "srv/policy", "/policy", "policy/", "/"] {
             assert!(
                 table
-                    .resolve_row(alias, Some(policy_methods::REGISTER_SERVICE_KEY))
+                    .resolve_row(alias, Some(&[policy_methods::REGISTER_SERVICE_KEY]))
                     .is_none(),
                 "VFS-shaped alias {alias:?} must not resolve"
             );
         }
         // Case and whitespace variants are not canonical names.
         assert!(table
-            .resolve_row("Policy", Some(policy_methods::REGISTER_SERVICE_KEY))
+            .resolve_row("Policy", Some(&[policy_methods::REGISTER_SERVICE_KEY]))
             .is_none());
         assert!(table
-            .resolve_row(" policy", Some(policy_methods::REGISTER_SERVICE_KEY))
+            .resolve_row(" policy", Some(&[policy_methods::REGISTER_SERVICE_KEY]))
             .is_none());
         // Undeclared service clearance.
         assert!(table.service_clearance("ghost").is_none());
@@ -686,11 +688,11 @@ mod tests {
         // The RpcObjectLabelResolver view agrees (None ⇒ deny).
         let resolver: &dyn RpcObjectLabelResolver = table;
         assert!(resolver
-            .resolve("policy", Some(policy_methods::REGISTER_SERVICE_KEY))
+            .resolve("policy", Some(&[policy_methods::REGISTER_SERVICE_KEY]))
             .is_some());
-        assert!(resolver.resolve("policy", Some(17)).is_none());
+        assert!(resolver.resolve("policy", Some(&[17])).is_none());
         assert!(resolver
-            .resolve("/srv/policy", Some(policy_methods::REGISTER_SERVICE_KEY))
+            .resolve("/srv/policy", Some(&[policy_methods::REGISTER_SERVICE_KEY]))
             .is_none());
     }
 
@@ -705,7 +707,7 @@ mod tests {
         let declared = pep.check(
             &caller,
             "policy",
-            Some(policy_methods::REGISTER_SERVICE_KEY),
+            Some(&[policy_methods::REGISTER_SERVICE_KEY]),
         );
         assert_eq!(
             declared,
@@ -714,7 +716,7 @@ mod tests {
         );
 
         // Causal twin: identical caller, identical service, undeclared leaf.
-        let undeclared = pep.check(&caller, "policy", Some(17));
+        let undeclared = pep.check(&caller, "policy", Some(&[17]));
         assert_eq!(
             undeclared,
             MacDecision::Deny(MacDenyReason::UnlabeledObject),
@@ -723,7 +725,7 @@ mod tests {
 
         // Unknown service denies the same way.
         assert_eq!(
-            pep.check(&caller, "ghost", Some(policy_methods::REGISTER_SERVICE_KEY)),
+            pep.check(&caller, "ghost", Some(&[policy_methods::REGISTER_SERVICE_KEY])),
             MacDecision::Deny(MacDenyReason::UnlabeledObject)
         );
 
@@ -733,7 +735,7 @@ mod tests {
             pep.check(
                 &caller,
                 "/srv/policy",
-                Some(policy_methods::REGISTER_SERVICE_KEY)
+                Some(&[policy_methods::REGISTER_SERVICE_KEY])
             ),
             MacDecision::Deny(MacDenyReason::UnlabeledObject)
         );
@@ -754,7 +756,7 @@ mod tests {
         // that is the fabricated-anonymous-clearance hole this slice closes.
         let ghost = service_subject_ctx("ghost", 0x62);
         assert_eq!(
-            pep.check(&ghost, "policy", Some(policy_methods::REGISTER_SERVICE_KEY)),
+            pep.check(&ghost, "policy", Some(&[policy_methods::REGISTER_SERVICE_KEY])),
             MacDecision::Deny(MacDenyReason::NoClearance),
             "undeclared service subject must deny NoClearance"
         );
@@ -762,7 +764,7 @@ mod tests {
         // A non-service (user) identity has no service clearance.
         let user = user_subject_ctx();
         assert_eq!(
-            pep.check(&user, "policy", Some(policy_methods::REGISTER_SERVICE_KEY)),
+            pep.check(&user, "policy", Some(&[policy_methods::REGISTER_SERVICE_KEY])),
             MacDecision::Deny(MacDenyReason::NoClearance)
         );
 
@@ -774,7 +776,7 @@ mod tests {
             pep.check(
                 &callback,
                 "policy",
-                Some(policy_methods::REGISTER_SERVICE_KEY)
+                Some(&[policy_methods::REGISTER_SERVICE_KEY])
             ),
             MacDecision::Deny(MacDenyReason::NoClearance),
             "keyless callback contexts must not claim a service clearance"
@@ -794,7 +796,7 @@ mod tests {
         ] {
             let ctx = service_subject_ctx(service, 0x63);
             assert_eq!(
-                pep.check(&ctx, "policy", Some(policy_methods::REGISTER_SERVICE_KEY)),
+                pep.check(&ctx, "policy", Some(&[policy_methods::REGISTER_SERVICE_KEY])),
                 MacDecision::Permit,
                 "declared service:{service} must permit the declared bootstrap call"
             );
@@ -824,7 +826,7 @@ mod tests {
         let pep = DeclaredDispatchPep::new(&TABLE).with_activation_control();
         let caller = service_subject_ctx("discovery", 0x64);
         assert_eq!(
-            pep.check(&caller, "policy", Some(7)),
+            pep.check(&caller, "policy", Some(&[7])),
             MacDecision::Deny(MacDenyReason::FloorDeny),
             "a label above the declared clearance must FloorDeny"
         );

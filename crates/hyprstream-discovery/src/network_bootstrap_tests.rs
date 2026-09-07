@@ -70,7 +70,7 @@ async fn network_roundtrip() -> Result<()> {
     use hyprstream_rpc::auth::mac::{MacDispatchPep, MacDecision, install_mac_dispatch_pep};
     struct FixturePep;
     impl MacDispatchPep for FixturePep {
-        fn check(&self, _ctx: &EnvelopeContext, service: &str, _method: Option<u16>) -> MacDecision {
+        fn check(&self, _ctx: &EnvelopeContext, service: &str, _method: Option<&[u16]>) -> MacDecision {
             if service == "discovery" { MacDecision::Permit } else { MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject) }
         }
     }
