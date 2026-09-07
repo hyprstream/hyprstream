@@ -3685,7 +3685,7 @@ mod tests {
             crate::config::TokenConfig::default(), policy_git,
             TransportConfig::inproc("at9p-policy"));
         let manager = InprocManager::new();
-        let policy_handle = manager.spawn(Box::new(policy)).await.unwrap();
+        let mut policy_handle = manager.spawn(Box::new(policy)).await.unwrap();
         let policy_client = PolicyClient::for_local_endpoint_bootstrap("inproc://at9p-policy", key.clone(), key.verifying_key(), None).unwrap();
         let store = Arc::new(crate::services::discovery::PdsRecordStore::open(&pds).unwrap()
             .with_at9p_acceptance_identity(key.verifying_key()));
@@ -3759,8 +3759,17 @@ mod tests {
             did, kind: At9pCandidateKind::Successor,
             record_bytes: after_terminal.to_dag_cbor().unwrap(),
         }).await.is_err());
-        let _ = handle.stop().await;
-        drop(policy_handle);
+        handle.stop().await.unwrap();
+        assert!(!handle.is_running());
+        drop(resolver);
+        // The client may retain the processor; stop must still destroy the
+        // service's publisher/ingest and release its RocksDB ownership first.
+        assert_eq!(Arc::strong_count(&store), 1, "stopped Registry retained its DB");
+        drop(store);
+        let reopened = crate::services::discovery::PdsRecordStore::open(&pds).unwrap();
+        drop(reopened);
+        policy_handle.stop().await.unwrap();
+        assert!(!policy_handle.is_running());
     }
 
     // ── #432 getBlob authz: the hash is NOT a capability ──────────────────────

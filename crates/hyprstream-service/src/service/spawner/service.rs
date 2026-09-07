@@ -179,8 +179,10 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
             let bridge = hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
                 service, Arc::clone(&nonce_cache), 0,
             ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("bridge: {e}")))?;
-            let processor: Arc<dyn IrohRequestProcessor> = Arc::new(bridge);
+            let bridge = Arc::new(bridge);
+            let processor: Arc<dyn IrohRequestProcessor> = bridge.clone();
 
+            let result = async {
             if let Some(mut qc) = quic_config {
                 let announcement_cancellation = qc.announcement_cancellation.clone();
                 let _announcement_guard = announcement_cancellation.clone().drop_guard();
@@ -546,6 +548,9 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     &transport, processor, signing_key, shutdown, on_ready,
                 ).await.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
             }
+            }.await;
+            bridge.shutdown().await;
+            result
         })
     }
 }

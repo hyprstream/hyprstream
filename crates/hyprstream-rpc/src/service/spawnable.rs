@@ -83,11 +83,14 @@ impl<S: RequestService + Send + Sync> Spawnable for S {
             let nonce_cache = Arc::new(crate::envelope::InMemoryNonceCache::new());
             let bridge = crate::transport::iroh_rpc::LocalServiceBridge::spawn(*self, nonce_cache, 0)
                 .map_err(|e| RpcError::SpawnFailed(format!("bridge: {e}")))?;
+            let bridge = Arc::new(bridge);
             let processor: Arc<dyn crate::transport::rpc_session::IrohRequestProcessor> =
-                Arc::new(bridge);
-            crate::service::serve::serve_bridged(&transport, processor, signing_key, shutdown, on_ready)
+                bridge.clone();
+            let result = crate::service::serve::serve_bridged(&transport, processor, signing_key, shutdown, on_ready)
                 .await
-                .map_err(|e| RpcError::SpawnFailed(e.to_string()))
+                .map_err(|e| RpcError::SpawnFailed(e.to_string()));
+            bridge.shutdown().await;
+            result
         })
     }
 }

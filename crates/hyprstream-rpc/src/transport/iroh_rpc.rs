@@ -312,11 +312,55 @@ async fn run_bridge_dispatch_loop<S>(
 /// [`IrohRpcProtocolHandler`] holding this bridge is shut down via
 /// `Router::shutdown` (each in-flight handler task holds a semaphore permit;
 /// the handler's drain waits for all permits to return, which only happens
-/// once the bridge has produced each response). After that, dropping the
-/// last `Arc<LocalServiceBridge>` closes the mpsc Sender, the bridge thread
-/// exits its receive loop, and `LocalSet::block_on` returns.
+/// once the bridge has produced each response). After that, the
+/// service owner calls `shutdown().await` to cancel remaining local work and
+/// join the bridge thread, including service/runtime destructors. Final-handle
+/// drop provides synchronous cleanup if the owner did not explicitly close it.
+/// A drop originating on the bridge thread signals cancellation without self-join.
 pub struct LocalServiceBridge {
     tx: tokio::sync::mpsc::Sender<BridgeMessage>,
+    shutdown: CancellationToken,
+    thread: Arc<BridgeThread>,
+}
+
+/// Join ownership survives cancellation of an async shutdown waiter.
+struct BridgeThread {
+    id: std::thread::ThreadId,
+    handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    completed: parking_lot::Mutex<bool>,
+    completion: parking_lot::Condvar,
+}
+
+impl BridgeThread {
+    fn new(handle: std::thread::JoinHandle<()>) -> Self {
+        Self {
+            id: handle.thread().id(),
+            handle: parking_lot::Mutex::new(Some(handle)),
+            completed: parking_lot::Mutex::new(false),
+            completion: parking_lot::Condvar::new(),
+        }
+    }
+
+    fn join(&self) {
+        if self.id == std::thread::current().id() {
+            // Self-owned shutdown only requests cancellation; never self-join.
+            return;
+        }
+        let handle = self.handle.lock().take();
+        if let Some(handle) = handle {
+            // No lock needed by any caller or service destructor is held here.
+            if handle.join().is_err() {
+                tracing::error!("bridge thread panicked");
+            }
+            *self.completed.lock() = true;
+            self.completion.notify_all();
+        } else {
+            let mut completed = self.completed.lock();
+            while !*completed {
+                self.completion.wait(&mut completed);
+            }
+        }
+    }
 }
 
 impl crate::transport::rpc_session::sealed::Sealed for LocalServiceBridge {
@@ -347,7 +391,9 @@ impl LocalServiceBridge {
         let (tx, rx) = tokio::sync::mpsc::channel::<BridgeMessage>(cap);
         let service_name = service.name().to_owned();
 
-        std::thread::Builder::new()
+        let shutdown = CancellationToken::new();
+        let stopped = shutdown.clone();
+        let thread = std::thread::Builder::new()
             .name(format!("iroh-rpc-bridge:{service_name}"))
             .spawn(move || {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -360,17 +406,26 @@ impl LocalServiceBridge {
                         return;
                     }
                 };
-                let local = tokio::task::LocalSet::new();
+                let mut local = tokio::task::LocalSet::new();
                 local.spawn_local(run_bridge_dispatch_loop(
                     std::rc::Rc::new(service),
                     rx,
                     nonce_cache,
                 ));
-                rt.block_on(local);
+                rt.block_on(async move {
+                    tokio::select! {
+                        biased;
+                        _ = stopped.cancelled() => {}
+                        _ = &mut local => {}
+                    }
+                    // Destroy local tasks/services with their runtime still entered.
+                    drop(local);
+                });
+                drop(rt);
             })
             .map_err(|e| anyhow::anyhow!("spawn iroh-rpc bridge thread: {e}"))?;
 
-        Ok(Self { tx })
+        Ok(Self { tx, shutdown, thread: Arc::new(BridgeThread::new(thread)) })
     }
 
     /// Like [`LocalServiceBridge::spawn`], but constructs the service ON the
@@ -400,7 +455,9 @@ impl LocalServiceBridge {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<()>>();
         let thread_name = thread_name.into();
 
-        std::thread::Builder::new()
+        let shutdown = CancellationToken::new();
+        let stopped = shutdown.clone();
+        let thread = std::thread::Builder::new()
             .name(format!("rpc-bridge:{thread_name}"))
             .spawn(move || {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -413,7 +470,7 @@ impl LocalServiceBridge {
                         return;
                     }
                 };
-                let local = tokio::task::LocalSet::new();
+                let mut local = tokio::task::LocalSet::new();
                 local.spawn_local(async move {
                     // Build on-thread; a failure (e.g. GPU init) is reported via
                     // the readiness channel and the bridge thread exits.
@@ -430,11 +487,45 @@ impl LocalServiceBridge {
                     }
                     run_bridge_dispatch_loop(service, rx, nonce_cache).await;
                 });
-                rt.block_on(local);
+                rt.block_on(async move {
+                    tokio::select! {
+                        biased;
+                        _ = stopped.cancelled() => {}
+                        _ = &mut local => {}
+                    }
+                    // Destroy local tasks/services with their runtime still entered.
+                    drop(local);
+                });
+                drop(rt);
             })
             .map_err(|e| anyhow::anyhow!("spawn rpc bridge thread: {e}"))?;
 
-        Ok((Self { tx }, ready_rx))
+        Ok((Self { tx, shutdown, thread: Arc::new(BridgeThread::new(thread)) }, ready_rx))
+    }
+}
+
+impl LocalServiceBridge {
+    /// End the bridge after transport drain and wait for service/runtime destruction.
+    /// Joining runs off the caller's runtime; no thread lock is held while waiting.
+    /// Concurrent close calls share the same completion barrier.
+    pub async fn shutdown(&self) {
+        self.shutdown.cancel();
+        if self.thread.id == std::thread::current().id() {
+            return;
+        }
+        let thread = Arc::clone(&self.thread);
+        if let Err(error) = tokio::task::spawn_blocking(move || thread.join()).await {
+            tracing::error!(?error, "bridge thread join task failed");
+        }
+    }
+}
+
+impl Drop for LocalServiceBridge {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        // Explicit async shutdown is the service-owner path. Final-handle drop
+        // also owns teardown, including failed or cancelled spawn_with builders.
+        self.thread.join();
     }
 }
 
@@ -497,10 +588,27 @@ mod tests {
         name: String,
         transport: crate::transport::TransportConfig,
         signing_key: SigningKey,
+        drop_probe: Option<BridgeDropProbe>,
     }
+
+    struct BridgeDropProbe {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        completed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for BridgeDropProbe {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv_timeout(Duration::from_secs(5));
+            self.completed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     impl BridgeEcho {
         fn new(signing_key: SigningKey) -> Self {
             Self {
+                drop_probe: None,
                 name: "bridge-echo".to_owned(),
                 transport: crate::transport::TransportConfig::inproc("bridge-echo-unused"),
                 signing_key,
@@ -527,6 +635,131 @@ mod tests {
         fn signing_key(&self) -> SigningKey {
             self.signing_key.clone()
         }
+    }
+
+    #[test]
+    fn bridge_drop_waits_for_service_destructor() -> Result<()> {
+        assert_bridge_destructor_completion(false)
+    }
+
+    #[test]
+    fn bridge_spawn_with_drop_waits_for_service_destructor() -> Result<()> {
+        assert_bridge_destructor_completion(true)
+    }
+
+    fn assert_bridge_destructor_completion(build_on_thread: bool) -> Result<()> {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut service = BridgeEcho::new(fresh_signing_key());
+        service.drop_probe = Some(BridgeDropProbe {
+            entered: entered_tx,
+            release: release_rx,
+            completed: Arc::clone(&completed),
+        });
+        let nonce = Arc::new(crate::envelope::InMemoryNonceCache::new());
+        let bridge = Arc::new(if build_on_thread {
+            let (bridge, ready) = LocalServiceBridge::spawn_with(
+                "destructor-gate", move || async move { Ok(service) }, nonce, 0,
+            )?;
+            ready.blocking_recv()??;
+            bridge
+        } else {
+            LocalServiceBridge::spawn(service, nonce, 0)?
+        });
+        let retained = Arc::clone(&bridge);
+        drop(retained);
+        assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            drop(bridge);
+            let _ = returned_tx.send(completed.load(std::sync::atomic::Ordering::SeqCst));
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5))?;
+        // The destructor is held at a causal gate, not slowed by a sleep.
+        // Teardown must not return while that gate is held.
+        let premature = returned_rx.recv_timeout(Duration::from_millis(100)).ok();
+        release_tx.send(())?;
+        owner.join().map_err(|_| anyhow::anyhow!("bridge owner panicked"))?;
+        assert!(premature.is_none(), "bridge drop returned before service destruction");
+        assert!(returned_rx.recv_timeout(Duration::from_secs(5))?);
+        Ok(())
+    }
+
+    #[test]
+    fn bridge_thread_join_never_joins_itself() -> Result<()> {
+        let (owner_tx, owner_rx) = std::sync::mpsc::channel::<Arc<BridgeThread>>();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            if let Ok(owner) = owner_rx.recv() {
+                owner.join();
+                let _ = returned_tx.send(());
+            }
+        });
+        let owner = Arc::new(BridgeThread::new(worker));
+        owner_tx.send(Arc::clone(&owner))?;
+        returned_rx.recv_timeout(Duration::from_secs(5))?;
+        owner.join();
+        assert!(*owner.completed.lock());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_cancelled_shutdown_waiter_keeps_completion_barrier() -> Result<()> {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut service = BridgeEcho::new(fresh_signing_key());
+        service.drop_probe = Some(BridgeDropProbe {
+            entered: entered_tx, release: release_rx, completed: Arc::clone(&completed),
+        });
+        let bridge = Arc::new(LocalServiceBridge::spawn(
+            service, Arc::new(crate::envelope::InMemoryNonceCache::new()), 0,
+        )?);
+        let owner = Arc::clone(&bridge);
+        let first = tokio::spawn(async move { owner.shutdown().await });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5))).await??;
+        first.abort();
+        let _ = first.await;
+        let premature = tokio::time::timeout(Duration::from_millis(100), bridge.shutdown()).await.is_ok();
+        release_tx.send(())?;
+        tokio::time::timeout(Duration::from_secs(5), bridge.shutdown()).await?;
+        assert!(!premature, "cancelled waiter lost the in-progress thread join");
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_shutdown_cancels_builder_with_retained_handle() -> Result<()> {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Dropped(Arc::clone(&completed));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (bridge, ready) = LocalServiceBridge::spawn_with::<_, _, BridgeEcho>(
+            "pending-builder",
+            move || async move {
+                let _guard = guard;
+                let _ = entered_tx.send(());
+                std::future::pending().await
+            },
+            Arc::new(crate::envelope::InMemoryNonceCache::new()), 0,
+        )?;
+        let bridge = Arc::new(bridge);
+        let retained = Arc::clone(&bridge);
+        tokio::time::timeout(Duration::from_secs(5), entered_rx).await??;
+        tokio::time::timeout(Duration::from_secs(5), bridge.shutdown()).await?;
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(ready.await.is_err());
+        assert!(retained.process(Bytes::new(),
+            crate::transport::carrier::CarrierContext::iroh()).await.is_err());
+        // Completion is idempotent while another owner still retains the bridge.
+        bridge.shutdown().await;
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
