@@ -74,10 +74,6 @@ pub struct ServerState {
     /// Contains trusted issuers (empty if none configured).
     pub federation_resolver: Arc<crate::auth::FederationKeyResolver>,
 
-    /// Shared JTI blocklist for access token revocation (RFC 7009).
-    /// Populated by the OAuth revocation endpoint; checked on every request.
-    pub jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
-
     /// Per-request DPoP JTI dedup cache (RFC 9449 §11.1 replay prevention).
     /// Backed by the shared `TtlCache` with atomic check-and-record
     /// (`insert_if_absent_no_evict`); TTL = iat + 120s; fail-closed at capacity.
@@ -113,7 +109,6 @@ pub struct ResourceAuthState {
     pub resource_url: String,
     pub oauth_issuer_url: String,
     pub federation_resolver: Arc<crate::auth::FederationKeyResolver>,
-    pub jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
     pub dpop_jti_seen: Arc<TtlCache<ReplayKey, ()>>,
     pub rate_limiter: Arc<crate::server::middleware::RateLimiter>,
 }
@@ -124,7 +119,6 @@ impl ResourceAuthState {
         resource_url: String,
         oauth_issuer_url: String,
         federation_resolver: Arc<crate::auth::FederationKeyResolver>,
-        jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
     ) -> Self {
         Self {
             verifying_key: Arc::new(verifying_key),
@@ -134,7 +128,6 @@ impl ResourceAuthState {
             resource_url,
             oauth_issuer_url,
             federation_resolver,
-            jti_blocklist,
             dpop_jti_seen: Arc::new(TtlCache::new(DPOP_JTI_MAX_ENTRIES, DPOP_JTI_REAP_BUDGET)),
             rate_limiter: Arc::new(crate::server::middleware::RateLimiter::new(300, 60)),
         }
@@ -177,7 +170,6 @@ impl ServerState {
             resource_url: self.resource_url.clone(),
             oauth_issuer_url: self.oauth_issuer_url.clone(),
             federation_resolver: Arc::clone(&self.federation_resolver),
-            jti_blocklist: Arc::clone(&self.jti_blocklist),
             dpop_jti_seen: Arc::clone(&self.dpop_jti_seen),
             rate_limiter: Arc::clone(&self.rate_limiter),
         }
@@ -198,7 +190,6 @@ impl ServerState {
         resource_url: String,
         oauth_issuer_url: String,
         trusted_issuers: &HashMap<String, crate::config::TrustedIssuerConfig>,
-        jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
         ninep_decider: Arc<dyn hyprstream_9p::AccessDecider>,
     ) -> Result<Self, anyhow::Error> {
         let signing_key = Arc::new(signing_key);
@@ -256,7 +247,6 @@ impl ServerState {
             resource_url,
             oauth_issuer_url,
             federation_resolver,
-            jti_blocklist,
             dpop_jti_seen: Arc::new(TtlCache::new(DPOP_JTI_MAX_ENTRIES, DPOP_JTI_REAP_BUDGET)),
             rate_limiter: Arc::new(crate::server::middleware::RateLimiter::new(300, 60)),
             browser_provisioning_rate_limiter: Arc::new(

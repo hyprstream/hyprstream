@@ -853,10 +853,18 @@ mod tests {
                 crate::auth::FederationKeyResolver::new(&trusted)
                     .with_jwks_fetcher(federation_fetcher),
             ),
-            Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
         );
         state.composite_key_set = composite_keys;
         state.dpop_jti_seen = Arc::new(hyprstream_util::TtlCache::new(8, 16));
+        // Mount-ticket verification fails closed without the process-global
+        // revocation store (one canonical store; no per-service plumbing).
+        // Install an in-memory authority when no other test in this binary
+        // got there first.
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
         (state, ed25519, ml_dsa, federation_ed25519)
     }
 

@@ -447,7 +447,6 @@ pub struct OAuthService {
     /// JWTs signed by PolicyService, derived from the root signing key.
     jwt_verifying_key: [u8; 32],
     /// Shared JTI blocklist (same Arc as PolicyService) for cross-plane revocation.
-    jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
     /// Authority-owned hosted-account records for ATProto DID → tenant
     /// resolution. Attached by the PDS service composition layer.
     hosted_account_store: Option<Arc<hyprstream_pds_service::AccountRecordStore>>,
@@ -478,7 +477,6 @@ impl OAuthService {
             discovery_transport,
             verifying_key,
             jwt_verifying_key: jwt_verifying_key.to_bytes(),
-            jti_blocklist: None,
             hosted_account_store: None,
             identity_registration_api: None,
         }
@@ -487,15 +485,6 @@ impl OAuthService {
     /// Attach the global QUIC configuration for DID-doc cert-hash publication (#185).
     pub fn with_quic_config(mut self, quic: crate::config::QuicConfig) -> Self {
         self.quic_config = Some(quic);
-        self
-    }
-
-    /// Attach the shared JTI blocklist (same Arc as PolicyService).
-    pub fn with_jti_blocklist(
-        mut self,
-        bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
-    ) -> Self {
-        self.jti_blocklist = Some(bl);
         self
     }
 
@@ -825,9 +814,6 @@ impl Spawnable for OAuthService {
             }
             if let Some(sink) = audit_sink {
                 oauth_state = oauth_state.with_audit_sink(sink);
-            }
-            if let Some(bl) = self.jti_blocklist {
-                oauth_state = oauth_state.with_jti_blocklist(bl);
             }
             // Populate legacy JWKS nbf/exp from signing-key file mtime (used when store absent).
             let key_nbf = crate::auth::identity_store::node_signing_key_mtime(&credentials_dir);
@@ -1509,6 +1495,16 @@ mod tests {
                 pq_store: None,
             },
         );
+        // Resource-token verification fails closed on jti-bearing bearers
+        // without the process-global revocation store. Install an in-memory
+        // authority when no other test in this binary got there first — this
+        // test must not depend on another test's fixture happening to run
+        // earlier.
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
         configure_test_policy_signing_authority()?;
 
         let service_key = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);

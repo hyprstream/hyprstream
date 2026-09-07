@@ -134,9 +134,10 @@ pub async fn production_moq_event_pep(
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VerifiedClaimsMoqClearanceSource;
 
+#[async_trait::async_trait]
 impl ClearanceSource for VerifiedClaimsMoqClearanceSource {
-    fn clearance(&self, subject: &Subject) -> Option<hyprstream_rpc::auth::mac::SecurityContext> {
-        hyprstream_rpc::auth::mac::subject_context(subject, None)
+    async fn clearance(&self, subject: &Subject) -> Option<hyprstream_rpc::auth::mac::SecurityContext> {
+        hyprstream_rpc::auth::mac::subject_context(subject, None).await
     }
 }
 
@@ -196,8 +197,9 @@ mod tests {
 
     struct PublicClearance;
 
+    #[async_trait::async_trait]
     impl ClearanceSource for PublicClearance {
-        fn clearance(&self, _subject: &Subject) -> Option<SecurityContext> {
+        async fn clearance(&self, _subject: &Subject) -> Option<SecurityContext> {
             Some(SecurityContext::from_clearance(
                 SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY),
                 VerifiedKeyMaterial::Classical,
@@ -219,8 +221,8 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn unlisted_moq_prefix_deny_is_durable_in_signed_wal() {
+    #[tokio::test]
+    async fn unlisted_moq_prefix_deny_is_durable_in_signed_wal() {
         let dir = tempdir().unwrap();
         let wal = Arc::new(WalAuditStore::open(dir.path(), StubSigner).unwrap());
         let pep = audited_moq_event_pep(
@@ -236,7 +238,8 @@ mod tests {
                 &Subject::new("did:web:tenant-a"),
                 "worker.sandbox123.started",
                 MoqEventAction::Subscribe,
-            ),
+            )
+            .await,
             hyprstream_rpc::auth::mac::MacDecision::Deny(
                 hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject
             )
@@ -259,8 +262,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unknown_identity_deny_is_durable_with_its_own_reason() {
+    #[tokio::test]
+    async fn unknown_identity_deny_is_durable_with_its_own_reason() {
         let dir = tempdir().unwrap();
         let wal = Arc::new(WalAuditStore::open(dir.path(), StubSigner).unwrap());
         let pep = audited_moq_event_pep(
@@ -276,7 +279,7 @@ mod tests {
                 &Subject::new("did:web:tenant-a"),
                 "5:tenantworker",
                 MoqEventAction::Publish,
-            ),
+            ).await,
             hyprstream_rpc::auth::mac::MacDecision::Deny(
                 hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject
             )
@@ -288,8 +291,8 @@ mod tests {
         assert_eq!(records[0].object_id.as_deref(), Some("5:tenantworker"));
     }
 
-    #[test]
-    fn declared_public_prefix_permits_and_audits_nothing() {
+    #[tokio::test]
+    async fn declared_public_prefix_permits_and_audits_nothing() {
         let dir = tempdir().unwrap();
         let wal = Arc::new(WalAuditStore::open(dir.path(), StubSigner).unwrap());
         let pep = audited_moq_event_pep(
@@ -303,7 +306,7 @@ mod tests {
                 &Subject::new("did:web:tenant-a"),
                 "registry.repo789.push",
                 MoqEventAction::Subscribe,
-            ),
+            ).await,
             hyprstream_rpc::auth::mac::MacDecision::Permit
         );
         // Only denials flow to the deny sink today (the permit-side WAL is
@@ -311,8 +314,8 @@ mod tests {
         assert!(wal.verify_journal(&StubSigner).unwrap().is_empty());
     }
 
-    #[test]
-    fn fail_closed_missing_artifact_deny_all_resolver() {
+    #[tokio::test]
+    async fn fail_closed_missing_artifact_deny_all_resolver() {
         let dir = tempdir().unwrap();
         let wal = Arc::new(WalAuditStore::open(dir.path(), StubSigner).unwrap());
         let pep = audited_moq_event_pep(
@@ -325,7 +328,7 @@ mod tests {
                 &Subject::new("did:web:tenant-a"),
                 "registry.repo789.push",
                 MoqEventAction::Subscribe,
-            ),
+            ).await,
             hyprstream_rpc::auth::mac::MacDecision::Deny(
                 hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject
             )

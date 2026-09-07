@@ -800,12 +800,17 @@ pub trait RequestService: 'static {
         true
     }
 
-    /// JWT ID blocklist for access token revocation.
+    /// Credential revocation store for access token revocation.
     ///
-    /// When `Some`, `verify_claims()` rejects tokens whose `jti` appears
-    /// in the blocklist. Override to provide a shared blocklist instance.
-    fn jti_blocklist(&self) -> Option<&dyn crate::auth::JtiBlocklist> {
-        None
+    /// Returns the process-global store published at startup: the durable
+    /// authority store in the policy process, or a policy-authority RPC
+    /// client store in every other process (checks cross the RPC bus to the
+    /// policy service, the one canonical revocation authority). When `None`
+    /// (startup not yet complete or authority initialization failed),
+    /// `verify_claims()` rejects tokens with a jti (fail-closed). Override
+    /// only for specialized testing.
+    fn credential_revocation_store(&self) -> Option<&dyn crate::auth::CredentialRevocationStore> {
+        crate::auth::global_credential_revocation_store().map(std::convert::AsRef::as_ref)
     }
 
     /// Fu4/#677: the minimum JWT `alg` policy enforced in `verify_claims`.
@@ -1142,12 +1147,32 @@ pub trait RequestService: 'static {
             _ => anyhow::bail!("unsupported JWT algorithm"),
         };
 
-        // Check jti against blocklist (revoked access tokens)
+        // Check credential against the revocation store (revoked access tokens)
+        //
+        // The check is issuer-scoped, and the empty-`iss` bare-sub plane is
+        // gated to in-process callers above (#328): a networked caller can
+        // never reach here with an empty issuer. No revocation entry can be
+        // published for an empty issuer either (`credential_id_from_ref`
+        // rejects it fail-closed), so an empty-`iss` token can never match an
+        // entry — skip the check rather than fail closed on an
+        // unconstructible issuer-scoped id.
         if let Some(ref jti) = verified.jti {
-            if let Some(blocklist) = self.jti_blocklist() {
-                if blocklist.is_revoked(jti) {
-                    tracing::warn!(jti = %jti, sub = %verified.sub, "Revoked JWT rejected");
-                    anyhow::bail!("JWT has been revoked");
+            if !verified.iss.is_empty() {
+                match self.credential_revocation_store() {
+                    Some(store) => {
+                        let cred_id = crate::auth::CredentialId::jwt(&verified.iss, jti);
+                        if store.is_revoked(&cred_id).await {
+                            tracing::warn!(jti = %jti, iss = %verified.iss, sub = %verified.sub, "Revoked JWT rejected");
+                            anyhow::bail!("JWT has been revoked");
+                        }
+                    }
+                    None => {
+                        // Fail-closed: a token carrying a jti cannot be verified
+                        // for revocation without a store. Reject rather than
+                        // admitting a potentially-revoked credential.
+                        tracing::warn!(jti = %jti, sub = %verified.sub, "Token with jti rejected: no revocation store configured");
+                        anyhow::bail!("revocation store unavailable");
+                    }
                 }
             }
         }
@@ -1557,7 +1582,21 @@ mod empty_iss_gate_tests {
         }
     }
 
+    /// `verify_claims` fails closed on jti-bearing, issuer-bearing tokens
+    /// without the process-global revocation store (`jwt::encode`
+    /// auto-assigns a jti). Install an in-memory authority when no other test
+    /// in this binary got there first — under nextest per-test process
+    /// isolation no other test can provide it.
+    fn ensure_test_revocation_store() {
+        if crate::auth::global_credential_revocation_store().is_none() {
+            let _ = crate::auth::set_global_credential_revocation_store(std::sync::Arc::new(
+                crate::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+    }
+
     fn mock_service() -> (MockService, SigningKey) {
+        ensure_test_revocation_store();
         // The CA key signs the bare-sub (empty-iss) token; the ClusterKeySource
         // anchors that same CA key with an empty local issuer URL (so empty iss
         // is "local").
@@ -1773,6 +1812,7 @@ mod empty_iss_gate_tests {
 
     #[tokio::test]
     async fn federated_issuer_cannot_assert_local_tenant() {
+        ensure_test_revocation_store();
         let local_ca = SigningKey::from_bytes(&[9u8; 32]);
         let federated_signer = SigningKey::from_bytes(&[10u8; 32]);
         let local_issuer = "https://this.node";
@@ -1815,6 +1855,7 @@ mod empty_iss_gate_tests {
 
     #[tokio::test]
     async fn local_issuer_preserves_verified_tenant() {
+        ensure_test_revocation_store();
         let local_ca = SigningKey::from_bytes(&[11u8; 32]);
         let local_issuer = "https://this.node";
         let key_source = std::sync::Arc::new(ClusterKeySource::new(

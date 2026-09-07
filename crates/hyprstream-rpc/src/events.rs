@@ -287,16 +287,20 @@ struct PrefixState {
 /// The caller attempting an event-plane op (`publish`/`subscribe`). Carries the
 /// verified subject identity (a DID when available). Until #446 lands, IPC
 /// callers may resolve as `anonymous` — see [`PublisherIdentity`].
+///
+/// Async because the MAC-backed adapter revalidates credential-bearing cached
+/// subject contexts against the canonical revocation authority on every check.
+#[async_trait::async_trait]
 pub trait EventAuthz: Send + Sync {
     /// May `caller` publish to the group/`prefix`? Maps to the `publish`
     /// ScopeAction.
-    fn can_publish(&self, caller: &Subject, prefix: &str) -> bool;
+    async fn can_publish(&self, caller: &Subject, prefix: &str) -> bool;
     /// May `caller` subscribe to the group/`prefix`? Maps to the `subscribe`
     /// ScopeAction.
-    fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool;
+    async fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool;
     /// May `caller` receive an encrypted epoch key and decrypt this prefix?
-    fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
-        self.can_subscribe(caller, prefix)
+    async fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
+        self.can_subscribe(caller, prefix).await
     }
 }
 
@@ -327,11 +331,12 @@ pub fn install_event_authz(authz: Arc<dyn EventAuthz>) -> std::result::Result<()
 /// by construction. Production wires a real UCAN/capability-backed impl (S3/S4
 /// vocab on main) via [`EventPublisher::with_authz`].
 pub struct DenyAllEventAuthz;
+#[async_trait::async_trait]
 impl EventAuthz for DenyAllEventAuthz {
-    fn can_publish(&self, _caller: &Subject, _prefix: &str) -> bool {
+    async fn can_publish(&self, _caller: &Subject, _prefix: &str) -> bool {
         false
     }
-    fn can_subscribe(&self, _caller: &Subject, _prefix: &str) -> bool {
+    async fn can_subscribe(&self, _caller: &Subject, _prefix: &str) -> bool {
         false
     }
 }
@@ -339,11 +344,12 @@ impl EventAuthz for DenyAllEventAuthz {
 /// Explicit permissive authz for callers that deliberately construct a public
 /// firehose or a test fixture. It is never an implicit fallback.
 pub struct AllowAllEventAuthz;
+#[async_trait::async_trait]
 impl EventAuthz for AllowAllEventAuthz {
-    fn can_publish(&self, _caller: &Subject, _prefix: &str) -> bool {
+    async fn can_publish(&self, _caller: &Subject, _prefix: &str) -> bool {
         true
     }
-    fn can_subscribe(&self, _caller: &Subject, _prefix: &str) -> bool {
+    async fn can_subscribe(&self, _caller: &Subject, _prefix: &str) -> bool {
         true
     }
 }
@@ -369,27 +375,28 @@ impl MacEventAuthz {
     }
 }
 
+#[async_trait::async_trait]
 impl EventAuthz for MacEventAuthz {
-    fn can_publish(&self, caller: &Subject, prefix: &str) -> bool {
+    async fn can_publish(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
             self.pep
-                .check_event_prefix(caller, prefix, MoqEventAction::Publish),
+                .check_event_prefix(caller, prefix, MoqEventAction::Publish).await,
             MacDecision::Permit
         )
     }
 
-    fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
+    async fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
             self.pep
-                .check_event_prefix(caller, prefix, MoqEventAction::Subscribe),
+                .check_event_prefix(caller, prefix, MoqEventAction::Subscribe).await,
             MacDecision::Permit
         )
     }
 
-    fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
+    async fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
             self.pep
-                .check_event_prefix(caller, prefix, MoqEventAction::JoinDecrypt),
+                .check_event_prefix(caller, prefix, MoqEventAction::JoinDecrypt).await,
             MacDecision::Permit
         )
     }
@@ -729,7 +736,7 @@ impl EventPublisher {
             Some(did) => Subject::new(did.clone()),
             None => Subject::anonymous(),
         };
-        if !self.authz.can_publish(&caller, &prefix) {
+        if !self.authz.can_publish(&caller, &prefix).await {
             return Err(anyhow!(
                 "publish denied by event-plane authz for prefix '{prefix}'"
             ));
@@ -1105,7 +1112,7 @@ impl EventSubscriber {
             );
         }
         let prefix_key = self.encrypted_prefix_key(prefix).await?;
-        if !self.authz.can_join_decrypt(&self.caller, prefix) {
+        if !self.authz.can_join_decrypt(&self.caller, prefix).await {
             return Err(format!(
                 "join/decrypt denied by event-plane MAC for prefix '{prefix}'"
             ));
@@ -1283,7 +1290,11 @@ impl EventSubscriber {
     /// they are returned as an explicit error (and an installed MAC adapter
     /// audits the denial) so callers cannot confuse enforcement with an empty
     /// queue.
-    pub fn try_recv(&mut self) -> Result<Option<(String, Vec<u8>)>> {
+    ///
+    /// Async only because the authorization check may revalidate a
+    /// credential-bearing cached subject against the revocation authority; the
+    /// receive itself remains non-blocking.
+    pub async fn try_recv(&mut self) -> Result<Option<(String, Vec<u8>)>> {
         let Some((topic, raw)) = self.inner.try_recv()? else {
             return Ok(None);
         };
@@ -1296,7 +1307,7 @@ impl EventSubscriber {
                 "try_recv() does not support decoding encrypted prefixes; use recv_timeout(Duration::ZERO)"
             ));
         }
-        if !self.authz.can_subscribe(&self.caller, prefix) {
+        if !self.authz.can_subscribe(&self.caller, prefix).await {
             return Err(anyhow!(
                 "subscribe denied by event-plane MAC for prefix '{prefix}'"
             ));
@@ -1325,7 +1336,7 @@ impl EventSubscriber {
     async fn decode_frame(&self, topic: &str, raw: &[u8]) -> FrameOutcome {
         let prefix = topic.split('.').next().unwrap_or(topic);
         let Ok(key) = self.encrypted_prefix_key(prefix).await else {
-            return if self.authz.can_subscribe(&self.caller, prefix) {
+            return if self.authz.can_subscribe(&self.caller, prefix).await {
                 FrameOutcome::Passthrough
             } else {
                 FrameOutcome::Drop(
@@ -1333,7 +1344,7 @@ impl EventSubscriber {
                 )
             };
         };
-        if !self.authz.can_subscribe(&self.caller, prefix) {
+        if !self.authz.can_subscribe(&self.caller, prefix).await {
             return FrameOutcome::Drop(
                 "subscribe denied by event-plane MAC for confidential prefix".to_owned(),
             );
@@ -1521,8 +1532,9 @@ mod tests {
 
     struct PublicClearance;
 
+    #[async_trait::async_trait]
     impl ClearanceSource for PublicClearance {
-        fn clearance(&self, _subject: &Subject) -> Option<SecurityContext> {
+        async fn clearance(&self, _subject: &Subject) -> Option<SecurityContext> {
             Some(SecurityContext::from_clearance(
                 public_label(),
                 VerifiedKeyMaterial::Classical,
@@ -1584,20 +1596,21 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl EventAuthz for RecordingMacEventAuthz {
-        fn can_publish(&self, caller: &Subject, prefix: &str) -> bool {
+        async fn can_publish(&self, caller: &Subject, prefix: &str) -> bool {
             self.record(MoqEventAction::Publish, prefix);
-            self.inner.can_publish(caller, prefix)
+            self.inner.can_publish(caller, prefix).await
         }
 
-        fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
+        async fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
             self.record(MoqEventAction::Subscribe, prefix);
-            self.inner.can_subscribe(caller, prefix)
+            self.inner.can_subscribe(caller, prefix).await
         }
 
-        fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
+        async fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
             self.record(MoqEventAction::JoinDecrypt, prefix);
-            self.inner.can_join_decrypt(caller, prefix)
+            self.inner.can_join_decrypt(caller, prefix).await
         }
     }
 
@@ -1617,11 +1630,11 @@ mod tests {
 
         // Start the background reader, then publish until it has relayed a
         // frame into this subscriber's non-blocking queue.
-        assert!(subscriber.try_recv().unwrap().is_none());
+        assert!(subscriber.try_recv().await.unwrap().is_none());
         for _ in 0..50 {
             publisher.publish("object", "changed", b"payload").unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
-            match subscriber.try_recv() {
+            match subscriber.try_recv().await {
                 Err(error) => {
                     assert!(error
                         .to_string()
@@ -2372,16 +2385,16 @@ mod tests {
         assert!(error.contains("already bound to tenant 'tenant-a'"));
     }
 
-    #[test]
-    fn rekey_policy_and_authz_are_fail_closed() {
+    #[tokio::test]
+    async fn rekey_policy_and_authz_are_fail_closed() {
         assert!(RekeyPolicy::Scheduled {
             interval: Duration::from_secs(100_000),
         }
         .validate()
         .is_err());
         let deny = DenyAllEventAuthz;
-        assert!(!deny.can_publish(&Subject::anonymous(), "worker"));
-        assert!(!deny.can_subscribe(&Subject::anonymous(), "worker"));
+        assert!(!deny.can_publish(&Subject::anonymous(), "worker").await);
+        assert!(!deny.can_subscribe(&Subject::anonymous(), "worker").await);
         assert!(EventPublisher::new_encrypted(
             signing_key(),
             EventPrivacy::Public,
@@ -2411,6 +2424,7 @@ mod tests {
         let subscriber = EventSubscriber::new().unwrap();
         assert!(!subscriber
             .authz
-            .can_subscribe(&Subject::anonymous(), &source));
+            .can_subscribe(&Subject::anonymous(), &source)
+            .await);
     }
 }

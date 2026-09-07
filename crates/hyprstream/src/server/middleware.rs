@@ -8,7 +8,6 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use hyprstream_rpc::auth::JtiBlocklist as _;
 use hyprstream_util::InsertIfAbsentNoEvictResult;
 use std::sync::Arc;
 use std::time::Duration;
@@ -569,11 +568,16 @@ pub(crate) async fn verify_resource_token_claims(
         }
     };
 
-    // JTI revocation check (RFC 7009) — shared blocklist with the OAuth
-    // revocation endpoint.
+    // Credential revocation check (RFC 7009) — fail-closed on store absence.
     if let Some(ref jti) = claims.jti {
-        if state.jti_blocklist.is_revoked(jti) {
-            return Err("revoked token");
+        let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
+        match hyprstream_rpc::auth::global_credential_revocation_store() {
+            Some(store) => {
+                if store.is_revoked(&cred_id).await {
+                    return Err("revoked token");
+                }
+            }
+            None => return Err("revocation store unavailable"),
         }
     }
 
@@ -1405,11 +1409,14 @@ mod rotation_aware_tests {
         assert_eq!(err, "JWT validation failed");
     }
 
-    #[test]
-    fn revoked_jti_still_rejected() {
-        // A rotation-signed token decodes cleanly, but the shared jti-blocklist
-        // check `verify_token_claims` performs after decode still rejects it.
-        use hyprstream_rpc::auth::{InMemoryJtiBlocklist, JtiBlocklist as _};
+    #[tokio::test]
+    async fn revoked_jti_still_rejected() {
+        // A rotation-signed token decodes cleanly, but the global
+        // credential-revocation store check still rejects it.
+        use hyprstream_rpc::auth::{
+            global_credential_revocation_store, set_global_credential_revocation_store,
+            CredentialId, InMemoryCredentialRevocationStore,
+        };
 
         let ca = new_key();
         let rotation = new_key();
@@ -1427,10 +1434,20 @@ mod rotation_aware_tests {
         .unwrap();
         assert_eq!(claims.jti.as_deref(), Some("jti-777"));
 
-        let blocklist = InMemoryJtiBlocklist::new();
-        blocklist.revoke("jti-777".to_owned(), now() + 3600);
+        // Ensure the global store is set.
+        if global_credential_revocation_store().is_none() {
+            let _ = set_global_credential_revocation_store(std::sync::Arc::new(
+                InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let store = global_credential_revocation_store().unwrap();
+        let issuer = claims.iss.as_str();
+        store
+            .revoke_credential(CredentialId::jwt(issuer, "jti-777"), now() + 3600)
+            .await
+            .unwrap();
         // This mirrors the exact post-decode check in `verify_token_claims`.
-        assert!(blocklist.is_revoked(claims.jti.as_deref().unwrap()));
+        assert!(store.is_revoked(&CredentialId::jwt(issuer, claims.jti.as_deref().unwrap())).await);
     }
 
     #[test]
@@ -1843,9 +1860,12 @@ mod composite_aware_tests {
         .is_err());
     }
 
-    #[test]
-    fn composite_jti_remains_subject_to_revocation() {
-        use hyprstream_rpc::auth::{InMemoryJtiBlocklist, JtiBlocklist as _};
+    #[tokio::test]
+    async fn composite_jti_remains_subject_to_revocation() {
+        use hyprstream_rpc::auth::{
+            global_credential_revocation_store, set_global_credential_revocation_store,
+            CredentialId, InMemoryCredentialRevocationStore,
+        };
 
         let ca = new_ed_key();
         let (pq, pq_vk) = new_ml_dsa();
@@ -1872,9 +1892,18 @@ mod composite_aware_tests {
         )
         .unwrap();
         let jti = verified.jti.as_deref().unwrap();
-        let blocklist = InMemoryJtiBlocklist::new();
-        blocklist.revoke(jti.to_owned(), verified.exp);
-        assert!(blocklist.is_revoked(jti));
+        let issuer = verified.iss.as_str();
+        if global_credential_revocation_store().is_none() {
+            let _ = set_global_credential_revocation_store(std::sync::Arc::new(
+                InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let store = global_credential_revocation_store().unwrap();
+        store
+            .revoke_credential(CredentialId::jwt(issuer, jti), verified.exp)
+            .await
+            .unwrap();
+        assert!(store.is_revoked(&CredentialId::jwt(issuer, jti)).await);
     }
 
     #[test]

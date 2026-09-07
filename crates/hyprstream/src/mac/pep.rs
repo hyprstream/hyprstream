@@ -528,9 +528,10 @@ impl NamespaceAccessDecider for VfsAccessDecider {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VerifiedClaimsSubjects;
 
+#[async_trait::async_trait]
 impl SubjectContextResolver for VerifiedClaimsSubjects {
-    fn resolve(&self, subject: &hyprstream_rpc::Subject) -> Option<SecurityContext> {
-        hyprstream_rpc::auth::mac::subject_context(subject, None)
+    async fn resolve(&self, subject: &hyprstream_rpc::Subject) -> Option<SecurityContext> {
+        hyprstream_rpc::auth::mac::subject_context(subject, None).await
     }
 }
 
@@ -645,8 +646,9 @@ mod tests {
         ctx: SecurityContext,
     }
 
+    #[async_trait::async_trait]
     impl SubjectContextResolver for FixtureVfsSubjects {
-        fn resolve(&self, subject: &hyprstream_rpc::Subject) -> Option<SecurityContext> {
+        async fn resolve(&self, subject: &hyprstream_rpc::Subject) -> Option<SecurityContext> {
             (subject.name() == Some(self.name)).then(|| self.ctx.clone())
         }
     }
@@ -828,8 +830,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn vfs_fail_closed_denies_are_audited() {
+    #[tokio::test]
+    async fn vfs_fail_closed_denies_are_audited() {
         let sink = Arc::new(SpySink::default());
         let pep = hyprstream_vfs::NamespacePep::new(
             Arc::new(FixtureVfsSubjects {
@@ -851,7 +853,8 @@ mod tests {
                 &hyprstream_rpc::Subject::new("mallory"),
                 "/public",
                 NamespaceAction::Read,
-            ),
+            )
+            .await,
             MacDecision::Deny(MacDenyReason::NoClearance)
         );
         assert_eq!(
@@ -859,7 +862,8 @@ mod tests {
                 &hyprstream_rpc::Subject::new("alice"),
                 "/missing",
                 NamespaceAction::Read,
-            ),
+            )
+            .await,
             MacDecision::Deny(MacDenyReason::UnlabeledObject)
         );
         assert_eq!(
@@ -867,7 +871,8 @@ mod tests {
                 &hyprstream_rpc::Subject::new("alice"),
                 "/secret",
                 NamespaceAction::Read,
-            ),
+            )
+            .await,
             MacDecision::Deny(MacDenyReason::FloorDeny)
         );
         assert_eq!(
@@ -875,7 +880,8 @@ mod tests {
                 &hyprstream_rpc::Subject::new("alice"),
                 "/public",
                 NamespaceAction::Write,
-            ),
+            )
+            .await,
             MacDecision::Deny(MacDenyReason::FloorDeny)
         );
 
