@@ -182,7 +182,10 @@ fn build_cli() -> ClapCommand {
                     .arg(Arg::new("service").long("service").required(true)
                         .action(clap::ArgAction::Append).value_delimiter(','))
                     .arg(Arg::new("valid-for-seconds").long("valid-for-seconds")
-                        .value_parser(clap::value_parser!(i64)).default_value("86400")),
+                        .value_parser(clap::value_parser!(i64)).default_value("86400"))
+                    .arg(Arg::new("roster-export").long("roster-export").value_name("PATH")
+                        .value_parser(clap::value_parser!(std::path::PathBuf))
+                        .help("Opt-in: atomically write a JSON manifest of the verified accepted roster (public fields only; not a trust root) to PATH. Behavior is unchanged when absent.")),
             )
             .subcommand(
                 ClapCommand::new("join")
@@ -1728,6 +1731,9 @@ async fn install_process_production_resolver(
              has no remote-Discovery story and would silently ignore this flag"
         );
     }
+    if config.quic.iroh_required() {
+        hyprstream_rpc::moq_stream::require_native_iroh();
+    }
     hyprstream_discovery::bootstrap_deployment_process(
         signing_key.clone(),
         trust_source,
@@ -2523,11 +2529,16 @@ fn main() -> Result<()> {
                     .context("service roster is required")?.cloned().collect::<Vec<_>>();
                 let lifetime = *provision_m.get_one::<i64>("valid-for-seconds")
                     .context("service identity lifetime is required")?;
+                let roster_export = provision_m.get_one::<std::path::PathBuf>("roster-export");
                 hyprstream_core::cli::deployment_bootstrap::provision_services(
                     &config,
                     &services,
                     lifetime,
+                    roster_export.map(std::path::PathBuf::as_path),
                 )?;
+                if let Some(path) = roster_export {
+                    println!("verified service roster manifest written to {}", path.display());
+                }
                 println!("checkpoint-accepted service roster ready ({} services)", services.len());
                 return Ok(());
             }
@@ -3136,12 +3147,10 @@ fn main() -> Result<()> {
                                         // verified resolver result; the URI alone is reachability,
                                         // never an application identity.
                                         moq_relay_server_identity: None,
-                                        // #1027: no moql admission material is provisioned at
-                                        // daemon bootstrap yet; the accept path stays in its
-                                        // fail-closed anonymous posture until a deployment
-                                        // installs an authenticator here.
-                                        moq_admission: None,
-                                        moq_ingress_authorizer: None,
+                                        moq_admission: if moq_admission_proof.is_some() {
+                                            Some(hyprstream_core::services::stream_network::production_stream_admission(&qc)?)
+                                        } else { None },
+                                        moq_ingress_authorizer: Some(hyprstream_core::services::stream_network::stream_ingress_authorizer(&qc)),
                                         moq_admission_proof,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             move |request: hyprstream_service::NativeAnnouncementRequest| {
@@ -3812,9 +3821,21 @@ mod resolver_startup_controls {
         assert_eq!(provision.get_many::<String>("service").expect("roster")
             .map(String::as_str).collect::<Vec<_>>(), vec!["model", "event"]);
         assert_eq!(provision.get_one::<i64>("valid-for-seconds"), Some(&3600));
+        assert!(provision.get_one::<std::path::PathBuf>("roster-export").is_none());
         assert!(super::build_cli().try_get_matches_from([
             "hyprstream", "pds", "provision-services",
         ]).is_err());
+        let matches = super::build_cli().try_get_matches_from([
+            "hyprstream", "pds", "provision-services", "--service", "model",
+            "--roster-export", "/tmp/roster.json",
+        ]).expect("bootstrap CLI with roster export");
+        let provision = matches.subcommand_matches("pds").expect("pds")
+            .subcommand_matches("provision-services").expect("provision");
+        assert_eq!(
+            provision.get_one::<std::path::PathBuf>("roster-export")
+                .map(std::path::PathBuf::as_path),
+            Some(std::path::Path::new("/tmp/roster.json"))
+        );
     }
     const REFRESH_SCHEDULER_TURNS: usize = 32;
 

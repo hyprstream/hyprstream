@@ -358,6 +358,10 @@ pub fn serve_moq_uds_background(origin: MoqStreamOrigin, path: PathBuf) {
     use crate::transport::uds_session::{PLANE_MOQ, accept_uds};
     use moq_net::Server as MoqServer;
 
+    if native_iroh_required() {
+        tracing::error!("network-iroh-required refuses a local MoQ socket server");
+        return;
+    }
     // Remove stale socket from a previous run (best-effort).
     let _ = std::fs::remove_file(&path);
 
@@ -1080,7 +1084,7 @@ impl MoqStreamHandle {
         // local moq UDS plane when the StreamInfo carries no dialable reach —
         // never the other way around (see method docs; #275).
         let has_dialable_reach = reach.iter().any(|d| reach_to_transport_config(d).is_some());
-        if has_dialable_reach {
+        if has_dialable_reach || native_iroh_required() {
             tokio::spawn(moq_stream_handle_task_networked(
                 reach,
                 broadcast_path.clone(),
@@ -1143,7 +1147,7 @@ impl MoqStreamHandle {
         let (tx, rx) =
             tokio::sync::mpsc::channel::<anyhow::Result<crate::streaming::StreamPayload>>(64);
         let has_dialable_reach = reach.iter().any(|d| reach_to_transport_config(d).is_some());
-        if has_dialable_reach {
+        if has_dialable_reach || native_iroh_required() {
             tokio::spawn(moq_stream_handle_task_networked(
                 reach,
                 broadcast_path.clone(),
@@ -1237,6 +1241,10 @@ async fn moq_stream_handle_task(
     use crate::transport::uds_session::{PLANE_MOQ, connect_uds};
     use moq_net::{Client as MoqClient, Origin, Track};
 
+    if native_iroh_required() {
+        let _ = tx.send(Err(anyhow!("network-iroh-required refuses a local MoQ socket client"))).await;
+        return;
+    }
     let session = match connect_uds(&uds_path, PLANE_MOQ).await {
         Ok(s) => s,
         Err(e) => {
@@ -1484,12 +1492,25 @@ pub struct MoqReachConnection {
     _session: moq_net::Session,
 }
 
+/// Monotonic process transport policy installed by native deployment bootstrap.
+static NATIVE_IROH_REQUIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Require native Iroh; later compatibility callers cannot reopen fallbacks.
+pub fn require_native_iroh() {
+    NATIVE_IROH_REQUIRED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub fn native_iroh_required() -> bool {
+    NATIVE_IROH_REQUIRED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Resolve a producer's reach into a live moq subscriber connection (#356).
 ///
 /// This is the **single** reach→connection resolver shared by every networked
 /// subscriber (the inference [`MoqStreamHandle::networked`] task and the CLI
 /// model-load / `notify subscribe` consumers). It enforces one transport policy
-/// in one place:
+/// in one place. A required native process accepts only Iroh and never takes
+/// the compatibility QUIC/UDS alternatives below:
 ///
 ///   1. **Networked first** — dial the first dialable `Destination` in `reach`
 ///      (the producer's wire-advertised QUIC/`/moq` endpoint) via
@@ -1523,9 +1544,19 @@ pub async fn connect_moq_reach_with_server_identity(
     reach: &[crate::stream_info::Destination],
     server_identity: &crate::stream_info::MoqlServerIdentity,
 ) -> Result<MoqReachConnection> {
+    connect_moq_reach_for_profile(reach, server_identity, native_iroh_required()).await
+}
+
+/// Explicit policy seam. Required mode admits only Iroh destinations.
+pub async fn connect_moq_reach_for_profile(
+    reach: &[crate::stream_info::Destination],
+    server_identity: &crate::stream_info::MoqlServerIdentity,
+    iroh_required: bool,
+) -> Result<MoqReachConnection> {
     use crate::transport::uds_session::{PLANE_MOQ, connect_uds};
     use moq_net::{Client as MoqClient, Origin};
 
+    let iroh_required = iroh_required || native_iroh_required();
     let client_origin = Origin::random().produce();
     let consumer = client_origin.consume();
     let moq_client = MoqClient::new().with_consume(client_origin);
@@ -1537,6 +1568,9 @@ pub async fn connect_moq_reach_with_server_identity(
         let Some(cfg) = reach_to_transport_config(dest) else {
             continue;
         };
+        if iroh_required && !matches!(cfg.endpoint, crate::transport::EndpointType::Iroh { .. }) {
+            continue;
+        }
         had_dialable_network_reach = true;
         let dial = match (&cfg.endpoint, global_moq_admission_proof()) {
             (crate::transport::EndpointType::Iroh { .. }, Some(proof)) => {
@@ -1589,6 +1623,9 @@ pub async fn connect_moq_reach_with_server_identity(
     // A producer-advertised network endpoint is authoritative. In particular,
     // an authenticated Iroh rejection must not silently cross into this
     // process's local plane: that could subscribe to an unrelated producer.
+    if iroh_required && !had_dialable_network_reach {
+        return Err(anyhow!("network-iroh-required: no dialable Iroh stream reach; refusing QUIC/local fallback"));
+    }
     if had_dialable_network_reach {
         return Err(anyhow!(
             "all dialable network reaches failed; refusing local moq UDS fallback{}",
@@ -1882,6 +1919,10 @@ pub async fn run_relay_announce_link(
     };
     let cfg = reach_to_transport_config(&dest)
         .ok_or_else(|| anyhow!("relay reach is not a dialable network transport"))?;
+
+    if native_iroh_required() && !matches!(cfg.endpoint, crate::transport::EndpointType::Iroh { .. }) {
+        return Err(anyhow!("network-iroh-required rejects non-Iroh stream relay"));
+    }
 
     // #504 item 3 — relay-capability gate (fail-closed): do NOT announce this
     // node's origin (broadcast track names / `broadcastPath`, traffic patterns)
@@ -3071,6 +3112,21 @@ mod tests {
                 cert_hashes: vec![vec![0u8; 32]],
             }),
             moql_server_identity: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn required_stream_reach_rejects_empty_and_browser_only_without_dial() {
+        let identity = crate::stream_info::MoqlServerIdentity::default();
+        for reach in [vec![], vec![crate::stream_info::Destination {
+            role: crate::stream_info::Role::Direct,
+            transport: crate::stream_info::TransportConfig::Quic(crate::stream_info::QuicReach {
+                addr: "127.0.0.1:9".into(), server_name: "localhost".into(), cert_hashes: vec![],
+            }), moql_server_identity: Default::default(),
+        }]] {
+            let result = tokio::time::timeout(std::time::Duration::from_millis(200),
+                connect_moq_reach_for_profile(&reach, &identity, true)).await.unwrap();
+            assert!(result.err().unwrap().to_string().contains("no dialable Iroh stream reach"));
         }
     }
 

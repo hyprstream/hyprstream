@@ -122,6 +122,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
             "oauth".to_owned(),
         ],
         3600,
+        None,
     )?;
 
     // Match OAuthService::run: clients are created and used on its own

@@ -188,3 +188,6 @@ pub use metrics::MetricsService;
 
 /// Authenticated Event transport and profile-aware initialization.
 pub mod event_network;
+
+/// Native producer/Streams carrier admission and lifecycle.
+pub mod stream_network;

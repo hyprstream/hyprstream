@@ -31,6 +31,22 @@ fn production_moq_authz(
         .with_ingress_authorizer_option(ingress_authorizer)
 }
 
+/// Native producer reach and channel must refer to the same service-owned tree.
+fn producer_moq_origin(
+    required: bool,
+    relay: Option<hyprstream_rpc::moq_stream::MoqStreamOrigin>,
+    has_producer: bool,
+) -> Option<hyprstream_rpc::moq_stream::MoqStreamOrigin> {
+    relay.or_else(|| {
+        if required {
+            has_producer.then(|| hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
+                .with_prefix(hyprstream_rpc::moq_stream::DEFAULT_PREFIX).build())
+        } else {
+            hyprstream_rpc::moq_stream::global_moq_origin().cloned()
+        }
+    })
+}
+
 // Re-export Spawnable trait from hyprstream-rpc (where it's defined so
 // types in that crate can implement it without circular deps).
 pub use hyprstream_rpc::service::Spawnable;
@@ -250,12 +266,11 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         .with_prefix(hyprstream_rpc::moq_stream::DEFAULT_PREFIX)
                         .build()
                 });
+                // Native producers serve only their own stream channel origin.
+                let moq_origin = producer_moq_origin(qc.iroh_required, relay_origin.clone(), moq_origin_handle.is_some());
                 if let Some(handle) = &moq_origin_handle {
-                    *handle.write() = relay_origin.clone();
+                    *handle.write() = moq_origin.clone();
                 }
-                let moq_origin = relay_origin
-                    .clone()
-                    .or_else(|| hyprstream_rpc::moq_stream::global_moq_origin().cloned());
 
                 let mut rpc_server = hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::with_capacity(
                     wt_server,
@@ -354,6 +369,11 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                 // Link a relay only to this service's scoped origin. The shared
                 // process origin would leak other services' broadcasts into it.
                 if let Some(relay) = qc.moq_relay.take() {
+                    if qc.iroh_required && !matches!(relay, hyprstream_rpc::stream_info::TransportConfig::Iroh(_)) {
+                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                            "network-iroh-required rejects non-Iroh stream relay".into(),
+                        ));
+                    }
                     if let Some(origin) = relay_origin {
                         hyprstream_rpc::moq_stream::serve_origin_to_relay_background(
                             origin.producer().clone(),
@@ -1168,6 +1188,20 @@ mod tests {
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::prelude::SigningKey;
     use hyprstream_rpc::service::RequestService;
+
+    #[tokio::test]
+    async fn native_producer_origins_do_not_expose_sibling_tracks() -> AnyhowResult<()> {
+        let first = producer_moq_origin(true, None, true).ok_or_else(|| anyhow!("native producer origin missing"))?;
+        let second = producer_moq_origin(true, None, true).ok_or_else(|| anyhow!("native producer origin missing"))?;
+        let _broadcast = first.producer().create_broadcast("local/streams/first").ok_or_else(|| anyhow!("first broadcast missing"))?;
+        assert!(first.consumer().announced_broadcast("local/streams/first").await.is_some());
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100),
+            second.consumer().announced_broadcast("local/streams/first")).await.is_err());
+        assert!(producer_moq_origin(true, None, false).is_none());
+        let relayed = producer_moq_origin(true, Some(first), true).ok_or_else(|| anyhow!("relay origin missing"))?;
+        assert!(relayed.consumer().announced_broadcast("local/streams/first").await.is_some());
+        Ok(())
+    }
 
     #[test]
     fn production_moq_handler_preserves_explicit_ingress_and_defaults_to_denial() {
