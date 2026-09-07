@@ -858,11 +858,18 @@ mod tests {
         grant.store(false, Ordering::SeqCst);
 
         // The same connection's session is closed by the watchdog; the peer
-        // cannot carry any further announcement on it.
-        tokio::time::timeout(std::time::Duration::from_secs(5), producer_session.closed())
+        // cannot carry any further announcement on it. Pinned moq-net
+        // (07f558f, rs/moq-net/src/session.rs:81-84) yields
+        // `Err(Error::Transport(..))` from `closed()` unconditionally, with
+        // the transport close reason inside; the session resolving at all IS
+        // the close — that is the success condition here.
+        let close = tokio::time::timeout(std::time::Duration::from_secs(5), producer_session.closed())
             .await
-            .map_err(|_| anyhow::anyhow!("revoked ingress did not close the live producer session"))?
-            .map_err(|e| anyhow::anyhow!("producer session closed with error: {e}"))?;
+            .map_err(|_| anyhow::anyhow!("revoked ingress did not close the live producer session"))?;
+        match close {
+            Err(moq_net::Error::Transport(_)) => {}
+            other => return Err(anyhow::anyhow!("unexpected session close outcome: {other:?}")),
+        }
         let _late = producer_origin
             .create_broadcast("alice/after-revoke")
             .ok_or_else(|| anyhow::anyhow!("create post-revocation broadcast"))?;
