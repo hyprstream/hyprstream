@@ -145,7 +145,10 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
             runtime_clients(&oauth).is_err(),
             "Compatibility still requires explicitly registered local peers"
         );
-        assert!(crate::services::McpService::new(mcp_config.clone()).is_err());
+        // Compatibility dials the factory-resolved typed IPC transport
+        // directly, so construction is registry-free; the process-local
+        // registry fallbacks below stay refused.
+        assert!(crate::services::McpService::new(mcp_config.clone()).is_ok());
         let client_carrier = IrohSubstrate::new(
             [0x76; 32],
             RefuseHandler::new("client only"),

@@ -1170,12 +1170,24 @@ mod tests {
             .expect("OAuthService must implement Spawnable");
         let run = &production[run_start..];
 
+        // Merged required/compat shape: required resolves through the
+        // checkpoint-backed discovery resolver; compat dials the
+        // factory-resolved IPC transports (20-space continuation inside the
+        // profile branch).
         assert!(run.contains(
-            "PolicyClient::for_local_transport_bootstrap(\n                &self.policy_transport,"
+            "PolicyClient::for_local_transport_bootstrap(\n                    &self.policy_transport,"
         ));
         assert!(run.contains(
-            "DiscoveryClient::for_local_transport_bootstrap(\n                &self.discovery_transport,"
+            "DiscoveryClient::for_local_transport_bootstrap(\n                    &self.discovery_transport,"
         ));
+        assert!(
+            run.contains("if hyprstream_discovery::native_network_required() {\n                PolicyClient::from_resolver("),
+            "Required profile must resolve Policy through the checkpoint resolver"
+        );
+        assert!(
+            run.contains("if hyprstream_discovery::native_network_required() {\n                crate::services::DiscoveryClient::from_resolver("),
+            "Required profile must resolve Discovery through the checkpoint resolver"
+        );
         assert!(
             !run.contains("PolicyClient::for_local_bootstrap("),
             "OAuth must not use the process-local Policy registry"

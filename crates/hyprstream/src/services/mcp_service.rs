@@ -946,11 +946,20 @@ impl McpService {
             tool_reg.by_uuid.len(),
         );
 
-        let policy_client = crate::services::policy_client_for_process(
-            config.signing_key.clone(),
-            config.policy_verifying_key,
-            None,
-        )?;
+        // Required profile resolves through the checkpoint-backed discovery
+        // resolver; compatibility dials the factory-resolved deterministic
+        // IPC transport — registry-free, so a separate rootless Quadlet
+        // process can reach the PolicyService socket.
+        let policy_client = if hyprstream_discovery::native_network_required() {
+            PolicyClient::from_resolver(config.signing_key.clone(), None)?
+        } else {
+            PolicyClient::for_local_transport_bootstrap(
+                &config.policy_transport,
+                config.signing_key.clone(),
+                config.policy_verifying_key,
+                None,
+            )?
+        };
 
         Ok(Self {
             registry: Arc::new(RwLock::new(tool_reg)),
