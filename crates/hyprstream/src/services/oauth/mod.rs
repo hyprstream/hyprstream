@@ -1480,6 +1480,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn oauth_handler_atproto_and_legacy_conformance() -> anyhow::Result<()> {
         crate::mac::install_explicit_test_dispatch_pep();
+        // Interactive OAuth issuance (v16 §3.3) registers a fresh session with
+        // the canonical registry, and the in-process policy authority validates
+        // it before minting; both live in THIS process, so publish one isolated
+        // in-memory session registry (plus a revocation store) — mirroring
+        // production `init_process_authority_stores`, which this bespoke
+        // in-process test bypasses. Guarded so a sibling that published first
+        // keeps its handle; the registrations use distinct keys.
+        if hyprstream_rpc::auth::global_session_registry().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_session_registry(std::sync::Arc::new(
+                hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+            ));
+        }
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(std::sync::Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
         use base64::{
             engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
             Engine as _,
@@ -1498,7 +1515,7 @@ mod tests {
         use super::token_store::RocksDbTokenStore;
         use crate::auth::rocksdb_store::RocksDbUserStore;
         use crate::auth::{PolicyManager, UserProfile, UserStore};
-        use crate::services::generated::policy_client::IssueToken;
+        use crate::services::generated::policy_client::{IssueToken, IssueTokenProfile};
         use crate::services::{DiscoveryClient, PolicyClient, PolicyService};
 
         const ISSUER: &str = "https://pds.example.test:8443";
@@ -1564,6 +1581,38 @@ mod tests {
             TransportConfig::inproc(&policy_tag),
         )
         .with_default_audience(GENERIC_ISSUER.to_owned())
+        // Production-equivalent key source: token signing resolves the composite
+        // authority through the configured JwtKeySource (a `ClusterKeySource`
+        // defaults its ledger to the process-global authority configured above).
+        .with_jwt_key_source(Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+            service_key.verifying_key(),
+            GENERIC_ISSUER.to_owned(),
+        )))
+        // v16: a dispatch-capable user `at+jwt` (cnf.jwk) binds its authoritative
+        // Primary suite. Production installs WS-C's enrollment resolver; this
+        // fixture stands in for it, resolving `alice` to the exact verified
+        // OAuth challenge key (`user_key`, [0x63; 32]) the flows bind as `cnf`.
+        .with_primary_enrollment_resolver({
+            struct AliceResolver;
+            impl crate::services::policy::PrimaryEnrollmentResolver for AliceResolver {
+                fn primary_group(
+                    &self,
+                    principal: &str,
+                    _tenant: &str,
+                ) -> Option<crate::services::policy::PrimaryGroup> {
+                    (principal == "alice").then(|| crate::services::policy::PrimaryGroup {
+                        suite_id: hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519.to_owned(),
+                        ordered_component_keys: vec![
+                            ed25519_dalek::SigningKey::from_bytes(&[0x63; 32])
+                                .verifying_key()
+                                .to_bytes()
+                                .to_vec(),
+                        ],
+                    })
+                }
+            }
+            Arc::new(AliceResolver)
+        })
         .with_token_clearance_resolver(Arc::new(|subject| {
             use hyprstream_rpc::auth::mac::{
                 Assurance, CompartmentSet, Level, SecurityLabel,
@@ -2874,6 +2923,9 @@ mod tests {
                 issuer: None,
                 tenant: Some(HOSTED_TENANT.to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2904,6 +2956,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("other.example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2934,6 +2989,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2982,6 +3040,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3037,6 +3098,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3185,6 +3249,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3335,6 +3402,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3385,6 +3455,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3557,6 +3630,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3655,6 +3731,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3701,6 +3780,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;

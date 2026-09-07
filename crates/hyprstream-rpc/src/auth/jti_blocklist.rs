@@ -185,6 +185,13 @@ impl InMemoryCredentialRevocationStore {
     fn insert_loaded(&self, id: CredentialId, expires_at: i64) {
         self.revoked.write().insert(id, expires_at);
     }
+
+    /// The stored expiry for an exact credential ID, if present. Sync
+    /// read-only probe for the durable store's writer-lock dedup.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn existing_expiry(&self, id: &CredentialId) -> Option<i64> {
+        self.revoked.read().get(id).copied()
+    }
 }
 
 #[async_trait::async_trait]
@@ -442,22 +449,41 @@ impl CredentialRevocationStore for FileBackedCredentialRevocationStore {
     ) -> Result<(), RevocationPublishError> {
         use std::io::Write as _;
 
-        // Phase 1 — PUBLISH (durable): append + fsync FIRST. On IO failure
-        // the in-memory index and the handle cache stay untouched — a
-        // revocation that is not durable must not pretend to exist.
+        // Phase 1 — PUBLISH (durable): append + fsync FIRST, under the
+        // writer lock. On IO failure the in-memory index and the handle
+        // cache stay untouched — a revocation that is not durable must not
+        // pretend to exist.
+        //
+        // Dedup under the same lock: when an entry for this exact credential
+        // with an equal-or-longer retention is already durable, the
+        // revocation is already published (and its handles were evicted by
+        // the first publication), so a repeated revocation appends nothing —
+        // a replayed revocation request cannot grow the log or force an
+        // fsync per request.
         let mut line = serde_json::to_string(&RevocationRecord::new(&id, expires_at))
             .map_err(|e| RevocationPublishError::new(format!("record serialization failed: {e}")))?;
         line.push('\n');
         {
             let mut file = self.file.lock();
+            if self
+                .inner
+                .existing_expiry(&id)
+                .is_some_and(|existing| existing >= expires_at)
+            {
+                return Ok(());
+            }
             file.write_all(line.as_bytes())
                 .and_then(|()| file.sync_all())
                 .map_err(|e| RevocationPublishError::new(format!("durable append failed: {e}")))?;
+            // Publish to memory under the same lock so the dedup check and
+            // the visible insert are atomic against concurrent writers.
+            self.inner.insert_loaded(id.clone(), expires_at);
         }
 
-        // Phase 2 — publish to memory, then evict handles (same
+        // Phase 2 — EVICT handles, strictly after publication (same
         // publication-before-eviction ordering as the in-memory store).
-        self.inner.revoke_credential(id, expires_at).await
+        crate::auth::mac::revoke_verified_subject_credential(&id);
+        Ok(())
     }
 }
 
@@ -751,8 +777,9 @@ mod tests {
     /// the session status is Revoked AND the verified-subject cache generation
     /// is flushed, removing every cached handle.
     #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn session_revocation_evicts_cached_handles() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn session_revocation_evicts_cached_handles() {
         use crate::auth::credential::{
             ActiveOrRevoked, InMemorySessionRegistry, SessionKind, SessionRegistry, SessionState,
         };
@@ -805,17 +832,18 @@ mod tests {
                 clearance_epoch: 0,
             },
         )
+        .await
         .unwrap();
 
         // Publication: session is active before revocation.
-        assert!(!reg.is_revoked(&key), "session must be active before revoke");
+        assert!(!reg.is_revoked(&key).await, "session must be active before revoke");
 
         // Revoke the session — this publishes (marks revoked) then evicts
         // (flushes the generation, removing all cached handles).
-        reg.revoke_session(&key);
+        reg.revoke_session(&key).await.unwrap();
 
         // Publication: session is now revoked.
-        assert!(reg.is_revoked(&key), "session must be revoked");
+        assert!(reg.is_revoked(&key).await, "session must be revoked");
 
         // Eviction: the verified-subject cache entry is gone (the generation
         // flush removed it). Trying to evict the credential returns 0 because
@@ -829,8 +857,8 @@ mod tests {
 
     /// A session registry marks a session revoked and subsequent
     /// `is_revoked` checks return true.
-    #[test]
-    fn session_revocation_marks_session_revoked() {
+    #[tokio::test]
+    async fn session_revocation_marks_session_revoked() {
         use crate::auth::credential::{
             ActiveOrRevoked, InMemorySessionRegistry, SessionRegistry, SessionState,
         };
@@ -846,20 +874,20 @@ mod tests {
             status: ActiveOrRevoked::Active,
             clearance_epoch: 0,
         };
-        reg.register_session(key.clone(), state).unwrap();
-        assert!(!reg.is_revoked(&key), "session is active");
+        reg.register_session(key.clone(), state).await.unwrap();
+        assert!(!reg.is_revoked(&key).await, "session is active");
 
-        reg.revoke_session(&key);
-        assert!(reg.is_revoked(&key), "session is now revoked");
+        reg.revoke_session(&key).await.unwrap();
+        assert!(reg.is_revoked(&key).await, "session is now revoked");
         assert_eq!(
-            reg.session_state(&key).unwrap().status,
+            reg.session_state(&key).await.unwrap().status,
             ActiveOrRevoked::Revoked
         );
     }
 
     /// An expired session reports as revoked even if its status bit is Active.
-    #[test]
-    fn expired_session_is_revoked() {
+    #[tokio::test]
+    async fn expired_session_is_revoked() {
         use crate::auth::credential::{
             ActiveOrRevoked, InMemorySessionRegistry, SessionKind, SessionRegistry, SessionState,
         };
@@ -875,16 +903,16 @@ mod tests {
             status: ActiveOrRevoked::Active,
             clearance_epoch: 0,
         };
-        reg.register_session(key.clone(), state).unwrap();
+        reg.register_session(key.clone(), state).await.unwrap();
         assert!(
-            reg.is_revoked(&key),
+            reg.is_revoked(&key).await,
             "expired session must report as revoked"
         );
     }
 
     /// A revoked session key cannot be re-registered (no reactivation).
-    #[test]
-    fn revoked_session_cannot_be_reactivated() {
+    #[tokio::test]
+    async fn revoked_session_cannot_be_reactivated() {
         use crate::auth::credential::{
             ActiveOrRevoked, InMemorySessionRegistry, SessionKind, SessionRegistry, SessionState,
         };
@@ -900,11 +928,11 @@ mod tests {
             status: ActiveOrRevoked::Active,
             clearance_epoch: 0,
         };
-        reg.register_session(key.clone(), state.clone()).unwrap();
-        reg.revoke_session(&key);
+        reg.register_session(key.clone(), state.clone()).await.unwrap();
+        reg.revoke_session(&key).await.unwrap();
 
         // Re-registration must fail — revoked sessions are never reassigned.
-        let result = reg.register_session(key.clone(), state);
+        let result = reg.register_session(key.clone(), state).await;
         assert!(
             result.is_err(),
             "a revoked session key must not be reactivated"
@@ -912,22 +940,22 @@ mod tests {
     }
 
     /// An unknown session key fails closed (is_revoked returns true).
-    #[test]
-    fn unknown_session_fails_closed() {
+    #[tokio::test]
+    async fn unknown_session_fails_closed() {
         use crate::auth::credential::{InMemorySessionRegistry, SessionRegistry};
 
         let reg = InMemorySessionRegistry::new();
         let key = SessionKey::oidc("https://a.example", "unknown");
         assert!(
-            reg.is_revoked(&key),
+            reg.is_revoked(&key).await,
             "unknown session must be treated as revoked (fail-closed)"
         );
     }
 
     /// OIDC `sid` and `workload_session_id` are disjoint: revoking one does
     /// not affect the other even for the same issuer and value string.
-    #[test]
-    fn session_namespaces_are_disjoint() {
+    #[tokio::test]
+    async fn session_namespaces_are_disjoint() {
         use crate::auth::credential::{
             ActiveOrRevoked, InMemorySessionRegistry, SessionKind, SessionRegistry, SessionState,
         };
@@ -955,14 +983,14 @@ mod tests {
             clearance_epoch: 0,
         };
 
-        reg.register_session(oidc_key.clone(), oidc_state).unwrap();
-        reg.register_session(wl_key.clone(), wl_state).unwrap();
+        reg.register_session(oidc_key.clone(), oidc_state).await.unwrap();
+        reg.register_session(wl_key.clone(), wl_state).await.unwrap();
 
         // Revoke the OIDC session.
-        reg.revoke_session(&oidc_key);
-        assert!(reg.is_revoked(&oidc_key), "OIDC session is revoked");
+        reg.revoke_session(&oidc_key).await.unwrap();
+        assert!(reg.is_revoked(&oidc_key).await, "OIDC session is revoked");
         assert!(
-            !reg.is_revoked(&wl_key),
+            !reg.is_revoked(&wl_key).await,
             "workload session with the same value string is NOT revoked"
         );
     }

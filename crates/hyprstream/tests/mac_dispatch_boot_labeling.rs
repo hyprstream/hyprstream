@@ -23,8 +23,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 
+use hyprstream_core::auth::identity_store::BootstrapPubkey;
 use hyprstream_core::auth::service_jwt::issue_or_load_service_jwt;
 use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::config::TokenConfig;
@@ -91,16 +92,19 @@ fn mint_service_jwt(
     dir: &tempfile::TempDir,
     service_name: &str,
     ca_jwt_key: &SigningKey,
-    service_vk: &VerifyingKey,
+    service_key: &SigningKey,
 ) -> String {
     let now = chrono::Utc::now().timestamp();
+    let bootstrap = BootstrapPubkey::for_service_key(service_key)
+        .expect("fixture service hybrid enrollment");
     issue_or_load_service_jwt(
         dir.path(),
         service_name,
         ca_jwt_key,
-        service_vk,
+        &bootstrap,
         ISSUER,
         now,
+        Some(&hyprstream_core::mac::dispatch_labels::BOOTSTRAP_SERVICE_CLEARANCE),
     )
     .expect("mint service JWT")
 }
@@ -168,7 +172,7 @@ async fn fresh_state_register_service_key_passes_production_dispatch_pep() -> Re
         &creds,
         "discovery",
         &ca_jwt_key,
-        &discovery_key.verifying_key(),
+        &discovery_key,
     );
 
     let tag = format!("mac-1499-policy-{}", uuid::Uuid::new_v4());
@@ -272,7 +276,7 @@ async fn undeclared_service_domain_denies_before_handler_entry() -> Result<()> {
         &creds,
         "discovery",
         &ca_jwt_key,
-        &discovery_key.verifying_key(),
+        &discovery_key,
     );
 
     // A live service whose domain is NOT in the declared table.

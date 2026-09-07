@@ -2583,6 +2583,37 @@ mod tests {
         }
     }
 
+    /// Fixed classical primary key + base64url for the multiprocess issuance
+    /// requests (they mint user at+jwt, which v16 binds to an authoritative
+    /// primary suite).
+    fn test_primary_key() -> [u8; 32] {
+        [0x66; 32]
+    }
+    fn test_user_pub_key_b64() -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        URL_SAFE_NO_PAD.encode(test_primary_key())
+    }
+    /// A permissive isolated primary resolver (any subject → the fixed classical
+    /// key) — the fixture equivalent of WS-C's enrollment store for these
+    /// multiprocess authority tests.
+    fn test_permissive_primary_resolver(
+    ) -> Arc<dyn crate::services::policy::PrimaryEnrollmentResolver> {
+        struct R;
+        impl crate::services::policy::PrimaryEnrollmentResolver for R {
+            fn primary_group(
+                &self,
+                _principal: &str,
+                _tenant: &str,
+            ) -> Option<crate::services::policy::PrimaryGroup> {
+                Some(crate::services::policy::PrimaryGroup {
+                    suite_id: hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519.to_owned(),
+                    ordered_component_keys: vec![test_primary_key().to_vec()],
+                })
+            }
+        }
+        Arc::new(R)
+    }
+
     #[test]
     fn composite_oauth_production_process() {
         let Some(dir) = authority_process_dir() else {
@@ -2593,6 +2624,28 @@ mod tests {
             .block_on(async {
                 install_signing_authority(&dir, true).await?;
                 wait_path(&dir.join("authority-policy.sock"));
+                // Mirror production `init_process_authority_stores`: a non-policy
+                // process (this OAuth child) publishes RPC-client authority
+                // stores that DELEGATE to the canonical policy-owned authority
+                // over the policy socket — never private in-memory stores, which
+                // the separate policy process (where `issue_token` actually runs)
+                // could not see. A fresh sid registered here therefore crosses
+                // RPC into the canonical registry that `handle_issue_token`
+                // validates against, and issued-token verification checks the
+                // same canonical revocation store. Fail-closed is preserved: an
+                // unreachable authority answers not-active / revoked. Isolated to
+                // this re-exec'd single-test subprocess — the main-binary
+                // invocation of this fn early-returns above before reaching here.
+                let _ = hyprstream_rpc::auth::set_global_session_registry(Arc::new(
+                    crate::services::revocation::PolicyAuthoritySessionRegistry::new(
+                        policy_client_for_socket(&dir)?,
+                    ),
+                ));
+                let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                    crate::services::revocation::PolicyAuthorityRevocationStore::new(
+                        policy_client_for_socket(&dir)?,
+                    ),
+                ));
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
                 let address = listener.local_addr()?;
                 let mut config = test_config();
@@ -2694,6 +2747,20 @@ mod tests {
         runtime
             .block_on(async {
                 install_signing_authority(&dir, true).await?;
+                // Canonical policy-owned authority stores (v16 §3.3): the policy
+                // process owns the single session registry and credential
+                // revocation store. Every other process delegates to it over RPC
+                // (see the OAuth child's PolicyAuthority* stores), so a sid the
+                // OAuth child registers crosses RPC into THIS registry, which
+                // `handle_issue_token` then validates against. Published before
+                // the PolicyService serves. Isolated to this re-exec'd
+                // single-test subprocess.
+                let _ = hyprstream_rpc::auth::set_global_session_registry(Arc::new(
+                    hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+                ));
+                let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                    hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+                ));
                 let db = dir.join(format!("policy-db-{}", std::process::id()));
                 std::fs::create_dir_all(&db)?;
                 let policy_manager = Arc::new(
@@ -2721,7 +2788,16 @@ mod tests {
                         dir.join("authority-policy.sock"),
                     ),
                 )
-                .with_default_audience("multiprocess".to_owned());
+                .with_default_audience("multiprocess".to_owned())
+                // Production-equivalent key source: signing resolves the
+                // composite authority through the configured JwtKeySource (the
+                // `ClusterKeySource` ledger defaults to the process-global
+                // authority this subprocess configures).
+                .with_jwt_key_source(Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+                    SigningKey::from_bytes(&[0x73; 32]).verifying_key(),
+                    "multiprocess".to_owned(),
+                )))
+                .with_primary_enrollment_resolver(test_permissive_primary_resolver());
                 let shutdown = Arc::new(tokio::sync::Notify::new());
                 let shutdown_server = Arc::clone(&shutdown);
                 std::thread::spawn(move || {
@@ -2738,11 +2814,14 @@ mod tests {
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("multiprocess-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?
                     .token;
@@ -2852,7 +2931,12 @@ mod tests {
                     git2db,
                     hyprstream_rpc::transport::TransportConfig::ipc(dir.join("stale-policy.sock")),
                 )
-                .with_default_audience("multiprocess".to_owned());
+                .with_default_audience("multiprocess".to_owned())
+                .with_jwt_key_source(Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+                    SigningKey::from_bytes(&[0x73; 32]).verifying_key(),
+                    "multiprocess".to_owned(),
+                )))
+                .with_primary_enrollment_resolver(test_permissive_primary_resolver());
                 let shutdown = Arc::new(tokio::sync::Notify::new());
                 let shutdown_server = Arc::clone(&shutdown);
                 std::thread::spawn(move || {
@@ -2866,11 +2950,14 @@ mod tests {
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("stale-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await;
                 anyhow::ensure!(result.is_err(), "stale PolicyService minted a token");
@@ -3013,7 +3100,12 @@ mod tests {
                     git2db,
                     hyprstream_rpc::transport::TransportConfig::ipc(dir.join(socket)),
                 )
-                .with_default_audience("multiprocess".to_owned());
+                .with_default_audience("multiprocess".to_owned())
+                .with_jwt_key_source(Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+                    SigningKey::from_bytes(&[0x73; 32]).verifying_key(),
+                    "multiprocess".to_owned(),
+                )))
+                .with_primary_enrollment_resolver(test_permissive_primary_resolver());
                 let shutdown = Arc::new(tokio::sync::Notify::new());
                 let shutdown_server = Arc::clone(&shutdown);
                 std::thread::spawn(move || {
@@ -3027,11 +3119,14 @@ mod tests {
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("restart-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?
                     .token;
@@ -3163,11 +3258,14 @@ mod tests {
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("pre-rotation-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?;
                 let client = reqwest::Client::new();
@@ -3394,11 +3492,14 @@ mod tests {
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("timeout-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?
                     .token;

@@ -28,6 +28,7 @@ pub mod policy_migration;
 pub mod policy_templates;
 mod production_user_store;
 pub mod rocksdb_store;
+pub mod service_enrollment;
 pub mod service_jwt;
 pub mod user_store;
 #[cfg(feature = "valkey")]

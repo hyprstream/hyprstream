@@ -170,6 +170,7 @@ mod tests {
             dpop_jkt: None,
             client_assertion_jkt: None,
             ucan_grant: None,
+            session_id: None,
         };
         store.put("refresh", &entry, 60).await.unwrap();
 

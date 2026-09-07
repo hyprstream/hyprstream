@@ -53,20 +53,31 @@ pub struct CnfJwk {
     pub x: String,
 }
 
-/// RFC 8705 Proof-of-Possession `cnf` claim.
+/// RFC 8705 / RFC 8747 Proof-of-Possession `cnf` claim.
 ///
-/// Two key-binding modes:
-/// - `jwk`: Full OKP JWK object — used for WIMSE service WITs (`cnf.jwk`).
-/// - `jkt`: JWK Thumbprint (RFC 7638 SHA-256, base64url) — used for DPoP user
-///   tokens (`cnf.jkt`, per RFC 9449 § 6).
+/// Key-binding modes:
+/// - `jwk`: Full OKP JWK object — legacy single-Ed25519 binding (`cnf.jwk`).
+/// - `jkt`: JWK Thumbprint (RFC 7638 SHA-256, base64url) — DPoP user tokens
+///   (`cnf.jkt`, per RFC 9449 § 6).
+/// - `hs_signer_suite`: the v16 signer-suite content thumbprint (frozen WS-A
+///   credential-profile §1.1/§5) — base64url(SHA-256(det-CBOR `[suite_id,
+///   [ordered raw component public keys]]`)). This is the ONLY confirmation
+///   method that can bind a **hybrid** (multi-key) primary signer group, and it
+///   also covers a classical (single-key) group; a v16 dispatch credential MUST
+///   carry it. Computed via [`crate::auth::signer_suite_thumbprint`] — the one
+///   shared helper mint (WS-B) and verify (WS-C) both use. Legacy `jwk`/`jkt`
+///   are preserved ALONGSIDE it where those protocols still require them; adding
+///   `hs_signer_suite` never overwrites them.
 ///
-/// Both fields are optional so the struct serialises correctly for each mode.
+/// All fields are optional so the struct serialises correctly for each mode.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Cnf {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jwk: Option<CnfJwk>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jkt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_signer_suite: Option<String>,
 }
 
 /// RFC 8693 §4.1 actor claim — the two-principal carrier for delegated calls
@@ -102,7 +113,7 @@ pub struct ActClaim {
     /// unlabeled ⇒ the delegated derivation **fails closed** (no default
     /// clearance for a missing principal; the S1 rule).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clearance: Option<crate::auth::mac::SecurityLabel>,
+    pub clearance: Option<crate::auth::mac::CredentialClearance>,
     /// Nested actor for multi-hop delegation (RFC 8693 §4.1). Boxed to keep
     /// [`Claims`] sized. Each hop composes into the clearance meet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,9 +145,28 @@ pub struct Claims {
     /// RFC 7519 JWT ID — unique token identifier for revocation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jti: Option<String>,
+    /// Registered OIDC session ID (`sid`) — groups an interactive session
+    /// whose access-token rotations share one revocable session. Absent on
+    /// standalone service credentials (no session lifecycle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    /// Workload credential family session ID (`workload_session_id`) — a
+    /// distinct namespace from OIDC `sid` (v16 §3.3). Present only on
+    /// credentials of an enrolled workload family (e.g. a service-JWT
+    /// renewal chain); a standalone service credential omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_session_id: Option<String>,
     /// RFC 8707 audience claim for resource indicator binding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<String>,
+    /// RFC 9068 §2.2.1 `client_id` — the OAuth client the access token was
+    /// issued to. REQUIRED (non-empty) on locally issued `at+jwt` credentials
+    /// (v16 credential profile; JWT-only, no CWT mapping). Distinct from `aud`
+    /// (the RFC 8707 resource indicator) and from `sub` (the resource owner).
+    /// Absent on non-`at+jwt` credentials (e.g. `wit+jwt` service tokens) and
+    /// on the in-process empty-issuer provenance path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     /// OAuth 2.0 granted scope set, serialized as a space-delimited string.
     ///
     /// This is optional because non-OAuth service tokens do not originate from
@@ -182,7 +212,7 @@ pub struct Claims {
     /// clearance; the S1 fail-closed rule). Carried on the hybrid-signed
     /// envelope/JWT so it is itself PQ-forgery-resistant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clearance: Option<crate::auth::mac::SecurityLabel>,
+    pub clearance: Option<crate::auth::mac::CredentialClearance>,
 
     /// **Delegation actor (RFC 8693 §4.1 `act`, #680/#681).** Present iff this is
     /// a delegated (on-behalf-of) token: [`Self::sub`] is the delegator (source of
@@ -218,7 +248,10 @@ impl std::fmt::Debug for Claims {
             .field("exp", &self.exp)
             .field("iat", &self.iat)
             .field("jti", &self.jti)
+            .field("sid", &self.sid)
+            .field("workload_session_id", &self.workload_session_id)
             .field("aud", &self.aud)
+            .field("client_id", &self.client_id)
             .field("scope", &self.scope)
             .field("cnf", &self.cnf)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
@@ -303,6 +336,7 @@ impl FromCapnp for Claims {
                     x: x.to_owned(),
                 }),
                 jkt: None,
+                hs_signer_suite: None,
             });
 
         Ok(Self {
@@ -314,7 +348,12 @@ impl FromCapnp for Claims {
             exp: reader.get_exp(),
             iat: reader.get_iat(),
             jti: None,
+            // `sid` / `workload_session_id` are JWT-carried, like `jti`;
+            // the envelope Claims surface does not carry them.
+            sid: None,
+            workload_session_id: None,
             aud,
+            client_id: None,
             // The dedicated OAuth field preserves the signed grant ceiling;
             // the legacy structured scope list remains unused by Claims.
             scope,
@@ -334,6 +373,34 @@ impl FromCapnp for Claims {
     }
 }
 
+/// Session-claim parsing failure (v16 §3.3 exact-one rule). Any error is a
+/// malformed-credential rejection at a verification boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionClaimError {
+    /// Both `sid` and `workload_session_id` present — the namespaces are
+    /// disjoint; carrying both is ambiguous and never valid.
+    AmbiguousSessionClaims,
+    /// A present session identifier is empty or whitespace.
+    EmptySessionIdentifier,
+}
+
+impl std::fmt::Display for SessionClaimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AmbiguousSessionClaims => write!(
+                f,
+                "credential carries both sid and workload_session_id (disjoint namespaces)"
+            ),
+            Self::EmptySessionIdentifier => {
+                write!(f, "session identifier is empty")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionClaimError {}
+
+
 impl Claims {
     /// Create new claims.
     pub fn new(sub: String, iat: i64, exp: i64) -> Self {
@@ -344,7 +411,10 @@ impl Claims {
             exp,
             iat,
             jti: None,
+            sid: None,
+            workload_session_id: None,
             aud: None,
+            client_id: None,
             scope: None,
             cnf: None,
             token: None,
@@ -364,6 +434,51 @@ impl Claims {
         self
     }
 
+    /// Set the OIDC session ID (`sid` claim).
+    pub fn with_sid(mut self, sid: impl Into<String>) -> Self {
+        self.sid = Some(sid.into());
+        self
+    }
+
+    /// Set the workload credential family session ID
+    /// (`workload_session_id` claim) — enrolled workload families only.
+    pub fn with_workload_session_id(mut self, id: impl Into<String>) -> Self {
+        self.workload_session_id = Some(id.into());
+        self
+    }
+
+    /// The credential's session binding under exact-one parsing (v16 §3.3):
+    /// a credential carries AT MOST ONE session identifier, in a disjoint
+    /// namespace — OIDC `sid` (interactive) or `workload_session_id`
+    /// (enrolled workload family). Both-present is ambiguous and rejects;
+    /// a present-but-empty identifier is malformed and rejects. Neither is
+    /// `Ok(None)` (standalone credential, no session).
+    ///
+    /// Every authorization and cache-insertion path MUST use this parser —
+    /// never an `sid.or_else(workload_session_id)` chain, which would let an
+    /// active OIDC session mask a revoked or unknown workload session.
+    pub fn session_key(&self) -> std::result::Result<
+        Option<super::credential::SessionKey>,
+        SessionClaimError,
+    > {
+        let sid = self.sid.as_deref();
+        let wsid = self.workload_session_id.as_deref();
+        if sid.is_some() && wsid.is_some() {
+            return Err(SessionClaimError::AmbiguousSessionClaims);
+        }
+        if sid.is_some_and(|v| v.trim().is_empty())
+            || wsid.is_some_and(|v| v.trim().is_empty())
+        {
+            return Err(SessionClaimError::EmptySessionIdentifier);
+        }
+        Ok(match (sid, wsid) {
+            (Some(sid), None) => Some(super::credential::SessionKey::oidc(&self.iss, sid)),
+            (None, Some(id)) => Some(super::credential::SessionKey::workload(&self.iss, id)),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("both-present rejected above"),
+        })
+    }
+
     /// Set the issuer URL (RFC 7519 `iss` claim).
     /// Should be the OAuth issuer URL of the hyprstream node that issued this token.
     pub fn with_issuer(mut self, issuer: String) -> Self {
@@ -380,6 +495,15 @@ impl Claims {
     /// Create new claims with an audience (RFC 8707 resource indicator).
     pub fn with_audience(mut self, audience: Option<String>) -> Self {
         self.aud = audience;
+        self
+    }
+
+    /// Set the RFC 9068 §2.2.1 `client_id` claim (the OAuth client the access
+    /// token was issued to). An empty/whitespace value is treated as absent so
+    /// a caller cannot satisfy the profile's non-empty requirement with a blank.
+    pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
+        let value = client_id.into();
+        self.client_id = (!value.trim().is_empty()).then_some(value);
         self
     }
 
@@ -414,14 +538,26 @@ impl Claims {
     /// OKP JWK object with `kty: "OKP"`, `crv: "Ed25519"`, `x: <base64url>`.
     pub fn with_cnf_jwk(mut self, key_bytes: &[u8; 32]) -> Self {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        self.cnf = Some(Cnf {
-            jwk: Some(CnfJwk {
-                kty: "OKP".to_owned(),
-                crv: "Ed25519".to_owned(),
-                x: URL_SAFE_NO_PAD.encode(key_bytes),
-            }),
-            jkt: None,
+        // Merge, never replace: a previously-stamped `hs_signer_suite` (or
+        // `jkt`) survives adding the legacy `jwk` binding, and vice versa.
+        let mut cnf = self.cnf.take().unwrap_or_default();
+        cnf.jwk = Some(CnfJwk {
+            kty: "OKP".to_owned(),
+            crv: "Ed25519".to_owned(),
+            x: URL_SAFE_NO_PAD.encode(key_bytes),
         });
+        self.cnf = Some(cnf);
+        self
+    }
+
+    /// Set the v16 `cnf.hs_signer_suite` confirmation (frozen WS-A profile
+    /// §1.1/§5): the base64url signer-suite content thumbprint. Merged into any
+    /// existing `cnf` so a legacy `jwk`/`jkt` binding is preserved alongside it.
+    /// Compute `thumbprint_b64url` from [`crate::auth::signer_suite_thumbprint`].
+    pub fn with_cnf_hs_signer_suite(mut self, thumbprint_b64url: String) -> Self {
+        let mut cnf = self.cnf.take().unwrap_or_default();
+        cnf.hs_signer_suite = Some(thumbprint_b64url);
+        self.cnf = Some(cnf);
         self
     }
 
@@ -431,10 +567,18 @@ impl Claims {
     /// computed per RFC 7638: SHA-256 of the lexicographic canonical JWK JSON,
     /// base64url-encoded.
     pub fn with_cnf_jkt(mut self, key_bytes: &[u8; 32]) -> Self {
-        self.cnf = Some(Cnf {
-            jwk: None,
-            jkt: Some(compute_jkt(key_bytes)),
-        });
+        let mut cnf = self.cnf.take().unwrap_or_default();
+        cnf.jkt = Some(compute_jkt(key_bytes));
+        self.cnf = Some(cnf);
+        self
+    }
+
+    /// Set the RFC 9449 `cnf.jkt` from a PRE-COMPUTED thumbprint string (e.g. a
+    /// verified DPoP proof's `jkt`). Merged into any existing `cnf`.
+    pub fn with_cnf_jkt_thumbprint(mut self, jkt: String) -> Self {
+        let mut cnf = self.cnf.take().unwrap_or_default();
+        cnf.jkt = Some(jkt);
+        self.cnf = Some(cnf);
         self
     }
 
@@ -444,6 +588,21 @@ impl Claims {
     /// PQ-forgery-resistant; the assurance axis is NOT carried here — it is
     /// derived from the verified key material at enforcement time.
     pub fn with_clearance(mut self, clearance: crate::auth::mac::SecurityLabel) -> Self {
+        // Project to the two-axis wire form (level + compartments); the
+        // assurance axis is dropped — it is never issuer-asserted (v16 §11).
+        self.clearance = Some(crate::auth::mac::CredentialClearance::from_label(clearance));
+        self
+    }
+
+    /// Set the MAC clearance claim from its two-axis wire projection directly.
+    /// Used when FORWARDING an already-projected clearance (e.g. re-stamping a
+    /// verified source credential's clearance onto a derived ticket) — the
+    /// value is copied through unchanged. Prefer [`Self::with_clearance`] when
+    /// starting from a full `SecurityLabel`.
+    pub fn with_credential_clearance(
+        mut self,
+        clearance: crate::auth::mac::CredentialClearance,
+    ) -> Self {
         self.clearance = Some(clearance);
         self
     }
@@ -520,7 +679,7 @@ impl Claims {
     /// is NOT thereby trusted to assert MAC clearance on this node — honoring it
     /// would let any trusted-for-identity federated IdP mint MAC clearance.
     /// Federated-path decode therefore drops the claim before the MAC PDP can
-    /// read it ([`crate::auth::mac::SubjectContextClaims::clearance_label`]
+    /// read it ([`crate::auth::mac::SubjectContextClaims::credential_clearance`]
     /// returns `None` ⇒ unlabeled ⇒ deny). Local-issuer tokens are unaffected.
     pub fn strip_federated_clearance(&mut self, local_issuers: &[&str]) {
         if !self.is_local_to(local_issuers) {
@@ -578,7 +737,7 @@ impl Claims {
 // Classical — the load-bearing #548 invariant: assurance is a property of the
 // verified identity, not a grant.
 impl crate::auth::mac::SubjectContextClaims for Claims {
-    fn clearance_label(&self) -> Option<crate::auth::mac::SecurityLabel> {
+    fn credential_clearance(&self) -> Option<crate::auth::mac::CredentialClearance> {
         self.clearance
     }
 }
@@ -734,7 +893,7 @@ mod tests {
             "a federated token's clearance MUST be ignored (Fu5/#677)"
         );
         assert!(
-            claims.clearance_label().is_none(),
+            claims.credential_clearance().is_none(),
             "the MAC PDP reads None ⇒ unlabeled ⇒ deny"
         );
     }
@@ -769,6 +928,55 @@ mod tests {
         assert!(
             claims.clearance.is_none(),
             "an unconfigured node honors no clearance (deny-by-default)"
+        );
+    }
+
+    /// Exact-one session parsing (v16 §3.3): a credential carries AT MOST ONE
+    /// session identifier in a disjoint namespace. Both-present is ambiguous
+    /// and rejects (an active OIDC `sid` must never mask a revoked/unknown
+    /// `workload_session_id`); a present-but-empty identifier is malformed and
+    /// rejects; neither is `Ok(None)`. This is the single parser every
+    /// authorization and cache-insertion path uses — never `sid.or(wsid)`.
+    #[test]
+    fn session_key_is_exact_one_never_or_else() {
+        use crate::auth::credential::SessionIdentifier;
+        let base =
+            || Claims::new("alice".to_owned(), 0, 100).with_issuer("https://iss.test".to_owned());
+
+        // Neither → no session.
+        assert_eq!(base().session_key(), Ok(None));
+
+        // sid only → the OIDC namespace, issuer-scoped.
+        let oidc = base().with_sid("s1").session_key().unwrap().unwrap();
+        assert_eq!(oidc.issuer, "https://iss.test");
+        assert!(matches!(oidc.id, SessionIdentifier::OidcSid(ref v) if v == "s1"));
+
+        // workload id only → the disjoint workload namespace.
+        let wl = base()
+            .with_workload_session_id("w1")
+            .session_key()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(wl.id, SessionIdentifier::WorkloadSessionId(ref v) if v == "w1"));
+
+        // Both present → ambiguous, rejected (no masking).
+        assert_eq!(
+            base().with_sid("s1").with_workload_session_id("w1").session_key(),
+            Err(SessionClaimError::AmbiguousSessionClaims)
+        );
+
+        // Present-but-empty (or whitespace) identifier → malformed, rejected.
+        assert_eq!(
+            base().with_sid("").session_key(),
+            Err(SessionClaimError::EmptySessionIdentifier)
+        );
+        assert_eq!(
+            base().with_sid("   ").session_key(),
+            Err(SessionClaimError::EmptySessionIdentifier)
+        );
+        assert_eq!(
+            base().with_workload_session_id("").session_key(),
+            Err(SessionClaimError::EmptySessionIdentifier)
         );
     }
 

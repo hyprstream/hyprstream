@@ -569,6 +569,13 @@ pub(crate) async fn verify_resource_token_claims(
     };
 
     // Credential revocation check (RFC 7009) — fail-closed on store absence.
+    // The credential profile makes `jti` REQUIRED on locally issued tokens:
+    // a local token without one is rejected outright (revocation could never
+    // observe it). Federated tokens keep the revocation check only.
+    let token_is_local = hyprstream_rpc::auth::is_local_iss(&claims.iss, local_issuers);
+    if token_is_local && claims.jti.is_none() {
+        return Err("local credential missing required jti");
+    }
     if let Some(ref jti) = claims.jti {
         let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
         match hyprstream_rpc::auth::global_credential_revocation_store() {
@@ -579,6 +586,39 @@ pub(crate) async fn verify_resource_token_claims(
             }
             None => return Err("revocation store unavailable"),
         }
+    }
+
+    // Session check (v16 §3.3): a local token carrying a session ID is
+    // rejected when the session is revoked, expired, unknown, or cannot be
+    // checked.
+    if token_is_local {
+        let session_key = match claims.session_key() {
+            Ok(key) => key,
+            Err(_) => return Err("malformed session claims"),
+        };
+        if let Some(session_key) = session_key {
+            match hyprstream_rpc::auth::global_session_registry() {
+                Some(registry) => {
+                    if registry.is_revoked(&session_key).await {
+                        return Err("session revoked");
+                    }
+                }
+                None => return Err("session registry unavailable"),
+            }
+        }
+    }
+
+    // RFC 9068 §2.2.1 (v16 credential profile): every token admitted on this
+    // resource-server path is an `at+jwt` (the verifier positively rejects any
+    // other `typ` before decoding — see the resource verifier's
+    // `is_rfc9068_access_token_type` gate), so it MUST carry a non-empty
+    // `client_id`. This covers local AND trusted federated at+jwt.
+    if claims
+        .client_id
+        .as_deref()
+        .is_none_or(|c| c.trim().is_empty())
+    {
+        return Err("at+jwt credential missing required client_id");
     }
 
     // Federation is trusted for identity, never for choosing a local
