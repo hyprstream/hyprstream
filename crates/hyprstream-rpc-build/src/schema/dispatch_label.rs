@@ -61,7 +61,8 @@ pub struct InitialLabelMap {
 }
 
 /// The map file is malformed (not valid JSON against the schema above, a
-/// duplicate name/bit, or a bit outside the `SecurityLabel` compartment width).
+/// duplicate live or tombstoned name/bit, live/tombstone overlap, or a bit
+/// outside the `SecurityLabel` compartment width).
 #[derive(Debug)]
 pub struct InitialLabelMapError(pub String);
 
@@ -152,6 +153,7 @@ impl InitialLabelMap {
             .map_err(|e| InitialLabelMapError(format!("invalid map JSON: {e}")))?;
         let mut bits = HashMap::new();
         let mut seen_bits = std::collections::HashSet::new();
+        let mut seen_names = std::collections::HashSet::new();
         for entry in &file.compartments {
             if entry.name.trim().is_empty() || entry.name != entry.name.trim() {
                 return Err(InitialLabelMapError(format!(
@@ -177,13 +179,32 @@ impl InitialLabelMap {
                     entry.bit
                 )));
             }
+            seen_names.insert(entry.name.clone());
             bits.insert(entry.name.clone(), entry.bit);
         }
         for entry in &file.retired {
-            if bits.contains_key(&entry.name) {
+            if entry.name.trim().is_empty() || entry.name != entry.name.trim() {
                 return Err(InitialLabelMapError(format!(
-                    "tombstoned compartment {:?} is also live",
+                    "tombstoned compartment name {:?} is empty or padded",
                     entry.name
+                )));
+            }
+            if entry.bit >= MAX_COMPARTMENT_BITS {
+                return Err(InitialLabelMapError(format!(
+                    "tombstoned compartment {:?} bit {} exceeds the {}-bit width",
+                    entry.name, entry.bit, MAX_COMPARTMENT_BITS
+                )));
+            }
+            if !seen_names.insert(entry.name.clone()) {
+                return Err(InitialLabelMapError(format!(
+                    "tombstoned compartment {:?} is already assigned or retired",
+                    entry.name
+                )));
+            }
+            if !seen_bits.insert(entry.bit) {
+                return Err(InitialLabelMapError(format!(
+                    "tombstoned compartment bit {} is already assigned or retired",
+                    entry.bit
                 )));
             }
         }
@@ -509,7 +530,39 @@ mod tests {
             r#"{"version":1,"compartments":[{"name":"a","bit":0}],"retired":[{"name":"a","bit":3}]}"#
         )
         .is_err());
+        // A renamed live compartment cannot reuse a retired bit.
+        assert!(InitialLabelMap::parse_text(
+            r#"{"version":1,"compartments":[{"name":"renamed","bit":3}],"retired":[{"name":"old","bit":3}]}"#
+        )
+        .is_err());
+        // Tombstones validate their own canonical name and bit constraints.
+        for malformed_retired in [
+            r#"{"version":1,"retired":[{"name":" ","bit":3}]}"#,
+            r#"{"version":1,"retired":[{"name":"old","bit":64}]}"#,
+            r#"{"version":1,"retired":[{"name":"old","bit":3},{"name":"old","bit":4}]}"#,
+            r#"{"version":1,"retired":[{"name":"old","bit":3},{"name":"older","bit":3}]}"#,
+        ] {
+            assert!(
+                InitialLabelMap::parse_text(malformed_retired).is_err(),
+                "malformed tombstone must deny: {malformed_retired}"
+            );
+        }
         // not JSON at all
         assert!(InitialLabelMap::parse_text("not json").is_err());
+    }
+
+    #[test]
+    fn disjoint_live_and_tombstoned_vocabulary_remains_canonical() {
+        let map = InitialLabelMap::parse_text(
+            r#"{"version":2,"compartments":[{"name":"pii","bit":0},{"name":"finance","bit":2}],"retired":[{"name":"former-core","bit":1},{"name":"former-legal","bit":3}]}"#,
+        )
+        .unwrap();
+        let label = parse_dispatch_mac("secret:pq-hybrid:pii,finance", &map).unwrap();
+        assert_eq!(label.compartment_bits, vec![0, 2]);
+        assert_eq!(
+            label.to_canonical_text(&map).as_deref(),
+            Some("secret:pq-hybrid:pii,finance")
+        );
+        assert_eq!(map.retired_names(), vec!["former-core", "former-legal"]);
     }
 }
