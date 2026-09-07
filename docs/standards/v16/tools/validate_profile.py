@@ -1170,6 +1170,25 @@ def gate_unattributed_keyset(positives, negatives) -> None:
 # --------------------------------------------------------------------------
 
 
+def vector_index_errors(text, positives, negatives):
+    """Compare table IDs only inside the canonical positive/negative sections."""
+    from collections import Counter
+    errors = []
+    for title, manifest in (("Positive vectors", positives), ("Negative vectors", negatives)):
+        section_match = re.search(rf"(?ms)^## {title}\s*\n(.*?)(?=^## |\Z)", text)
+        if section_match is None:
+            errors.append(f"missing {title} index section")
+            continue
+        ids = re.findall(r"(?m)^\|\s*([PN]-[0-9]+[a-z]*)\s*\|", section_match[1])
+        counts = Counter(ids)
+        expected = {v["id"] for v in manifest["vectors"]}
+        missing, extra = sorted(expected - counts.keys()), sorted(counts.keys() - expected)
+        duplicates = sorted(vid for vid, count in counts.items() if count > 1)
+        if missing or extra or duplicates:
+            errors.append(f"{title}: missing {missing}, extra {extra}, duplicates {duplicates}")
+    return errors
+
+
 def gate_readme_counts(positives, negatives) -> None:
     section("C2. Documented vector counts match the manifests")
     npos, nneg = len(positives["vectors"]), len(negatives["vectors"])
@@ -1188,6 +1207,30 @@ def gate_readme_counts(positives, negatives) -> None:
         check(ok, f"{label} vector counts must read {npos} positive / {nneg} negative")
         if ok:
             print(f"   {label} counts agree ({npos} positive / {nneg} negative)")
+
+    index_text = CANONICAL_VECTORS_PATH.read_text()
+    errors = vector_index_errors(index_text, positives, negatives)
+    check(not errors, f"canonical vector index must match manifest IDs exactly: {errors}")
+    # Causal controls keep count prose intact and mutate only actual table rows.
+    # Incidental mentions elsewhere cannot fill a missing index entry.
+    for vid, heading in (("P-10", "Positive vectors"), ("N-1", "Negative vectors")):
+        row = re.search(rf"(?m)^\| {vid} \|[^\n]*\n", index_text)
+        check(row is not None, f"{vid} index row must exist for completeness controls")
+        if row is None:
+            continue
+        missing = index_text[:row.start()] + index_text[row.end():]
+        duplicate = index_text[:row.end()] + row[0] + index_text[row.end():]
+        extra_id = vid[0] + "-999"
+        extra = index_text[:row.end()] + row[0].replace(vid, extra_id, 1) + index_text[row.end():]
+        for label, mutated, diagnostic in (
+            ("missing", missing, f"missing ['{vid}']"),
+            ("duplicate", duplicate, f"duplicates ['{vid}']"),
+            ("extra", extra, f"extra ['{extra_id}']"),
+        ):
+            failures = vector_index_errors(mutated, positives, negatives)
+            check(any(heading in e and diagnostic in e for e in failures),
+                  f"{heading} {label} row mutation must fail with {diagnostic}: {failures}")
+    print("   canonical P/N index IDs match; missing, duplicate and extra row controls deny")
 
 
 # --------------------------------------------------------------------------

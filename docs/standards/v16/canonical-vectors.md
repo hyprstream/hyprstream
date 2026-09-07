@@ -248,8 +248,9 @@ Object encoding is untagged: typing is performed by the protected `typ` header
 | P-6 | `COSE_Sign1` | 411 | Authenticated classical proof with a cleartext stream-setup `response_binding` (`response_kind` stream_setup, `protection_mode` cleartext, null recipient) — exercises the orthogonal axes | `86f50e9862a45d0805786ae207fc310693e75f60dc50d44682b9ae1846030201` |
 | P-7 | `COSE_Sign1` | 1605 | Bound response proof whose `response_binding` equals the originating request (P-4) field-for-field | `ab0b26bd2956ad31dcd047869a76e663171e2c57f0414d9d91d7795ba99aa5ab` |
 | P-8 | `COSE_Sign` | 5862 | Hybrid unattributed proof; two embedded keys in plan order, each signature verified against its embedded key | `4f8fdbf677f7b28cf16b45af61067602f7f4082be2ced79b251ede6ecf82e6df` |
-| P-11 | `COSE_Sign1` | 392 | Authenticated request for N-59's alternate audience, with a matching issuer-signed credential and null response binding | `e6f62643192c9b646fe126d650e81ba7550a2df4097d7b63d4e6a41391c508bc` |
 | P-9 | `COSE_Sign1` | 395 | Session-bound classical proof whose `exp` equals the authoritative session expiry (accepts within both bounds) | `bfa6026b0c940b15c050274b640344ef77117585881a6c0c25c1b39671bba77d` |
+| P-10 | `COSE_Sign1` | 401 | Workload-session-bound classical proof with a workload primary key and `exp` within the workload session | `c68104374c0f4a28138974694cce358778617af5fb4e6336dc8b8df27617a5e2` |
+| P-11 | `COSE_Sign1` | 392 | Authenticated request for N-59's alternate audience, with a matching issuer-signed credential and null response binding | `e6f62643192c9b646fe126d650e81ba7550a2df4097d7b63d4e6a41391c508bc` |
 
 ### P-1 — unattributed `COSE_Sign1` (complete CBOR)
 
