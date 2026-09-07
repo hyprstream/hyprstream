@@ -43,6 +43,7 @@ use tempfile::TempDir;
 struct Fixture {
     _dir: TempDir,
     _discovery: hyprstream_service::SpawnedService,
+    announcement_cancellation: tokio_util::sync::CancellationToken,
     well_known: std::path::PathBuf,
     did_web: String,
     capsule: CapsuleMaterial,
@@ -192,7 +193,9 @@ async fn build_fixture() -> Fixture {
         TransportConfig::inproc("did-trust-e2e-discovery"),
     );
     let (addr_tx, addr_rx) = tokio::sync::oneshot::channel::<SocketAddr>();
+    let announcement_cancellation = tokio_util::sync::CancellationToken::new();
     let quic_config = hyprstream_rpc::service::QuicLoopConfig {
+        announcement_cancellation: announcement_cancellation.clone(),
         cert_chain: vec![quic_cert_der.clone()],
         key_der: zeroize::Zeroizing::new(quic_key_der),
         bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -223,6 +226,7 @@ async fn build_fixture() -> Fixture {
     let fixture = Fixture {
         well_known,
         _discovery: spawned,
+        announcement_cancellation,
         did_web,
         capsule,
         // The GATE-verified capsule's primary subject key is the deployment
@@ -387,4 +391,14 @@ async fn dead_or_wrong_key_discovery_fails_liveness() {
         client.ping().await.is_err(),
         "ping pinned to a key the endpoint does not hold must fail"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_bound_service_cancels_announcement_lifetime() {
+    let mut fixture = build_fixture().await;
+    assert!(!fixture.announcement_cancellation.is_cancelled());
+    tokio::time::timeout(std::time::Duration::from_secs(10), fixture._discovery.stop())
+        .await.expect("service stop must drain without competing Notify consumers")
+        .expect("service stop");
+    assert!(fixture.announcement_cancellation.is_cancelled());
 }

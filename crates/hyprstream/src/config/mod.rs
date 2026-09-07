@@ -603,6 +603,7 @@ impl QuicConfig {
             serde_json::to_vec(&meta).unwrap_or_default()
         });
         Ok(hyprstream_rpc::service::QuicLoopConfig {
+            announcement_cancellation: tokio_util::sync::CancellationToken::new(),
             cert_chain,
             key_der,
             bind_addr: addr,
