@@ -12,11 +12,16 @@ use hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes;
 use std::sync::Arc;
 
 use crate::auth::identity_store::{load_existing_service_signing_key, SecretsProfile};
+use crate::config::HyprConfig;
 use crate::services::discovery::{At9pStateIngest, PdsRecordStore};
 
 /// Provision or renew a complete local service roster. The database writer
 /// lock excludes a running registry; callers must order this before services.
-pub fn provision_services(services: &[String], valid_for_seconds: i64) -> Result<()> {
+pub fn provision_services(
+    config: &HyprConfig,
+    services: &[String],
+    valid_for_seconds: i64,
+) -> Result<()> {
     ensure!(
         (600..=86_400).contains(&valid_for_seconds),
         "service identity lifetime must be 600..86400 seconds"
@@ -31,7 +36,7 @@ pub fn provision_services(services: &[String], valid_for_seconds: i64) -> Result
         );
     }
     let verifier = hyprstream_discovery::authenticate_local_deployment_registry()?;
-    let secrets = crate::config::HyprConfig::resolve_secrets_dir()?;
+    let secrets = provisioning_secrets_dir(config)?;
     let acceptance =
         load_existing_service_signing_key(&secrets, "registry", SecretsProfile::SharedDirectory)?;
     ensure!(
@@ -89,6 +94,13 @@ pub fn provision_services(services: &[String], valid_for_seconds: i64) -> Result
         tracing::info!(service = name, did = %verified.did, epoch = verified.epoch, "checkpoint-accepted service identity ready");
     }
     Ok(())
+}
+
+/// The command is dispatched after `main` has loaded and validated the
+/// operator-selected configuration. Reusing that exact value keeps an explicit
+/// `--config` `[secrets].path` authoritative rather than reloading defaults.
+fn provisioning_secrets_dir(config: &HyprConfig) -> Result<std::path::PathBuf> {
+    HyprConfig::resolve_secrets_dir_for(Some(config))
 }
 
 fn provision_one(
@@ -203,11 +215,23 @@ mod tests {
 
     #[test]
     fn deployment_bootstrap_rejects_invalid_roster_and_lifetime_before_credentials() {
-        assert!(provision_services(&["model".to_owned()], 599).is_err());
-        assert!(provision_services(&["model".to_owned()], 86401).is_err());
-        assert!(provision_services(&[], 86400).is_err());
-        assert!(provision_services(&["model".to_owned(), "model".to_owned()], 86400).is_err());
-        assert!(provision_services(&["../not-a-service".to_owned()], 86400).is_err());
+        let config = HyprConfig::default();
+        assert!(provision_services(&config, &["model".to_owned()], 599).is_err());
+        assert!(provision_services(&config, &["model".to_owned()], 86401).is_err());
+        assert!(provision_services(&config, &[], 86400).is_err());
+        assert!(
+            provision_services(&config, &["model".to_owned(), "model".to_owned()], 86400).is_err()
+        );
+        assert!(provision_services(&config, &["../not-a-service".to_owned()], 86400).is_err());
+    }
+
+    #[test]
+    fn deployment_bootstrap_uses_loaded_config_for_secrets_dir() -> Result<()> {
+        let mut config = HyprConfig::default();
+        let custom_secrets = tempfile::tempdir()?.path().join("custom-secrets");
+        config.secrets.path = Some(custom_secrets.clone());
+        assert_eq!(provisioning_secrets_dir(&config)?, custom_secrets);
+        Ok(())
     }
 
     fn fixture() -> Result<(

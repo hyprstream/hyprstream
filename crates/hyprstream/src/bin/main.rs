@@ -2380,7 +2380,11 @@ fn main() -> Result<()> {
                     .context("service roster is required")?.cloned().collect::<Vec<_>>();
                 let lifetime = *provision_m.get_one::<i64>("valid-for-seconds")
                     .context("service identity lifetime is required")?;
-                hyprstream_core::cli::deployment_bootstrap::provision_services(&services, lifetime)?;
+                hyprstream_core::cli::deployment_bootstrap::provision_services(
+                    &config,
+                    &services,
+                    lifetime,
+                )?;
                 println!("checkpoint-accepted service roster ready ({} services)", services.len());
                 return Ok(());
             }
