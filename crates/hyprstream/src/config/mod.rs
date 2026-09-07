@@ -460,6 +460,11 @@ pub struct QuicConfig {
     #[serde(default)]
     pub event_publishers: std::collections::BTreeSet<String>,
 
+    /// Explicit remote Streams ingress, separate from Event permissions.
+    /// Empty leaves admitted peers read-only.
+    #[serde(default)]
+    pub stream_publishers: std::collections::BTreeSet<String>,
+
     /// #358: the producer-chosen moq RELAY this node rendezvouses through, as a
     /// dialable URI (`https://host:port` for the relay's WebTransport `/moq`
     /// endpoint, or an iroh node URI). Empty = direct-only (the baseline). When
@@ -483,6 +488,7 @@ impl Default for QuicConfig {
             native_network_profile: NativeNetworkProfile::Compatibility,
             moql_subject_tenants: Default::default(),
             event_publishers: Default::default(),
+            stream_publishers: Default::default(),
             relay: String::new(),
         }
     }

@@ -269,7 +269,7 @@ impl NativeServiceAnnouncement {
         let recipient = hyprstream_rpc::node_identity::derive_mesh_kem_recipient(signer)?.public();
         let announcement = Self {
             service_did: did.clone(),
-            capabilities: if service_name == "event" {
+            capabilities: if matches!(service_name, "event" | "streams") {
                 vec!["hyprstream-moq/1".to_owned()]
             } else {
                 vec!["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()]
@@ -293,7 +293,7 @@ impl NativeServiceAnnouncement {
         );
         anyhow::ensure!(
             !service_name.is_empty() && self.capabilities.iter().any(|c| c ==
-                if service_name == "event" { "hyprstream-moq/1" } else { "hyprstream-rpc/1" }),
+                if matches!(service_name, "event" | "streams") { "hyprstream-moq/1" } else { "hyprstream-rpc/1" }),
             "native announcement lacks canonical service capability"
         );
         anyhow::ensure!(
@@ -426,7 +426,7 @@ impl QuicSharedConfig {
             moq_relay_server_identity: self.moq_relay_server_identity.clone(),
             // #1027: thread the daemon-owned moql admission authenticator
             // through so the spawner installs it on the iroh `moql` handler.
-            moq_admission: self.moq_admission.clone(),
+            moq_admission: self.moq_admission.as_ref().map(|admission| Arc::new(admission.for_server())),
             moq_ingress_authorizer: self.moq_ingress_authorizer.clone(),
             moq_admission_proof: self.moq_admission_proof.clone(),
         }

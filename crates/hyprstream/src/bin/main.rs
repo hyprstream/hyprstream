@@ -1737,6 +1737,9 @@ async fn install_process_production_resolver(
              has no remote-Discovery story and would silently ignore this flag"
         );
     }
+    if config.quic.iroh_required() {
+        hyprstream_rpc::moq_stream::require_native_iroh();
+    }
     hyprstream_discovery::bootstrap_deployment_process(
         signing_key.clone(),
         trust_source,
@@ -3163,12 +3166,10 @@ fn main() -> Result<()> {
                                         // verified resolver result; the URI alone is reachability,
                                         // never an application identity.
                                         moq_relay_server_identity: None,
-                                        // #1027: no moql admission material is provisioned at
-                                        // daemon bootstrap yet; the accept path stays in its
-                                        // fail-closed anonymous posture until a deployment
-                                        // installs an authenticator here.
-                                        moq_admission: None,
-                                        moq_ingress_authorizer: None,
+                                        moq_admission: if moq_admission_proof.is_some() {
+                                            Some(hyprstream_core::services::stream_network::production_stream_admission(&qc)?)
+                                        } else { None },
+                                        moq_ingress_authorizer: Some(hyprstream_core::services::stream_network::stream_ingress_authorizer(&qc)),
                                         moq_admission_proof,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             move |request: hyprstream_service::NativeAnnouncementRequest| {
