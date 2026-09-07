@@ -384,9 +384,19 @@ pub fn current_timestamp_ms() -> i64 {
 }
 
 /// Generate a random 16-byte nonce.
+///
+/// Backed by `OsRng` — the same cryptographic source this module already uses
+/// for the AES-GCM nonce below and that `envelope::generate_nonce` uses
+/// natively (`getrandom` is configured with the browser backend for wasm32).
+/// A previous revision returned all-zeros here on the assumption `OsRng` was
+/// wasm-hostile; that was a footgun — any browser caller populating a replay
+/// nonce from it would silently defeat replay protection. It returns real
+/// entropy.
 #[wasm_bindgen]
 pub fn generate_nonce() -> Vec<u8> {
-    crate::envelope::generate_nonce().to_vec()
+    let mut nonce = vec![0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    nonce
 }
 
 // ============================================================================

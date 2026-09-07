@@ -701,10 +701,10 @@ mod tests {
         async fn handle_request(
             &self,
             _ctx: &crate::service::EnvelopeContext,
-            payload: &[u8],
+            body: &crate::service::DecodedRequestBody,
         ) -> Result<(Vec<u8>, Option<crate::service::Continuation>)> {
             let mut out = vec![0xBE];
-            out.extend_from_slice(payload);
+            out.extend_from_slice(body.bytes());
             Ok((out, None))
         }
         async fn verify_claims(&self, _ctx: &mut crate::service::EnvelopeContext) -> Result<()> {
@@ -716,6 +716,13 @@ mod tests {
         }
         fn build_error_payload(&self, _request_id: u64, error: &str) -> Vec<u8> {
             error.as_bytes().to_vec()
+        }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> Result<crate::service::DecodedRequestBody> {
+            Ok(crate::service::DecodedRequestBody::opaque(signed_body.to_vec()))
+
         }
         fn name(&self) -> &str {
             &self.name
@@ -903,7 +910,7 @@ mod tests {
             for response in responses {
                 let wire = response.await??;
                 let (_, payload) = crate::envelope::unwrap_response(&wire, Some(&key.verifying_key()))?;
-                assert_eq!(payload, b"gated claims denial");
+                assert_eq!(payload, crate::service::dispatch::DISPATCH_DENIED.as_bytes());
             }
             anyhow::Ok(())
         };

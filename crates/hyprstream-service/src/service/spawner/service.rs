@@ -1251,12 +1251,21 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl RequestService for EchoService {
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> AnyhowResult<hyprstream_rpc::service::DecodedRequestBody> {
+            Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(
+                signed_body.to_vec(),
+            ))
+        }
+
         async fn handle_request(
             &self,
             _ctx: &hyprstream_rpc::service::EnvelopeContext,
-            payload: &[u8],
+            body: &hyprstream_rpc::service::DecodedRequestBody,
         ) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
-            Ok((payload.to_vec(), None))
+            Ok((body.bytes().to_vec(), None))
         }
 
         fn name(&self) -> &str {
@@ -1289,12 +1298,15 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl RequestService for GatedService {
+        fn decode_request_body(&self, signed_body: &[u8]) -> AnyhowResult<hyprstream_rpc::service::DecodedRequestBody> {
+            self.echo.decode_request_body(signed_body)
+        }
         async fn handle_request(
             &self,
             _ctx: &hyprstream_rpc::service::EnvelopeContext,
-            payload: &[u8],
+            body: &hyprstream_rpc::service::DecodedRequestBody,
         ) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
-            anyhow::bail!("denied request reached handler: {}", payload.len())
+            anyhow::bail!("denied request reached handler: {}", body.bytes().len())
         }
         async fn verify_claims(&self, _ctx: &mut hyprstream_rpc::service::EnvelopeContext) -> AnyhowResult<()> {
             self.entered.notify_one();
@@ -1367,7 +1379,7 @@ mod tests {
             // client must be rejected while the accepted call is still gated.
             assert!(tokio::time::timeout(std::time::Duration::from_secs(5), client.call(b"late".to_vec())).await?.is_err());
             release.notify_one();
-            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), response).await???, b"gated claims denial");
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), response).await???, hyprstream_rpc::service::dispatch::DISPATCH_DENIED.as_bytes());
             tokio::time::timeout(std::time::Duration::from_secs(5), task).await???;
             assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "retained client pinned service");
             assert!(client.call(b"late".to_vec()).await.is_err());

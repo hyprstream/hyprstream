@@ -1327,9 +1327,15 @@ mod tests {
         async fn handle_request(
             &self,
             _ctx: &hyprstream_rpc::service::EnvelopeContext,
-            payload: &[u8],
+            body: &hyprstream_rpc::service::DecodedRequestBody,
         ) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
-            Ok((payload.to_vec(), None))
+            Ok((body.bytes().to_vec(), None))
+        }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+            Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(signed_body.to_vec()))
         }
         fn name(&self) -> &str { "model" }
         fn transport(&self) -> &hyprstream_rpc::transport::TransportConfig { &self.transport }
