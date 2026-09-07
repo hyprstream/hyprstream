@@ -453,7 +453,8 @@ def main() -> None:
         service_ed_2_pub = sk_s_ed_2.public_key().public_bytes_raw()  # A3 second response signer
 
         def build_at_jwt(jti: str, cnf_thumbprint: bytes, *, sid: str = None, exp: int = EXP,
-                         sub: str = CREDENTIAL_SUBJECT, workload_session_id: str = None):
+                         sub: str = CREDENTIAL_SUBJECT, workload_session_id: str = None,
+                         aud: str = SERVICE_DOMAIN):
             """A compact JWS (RFC 7519/8725) access token: exact at+jwt header,
             EdDSA over the seeded issuer key, and every required v16
             authenticated-dispatch claim. Ed25519 + canonical JSON => byte-stable.
@@ -464,7 +465,7 @@ def main() -> None:
             claims = {
                 "iss": ISSUER_ISS,
                 "sub": sub,
-                "aud": SERVICE_DOMAIN,
+                "aud": aud,
                 "iat": IAT,
                 "exp": exp,
                 "jti": jti,
@@ -486,6 +487,10 @@ def main() -> None:
 
         cred_classical, hdr_classical, claims_classical = build_at_jwt("cred-classical-1", cnf_classical)
         cred_hybrid, hdr_hybrid, claims_hybrid = build_at_jwt("cred-hybrid-1", cnf_hybrid)
+        other_aud = "other.svc.hyprstream.test"
+        cred_other, hdr_other, claims_other = build_at_jwt(
+            "cred-other-audience-1", cnf_classical, aud=other_aud)
+        credential_hash_other = hashlib.sha256(cred_other.encode("ascii")).digest()
         # K1: a user-session at+jwt credential carrying OIDC `sid`; its authoritative
         # session record (below) has an EARLIER expiry than the credential, so a proof
         # can be within the credential bound yet outlive the session.
@@ -1028,6 +1033,17 @@ def main() -> None:
                 "workload primary enrollment (principal workload-1); proof exp 1786000022 "
                 "<= workload session exp 1786000022 <= credential exp 1786000030."
             ),
+        )
+
+        # P-11 supplies N-59's real authenticated request context. Both request and
+        # credential target the alternate audience; only RESPONSE enrollment is absent.
+        p11_claims = request_claims(credential_hash=credential_hash_other, aud=other_aud)
+        p11, p11_prot, p11_payload = sign1(p4_protected, p11_claims, sk_c_ed)
+        record(
+            positives, "P-11", "Authenticated request for N-59's alternate audience",
+            "accept", "COSE_Sign1", p11,
+            protected_hex=p11_prot.hex(), payload_hex=p11_payload.hex(),
+            notes="Valid issuer-signed alternate-audience credential, enrolled classical primary, and null response binding; no response signer is enrolled for this audience.",
         )
 
         # =================== NEGATIVE VECTORS ===============================
@@ -2401,6 +2417,7 @@ def main() -> None:
             negatives, "N-58",
             "Response proof signed by the client key (not the enrolled response service signer)",
             "deny", "COSE_Sign1", n58,
+            originating_request="P-2",
             deny_class="response-signer",
             deny_rule="a response proof's realized signer must resolve to an authoritative response-service enrollment for its audience",
             notes="Self-consistent client-key response (plan/kid/signature all the client key); denies solely because the client is not an authorized response signer for the audience.",
@@ -2410,12 +2427,13 @@ def main() -> None:
         # service suite/keys, but no response-signer enrollment exists for that
         # audience, so it denies solely on the audience binding.
         n59_claims = request_claims(credential_hash=None, schema_id=SCHEMA_ID_RESPONSE,
-                                    body=CAPNP_RESPONSE_BYTES, aud="other.svc.hyprstream.test")
+                                    body=CAPNP_RESPONSE_BYTES, aud=other_aud)
         n59, _, _ = sign1(p3_protected, n59_claims, sk_s_ed)
         record(
             negatives, "N-59",
             "Service-signed response proof for an unenrolled audience (other.svc.hyprstream.test)",
             "deny", "COSE_Sign1", n59,
+            originating_request="P-11",
             deny_class="response-signer",
             deny_rule="a response proof's realized signer must resolve to an authoritative response-service enrollment for its EXACT audience",
             notes="Correctly service-signed, but no response-signer enrollment exists for this audience; denies solely on the audience-bound resolution.",
@@ -2446,6 +2464,7 @@ def main() -> None:
             negatives, "N-60",
             "Two-group response COSE_Sign (both groups enrolled) — violates exactly-one response signer",
             "deny", "COSE_Sign", n60,
+            originating_request="P-2",
             deny_class="response-signer",
             deny_rule="a response proof's realized plan MUST contain exactly one signer group resolving one active response-service enrollment for its audience",
             notes="Both groups are enrolled response-service signers for the audience and both signatures verify (coverage complete); denies solely on the exactly-one response-signer-group rule.",
@@ -2538,6 +2557,17 @@ def main() -> None:
                 "cnf_preimage_hex": enc([SUITE_CLASSICAL, [client_ed_pub]]).hex(),
                 "cnf_thumbprint_b64": b64u(cnf_classical),
                 "token_sha256": CREDENTIAL_HASH.hex(),
+            },
+            "other_audience": {
+                "encoding": "at+jwt",
+                "credential_kind": "rfc8693",
+                "token": cred_other,
+                "header": hdr_other,
+                "claims": claims_other,
+                "primary_suite": SUITE_CLASSICAL,
+                "cnf_preimage_hex": enc([SUITE_CLASSICAL, [client_ed_pub]]).hex(),
+                "cnf_thumbprint_b64": b64u(cnf_classical),
+                "token_sha256": credential_hash_other.hex(),
             },
             "hybrid": {
                 "encoding": "at+jwt",
@@ -2758,6 +2788,7 @@ def main() -> None:
             "P-6": "classical",
             "P-9": "session",
             "P-10": "workload",
+            "P-11": "other_audience",
         },
     }
 

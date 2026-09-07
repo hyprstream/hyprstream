@@ -12,7 +12,7 @@ Machine-readable files (the normative form — this page is the human index):
 | File | Contents |
 |---|---|
 | [`vectors/proof-v1-keys.json`](vectors/proof-v1-keys.json) | Test keys, seeds, and fixture values |
-| [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 10 vectors that MUST verify |
+| [`vectors/proof-v1-positive.json`](vectors/proof-v1-positive.json) | 11 vectors that MUST verify |
 | [`vectors/proof-v1-negative.json`](vectors/proof-v1-negative.json) | 66 vectors that MUST deny |
 | [`vectors/proof-v1-thumbprints.json`](vectors/proof-v1-thumbprints.json) | Cross-implementation replay-namespace thumbprint vectors (C1) |
 | [`vectors/proof-v1-credentials.json`](vectors/proof-v1-credentials.json) | Frozen `verifier_now` clock (F1) and the issuer-signed at+jwt tokens the authenticated positives hash (F2) |
@@ -248,6 +248,7 @@ Object encoding is untagged: typing is performed by the protected `typ` header
 | P-6 | `COSE_Sign1` | 411 | Authenticated classical proof with a cleartext stream-setup `response_binding` (`response_kind` stream_setup, `protection_mode` cleartext, null recipient) — exercises the orthogonal axes | `86f50e9862a45d0805786ae207fc310693e75f60dc50d44682b9ae1846030201` |
 | P-7 | `COSE_Sign1` | 1605 | Bound response proof whose `response_binding` equals the originating request (P-4) field-for-field | `ab0b26bd2956ad31dcd047869a76e663171e2c57f0414d9d91d7795ba99aa5ab` |
 | P-8 | `COSE_Sign` | 5862 | Hybrid unattributed proof; two embedded keys in plan order, each signature verified against its embedded key | `4f8fdbf677f7b28cf16b45af61067602f7f4082be2ced79b251ede6ecf82e6df` |
+| P-11 | `COSE_Sign1` | 392 | Authenticated request for N-59's alternate audience, with a matching issuer-signed credential and null response binding | `e6f62643192c9b646fe126d650e81ba7550a2df4097d7b63d4e6a41391c508bc` |
 | P-9 | `COSE_Sign1` | 395 | Session-bound classical proof whose `exp` equals the authoritative session expiry (accepts within both bounds) | `bfa6026b0c940b15c050274b640344ef77117585881a6c0c25c1b39671bba77d` |
 
 ### P-1 — unattributed `COSE_Sign1` (complete CBOR)
@@ -604,6 +605,12 @@ Ed25519 signature over the stripped object.
   inactive/expired, key/suite-mismatched, ambiguous, or multi-group responses deny;
   neutralizing the resolver turns the gate red. The general non-response `1*8`-group
   cap (N-6) is unaffected — the exactly-one rule is response-specific.
+  All three negatives carry an actual originating request: P-2 for N-58/N-60,
+  and P-11 for N-59. P-11 and its signed credential both target the alternate
+  audience. Both checkers require all four `response_context_bindings` comparisons
+  to pass and an authenticated originating tenant. The gate proves correction:
+  P-3 replaces only N-58/N-60's signer plan/signatures with identical claims;
+  changing only the service enrollment's audience admits N-59's unchanged proof.
 - **Credential `iat`/`exp` NumericDate (Z2).** A credential's `iat` and `exp` are
   validated as integer Unix-second NumericDate values, **explicitly excluding Python
   `bool`** (`True`/`False` are not timestamps), **before** any temporal comparison in

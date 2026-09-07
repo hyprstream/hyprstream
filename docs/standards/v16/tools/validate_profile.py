@@ -72,6 +72,7 @@ from check_proof_vectors import (  # noqa: E402
     validate_jwt_header, validate_required_scalars, validate_act_chain, clearance_meet,
     validate_numericdate_claims, is_numericdate,
     resolve_response_signer_enrollments, validate_response_signer_enrollment,
+    response_context_bindings,
 )
 
 # ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
@@ -270,7 +271,11 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
     # PROTECTED BUCKET and the PAYLOAD directly against the paired rules — a
     # strictly stronger check that does enforce the pairing (F1) and the
     # response-only claim invariants (F3).
-    for v in positives["vectors"]:
+    # Response-signer negatives have no structural defect; prove schema rejection
+    # cannot mask their targeted authorization rule.
+    schema_vectors = positives["vectors"] + [v for v in negatives["vectors"]
+                                             if v.get("deny_class") == "response-signer"]
+    for v in schema_vectors:
         obj = decode(bytes.fromhex(v["cbor_hex"]))
         prot_bytes, payload = obj[0], obj[2]
         pm = decode(prot_bytes)
@@ -279,18 +284,18 @@ def gate_cddl(cddl: str, positives, negatives) -> None:
         try:
             pschema.validate_cbor(prot_bytes)
         except ValidationError as exc:
-            check(False, f"positive {v['id']} protected bucket fails CDDL: {exc}")
+            check(False, f"{v['id']} protected bucket fails CDDL: {exc}")
         cschema = claims_schema_for(kind)
         try:
             cschema.validate_cbor(payload)
         except ValidationError as exc:
-            check(False, f"positive {v['id']} claims payload ({kind}) fails CDDL: {exc}")
+            check(False, f"{v['id']} claims payload ({kind}) fails CDDL: {exc}")
         if v["structure"] == "COSE_Sign":
             for entry in obj[3]:
                 try:
                     sig_entry_prot.validate_cbor(entry[0])
                 except ValidationError as exc:
-                    check(False, f"positive {v['id']} signature bucket fails CDDL: {exc}")
+                    check(False, f"{v['id']} signature bucket fails CDDL: {exc}")
 
     by_id_pos = {v["id"]: v for v in positives["vectors"]}
 
@@ -1337,24 +1342,6 @@ def gate_replay_thumbprints(cddl: str, positives) -> None:
 # --------------------------------------------------------------------------
 
 
-def response_context_bindings(vid, by_id):
-    """The COMPLETE set of request-derived response fields, compared in one place:
-    a response proof's aud (3), cti (7), response_binding (-70004), and -70002
-    (root type, vs the binding's root_type_id) MUST bind to the originating
-    request. Returns {aud_eq, cti_eq, binding_eq, schema_eq}."""
-    v = by_id[vid]
-    req = by_id[v["originating_request"]]
-    c = claims_of(v["cbor_hex"])
-    rc = claims_of(req["cbor_hex"])
-    rb = c.get(C_RESPONSE_BINDING)
-    return {
-        "aud_eq": c.get(C_AUD) == rc.get(C_AUD),
-        "cti_eq": c.get(C_CTI) == rc.get(C_CTI),
-        "binding_eq": rb == rc.get(C_RESPONSE_BINDING),
-        "schema_eq": (not isinstance(rb, dict)) or (c.get(C_SCHEMA_ID) == rb.get(1)),
-    }
-
-
 def gate_response_context(positives, negatives) -> None:
     section("11. Request->response contextual binding set (aud, cti, response_binding, -70002) — D2")
     by_id = {v["id"]: v for v in positives["vectors"]}
@@ -2133,7 +2120,7 @@ def gate_response_signer(positives, negatives) -> None:
             return None
         return creds["credentials"][credname]["claims"].get("tenant")
 
-    def response_signer_errors(vec):
+    def response_signer_errors(vec, authority=creds):
         """A3/B2: a response proof's realized plan MUST contain EXACTLY ONE signer group
         that resolves EXACTLY ONE active audience-bound response-service enrollment
         whose tenant equals the originating-request tenant (B2)."""
@@ -2145,7 +2132,7 @@ def gate_response_signer(positives, negatives) -> None:
         if len(tps) != 1:
             return [f"a response proof must resolve exactly one signer group, got {len(tps)}"]
         return validate_response_signer_enrollment(
-            resolve_response_signer_enrollments(creds, aud, tps[0]), tps[0], aud, now,
+            resolve_response_signer_enrollments(authority, aud, tps[0]), tps[0], aud, now,
             expected_tenant=originating_tenant(vec))
 
     # Every RESPONSE positive resolves exactly one active response-service enrollment.
@@ -2157,19 +2144,57 @@ def gate_response_signer(positives, negatives) -> None:
         check(not errs, f"{v['id']} response signer must resolve exactly one valid enrollment: {errs}")
 
     # Shipped negatives: N-58 client-signed, N-59 wrong-audience, N-60 two-group deny.
-    by_id = {v["id"]: v for v in negatives["vectors"]}
+    by_id = {v["id"]: v for v in positives["vectors"] + negatives["vectors"]}
     for nid in ("N-58", "N-59", "N-60"):
         v = by_id.get(nid)
         check(v is not None, f"response-signer negative {nid} must exist")
         if v is None:
             continue
+        orig = v.get("originating_request")
+        check(orig in p2c and orig in by_id and by_id[orig]["expect"] == "accept",
+              f"{nid} must carry an authenticated positive originating request")
+        if orig not in p2c or orig not in by_id:
+            continue
+        bindings = response_context_bindings(nid, by_id)
+        check(all(bindings.values()), f"{nid} all non-target response bindings must pass: {bindings}")
+        tenant = originating_tenant(v)
+        check(tenant is not None, f"{nid} must derive an authenticated originating tenant")
+        check(claims_of(by_id[orig]["cbor_hex"])[C_AUD] ==
+              creds["credentials"][p2c[orig]]["claims"]["aud"],
+              f"{nid} originating request and signed credential audiences must match")
         check(bool(response_signer_errors(v)), f"{nid} must deny at the response-signer check")
+        # Correct only the target signer defect. P-3 is the independently signed,
+        # fully checked single service-signer control for N-58 and N-60; its entire
+        # claims payload must be byte-identical, retaining every request binding.
+        if nid in ("N-58", "N-60"):
+            control = {**by_id["P-3"], "originating_request": orig}
+            check(decode(bytes.fromhex(control["cbor_hex"]))[2] ==
+                  decode(bytes.fromhex(v["cbor_hex"]))[2],
+                  f"{nid} corrected signer control must preserve the entire claims payload")
+            check(all(response_context_bindings("control", {**by_id, "control": control}).values())
+                  and not response_signer_errors(control),
+                  f"{nid} correcting only the signer plan/signatures must admit")
+        else:
+            # N-59 already has the correct service signature. Change ONLY the
+            # matching enrollment's audience; request, response and tenant stay fixed.
+            import copy
+            corrected = copy.deepcopy(creds)
+            aud, tps = realized(v)
+            records = [r for r in corrected["response_signer_enrollments"]
+                       if r["thumbprint_b64"] == tps[0]]
+            check(len(records) == 1, "N-59 control must find one existing service signer record")
+            if len(records) == 1:
+                records[0]["aud"] = aud
+                check(not response_signer_errors(v, corrected),
+                      "N-59 correcting only enrollment audience must admit the unchanged response")
+        print(f"   {nid}: all request bindings + authenticated tenant pass; signer denies, corrected control admits")
     # A3 isolation: N-60's two groups are BOTH otherwise-enrolled (each resolves a
     # valid record), so it denies solely on the exactly-one-group rule.
     n60_aud, n60_tps = realized(by_id["N-60"])
     check(len(n60_tps) == 2 and all(
         not validate_response_signer_enrollment(
-            resolve_response_signer_enrollments(creds, n60_aud, tp), tp, n60_aud, now)
+            resolve_response_signer_enrollments(creds, n60_aud, tp), tp, n60_aud, now,
+            expected_tenant=originating_tenant(by_id["N-60"]))
         for tp in n60_tps), "N-60's two groups must each resolve a valid enrollment (isolation)")
     check(response_signer_errors(by_id["N-60"])[0].startswith("a response proof must have exactly one"),
           "N-60 must deny solely on the exactly-one-signer-group rule")

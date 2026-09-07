@@ -165,6 +165,21 @@ def enc(obj) -> bytes:
     raise TypeError(type(obj))
 
 
+def response_context_bindings(vid, by_id):
+    """All four request-derived response comparisons, shared by both checkers."""
+    v = by_id[vid]
+    req = by_id[v["originating_request"]]
+    c = decode(decode(bytes.fromhex(v["cbor_hex"]))[2])
+    rc = decode(decode(bytes.fromhex(req["cbor_hex"]))[2])
+    rb = c.get(-70004)
+    return {
+        "aud_eq": c.get(3) == rc.get(3),
+        "cti_eq": c.get(7) == rc.get(7),
+        "binding_eq": rb == rc.get(-70004),
+        "schema_eq": (not isinstance(rb, dict)) or (c.get(-70002) == rb.get(1)),
+    }
+
+
 def cross_group_key_aliases(components):
     """S1: `components` is a list of (group_id, alg, raw_public_key_bytes) for a
     proof's resolved signer components. A cryptographic public-key IDENTITY —
@@ -900,7 +915,11 @@ def main() -> None:
         else:
             fail(f"{vec['id']}: algorithm {alg} is not in the profile")
 
-    for vec in positive["vectors"]:
+    # Signer-authorization negatives must be cryptographically valid; otherwise a
+    # bad signature/plan could hide a missing enrollment check.
+    crypto_vectors = positive["vectors"] + [v for v in negative["vectors"]
+                                            if v.get("deny_class") == "response-signer"]
+    for vec in crypto_vectors:
         raw = check_digest(vec)
         try:
             obj = decode(raw)
@@ -1216,9 +1235,20 @@ def main() -> None:
             for e in _resp_signer_errors(o, bh, v):
                 fail(f"{v['id']} response signer: {e}")
         # The response-signer negatives (N-58/N-59/N-60) MUST deny under the same rule.
+        response_by_id = {v["id"]: v for v in positive["vectors"] + negative["vectors"]}
         for v in negative["vectors"]:
             if v.get("deny_class") != "response-signer":
                 continue
+            orig = v.get("originating_request")
+            if orig not in pos_by_id or _orig_tenant(v) is None:
+                fail(f"{v['id']}: response-signer negative needs an authenticated originating request")
+                continue
+            bindings = response_context_bindings(v["id"], response_by_id)
+            if not all(bindings.values()):
+                fail(f"{v['id']}: non-target response context must pass: {bindings}")
+            req_claims = decode(decode(bytes.fromhex(pos_by_id[orig]["cbor_hex"]))[2])
+            if req_claims.get(3) != cd["credentials"][_p2c[orig]]["claims"].get("aud"):
+                fail(f"{v['id']}: originating request audience must match its credential")
             try:
                 o = decode(bytes.fromhex(v["cbor_hex"]))
                 bh = decode(o[0])
