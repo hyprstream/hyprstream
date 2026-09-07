@@ -2341,6 +2341,46 @@ where
     result
 }
 
+/// Policy must serve authority probes while Discovery starts, but is not READY
+/// until Discovery accepts its announcement. Only typed pre-dispatch Iroh
+/// unavailability can keep that initial publication pending.
+const POLICY_INITIAL_PUBLICATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+const POLICY_INITIAL_PUBLICATION_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
+
+async fn wait_for_policy_initial_publication<F, Fut>(
+    cancellation: &tokio_util::sync::CancellationToken,
+    budget: std::time::Duration,
+    mut attempt: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => anyhow::bail!("Policy initial publication cancelled"),
+            _ = tokio::time::sleep_until(deadline) => anyhow::bail!("Policy initial publication deadline exceeded"),
+            result = async { attempt().await } => result,
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if hyprstream_rpc::transport_traits::is_pre_dispatch_transport_error(&error)
+                && error.chain().any(|cause| cause.downcast_ref::<hyprstream_rpc::transport::lazy_iroh::IrohPeerUnavailable>().is_some()) => {
+                tracing::info!(%error, "Policy awaiting Discovery initial publication");
+            }
+            Err(error) => return Err(error),
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => anyhow::bail!("Policy initial publication cancelled"),
+            _ = tokio::time::sleep_until(deadline) => anyhow::bail!("Policy initial publication deadline exceeded"),
+            _ = tokio::time::sleep(POLICY_INITIAL_PUBLICATION_RETRY) => {}
+        }
+    }
+}
+
 /// Spawn the native-announcement refresh loop on its own current-thread Tokio
 /// runtime and return a channel for the first announcement result.
 ///
@@ -2741,7 +2781,6 @@ fn main() -> Result<()> {
         init_registry(mode, runtime_dir);
     }
     // ========== END ENDPOINT REGISTRY INITIALIZATION ==========
-
     // ── Wizard / first-run early dispatch ───────────────────────────────────
     // The wizard is a bootstrap command: it creates credentials that the
     // registry client init (below) depends on. Handle both `wizard` and the
@@ -3557,6 +3596,52 @@ fn main() -> Result<()> {
                                                                 return;
                                                             }
                                                         };
+                                                        if service_name == "policy"
+                                                            && hyprstream_discovery::native_network_required()
+                                                            && matches!(request.reach, hyprstream_service::NativeAnnouncementReach::Iroh { .. })
+                                                        {
+                                                            let cancellation = request.cancellation.clone();
+                                                            let initial = wait_for_policy_initial_publication(
+                                                                &cancellation,
+                                                                POLICY_INITIAL_PUBLICATION_BUDGET,
+                                                                || {
+                                                                    // Re-read signed current state and the exact service
+                                                                    // key's credential on every attempt, before any dial.
+                                                                    let announcement = hyprstream_core::services::factories::current_native_announcement(&mut request);
+                                                                    let client = &client;
+                                                                    async move {
+                                                                        let announcement = announcement?;
+                                                                        let jwt_expiry = announcement.service_jwt.as_deref()
+                                                                            .and_then(hyprstream_core::auth::identity_store::decode_jwt_exp_raw)
+                                                                            .and_then(|seconds| seconds.checked_mul(1_000))
+                                                                            .context("Policy initial announcement requires a bounded service JWT")?;
+                                                                        let expiry = announcement.expires_at_unix_ms.min(jwt_expiry);
+                                                                        let remaining = expiry.saturating_sub(chrono::Utc::now().timestamp_millis());
+                                                                        anyhow::ensure!(remaining > 0, "Policy initial announcement authority expired");
+                                                                        let duration = std::time::Duration::from_millis(u64::try_from(remaining)?);
+                                                                        tokio::time::timeout(duration, client.announce(&announcement)).await
+                                                                            .context("Policy initial announcement authority expired during publication")??;
+                                                                        anyhow::ensure!(chrono::Utc::now().timestamp_millis() < expiry,
+                                                                            "Policy initial announcement authority expired before readiness");
+                                                                        Ok(())
+                                                                    }
+                                                                },
+                                                            ).await;
+                                                            // Report only success or terminal failure, never a
+                                                            // transient availability error. The spawner's existing
+                                                            // bind/publication READY and cancellation gates remain.
+                                                            if let Some(tx) = announce_tx.as_ref() {
+                                                                if let Some(tx) = tx.lock().take() {
+                                                                    let _ = tx.send(initial.as_ref().map(|_| ()).map_err(ToString::to_string));
+                                                                }
+                                                            }
+                                                            if initial.is_err() { return; }
+                                                            tokio::select! {
+                                                                biased;
+                                                                _ = cancellation.cancelled() => return,
+                                                                _ = tokio::time::sleep(std::time::Duration::from_secs(25)) => {}
+                                                            }
+                                                        }
                                                         let _completion = refresh_native_announcement(
                                                             &service_name,
                                                             &socket_kind,
@@ -4415,6 +4500,95 @@ mod resolver_startup_controls {
             vec!["hyprstream", "pds", "inspect-services", "--service", "model", "--valid-for-seconds", "86400"],
             vec!["hyprstream", "pds", "inspect-services", "--service", "model", "--roster-export", "out.json"],
         ] { assert!(super::build_cli().try_get_matches_from(args).is_err()); }
+    }
+
+    fn unavailable_policy_publication() -> anyhow::Error {
+        hyprstream_rpc::transport_traits::PreDispatchTransportError::new(
+            hyprstream_rpc::transport::lazy_iroh::IrohPeerUnavailable::ConnectTimeout.into(),
+        ).into()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn policy_initial_publication_retries_only_typed_availability_and_reprojects() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mut projections = 0;
+        let start = tokio::time::Instant::now();
+        super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), || {
+            projections += 1;
+            let generation = projections;
+            async move {
+                if generation < 3 { Err(unavailable_policy_publication()) } else { Ok(()) }
+            }
+        }).await.expect("late Discovery should allow Policy to publish");
+        assert_eq!(projections, 3, "every retry must request fresh authority material");
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn policy_initial_publication_permanent_error_after_availability_is_terminal() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        // These are intentionally untyped security/projection errors. Even
+        // availability-looking text must never select the retry path.
+        for terminal in ["expired current authority", "revoked service JWT", "iroh connect timed out"] {
+            let mut attempts = 0;
+            let error = super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), || {
+                attempts += 1;
+                let first = attempts == 1;
+                async move {
+                    if first { Err(unavailable_policy_publication()) } else { anyhow::bail!(terminal) }
+                }
+            }).await.expect_err("security failures must be terminal");
+            assert_eq!(error.to_string(), terminal);
+            assert_eq!(attempts, 2);
+        }
+        let mut attempts = 0;
+        let error = super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), || {
+            attempts += 1;
+            async {
+                Err(hyprstream_rpc::transport_traits::PreDispatchTransportError::new(
+                    anyhow::anyhow!("missing Iroh client endpoint"),
+                ).into())
+            }
+        }).await.expect_err("pre-dispatch alone is not an availability proof");
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("missing Iroh client endpoint"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn policy_initial_publication_deadline_bounds_retries_and_inflight_call() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let start = tokio::time::Instant::now();
+        let error = super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(2), || async {
+            Err(unavailable_policy_publication())
+        }).await.expect_err("absent Discovery cannot keep startup pending forever");
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
+        let start = tokio::time::Instant::now();
+        let error = super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(2), std::future::pending).await
+            .expect_err("deadline also interrupts a stalled RPC");
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn policy_initial_publication_cancellation_precedes_success() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let mut called = false;
+        super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), || {
+            called = true;
+            async { Ok(()) }
+        }).await.expect_err("cancelled startup cannot publish or become ready");
+        assert!(!called);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancel = cancellation.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            cancel.cancel();
+        });
+        super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), std::future::pending).await
+            .expect_err("shutdown interrupts an in-flight publication");
+        cancel_task.await.expect("canceller");
     }
 
     #[test]
