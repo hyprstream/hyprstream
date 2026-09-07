@@ -150,8 +150,9 @@ pub use plc_directory::{
 };
 pub use service::{
     authenticate_local_deployment_registry,
+    native_network_required,
     bootstrap_deployment_process, deployment_registry_verifier, resolve_and_authenticate_did_anchors,
-    AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
+    AuthorizationProvider, DiscoveryService, DiscoverySelfAnnouncer, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
     production_browser_currentness_verifier, production_browser_provisioning,
     production_inference_rpc_client_at_transport, production_rpc_client,
     verify_genesis_deployment_artifacts,

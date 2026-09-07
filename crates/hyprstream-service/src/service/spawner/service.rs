@@ -403,10 +403,20 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                 let drain_capacity = rpc_server.capacity();
                 let drain_token = rpc_server.shutdown_token();
                 let local_shutdown = Arc::new(tokio::sync::Notify::new());
-                let rep_fut = hyprstream_rpc::service::serve::serve_bridged(
-                    &transport, Arc::clone(&processor), signing_key.clone(),
-                    Arc::clone(&local_shutdown), on_ready,
-                );
+                let rep_fut = async {
+                    if qc.iroh_required {
+                        // Iroh bind and first publication have completed. Local
+                        // sockets do not gate readiness or serve required RPCs.
+                        if let Some(ready) = on_ready { let _ = ready.send(()); }
+                        local_shutdown.notified().await;
+                        Ok(())
+                    } else {
+                        hyprstream_rpc::service::serve::serve_bridged(
+                            &transport, Arc::clone(&processor), signing_key.clone(),
+                            Arc::clone(&local_shutdown), on_ready,
+                        ).await
+                    }
+                };
                 let quic_fut = rpc_server.run();
                 tokio::pin!(rep_fut, quic_fut);
                 let completed_rep = tokio::select! {

@@ -242,10 +242,7 @@ pub fn with_checkpointed_native_announcements(
     let store = crate::services::discovery::PdsRecordStore::open_readonly(&pds_store_dir(&ctx)?)?
         .with_at9p_deployment_verifier(acceptance_identity);
     let states = store.accepted_at9p_states()?;
-    for service_name in service_names
-        .iter()
-        .filter(|name| name.as_str() != "discovery")
-    {
+    for service_name in service_names {
         let signer = ctx.service_signing_key(service_name);
         let mut matching = states.iter().filter(|state| {
             accepted_state_matches_service(state, service_name, signer.verifying_key().as_bytes())
@@ -1543,7 +1540,8 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = crate::services::PolicyClient::for_local_bootstrap(
+    let policy_client = policy_client_for_deployment(
+        ctx,
         sk.clone(),
         policy_vk,
         service_token(&sk),
@@ -1622,7 +1620,8 @@ fn create_workflow_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = crate::services::PolicyClient::for_local_bootstrap(
+    let policy_client = policy_client_for_deployment(
+        ctx,
         sk.clone(),
         policy_vk,
         service_token(&sk),
@@ -1818,7 +1817,7 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     let federation_resolver = Arc::new(
         crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
             .with_policy_client(Arc::new(policy_client)),
@@ -1914,7 +1913,7 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     let federation_resolver = Arc::new(
         crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
             .with_policy_client(Arc::new(policy_client.clone())),
@@ -2075,7 +2074,8 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         if let Some(fed) = federation_key_source {
             fed
         } else {
-            let fallback_policy_client = std::sync::Arc::new(PolicyClient::for_local_bootstrap(
+            let fallback_policy_client = std::sync::Arc::new(policy_client_for_deployment(
+                ctx,
                 ctx.service_signing_key("mcp"),
                 policy_vk,
                 service_token(&sk),
@@ -2512,7 +2512,7 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // Build the direct-VFS PEP before exposing the namespace. Failure to open
     // its signed WAL aborts construction; there is no unarmed fallback.
@@ -2605,7 +2605,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     let auth_provider = crate::services::discovery::PolicyAuthProvider::new(policy_client);
 
     // #431 — record resolver backing getRecord/getRepo, over the durable
@@ -2703,7 +2703,60 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     // TODO: DiscoveryService federation key source support
     // (federation_key_source not yet implemented on DiscoveryService)
 
-    Ok(ctx.into_spawnable_quic(discovery_service, config.discovery.quic_port))
+    let publisher = if ctx.iroh_required() {
+        Some(discovery_self_publisher(discovery_service.self_announcer()?))
+    } else { None };
+    Ok(ctx.into_spawnable_quic_with_publisher(discovery_service, config.discovery.quic_port, publisher))
+}
+
+fn discovery_self_publisher(owner: hyprstream_discovery::DiscoverySelfAnnouncer) -> hyprstream_service::NativeAnnouncementPublisher {
+    let owner = Arc::new(owner);
+    Arc::new(move |mut request| {
+        let owner = owner.clone();
+        let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime,
+                Err(error) => { let _ = first_tx.send(Err(error.to_string())); return; }
+            };
+            runtime.block_on(async move {
+                let mut first_tx = Some(first_tx);
+                let mut delay = std::time::Duration::from_secs(5);
+                let cancellation = request.cancellation.clone();
+                loop {
+                    let result = tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err(anyhow::anyhow!("Discovery self publication cancelled")),
+                        result = async {
+                            let announcement = current_native_announcement(&mut request)?;
+                            owner.publish(&announcement).await
+                        } => result,
+                    };
+                    if let Some(tx) = first_tx.take() {
+                        let _ = tx.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                        if result.is_err() { return; }
+                    }
+                    if cancellation.is_cancelled() { return; }
+                    let wait = match result {
+                        Ok(()) => { delay = std::time::Duration::from_secs(5); std::time::Duration::from_secs(25) }
+                        Err(error) => {
+                            tracing::warn!("Discovery self publication refresh failed: {error}");
+                            let wait = delay;
+                            delay = delay.saturating_mul(2).min(std::time::Duration::from_secs(25));
+                            wait
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => return,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                }
+            });
+        });
+        first_rx.recv().map_err(|_| anyhow::anyhow!("Discovery self publication ended before readiness"))?
+            .map_err(anyhow::Error::msg)
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2763,7 +2816,7 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     let mut metrics_service = MetricsService::new(
         orchestrator,

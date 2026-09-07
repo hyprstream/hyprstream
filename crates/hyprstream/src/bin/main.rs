@@ -1673,6 +1673,7 @@ async fn install_process_production_resolver(
         signing_key.clone(),
         trust_source,
         config.cluster_remote_node,
+        config.quic.iroh_required(),
     )
     .await?;
     hyprstream_rpc::envelope::install_browser_currentness_verifier(
@@ -2991,11 +2992,13 @@ fn main() -> Result<()> {
                                                         let socket_kind = request.reach.socket_kind().to_owned();
                                                         let endpoint = request.reach.endpoint();
                                                         let service_name = request.service_name.clone();
-                                                        let client = match hyprstream_discovery::DiscoveryClient::for_local_bootstrap(
+                                                        let client = match if hyprstream_discovery::native_network_required() {
+                                                            hyprstream_discovery::DiscoveryClient::from_resolver(request.signing_key.clone(), None)
+                                                        } else { hyprstream_discovery::DiscoveryClient::for_local_bootstrap(
                                                             request.signing_key.clone(),
                                                             request.discovery_verifying_key,
                                                             None,
-                                                        ) {
+                                                        ) } {
                                                             Ok(client) => client,
                                                             Err(error) => {
                                                                 tracing::warn!("Failed to build DiscoveryClient: {error}");
@@ -3218,7 +3221,9 @@ fn main() -> Result<()> {
                                 let mut handles = Vec::new();
 
                                 // Compute dependency-aware startup stages.
-                                let stages = hyprstream_service::startup_stages(&service_names);
+                                let stages = hyprstream_service::service::ordering::startup_stages_for_profile(
+                                    &service_names, ctx.iroh_required(),
+                                );
 
                                 // #275: in the systemd / --ipc deployment each service
                                 // runs in its OWN process. Only the `event` service's

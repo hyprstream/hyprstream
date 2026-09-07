@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::services::generated::inference_client::InferenceClient;
 use crate::services::generated::model_client::ModelClient;
 use crate::services::generated::{inference_client, model_client, policy_client, registry_client};
-use crate::services::{PolicyClient, RegistryClient};
+use crate::services::RegistryClient;
 use hyprstream_workers::generated::{worker_client, workflow_client};
 use hyprstream_workers::runtime::WorkerClient;
 
@@ -400,9 +400,7 @@ async fn dispatch_top_level(
             client.call_method(method, args).await
         }
         "policy" => {
-            // Bootstrap: PolicyService uses the root key
-            let server_vk = signing_key.verifying_key();
-            let client = PolicyClient::for_local_bootstrap(signing_key, server_vk, None)?;
+            let client = super::policy_handlers::create_policy_client(&signing_key)?;
             client.call_method(method, args).await
         }
         "worker" => {

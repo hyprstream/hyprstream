@@ -120,10 +120,13 @@ fn provision_one(
     let commitment = hybrid.commitment_digest();
     let carrier =
         hyprstream_rpc::node_identity::derive_purpose_key(signer, "hyprstream-iroh-transport-v1");
-    let endpoint = ServiceEndpoint::new(
+    let mut endpoint = ServiceEndpoint::new(
         Transport::Iroh,
         format!("iroh://{}", hex::encode(carrier.verifying_key().to_bytes())),
     )?;
+    endpoint.request_kem = Some(
+        hyprstream_rpc::node_identity::derive_mesh_kem_recipient(signer)?.public().encode(),
+    );
     let service = ServiceEntry::new(&service_id, ServiceType::NinePExport, endpoint)?;
     let states = store.accepted_at9p_states()?;
     let mut matching = states.into_iter().filter(|state| {
