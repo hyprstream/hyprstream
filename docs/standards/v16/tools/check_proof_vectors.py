@@ -676,6 +676,20 @@ def validate_jwt_header(header, issuer_kid):
     return errs
 
 
+def validate_signer_suite_confirmation(cnf):
+    """The v16 JWT confirmation is one canonical base64url SHA-256 thumbprint."""
+    if not isinstance(cnf, dict) or set(cnf) != {"hs_signer_suite"}:
+        return ["cnf must be an object containing only hs_signer_suite"]
+    value = cnf["hs_signer_suite"]
+    if (not isinstance(value, str) or len(value) != 43
+            or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for c in value)):
+        return ["cnf hs_signer_suite must be a canonical base64url 32-byte digest"]
+    decoded = base64.urlsafe_b64decode(value + "=")
+    if len(decoded) != 32 or base64.urlsafe_b64encode(decoded).rstrip(b"=").decode() != value:
+        return ["cnf hs_signer_suite must be a canonical base64url 32-byte digest"]
+    return []
+
+
 def is_numericdate(v):
     """Z2: a JWT NumericDate is an integer count of Unix seconds. Python `bool` is an
     `int` subclass, so it is explicitly EXCLUDED (True/False are not timestamps)."""
@@ -1260,19 +1274,25 @@ def main() -> None:
                 fail(f"{v['id']}: a response-signer negative must deny under the exactly-one response-signer rule")
 
         def verify_at_jwt(token: str, label: str):
+            before = len(FAILURES)
             parts = token.split(".")
             if len(parts) != 3:
                 fail(f"{label}: not a compact JWS"); return None
             hp, pp, sp = parts
-            header = json.loads(b64u_dec(hp))
-            claims = json.loads(b64u_dec(pp))
+            try:
+                header = json.loads(b64u_dec(hp))
+                claims = json.loads(b64u_dec(pp))
+            except (ValueError, TypeError):
+                fail(f"{label}: undecodable JWS"); return None
+            if not isinstance(claims, dict):
+                fail(f"{label}: JWT claims must be an object"); return None
             # X1: closed understood header set + reject unsupported `crit` extensions.
             for he in validate_jwt_header(header, issuer_kid):
                 fail(f"{label}: {he}")
             try:
                 Ed25519PublicKey.from_public_bytes(issuer_pub).verify(
                     b64u_dec(sp), f"{hp}.{pp}".encode("ascii"))
-            except InvalidSignature:
+            except (InvalidSignature, ValueError):
                 fail(f"{label}: issuer Ed25519 signature does not verify")
             for req in ("iss", "sub", "aud", "iat", "exp", "jti", "client_id", "tenant", "clearance", "cnf"):
                 if req not in claims:
@@ -1302,17 +1322,20 @@ def main() -> None:
                 fail(f"{label}: {e}")
             if not nd_errs and not (claims["iat"] <= now < claims["exp"]):
                 fail(f"{label}: not temporally valid at verifier_now {now}")
-            if "hs_signer_suite" not in (claims.get("cnf") or {}):
-                fail(f"{label}: cnf lacks the hs_signer_suite confirmation")
+            for ce in validate_signer_suite_confirmation(claims.get("cnf")):
+                fail(f"{label}: {ce}")
             # U1: after issuer-signature + profile validation, consult the
             # authoritative (iss, jti) credential-revocation store; a revoked
             # credential fails closed (the shipped live credentials are unrevoked).
             if is_credential_revoked(cd, claims.get("iss"), claims.get("jti")):
                 fail(f"{label}: credential (iss={claims.get('iss')!r}, jti={claims.get('jti')!r}) is revoked")
-            return claims
+            return claims if len(FAILURES) == before else None
 
+        verified_credentials = {}
         for name, cred in cd["credentials"].items():
             claims = verify_at_jwt(cred["token"], f"credential {name}")
+            if claims is not None:
+                verified_credentials[name] = claims
             if hashlib.sha256(cred["token"].encode("ascii")).hexdigest() != cred["token_sha256"]:
                 fail(f"credential {name}: published token_sha256 does not match the token bytes")
             # K1: a sid-bearing credential must map to a valid authoritative session.
@@ -1321,6 +1344,8 @@ def main() -> None:
                 fail(f"credential {name} session: {se}")
 
         for pid, credname in cd["positive_to_credential"].items():
+            if credname not in verified_credentials:
+                continue  # Already denied; never decode/use malformed confirmation downstream.
             cred = cd["credentials"][credname]
             v = pos_by_id.get(pid)
             if v is None:
@@ -1330,7 +1355,7 @@ def main() -> None:
             ch = pclaims.get(-70001)  # credential_hash
             if ch != hashlib.sha256(cred["token"].encode("ascii")).digest():
                 fail(f"{pid}: credential_hash != SHA-256(mapped {credname} credential)")
-            cred_claims = json.loads(b64u_dec(cred["token"].split(".")[1]))
+            cred_claims = verified_credentials[credname]
             if cred_claims.get("aud") != pclaims.get(3):
                 fail(f"{pid}: credential aud != the proof's aud")
             cnf_tp = b64u_dec(cred_claims["cnf"]["hs_signer_suite"])

@@ -73,6 +73,7 @@ from check_proof_vectors import (  # noqa: E402
     validate_numericdate_claims, is_numericdate,
     resolve_response_signer_enrollments, validate_response_signer_enrollment,
     response_context_bindings,
+    validate_signer_suite_confirmation,
 )
 
 # ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
@@ -1979,12 +1980,14 @@ def _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=None, ex
         claims = json.loads(_b64u_dec(pp))
     except Exception as e:  # noqa: BLE001
         return [f"undecodable JWS: {e}"]
+    if not isinstance(claims, dict):
+        return ["JWT claims must be an object"]
     # X1: closed understood header set + reject unsupported `crit` extensions.
     errs += validate_jwt_header(header, issuer_kid)
     try:
         Ed25519PublicKey.from_public_bytes(issuer_pub).verify(
             _b64u_dec(sp), f"{hp}.{pp}".encode("ascii"))
-    except InvalidSignature:
+    except (InvalidSignature, ValueError):
         errs.append("issuer signature invalid")
     for r in ("iss", "sub", "aud", "iat", "exp", "jti", "client_id", "tenant", "clearance", "cnf"):
         if r not in claims:
@@ -2008,8 +2011,7 @@ def _verify_credential(token, issuer_pub, issuer_kid, now, expected_aud=None, ex
     errs += nd_errs
     if not nd_errs and not (claims["iat"] <= now < claims["exp"]):
         errs.append("not temporally valid at verifier_now")
-    if "hs_signer_suite" not in (claims.get("cnf") or {}):
-        errs.append("cnf lacks hs_signer_suite")
+    errs += validate_signer_suite_confirmation(claims.get("cnf"))
     errs += [f"clearance: {e}" for e in _validate_clearance(claims.get("clearance"))]
     return errs
 
@@ -2466,6 +2468,20 @@ def gate_credential_context(positives, negatives) -> None:
               f"counter-proof '{label}' must deny SOLELY on {needle!r}, got {errs}")
         if errs:
             print(f"   counter '{label}' rejected (single-cause {needle}): {errs[0]}")
+
+    # Re-signed payload/confirmation mutations must deny on shape alone, before
+    # malformed values can reach scalar checks or proof-binding base64 decoding.
+    for payload in ([], ["sub"], None, 7, True, "claims"):
+        rejected_single("non-object JWT claims", _make_jwt(hdr, payload, sk_i), "claims must be an object")
+    for cnf in (None, [], 7, {}, {"hs_signer_suite": 7}, {"hs_signer_suite": ""},
+                {"hs_signer_suite": "!" * 43}, {"hs_signer_suite": _b64u(b"x" * 31)},
+                {"hs_signer_suite": _b64u(b"x" * 33)},
+                {"hs_signer_suite": _b64u(b"x" * 32) + "="},
+                {"hs_signer_suite": "A" * 42 + "B"},
+                {**base_claims["cnf"], "unknown": "method"}):
+        rejected_single("malformed confirmation", _make_jwt(hdr, {**base_claims, "cnf": cnf}, sk_i), "cnf")
+    check(not _verify_credential(good["token"], issuer_pub, issuer_kid, now, aud, issuer_iss),
+          "correct object/confirmation control must admit")
 
     # 1. flipped signature byte.
     tok = good["token"]
