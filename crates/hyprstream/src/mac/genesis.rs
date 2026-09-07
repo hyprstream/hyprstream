@@ -484,7 +484,7 @@ impl ObjectLabelResolver for CompositeObjectLabelResolver {
 /// as a path here. This impl serves the VFS/9P plane only
 /// ([`crate::mac::pep::production_vfs_pep`]).
 impl hyprstream_rpc::auth::mac::RpcObjectLabelResolver for CompositeObjectLabelResolver {
-    fn resolve(&self, service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
+    fn resolve(&self, service_domain: &str, _method: Option<&[u16]>) -> Option<SecurityLabel> {
         let components: Vec<&str> = service_domain
             .split('/')
             .filter(|component| !component.is_empty() && *component != "." && *component != "..")
