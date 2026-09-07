@@ -2084,6 +2084,30 @@ where
     initial_rx
 }
 
+/// Production publisher startup boundary: only required Iroh waits for a
+/// successful first publication. Compatibility keeps its retry task alive.
+fn start_native_announcement_publisher<F, Fut>(
+    reach: hyprstream_service::NativeAnnouncementReach,
+    network_required: bool,
+    cancellation: tokio_util::sync::CancellationToken,
+    loop_body: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(NativeAnnouncementFirstTx) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let require_initial = network_required
+        && matches!(reach, hyprstream_service::NativeAnnouncementReach::Iroh { .. });
+    if let Some(rx) = spawn_native_announcement_loop(require_initial, cancellation, loop_body) {
+        match rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => anyhow::bail!("initial Iroh announcement failed: {error}"),
+            Err(_) => anyhow::bail!("initial Iroh announcement thread exited"),
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // ROCm allocator and BLAS optimizations — must be set before any tch/libtorch init.
     // Expandable segments eliminates ~1,900 hipMalloc/hipFree calls per decode step.
@@ -2980,12 +3004,9 @@ fn main() -> Result<()> {
                                         moq_relay,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             |request: hyprstream_service::NativeAnnouncementRequest| {
-                                                let require_initial_iroh = matches!(
-                                                    &request.reach,
-                                                    hyprstream_service::NativeAnnouncementReach::Iroh { .. }
-                                                );
-                                                let initial_rx = spawn_native_announcement_loop(
-                                                    require_initial_iroh,
+                                                start_native_announcement_publisher(
+                                                    request.reach.clone(),
+                                                    hyprstream_discovery::native_network_required(),
                                                     request.cancellation.clone(),
                                                     move |announce_tx| async move {
                                                         let mut request = request;
@@ -3029,19 +3050,7 @@ fn main() -> Result<()> {
                                                         )
                                                         .await;
                                                     },
-                                                );
-                                                if let Some(rx) = initial_rx {
-                                                    match rx.recv() {
-                                                        Ok(Ok(())) => {}
-                                                        Ok(Err(error)) => anyhow::bail!(
-                                                            "initial Iroh announcement failed: {error}"
-                                                        ),
-                                                        Err(_) => anyhow::bail!(
-                                                            "initial Iroh announcement thread exited"
-                                                        ),
-                                                    }
-                                                }
-                                                Ok(())
+                                                )
                                             },
                                         )),
                                     };
@@ -4048,6 +4057,73 @@ mod resolver_startup_controls {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod native_announcement_wiring {
     use std::time::Duration;
+
+    #[test]
+    fn production_publisher_profile_controls_first_failure_and_retry() {
+        use hyprstream_service::NativeAnnouncementReach;
+        // Guard the real QuicSharedConfig publisher's inputs in addition to
+        // exercising its extracted startup boundary below. A correct loop
+        // test alone did not catch the old reach-only call-site decision.
+        let source = include_str!("main.rs");
+        let production = source.split("mod native_announcement_wiring").next().unwrap();
+        let compact: String = production.split_whitespace().collect();
+        assert!(compact.contains("start_native_announcement_publisher(request.reach.clone(),hyprstream_discovery::native_network_required(),request.cancellation.clone(),"));
+
+        for network_required in [false, true] {
+            for reach in [
+                NativeAnnouncementReach::Iroh { node_id: [7; 32] },
+                NativeAnnouncementReach::Quic {
+                    address: "127.0.0.1:12345".parse().unwrap(),
+                    server_name: "fixture".to_owned(),
+                },
+            ] {
+                let fatal = network_required && matches!(reach, NativeAnnouncementReach::Iroh { .. });
+                let cancellation = tokio_util::sync::CancellationToken::new();
+                let loop_cancellation = cancellation.clone();
+                let (retry_tx, retry_rx) = std::sync::mpsc::sync_channel(2);
+                let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
+                struct Dropped(std::sync::mpsc::SyncSender<()>);
+                impl Drop for Dropped {
+                    fn drop(&mut self) { let _ = self.0.send(()); }
+                }
+                let result = super::start_native_announcement_publisher(
+                    reach, network_required, cancellation.clone(), move |announce_tx| async move {
+                        let _dropped = Dropped(dropped_tx);
+                        let mut attempts = 0;
+                        super::refresh_native_announcement(
+                            "policy", "iroh", "iroh://fixture", i64::MAX, loop_cancellation,
+                            || {
+                                attempts += 1;
+                                let attempt = attempts;
+                                let tx = announce_tx.clone();
+                                let retry_tx = retry_tx.clone();
+                                async move {
+                                    let outcome = if attempt == 1 {
+                                        Err(anyhow::anyhow!("local Discovery is not bound yet"))
+                                    } else {
+                                        retry_tx.send(attempt).unwrap();
+                                        Ok(())
+                                    };
+                                    send_first_result(&tx, outcome.as_ref().map(|_| ()).map_err(ToString::to_string));
+                                    outcome
+                                }
+                            },
+                        ).await;
+                    },
+                );
+                if fatal {
+                    assert!(result.unwrap_err().to_string().contains("local Discovery is not bound yet"));
+                    dropped_rx.recv_timeout(Duration::from_secs(2)).expect("failed required startup aborts the publisher");
+                    assert!(retry_rx.try_recv().is_err(), "required startup cannot silently retry its first failure");
+                } else {
+                    result.expect("Compatibility/non-Iroh startup is nonfatal");
+                    assert_eq!(retry_rx.recv_timeout(Duration::from_secs(8)).expect("publication retries at the production five-second cadence when Discovery becomes ready"), 2);
+                    cancellation.cancel();
+                    dropped_rx.recv_timeout(Duration::from_secs(2)).expect("service cancellation still owns the retry task");
+                }
+            }
+        }
+    }
 
     fn send_first_result(
         announce_tx: &super::NativeAnnouncementFirstTx,

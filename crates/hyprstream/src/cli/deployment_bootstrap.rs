@@ -135,11 +135,6 @@ fn provision_one(
             .services
             .iter()
             .any(|entry| entry.id == service_id)
-            && state
-                .current
-                .subject_keys
-                .iter()
-                .any(|key| key.ed25519_pub == hybrid.ed25519_pub)
     });
     let existing = matching.next();
     ensure!(
@@ -312,6 +307,46 @@ mod tests {
         let resumed = provision_one(&store, &ingest, "model", &key, now, 86400)?;
         assert_eq!(resumed.did, states[0].did);
         assert_eq!(resumed.epoch, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn deployment_bootstrap_rejects_wrong_key_without_duplicate_genesis() -> Result<()> {
+        let (_dir, store, ingest, key) = fixture()?;
+        let now = Utc::now();
+        let first = provision_one(&store, &ingest, "model", &key, now, 86400)?;
+        let wrong_key = SigningKey::from_bytes(&[0x65; 32]);
+        let error = provision_one(&store, &ingest, "model", &wrong_key, now, 86400)
+            .err().context("an enrolled service cannot be treated as absent after a key change")?;
+        assert!(error.to_string().contains("hybrid key does not match"));
+        let states = store.accepted_at9p_states()?;
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].did, first.did);
+        assert_eq!(states[0].epoch, first.epoch);
+        assert_eq!(states[0].head_digest, first.head_digest);
+        Ok(())
+    }
+
+    #[test]
+    fn deployment_bootstrap_rejects_multiple_service_identities_across_keys() -> Result<()> {
+        let (_dir, store, ingest, key) = fixture()?;
+        let now = Utc::now();
+        let first = provision_one(&store, &ingest, "model", &key, now, 86400)?;
+        // Simulate a pre-existing duplicate, admitted through the real signed
+        // genesis/checkpoint path, with the same service ID but a different key.
+        let other = SigningKey::from_bytes(&[0x66; 32]);
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&other);
+        let pair = HybridKeyPair::new(other.verifying_key().to_bytes().to_vec(), ml_dsa_sk_to_vk_bytes(&pq))?;
+        let body = CapsuleBody::new(vec![pair], first.current.services.clone())?;
+        let capsule = sign_capsule(body, &other, &pq)?;
+        let duplicate = ingest.ingest_genesis(&format!("did:at9p:{}", capsule.cid512()?), &capsule.to_dag_cbor()?)?;
+        let error = provision_one(&store, &ingest, "model", &key, now, 86400)
+            .err().context("matching a key cannot hide a second service authority")?;
+        assert!(error.to_string().contains("multiple accepted identities"));
+        let states = store.accepted_at9p_states()?;
+        assert_eq!(states.len(), 2);
+        assert!(states.iter().any(|state| state.head_digest == first.head_digest));
+        assert!(states.iter().any(|state| state.head_digest == duplicate.head_digest));
         Ok(())
     }
 
