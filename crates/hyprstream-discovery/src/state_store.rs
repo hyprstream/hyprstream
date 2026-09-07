@@ -1279,8 +1279,10 @@ struct TieredStateStore {
     valkey: Arc<ValkeyStateStore>,
     l1_max_ttl_ms: i64,
     observed: Mutex<HashMap<String, ObservedRevision>>,
-    // Keep cache contents and revision labels in one local operation order.
-    operation: tokio::sync::Mutex<()>,
+    // Serialize cache contents/revision labels within a scope, while unrelated
+    // network reads and heartbeats can use the pool concurrently. Fixed storage
+    // avoids accumulating a mutex for every historical identity.
+    operations: [tokio::sync::Mutex<()>; 64],
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
@@ -1295,12 +1297,17 @@ impl TieredStateStore {
             valkey,
             l1_max_ttl_ms: i64::try_from(l1_max_ttl_ms).unwrap_or(i64::MAX),
             observed: Mutex::new(HashMap::new()),
-            operation: tokio::sync::Mutex::new(()),
+            operations: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
         }
     }
 
     fn scope(kind: &str, value: &str) -> String {
         format!("{kind}:{value}")
+    }
+
+    fn operation(&self, kind: &str, value: &str) -> &tokio::sync::Mutex<()> {
+        let digest = blake3::hash(Self::scope(kind, value).as_bytes());
+        &self.operations[usize::from(digest.as_bytes()[0]) % self.operations.len()]
     }
 
     fn is_observed(&self, scope: &str, revision: u64, now_unix_ms: i64) -> bool {
@@ -1356,7 +1363,7 @@ impl DiscoveryStateStore for TieredStateStore {
         service_name: &str,
         endpoint: AnnouncedEndpoint,
     ) -> Result<PutResult> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("announcement", service_name).lock().await;
         // Invalidate before the command, including on ambiguous write errors
         // or cancellation. Never tag a caller's value with a later revision.
         self.observed
@@ -1371,7 +1378,7 @@ impl DiscoveryStateStore for TieredStateStore {
         service_name: &str,
         now_unix_ms: i64,
     ) -> Result<Vec<AnnouncedEndpoint>> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("announcement", service_name).lock().await;
         let scope = Self::scope("announcement", service_name);
         let revision = self.valkey.announcement_revision().await?;
         if self.is_observed(&scope, revision, now_unix_ms) {
@@ -1418,7 +1425,7 @@ impl DiscoveryStateStore for TieredStateStore {
     }
 
     async fn put_liveness(&self, node: &Did, value: LiveAllocatable) -> Result<PutResult> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("liveness", node.as_str()).lock().await;
         self.observed
             .lock()
             .remove(&Self::scope("liveness", node.as_str()));
@@ -1427,7 +1434,7 @@ impl DiscoveryStateStore for TieredStateStore {
     }
 
     async fn liveness(&self, node: &Did, now_unix_ms: i64) -> Result<Option<LiveAllocatable>> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("liveness", node.as_str()).lock().await;
         let scope = Self::scope("liveness", node.as_str());
         let revision = self.valkey.liveness_revision().await?;
         if self.is_observed(&scope, revision, now_unix_ms) {
@@ -1454,14 +1461,14 @@ impl DiscoveryStateStore for TieredStateStore {
     }
 
     async fn put_entity_statement(&self, issuer: &str, value: CachedEntityStatement) -> Result<()> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("entity", issuer).lock().await;
         self.observed.lock().remove(&Self::scope("entity", issuer));
         self.memory.clear_entity_statement_sync(issuer);
         self.valkey.put_entity_statement(issuer, value).await
     }
 
     async fn entity_statement(&self, issuer: &str) -> Result<Option<CachedEntityStatement>> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("entity", issuer).lock().await;
         let now = unix_millis_now();
         let scope = Self::scope("entity", issuer);
         let revision = self.valkey.entity_revision().await?;
@@ -1501,7 +1508,7 @@ impl DiscoveryStateStore for TieredStateStore {
         service_did: &str,
         value: CachedEnvelopeKeyset,
     ) -> Result<()> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("envelope", service_did).lock().await;
         self.observed
             .lock()
             .remove(&Self::scope("envelope", service_did));
@@ -1510,7 +1517,7 @@ impl DiscoveryStateStore for TieredStateStore {
     }
 
     async fn envelope_keyset(&self, service_did: &str) -> Result<Option<CachedEnvelopeKeyset>> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("envelope", service_did).lock().await;
         let now = unix_millis_now();
         let scope = Self::scope("envelope", service_did);
         let revision = self.valkey.envelope_revision(service_did).await?;
@@ -2386,6 +2393,136 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn tiered_scoped_operations_allow_unrelated_liveness_and_heartbeats_to_progress() {
+        use futures::{stream, StreamExt};
+        use std::time::Duration;
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let shared = Arc::new(
+            ValkeyStateStore::connect(&valkey_config(url, "striped-concurrency"))
+                .await
+                .unwrap(),
+        );
+        let tier = TieredStateStore::new(
+            Arc::new(MemoryStateStore::new(64, 64, 64)),
+            shared.clone(),
+            60_000,
+        );
+        let now = unix_millis_now();
+        // Pick sixteen distinct stripes so the regression is deterministic,
+        // including when the hash happens to collide for adjacent node names.
+        let mut nodes: Vec<Did> = Vec::new();
+        for i in 0..1024 {
+            let node = Did::new(format!("did:web:concurrent-{i}.example"));
+            if nodes.iter().all(|other| {
+                !std::ptr::eq(
+                    tier.operation("liveness", other.as_str()),
+                    tier.operation("liveness", node.as_str()),
+                )
+            }) {
+                nodes.push(node);
+            }
+            if nodes.len() == 16 {
+                break;
+            }
+        }
+        assert_eq!(nodes.len(), 16);
+        for node in &nodes {
+            shared
+                .put_liveness(
+                    node,
+                    LiveAllocatable {
+                        allocatable: vec![],
+                        load_fraction: 0.1,
+                        last_seen: now,
+                        live_until_unix_ms: now + 60_000,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        // Hold one scope exactly as a delayed read/write does across its L2
+        // awaits. A store-wide mutex prevents every other operation below from
+        // finishing; striped ordering lets all fifteen real Valkey reads pass.
+        let stalled = tier.operation("liveness", nodes[0].as_str()).lock().await;
+        let mut reads = stream::iter(
+            nodes
+                .iter()
+                .map(|node| {
+                    let tier = &tier;
+                    async move { (node, tier.liveness(node, now).await) }
+                }),
+        )
+        .buffer_unordered(16);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..15 {
+                let (node, result) = reads.next().await.unwrap();
+                assert_ne!(node, &nodes[0]);
+                assert_eq!(result.unwrap().unwrap().load_fraction, 0.1);
+            }
+        })
+        .await
+        .expect("unrelated tiered liveness reads serialized behind a stalled scope");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), reads.next())
+                .await
+                .is_err()
+        );
+
+        let heartbeat = LiveAllocatable {
+            allocatable: vec![],
+            load_fraction: 0.8,
+            last_seen: now + 1,
+            live_until_unix_ms: now + 60_001,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tier.put_liveness(&nodes[1], heartbeat.clone()),
+        )
+        .await
+        .expect("unrelated heartbeat serialized behind a stalled scope")
+        .unwrap();
+        // Same-scope writes still wait. Cancelling a queued operation must not
+        // corrupt the cache or leave the stripe permanently locked.
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            tier.put_liveness(&nodes[0], heartbeat.clone())
+        )
+        .await
+        .is_err());
+        drop(reads);
+        drop(stalled);
+        assert_eq!(
+            tier.liveness(&nodes[0], now)
+                .await
+                .unwrap()
+                .unwrap()
+                .load_fraction,
+            0.1
+        );
+        tier.put_liveness(&nodes[0], heartbeat).await.unwrap();
+        assert_eq!(
+            tier.liveness(&nodes[0], now)
+                .await
+                .unwrap()
+                .unwrap()
+                .load_fraction,
+            0.8
+        );
+        assert_eq!(
+            tier.liveness(&nodes[1], now)
+                .await
+                .unwrap()
+                .unwrap()
+                .load_fraction,
+            0.8
+        );
+        assert_eq!(tier.operations.len(), 64);
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]

@@ -40,8 +40,10 @@ backend.
 
 `tiered` uses bounded memory for point lookups over authoritative Valkey state.
 Writes invalidate local entries before updating Valkey; they never cache a
-caller value under a subsequently observed revision. Local cache operations
-are serialized, and fills bind their snapshot to a revision read before the
+caller value under a subsequently observed revision. Operations on the same
+cache scope are serialized through a fixed array of 64 mutexes; unrelated
+scopes can use the Valkey pool concurrently. Hash collisions share a mutex,
+but identity churn cannot grow a lock map. Fills bind their snapshot to a revision read before the
 values. Every L1 use verifies its L2 revision, and cached lifetime is clamped
 to both the L1 freshness window and the signed/effective record expiry.
 Listings (announcements, live nodes, issuers) read Valkey directly. Oversized
