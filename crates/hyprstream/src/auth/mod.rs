@@ -14,6 +14,7 @@ pub mod federation_admission;
 pub mod id_token_verify;
 pub mod identity_store;
 pub mod jwt;
+pub mod jwks_fetcher;
 pub mod key_rotation;
 pub mod mesh_trust;
 pub mod proof_enrollment;
