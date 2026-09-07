@@ -1569,6 +1569,20 @@ fn select_single_process_moql_admission_proof<T>(
     Ok(proofs.into_iter().next().and_then(|(_, proof)| proof))
 }
 
+/// Quinn's CONNECT path has no process-global MoQL proof slot. Defer proof
+/// collection itself to an enabled Iroh profile so Quinn-only multi-service
+/// startup does not inherit Iroh's one-service dialer restriction.
+fn select_iroh_moql_admission_proof<T>(
+    iroh_enabled: bool,
+    proofs: impl FnOnce() -> Result<Vec<(String, Option<T>)>>,
+) -> Result<Option<T>> {
+    if iroh_enabled {
+        select_single_process_moql_admission_proof(proofs()?)
+    } else {
+        Ok(None)
+    }
+}
+
 fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
     let trust = hyprstream_service::global_trust_store();
     // Fast path: already populated (service startup seeded it)
@@ -2796,14 +2810,17 @@ fn main() -> Result<()> {
                                     // response signer. Use that existing state to prove Iroh
                                     // `moql` admission; do not fabricate credentials or fall
                                     // back to an anonymous Iroh handshake.
-                                    let moq_admission_proof = select_single_process_moql_admission_proof(
-                                        service_names
-                                            .iter()
-                                            .map(|service_name| {
-                                                ctx.moql_admission_proof(service_name)
-                                                    .map(|proof| (service_name.clone(), proof))
-                                            })
-                                            .collect::<Result<Vec<_>>>()?,
+                                    let moq_admission_proof = select_iroh_moql_admission_proof(
+                                        qc.iroh,
+                                        || {
+                                            service_names
+                                                .iter()
+                                                .map(|service_name| {
+                                                    ctx.moql_admission_proof(service_name)
+                                                        .map(|proof| (service_name.clone(), proof))
+                                                })
+                                                .collect::<Result<Vec<_>>>()
+                                        },
                                     )?;
                                     let discovery_transport = ctx.transport("discovery", SocketKind::Rep);
                                     let shared = hyprstream_service::QuicSharedConfig {
@@ -3485,6 +3502,15 @@ mod resolver_startup_controls {
             .expect("one service has one scoped proof"),
             Some(7),
         );
+    }
+
+    #[test]
+    fn quinn_only_multi_service_startup_never_selects_an_iroh_proof() {
+        let selected = super::select_iroh_moql_admission_proof::<u8>(false, || {
+            panic!("Quinn-only startup must not inspect Iroh admission proofs")
+        })
+        .expect("Quinn-only profile does not need an Iroh proof");
+        assert_eq!(selected, None);
     }
 
     #[test]

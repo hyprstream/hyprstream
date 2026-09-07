@@ -872,6 +872,9 @@ impl MoqlAdmissionAuthenticator {
             && current.epoch == admitted.epoch
             && current.head_digest == admitted.head_digest
             && current.subject_key_for(&admitted.subject_ed25519).is_some()
+            // Tenant assignment is live deployment authority: removal or
+            // reassignment closes a previously admitted scoped session.
+            && (self.tenant_resolver)(&admitted.peer).as_deref() == Some(admitted.tenant.as_str())
             && server_identity
                 .as_ref()
                 .is_some_and(|server| self.is_server_identity_current(server))
@@ -1476,6 +1479,39 @@ mod tests {
             .check_hello(&hello_for(&ed))
             .expect_err("a rotated-out key is not a current subject key");
         assert!(matches!(err, MoqlAdmissionError::KeyNotCurrent(_)), "{err}");
+    }
+
+    #[test]
+    fn current_session_rejects_removed_or_reassigned_tenant() {
+        let (ed, pq) = keypair(7);
+        let state = state_with(&ed, &pq, 3, 9);
+        let authority: Arc<dyn AcceptedStateAuthority> = Arc::new({
+            let state = state.clone();
+            move |did: &str| (did == DID).then(|| state.clone())
+        });
+        let tenant = Arc::new(Mutex::new(Some("alice".to_owned())));
+        let resolver: PeerTenantResolver = Arc::new({
+            let tenant = Arc::clone(&tenant);
+            move |_peer| tenant.lock().clone()
+        });
+        let identity = crate::stream_info::MoqlServerIdentity {
+            did: DID.to_owned(), epoch: state.epoch, head_digest: state.head_digest.to_vec(),
+            expires_at_unix_ms: crate::envelope::current_timestamp() + 60_000,
+            ed25519: ed.verifying_key().to_bytes(), ml_dsa65: crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq),
+        };
+        let auth = MoqlAdmissionAuthenticator::new(authority, resolver).with_server_identity(
+            MoqlServerIdentityProof { identity, ed25519: ed.clone(), ml_dsa_65: pq },
+        );
+        let admitted = AdmittedMoqPeer {
+            peer: PeerIdentity::authenticated(DID.to_owned()), tenant: "alice".to_owned(),
+            epoch: state.epoch, head_digest: state.head_digest,
+            subject_ed25519: ed.verifying_key().to_bytes(), carrier_node_id: [0; 32],
+        };
+        assert!(auth.is_still_current(&admitted));
+        *tenant.lock() = None;
+        assert!(!auth.is_still_current(&admitted));
+        *tenant.lock() = Some("bob".to_owned());
+        assert!(!auth.is_still_current(&admitted));
     }
 
     #[test]

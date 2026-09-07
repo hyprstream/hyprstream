@@ -235,7 +235,9 @@ impl ProducerReachConfig {
                 .map(|relay| (relay, self.relay_moql_server_identity.clone())),
             // An override describes an independent remote endpoint. It must not
             // inherit the server-default relay's accepted-state witness.
-            RelayChoice::Override(r) | RelayChoice::Only(r) => Some((r, None)),
+            RelayChoice::Override(target) | RelayChoice::Only(target) => {
+                Some((target.transport, Some(target.server_identity)))
+            }
             RelayChoice::NoRelay => None,
         };
         if let Some((relay, relay_identity)) = relay {
@@ -260,17 +262,39 @@ pub enum RelayChoice {
     /// case. Falls back to direct-only when the server has no relay configured.
     #[default]
     ServerDefault,
-    /// Override the server-global relay with a per-stream relay (e.g. per-tenant
-    /// isolation). Direct reaches are still advertised alongside it.
-    Override(crate::stream_info::TransportConfig),
+    /// Override the server-global relay with a separately resolver-verified
+    /// per-stream target (e.g. per-tenant isolation). Direct reaches are still
+    /// advertised alongside it. A transport alone cannot authenticate an Iroh
+    /// relay and is deliberately not representable here.
+    Override(RelayTarget),
     /// Relay-ONLY (anonymized): use this per-stream relay and OMIT all direct
     /// reaches, so the client can only route through the relay (server authority).
-    Only(crate::stream_info::TransportConfig),
+    Only(RelayTarget),
     /// No relay reach for this stream — advertise the direct reaches only.
     ///
     /// Named `NoRelay` (not `None`) to avoid shadowing [`Option::None`] under a
     /// glob import of this enum's variants.
     NoRelay,
+}
+
+/// One independently resolver-verified relay selection for a stream.
+///
+/// The accepted-state server witness belongs to the relay, not the producer
+/// advertising the reach. Keeping them together prevents an Override/Only
+/// call site from emitting an Iroh relay that cannot confirm its remote peer.
+#[derive(Clone, Debug)]
+pub struct RelayTarget {
+    pub transport: crate::stream_info::TransportConfig,
+    pub server_identity: crate::stream_info::MoqlServerIdentity,
+}
+
+impl RelayTarget {
+    pub fn new(
+        transport: crate::stream_info::TransportConfig,
+        server_identity: crate::stream_info::MoqlServerIdentity,
+    ) -> Self {
+        Self { transport, server_identity }
+    }
 }
 
 /// Build the producer-chosen relay's wire-reach [`crate::stream_info::TransportConfig`]
@@ -3095,16 +3119,15 @@ mod tests {
             "the relay must never inherit the producer accepted-state witness"
         );
 
-        let independent = cfg.reach_with_relay(RelayChoice::Override(relay_transport));
+        let independent = cfg.reach_with_relay(RelayChoice::Override(RelayTarget::new(
+            relay_transport,
+            relay.clone(),
+        )));
         let independent_relay = independent
             .iter()
             .find(|destination| destination.role == Role::Relay)
             .expect("independent relay reach");
-        assert!(
-            independent_relay.moql_server_identity.did.is_empty(),
-            "an independent relay without resolver evidence must fail closed, not borrow \
-             the server-default relay witness"
-        );
+        assert_eq!(independent_relay.moql_server_identity, relay);
     }
 
     /// A live enclosing producer witness authenticates only a direct legacy
@@ -3253,7 +3276,10 @@ mod tests {
             server_name: "relay-anon".to_owned(),
             cert_hashes: vec![vec![9u8; 32]],
         });
-        let reach_x = cfg.reach_with_relay(RelayChoice::Only(relay_only.clone()));
+        let reach_x = cfg.reach_with_relay(RelayChoice::Only(RelayTarget::new(
+            relay_only.clone(),
+            accepted_server_identity("did:at9p:relay-anon", 0x23),
+        )));
         assert_eq!(
             reach_x.len(),
             1,
@@ -3298,7 +3324,10 @@ mod tests {
             quic_reach: None,
             relay: Some(server_relay.clone()),
         };
-        let reach = cfg.reach_with_relay(RelayChoice::Override(tenant_relay.clone()));
+        let reach = cfg.reach_with_relay(RelayChoice::Override(RelayTarget::new(
+            tenant_relay.clone(),
+            accepted_server_identity("did:at9p:tenant-relay", 0x24),
+        )));
         assert_eq!(
             reach[0].role,
             Role::Direct,
