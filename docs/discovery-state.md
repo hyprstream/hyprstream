@@ -123,6 +123,12 @@ liveness never grants identity, placement labels, or policy authority.
 Cross-service announcement listings read names and values in one Lua operation
 over the capacity-bounded expiry index, together with atomic metadata cleanup.
 They do not perform network round trips per service or populate point-cache L1.
+Announcement writes, point reads, listings, and tiered revision checks take
+Valkey TIME inside the same transaction as reaping/live checks. Replica wall
+clocks cannot delete globally live entries or keep an expired L1 entry alive.
+PXAT remains the earlier absolute signed/accepted-state and effective lease
+expiry; shared receipt time never renews that authority ceiling. Already-expired
+writes are ignored before value/index admission.
 
 Heartbeat `last_seen` is the admitted server receipt time; the node's `ts` cannot
 poison ordering after future skew or clock rollback. Shared writes take Valkey

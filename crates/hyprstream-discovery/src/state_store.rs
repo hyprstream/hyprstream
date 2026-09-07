@@ -829,6 +829,7 @@ impl ValkeyStateStore {
     // Persistent family-wide generations bound revision storage independently
     // of identity churn. Never expire/reset these counters: recreating a scope
     // must not reuse a revision still attached to another replica's L1 value.
+    #[cfg(test)]
     async fn announcement_revision(&self) -> Result<u64> {
         self.revision(self.key("announcement-global-revision"))
             .await
@@ -844,7 +845,9 @@ impl ValkeyStateStore {
     // plus the last expired cohort; no historical service-name scan is needed.
     // All derived keys retain the deployment's cluster hash tag.
     const REAP_ANNOUNCEMENTS: &str = r#"
-local function reap(expiry, services, names, revision, now)
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local function reap(expiry, services, names, revision)
   local expired = redis.call('ZRANGEBYSCORE', expiry, '-inf', now)
   if #expired > 0 then redis.call('INCR', revision) end
   for _, key in ipairs(expired) do
@@ -860,6 +863,18 @@ local function reap(expiry, services, names, revision, now)
   end
 end
 "#;
+
+    async fn announcement_revision_at_shared_time(&self) -> Result<(u64, i64)> {
+        use fred::prelude::*;
+        // Cache hits need the same expiry clock as L2. Reap before reading the
+        // generation so an expired L2 value cannot remain valid in another L1.
+        self.pool.eval(
+            format!("{}\nreap(KEYS[1], KEYS[2], KEYS[3], KEYS[4])\nreturn {{redis.call('GET', KEYS[4]) or '0', now}}", Self::REAP_ANNOUNCEMENTS),
+            vec![self.key("announcement-expiry"), self.key("services"),
+                self.key("service-names"), self.key("announcement-global-revision")],
+            Vec::<String>::new(),
+        ).await.map_err(Into::into)
+    }
 
     async fn entity_revision(&self) -> Result<u64> {
         // Survives eviction/reinsertion: no per-issuer tombstones and no ABA
@@ -879,7 +894,6 @@ end
     async fn announcements_for_inner(
         &self,
         service_name: &str,
-        now_unix_ms: i64,
     ) -> Result<Vec<AnnouncedEndpoint>> {
         use fred::prelude::*;
 
@@ -887,14 +901,14 @@ end
         // refresh the same key, so GET followed by a separate DEL/SREM can
         // delete its newer value or remove its live index membership.
         const LIST: &str = r#"
-reap(KEYS[4], KEYS[2], KEYS[3], KEYS[5], ARGV[1])
+reap(KEYS[4], KEYS[2], KEYS[3], KEYS[5])
 local live = {}
 for _, key in ipairs(redis.call('SMEMBERS', KEYS[1])) do
   local encoded = redis.call('GET', key)
   if encoded then
     local ok, value = pcall(cjson.decode, encoded)
     if not ok then return redis.error_reply('corrupt Discovery announcement') end
-    if tonumber(value.live_until_unix_ms) > tonumber(ARGV[1]) and tonumber(value.expires_at_unix_ms) > tonumber(ARGV[1]) then
+    if tonumber(value.live_until_unix_ms) > now and tonumber(value.expires_at_unix_ms) > now then
       table.insert(live, encoded)
     else
       redis.call('INCR', KEYS[5])
@@ -908,8 +922,8 @@ for _, key in ipairs(redis.call('SMEMBERS', KEYS[1])) do
   end
 end
 if redis.call('SCARD', KEYS[1]) == 0 then
-  redis.call('SREM', KEYS[2], ARGV[2])
-  redis.call('HDEL', KEYS[3], ARGV[2])
+  redis.call('SREM', KEYS[2], ARGV[1])
+  redis.call('HDEL', KEYS[3], ARGV[1])
 end
 return live
 "#;
@@ -924,7 +938,7 @@ return live
                     self.key("announcement-expiry"),
                     self.key("announcement-global-revision"),
                 ],
-                vec![now_unix_ms.to_string(), Self::service_id(service_name)],
+                vec![Self::service_id(service_name)],
             )
             .await?;
         encoded
@@ -945,9 +959,10 @@ impl DiscoveryStateStore for ValkeyStateStore {
         use fred::prelude::*;
 
         const PUT: &str = r#"
-reap(KEYS[6], KEYS[3], KEYS[4], KEYS[5], ARGV[7])
+reap(KEYS[6], KEYS[3], KEYS[4], KEYS[5])
+if tonumber(ARGV[4]) <= now then return 0 end
 local current = redis.call('GET', KEYS[1])
-if not current and redis.call('ZCARD', KEYS[6]) >= tonumber(ARGV[8]) then
+if not current and redis.call('ZCARD', KEYS[6]) >= tonumber(ARGV[7]) then
   return redis.error_reply('Discovery Valkey announcement capacity exhausted')
 end
 if current then
@@ -993,7 +1008,6 @@ return 1
                         .to_string(),
                     service_id,
                     service_name.to_owned(),
-                    unix_millis_now().to_string(),
                     self.announcement_capacity.to_string(),
                 ],
             )
@@ -1008,15 +1022,15 @@ return 1
     async fn announcements_for(
         &self,
         service_name: &str,
-        now_unix_ms: i64,
+        _now_unix_ms: i64,
     ) -> Result<Vec<AnnouncedEndpoint>> {
-        self.announcements_for_inner(service_name, now_unix_ms)
+        self.announcements_for_inner(service_name)
             .await
     }
 
     async fn all_announcements(
         &self,
-        now_unix_ms: i64,
+        _now_unix_ms: i64,
     ) -> Result<Vec<(String, Vec<AnnouncedEndpoint>)>> {
         use fred::prelude::*;
 
@@ -1024,15 +1038,19 @@ return 1
         // expiry index. Reap and refresh still serialize, and a listing never
         // labels an L1 snapshot or performs round trips per service.
         const LIST: &str = r#"
-reap(KEYS[1], KEYS[2], KEYS[3], KEYS[4], ARGV[1])
+reap(KEYS[1], KEYS[2], KEYS[3], KEYS[4])
 local values = {}
 for _, key in ipairs(redis.call('ZRANGE', KEYS[1], 0, -1)) do
   local value = redis.call('GET', key)
   if value then
-    local service = string.match(key, ':announcement:([^:]+):[^:]+$')
-    local name = redis.call('HGET', KEYS[3], service)
-    if not name then return redis.error_reply('missing Discovery service name') end
-    table.insert(values, {name, value})
+    local ok, decoded = pcall(cjson.decode, value)
+    if not ok then return redis.error_reply('corrupt Discovery announcement') end
+    if tonumber(decoded.live_until_unix_ms) > now and tonumber(decoded.expires_at_unix_ms) > now then
+      local service = string.match(key, ':announcement:([^:]+):[^:]+$')
+      local name = redis.call('HGET', KEYS[3], service)
+      if not name then return redis.error_reply('missing Discovery service name') end
+      table.insert(values, {name, value})
+    end
   end
 end
 return values
@@ -1047,15 +1065,13 @@ return values
                     self.key("service-names"),
                     self.key("announcement-global-revision"),
                 ],
-                vec![now_unix_ms.to_string()],
+                Vec::<String>::new(),
             )
             .await?;
         let mut all: HashMap<String, Vec<AnnouncedEndpoint>> = HashMap::new();
         for (name, value) in encoded {
             let endpoint: AnnouncedEndpoint = serde_json::from_str(&value)?;
-            if endpoint.is_live_at(now_unix_ms) {
-                all.entry(name).or_default().push(endpoint);
-            }
+            all.entry(name).or_default().push(endpoint);
         }
         Ok(all.into_iter().collect())
     }
@@ -1384,11 +1400,11 @@ impl DiscoveryStateStore for TieredStateStore {
     async fn announcements_for(
         &self,
         service_name: &str,
-        now_unix_ms: i64,
+        _now_unix_ms: i64,
     ) -> Result<Vec<AnnouncedEndpoint>> {
         let _operation = self.operation("announcement", service_name).lock().await;
         let scope = Self::scope("announcement", service_name);
-        let revision = self.valkey.announcement_revision().await?;
+        let (revision, now_unix_ms) = self.valkey.announcement_revision_at_shared_time().await?;
         if self.is_observed(&scope, revision, now_unix_ms) {
             return self
                 .memory
@@ -1534,7 +1550,18 @@ impl DiscoveryStateStore for TieredStateStore {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    // Used only by current-thread clock-skew tests; never changes the host or
+    // the clock of another concurrently running test/Valkey driver thread.
+    static TEST_REPLICA_TIME: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
 pub(crate) fn unix_millis_now() -> i64 {
+    #[cfg(test)]
+    if let Some(now) = TEST_REPLICA_TIME.with(std::cell::Cell::get) {
+        return now;
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1745,11 +1772,12 @@ mod tests {
             10_000,
         );
         let now = unix_millis_now();
+        let cohort_expiry = now + 5_000;
         for i in 0..256 {
             let name = format!("service:{i}:λ");
             for kind in ["iroh", "quic"] {
                 writer
-                    .put_announcement(&name, endpoint(kind, 1, now + 60_000, now + 60_000))
+                    .put_announcement(&name, endpoint(kind, 1, cohort_expiry, cohort_expiry))
                     .await
                     .unwrap();
             }
@@ -1774,6 +1802,13 @@ mod tests {
             )
             .await
             .unwrap();
+        // Caller time cannot expire shared values. Keep the original name,
+        // value, index cleanup, and capacity assertions, but wait for the
+        // cohort's real server-side lease instead of advancing a replica.
+        assert_eq!(reader.all_announcements(now + 60_001).await.unwrap().len(), 256);
+        tokio::time::sleep(std::time::Duration::from_millis(
+            (cohort_expiry + 50 - unix_millis_now()).max(0) as u64,
+        )).await;
         let remaining = reader.all_announcements(now + 60_001).await.unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].0, "service:0:λ");
@@ -2096,6 +2131,120 @@ mod tests {
             artifact_capacity: 64,
             command_timeout_ms: 250,
         }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    struct ReplicaClock;
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    impl ReplicaClock {
+        fn at(now: i64) -> Self {
+            TEST_REPLICA_TIME.with(|clock| {
+                assert!(clock.replace(Some(now)).is_none());
+            });
+            Self
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    impl Drop for ReplicaClock {
+        fn drop(&mut self) {
+            TEST_REPLICA_TIME.with(|clock| clock.set(None));
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_announcement_reaping_ignores_replica_clock_skew() {
+        use fred::prelude::*;
+
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        // Each entry point gets its own still-live anchor. The clock guard
+        // also affects put_announcement's implicit host-clock call before the
+        // repair, not just the explicit timestamp arguments on read methods.
+        for operation in ["put", "point", "list", "tiered"] {
+            let config = valkey_config(url.clone(), operation);
+            let shared = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
+            let replica = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
+            let tiered = TieredStateStore::new(
+                Arc::new(MemoryStateStore::new(8, 8, 8)), replica.clone(), 30_000,
+            );
+            let now: i64 = shared.pool.eval(
+                "local t = redis.call('TIME'); return tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)",
+                Vec::<String>::new(), Vec::<String>::new(),
+            ).await.unwrap();
+            shared.put_announcement("anchor", endpoint("iroh", 1, now + 60_000, now + 30_000)).await.unwrap();
+            if operation == "tiered" {
+                assert_eq!(tiered.announcements_for("anchor", now).await.unwrap().len(), 1);
+            }
+            let revision = shared.announcement_revision().await.unwrap();
+            let ahead = now + 3_600_000;
+            {
+                let _clock = ReplicaClock::at(ahead);
+                match operation {
+                    "put" => {
+                        replica.put_announcement("writer", endpoint("iroh", 1, ahead + 60_000, ahead + 30_000)).await.unwrap();
+                    }
+                    "point" => assert_eq!(replica.announcements_for("anchor", ahead).await.unwrap().len(), 1),
+                    "list" => assert_eq!(replica.all_announcements(ahead).await.unwrap().len(), 1),
+                    "tiered" => assert_eq!(tiered.announcements_for("anchor", ahead).await.unwrap().len(), 1),
+                    _ => unreachable!(),
+                }
+            }
+            assert_eq!(shared.announcements_for("anchor", now).await.unwrap().len(), 1, "{operation} deleted another replica's live announcement");
+            let exists: bool = shared.pool.exists(shared.announcement_key("anchor", "iroh")).await.unwrap();
+            assert!(exists);
+            assert_eq!(shared.announcement_revision().await.unwrap(), revision + u64::from(operation == "put"));
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_announcement_shared_expiry_rejects_behind_replica_revival() {
+        use fred::prelude::*;
+
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let config = valkey_config(url, "announcement-expiry-clock");
+        let shared = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
+        let tiered = TieredStateStore::new(
+            Arc::new(MemoryStateStore::new(8, 8, 8)), shared.clone(), 30_000,
+        );
+        let now: i64 = shared.pool.eval(
+            "local t = redis.call('TIME'); return tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)",
+            Vec::<String>::new(), Vec::<String>::new(),
+        ).await.unwrap();
+        // Either signed/accepted authority or the shorter effective heartbeat
+        // lease can expire first; neither becomes a new receipt-relative lease.
+        let expiry = now + 300;
+        for (name, signed, live) in [("signed", expiry, now + 60_000), ("lease", now + 60_000, expiry)] {
+            shared.put_announcement(name, endpoint("iroh", 1, signed, live)).await.unwrap();
+            let pxat: i64 = shared.pool.eval("return redis.call('PEXPIRETIME', KEYS[1])",
+                vec![shared.announcement_key(name, "iroh")], Vec::<String>::new()).await.unwrap();
+            assert_eq!(pxat, expiry, "preserve the absolute authority/lease ceiling");
+            assert_eq!(tiered.announcements_for(name, now).await.unwrap().len(), 1);
+        }
+        let revision = shared.announcement_revision().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let behind = now - 3_600_000;
+        let _clock = ReplicaClock::at(behind);
+        for name in ["signed", "lease"] {
+            // Exercise an already-populated L1 before any separate listing
+            // reaps L2 or invalidates its revision for us.
+            assert!(tiered.announcements_for(name, behind).await.unwrap().is_empty());
+            assert!(shared.announcements_for(name, behind).await.unwrap().is_empty());
+            assert_eq!(shared.put_announcement(name, endpoint("iroh", 2, expiry, now + 60_000)).await.unwrap(), PutResult::IgnoredOlder);
+        }
+        assert!(shared.all_announcements(behind).await.unwrap().is_empty());
+        assert!(shared.announcement_revision().await.unwrap() > revision);
+        let metadata: Vec<usize> = shared.pool.eval(
+            "return {redis.call('ZCARD', KEYS[1]), redis.call('SCARD', KEYS[2]), redis.call('HLEN', KEYS[3])}",
+            vec![shared.key("announcement-expiry"), shared.key("services"), shared.key("service-names")], Vec::<String>::new(),
+        ).await.unwrap();
+        assert_eq!(metadata, vec![0, 0, 0], "expired writes must not resurrect secondary indexes");
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
