@@ -1909,7 +1909,7 @@ where
             _ = cancellation.cancelled() => return NativeAnnouncementRefreshCompletion::Cancelled,
             result = async { announce().await } => result,
         };
-        match result {
+        let sleep_delay = match result {
             Ok(()) => {
                 tracing::info!(
                     service = service_name,
@@ -1917,7 +1917,8 @@ where
                     endpoint,
                     "Announced native endpoint to DiscoveryService"
                 );
-                delay = ANNOUNCEMENT_REFRESH;
+                delay = RETRY_INITIAL;
+                ANNOUNCEMENT_REFRESH
             }
             Err(error) => {
                 tracing::warn!(
@@ -1925,17 +1926,19 @@ where
                     socket_kind,
                     "Failed to announce native endpoint: {error}"
                 );
+                let sleep_delay = delay;
                 delay = delay
                     .checked_mul(2)
                     .unwrap_or(ANNOUNCEMENT_REFRESH)
                     .min(ANNOUNCEMENT_REFRESH)
                     .max(RETRY_INITIAL);
+                sleep_delay
             }
-        }
+        };
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => return NativeAnnouncementRefreshCompletion::Cancelled,
-            _ = tokio::time::sleep(delay) => {}
+            _ = tokio::time::sleep(sleep_delay) => {}
         }
     }
 }
@@ -2824,22 +2827,12 @@ fn main() -> Result<()> {
                                                         }
                                                     };
                                                     runtime.block_on(async move {
+                                                        let mut request = request;
                                                         let socket_kind = request.reach.socket_kind().to_owned();
                                                         let endpoint = request.reach.endpoint();
                                                         let service_name = request.service_name.clone();
-                                                        let jwt_expires_at_unix_ms = request.service_jwt.as_deref().and_then(|jwt| {
-                                                            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-                                                            let payload = jwt.split('.').nth(1)?;
-                                                            let claims = URL_SAFE_NO_PAD.decode(payload).ok()
-                                                                .and_then(|payload| serde_json::from_slice::<serde_json::Value>(&payload).ok())?;
-                                                            claims["exp"].as_i64()?.checked_mul(1_000)
-                                                        });
-                                                        let refresh_expires_at_unix_ms = jwt_expires_at_unix_ms
-                                                            .map_or(request.expires_at_unix_ms, |jwt_expiry| {
-                                                                request.expires_at_unix_ms.min(jwt_expiry)
-                                                            });
                                                         let client = match hyprstream_discovery::DiscoveryClient::for_local_bootstrap(
-                                                            request.signing_key,
+                                                            request.signing_key.clone(),
                                                             request.discovery_verifying_key,
                                                             None,
                                                         ) {
@@ -2849,28 +2842,21 @@ fn main() -> Result<()> {
                                                                 return;
                                                             }
                                                         };
-                                                        let announcement = hyprstream_discovery::ServiceAnnouncement {
-                                                            service_name,
-                                                            socket_kind,
-                                                            endpoint,
-                                                            service_jwt: request.service_jwt,
-                                                            service_did: request.service_did,
-                                                            capabilities: request.capabilities,
-                                                            accepted_state_digest: request.accepted_state_digest,
-                                                            accepted_state_epoch: request.accepted_state_epoch,
-                                                            response_key_id: request.response_key_id,
-                                                            request_kem_key_id: request.request_kem_key_id,
-                                                            request_kem_recipient: request.request_kem_recipient,
-                                                            expires_at_unix_ms: request.expires_at_unix_ms,
-                                                        };
                                                         let _completion = refresh_native_announcement(
-                                                            &announcement.service_name,
-                                                            &announcement.socket_kind,
-                                                            &announcement.endpoint,
-                                                            refresh_expires_at_unix_ms,
-                                                            request.cancellation,
-                                                            || async {
-                                                                client.announce(&announcement).await.map(|_| ())
+                                                            &service_name,
+                                                            &socket_kind,
+                                                            &endpoint,
+                                                            // Authority/JWT expiry is rechecked for each attempt.
+                                                            // Never retain the original deadline after renewal.
+                                                            i64::MAX,
+                                                            request.cancellation.clone(),
+                                                            || {
+                                                                let announcement = hyprstream_core::services::factories::current_native_announcement(&mut request);
+                                                                let client = &client;
+                                                                async move {
+                                                                    let announcement = announcement?;
+                                                                    client.announce(&announcement).await.map(|_| ())
+                                                                }
                                                             },
                                                         )
                                                         .await;
@@ -3807,6 +3793,38 @@ mod resolver_startup_controls {
             .await.expect("cancellation must not wait for RPC completion").expect("task");
         assert_eq!(completion, super::NativeAnnouncementRefreshCompletion::Cancelled);
         assert!(!completed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_announcement_refresh_loop_backoff_starts_at_five_and_resets_after_success() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            let mut attempt = 0;
+            async move {
+                super::refresh_native_announcement(
+                    "model", "iroh", "iroh://test", i64::MAX, cancellation,
+                    move || {
+                        attempt += 1;
+                        sent.send(tokio::time::Instant::now()).expect("receiver live");
+                        let success = attempt == 5;
+                        async move { if success { Ok(()) } else { Err("retry fixture") } }
+                    },
+                ).await
+            }
+        });
+        let mut previous = received.recv().await.expect("initial attempt");
+        for seconds in [5, 10, 20, 25, 25, 5, 10] {
+            let current = received.recv().await.expect("next attempt");
+            let elapsed = current.duration_since(previous);
+            let expected = std::time::Duration::from_secs(seconds);
+            assert!(elapsed >= expected && elapsed <= expected + std::time::Duration::from_millis(1),
+                "expected {expected:?} retry interval, got {elapsed:?}");
+            previous = current;
+        }
+        cancellation.cancel();
+        assert_eq!(task.await.expect("refresh task"), super::NativeAnnouncementRefreshCompletion::Cancelled);
     }
 
     #[tokio::test]
