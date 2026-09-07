@@ -28,11 +28,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh::{EndpointAddr, TransportAddr};
@@ -41,14 +41,14 @@ use parking_lot::Mutex;
 use rand::RngCore;
 use web_transport_iroh::Session;
 
-use hyprstream_rpc::crypto::pq::{MlDsaSigningKey, ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes};
+use hyprstream_rpc::crypto::pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes, MlDsaSigningKey};
 use hyprstream_rpc::moq_authz::PeerIdentity;
 use hyprstream_rpc::transport::iroh_moq::{IrohMoqProtocolHandler, MoqAuthzConfig};
-use hyprstream_rpc::transport::iroh_substrate::{ALPN_MOQ_LITE, IrohSubstrate, NoopHandler};
+use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, NoopHandler, ALPN_MOQ_LITE};
 use hyprstream_rpc::transport::moql_admission::{
+    admission_transcript, decode_challenge, encode_hello, encode_response, prove_moql_admission,
     AcceptedIdentityState, AcceptedStateAuthority, AcceptedSubjectKey, AdmissionHello,
-    AdmissionResponse, MoqlAdmissionAuthenticator, MoqlAdmissionProof, admission_transcript,
-    decode_challenge, encode_hello, encode_response, prove_moql_admission,
+    AdmissionResponse, MoqlAdmissionAuthenticator, MoqlAdmissionProof, MoqlServerIdentityProof,
 };
 
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -92,12 +92,15 @@ fn peer(seed: u8, cid_tag: &str) -> PeerFixture {
     }
 }
 
-fn proof(peer: &PeerFixture) -> MoqlAdmissionProof {
+fn proof(
+    peer: &PeerFixture,
+    expected_server: hyprstream_rpc::stream_info::MoqlServerIdentity,
+) -> MoqlAdmissionProof {
     MoqlAdmissionProof {
         did: peer.did.clone(),
         ed25519: peer.ed.clone(),
         ml_dsa_65: peer.pq.clone(),
-        expected_server: Default::default(),
+        expected_server,
     }
 }
 
@@ -142,6 +145,24 @@ struct AdmissionServer {
     substrate: IrohSubstrate,
     producer: OriginProducer,
     resolver_calls: Arc<AtomicUsize>,
+    server_identity: hyprstream_rpc::stream_info::MoqlServerIdentity,
+}
+
+fn server_identity() -> MoqlServerIdentityProof {
+    let server = peer(0xC1, "server-cid512");
+    let identity = hyprstream_rpc::stream_info::MoqlServerIdentity {
+        did: server.did,
+        epoch: 11,
+        head_digest: vec![0xD1; 64],
+        expires_at_unix_ms: hyprstream_rpc::envelope::current_timestamp() + 60_000,
+        ed25519: server.ed.verifying_key().to_bytes(),
+        ml_dsa65: ml_dsa_sk_to_vk_bytes(&server.pq),
+    };
+    MoqlServerIdentityProof {
+        identity,
+        ed25519: server.ed,
+        ml_dsa_65: server.pq,
+    }
 }
 
 /// Bind a `moql` server whose handler requires #1027 admission. `tenants` is
@@ -151,6 +172,15 @@ async fn admission_server(
     tenants: HashMap<String, String>,
     timeout: Duration,
 ) -> Result<AdmissionServer> {
+    admission_server_with_identity(authority, tenants, timeout, server_identity()).await
+}
+
+async fn admission_server_with_identity(
+    authority: Arc<FixtureAuthority>,
+    tenants: HashMap<String, String>,
+    timeout: Duration,
+    server_identity: MoqlServerIdentityProof,
+) -> Result<AdmissionServer> {
     let resolver_calls = Arc::new(AtomicUsize::new(0));
     let calls = Arc::clone(&resolver_calls);
     let resolver = Arc::new(move |peer: &PeerIdentity| {
@@ -159,8 +189,26 @@ async fn admission_server(
             .as_deref()
             .and_then(|sub| tenants.get(sub).cloned())
     });
-    let authenticator =
-        Arc::new(MoqlAdmissionAuthenticator::new(authority, resolver).with_timeout(timeout));
+    let mut server_head = [0u8; 64];
+    server_head.copy_from_slice(&server_identity.identity.head_digest);
+    authority.set(
+        &server_identity.identity.did,
+        AcceptedIdentityState {
+            epoch: server_identity.identity.epoch,
+            head_digest: server_head,
+            subject_keys: vec![AcceptedSubjectKey {
+                ed25519: server_identity.identity.ed25519,
+                ml_dsa_65: server_identity.identity.ml_dsa65.clone(),
+            }],
+            expires_at_unix_ms: Some(server_identity.identity.expires_at_unix_ms),
+        },
+    );
+    let public_server_identity = server_identity.identity.clone();
+    let authenticator = Arc::new(
+        MoqlAdmissionAuthenticator::new(authority, resolver)
+            .with_server_identity(server_identity)
+            .with_timeout(timeout),
+    );
     let handler = IrohMoqProtocolHandler::new()
         .with_authz(MoqAuthzConfig::default().with_admission(authenticator));
     let producer = handler.origin_producer().clone();
@@ -169,6 +217,7 @@ async fn admission_server(
         substrate,
         producer,
         resolver_calls,
+        server_identity: public_server_identity,
     })
 }
 
@@ -254,7 +303,8 @@ async fn admitted_peer_streams_own_tenant_broadcast() -> Result<()> {
     let _bob_broadcast = publish_frame(&server.producer, "bob/run-9", b"bob-tokens")?;
 
     // ── alice admits and streams her own tenant's broadcast ─────────────────
-    let (client, _moq_session, consumer) = admitted_client(&addr, &proof(&alice)).await?;
+    let (client, _moq_session, consumer) =
+        admitted_client(&addr, &proof(&alice, server.server_identity.clone())).await?;
     assert!(
         server.resolver_calls.load(Ordering::SeqCst) >= 1,
         "admission must resolve the verified subject to a tenant"
@@ -291,6 +341,69 @@ async fn admitted_peer_streams_own_tenant_broadcast() -> Result<()> {
     Ok(())
 }
 
+/// The server that answers the carrier must be precisely the server identity
+/// authenticated by the enclosing signed StreamInfo. A valid client proof must
+/// not disclose a usable MoQ session to a substituted server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrong_server_witness_is_rejected_before_moq_handshake() -> Result<()> {
+    let authority = Arc::new(FixtureAuthority::default());
+    let alice = peer(0x31, "wrong-server-client");
+    authority.set(&alice.did, accepted_state(&alice, 2, 7, None));
+    let tenants = [(alice.did.clone(), "alice".to_owned())]
+        .into_iter()
+        .collect();
+    let server = admission_server(authority, tenants, ADMISSION_TIMEOUT).await?;
+    let addr = direct_addr(&server.substrate);
+
+    let mut wrong_server = server.server_identity.clone();
+    wrong_server.head_digest = vec![0xEE; 64];
+    let error = match admitted_client(&addr, &proof(&alice, wrong_server)).await {
+        Ok(_) => panic!("a substituted server witness must reject"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("does not match resolver witness"),
+        "wrong-server rejection must happen before MoQ: {error}"
+    );
+
+    server.substrate.shutdown().await?;
+    Ok(())
+}
+
+/// A server that advertises the right witness but cannot prove possession of
+/// the witness's private hybrid keys must be rejected after the client proof.
+/// This catches an unsigned/forged verdict and wrong-key server confirmation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unconfirmed_server_is_rejected_before_moq_handshake() -> Result<()> {
+    let authority = Arc::new(FixtureAuthority::default());
+    let alice = peer(0x32, "unconfirmed-server-client");
+    authority.set(&alice.did, accepted_state(&alice, 2, 8, None));
+    let tenants = [(alice.did.clone(), "alice".to_owned())]
+        .into_iter()
+        .collect();
+    let mut forged_server = server_identity();
+    let public_server = forged_server.identity.clone();
+    forged_server.ed25519 = SigningKey::from_bytes(&[0xEF; 32]);
+    let server =
+        admission_server_with_identity(authority, tenants, ADMISSION_TIMEOUT, forged_server)
+            .await?;
+    let addr = direct_addr(&server.substrate);
+
+    let error = match admitted_client(&addr, &proof(&alice, public_server)).await {
+        Ok(_) => panic!("an unconfirmed server must not be handed to the MoQ handshake"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("did not mutually confirm"),
+        "forged server confirmation must reject before MoQ: {error}"
+    );
+
+    server.substrate.shutdown().await?;
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // replay
 // ─────────────────────────────────────────────────────────────────────────────
@@ -315,7 +428,7 @@ async fn replayed_response_on_a_fresh_challenge_is_rejected() -> Result<()> {
         NoopHandler::new("c-rpc"),
     )
     .await?;
-    let proof = proof(&alice);
+    let proof = proof(&alice, server.server_identity.clone());
     let captured: Vec<u8> = {
         let conn = client.connect(addr.clone(), ALPN_MOQ_LITE).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
@@ -423,7 +536,7 @@ async fn expired_accepted_state_is_rejected() -> Result<()> {
     let server = admission_server(authority, tenants, ADMISSION_TIMEOUT).await?;
     let addr = direct_addr(&server.substrate);
 
-    let result = admitted_client(&addr, &proof(&alice)).await;
+    let result = admitted_client(&addr, &proof(&alice, server.server_identity.clone())).await;
     assert!(
         result.is_err(),
         "an expired accepted state must reject admission"
@@ -450,7 +563,8 @@ async fn expiry_closes_an_already_admitted_session() -> Result<()> {
     let server = admission_server(Arc::clone(&authority), tenants, ADMISSION_TIMEOUT).await?;
     let addr = direct_addr(&server.substrate);
 
-    let (client, session, _consumer) = admitted_client(&addr, &proof(&alice)).await?;
+    let (client, session, _consumer) =
+        admitted_client(&addr, &proof(&alice, server.server_identity.clone())).await?;
     let _ = tokio::time::timeout(Duration::from_secs(5), session.closed())
         .await
         .map_err(|_| anyhow!("expired accepted state did not close live MoQ session"))?;
@@ -480,7 +594,8 @@ async fn state_advance_invalidates_previous_keys() -> Result<()> {
     let _alice_broadcast = publish_frame(&server.producer, "alice/run-1", b"alice-tokens")?;
 
     // ── epoch 3: the proof admits ────────────────────────────────────────────
-    let (client1, s1, _c1) = admitted_client(&addr, &proof(&alice_v1)).await?;
+    let (client1, s1, _c1) =
+        admitted_client(&addr, &proof(&alice_v1, server.server_identity.clone())).await?;
 
     // ── state advance: epoch 4 publishes a rotated key set ──────────────────
     let alice_v2 = peer(6, "rotatecid512");
@@ -492,14 +607,15 @@ async fn state_advance_invalidates_previous_keys() -> Result<()> {
     client1.shutdown().await?;
 
     // ── the previous proof is now rejected ───────────────────────────────────
-    let result = admitted_client(&addr, &proof(&alice_v1)).await;
+    let result = admitted_client(&addr, &proof(&alice_v1, server.server_identity.clone())).await;
     assert!(
         result.is_err(),
         "a proof under rotated-out keys must be rejected after state advance"
     );
 
     // ── the rotated-in key admits ────────────────────────────────────────────
-    let (client2, _s2, consumer2) = admitted_client(&addr, &proof(&alice_v2)).await?;
+    let (client2, _s2, consumer2) =
+        admitted_client(&addr, &proof(&alice_v2, server.server_identity.clone())).await?;
     let seen = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         consumer2.announced_broadcast("alice/run-1"),

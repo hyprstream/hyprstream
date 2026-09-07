@@ -17,15 +17,17 @@
 //! 1. **Hello** (client → server): wire version, the peer's `did:at9p` DID, its
 //!    Ed25519 verifying key, and a fresh random `client_nonce`.
 //! 2. **Challenge** (server → client): a fresh random `server_nonce` plus the
-//!    server's *current* accepted-state `epoch` and `head_digest` for that DID,
-//!    drawn from the daemon-owned [`AcceptedStateAuthority`] at admission time.
+//!    client's current accepted-state `epoch` and `head_digest`, and the
+//!    server identity pinned by the signed `StreamInfo` response.
 //! 3. **Response** (client → server): a nested composite signature over the
 //!    transcript — the inner Ed25519 layer signs the transcript `T`, the outer
 //!    ML-DSA-65 layer signs `T ‖ ed_sig` (the same inner→outer nesting the at9p
 //!    record composite uses, `hyprstream-pds::at9p_sign`).
-//! 4. **Verdict** (server → client, success only): the session is admitted and
-//!    the moq handshake may proceed. Any rejection instead closes the
-//!    connection — the client learns "not admitted", never which check failed.
+//! 4. **Confirmation** (server → client, success only): a nested server
+//!    Ed25519 + ML-DSA-65 signature covers every previous frame, including the
+//!    server accepted-state witness and the client's complete hybrid response.
+//!    Only after verifying it may the client start the MoQ handshake. Any
+//!    rejection instead closes the connection.
 //!
 //! The transcript binds domain, ALPN, DID, both nonces, and the accepted-state
 //! epoch/head digest:
@@ -78,16 +80,19 @@ use rand::RngCore as _;
 use sha2::Digest as _;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::crypto::pq::{MlDsaSigningKey, ml_dsa_sign, ml_dsa_verify, ml_dsa_vk_from_bytes};
+use crate::crypto::pq::{
+    ml_dsa_sign, ml_dsa_sk_to_vk_bytes, ml_dsa_verify, ml_dsa_vk_from_bytes, MlDsaSigningKey,
+};
 use crate::identity::DID_AT9P_PREFIX;
-use crate::moq_authz::{PeerIdentity, is_valid_tenant_segment};
+use crate::moq_authz::{is_valid_tenant_segment, PeerIdentity};
 use crate::transport::iroh_moq::PeerTenantResolver;
 
 /// Domain separation tag at the head of every admission transcript.
 pub const MOQL_ADMISSION_DOMAIN: &[u8] = b"hyprstream/moql-admission/v1";
 
-/// Wire format version byte.
-const WIRE_VERSION: u8 = 1;
+/// Wire format version byte. Version 2 adds the accepted server identity to
+/// the challenge and a hybrid server confirmation over the completed exchange.
+const WIRE_VERSION: u8 = 2;
 
 /// Maximum DID length accepted on the wire (DIDs are short identifiers; a
 /// longer field is a parse error, not a truncation).
@@ -163,6 +168,26 @@ pub enum MoqlAdmissionError {
     /// The resolver returned a tenant that is not one MoQ path segment.
     #[error("resolved tenant {0:?} is not a valid single MoQ path segment")]
     InvalidTenant(String),
+    /// An admission-enabled server did not have the local private identity
+    /// required to prove possession to the client.
+    #[error("moql server has no accepted-state signing identity")]
+    ServerIdentityUnavailable,
+    /// The server's configured private keys do not match its public,
+    /// resolver-verified accepted-state witness.
+    #[error("moql server signing identity does not match its accepted-state witness")]
+    ServerIdentityMismatch,
+    /// The local server witness expired, advanced, or lost its published key
+    /// pair after startup. It cannot be used to confirm a new or live tunnel.
+    #[error("moql server accepted-state identity is no longer current")]
+    ServerIdentityNotCurrent,
+    /// The remote server's challenge did not carry precisely the witness that
+    /// the signed StreamInfo authenticated for this dial.
+    #[error("moql challenge server identity does not match resolver witness")]
+    WrongServer,
+    /// The server did not provide a valid hybrid signature over the completed
+    /// admission exchange. The client must never proceed to MoQ in this case.
+    #[error("moql server did not mutually confirm the full admission transcript")]
+    ServerUnconfirmed,
 }
 
 /// One accepted current subject key: an atomic Ed25519 ↔ ML-DSA-65 pair as
@@ -268,7 +293,7 @@ pub struct AdmissionHello {
 }
 
 /// Challenge (server → client): server freshness + currentness claim.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AdmissionChallenge {
     /// Fresh random server nonce, single-use per connection.
     pub server_nonce: [u8; 32],
@@ -276,6 +301,9 @@ pub struct AdmissionChallenge {
     pub epoch: u64,
     /// The server's current accepted-state head digest for the DID.
     pub head_digest: [u8; 64],
+    /// The server accepted-state identity expected by this client from the
+    /// signed StreamInfo response. It is signed in the final confirmation.
+    pub server_identity: crate::stream_info::MoqlServerIdentity,
 }
 
 /// Response (client → server): the nested composite proof.
@@ -284,6 +312,17 @@ pub struct AdmissionResponse {
     /// Ed25519 signature over the transcript `T`.
     pub ed_sig: [u8; 64],
     /// ML-DSA-65 signature over `T ‖ ed_sig` (inner→outer nesting).
+    pub pq_sig: Vec<u8>,
+}
+
+/// Server → client mutual confirmation. Both signature halves cover every
+/// admission frame: hello, challenge (including the server accepted-state
+/// witness), and the client's nested hybrid response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionConfirmation {
+    /// Ed25519 signature over [`mutual_confirmation_transcript`].
+    pub ed_sig: [u8; 64],
+    /// ML-DSA-65 signature over the transcript followed by `ed_sig`.
     pub pq_sig: Vec<u8>,
 }
 
@@ -308,6 +347,61 @@ pub fn decode_verdict(bytes: &[u8]) -> Result<(), MoqlAdmissionError> {
     }
 }
 
+/// Canonical public encoding of a resolver-verified server identity. It is
+/// deliberately included in both the challenge and the signed confirmation so
+/// a carrier peer cannot substitute a server between RPC resolution and MoQ.
+fn encode_server_identity(identity: &crate::stream_info::MoqlServerIdentity) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(2 + identity.did.len() + 8 + 64 + 8 + 32 + 2 + identity.ml_dsa65.len());
+    out.extend_from_slice(&(identity.did.len() as u16).to_be_bytes());
+    out.extend_from_slice(identity.did.as_bytes());
+    out.extend_from_slice(&identity.epoch.to_be_bytes());
+    out.extend_from_slice(&identity.head_digest);
+    out.extend_from_slice(&identity.expires_at_unix_ms.to_be_bytes());
+    out.extend_from_slice(&identity.ed25519);
+    out.extend_from_slice(&(identity.ml_dsa65.len() as u16).to_be_bytes());
+    out.extend_from_slice(&identity.ml_dsa65);
+    out
+}
+
+fn decode_server_identity(
+    bytes: &[u8],
+) -> Result<crate::stream_info::MoqlServerIdentity, MoqlAdmissionError> {
+    let malformed = |why: &str| MoqlAdmissionError::Malformed(format!("server identity: {why}"));
+    if bytes.len() < 2 {
+        return Err(malformed("truncated DID length"));
+    }
+    let did_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+    if did_len == 0 || did_len > MAX_DID_BYTES || bytes.len() < 2 + did_len + 8 + 64 + 8 + 32 + 2 {
+        return Err(malformed("invalid DID length or truncated fields"));
+    }
+    let did = std::str::from_utf8(&bytes[2..2 + did_len])
+        .map_err(|_| malformed("DID is not UTF-8"))?
+        .to_owned();
+    let offset = 2 + did_len;
+    let mut epoch = [0u8; 8];
+    epoch.copy_from_slice(&bytes[offset..offset + 8]);
+    let mut head_digest = vec![0u8; 64];
+    head_digest.copy_from_slice(&bytes[offset + 8..offset + 72]);
+    let mut expiry = [0u8; 8];
+    expiry.copy_from_slice(&bytes[offset + 72..offset + 80]);
+    let mut ed25519 = [0u8; 32];
+    ed25519.copy_from_slice(&bytes[offset + 80..offset + 112]);
+    let pq_len = u16::from_be_bytes([bytes[offset + 112], bytes[offset + 113]]) as usize;
+    let pq = &bytes[offset + 114..];
+    if pq_len == 0 || pq_len != pq.len() {
+        return Err(malformed("ML-DSA-65 length mismatch or empty"));
+    }
+    Ok(crate::stream_info::MoqlServerIdentity {
+        did,
+        epoch: u64::from_be_bytes(epoch),
+        head_digest,
+        expires_at_unix_ms: i64::from_be_bytes(expiry),
+        ed25519,
+        ml_dsa65: pq.to_vec(),
+    })
+}
+
 /// The signed transcript both sides reconstruct byte-identically.
 pub fn admission_transcript(
     did: &str,
@@ -330,6 +424,38 @@ pub fn admission_transcript(
     t.extend_from_slice(&epoch.to_be_bytes());
     t.extend_from_slice(head_digest);
     t
+}
+
+/// The complete mutually-confirmed admission transcript. Unlike the client
+/// proof's preface, this includes the advertised server accepted-state witness
+/// and the client's two signature layers, so the server cannot be substituted
+/// after the client proves possession.
+pub fn mutual_confirmation_transcript(
+    hello: &AdmissionHello,
+    challenge: &AdmissionChallenge,
+    response: &AdmissionResponse,
+) -> Vec<u8> {
+    let client = admission_transcript(
+        &hello.did,
+        &hello.client_nonce,
+        &challenge.server_nonce,
+        challenge.epoch,
+        &challenge.head_digest,
+    );
+    let server = encode_server_identity(&challenge.server_identity);
+    let response = encode_response(response);
+    let mut out = Vec::with_capacity(
+        MOQL_ADMISSION_DOMAIN.len() + 1 + client.len() + 4 + server.len() + 4 + response.len(),
+    );
+    out.extend_from_slice(MOQL_ADMISSION_DOMAIN);
+    out.extend_from_slice(b"/mutual-confirm/v1\0");
+    out.extend_from_slice(&(client.len() as u32).to_be_bytes());
+    out.extend_from_slice(&client);
+    out.extend_from_slice(&(server.len() as u32).to_be_bytes());
+    out.extend_from_slice(&server);
+    out.extend_from_slice(&(response.len() as u32).to_be_bytes());
+    out.extend_from_slice(&response);
+    out
 }
 
 /// The replay-cache key for a transcript.
@@ -385,11 +511,14 @@ pub fn decode_hello(bytes: &[u8]) -> Result<AdmissionHello, MoqlAdmissionError> 
 
 /// Encode a Challenge frame payload.
 pub fn encode_challenge(challenge: &AdmissionChallenge) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 32 + 8 + 64);
+    let identity = encode_server_identity(&challenge.server_identity);
+    let mut out = Vec::with_capacity(1 + 32 + 8 + 64 + 2 + identity.len());
     out.push(WIRE_VERSION);
     out.extend_from_slice(&challenge.server_nonce);
     out.extend_from_slice(&challenge.epoch.to_be_bytes());
     out.extend_from_slice(&challenge.head_digest);
+    out.extend_from_slice(&(identity.len() as u16).to_be_bytes());
+    out.extend_from_slice(&identity);
     out
 }
 
@@ -400,7 +529,7 @@ pub fn decode_challenge(bytes: &[u8]) -> Result<AdmissionChallenge, MoqlAdmissio
     if *version != WIRE_VERSION {
         return Err(malformed("unsupported wire version"));
     }
-    if rest.len() != 32 + 8 + 64 {
+    if rest.len() < 32 + 8 + 64 + 2 {
         return Err(malformed("bad length"));
     }
     let mut server_nonce = [0u8; 32];
@@ -408,11 +537,17 @@ pub fn decode_challenge(bytes: &[u8]) -> Result<AdmissionChallenge, MoqlAdmissio
     let mut epoch = [0u8; 8];
     epoch.copy_from_slice(&rest[32..40]);
     let mut head_digest = [0u8; 64];
-    head_digest.copy_from_slice(&rest[40..]);
+    head_digest.copy_from_slice(&rest[40..104]);
+    let identity_len = u16::from_be_bytes([rest[104], rest[105]]) as usize;
+    let identity = &rest[106..];
+    if identity_len != identity.len() {
+        return Err(malformed("server identity length mismatch"));
+    }
     Ok(AdmissionChallenge {
         server_nonce,
         epoch: u64::from_be_bytes(epoch),
         head_digest,
+        server_identity: decode_server_identity(identity)?,
     })
 }
 
@@ -446,6 +581,23 @@ pub fn decode_response(bytes: &[u8]) -> Result<AdmissionResponse, MoqlAdmissionE
     Ok(AdmissionResponse {
         ed_sig,
         pq_sig: pq_sig.to_vec(),
+    })
+}
+
+/// Encode a hybrid server confirmation frame.
+pub fn encode_confirmation(confirmation: &AdmissionConfirmation) -> Vec<u8> {
+    encode_response(&AdmissionResponse {
+        ed_sig: confirmation.ed_sig,
+        pq_sig: confirmation.pq_sig.clone(),
+    })
+}
+
+/// Decode a hybrid server confirmation frame.
+pub fn decode_confirmation(bytes: &[u8]) -> Result<AdmissionConfirmation, MoqlAdmissionError> {
+    let response = decode_response(bytes)?;
+    Ok(AdmissionConfirmation {
+        ed_sig: response.ed_sig,
+        pq_sig: response.pq_sig,
     })
 }
 
@@ -502,6 +654,61 @@ fn fresh_nonce() -> [u8; 32] {
 /// [`crate::transport::iroh_moq::MoqAuthzConfig::with_admission`]. With no
 /// authenticator installed the accept path keeps its pre-#1027 posture
 /// (anonymous ⇒ refused).
+#[derive(Clone)]
+pub struct MoqlServerIdentityProof {
+    /// The public resolver-verified state this server must prove possession of.
+    pub identity: crate::stream_info::MoqlServerIdentity,
+    /// Private Ed25519 half corresponding to `identity.ed25519`.
+    pub ed25519: SigningKey,
+    /// Private ML-DSA-65 half corresponding to `identity.ml_dsa65`.
+    pub ml_dsa_65: MlDsaSigningKey,
+}
+
+impl MoqlServerIdentityProof {
+    /// Construct the server confirmation material from the same checkpointed
+    /// local identity already used for native client admission. This does not
+    /// create a credential: both public keys must exactly match the accepted
+    /// witness captured by the native announcement.
+    pub fn from_local_admission_proof(
+        proof: &MoqlAdmissionProof,
+    ) -> Result<Self, MoqlAdmissionError> {
+        let identity = proof.expected_server.clone();
+        if !identity.did.starts_with(DID_AT9P_PREFIX)
+            || identity.did.len() > MAX_DID_BYTES
+            || identity.epoch == 0
+            || identity.head_digest.len() != 64
+            || identity.ml_dsa65.is_empty()
+            || identity.ml_dsa65.len() > u16::MAX as usize
+            || identity.expires_at_unix_ms <= crate::envelope::current_timestamp()
+            || identity.ed25519 != proof.ed25519.verifying_key().to_bytes()
+            || identity.ml_dsa65 != ml_dsa_sk_to_vk_bytes(&proof.ml_dsa_65)
+        {
+            return Err(MoqlAdmissionError::ServerIdentityMismatch);
+        }
+        Ok(Self {
+            identity,
+            ed25519: proof.ed25519.clone(),
+            ml_dsa_65: proof.ml_dsa_65.clone(),
+        })
+    }
+
+    fn sign(
+        &self,
+        hello: &AdmissionHello,
+        challenge: &AdmissionChallenge,
+        response: &AdmissionResponse,
+    ) -> AdmissionConfirmation {
+        let transcript = mutual_confirmation_transcript(hello, challenge, response);
+        let ed_sig: [u8; 64] = self.ed25519.sign(&transcript).to_bytes();
+        let mut outer = transcript;
+        outer.extend_from_slice(&ed_sig);
+        AdmissionConfirmation {
+            ed_sig,
+            pq_sig: ml_dsa_sign(&self.ml_dsa_65, &outer),
+        }
+    }
+}
+
 pub struct MoqlAdmissionAuthenticator {
     authority: Arc<dyn AcceptedStateAuthority>,
     tenant_resolver: PeerTenantResolver,
@@ -509,6 +716,9 @@ pub struct MoqlAdmissionAuthenticator {
     /// Consumed transcript digests → the unix-ms after which the record may be
     /// dropped. Makes each accepted transcript single-use.
     used: Mutex<HashMap<[u8; 32], i64>>,
+    /// The server's private accepted identity for the mutual confirmation.
+    /// Absence is fail-closed on every admission exchange.
+    server_identity: Mutex<Option<MoqlServerIdentityProof>>,
 }
 
 impl std::fmt::Debug for MoqlAdmissionAuthenticator {
@@ -530,6 +740,37 @@ impl MoqlAdmissionAuthenticator {
             tenant_resolver,
             timeout: DEFAULT_ADMISSION_TIMEOUT,
             used: Mutex::new(HashMap::new()),
+            server_identity: Mutex::new(None),
+        }
+    }
+
+    /// Install the local accepted-state identity that signs server confirmation
+    /// frames. A bare authenticator remains useful for unit decision tests but
+    /// cannot admit a network tunnel.
+    #[must_use]
+    pub fn with_server_identity(mut self, server_identity: MoqlServerIdentityProof) -> Self {
+        self.server_identity = Mutex::new(Some(server_identity));
+        self
+    }
+
+    /// Attach the local confirmation proof at the service-spawner boundary.
+    /// A caller that already supplied one must agree on the same public
+    /// accepted-state identity; silently replacing it would make configuration
+    /// order an authentication decision.
+    pub fn install_server_identity(
+        &self,
+        server_identity: MoqlServerIdentityProof,
+    ) -> Result<(), MoqlAdmissionError> {
+        let mut installed = self.server_identity.lock();
+        match installed.as_ref() {
+            Some(existing) if existing.identity != server_identity.identity => {
+                Err(MoqlAdmissionError::ServerIdentityMismatch)
+            }
+            Some(_) => Ok(()),
+            None => {
+                *installed = Some(server_identity);
+                Ok(())
+            }
         }
     }
 
@@ -552,6 +793,14 @@ impl MoqlAdmissionAuthenticator {
 
     async fn exchange(&self, conn: &Connection) -> Result<AdmittedMoqPeer, MoqlAdmissionError> {
         let carrier_node_id = *conn.remote_id().as_bytes();
+        let server_identity = self
+            .server_identity
+            .lock()
+            .clone()
+            .ok_or(MoqlAdmissionError::ServerIdentityUnavailable)?;
+        if !self.is_server_identity_current(&server_identity) {
+            return Err(MoqlAdmissionError::ServerIdentityNotCurrent);
+        }
         let (mut send, mut recv) = conn
             .accept_bi()
             .await
@@ -566,6 +815,7 @@ impl MoqlAdmissionAuthenticator {
             server_nonce: fresh_nonce(),
             epoch: state.epoch,
             head_digest: state.head_digest,
+            server_identity: server_identity.identity.clone(),
         };
         write_frame(&mut send, &encode_challenge(&challenge)).await?;
 
@@ -573,6 +823,12 @@ impl MoqlAdmissionAuthenticator {
         let response = decode_response(&read_frame(&mut recv).await?)?;
         let now = crate::envelope::current_timestamp();
         self.verify_response(&hello, &challenge, &response, now)?;
+        // The server witness is a live authorization fact too. Re-read it
+        // after the client response so an expiry or state advance while this
+        // exchange was in flight cannot receive a valid confirmation.
+        if !self.is_server_identity_current(&server_identity) {
+            return Err(MoqlAdmissionError::ServerIdentityNotCurrent);
+        }
 
         // ── Tenant binding (server-side, from the verified subject) ──────────
         let peer = PeerIdentity::authenticated(hello.did.clone());
@@ -581,10 +837,11 @@ impl MoqlAdmissionAuthenticator {
         if !is_valid_tenant_segment(&tenant) {
             return Err(MoqlAdmissionError::InvalidTenant(tenant));
         }
-        // Admitted: tell the client the moq handshake may proceed, then close
-        // the admission stream. Rejections never reach here — they close the
-        // connection instead, so this frame is unforgeable by a rejected peer.
-        write_frame(&mut send, &encode_verdict()).await?;
+        // Only after client proof verification does the server prove possession
+        // of the resolver-pinned server identity over the *entire* exchange.
+        // A bare verdict would be forgeable by an on-path wrong server.
+        let confirmation = server_identity.sign(&hello, &challenge, &response);
+        write_frame(&mut send, &encode_confirmation(&confirmation)).await?;
         send.finish()
             .map_err(|e| MoqlAdmissionError::Carrier(format!("finish: {e}")))?;
         Ok(AdmittedMoqPeer {
@@ -602,6 +859,7 @@ impl MoqlAdmissionAuthenticator {
     /// session admission is not a permanent capability after a state advance,
     /// key rotation, expiry, or withdrawal.
     pub fn is_still_current(&self, admitted: &AdmittedMoqPeer) -> bool {
+        let server_identity = self.server_identity.lock().clone();
         let Some(current) = admitted
             .peer
             .subject
@@ -614,6 +872,26 @@ impl MoqlAdmissionAuthenticator {
             && current.epoch == admitted.epoch
             && current.head_digest == admitted.head_digest
             && current.subject_key_for(&admitted.subject_ed25519).is_some()
+            && server_identity
+                .as_ref()
+                .is_some_and(|server| self.is_server_identity_current(server))
+    }
+
+    fn is_server_identity_current(&self, server: &MoqlServerIdentityProof) -> bool {
+        let Some(current) = self.authority.accepted_state(&server.identity.did) else {
+            return false;
+        };
+        if server.identity.head_digest.len() != 64 {
+            return false;
+        }
+        let mut head_digest = [0u8; 64];
+        head_digest.copy_from_slice(&server.identity.head_digest);
+        current.is_live(crate::envelope::current_timestamp())
+            && current.epoch == server.identity.epoch
+            && current.head_digest == head_digest
+            && current
+                .subject_key_for(&server.identity.ed25519)
+                .is_some_and(|key| key.ml_dsa_65 == server.identity.ml_dsa65)
     }
 
     /// The hello-time decision: identity class, currentness, expiry, and
@@ -760,9 +1038,11 @@ pub struct MoqlAdmissionProof {
     pub ed25519: SigningKey,
     /// ML-DSA-65 signing key bound to that Ed25519 key in the accepted state.
     pub ml_dsa_65: MlDsaSigningKey,
-    /// Public, resolver-verified accepted-state witness expected from the Iroh
-    /// server during mutual admission. Empty/default is never accepted for an
-    /// Iroh dial.
+    /// Public accepted-state witness expected from the Iroh server during
+    /// mutual admission. The service bootstrap holds its own checkpointed
+    /// witness here for server-confirmation construction; the shared reach
+    /// resolver replaces it with the remote RPC-authenticated `StreamInfo`
+    /// witness for every client dial. Empty/default is never accepted.
     pub expected_server: crate::stream_info::MoqlServerIdentity,
 }
 
@@ -772,6 +1052,45 @@ impl std::fmt::Debug for MoqlAdmissionProof {
             .field("did", &self.did)
             .finish_non_exhaustive()
     }
+}
+
+fn verify_server_challenge(
+    expected: &crate::stream_info::MoqlServerIdentity,
+    challenge: &AdmissionChallenge,
+) -> Result<(), MoqlAdmissionError> {
+    if !expected.did.starts_with(DID_AT9P_PREFIX)
+        || expected.did.len() > MAX_DID_BYTES
+        || expected.epoch == 0
+        || expected.head_digest.len() != 64
+        || expected.ml_dsa65.is_empty()
+        || expected.ml_dsa65.len() > u16::MAX as usize
+        || expected.expires_at_unix_ms <= crate::envelope::current_timestamp()
+        || &challenge.server_identity != expected
+    {
+        return Err(MoqlAdmissionError::WrongServer);
+    }
+    Ok(())
+}
+
+fn verify_server_confirmation(
+    expected: &crate::stream_info::MoqlServerIdentity,
+    hello: &AdmissionHello,
+    challenge: &AdmissionChallenge,
+    response: &AdmissionResponse,
+    confirmation: &AdmissionConfirmation,
+) -> Result<(), MoqlAdmissionError> {
+    let ed_vk = VerifyingKey::from_bytes(&expected.ed25519)
+        .map_err(|_| MoqlAdmissionError::ServerUnconfirmed)?;
+    let pq_vk = ml_dsa_vk_from_bytes(&expected.ml_dsa65)
+        .map_err(|_| MoqlAdmissionError::ServerUnconfirmed)?;
+    let transcript = mutual_confirmation_transcript(hello, challenge, response);
+    ed_vk
+        .verify(&transcript, &Signature::from_bytes(&confirmation.ed_sig))
+        .map_err(|_| MoqlAdmissionError::ServerUnconfirmed)?;
+    let mut outer = transcript;
+    outer.extend_from_slice(&confirmation.ed_sig);
+    ml_dsa_verify(&pq_vk, &outer, &confirmation.pq_sig)
+        .map_err(|_| MoqlAdmissionError::ServerUnconfirmed)
 }
 
 /// Run the client half of the admission exchange on `conn`, consuming its
@@ -805,6 +1124,7 @@ async fn prove_exchange(
     write_frame(&mut send, &encode_hello(&hello)).await?;
 
     let challenge = decode_challenge(&read_frame(&mut recv).await?)?;
+    verify_server_challenge(&proof.expected_server, &challenge)?;
     let t = admission_transcript(
         &hello.did,
         &hello.client_nonce,
@@ -818,16 +1138,25 @@ async fn prove_exchange(
     let pq_sig = ml_dsa_sign(&proof.ml_dsa_65, &outer);
     write_frame(
         &mut send,
-        &encode_response(&AdmissionResponse { ed_sig, pq_sig }),
+        &encode_response(&AdmissionResponse {
+            ed_sig,
+            pq_sig: pq_sig.clone(),
+        }),
     )
     .await?;
     send.finish()
         .map_err(|e| MoqlAdmissionError::Carrier(format!("finish: {e}")))?;
-    // The server answers a verified proof with an explicit verdict frame; a
-    // rejection closes the connection instead, surfacing here as a read error
-    // rather than as a later moq-handshake mystery.
-    let verdict = read_frame(&mut recv).await?;
-    decode_verdict(&verdict)
+    // Do not hand an unconfirmed carrier to the MoQ handshake. The server's
+    // hybrid confirmation binds its resolver-pinned identity, the challenge,
+    // and this client's full hybrid response into one transcript.
+    let confirmation = decode_confirmation(&read_frame(&mut recv).await?)?;
+    verify_server_confirmation(
+        &proof.expected_server,
+        &hello,
+        &challenge,
+        &AdmissionResponse { ed_sig, pq_sig },
+        &confirmation,
+    )
 }
 
 #[cfg(test)]
@@ -907,6 +1236,7 @@ mod tests {
             server_nonce: [0xBB; 32],
             epoch: state.epoch,
             head_digest: state.head_digest,
+            server_identity: Default::default(),
         }
     }
 
@@ -923,6 +1253,14 @@ mod tests {
             server_nonce: [3; 32],
             epoch: 42,
             head_digest: [4; 64],
+            server_identity: crate::stream_info::MoqlServerIdentity {
+                did: "did:at9p:test-server".to_owned(),
+                epoch: 7,
+                head_digest: vec![5; 64],
+                expires_at_unix_ms: crate::envelope::current_timestamp() + 60_000,
+                ed25519: [6; 32],
+                ml_dsa65: vec![7; 1952],
+            },
         };
         assert_eq!(
             decode_challenge(&encode_challenge(&challenge)).unwrap(),
@@ -936,6 +1274,15 @@ mod tests {
         assert_eq!(
             decode_response(&encode_response(&response)).unwrap(),
             response
+        );
+
+        let confirmation = AdmissionConfirmation {
+            ed_sig: [8; 64],
+            pq_sig: vec![9; 3309],
+        };
+        assert_eq!(
+            decode_confirmation(&encode_confirmation(&confirmation)).unwrap(),
+            confirmation
         );
     }
 

@@ -1510,7 +1510,13 @@ pub async fn connect_moq_reach_with_server_identity(
                         "iroh moql reach lacks a live resolver-verified server witness"
                     ))
                 } else {
-                    crate::dial::dial_stream_authenticated(&cfg, proof).await
+                    // The process-global proof is this client's local accepted
+                    // identity. The signed StreamInfo supplies the *remote*
+                    // server witness for this particular dial; never reuse the
+                    // local announcement's witness as the expected server.
+                    let mut proof = proof.clone();
+                    proof.expected_server = server_identity.clone();
+                    crate::dial::dial_stream_authenticated(&cfg, &proof).await
                 }
             }
             (crate::transport::EndpointType::Iroh { .. }, None) => Err(anyhow::anyhow!(

@@ -95,6 +95,20 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
             let processor: Arc<dyn IrohRequestProcessor> = Arc::new(bridge);
 
             if let Some(mut qc) = quic_config {
+                // The native client proof is projected from the same
+                // checkpoint-verified local accepted state that StreamInfo
+                // advertises. Reuse its private halves for the server's mutual
+                // confirmation; never manufacture a separate MoQ identity.
+                let moq_server_identity = qc
+                    .moq_admission_proof
+                    .as_ref()
+                    .map(hyprstream_rpc::transport::moql_admission::MoqlServerIdentityProof::from_local_admission_proof)
+                    .transpose()
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "MoQ server confirmation identity: {error}"
+                        ))
+                    })?;
                 // web-transport-quinn has no per-builder provider hook and
                 // resolves rustls's process default. Install and validate it at
                 // the actual bind seam so task/thread/subprocess startup cannot
@@ -296,10 +310,25 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     // moq handshake. Without it the accept path stays in its
                     // fail-closed anonymous posture.
                     let moq_handler = match qc.moq_admission.take() {
-                        Some(admission) => moq_handler.with_authz(
-                            hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig::default()
-                                .with_admission(admission),
-                        ),
+                        Some(admission) => {
+                            let server_identity = moq_server_identity.ok_or_else(|| {
+                                hyprstream_rpc::error::RpcError::SpawnFailed(
+                                    "MoQ admission enabled without checkpointed server confirmation identity"
+                                        .to_owned(),
+                                )
+                            })?;
+                            admission
+                                .install_server_identity(server_identity)
+                                .map_err(|error| {
+                                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                                        "MoQ server confirmation identity: {error}"
+                                    ))
+                                })?;
+                            moq_handler.with_authz(
+                                hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig::default()
+                                    .with_admission(admission),
+                            )
+                        }
                         None => moq_handler,
                     };
                     // RPC plane: same processor + signing key as the quinn path.

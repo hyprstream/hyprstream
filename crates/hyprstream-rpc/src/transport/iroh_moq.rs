@@ -395,26 +395,31 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
         // Hold the session alive until either the connection closes or
         // shutdown is requested. Server::accept has already spawned the
         // session's pump tasks; dropping `moq_session` tears them down.
-        tokio::select! {
-            biased;
-            _ = self.inner.shutdown.cancelled() => {
-                tracing::debug!("iroh-moq: shutdown signalled, dropping session");
-            }
-            _ = currentness.tick() => {
-                if let (Some(admission), Some(admitted)) =
-                    (admission.as_ref(), admitted_for_session.as_ref())
-                {
-                    if !admission.is_still_current(admitted) {
-                        tracing::warn!(
-                            subject = %admitted.peer.subject.as_deref().unwrap_or("?"),
-                            "iroh-moq: accepted state changed or expired; closing session"
-                        );
-                        session_conn.close(0u32.into(), b"moql accepted state no longer current");
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.inner.shutdown.cancelled() => {
+                    tracing::debug!("iroh-moq: shutdown signalled, dropping session");
+                    break;
+                }
+                _ = currentness.tick() => {
+                    if let (Some(admission), Some(admitted)) =
+                        (admission.as_ref(), admitted_for_session.as_ref())
+                    {
+                        if !admission.is_still_current(admitted) {
+                            tracing::warn!(
+                                subject = %admitted.peer.subject.as_deref().unwrap_or("?"),
+                                "iroh-moq: accepted state changed or expired; closing session"
+                            );
+                            session_conn.close(0u32.into(), b"moql accepted state no longer current");
+                            break;
+                        }
                     }
                 }
-            }
-            res = moq_session.closed() => {
-                tracing::debug!(result = ?res, "iroh-moq: session closed");
+                res = moq_session.closed() => {
+                    tracing::debug!(result = ?res, "iroh-moq: session closed");
+                    break;
+                }
             }
         }
         Ok(())
@@ -430,6 +435,7 @@ mod tests {
     use super::*;
     use crate::transport::iroh_substrate::{ALPN_MOQ_LITE, IrohSubstrate, NoopHandler};
     use bytes::Bytes;
+    use ed25519_dalek::SigningKey;
     use iroh::{EndpointAddr, TransportAddr};
     use moq_net::{Client, Group, Track};
     use rand::RngCore;
@@ -552,22 +558,47 @@ mod tests {
     /// the stalled carrier closes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admission_connection_cap_saturates_and_releases() -> anyhow::Result<()> {
-        struct NoAcceptedState;
+        use crate::crypto::pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes};
+        use crate::stream_info::MoqlServerIdentity;
+        use crate::transport::moql_admission::{
+            AcceptedIdentityState, AcceptedSubjectKey, MoqlServerIdentityProof,
+        };
 
-        impl crate::transport::moql_admission::AcceptedStateAuthority for NoAcceptedState {
-            fn accepted_state(
-                &self,
-                _did: &str,
-            ) -> Option<crate::transport::moql_admission::AcceptedIdentityState> {
-                None
-            }
-        }
+        let server_ed = SigningKey::from_bytes(&[0xA1; 32]);
+        let server_pq = ml_dsa_sk_from_seed(&[0xA2; 32]);
+        let server_did = "did:at9p:connection-cap-server".to_owned();
+        let server_identity = MoqlServerIdentity {
+            did: server_did.clone(),
+            epoch: 1,
+            head_digest: vec![0xA3; 64],
+            expires_at_unix_ms: crate::envelope::current_timestamp() + 60_000,
+            ed25519: server_ed.verifying_key().to_bytes(),
+            ml_dsa65: ml_dsa_sk_to_vk_bytes(&server_pq),
+        };
+        let mut head_digest = [0u8; 64];
+        head_digest.copy_from_slice(&server_identity.head_digest);
+        let accepted_server = AcceptedIdentityState {
+            epoch: server_identity.epoch,
+            head_digest,
+            subject_keys: vec![AcceptedSubjectKey {
+                ed25519: server_identity.ed25519,
+                ml_dsa_65: server_identity.ml_dsa65.clone(),
+            }],
+            expires_at_unix_ms: Some(server_identity.expires_at_unix_ms),
+        };
+        let authority: Arc<dyn crate::transport::moql_admission::AcceptedStateAuthority> =
+            Arc::new(move |did: &str| (did == server_did).then(|| accepted_server.clone()));
 
         let admission = Arc::new(
             crate::transport::moql_admission::MoqlAdmissionAuthenticator::new(
-                Arc::new(NoAcceptedState),
+                authority,
                 Arc::new(|_peer| None),
-            ),
+            )
+            .with_server_identity(MoqlServerIdentityProof {
+                identity: server_identity,
+                ed25519: server_ed,
+                ml_dsa_65: server_pq,
+            }),
         );
         let handler = IrohMoqProtocolHandler::new()
             .with_authz(MoqAuthzConfig::default().with_admission(admission))
