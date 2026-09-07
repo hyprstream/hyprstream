@@ -50,7 +50,7 @@ or turns a successful shared write into a cache-capacity error. Cache values
 and revision bookkeeping are bounded; unknown-key misses are not cached. An L2
 error is returned to the caller rather than serving an isolated or expired L1
 value.
-Announcement and liveness revisions use one persistent generation counter per
+Announcement, liveness, and issuer-cache revisions use one persistent generation counter per
 family, not one key per service/node. A write can therefore invalidate unrelated
 L1 entries in the same family; counters must never expire or reset while any
 replica retains L1 state. Announcement writes and listings atomically reap
@@ -58,10 +58,19 @@ expired values, service indexes, and name metadata before admitting new state
 or enumerating services. Backend metadata and listing work are bounded by the
 configured live capacity even when identities continually change.
 
+Entity statements are inert cached artifacts, not a registered-issuer authority.
+At capacity, a new issuer atomically evicts the existing entry with the oldest
+server `fetched_at` timestamp, including its name and ordering metadata. Updating
+an issuer refreshes its eviction order. Memory and Valkey use the same policy;
+JWT claims do not control cache eviction or replace verification at use. Issuer
+listing reads the bounded names hash in one command; registration obtains only
+the count with `SCARD`. Envelope keysets retain their separate bounded admission
+policy and do not share the issuer eviction index.
+
 When upgrading from the experimental per-scope revision implementation, stop
 all old replicas and retire its configured **volatile Discovery key prefix**,
 then restart all replicas with an empty prefix and let services reannounce.
-Old writers do not update the new liveness generation, and previously orphaned
+Old writers do not maintain the new issuer eviction index or liveness generation, and previously orphaned
 metadata has already lost its expiry-index membership; it cannot be reclaimed
 by normal expiry traversal. This is not a rolling-compatible state migration.
 Do not clear shared generations with running replicas, or touch the separate

@@ -254,6 +254,7 @@ pub(crate) trait DiscoveryStateStore: Send + Sync {
     async fn put_entity_statement(&self, issuer: &str, value: CachedEntityStatement) -> Result<()>;
     async fn entity_statement(&self, issuer: &str) -> Result<Option<CachedEntityStatement>>;
     async fn known_issuers(&self) -> Result<Vec<String>>;
+    async fn known_issuer_count(&self) -> Result<usize>;
 
     async fn put_envelope_keyset(
         &self,
@@ -620,7 +621,16 @@ impl DiscoveryStateStore for MemoryStateStore {
         if !inner.entity_statements.contains_key(issuer)
             && inner.entity_statements.len() >= self.artifact_capacity
         {
-            bail!("Discovery memory federation artifact capacity exhausted");
+            // These are inert artifacts, verified again at use. Retain the
+            // newest fetched entries without interpreting JWT expiry as trust.
+            if let Some(oldest) = inner
+                .entity_statements
+                .iter()
+                .min_by_key(|(name, value)| (value.fetched_at, *name))
+                .map(|(name, _)| name.clone())
+            {
+                inner.entity_statements.remove(&oldest);
+            }
         }
         inner.entity_statements.insert(issuer.to_owned(), value);
         Ok(())
@@ -638,6 +648,10 @@ impl DiscoveryStateStore for MemoryStateStore {
             .keys()
             .cloned()
             .collect())
+    }
+
+    async fn known_issuer_count(&self) -> Result<usize> {
+        Ok(self.inner.lock().entity_statements.len())
     }
 
     async fn put_envelope_keyset(
@@ -842,13 +856,10 @@ local function reap(expiry, services, names, revision, now)
 end
 "#;
 
-    async fn entity_revision(&self, issuer: &str) -> Result<u64> {
-        self.revision(format!(
-            "{}:entity-revision:{}",
-            self.prefix,
-            Self::digest(issuer)
-        ))
-        .await
+    async fn entity_revision(&self) -> Result<u64> {
+        // Survives eviction/reinsertion: no per-issuer tombstones and no ABA
+        // when another replica still has an evicted artifact in L1.
+        self.revision(self.key("entity-global-revision")).await
     }
 
     async fn envelope_revision(&self, service_did: &str) -> Result<u64> {
@@ -1145,13 +1156,19 @@ return values
         use fred::prelude::*;
         const PUT: &str = r#"
 if redis.call('EXISTS', KEYS[1]) == 0 and redis.call('SCARD', KEYS[2]) >= tonumber(ARGV[4]) then
-  return redis.error_reply('Discovery Valkey federation artifact capacity exhausted')
+  local oldest = redis.call('ZRANGE', KEYS[5], 0, 0)[1]
+  if not oldest then return redis.error_reply('Discovery issuer cache index is inconsistent') end
+  local oldkey = string.gsub(KEYS[1], ':entity:[^:]+$', ':entity:' .. oldest)
+  redis.call('DEL', oldkey)
+  redis.call('SREM', KEYS[2], oldest)
+  redis.call('HDEL', KEYS[3], oldest)
+  redis.call('ZREM', KEYS[5], oldest)
 end
 redis.call('SET', KEYS[1], ARGV[1])
 redis.call('SADD', KEYS[2], ARGV[2])
 redis.call('HSET', KEYS[3], ARGV[2], ARGV[3])
 redis.call('INCR', KEYS[4])
-redis.call('INCR', KEYS[5])
+redis.call('ZADD', KEYS[5], ARGV[5], ARGV[2])
 return 1
 "#;
         let id = Self::digest(issuer);
@@ -1163,14 +1180,15 @@ return 1
                     format!("{}:entity:{id}", self.prefix),
                     self.key("issuers"),
                     self.key("issuer-names"),
-                    format!("{}:entity-revision:{id}", self.prefix),
                     self.key("entity-global-revision"),
+                    self.key("issuer-fetched"),
                 ],
                 vec![
                     serde_json::to_string(&value)?,
                     id,
                     issuer.to_owned(),
                     self.artifact_capacity.to_string(),
+                    value.fetched_at.to_string(),
                 ],
             )
             .await?;
@@ -1190,18 +1208,12 @@ return 1
 
     async fn known_issuers(&self) -> Result<Vec<String>> {
         use fred::prelude::*;
-        let ids: Vec<String> = self.pool.smembers(self.key("issuers")).await?;
-        let mut issuers = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(issuer) = self
-                .pool
-                .hget::<Option<String>, _, _>(self.key("issuer-names"), &id)
-                .await?
-            {
-                issuers.push(issuer);
-            }
-        }
-        Ok(issuers)
+        Ok(self.pool.hvals(self.key("issuer-names")).await?)
+    }
+
+    async fn known_issuer_count(&self) -> Result<usize> {
+        use fred::prelude::*;
+        Ok(self.pool.scard(self.key("issuers")).await?)
     }
 
     async fn put_envelope_keyset(
@@ -1452,9 +1464,13 @@ impl DiscoveryStateStore for TieredStateStore {
         let _operation = self.operation.lock().await;
         let now = unix_millis_now();
         let scope = Self::scope("entity", issuer);
-        let revision = self.valkey.entity_revision(issuer).await?;
+        let revision = self.valkey.entity_revision().await?;
         if self.is_observed(&scope, revision, now) {
-            return self.memory.entity_statement(issuer).await;
+            // A fill of a different issuer can evict this L1 entry without a
+            // shared write. Missing L1 data is a miss, never cached absence.
+            if let Some(value) = self.memory.entity_statement(issuer).await? {
+                return Ok(Some(value));
+            }
         }
         let value = self.valkey.entity_statement(issuer).await?;
         self.observed.lock().remove(&scope);
@@ -1474,6 +1490,10 @@ impl DiscoveryStateStore for TieredStateStore {
 
     async fn known_issuers(&self) -> Result<Vec<String>> {
         self.valkey.known_issuers().await
+    }
+
+    async fn known_issuer_count(&self) -> Result<usize> {
+        self.valkey.known_issuer_count().await
     }
 
     async fn put_envelope_keyset(
@@ -1852,6 +1872,190 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("l1_max_ttl_ms must be positive"));
+    }
+
+    async fn assert_issuer_eviction_contract(store: &dyn DiscoveryStateStore) {
+        for (issuer, fetched_at) in [
+            ("old", 1),
+            ("refresh", 2),
+            ("keep", 3),
+            ("refresh", 4),
+            ("new", 5),
+        ] {
+            store
+                .put_entity_statement(
+                    issuer,
+                    CachedEntityStatement {
+                        jwt: format!("inert:{issuer}:{fetched_at}"),
+                        fetched_at,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.known_issuer_count().await.unwrap(), 3);
+        let mut names = store.known_issuers().await.unwrap();
+        names.sort();
+        assert_eq!(names, ["keep", "new", "refresh"]);
+        assert!(store.entity_statement("old").await.unwrap().is_none());
+        assert_eq!(
+            store
+                .entity_statement("refresh")
+                .await
+                .unwrap()
+                .unwrap()
+                .fetched_at,
+            4
+        );
+        store
+            .put_entity_statement(
+                "old",
+                CachedEntityStatement {
+                    jwt: "reinserted".to_owned(),
+                    fetched_at: 6,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store.entity_statement("keep").await.unwrap().is_none());
+        assert_eq!(
+            store.entity_statement("old").await.unwrap().unwrap().jwt,
+            "reinserted"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_issuer_cache_evicts_oldest_and_accepts_reinsertion() {
+        assert_issuer_eviction_contract(&MemoryStateStore::new(1, 1, 3)).await;
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_issuer_cache_churn_bounds_metadata_and_invalidates_other_l1() {
+        use fred::prelude::*;
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let mut config = valkey_config(url, "issuer-churn");
+        config.artifact_capacity = 3;
+        let writer = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
+        assert_issuer_eviction_contract(writer.as_ref()).await;
+        let reader = TieredStateStore::new(
+            Arc::new(MemoryStateStore::new(1, 1, 1)),
+            Arc::new(ValkeyStateStore::connect(&config).await.unwrap()),
+            60_000,
+        );
+        // A smaller L1 must refetch entries evicted by other fills even if L2
+        // has not changed. Previously an observed-but-missing entry returned None.
+        for issuer in ["old", "refresh", "old"] {
+            assert!(reader.entity_statement(issuer).await.unwrap().is_some());
+        }
+        let generation = writer.entity_revision().await.unwrap();
+        for i in 0..96 {
+            writer
+                .put_entity_statement(
+                    &format!("issuer-{i}"),
+                    CachedEntityStatement {
+                        jwt: format!("inert-{i}"),
+                        fetched_at: 100 + i,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(writer.known_issuer_count().await.unwrap(), 3);
+        }
+        assert!(reader.entity_statement("old").await.unwrap().is_none());
+        let counts: Vec<usize> = writer.pool.eval(
+            "return {redis.call('SCARD', KEYS[1]), redis.call('HLEN', KEYS[2]), redis.call('ZCARD', KEYS[3]), #redis.call('KEYS', ARGV[1]), #redis.call('KEYS', ARGV[2])}",
+            vec![writer.key("issuers"), writer.key("issuer-names"), writer.key("issuer-fetched")],
+            vec![writer.key("*"), writer.key("*revision*")],
+        ).await.unwrap();
+        assert_eq!(counts, [3, 3, 3, 7, 1]);
+        assert!(writer.entity_revision().await.unwrap() > generation);
+        writer
+            .put_entity_statement(
+                "old",
+                CachedEntityStatement {
+                    jwt: "new-generation".to_owned(),
+                    fetched_at: 1000,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.entity_statement("old").await.unwrap().unwrap().jwt,
+            "new-generation"
+        );
+        // Retain a positive old snapshot across eviction AND reinsertion (ABA).
+        for i in 0..3 {
+            writer
+                .put_entity_statement(
+                    &format!("replacement-{i}"),
+                    CachedEntityStatement {
+                        jwt: "other".to_owned(),
+                        fetched_at: 2000 + i,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        writer
+            .put_entity_statement(
+                "old",
+                CachedEntityStatement {
+                    jwt: "after-aba".to_owned(),
+                    fetched_at: 3000,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.entity_statement("old").await.unwrap().unwrap().jwt,
+            "after-aba"
+        );
+        assert!(reader.observed.lock().len() <= 4);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_issuer_listing_and_count_return_complete_bounded_cache() {
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let mut config = valkey_config(url, "issuer-list-count");
+        config.artifact_capacity = 128;
+        let writer = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
+        let reader = TieredStateStore::new(
+            Arc::new(MemoryStateStore::new(1, 1, 1)),
+            writer.clone(),
+            60_000,
+        );
+        let mut expected = Vec::new();
+        for i in 0..256 {
+            let name = format!("https://issuer:{i}:λ.example");
+            writer
+                .put_entity_statement(
+                    &name,
+                    CachedEntityStatement {
+                        jwt: "inert".to_owned(),
+                        fetched_at: i,
+                    },
+                )
+                .await
+                .unwrap();
+            if i >= 128 {
+                expected.push(name);
+            }
+        }
+        expected.sort();
+        for _ in 0..2 {
+            let mut actual = reader.known_issuers().await.unwrap();
+            actual.sort();
+            assert_eq!(actual, expected);
+            assert_eq!(reader.known_issuer_count().await.unwrap(), 128);
+        }
+        assert!(reader.memory.inner.lock().entity_statements.is_empty());
+        assert!(reader.observed.lock().is_empty());
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]

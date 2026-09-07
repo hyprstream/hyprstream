@@ -6212,7 +6212,7 @@ impl DiscoveryHandler for DiscoveryService {
         self.state_store
             .put_entity_statement(&data.issuer, cached)
             .await?;
-        let total = self.state_store.known_issuers().await?.len();
+        let total = self.state_store.known_issuer_count().await?;
 
         info!(
             issuer = %data.issuer,
