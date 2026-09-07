@@ -196,6 +196,67 @@ pub fn classify_pds_store_for_quic(ctx: &ServiceContext) -> anyhow::Result<PdsBo
     )
 }
 
+fn accepted_state_matches_service(
+    state: &hyprstream_pds::at9p_duplicity::AcceptedAt9pState,
+    service_name: &str,
+    verifying_key: &[u8; 32],
+) -> bool {
+    let service_id = format!("#{service_name}");
+    state.current.services.iter().any(|entry| entry.id == service_id)
+        && state
+            .current
+            .subject_keys
+            .iter()
+            .any(|key| key.ed25519_pub.as_slice() == verifying_key)
+}
+
+/// Rebuild one running service's announcement from a fresh checkpoint read
+/// and the latest registered JWT. No stale authority is returned on failure.
+pub fn current_native_announcement(
+    request: &mut hyprstream_service::NativeAnnouncementRequest,
+) -> anyhow::Result<hyprstream_discovery::ServiceAnnouncement> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let verifier = hyprstream_discovery::deployment_registry_verifier()?;
+    let store = crate::services::discovery::PdsRecordStore::open_readonly(
+        &hyprstream_service::deployment_data_dir()?.join("pds-store"),
+    )?.with_at9p_deployment_verifier(verifier);
+    let now = chrono::Utc::now();
+    let state = store.accepted_at9p_state(&request.service_did.to_string(), Some(&now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)))?
+        .ok_or_else(|| anyhow::anyhow!("native announcement accepted state is unavailable"))?;
+    request.refresh_from_accepted_state(&state)?;
+    let service_jwt = hyprstream_service::global_trust_store()
+        .get(&request.signing_key.verifying_key())
+        .and_then(|attestation| attestation.jwt)
+        .or_else(|| request.service_jwt.clone());
+    if let Some(jwt) = service_jwt.as_deref() {
+        let payload = jwt.split('.').nth(1)
+            .ok_or_else(|| anyhow::anyhow!("native announcement JWT is malformed"))?;
+        // Do not include token/claims in diagnostics. Signature verification is
+        // still performed by Discovery; this check bounds local publication.
+        let claims: serde_json::Value = URL_SAFE_NO_PAD.decode(payload).ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or_else(|| anyhow::anyhow!("native announcement JWT is malformed"))?;
+        let expiry = claims["exp"].as_i64()
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .ok_or_else(|| anyhow::anyhow!("native announcement JWT has no bounded expiry"))?;
+        anyhow::ensure!(expiry > now.timestamp_millis(), "native announcement JWT expired");
+    }
+    Ok(hyprstream_discovery::ServiceAnnouncement {
+        service_name: request.service_name.clone(),
+        socket_kind: request.reach.socket_kind().to_owned(),
+        endpoint: request.reach.endpoint(),
+        service_jwt,
+        service_did: request.service_did.clone(),
+        capabilities: request.capabilities.clone(),
+        accepted_state_digest: request.accepted_state_digest.clone(),
+        accepted_state_epoch: request.accepted_state_epoch,
+        response_key_id: request.response_key_id.clone(),
+        request_kem_key_id: request.request_kem_key_id.clone(),
+        request_kem_recipient: request.request_kem_recipient.clone(),
+        expires_at_unix_ms: request.expires_at_unix_ms,
+    })
+}
+
 /// Populate every ordinary network service announcement from a fresh
 /// checkpoint-verifying PDS read. Missing or ambiguous state fails startup
 /// before any QUIC service can bind and advertise an incomplete bundle.
@@ -213,16 +274,7 @@ pub fn with_checkpointed_native_announcements(
     {
         let signer = ctx.service_signing_key(service_name);
         let mut matching = states.iter().filter(|state| {
-            state
-                .current
-                .services
-                .iter()
-                .any(|entry| entry.id == *service_name)
-                && state
-                    .current
-                    .subject_keys
-                    .iter()
-                    .any(|key| key.ed25519_pub.as_slice() == signer.verifying_key().as_bytes())
+            accepted_state_matches_service(state, service_name, signer.verifying_key().as_bytes())
         });
         let state = matching.next().ok_or_else(|| {
             anyhow::anyhow!(
@@ -2781,6 +2833,51 @@ mod tests {
             client.is_ok(),
             "IPC policy client must be lazy at first boot"
         );
+    }
+
+    #[test]
+    fn checkpointed_service_selection_uses_canonical_id_and_current_signer() {
+        use hyprstream_pds::at9p::{
+            CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
+        };
+        use hyprstream_pds::at9p_duplicity::AcceptedAt9pState;
+        use hyprstream_pds::at9p_gate::verify_genesis_capsule;
+        use hyprstream_pds::at9p_sign::sign_capsule;
+        use hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes;
+
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signer);
+        let key = HybridKeyPair::new(
+            signer.verifying_key().to_bytes().to_vec(),
+            ml_dsa_sk_to_vk_bytes(&pq),
+        )
+        .unwrap();
+        let endpoint = ServiceEndpoint::new(
+            Transport::Iroh,
+            format!("iroh://{}", hex::encode([0x72; 32])),
+        )
+        .unwrap();
+        let service = ServiceEntry::new("#model", ServiceType::NinePExport, endpoint).unwrap();
+        let body = CapsuleBody::new(vec![key], vec![service]).unwrap();
+        let genesis = sign_capsule(body, &signer, &pq).unwrap();
+        let verified = verify_genesis_capsule(
+            &genesis.cid512().unwrap(),
+            &genesis.to_dag_cbor().unwrap(),
+        )
+        .unwrap();
+        let state = AcceptedAt9pState::from_verified_genesis(&verified).unwrap();
+        let key = signer.verifying_key().to_bytes();
+        assert!(accepted_state_matches_service(&state, "model", &key));
+        assert!(!accepted_state_matches_service(&state, "#model", &key));
+        assert!(!accepted_state_matches_service(&state, "registry", &key));
+        assert!(!accepted_state_matches_service(&state, "model", &[0x73; 32]));
+        // Selection does not weaken the separate bounded-successor gate.
+        let error = hyprstream_service::NativeServiceAnnouncement::from_accepted_state(
+            "model", &signer, &state,
+        )
+        .err()
+        .expect("genesis alone cannot authorize a production announcement");
+        assert!(error.to_string().contains("bounded production expiry"));
     }
 
     #[test]
