@@ -41,7 +41,6 @@ use web_transport_iroh::Session;
 use crate::moq_authz::{
     PeerIdentity, SharedSubscribeAuthorizer, SubscribeDecision, is_valid_tenant_segment,
     tenant_prefix,
-    tenant_scoped_consumer,
 };
 use crate::transport::moql_admission::MoqlAdmissionAuthenticator;
 
@@ -222,6 +221,7 @@ struct HandlerInner {
     /// Triggered by `ProtocolHandler::shutdown` so accept handlers stop
     /// waiting for `Session::closed()` and exit promptly.
     shutdown: CancellationToken,
+    event_authz: Option<Arc<dyn crate::events::EventAuthz>>,
 }
 
 impl std::fmt::Debug for IrohMoqProtocolHandler {
@@ -250,6 +250,7 @@ impl IrohMoqProtocolHandler {
                     super::rpc_session::DEFAULT_CONNECTION_LIMIT,
                 )),
                 shutdown: CancellationToken::new(),
+                event_authz: None,
             }),
         }
     }
@@ -280,6 +281,34 @@ impl IrohMoqProtocolHandler {
         self
     }
 
+    /// Serve only the fixed Event namespace, with independent MAC decisions
+    /// for each declared source and direction. No per-track callback is needed:
+    /// the session never receives an origin outside its authorized sources.
+    pub fn with_event_authz(mut self, authz: Arc<dyn crate::events::EventAuthz>) -> Self {
+        self.rebuild_inner(|i| i.event_authz = Some(authz));
+        self
+    }
+
+    async fn event_scopes(&self, peer: &PeerIdentity, tenant: &str, ingress: bool) -> (Vec<String>, Vec<String>) {
+        let mut subscribe = Vec::new();
+        let mut publish = Vec::new();
+        if let (Some(authz), Some(subject)) = (&self.inner.event_authz, &peer.subject) {
+            // Event has a fixed namespace. Other tenants cannot acquire local
+            // visibility, even if their policy happens to permit a source.
+            if tenant != "local" { return (subscribe, publish); }
+            let subject = crate::envelope::Subject::new(subject.clone());
+            // Source inventory only, not label policy. Missing policy rows and
+            // absent verified clearances continue to deny through EventAuthz.
+            // TODO(#1530): consume the generated Event source inventory.
+            for source in ["system", "worker", "model"] {
+                let path = format!("local/events/{source}");
+                if authz.can_subscribe(&subject, source).await { subscribe.push(path.clone()); }
+                if ingress && authz.can_publish(&subject, source).await { publish.push(path); }
+            }
+        }
+        (subscribe, publish)
+    }
+
     /// Mutate the inner config, cloning the shared `Arc<HandlerInner>` only when
     /// it is already shared (cloned handler) so builder calls compose without
     /// dropping previously-installed fields (authz / admission).
@@ -294,6 +323,7 @@ impl IrohMoqProtocolHandler {
                 authz: old.authz.clone(),
                 connection_limit: Arc::clone(&old.connection_limit),
                 shutdown: old.shutdown.clone(),
+                event_authz: old.event_authz.clone(),
             };
             f(&mut cloned);
             self.inner = Arc::new(cloned);
@@ -421,22 +451,28 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
         // the peer a scoped writable origin. This keeps an ordinary subscriber
         // from colliding with a producer's broadcast names.
         let ingress_granted = self.inner.authz.authorizes_ingress(&peer, &tenant);
-        let server = if ingress_granted {
+        let event_scopes = self.event_scopes(&peer, &tenant, ingress_granted).await;
+        let server = if self.inner.event_authz.is_some() {
+            if event_scopes.0.is_empty() && event_scopes.1.is_empty() {
+                conn.close(0u32.into(), b"no authorized event sources");
+                return Ok(());
+            }
+            let read: Vec<_> = event_scopes.0.iter().map(|s| moq_net::Path::new(s)).collect();
+            let write: Vec<_> = event_scopes.1.iter().map(|s| moq_net::Path::new(s)).collect();
+            // Never scope with an empty list: library defaults must not turn
+            // deny into an unrestricted origin.
+            let consume = if write.is_empty() { None } else { self.inner.origin.producer.scope(&write) };
+            let publish = if read.is_empty() { None } else { self.inner.origin.consumer.scope(&read) };
+            Server::new().with_publish(publish).with_consume(consume)
+        } else if ingress_granted {
             let prefix = tenant_prefix(&tenant);
             let path = moq_net::Path::new(&prefix);
             let Some(scoped_origin) = self.inner.origin.producer.scope(&[path]) else {
-                tracing::debug!(%tenant, "iroh-moq: tenant has no visible relay scope");
                 return Ok(());
             };
-            tracing::debug!(
-                subject = %peer.subject.as_deref().unwrap_or("?"),
-                %tenant,
-                "iroh-moq: admitting explicitly authorized ingress"
-            );
             Server::new().with_origin(scoped_origin)
         } else {
-            let Some(scoped_consumer) = tenant_scoped_consumer(self.inner.origin.consumer(), &tenant) else {
-                tracing::debug!(%tenant, "iroh-moq: tenant has no visible subscriber scope");
+            let Some(scoped_consumer) = crate::moq_authz::tenant_scoped_consumer(self.inner.origin.consumer(), &tenant) else {
                 return Ok(());
             };
             Server::new().with_publish(scoped_consumer)
@@ -479,6 +515,12 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
                             session_conn.close(0u32.into(), b"moql accepted state no longer current");
                             break;
                         }
+                    }
+                    if self.inner.event_authz.is_some()
+                        && self.event_scopes(&peer, &tenant, ingress_granted).await != event_scopes
+                    {
+                        session_conn.close(0u32.into(), b"event policy changed");
+                        break;
                     }
                     // Ingress is live deployment authority, not a one-time
                     // capability: a revoked grant must not keep announcing on

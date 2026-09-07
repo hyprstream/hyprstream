@@ -379,6 +379,8 @@ mod tests {
             ..Default::default()
         };
         let quic = crate::config::QuicConfig {
+            event_publishers: Default::default(),
+            moql_subject_tenants: Default::default(),
             enabled: true,
             bind_addr: "127.0.0.1:4433".to_owned(),
             server_name: "pds.example.test".to_owned(),

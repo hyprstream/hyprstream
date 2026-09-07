@@ -80,7 +80,8 @@ pub fn init_global_moq_admission_proof(
     GLOBAL_MOQ_ADMISSION_PROOF.set(proof).is_ok()
 }
 
-fn global_moq_admission_proof()
+/// Borrow the process proof for other authenticated native MoQ planes.
+pub fn global_moq_admission_proof()
 -> Option<&'static crate::transport::moql_admission::MoqlAdmissionProof> {
     GLOBAL_MOQ_ADMISSION_PROOF.get()
 }

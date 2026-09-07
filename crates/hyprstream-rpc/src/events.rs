@@ -306,7 +306,8 @@ pub trait EventAuthz: Send + Sync {
 
 static EVENT_AUTHZ: OnceLock<Arc<dyn EventAuthz>> = OnceLock::new();
 
-fn installed_event_authz() -> Option<Arc<dyn EventAuthz>> {
+/// Clone the process reference monitor for authenticated network Event sessions.
+pub fn installed_event_authz() -> Option<Arc<dyn EventAuthz>> {
     EVENT_AUTHZ.get().cloned()
 }
 
@@ -434,6 +435,19 @@ impl PublisherIdentity {
     }
 }
 
+/// The local Event caller selected by checkpoint-verified process bootstrap.
+/// This supplies an identity to MAC, never a clearance or authorization grant.
+static NETWORK_EVENT_IDENTITY: OnceLock<PublisherIdentity> = OnceLock::new();
+
+/// Bind Event publishers/subscribers before construction in a single-identity
+/// native process. A later service cannot silently replace that process identity.
+pub fn install_network_event_identity(proof: &crate::transport::moql_admission::MoqlAdmissionProof) -> Result<()> {
+    anyhow::ensure!(proof.did.starts_with("did:at9p:"), "native Event identity must be checkpointed did:at9p");
+    let installed = NETWORK_EVENT_IDENTITY.get_or_init(|| PublisherIdentity::verified(proof.did.clone()));
+    anyhow::ensure!(installed.did.as_ref() == Some(&proof.did), "Event process identity already bound to another DID");
+    Ok(())
+}
+
 impl Default for PublisherIdentity {
     fn default() -> Self {
         Self::anonymous()
@@ -524,7 +538,7 @@ impl EventPublisher {
             rekey_policy: RekeyPolicy::default(),
             // An omitted production installation is a hard deny at rest.
             authz: installed_event_authz().unwrap_or_else(|| Arc::new(DenyAllEventAuthz)),
-            publisher_identity: PublisherIdentity::anonymous(),
+            publisher_identity: NETWORK_EVENT_IDENTITY.get().cloned().unwrap_or_default(),
         })
     }
 
@@ -969,7 +983,8 @@ impl EventSubscriber {
             prefixes: Arc::new(RwLock::new(HashMap::new())),
             tenant: Arc::new(RwLock::new(None)),
             authz: installed_event_authz().unwrap_or_else(|| Arc::new(DenyAllEventAuthz)),
-            caller: Subject::anonymous(),
+            caller: NETWORK_EVENT_IDENTITY.get().and_then(|identity| identity.did.clone())
+                .map(Subject::new).unwrap_or_else(Subject::anonymous),
         })
     }
 
