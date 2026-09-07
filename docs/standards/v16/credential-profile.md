@@ -126,13 +126,17 @@ replay rules the proof profile cross-references).
 
 **Individual credential revocation is normative and enforced (U1).** The
 authority holds a credential-revocation store keyed by the exact credential-ID
-tuple `(iss, jti)` — authoritative off-wire state, never a wire claim and never a
+typed tuple `(iss, kind, identifier)`: `kind=jti` with JWT text, or `kind=cti`
+with CWT raw bytes — authoritative off-wire state, never a wire claim and never a
 consume-once behavior (a Reusable credential ID is never consumed). Full
 credential verification MUST consult it **after** issuer-signature and profile
 validation, and **fail closed** for an otherwise-valid, unexpired credential
-whose `(iss, jti)` is listed. The match is the **exact tuple**: a different `jti`,
-or the same `jti` under a different `iss`, does **not** match, so unrelated
-credential identities never collapse. This is **distinct** from session-wide
+whose typed identity is listed. The match is the **exact tuple**: a different
+identifier, kind, or issuer does **not** match. JWT text and identical UTF-8 CWT
+bytes are distinct; arbitrary non-UTF8 `cti` bytes remain lossless. The JSON
+fixture encodes CWT authority records as `{iss, kind: "cti", cti_hex}` (canonical
+hex decoded to bytes) and JWT records as `{iss, kind: "jti", jti}`. No wire claim
+is added. This is **distinct** from session-wide
 revocation (a session's `status` under `(iss, sid)`, §3.4) and from enrollment
 revocation (an enrollment record's `status`, §5) — revoking one credential
 affects exactly that one token.
@@ -312,7 +316,7 @@ backed by an idempotency/result ledger whose lookup binds the retrying principal
 
 | Operation | Effect |
 |---|---|
-| Revoke `CredentialId` = `(iss, jti/cti)` | Reject **that one credential** (exact tuple; §3.1, U1); evict every handle derived from it. Full verification consults the `(iss, jti)` revocation store after issuer-signature/profile validation and fails closed on a match. A different `jti`, or the same `jti` under a different `iss`, is unaffected. |
+| Revoke `CredentialId` = `(iss, jti/cti)` | Reject **that one credential** (typed tuple; §3.1, U1); evict every handle derived from it. Full verification consults the `(iss, kind, identifier)` revocation store after issuer-signature/profile validation and fails closed on a match. A different identifier, JWT/CWT kind, or issuer is unaffected. |
 | Revoke `SessionKey` = `(iss, sid \| workload_session_id)` | Reject every credential and handle carrying that session ID; terminate or revalidate associated streams and continuations; prevent refresh within the session. **Distinct from** individual `(iss, jti)` credential revocation above. |
 | Disable subject or tenant | A separate authority operation that may revoke multiple sessions. |
 | Expiry of token or session | The same rejection behavior, with no unauthenticated downgrade. |

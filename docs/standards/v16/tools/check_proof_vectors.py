@@ -735,18 +735,90 @@ def configured_issuer(creds_doc):
     return (creds_doc.get("issuer") or {}).get("iss")
 
 
-def is_credential_revoked(creds_doc, iss, jti):
-    """U1: authoritative (iss, jti) credential-revocation lookup (credential-profile
-    §6/§3.3). EXACT tuple match — a different jti, or the same jti under a different
-    iss, does not match (unrelated identities never collapse). This is DISTINCT from
-    session-wide revocation (a session status='revoked') and from enrollment
-    revocation (an enrollment status='revoked'/'inactive'). It carries no wire bit and
-    no consume-once behavior. Full credential verification consults it AFTER issuer
-    signature/profile validation and fails closed on a match."""
+def is_credential_revoked(creds_doc, iss, identifier, *, kind="jti"):
+    """Exact typed identity: issuer + JWT jti text OR CWT cti raw bytes.
+
+    JSON authority records spell binary cti as hex; comparison decodes it back to
+    bytes, never UTF-8 or a JWT identifier. Invalid identity/store shapes fail closed.
+    """
+    expected_type = {"jti": str, "cti": bytes}.get(kind)
+    if not isinstance(iss, str) or not iss or expected_type is None:
+        return True
+    if not isinstance(identifier, expected_type) or not identifier:
+        return True
     for r in creds_doc.get("credential_revocations", []):
-        if r.get("iss") == iss and r.get("jti") == jti:
+        if not isinstance(r, dict):
+            return True
+        rkind = r.get("kind")
+        if rkind == "jti" and set(r) == {"iss", "kind", "jti"}:
+            value = r["jti"]
+            valid = isinstance(value, str) and bool(value)
+        elif rkind == "cti" and set(r) == {"iss", "kind", "cti_hex"}:
+            try:
+                value = bytes.fromhex(r["cti_hex"])
+                valid = bool(value) and value.hex() == r["cti_hex"]
+            except (ValueError, TypeError):
+                valid = False
+        else:
+            return True
+        if not valid or not isinstance(r.get("iss"), str) or not r["iss"]:
+            return True
+        if r["iss"] == iss and rkind == kind and value == identifier:
             return True
     return False
+
+
+def cwt_revocation_control_errors(creds_doc, negatives):
+    """Signed CWT controls differ from the valid N-1 credential only in cti."""
+    errors = []
+    base = next(v for v in negatives["vectors"] if v["id"] == "N-1")
+    base_obj = decode(bytes.fromhex(base["cbor_hex"]))
+    base_claims = decode(base_obj[2])
+    controls = creds_doc.get("cwt_revocation_controls", [])
+    if [v.get("expect_revoked") for v in controls] != [False, True]:
+        return ["CWT revocation controls must include live and revoked credentials"]
+    pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(creds_doc["issuer"]["public_hex"]))
+    now = creds_doc["verifier_now"]
+    for control in controls:
+        obj = decode(bytes.fromhex(control["cbor_hex"]))
+        claims = decode(obj[2])
+        header = decode(obj[0])
+        if header != {1: -19, 4: creds_doc["issuer"]["kid"].encode(), 16: "application/cwt"} or obj[1] != {}:
+            errors.append("CWT control must have the configured issuer's classical credential header")
+        try:
+            pub.verify(obj[3], enc(["Signature1", obj[0], b"", obj[2]]))
+        except InvalidSignature:
+            errors.append("CWT control issuer signature invalid")
+        if {k: v for k, v in claims.items() if k != 7} != {k: v for k, v in base_claims.items() if k != 7}:
+            errors.append("CWT control changed a non-target field of the valid N-1 credential")
+        if (claims.get(1) != configured_issuer(creds_doc)
+                or not isinstance(claims.get(7), bytes) or not claims[7]
+                or not is_numericdate(claims.get(6)) or not is_numericdate(claims.get(4))
+                or not claims[6] <= now < claims[4]):
+            errors.append("CWT control must have valid issuer, byte-string cti and lifetime")
+        errors += validate_tenant(claims.get(-70005))
+        errors += validate_clearance_shape(claims.get(-70006))
+        # The unchanged RFC8747 classical cnf resolves a real primary enrollment.
+        key = claims[8][1]
+        tp = base64.urlsafe_b64encode(hashlib.sha256(
+            enc(["hs-cose-sign-ed25519-v1", [key[-2]]])).digest()).rstrip(b"=").decode()
+        errors += validate_primary_enrollment(resolve_primary_enrollment(creds_doc, tp),
+                                              tp, claims[-70005], claims[2], now)
+        if errors:
+            continue  # A malformed credential cannot supply causal revocation evidence.
+        revoked = is_credential_revoked(creds_doc, claims[1], claims[7], kind="cti")
+        if revoked != control["expect_revoked"]:
+            errors.append("CWT control revocation result differs from its expected typed identity")
+        if control["expect_revoked"]:
+            corrected = {**creds_doc, "credential_revocations": [r for r in creds_doc["credential_revocations"]
+                         if not (r["iss"] == claims[1] and r["kind"] == "cti" and r["cti_hex"] == claims[7].hex())]}
+            if is_credential_revoked(corrected, claims[1], claims[7], kind="cti"):
+                errors.append("removing only the target CWT revocation must admit the unchanged credential")
+            if is_credential_revoked(creds_doc, "https://other-issuer.example", claims[7], kind="cti"):
+                errors.append("CWT revocation must not cross issuer namespaces")
+        elif not is_credential_revoked(creds_doc, claims[1], claims[7].decode(), kind="jti"):
+            errors.append("live CWT bytes must remain distinct from the revoked same-spelling JWT jti")
+    return errors
 
 
 def validate_tenant(value):
@@ -1186,6 +1258,8 @@ def main() -> None:
         fail("proof-v1-credentials.json is missing (F2 authenticated credential context)")
     else:
         cd = json.loads(cred_path.read_text())
+        for error in cwt_revocation_control_errors(cd, negative):
+            fail(error)
         now = cd.get("verifier_now")
         if not isinstance(now, int):
             fail("verifier_now must be a declared integer")

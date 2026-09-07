@@ -74,6 +74,7 @@ from check_proof_vectors import (  # noqa: E402
     resolve_response_signer_enrollments, validate_response_signer_enrollment,
     response_context_bindings,
     validate_signer_suite_confirmation,
+    cwt_revocation_control_errors,
 )
 
 # ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
@@ -2551,6 +2552,9 @@ def gate_credential_context(positives, negatives) -> None:
     rejected("wrong iss (foreign issuer, issuer-signed)",
              _make_jwt(hdr, {**base_claims, "iss": "https://evil-issuer.example"}, sk_i))
     # 6c. U1: individual credential revocation. Build an OTHERWISE-VALID credential
+    cwt_errors = cwt_revocation_control_errors(creds, negatives)
+    check(not cwt_errors, f"typed CWT revocation controls must pass: {cwt_errors}")
+    print("   CWT revocation: signed byte-cti credential denies, record-only correction admits; JWT/issuer namespaces stay distinct")
     #     whose (iss, jti) is listed in the authoritative revocation store, prove it
     #     passes signature/profile validation, then prove the (iss, jti) lookup
     #     denies it (it would pass a verifier that ignored the normative rule).

@@ -176,9 +176,10 @@ credential revocation and `(iss, sid)` session resolution.
 
 **Authoritative credential revocation (U1).** Individual credential revocation is
 normative (credential-profile §6 / §3.1) and enforced: the authority holds an
-off-wire revocation store keyed by the exact credential-ID tuple `(iss, jti)`,
+off-wire revocation store keyed by the exact typed credential-ID tuple
+`(iss, kind, identifier)` (JWT `jti` text or CWT `cti` bytes),
 consulted **after** issuer-signature and profile validation, failing **closed**
-for an otherwise-valid, unexpired credential whose `(iss, jti)` is listed. The
+for an otherwise-valid, unexpired credential whose typed identity is listed. The
 shipped store lists `cred-revoked-1`; none of the live credentials are listed
 (**positive unrevoked evidence**). The gate re-signs an otherwise-profile-valid
 credential carrying the revoked `jti`, proves it passes signature/profile checks
@@ -188,6 +189,15 @@ collapse: a different `jti`, or the same `jti` under a different `iss`, does not
 match. This credential revocation is **distinct** from session-wide `(iss, sid)`
 revocation and from enrollment revocation — it affects exactly one token, adds no
 wire bit, and introduces no consume-once behavior.
+
+The same context ships two issuer-signed classical CWT controls, both with N-1's
+valid credential claims and enrolled primary key, changing only `cti`. The live
+CWT uses the bytes of the revoked JWT's text identifier and remains unrevoked;
+the revoked CWT uses a non-UTF8 byte identifier. Both checker layers verify the
+signatures, unchanged non-target claims, lifetime and enrollment before lookup.
+Removing only the CWT revocation admits the unchanged credential, and a different
+issuer does not match. JSON `cti_hex` is only a lossless representation of raw
+bytes in the authority fixture; it never becomes a JWT identifier.
 
 **Encoding matrix (G1).** `cnf.hs_signer_suite` is a **JWT** confirmation method and
 binds a signer-suite record of any component count. A **CWT** `cnf` is a single

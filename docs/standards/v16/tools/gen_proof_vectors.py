@@ -1081,6 +1081,13 @@ def main() -> None:
             -70006: [2, [5, 7]],                  # clearance [level, compartments]; assurance absent
         }
         n1, _, _ = sign1(n1_protected, n1_claims, sk_i_ed)
+        # Typed revocation controls keep every N-1 credential field except cti.
+        # JWT-like bytes must not collide with the revoked textual jti, and a
+        # non-UTF8 cti proves binary identifiers remain lossless.
+        cwt_revocation_controls = []
+        for ident, revoked in ((b"cred-revoked-1", False), (b"\xffcwt-revoked-1", True)):
+            raw, _, _ = sign1(n1_protected, {**n1_claims, C_CTI: ident}, sk_i_ed)
+            cwt_revocation_controls.append({"cbor_hex": raw.hex(), "expect_revoked": revoked})
         record(
             negatives,
             "N-1",
@@ -2763,24 +2770,27 @@ def main() -> None:
             "note": (
                 "U1 (credential-profile §6/§3.3): individual credential revocation is "
                 "normative and affects EXACTLY ONE token, keyed by the credential "
-                "identity tuple (iss, jti). This authoritative off-wire store is "
+                "typed identity tuple (iss, kind, identifier): JWT jti text or CWT cti bytes. This authoritative off-wire store is "
                 "consulted AFTER issuer-signature and profile validation; an otherwise-"
-                "valid, unexpired credential whose (iss, jti) is listed fails closed. "
-                "The match is the EXACT tuple — a different jti, or the same jti under a "
-                "different iss, does NOT match, so unrelated identities never collapse. "
+                "valid, unexpired credential whose typed identity is listed fails closed. "
+                "The match is the EXACT tuple — a different identifier, kind or issuer "
+                "does NOT match. CWT cti_hex is decoded to bytes, never UTF-8 or jti text. "
                 "This is DISTINCT from session-wide revocation (a session status = "
                 "'revoked', keyed by (iss, sid)) and from enrollment revocation (an "
                 "enrollment status = 'revoked'/'inactive'). It is not a wire claim and "
                 "adds no consume-once behavior; a Reusable credential ID is never "
                 "consumed. The shipped live credentials are NOT listed (positive "
                 "unrevoked evidence); `cred-revoked-1` is a revoked identity a "
-                "conformance runner re-signs to exercise the deny path."
+                "conformance runner re-signs to exercise the JWT deny path. Separate signed "
+                "CWT controls prove binary-cti revocation and JWT/CWT namespace separation."
             ),
-            "tuple": "(iss, jti)",
+            "tuple": "(iss, kind, identifier): jti text or cti bytes",
         },
         "credential_revocations": [
-            {"iss": ISSUER_ISS, "jti": "cred-revoked-1"},
+            {"iss": ISSUER_ISS, "kind": "jti", "jti": "cred-revoked-1"},
+            {"iss": ISSUER_ISS, "kind": "cti", "cti_hex": b"\xffcwt-revoked-1".hex()},
         ],
+        "cwt_revocation_controls": cwt_revocation_controls,
         "positive_to_credential": {
             "P-2": "hybrid",
             "P-4": "classical",
