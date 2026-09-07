@@ -1591,6 +1591,22 @@ fn select_iroh_moql_admission_proof<T>(
     }
 }
 
+/// The Event origin is deliberately rooted at `local/events`; it is not a
+/// remote tenant claim. Required-native participants must therefore carry the
+/// explicit operator binding for that fixed local staging namespace before an
+/// Event carrier can be created.
+fn require_native_event_namespace_tenant(
+    config: &HyprConfig,
+    proof: &hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof,
+) -> Result<()> {
+    anyhow::ensure!(
+        config.quic.moql_subject_tenants.get(&proof.did).is_some_and(|tenant| tenant == "local"),
+        "network-iroh-required Event client DID {} must have explicit [quic].moql_subject_tenants local binding for the fixed local/events namespace",
+        proof.did,
+    );
+    Ok(())
+}
+
 /// Build the required-native `moql` admission gate from the process-pinned
 /// checkpoint reader and explicit operator subject→tenant rows.  Service DIDs
 /// and tenants are separate deployment facts: neither carrier reach nor a
@@ -3343,6 +3359,11 @@ fn main() -> Result<()> {
 
                                 let manager = InprocManager::new();
                                 let mut handles = Vec::new();
+                                // Owned by this standalone service process and
+                                // cancelled before its service handles stop.
+                                // The network Event link must not outlive the
+                                // process's authenticated service lifetime.
+                                let event_link_cancellation = tokio_util::sync::CancellationToken::new();
 
                                 // Compute dependency-aware startup stages.
                                 let stages = hyprstream_service::service::ordering::startup_stages_for_profile(
@@ -3367,36 +3388,49 @@ fn main() -> Result<()> {
                                         // silently select the first service in a combined
                                         // process: a later service would then identify as a
                                         // different checkpointed DID on its Event link.
-                                        let proof = select_single_process_moql_admission_proof(
-                                            service_names
-                                                .iter()
-                                                .map(|service_name| {
-                                                    ctx.moql_admission_proof(service_name)
-                                                        .map(|proof| (service_name.clone(), proof))
-                                                })
-                                                .collect::<Result<Vec<_>>>()?,
+                                        let proof = select_iroh_moql_admission_proof(
+                                            true,
+                                            || {
+                                                service_names
+                                                    .iter()
+                                                    .map(|service_name| {
+                                                        ctx.moql_admission_proof(service_name)
+                                                            .map(|proof| (service_name.clone(), proof))
+                                                    })
+                                                    .collect::<Result<Vec<_>>>()
+                                            },
                                         )?.ok_or_else(|| anyhow::anyhow!(
                                             "network-iroh-required Event client has no checkpointed MoQL proof"
                                         ))?;
+                                        require_native_event_namespace_tenant(&config, &proof)?;
                                         if let Some(origin) = hyprstream_rpc::moq_event::install_event_network_client_origin() {
+                                            let cancellation = event_link_cancellation.clone();
                                             tokio::spawn(async move {
                                                 loop {
-                                                    let attempt: anyhow::Result<()> = async {
-                                                        let target = hyprstream_discovery::production_moq_event_target().await?;
-                                                        let mut proof = proof.clone();
-                                                        proof.expected_server = target.server_identity;
-                                                        let stream_session = hyprstream_rpc::dial::dial_stream_authenticated(
-                                                            &target.transport, &proof,
-                                                        ).await?;
-                                                        let client = moq_net::Client::new().with_origin(origin.producer());
-                                                        let session = stream_session.connect_moq(&client).await?;
-                                                        let _ = session.closed().await;
-                                                        anyhow::bail!("authenticated Event MoQ link closed")
-                                                    }.await;
-                                                    if let Err(error) = attempt {
-                                                        tracing::warn!("authenticated Event MoQ link unavailable: {error}");
+                                                    tokio::select! {
+                                                        _ = cancellation.cancelled() => break,
+                                                        attempt = async {
+                                                            let result: anyhow::Result<()> = async {
+                                                                let target = hyprstream_discovery::production_moq_event_target().await?;
+                                                                let mut proof = proof.clone();
+                                                                proof.expected_server = target.server_identity;
+                                                                let stream_session = hyprstream_rpc::dial::dial_stream_authenticated(
+                                                                    &target.transport, &proof,
+                                                                ).await?;
+                                                                let client = moq_net::Client::new().with_origin(origin.producer());
+                                                                let session = stream_session.connect_moq(&client).await?;
+                                                                let _ = session.closed().await;
+                                                                anyhow::bail!("authenticated Event MoQ link closed")
+                                                            }.await;
+                                                            result
+                                                        } => if let Err(error) = attempt {
+                                                            tracing::warn!("authenticated Event MoQ link unavailable: {error}");
+                                                        },
                                                     }
-                                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                                    tokio::select! {
+                                                        _ = cancellation.cancelled() => break,
+                                                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                                                    }
                                                 }
                                             });
                                         }
@@ -3452,6 +3486,7 @@ fn main() -> Result<()> {
                                 }
 
                                 if handles.is_empty() {
+                                    event_link_cancellation.cancel();
                                     return Err(anyhow::anyhow!("No services to start"));
                                 }
 
@@ -3462,6 +3497,7 @@ fn main() -> Result<()> {
                                 );
 
                                 let _ = shutdown_rx.await;
+                                event_link_cancellation.cancel();
 
                                 // Stop all services
                                 for (svc_name, mut handle) in handles {

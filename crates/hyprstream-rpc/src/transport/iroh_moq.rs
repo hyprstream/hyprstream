@@ -169,6 +169,10 @@ struct HandlerInner {
     /// Triggered by `ProtocolHandler::shutdown` so accept handlers stop
     /// waiting for `Session::closed()` and exit promptly.
     shutdown: CancellationToken,
+    /// Optional fixed path segment after the admission-resolved tenant. Event
+    /// uses `events`, yielding its existing `local/events` namespace while
+    /// retaining the tenant boundary at the carrier.
+    origin_scope_suffix: Option<&'static str>,
 }
 
 impl std::fmt::Debug for IrohMoqProtocolHandler {
@@ -197,6 +201,7 @@ impl IrohMoqProtocolHandler {
                     super::rpc_session::DEFAULT_CONNECTION_LIMIT,
                 )),
                 shutdown: CancellationToken::new(),
+                origin_scope_suffix: None,
             }),
         }
     }
@@ -220,6 +225,14 @@ impl IrohMoqProtocolHandler {
         self
     }
 
+    /// Further narrow every admitted origin to a fixed child of its tenant.
+    /// This is for a protocol with a fixed rooted namespace (the Event plane),
+    /// not a caller-controlled per-peer path.
+    pub fn with_origin_scope_suffix(mut self, suffix: &'static str) -> Self {
+        self.rebuild_inner(|i| i.origin_scope_suffix = Some(suffix));
+        self
+    }
+
     /// Mutate the inner config, cloning the shared `Arc<HandlerInner>` only when
     /// it is already shared (cloned handler) so builder calls compose without
     /// dropping previously-installed fields (authz / admission).
@@ -234,6 +247,7 @@ impl IrohMoqProtocolHandler {
                 authz: old.authz.clone(),
                 connection_limit: Arc::clone(&old.connection_limit),
                 shutdown: old.shutdown.clone(),
+                origin_scope_suffix: old.origin_scope_suffix,
             };
             f(&mut cloned);
             self.inner = Arc::new(cloned);
@@ -353,7 +367,10 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
         // producer's `with_origin` announcements are dropped at this Iroh hop.
         // Scope the writable origin to the admission-derived tenant first, so
         // bidirectional ingestion cannot cross tenant boundaries.
-        let prefix = tenant_prefix(&tenant);
+        let prefix = match self.inner.origin_scope_suffix {
+            Some(suffix) => format!("{}/{suffix}", tenant_prefix(&tenant).trim_end_matches('/')),
+            None => tenant_prefix(&tenant),
+        };
         let path = moq_net::Path::new(&prefix);
         let Some(scoped_origin) = self.inner.origin.producer.scope(&[path]) else {
             tracing::debug!(%tenant, "iroh-moq: tenant has no visible relay scope");
@@ -538,10 +555,10 @@ mod tests {
         Ok(())
     }
 
-    /// A real mutually admitted Iroh session ingests a producer origin at the
-    /// relay and re-serves relay broadcasts on the same tenant-scoped link.
+    /// A real mutually admitted Iroh Event session ingests a producer origin
+    /// and re-serves Event broadcasts on the same fixed `local/events` scope.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn authenticated_iroh_origin_ingests_and_serves_tenant_scope() -> anyhow::Result<()> {
+    async fn authenticated_iroh_event_origin_ingests_and_serves() -> anyhow::Result<()> {
         use crate::crypto::pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes};
         use crate::stream_info::MoqlServerIdentity;
         use crate::transport::moql_admission::{AcceptedIdentityState, AcceptedSubjectKey, MoqlAdmissionProof, MoqlServerIdentityProof, prove_moql_admission};
@@ -571,11 +588,13 @@ mod tests {
         });
         let admission = Arc::new(crate::transport::moql_admission::MoqlAdmissionAuthenticator::new(
             authority,
-            Arc::new(|peer| (peer.subject.as_deref() == Some("did:at9p:producer")).then(|| "alice".to_owned())),
+            Arc::new(|peer| (peer.subject.as_deref() == Some("did:at9p:producer")).then(|| "local".to_owned())),
         ).with_server_identity(MoqlServerIdentityProof {
             identity: server_identity.clone(), ed25519: server_ed, ml_dsa_65: server_pq,
         }));
-        let handler = IrohMoqProtocolHandler::new().with_authz(MoqAuthzConfig::default().with_admission(admission));
+        let handler = IrohMoqProtocolHandler::new()
+            .with_origin_scope_suffix("events")
+            .with_authz(MoqAuthzConfig::default().with_admission(admission));
         let relay_consumer = handler.origin_consumer().clone();
         let relay_producer = handler.origin_producer().clone();
         let relay = IrohSubstrate::new_test(fresh_key(), handler, NoopHandler::new("rpc-not-wired")).await?;
@@ -589,19 +608,19 @@ mod tests {
         let client_consumer = client_origin.consume();
         let session = Client::new().with_origin(client_origin.clone()).connect(Session::raw(conn)).await?;
 
-        let mut client_broadcast = client_origin.create_broadcast("alice/from-client").ok_or_else(|| anyhow::anyhow!("create client broadcast"))?;
+        let mut client_broadcast = client_origin.create_broadcast("local/events/from-client").ok_or_else(|| anyhow::anyhow!("create client broadcast"))?;
         let mut client_track = client_broadcast.create_track(Track::new("tokens"))?;
         let mut client_group = client_track.create_group(Group::from(0u64))?;
         client_group.write_frame(Bytes::from_static(b"up"))?;
         drop(client_group);
-        tokio::time::timeout(std::time::Duration::from_secs(2), relay_consumer.announced_broadcast("alice/from-client")).await?.ok_or_else(|| anyhow::anyhow!("relay did not ingest authenticated origin"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay_consumer.announced_broadcast("local/events/from-client")).await?.ok_or_else(|| anyhow::anyhow!("Event carrier did not ingest authenticated origin"))?;
 
-        let mut relay_broadcast = relay_producer.create_broadcast("alice/from-relay").ok_or_else(|| anyhow::anyhow!("create relay broadcast"))?;
+        let mut relay_broadcast = relay_producer.create_broadcast("local/events/from-relay").ok_or_else(|| anyhow::anyhow!("create Event broadcast"))?;
         let mut relay_track = relay_broadcast.create_track(Track::new("tokens"))?;
         let mut relay_group = relay_track.create_group(Group::from(0u64))?;
         relay_group.write_frame(Bytes::from_static(b"down"))?;
         drop(relay_group);
-        tokio::time::timeout(std::time::Duration::from_secs(2), client_consumer.announced_broadcast("alice/from-relay")).await?.ok_or_else(|| anyhow::anyhow!("client did not consume relay origin"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), client_consumer.announced_broadcast("local/events/from-relay")).await?.ok_or_else(|| anyhow::anyhow!("client did not consume Event origin"))?;
         drop(session);
         client.shutdown().await?;
         relay.shutdown().await?;

@@ -608,9 +608,9 @@ fn spawn_jwt_renewal_task(
 #[service_factory("event")]
 fn create_event_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating EventService (moq-lite event bus)");
+    let config = load_config();
 
     if !hyprstream_rpc::events::event_authz_installed() {
-        let config = load_config();
         let sk = ctx.service_signing_key("event");
         // Declared MoQ/event track policy (v16 §10 / #1510). The generated
         // dispatch inventory (WS-D / #1505) is the end-state producer of these
@@ -645,6 +645,11 @@ fn create_event_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         let proof = ctx.moql_admission_proof("event")?.ok_or_else(|| {
             anyhow::anyhow!("network-iroh-required Event service has no checkpointed MoQL proof")
         })?;
+        anyhow::ensure!(
+            config.quic.moql_subject_tenants.get(&proof.did).is_some_and(|tenant| tenant == "local"),
+            "network-iroh-required Event service DID {} must have explicit [quic].moql_subject_tenants local binding for the fixed local/events namespace",
+            proof.did,
+        );
         let identity = hyprstream_rpc::transport::moql_admission::MoqlServerIdentityProof::from_local_admission_proof(&proof)
             .context("construct Event server accepted-state witness")?;
         admission.install_server_identity(identity).map_err(|error| {
@@ -655,6 +660,7 @@ fn create_event_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
             origin.consumer().clone(),
         );
         let handler = hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::with_origin(shared_origin)
+            .with_origin_scope_suffix("events")
             .with_authz(
                 hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig::default()
                     .with_admission(admission),
