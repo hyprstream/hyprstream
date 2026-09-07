@@ -100,14 +100,14 @@ struct PolicyRequest {
     # Publish a credential revocation to the canonical store owned by this service.
     # Restricted to the OAuth revocation authority (service:oauth) by Casbin —
     # the RFC 7009 endpoint is the only legitimate publisher.
-    revokeCredential @24 :RevokeCredential
+    revokeCredential @23 :RevokeCredential
       $scope(manage);
 
     # Ask the revocation authority whether a credential has been revoked.
     # Service-identities only (service:*): every enrolled service process
     # checks revocations on its verification path and probes at startup;
     # anonymous/end-user callers have no legitimate read.
-    checkCredentialRevocation @25 :CheckCredentialRevocation
+    checkCredentialRevocation @24 :CheckCredentialRevocation
       $scope(query);
   }
 }
