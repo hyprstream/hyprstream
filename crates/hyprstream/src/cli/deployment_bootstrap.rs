@@ -162,8 +162,10 @@ fn build_verified_roster_entries(
 
 /// Atomically write the verified roster manifest: serialize fully, write to a
 /// sibling temporary file (created exclusively), sync, then rename. A failure
-/// at any step removes the temporary file and never creates, truncates, or
-/// replaces the target path.
+/// at any step never creates, truncates, or replaces the target path. Only a
+/// temporary file this invocation successfully created is ever removed; if
+/// exclusive creation fails because the predictable sibling already exists,
+/// that preexisting file belongs to someone else and is left untouched.
 fn write_verified_roster_manifest(
     path: &Path,
     services: Vec<VerifiedServiceRosterEntry>,
@@ -199,23 +201,39 @@ fn write_verified_roster_manifest(
         generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         services,
     };
+    let bytes = serde_json::to_vec_pretty(&manifest)?;
+    // Ownership boundary: until the exclusive create succeeds, `temp` is not
+    // ours — a collision means a leftover from an interrupted earlier process
+    // (possibly with a reused PID) or another entry in the caller's directory,
+    // and must survive this failed invocation.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .with_context(|| format!("create roster export temporary {}", temp.display()))?;
+    publish_owned_roster_temp(file, &temp, path, &bytes)
+}
+
+/// Publish through a temporary file this invocation created exclusively. On
+/// any failure before the rename lands, only that owned file is removed;
+/// nothing else in the directory is touched.
+fn publish_owned_roster_temp(
+    mut file: std::fs::File,
+    temp: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<()> {
     let result = (|| -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(&manifest)?;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .with_context(|| format!("create roster export temporary {}", temp.display()))?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temp, path)
+        std::fs::rename(temp, path)
             .with_context(|| format!("publish roster export {}", path.display()))?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_file(temp);
     }
     result
 }
@@ -744,6 +762,107 @@ mod tests {
         // signing seed nor the derived ML-DSA secret appears in any form.
         assert!(!text.contains(&hex::encode([0x62; 32])));
         assert!(!text.contains("signing-key"));
+        Ok(())
+    }
+
+    /// The predictable sibling temp path of the current process, exactly as
+    /// `write_verified_roster_manifest` computes it.
+    fn roster_temp_sibling(target: &Path) -> Result<std::path::PathBuf> {
+        let file_name = target
+            .file_name()
+            .context("roster target has no file name")?;
+        Ok(target.with_file_name(format!(
+            ".{}.tmp-{}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        )))
+    }
+
+    #[test]
+    fn deployment_bootstrap_roster_export_collision_preserves_foreign_sibling_and_target(
+    ) -> Result<()> {
+        let out_dir = tempfile::tempdir()?;
+        let target = out_dir.path().join("roster.json");
+        // A leftover from an interrupted earlier process (possibly a reused
+        // PID) occupies the predictable temp path, and an older published
+        // manifest occupies the target. The failed invocation must not delete
+        // or modify either: it never owned the sibling.
+        let foreign = roster_temp_sibling(&target)?;
+        std::fs::write(&foreign, b"interrupted earlier process")?;
+        std::fs::write(&target, b"previous good manifest")?;
+        let error = write_verified_roster_manifest(
+            &target,
+            vec![VerifiedServiceRosterEntry {
+                service: "model".to_owned(),
+                did: "did:at9p:collision".to_owned(),
+                epoch: 1,
+                expires_at: "2099-01-01T00:00:00Z".to_owned(),
+                accepted_head_digest: hex::encode([0x42; 64]),
+            }],
+        )
+        .err()
+        .context("temp collision must fail the export")?;
+        assert!(error.to_string().contains("create roster export temporary"));
+        assert_eq!(std::fs::read(&foreign)?, b"interrupted earlier process");
+        assert_eq!(std::fs::read(&target)?, b"previous good manifest");
+        Ok(())
+    }
+
+    #[test]
+    fn deployment_bootstrap_roster_export_failure_after_create_removes_only_owned_temp(
+    ) -> Result<()> {
+        let out_dir = tempfile::tempdir()?;
+        let target = out_dir.path().join("roster.json");
+        let temp = roster_temp_sibling(&target)?;
+        // Simulate ownership exactly as the writer acquires it, then fail the
+        // publication step: the rename destination's parent does not exist.
+        let owned = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        let missing_target = out_dir.path().join("gone").join("roster.json");
+        let result = publish_owned_roster_temp(owned, &temp, &missing_target, b"{}");
+        assert!(result.is_err());
+        assert!(!temp.exists(), "owned temp must be removed after failure");
+        // An unrelated preexisting sibling entry is never cleanup scope.
+        let foreign = out_dir.path().join(".roster.json.tmp-foreign");
+        std::fs::write(&foreign, b"not ours")?;
+        let owned = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        assert!(publish_owned_roster_temp(owned, &temp, &missing_target, b"{}").is_err());
+        assert!(!temp.exists());
+        assert_eq!(std::fs::read(&foreign)?, b"not ours");
+        // Success control: the owned path publishes and removes the temp.
+        let owned = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        publish_owned_roster_temp(owned, &temp, &target, b"{\"ok\":true}")?;
+        assert!(!temp.exists());
+        assert_eq!(std::fs::read(&target)?, b"{\"ok\":true}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn deployment_bootstrap_roster_export_success_control_publishes_atomically() -> Result<()> {
+        let (_dir, store, ingest, key) = fixture()?;
+        let now = Utc::now();
+        let now_text = now.to_rfc3339_opts(SecondsFormat::Secs, true);
+        let first = provision_one(&store, &ingest, "model", &key, now, 86400)?;
+        let admitted = [("model", &key, first.clone())];
+        let entries = build_verified_roster_entries(&store, &admitted, &now_text)?;
+        let out_dir = tempfile::tempdir()?;
+        let target = out_dir.path().join("roster.json");
+        write_verified_roster_manifest(&target, entries)?;
+        // Successful publication leaves exactly the target: no temp sibling.
+        let names = std::fs::read_dir(out_dir.path())?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(names, [std::ffi::OsString::from("roster.json")]);
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&target)?)?;
+        assert_eq!(parsed["services"][0]["did"], first.did);
         Ok(())
     }
 }
