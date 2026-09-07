@@ -94,10 +94,23 @@ startup and commands fail closed on connection errors, with bounded timeouts.
 
 Candidate queries enumerate the shared, capacity-bounded liveness index. A
 replica then ingests missing placement records through the existing verified
-repository resolver and bounded retry gate. Authorization, ingestion, and live
-point reads run with at most 16 concurrent node operations per query; final
-authorization is also concurrent. Native queries have a five-second deadline
-covering enumeration through final authorization. A deadline or still-pending
+repository resolver and bounded retry gate. Resource and already-warm label filtering precede RPC work;
+Policy authorizes bounded vectors of at most 256 resources, with at most 16
+batches in flight. The batch handler reuses the exact single-check verified
+subject/tenant/audit boundary and requires an ordered decision for every entry.
+There is no authorization cache or duplicate second authorization pass. Denied
+nodes never trigger hydration. Two bulk liveness snapshots replace per-node
+Valkey reads; the second excludes expiry during authorization/hydration. Ranking
+and exact authorized `totalMatching` still inspect all eligible survivors before
+applying maxCandidates. The exact-count contract inherently requires O(fleet)
+local work; a small result limit cannot justify an incomplete count. A warm
+65,536-node tiered query is exercised at the advertised capacity.
+
+Cold verified-repository hydration remains bounded at 16 operations. A completely
+cold large fleet can require retries or prior heartbeat-driven ingestion; bounded
+batch authorization does not pretend that arbitrary remote repository reads can
+finish within one deadline. Native queries retain the five-second deadline
+covering enumeration through final filtering. A deadline or still-pending
 ingest returns an error requiring retry, never a successful partial candidate
 set or understated `totalMatching`. Completed verified records remain available
 for the retry; cancelled ingests are retryable and are not cached as absence.
@@ -112,10 +125,18 @@ over the capacity-bounded expiry index, together with atomic metadata cleanup.
 They do not perform network round trips per service or populate point-cache L1.
 
 Heartbeat `last_seen` is the admitted server receipt time; the node's `ts` cannot
-poison ordering after future skew or clock rollback. Stores accept a newer
-receipt even if it shortens lifetime; a newer receipt-derived lifetime also
-supersedes legacy client-clock skew. A write with an older receipt and no newer
-lifetime cannot replace fresher state. This changes no identity authority:
+poison ordering after future skew or clock rollback. Shared writes take Valkey
+TIME atomically with storage and PXAT expiry (at most the 45-second heartbeat
+TTL); replica absolute timestamps never select ordering or expiry. Concurrent
+shared writes follow Valkey receipt order, not a comparison of caller clocks.
+Shared listings reap with Valkey TIME and point reads use Valkey key expiry;
+tiered liveness does not use host-clock L1 caching. Memory-only deployments keep
+their local receipt ordering. The bounded listing retires legacy volatile rows
+without the shared-receipt marker, since their clock-derived lifetime cannot be
+trusted; a new admitted heartbeat replaces them. No PDS state reset is involved.
+Deploy the batch-capable Policy service before Discovery uses batching; an old
+Policy endpoint fails closed, without a fleet-sized per-node RPC fallback.
+This changes no identity authority:
 signed/accepted announcement expiry
 is independently enforced, and refreshing liveness does not renew it.
 

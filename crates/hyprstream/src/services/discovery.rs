@@ -50,6 +50,31 @@ impl PolicyAuthProvider {
 
 #[async_trait(?Send)]
 impl AuthorizationProvider for PolicyAuthProvider {
+    async fn check_batch(
+        &self, subject: &str, domain: &str, resources: &[String],
+        operation: &str, bearer: Option<&str>,
+    ) -> anyhow::Result<Vec<bool>> {
+        use crate::services::generated::policy_client::PolicyCheckBatch;
+        anyhow::ensure!(resources.len() <= 256, "authorization batch exceeds 256");
+        let client = match bearer {
+            Some(token) => self.client.clone().with_delegated_bearer(token.to_owned()),
+            None => {
+                let upstream = hyprstream_rpc::envelope::Subject::new(subject);
+                anyhow::ensure!(!upstream.is_federated() && upstream.name()
+                    .is_some_and(|name| name == "system" || name.starts_with("service:")),
+                    "service-mediated user policy check requires verified bearer");
+                self.client.clone()
+            }
+        };
+        let request = PolicyCheckBatch { checks: resources.iter().map(|resource| PolicyCheck {
+            subject: subject.to_owned(), domain: domain.to_owned(),
+            resource: resource.clone(), operation: operation.to_owned(),
+        }).collect() };
+        let result = client.check_batch(&request).await?;
+        anyhow::ensure!(result.allowed.len() == resources.len(), "invalid policy batch decision count");
+        Ok(result.allowed)
+    }
+
     async fn check(
         &self,
         subject: &str,

@@ -498,6 +498,20 @@ fn to_scheduling_op(op: crate::generated::discovery_client::SelectorOp) -> sched
 /// provides a `PolicyAuthProvider` that wraps `PolicyClient`.
 #[async_trait(?Send)]
 pub trait AuthorizationProvider: Send + Sync {
+    /// One bounded authorization vector; implementations may amortize RPC
+    /// overhead but must retain one decision per resource in input order.
+    async fn check_batch(
+        &self, subject: &str, domain: &str, resources: &[String],
+        operation: &str, bearer: Option<&str>,
+    ) -> Result<Vec<bool>> {
+        anyhow::ensure!(resources.len() <= 256, "authorization batch exceeds 256");
+        let mut allowed = Vec::with_capacity(resources.len());
+        for resource in resources {
+            allowed.push(self.check(subject, domain, resource, operation, bearer).await.unwrap_or(false));
+        }
+        Ok(allowed)
+    }
+
     /// Check if a subject is authorized for the given operation on a resource.
     async fn check(
         &self,
@@ -6501,7 +6515,6 @@ impl DiscoveryHandler for DiscoveryService {
                 load_fraction: f32,
                 allocatable: Vec<(String, String)>,
                 last_seen: i64,
-                labels: Vec<(String, String)>,
             }
 
             let selectors: Vec<scheduling::LabelSelector> = data
@@ -6521,121 +6534,72 @@ impl DiscoveryHandler for DiscoveryService {
                 .map(|r| scheduling::ResourceRequest::new(r.name.clone(), r.min_quantity.clone()))
                 .collect();
 
-            // Hard liveness exclusion (decision #1): only nodes with a live,
-            // unexpired `reportNodeLiveness` entry become candidates at all.
+            // Exact totalMatching requires examining every eligible node, but
+            // not one or two Policy RPCs and a point GET per node. Read bounded
+            // shared snapshots and authorize in bounded vectors instead.
             let live_nodes = self.state_store.all_liveness(unix_millis_now()).await?;
-            let candidates: Vec<Candidate> = stream::iter(live_nodes)
-                .map(|(node, _)| async move {
-                    anyhow::ensure!(
-                        started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
-                        "candidate query deadline exceeded; retry"
-                    );
-                    let did = node.as_str().to_owned();
-                    // Authorize before a query can trigger resolver work on this
-                    // replica. Liveness is shared, but placement facts still come only
-                    // from the verified repository ingestion path.
-                    if self
-                        .authorize(ctx, &format!("placement:candidate:{did}"), "query")
-                        .await
-                        .is_err()
-                    {
-                        return Ok(None);
-                    }
-                    anyhow::ensure!(
-                        self.ensure_placement_ingested(&node).await,
-                        "candidate projection ingestion is pending; retry"
-                    );
-                    let Some(record_uri) = self.placement_index.record_uri(&did) else {
-                        return Ok(None);
+            let eligible: Vec<_> = live_nodes.into_iter().filter(|(node, live)| {
+                resources.iter().all(|req| live.allocatable.iter()
+                    .find(|(name, _)| name == &req.name)
+                    .is_some_and(|(_, quantity)| req.satisfied_by(quantity)))
+                    && (self.placement_index.record_uri(node.as_str()).is_none()
+                        || selectors.iter().all(|selector| selector.matches(
+                            &self.placement_index.effective_labels(node.as_str()))))
+            }).map(|(node, _)| node).collect();
+            let authorized = stream::iter(eligible.chunks(256))
+                .map(|nodes| async move {
+                    anyhow::ensure!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
+                        "candidate query deadline exceeded; retry");
+                    let resources: Vec<_> = nodes.iter()
+                        .map(|node| format!("placement:candidate:{node}")).collect();
+                    let decisions = match &self.auth_provider {
+                        Some(auth) => auth.check_batch(&ctx.subject().to_string(), "*",
+                            &resources, "query", ctx.jwt_token()).await?,
+                        None => vec![true; resources.len()],
                     };
-                    // Repository ingestion can take time; never return a node whose
-                    // heartbeat expired while this replica was loading its facts.
-                    let Some(live) = self.state_store.liveness(&node, unix_millis_now()).await?
-                    else {
-                        return Ok(None);
-                    };
-                    let labels = self.placement_index.effective_labels(&did);
-                    Ok::<_, anyhow::Error>(Some(Candidate {
-                        did,
-                        record_uri,
-                        load_fraction: live.load_fraction,
-                        allocatable: live.allocatable,
-                        last_seen: live.last_seen,
-                        labels,
-                    }))
+                    anyhow::ensure!(decisions.len() == nodes.len(), "invalid authorization decision count");
+                    Ok::<_, anyhow::Error>(nodes.iter().zip(decisions)
+                        .filter(|(_, allowed)| *allowed).map(|(node, _)| node.clone()).collect::<Vec<_>>())
                 })
                 .buffer_unordered(CANDIDATE_QUERY_CONCURRENCY)
-                .try_collect::<Vec<_>>()
-                .await?
-                .into_iter()
-                .flatten()
-                .collect();
+                .try_collect::<Vec<_>>().await?
+                .into_iter().flatten().collect::<Vec<_>>();
 
-            let predicates: Vec<scheduling::Predicate<Candidate>> = vec![
-                Box::new({
-                    let selectors = selectors.clone();
-                    move |c: &Candidate| {
-                        for sel in &selectors {
-                            if !sel.matches(&c.labels) {
-                                return Some(scheduling::RejectionReason(format!(
-                                    "label selector on {:?} did not match",
-                                    sel.key
-                                )));
-                            }
-                        }
-                        None
-                    }
-                }),
-                Box::new({
-                    let resources = resources.clone();
-                    move |c: &Candidate| {
-                        for req in &resources {
-                            let satisfied = c
-                                .allocatable
-                                .iter()
-                                .find(|(name, _)| name == &req.name)
-                                .is_some_and(|(_, quantity)| req.satisfied_by(quantity));
-                            if !satisfied {
-                                return Some(scheduling::RejectionReason(format!(
-                                    "resource {:?} not satisfied",
-                                    req.name
-                                )));
-                            }
-                        }
-                        None
-                    }
-                }),
-            ];
+            // No denied node can trigger repository hydration. Completed
+            // verified ingests survive a cold-query timeout, so retries progress.
+            stream::iter(&authorized).map(|node| async move {
+                anyhow::ensure!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
+                    "candidate query deadline exceeded; retry");
+                anyhow::ensure!(self.ensure_placement_ingested(node).await,
+                    "candidate projection ingestion is pending; retry");
+                Ok::<_, anyhow::Error>(())
+            }).buffer_unordered(CANDIDATE_QUERY_CONCURRENCY)
+                .try_collect::<Vec<_>>().await?;
 
-            let outcomes = scheduling::filter(&candidates, &predicates);
-            let survivors: Vec<&Candidate> = outcomes
-                .iter()
-                .filter(|o| o.passed())
-                .map(|o| o.candidate)
-                .collect();
-
-            // Per-candidate fail-closed authz — async, so it runs as its own pass
-            // rather than inside a (sync) `scheduling::Predicate` closure. A denied
-            // node is silently dropped, never surfaced as an error.
-            let authorized: Vec<&Candidate> = stream::iter(survivors)
-                .map(|c| async move {
-                    let resource = format!("placement:candidate:{}", c.did);
-                    if self.authorize(ctx, &resource, "query").await.is_ok() {
-                        Some(c)
-                    } else {
-                        None
-                    }
-                })
-                .buffer_unordered(CANDIDATE_QUERY_CONCURRENCY)
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .flatten()
-                .collect();
-            anyhow::ensure!(
-                started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
-                "candidate query deadline exceeded; retry"
-            );
+            // Recheck expiry in one shared-clock snapshot after possibly slow
+            // hydration/authz, rather than issuing an awaited GET for each DID.
+            let mut live: std::collections::HashMap<_, _> = self.state_store.all_liveness(unix_millis_now())
+                .await?.into_iter().collect();
+            let mut candidates = Vec::new();
+            for node in authorized {
+                let did = node.as_str().to_owned();
+                let Some(record_uri) = self.placement_index.record_uri(&did) else { continue };
+                let Some(value) = live.remove(&node) else { continue };
+                let labels = self.placement_index.effective_labels(&did);
+                if !selectors.iter().all(|selector| selector.matches(&labels)) ||
+                    !resources.iter().all(|req| value.allocatable.iter()
+                        .find(|(name, _)| name == &req.name)
+                        .is_some_and(|(_, quantity)| req.satisfied_by(quantity))) {
+                    continue;
+                }
+                candidates.push(Candidate {
+                    did, record_uri, load_fraction: value.load_fraction,
+                    allocatable: value.allocatable, last_seen: value.last_seen,
+                });
+            }
+            let authorized: Vec<_> = candidates.iter().collect();
+            anyhow::ensure!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
+                "candidate query deadline exceeded; retry");
 
             // Post-filter, post-authz, pre-bound — so callers can tell truncation
             // apart from "that's really all of them".
@@ -7407,6 +7371,70 @@ mod query_candidates_tests {
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
     #[tokio::test]
+    async fn valkey_capacity_query_batches_exact_count_and_ranking() {
+        use futures::{stream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        struct BatchPolicy(Arc<AtomicUsize>);
+        #[async_trait(?Send)]
+        impl AuthorizationProvider for BatchPolicy {
+            async fn check(&self, _: &str, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<bool> {
+                panic!("capacity query regressed to per-node Policy RPC");
+            }
+            async fn check_batch(&self, _: &str, _: &str, resources: &[String], _: &str, _: Option<&str>) -> Result<Vec<bool>> {
+                assert!(resources.len() <= 256);
+                self.0.fetch_add(1, SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(resources.iter().map(|r| !r.ends_with("capacity-00001.example")).collect())
+            }
+        }
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else { return };
+        let config = crate::DiscoveryStateConfig {
+            backend: crate::DiscoveryStateBackend::Tiered, active_active: true,
+            valkey: crate::ValkeyStateConfig {
+                url, key_prefix: format!("capacity-query-{}-{}", std::process::id(), unix_millis_now()),
+                ..crate::ValkeyStateConfig::default()
+            }, ..crate::DiscoveryStateConfig::default()
+        };
+        let capacity = config.valkey.liveness_capacity;
+        assert_eq!(capacity, 65_536, "exercise advertised capacity without lowering it");
+        let state = DiscoveryState::connect(&config).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let svc = service_with(Box::new(BatchPolicy(calls.clone())), HashMap::new()).with_state(state);
+        // Warm verified placement projection: signature/admission behavior has
+        // separate real-CAR tests; this fixture isolates full-capacity querying.
+        for i in 0..capacity {
+            let did = format!("did:web:capacity-{i:05}.example");
+            svc.placement_index.seed_warm_node_for_test(did.clone(), crate::placement_index::NodeFacts {
+                record_uri: format!("at://{did}/ai.hyprstream.placement.node/3a"),
+                labels: vec![("zone".to_owned(), if i % 2 == 1 { "west" } else { "east" }.to_owned())],
+                ..Default::default()
+            });
+        }
+        stream::iter(0..capacity).map(|i| {
+            let store = &svc.state_store;
+            async move {
+                let now = unix_millis_now();
+                store.put_liveness(&Did::new(format!("did:web:capacity-{i:05}.example")), LiveAllocatable {
+                    allocatable: vec![("cpu".to_owned(), "8".to_owned())],
+                    load_fraction: 1.0 - i as f32 / capacity as f32,
+                    last_seen: now, live_until_unix_ms: now + 45_000,
+                }).await.unwrap();
+            }
+        }).buffer_unordered(256).collect::<Vec<_>>().await;
+        let mut request = empty_query(1);
+        request.selectors = vec![LabelSelector { key: "zone".to_owned(), op: SelectorOp::In, values: vec!["west".to_owned()] }];
+        request.resources = vec![ResourceRequest { name: "cpu".to_owned(), min_quantity: "4".to_owned() }];
+        let started = Instant::now();
+        let result = as_set(svc.handle_query_candidates(&test_ctx(), 1, &request).await.unwrap());
+        assert!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT);
+        assert_eq!(result.total_matching, (capacity / 2 - 1) as u32);
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].node, format!("did:web:capacity-{:05}.example", capacity - 1));
+        assert_eq!(calls.load(SeqCst), capacity / 2 / 256, "warm selector filtering precedes Policy RPC");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
     async fn valkey_cold_candidate_query_hydrates_concurrently_without_truncation() {
         let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
             return;
@@ -7613,11 +7641,13 @@ mod query_candidates_tests {
             0
         );
         // Expiring the shared record excludes it even from populated indexes.
-        replica_a
-            .state_store
-            .all_liveness(unix_millis_now() + LIVENESS_TTL.as_millis() as i64 + 1)
-            .await
-            .unwrap();
+        let now = unix_millis_now();
+        replica_a.state_store.put_liveness(&Did::new(did.to_owned()), LiveAllocatable {
+            allocatable: vec![], load_fraction: 0.1,
+            last_seen: now, live_until_unix_ms: now + 20,
+        }).await.unwrap();
+        // The shared clock cannot be advanced by passing a replica timestamp.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             as_set(
                 replica_b
