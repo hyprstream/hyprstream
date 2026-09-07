@@ -27,13 +27,19 @@ use crate::generated::discovery_client::{
 };
 use crate::placement_index::PlacementIndex;
 use crate::scheduling;
+use crate::state_store::{
+    unix_millis_now, AnnouncedEndpoint, CachedEntityStatement, CachedEnvelopeKeyset,
+    DiscoveryState, DiscoveryStateStore, LiveAllocatable, MemoryStateStore, PutResult,
+    ANNOUNCED_ENDPOINT_TTL,
+};
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyprstream_rpc::identity::Did;
 use hyprstream_util::ttl_cache::TtlCache;
-use parking_lot::RwLock;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+#[cfg(any(test, feature = "test-fixtures"))]
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -56,32 +62,31 @@ const LIVENESS_CACHE_REAP_BUDGET: usize = 32;
 /// not yet contain a node record. This prevents heartbeat-rate resolver polls
 /// while allowing eventual recovery when a placement record is later published.
 const PLACEMENT_INGEST_RETRY_TTL: Duration = Duration::from_secs(300);
-const ANNOUNCED_ENDPOINT_TTL: Duration = Duration::from_secs(90);
+const CANDIDATE_QUERY_CONCURRENCY: usize = 16;
+const CANDIDATE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlacementIngestStatus {
+    Pending,
+    Complete,
+    Cancelled,
+}
+
+struct PlacementIngestGuard(Arc<parking_lot::Mutex<PlacementIngestStatus>>);
+
+impl Drop for PlacementIngestGuard {
+    fn drop(&mut self) {
+        let mut status = self.0.lock();
+        if *status == PlacementIngestStatus::Pending {
+            *status = PlacementIngestStatus::Cancelled;
+        }
+    }
+}
 
 /// Default bound applied to `queryCandidates` when the caller passes
 /// `maxCandidates == 0` (unspecified) — keeps an unscoped query from returning
 /// the entire fleet in one response.
 const DEFAULT_MAX_CANDIDATES: usize = 100;
-
-/// One node's live allocatable capacity + load, as reported via
-/// `reportNodeLiveness`. Stored in a `TtlCache<Did, _>` — absence (never
-/// reported, or expired) hard-excludes the node from `queryCandidates`.
-#[derive(Clone, Debug)]
-struct LiveAllocatable {
-    /// resource name -> k8s-quantity, free right now.
-    allocatable: Vec<(String, String)>,
-    load_fraction: f32,
-    /// unix millis of this snapshot.
-    last_seen: i64,
-}
-
-fn unix_millis_now() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
 
 /// Private checkpoint-bound projection used only while Discovery validates an
 /// announcement against the daemon-owned accepted-state source.
@@ -493,6 +498,20 @@ fn to_scheduling_op(op: crate::generated::discovery_client::SelectorOp) -> sched
 /// provides a `PolicyAuthProvider` that wraps `PolicyClient`.
 #[async_trait(?Send)]
 pub trait AuthorizationProvider: Send + Sync {
+    /// One bounded authorization vector; implementations may amortize RPC
+    /// overhead but must retain one decision per resource in input order.
+    async fn check_batch(
+        &self, subject: &str, domain: &str, resources: &[String],
+        operation: &str, bearer: Option<&str>,
+    ) -> Result<Vec<bool>> {
+        anyhow::ensure!(resources.len() <= 256, "authorization batch exceeds 256");
+        let mut allowed = Vec::with_capacity(resources.len());
+        for resource in resources {
+            allowed.push(self.check(subject, domain, resource, operation, bearer).await.unwrap_or(false));
+        }
+        Ok(allowed)
+    }
+
     /// Check if a subject is authorized for the given operation on a resource.
     async fn check(
         &self,
@@ -580,28 +599,6 @@ pub trait RecordResolver: Send + Sync {
 // ============================================================================
 // DiscoveryService
 // ============================================================================
-
-/// Endpoint data stored per announced entry.
-#[derive(Clone)]
-struct AnnouncedEndpoint {
-    /// Socket kind (e.g. "quic", "rep")
-    socket_kind: String,
-    /// Endpoint string (e.g. "quic://localhost:0.0.0.0:4433")
-    endpoint: String,
-    /// Service JWT attesting to the service's identity and pubkey
-    service_jwt: String,
-    service_did: Did,
-    capabilities: BTreeSet<String>,
-    accepted_state_digest: Vec<u8>,
-    accepted_state_epoch: u64,
-    response_key_id: String,
-    request_kem_key_id: String,
-    request_kem_recipient: Vec<u8>,
-    expires_at_unix_ms: i64,
-    source_signer: [u8; 32],
-    /// Last heartbeat timestamp (Instant)
-    last_heartbeat: Instant,
-}
 
 /// Checkpoint-verifying accepted-current-state read used by production
 /// resolution. Implemented by the daemon-owned PDS reader from #1004.
@@ -709,25 +706,9 @@ impl StreamHandle for CurrentStreamHandle {
 
 /// Cloneable production resolver installed after Discovery bootstrap.
 struct DiscoveryServiceResolver {
-    announced_endpoints: Arc<RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>>,
+    state_store: Arc<dyn DiscoveryStateStore>,
     accepted_state_source: Arc<dyn AcceptedStateSource>,
     discovery_client: Option<crate::DiscoveryClient>,
-}
-
-/// Phase 0.5 Stage D — cached signed OIDF entity statement.
-struct CachedEntityStatement {
-    /// Signed OpenID Federation 1.0 entity statement (compact JWS).
-    jwt: String,
-    /// Unix seconds when this was registered (set on push from issuer).
-    fetched_at: i64,
-}
-
-/// Phase 0.5 Stage D — cached envelope COSE_KeySet.
-struct CachedEnvelopeKeyset {
-    /// CBOR-encoded COSE_KeySet (RFC 9052 §7).
-    cose_keyset_cbor: Vec<u8>,
-    /// Unix seconds when this was registered.
-    fetched_at: i64,
 }
 
 /// Parse an `at://<did>/<collection>/<rkey>` URI into its three components.
@@ -777,17 +758,9 @@ pub struct DiscoveryService {
     /// so getRecord/getRepo report NOT_FOUND for everything.
     record_resolver: Option<Arc<dyn RecordResolver>>,
     accepted_state_source: Option<Arc<dyn AcceptedStateSource>>,
-    /// Endpoints announced by other services (cross-process).
-    /// Maps service_name → Vec<AnnouncedEndpoint>.
-    announced_endpoints: Arc<RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>>,
-    /// Phase 0.5 Stage D — cached signed OIDF entity statements per issuer URL.
-    /// Pushed by IdPService/OAuth at startup + on every signing-key rotation.
-    /// Consumed by FederationKeyResolver before falling back to HTTPS.
-    entity_statements: RwLock<HashMap<String, CachedEntityStatement>>,
-    /// Phase 0.5 Stage D — cached envelope COSE_KeySets per service did:web.
-    /// Pushed by each service at startup + rotation. Consumed by RequestService
-    /// receivers verifying COSE_Sign1 envelope signatures.
-    envelope_keysets: RwLock<HashMap<String, CachedEnvelopeKeyset>>,
+    /// Backend-neutral volatile state. Memory is the safe single-process/WASM
+    /// default; configured native deployments may install shared/tiered stores.
+    state_store: Arc<dyn DiscoveryStateStore>,
     /// Pre-computed TLS endorsement: Sign(tls_key, ed25519_pubkey || domain).
     /// Empty when TLS endorsement is not available (e.g. self-signed certs).
     tls_endorsement: Vec<u8>,
@@ -800,16 +773,59 @@ pub struct DiscoveryService {
     /// Bounded retry gate for first-seen placement repository polls. A DID is
     /// marked before resolver access, so absent/invalid/non-node repos cannot
     /// turn heartbeat frequency into unbounded work.
-    placement_ingest_attempts: TtlCache<Did, ()>,
-    /// #524 P1 — live allocatable capacity + load per node, TTL'd
-    /// (`LIVENESS_TTL`). Backs the hard-exclusion-on-staleness rule in
-    /// `queryCandidates`.
-    liveness: TtlCache<Did, LiveAllocatable>,
+    placement_ingest_attempts: TtlCache<Did, Arc<parking_lot::Mutex<PlacementIngestStatus>>>,
     // Infrastructure (for Spawnable)
     transport: TransportConfig,
 }
 
 impl DiscoveryService {
+    /// Populate this replica's verified placement projection for an admitted
+    /// shared live node. Failed/absent repos use the existing bounded retry gate.
+    async fn ensure_placement_ingested(&self, node: &Did) -> bool {
+        if self.placement_index.record_uri(node.as_str()).is_some() {
+            return true;
+        }
+        let attempt = Arc::new(parking_lot::Mutex::new(PlacementIngestStatus::Pending));
+        let attempt = if self.placement_ingest_attempts.insert_if_absent(
+            node.clone(),
+            Arc::clone(&attempt),
+            PLACEMENT_INGEST_RETRY_TTL,
+        ) {
+            attempt
+        } else {
+            let Some(existing) = self.placement_ingest_attempts.get(node) else {
+                return false;
+            };
+            {
+                let mut status = existing.lock();
+                match *status {
+                    PlacementIngestStatus::Complete => return true,
+                    PlacementIngestStatus::Pending => return false,
+                    PlacementIngestStatus::Cancelled => *status = PlacementIngestStatus::Pending,
+                }
+            }
+            existing
+        };
+        // A cancelled query must not turn an unfinished ingest into a cached
+        // absence. Its next query can retry; concurrent queries fail closed.
+        let _guard = PlacementIngestGuard(Arc::clone(&attempt));
+        if let Some(resolver) = &self.record_resolver {
+            if let Err(e) = self
+                .placement_index
+                .ingest_did(resolver.as_ref(), node.as_str())
+                .await
+            {
+                tracing::warn!(
+                    node = %node,
+                    error = %e,
+                    "placement directory ingestion failed for live node (liveness still recorded)"
+                );
+            }
+        }
+        *attempt.lock() = PlacementIngestStatus::Complete;
+        true
+    }
+
     /// Create a new discovery service with infrastructure.
     ///
     /// `signing_key` is used for envelope signing (should be the per-service key
@@ -830,9 +846,7 @@ impl DiscoveryService {
             auth_provider: None,
             record_resolver: None,
             accepted_state_source: None,
-            announced_endpoints: Arc::new(RwLock::new(HashMap::new())),
-            entity_statements: RwLock::new(HashMap::new()),
-            envelope_keysets: RwLock::new(HashMap::new()),
+            state_store: MemoryStateStore::production_default(),
             tls_endorsement: Vec::new(),
             tls_domain: String::new(),
             placement_index: PlacementIndex::new(),
@@ -840,9 +854,14 @@ impl DiscoveryService {
                 LIVENESS_CACHE_MAX_ENTRIES,
                 LIVENESS_CACHE_REAP_BUDGET,
             ),
-            liveness: TtlCache::new(LIVENESS_CACHE_MAX_ENTRIES, LIVENESS_CACHE_REAP_BUDGET),
             transport,
         }
+    }
+
+    /// Install the configured volatile-state backend before the service is shared.
+    pub fn with_state(mut self, state: DiscoveryState) -> Self {
+        self.state_store = state.into_inner();
+        self
     }
 
     /// Set the pre-computed TLS endorsement and domain.
@@ -1082,7 +1101,7 @@ impl DiscoveryService {
         }
         PRODUCTION_RESOLVER
             .set(Arc::new(DiscoveryServiceResolver {
-                announced_endpoints: Arc::new(RwLock::new(HashMap::new())),
+                state_store: MemoryStateStore::production_default(),
                 accepted_state_source: source,
                 discovery_client: Some(discovery_client),
             }))
@@ -1104,7 +1123,7 @@ impl DiscoveryService {
     #[cfg(test)]
     fn production_resolver(&self) -> Result<DiscoveryServiceResolver> {
         Ok(DiscoveryServiceResolver {
-            announced_endpoints: Arc::clone(&self.announced_endpoints),
+            state_store: Arc::clone(&self.state_store),
             accepted_state_source: self.accepted_state_source.clone().ok_or_else(|| {
                 anyhow::anyhow!("Discovery accepted-state source is not installed")
             })?,
@@ -1125,7 +1144,7 @@ impl DiscoveryService {
 #[async_trait]
 impl Resolver for DiscoveryService {
     async fn resolve(&self, name: &str, kind: SocketKind) -> anyhow::Result<TransportConfig> {
-        if let Some(transport) = self.resolve_announced_endpoint(name, kind)? {
+        if let Some(transport) = self.resolve_announced_endpoint(name, kind).await? {
             return Ok(transport);
         }
 
@@ -1189,22 +1208,23 @@ impl DiscoveryServiceResolver {
                         request_kem_recipient: endpoint.request_kem_recipient,
                         expires_at_unix_ms: endpoint.expires_at_unix_ms,
                         source_signer,
-                        last_heartbeat: Instant::now(),
+                        live_until_unix_ms: endpoint
+                            .expires_at_unix_ms
+                            .min(unix_millis_now() + ANNOUNCED_ENDPOINT_TTL.as_millis() as i64),
                     })
                 })
                 .collect()
         } else {
-            self.announced_endpoints
-                .read()
-                .get(&query.service_name)
-                .cloned()
-                .unwrap_or_default()
+            self.state_store
+                .announcements_for(&query.service_name, unix_millis_now())
+                .await?
         };
 
         let mut candidates = Vec::new();
         for entry in entries {
-            if entry.last_heartbeat.elapsed() > ANNOUNCED_ENDPOINT_TTL
-                || entry.service_did.as_str().is_empty()
+            // The backend/remote Discovery already checked the volatile lease
+            // on its receipt clock. Signed/current authority is checked below.
+            if entry.service_did.as_str().is_empty()
                 || entry.accepted_state_digest.len() != 64
             {
                 continue;
@@ -3608,6 +3628,132 @@ pub mod test_fixtures {
         request_kem_recipient: hyprstream_rpc::crypto::hybrid_kem::RecipientPublic,
     }
 
+    /// Multi-endpoint announcement backend for the fixture. The production
+    /// [`MemoryStateStore`] deliberately keeps one live announcement per
+    /// (service, socket kind) — the single-replica lease model — while
+    /// production retry sets with several same-authority reaches are served
+    /// from the remote Discovery `get_endpoints` fan-out. A resolver fixture
+    /// runs client-less, so it needs a backend that keeps every announced
+    /// endpoint to express those sets.
+    #[derive(Default)]
+    struct FixtureAnnouncementStore {
+        services: parking_lot::Mutex<HashMap<String, Vec<AnnouncedEndpoint>>>,
+    }
+
+    impl FixtureAnnouncementStore {
+        fn put_announcement_sync(&self, service_name: &str, endpoint: AnnouncedEndpoint) {
+            let mut services = self.services.lock();
+            let endpoints = services.entry(service_name.to_owned()).or_default();
+            endpoints.retain(|existing| existing.endpoint != endpoint.endpoint);
+            endpoints.push(endpoint);
+        }
+
+        fn announcements_for_sync(&self, service_name: &str, now_unix_ms: i64) -> Vec<AnnouncedEndpoint> {
+            self.services
+                .lock()
+                .get(service_name)
+                .into_iter()
+                .flatten()
+                .filter(|entry| entry.is_live_at(now_unix_ms))
+                .cloned()
+                .collect()
+        }
+
+        fn clear_announcements_sync(&self, service_name: &str) {
+            self.services.lock().remove(service_name);
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    impl DiscoveryStateStore for FixtureAnnouncementStore {
+        async fn put_announcement(
+            &self,
+            service_name: &str,
+            endpoint: AnnouncedEndpoint,
+        ) -> Result<PutResult> {
+            self.put_announcement_sync(service_name, endpoint);
+            Ok(PutResult::Stored)
+        }
+
+        async fn announcements_for(
+            &self,
+            service_name: &str,
+            now_unix_ms: i64,
+        ) -> Result<Vec<AnnouncedEndpoint>> {
+            Ok(self.announcements_for_sync(service_name, now_unix_ms))
+        }
+
+        async fn all_announcements(
+            &self,
+            now_unix_ms: i64,
+        ) -> Result<Vec<(String, Vec<AnnouncedEndpoint>)>> {
+            Ok(self
+                .services
+                .lock()
+                .iter()
+                .map(|(service_name, endpoints)| {
+                    (
+                        service_name.clone(),
+                        endpoints
+                            .iter()
+                            .filter(|entry| entry.is_live_at(now_unix_ms))
+                            .cloned()
+                            .collect(),
+                    )
+                })
+                .collect())
+        }
+
+        // The resolver fixture exercises only the announcement plane; the
+        // remaining store surface belongs to the Discovery daemon backends and
+        // fails closed here rather than pretending to track it.
+        async fn put_liveness(&self, _node: &Did, _value: LiveAllocatable) -> Result<PutResult> {
+            anyhow::bail!("fixture announcement store does not track liveness")
+        }
+
+        #[cfg(test)]
+        async fn liveness(&self, _node: &Did, _now_unix_ms: i64) -> Result<Option<LiveAllocatable>> {
+            anyhow::bail!("fixture announcement store does not track liveness")
+        }
+
+        async fn all_liveness(&self, _now_unix_ms: i64) -> Result<Vec<(Did, LiveAllocatable)>> {
+            anyhow::bail!("fixture announcement store does not track liveness")
+        }
+
+        async fn put_entity_statement(
+            &self,
+            _issuer: &str,
+            _value: CachedEntityStatement,
+        ) -> Result<()> {
+            anyhow::bail!("fixture announcement store does not track entity statements")
+        }
+
+        async fn entity_statement(&self, _issuer: &str) -> Result<Option<CachedEntityStatement>> {
+            anyhow::bail!("fixture announcement store does not track entity statements")
+        }
+
+        async fn known_issuers(&self) -> Result<Vec<String>> {
+            anyhow::bail!("fixture announcement store does not track entity statements")
+        }
+
+        async fn known_issuer_count(&self) -> Result<usize> {
+            anyhow::bail!("fixture announcement store does not track entity statements")
+        }
+
+        async fn put_envelope_keyset(
+            &self,
+            _service_did: &str,
+            _value: CachedEnvelopeKeyset,
+        ) -> Result<()> {
+            anyhow::bail!("fixture announcement store does not track envelope keysets")
+        }
+
+        async fn envelope_keyset(&self, _service_did: &str) -> Result<Option<CachedEnvelopeKeyset>> {
+            anyhow::bail!("fixture announcement store does not track envelope keysets")
+        }
+    }
+
     /// Mutable handle for one process-global, model-free production resolver
     /// fixture. The resolver and dial hook are installed once; individual tests
     /// reset only the accepted-state and announcement data behind that fixed
@@ -3615,7 +3761,7 @@ pub mod test_fixtures {
     #[derive(Clone)]
     pub struct ProductionInferenceFixture {
         service_name: String,
-        announced: Arc<RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>>,
+        announced: Arc<FixtureAnnouncementStore>,
         states: Arc<FixtureAcceptedStates>,
         primary: FixtureAuthority,
         foreign: FixtureAuthority,
@@ -3683,7 +3829,13 @@ pub mod test_fixtures {
             request_kem_recipient: authority.request_kem_recipient.encode(),
             expires_at_unix_ms: 4_070_908_800_000,
             source_signer: authority.signing.verifying_key().to_bytes(),
-            last_heartbeat,
+            live_until_unix_ms: unix_millis_now()
+                .saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64)
+                .saturating_sub(
+                    Instant::now()
+                        .saturating_duration_since(last_heartbeat)
+                        .as_millis() as i64,
+                ),
         })
     }
 
@@ -3695,23 +3847,25 @@ pub mod test_fixtures {
                 states.clear();
                 states.insert(self.primary.state.did.clone(), self.primary.state.clone());
             }
-            let endpoints = transports
-                .iter()
-                .map(|transport| announcement(&self.primary, transport, Instant::now()))
-                .collect::<Result<Vec<_>>>()?;
-            self.announced
-                .write()
-                .insert(self.service_name.clone(), endpoints);
+            self.announced.clear_announcements_sync(&self.service_name);
+            for transport in transports {
+                self.announced.put_announcement_sync(
+                    &self.service_name,
+                    announcement(&self.primary, transport, Instant::now())?,
+                );
+            }
             Ok(())
         }
 
         /// Age every announcement beyond the production freshness bound.
         pub fn mark_stale(&self) {
-            if let Some(endpoints) = self.announced.write().get_mut(&self.service_name) {
-                for endpoint in endpoints {
-                    endpoint.last_heartbeat =
-                        Instant::now() - ANNOUNCED_ENDPOINT_TTL - Duration::from_secs(1);
-                }
+            for mut endpoint in self
+                .announced
+                .announcements_for_sync(&self.service_name, unix_millis_now())
+            {
+                endpoint.live_until_unix_ms = unix_millis_now() - 1;
+                self.announced
+                    .put_announcement_sync(&self.service_name, endpoint);
             }
         }
 
@@ -3721,11 +3875,10 @@ pub mod test_fixtures {
                 .0
                 .lock()
                 .insert(self.foreign.state.did.clone(), self.foreign.state.clone());
-            self.announced
-                .write()
-                .entry(self.service_name.clone())
-                .or_default()
-                .push(announcement(&self.foreign, transport, Instant::now())?);
+            self.announced.put_announcement_sync(
+                &self.service_name,
+                announcement(&self.foreign, transport, Instant::now())?,
+            );
             Ok(())
         }
     }
@@ -3746,7 +3899,7 @@ pub mod test_fixtures {
         let states = Arc::new(FixtureAcceptedStates(parking_lot::Mutex::new(
             HashMap::new(),
         )));
-        let announced = Arc::new(RwLock::new(HashMap::new()));
+        let announced = Arc::new(FixtureAnnouncementStore::default());
         let fixture = ProductionInferenceFixture {
             service_name: service_name.to_owned(),
             announced: Arc::clone(&announced),
@@ -3760,7 +3913,7 @@ pub mod test_fixtures {
         })?;
         PRODUCTION_RESOLVER
             .set(Arc::new(DiscoveryServiceResolver {
-                announced_endpoints: announced,
+                state_store: announced,
                 accepted_state_source: states,
                 discovery_client: None,
             }))
@@ -4021,21 +4174,19 @@ impl RpcClient for ProductionRpcClient {
 }
 
 impl DiscoveryService {
-    fn resolve_announced_endpoint(
+    async fn resolve_announced_endpoint(
         &self,
         name: &str,
         kind: SocketKind,
     ) -> anyhow::Result<Option<TransportConfig>> {
         let wanted = socket_kind_to_string(kind);
-        let announced = self.announced_endpoints.read();
-        let Some(endpoints) = announced.get(name) else {
-            return Ok(None);
-        };
-
+        let endpoints = self
+            .state_store
+            .announcements_for(name, unix_millis_now())
+            .await?;
         let Some(endpoint) = endpoints
             .iter()
-            .filter(|ep| ep.socket_kind == wanted)
-            .find(|ep| ep.last_heartbeat.elapsed() <= ANNOUNCED_ENDPOINT_TTL)
+            .find(|ep| ep.socket_kind == wanted)
         else {
             return Ok(None);
         };
@@ -4749,6 +4900,12 @@ mod resolver_tests {
         endpoint: &str,
         last_heartbeat: Instant,
     ) -> AnnouncedEndpoint {
+        let age_ms = Instant::now()
+            .saturating_duration_since(last_heartbeat)
+            .as_millis() as i64;
+        let live_until_unix_ms = unix_millis_now()
+            .saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64)
+            .saturating_sub(age_ms);
         AnnouncedEndpoint {
             socket_kind: socket_kind.to_owned(),
             endpoint: endpoint.to_owned(),
@@ -4760,13 +4917,17 @@ mod resolver_tests {
             response_key_id: String::new(),
             request_kem_key_id: String::new(),
             request_kem_recipient: Vec::new(),
-            expires_at_unix_ms: 0,
+            expires_at_unix_ms: i64::MAX,
             source_signer: [0; 32],
-            last_heartbeat,
+            live_until_unix_ms,
         }
     }
 
     fn accepted_state(tag: u8) -> (AcceptedAt9pState, SigningKey) {
+        accepted_state_with_expiry(tag, "2099-01-01T00:00:00Z")
+    }
+
+    fn accepted_state_with_expiry(tag: u8, expiry: &str) -> (AcceptedAt9pState, SigningKey) {
         let signing = SigningKey::from_bytes(&[tag; 32]);
         let pq_signing = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signing);
         let keys = HybridKeyPair::new(
@@ -4790,7 +4951,7 @@ mod resolver_tests {
             1,
             [1; 64],
             body,
-            "2099-01-01T00:00:00Z".to_owned(),
+            expiry.to_owned(),
             &signing,
             &pq_signing,
         )
@@ -4824,9 +4985,11 @@ mod resolver_tests {
         } else {
             "quic://localhost:127.0.0.1:9".to_owned()
         };
-        let announced = Arc::new(RwLock::new(HashMap::from([(
-            "model".to_owned(),
-            vec![AnnouncedEndpoint {
+        let state_store = Arc::new(MemoryStateStore::default());
+        state_store
+            .put_announcement_sync(
+                "model",
+                AnnouncedEndpoint {
                 socket_kind: if local_reach { "rep" } else { "quic" }.to_owned(),
                 endpoint,
                 service_jwt: "verified-by-handler".to_owned(),
@@ -4841,18 +5004,42 @@ mod resolver_tests {
                 request_kem_recipient: kem.public().encode(),
                 expires_at_unix_ms: 4_070_908_800_000,
                 source_signer: signing.verifying_key().to_bytes(),
-                last_heartbeat: Instant::now(),
-            }],
-        )])));
+                live_until_unix_ms: unix_millis_now()
+                    + ANNOUNCED_ENDPOINT_TTL.as_millis() as i64,
+            },
+            )
+            .expect("seed announcement");
         let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(state))));
         (
             DiscoveryServiceResolver {
-                announced_endpoints: announced,
+                state_store,
                 accepted_state_source: Arc::clone(&source) as Arc<dyn AcceptedStateSource>,
                 discovery_client: None,
             },
             source,
         )
+    }
+
+    async fn mutate_endpoint(
+        resolver: &DiscoveryServiceResolver,
+        service_name: &str,
+        socket_kind: &str,
+        mutate: impl FnOnce(&mut AnnouncedEndpoint),
+    ) {
+        let mut endpoint = resolver
+            .state_store
+            .announcements_for(service_name, unix_millis_now())
+            .await
+            .expect("read fixture announcement")
+            .into_iter()
+            .find(|entry| entry.socket_kind == socket_kind)
+            .expect("fixture announcement");
+        mutate(&mut endpoint);
+        resolver
+            .state_store
+            .put_announcement(service_name, endpoint)
+            .await
+            .expect("replace fixture announcement");
     }
 
     #[tokio::test]
@@ -4913,13 +5100,10 @@ mod resolver_tests {
             .is_err());
 
         let (resolver, _) = production_fixture(false);
-        resolver
-            .announced_endpoints
-            .write()
-            .get_mut("model")
-            .and_then(|entries| entries.first_mut())
-            .expect("fixture announcement")
-            .request_kem_recipient = vec![0x01];
+        mutate_endpoint(&resolver, "model", "quic", |endpoint| {
+            endpoint.request_kem_recipient = vec![0x01];
+        })
+        .await;
         assert!(resolver
             .browser_provisioning(owned_browser_request())
             .await
@@ -5030,40 +5214,31 @@ mod resolver_tests {
 
         let (resolver, _) = production_fixture(false);
         let route_binding = binding_for(&resolver).await;
-        resolver
-            .announced_endpoints
-            .write()
-            .get_mut("model")
-            .and_then(|entries| entries.first_mut())
-            .expect("fixture route")
-            .endpoint = "quic://localhost:127.0.0.1:10".to_owned();
+        mutate_endpoint(&resolver, "model", "quic", |endpoint| {
+            endpoint.endpoint = "quic://localhost:127.0.0.1:10".to_owned();
+        })
+        .await;
         assert!(resolver
             .verify_browser_binding(&route_binding)
             .await
             .is_err());
 
         let (resolver, _) = production_fixture(false);
-        resolver
-            .announced_endpoints
-            .write()
-            .get_mut("model")
-            .and_then(|entries| entries.first_mut())
-            .expect("fixture pin")
-            .endpoint = format!(
-            "quic://localhost:127.0.0.1:9#{}",
-            URL_SAFE_NO_PAD.encode([0x51; 32])
-        );
+        mutate_endpoint(&resolver, "model", "quic", |endpoint| {
+            endpoint.endpoint = format!(
+                "quic://localhost:127.0.0.1:9#{}",
+                URL_SAFE_NO_PAD.encode([0x51; 32])
+            );
+        })
+        .await;
         let pin_binding = binding_for(&resolver).await;
-        resolver
-            .announced_endpoints
-            .write()
-            .get_mut("model")
-            .and_then(|entries| entries.first_mut())
-            .expect("fixture pin rotation")
-            .endpoint = format!(
-            "quic://localhost:127.0.0.1:9#{}",
-            URL_SAFE_NO_PAD.encode([0x52; 32])
-        );
+        mutate_endpoint(&resolver, "model", "quic", |endpoint| {
+            endpoint.endpoint = format!(
+                "quic://localhost:127.0.0.1:9#{}",
+                URL_SAFE_NO_PAD.encode([0x52; 32])
+            );
+        })
+        .await;
         assert!(resolver.verify_browser_binding(&pin_binding).await.is_err());
     }
 
@@ -5127,6 +5302,116 @@ mod resolver_tests {
             .await
             .expect("ordinary announcement must resolve");
         assert_eq!(resolved.evidence().accepted_state_digest, state.head_digest);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_announcement_handler_lease_and_result_follow_shared_time() {
+        use crate::state_store::tests::ReplicaClock;
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else { return; };
+        for backend in [crate::DiscoveryStateBackend::Valkey, crate::DiscoveryStateBackend::Tiered] {
+            let config = crate::DiscoveryStateConfig {
+                backend, active_active: true,
+                valkey: crate::ValkeyStateConfig {
+                    url: url.clone(),
+                    key_prefix: format!("hs-handler-lease-{}-{}-{backend:?}", std::process::id(), unix_millis_now()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (state, signing) = accepted_state(12);
+            let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(state.clone()))));
+            let root = SigningKey::from_bytes(&[0x61; 32]);
+            let service = DiscoveryService::new(Arc::new(root.clone()), root.verifying_key(), TransportConfig::inproc("lease-handler-test"))
+                .with_accepted_state_source(source.clone())
+                .with_state(DiscoveryState::connect(&config).await.unwrap());
+            let claims = hyprstream_rpc::auth::Claims::new("service:model".to_owned(),
+                chrono::Utc::now().timestamp(), chrono::Utc::now().timestamp() + 7_200)
+                .with_cnf_jwk(signing.verifying_key().as_bytes());
+            let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signing);
+            let envelope = hyprstream_rpc::SignedEnvelope::new_signed_hybrid(
+                hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()), &signing, &pq);
+            let ctx = EnvelopeContext::from_verified_as_system(&envelope);
+            let kem = hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&signing).unwrap();
+            let now = unix_millis_now();
+            let mut request = ServiceAnnouncement {
+                service_name: "model".to_owned(), socket_kind: "quic".to_owned(),
+                endpoint: "quic://localhost:127.0.0.1:9".to_owned(),
+                service_jwt: Some(hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &root)),
+                service_did: Did::from(state.did.clone()), capabilities: vec!["hyprstream-rpc/1".to_owned()],
+                accepted_state_digest: state.head_digest.to_vec(), accepted_state_epoch: state.epoch,
+                response_key_id: format!("{}#response-current", state.did),
+                request_kem_key_id: format!("{}#kem-current", state.did),
+                request_kem_recipient: kem.public().encode(), expires_at_unix_ms: now + 7_200_000,
+            };
+            for skew in [3_600_000, -3_600_000] {
+                let _clock = ReplicaClock::at(now + skew);
+                assert!(matches!(service.handle_announce(&ctx, 1, &request).await.unwrap(), DiscoveryResponseVariant::AnnounceResult));
+                let rows = service.state_store.announcements_for("model", now + skew).await.unwrap();
+                assert_eq!(rows.len(), 1, "successful response requires a stored publication");
+                assert!((now + 89_000..=now + 91_000).contains(&rows[0].live_until_unix_ms));
+                assert_eq!(rows[0].expires_at_unix_ms, request.expires_at_unix_ms);
+                assert_eq!(rows[0].request_kem_recipient, request.request_kem_recipient);
+                assert_eq!(rows[0].service_jwt, request.service_jwt.clone().unwrap());
+                // Repeated reads exercise populated L1, not only its first fill.
+                assert!(service.resolve_announced_endpoint("model", SocketKind::Quic).await.unwrap().is_some());
+                assert_eq!(service.state_store.all_announcements(now + skew).await.unwrap().len(), 1);
+                service.production_resolver().unwrap().resolve_service(ServiceQuery::network("model").unwrap()).await.unwrap();
+            }
+            // Legacy publication has no signed expiry, but receives the same
+            // bounded backend lease on both initial publication and refresh.
+            let mut legacy = request.clone();
+            legacy.service_name = "legacy".to_owned();
+            legacy.service_jwt = None;
+            legacy.service_did = Did::default();
+            legacy.capabilities.clear();
+            legacy.accepted_state_digest.clear();
+            legacy.accepted_state_epoch = 0;
+            legacy.response_key_id.clear();
+            legacy.request_kem_key_id.clear();
+            legacy.request_kem_recipient.clear();
+            legacy.expires_at_unix_ms = 0;
+            for skew in [3_600_000, -3_600_000] {
+                let _clock = ReplicaClock::at(now + skew);
+                assert!(matches!(service.handle_announce(&ctx, 1, &legacy).await.unwrap(), DiscoveryResponseVariant::AnnounceResult));
+                let rows = service.state_store.announcements_for("legacy", now + skew).await.unwrap();
+                assert_eq!(rows.len(), 1);
+                assert!((now + 89_000..=now + 91_000).contains(&rows[0].live_until_unix_ms));
+                assert_eq!(rows[0].expires_at_unix_ms, rows[0].live_until_unix_ms);
+            }
+
+            // Signed expiry is still an independent ceiling. A shorter valid
+            // signed deadline with the same epoch is an ignored older write;
+            // the handler must not claim it was published.
+            request.expires_at_unix_ms = now + 20_000;
+            assert!(service.handle_announce(&ctx, 2, &request).await.unwrap_err().to_string().contains("not stored"));
+
+            // Updated signed accepted-state evidence supplies a shorter current-state
+            // ceiling; the backend must not extend it to the receipt TTL.
+            let accepted_limit = (now / 1_000) * 1_000 + 20_000;
+            let accepted_expiry = chrono::DateTime::from_timestamp_millis(accepted_limit).unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let (bounded, _) = accepted_state_with_expiry(12, &accepted_expiry);
+            *source.0.lock() = Some(bounded.clone());
+            request.expires_at_unix_ms = now + 7_200_000;
+            request.accepted_state_digest = bounded.head_digest.to_vec();
+            assert!(matches!(service.handle_announce(&ctx, 3, &request).await.unwrap(), DiscoveryResponseVariant::AnnounceResult));
+            let values = service.state_store.announcements_for("model", now).await.unwrap();
+            assert_eq!(values[0].live_until_unix_ms, accepted_limit);
+
+            // Both signed and accepted expiry reject under a behind clock, and
+            // neither rejection is reported as AnnounceResult.
+            let _clock = ReplicaClock::at(now - 3_600_000);
+            request.expires_at_unix_ms = now - 1;
+            assert!(service.handle_announce(&ctx, 4, &request).await.unwrap_err().to_string().contains("not stored"));
+            let expired_text = chrono::DateTime::from_timestamp_millis(now - 1).unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let (expired, _) = accepted_state_with_expiry(12, &expired_text);
+            *source.0.lock() = Some(expired.clone());
+            request.expires_at_unix_ms = now + 7_200_000;
+            request.accepted_state_digest = expired.head_digest.to_vec();
+            assert!(service.handle_announce(&ctx, 5, &request).await.unwrap_err().to_string().contains("not stored"));
+        }
     }
 
     #[tokio::test]
@@ -5261,14 +5546,17 @@ mod resolver_tests {
     async fn generated_client_uses_ordinary_identity_bound_resolver_path() {
         let (resolver, _) = production_fixture(false);
         let entries = resolver
-            .announced_endpoints
-            .write()
-            .remove("model")
+            .state_store
+            .announcements_for("model", unix_millis_now())
+            .await
             .expect("fixture announcement");
-        resolver
-            .announced_endpoints
-            .write()
-            .insert("discovery".to_owned(), entries);
+        for endpoint in entries {
+            resolver
+                .state_store
+                .put_announcement("discovery", endpoint)
+                .await
+                .expect("seed discovery announcement");
+        }
         let resolver = Arc::new(resolver);
         let _ = PRODUCTION_RESOLVER.set(resolver);
         let client_signing = SigningKey::from_bytes(&[0x44; 32]);
@@ -5918,17 +6206,18 @@ mod resolver_tests {
     #[tokio::test]
     async fn stale_or_expired_production_evidence_is_rejected() {
         let (resolver, _) = production_fixture(false);
-        resolver
-            .announced_endpoints
-            .write()
-            .get_mut("model")
-            .and_then(|entries| entries.first_mut())
-            .expect("fixture service")
-            .last_heartbeat = Instant::now() - ANNOUNCED_ENDPOINT_TTL - Duration::from_secs(1);
-        assert!(resolver
-            .resolve_service(ServiceQuery::network("model").expect("query"))
-            .await
-            .is_err());
+        let expiry = resolver.state_store.announcements_for("model", unix_millis_now())
+            .await.unwrap()[0].live_until_unix_ms;
+        {
+            // Expired writes now correctly leave a prior valid value intact.
+            // Advance this memory backend's clock to expire the real lease
+            // instead of attempting to overwrite it with a rejected write.
+            let _clock = crate::state_store::tests::ReplicaClock::at(expiry);
+            assert!(resolver
+                .resolve_service(ServiceQuery::network("model").expect("query"))
+                .await
+                .is_err());
+        }
 
         let (resolver, source) = production_fixture(false);
         source.0.lock().as_mut().expect("fixture state").expires_at =
@@ -5942,15 +6231,22 @@ mod resolver_tests {
     #[tokio::test]
     async fn malformed_candidate_does_not_poison_valid_alternative() {
         let (resolver, _) = production_fixture(false);
-        {
-            let mut endpoints = resolver.announced_endpoints.write();
-            let entries = endpoints.get_mut("model").expect("fixture service");
-            let mut malformed = entries.first().expect("fixture endpoint").clone();
-            malformed.request_kem_recipient = vec![0xff];
-            malformed.socket_kind = "quic".to_owned();
-            malformed.endpoint = "quic://missing-port".to_owned();
-            entries.insert(0, malformed);
-        }
+        let mut malformed = resolver
+            .state_store
+            .announcements_for("model", unix_millis_now())
+            .await
+            .expect("fixture service")
+            .into_iter()
+            .next()
+            .expect("fixture endpoint");
+        malformed.request_kem_recipient = vec![0xff];
+        malformed.socket_kind = "iroh".to_owned();
+        malformed.endpoint = "iroh://invalid".to_owned();
+        resolver
+            .state_store
+            .put_announcement("model", malformed)
+            .await
+            .expect("seed malformed alternative");
 
         let resolved = resolver
             .resolve_service(ServiceQuery::network("model").expect("query"))
@@ -5969,13 +6265,10 @@ mod resolver_tests {
             .is_err());
 
         let (resolver, _) = production_fixture(false);
-        resolver
-            .announced_endpoints
-            .write()
-            .get_mut("model")
-            .and_then(|entries| entries.first_mut())
-            .expect("fixture service")
-            .accepted_state_digest = vec![0x77; 64];
+        mutate_endpoint(&resolver, "model", "quic", |endpoint| {
+            endpoint.accepted_state_digest = vec![0x77; 64];
+        })
+        .await;
         assert!(resolver
             .resolve_service(ServiceQuery::network("model").expect("query"))
             .await
@@ -5985,14 +6278,17 @@ mod resolver_tests {
     #[tokio::test]
     async fn resolver_uses_fresh_announced_quic_endpoint() {
         let svc = service();
-        svc.announced_endpoints.write().insert(
-            "model".to_owned(),
-            vec![legacy_endpoint(
+        svc.state_store
+            .put_announcement(
+                "model",
+                legacy_endpoint(
                 "quic",
                 "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433",
                 Instant::now(),
-            )],
-        );
+                ),
+            )
+            .await
+            .expect("seed announcement");
 
         let transport = match svc.resolve("model", SocketKind::Quic).await {
             Ok(transport) => transport,
@@ -6025,14 +6321,17 @@ mod resolver_tests {
     #[tokio::test]
     async fn resolver_rejects_stale_announced_quic_endpoint() {
         let svc = service();
-        svc.announced_endpoints.write().insert(
-            "model".to_owned(),
-            vec![legacy_endpoint(
+        svc.state_store
+            .put_announcement(
+                "model",
+                legacy_endpoint(
                 "quic",
                 "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433",
                 Instant::now() - (ANNOUNCED_ENDPOINT_TTL + Duration::from_secs(1)),
-            )],
-        );
+                ),
+            )
+            .await
+            .expect("seed stale announcement");
 
         let err = match svc.resolve("model", SocketKind::Quic).await {
             Ok(transport) => panic!("stale announced QUIC endpoint resolved to {transport:?}"),
@@ -6144,10 +6443,10 @@ impl DiscoveryHandler for DiscoveryService {
             .collect();
         drop(reg);
 
-        // Merge announced endpoints from other processes
-        let announced = self.announced_endpoints.read();
+        // Merge live announcements from the configured state backend.
+        let announced = self.state_store.all_announcements(unix_millis_now()).await?;
         let local_names: Vec<String> = summaries.iter().map(|s| s.name.clone()).collect();
-        for (name, endpoints) in announced.iter() {
+        for (name, endpoints) in &announced {
             if local_names.iter().any(|n| n == name) {
                 // Service exists locally — add announced socket kinds
                 if let Some(summary) = summaries.iter_mut().find(|s| s.name == *name) {
@@ -6211,29 +6510,29 @@ impl DiscoveryHandler for DiscoveryService {
             None => Vec::new(),
         };
 
-        // Merge announced endpoints from other processes (carry service JWT)
-        let announced = self.announced_endpoints.read();
-        if let Some(announced_eps) = announced.get(service_name) {
-            for ep in announced_eps {
-                // Don't duplicate if already present from local registry
-                if !endpoints.iter().any(|e| e.socket_kind == ep.socket_kind) {
-                    endpoints.push(EndpointInfo {
-                        socket_kind: ep.socket_kind.clone(),
-                        endpoint: ep.endpoint.clone(),
-                        service_jwt: ep.service_jwt.clone(),
-                        tls_endorsement: self.tls_endorsement.clone(),
-                        tls_domain: self.tls_domain.clone(),
-                        service_did: ep.service_did.clone(),
-                        capabilities: ep.capabilities.iter().cloned().collect(),
-                        accepted_state_digest: ep.accepted_state_digest.clone(),
-                        accepted_state_epoch: ep.accepted_state_epoch,
-                        response_key_id: ep.response_key_id.clone(),
-                        request_kem_key_id: ep.request_kem_key_id.clone(),
-                        request_kem_recipient: ep.request_kem_recipient.clone(),
-                        expires_at_unix_ms: ep.expires_at_unix_ms,
-                        source_signer: ep.source_signer.to_vec(),
-                    });
-                }
+        // Merge announced endpoints from other processes (carry service JWT).
+        for ep in self
+            .state_store
+            .announcements_for(service_name, unix_millis_now())
+            .await?
+        {
+            if !endpoints.iter().any(|e| e.socket_kind == ep.socket_kind) {
+                endpoints.push(EndpointInfo {
+                    socket_kind: ep.socket_kind,
+                    endpoint: ep.endpoint,
+                    service_jwt: ep.service_jwt,
+                    tls_endorsement: self.tls_endorsement.clone(),
+                    tls_domain: self.tls_domain.clone(),
+                    service_did: ep.service_did,
+                    capabilities: ep.capabilities.into_iter().collect(),
+                    accepted_state_digest: ep.accepted_state_digest,
+                    accepted_state_epoch: ep.accepted_state_epoch,
+                    response_key_id: ep.response_key_id,
+                    request_kem_key_id: ep.request_kem_key_id,
+                    request_kem_recipient: ep.request_kem_recipient,
+                    expires_at_unix_ms: ep.expires_at_unix_ms,
+                    source_signer: ep.source_signer.to_vec(),
+                });
             }
         }
 
@@ -6422,15 +6721,14 @@ impl DiscoveryHandler for DiscoveryService {
                     && data
                         .request_kem_key_id
                         .starts_with(&format!("{}#", data.service_did))
-                    && data.expires_at_unix_ms > unix_millis_now(),
+                    && data.expires_at_unix_ms > 0,
                 "identity-bound announcement metadata is incomplete or expired"
             );
             let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(
                 &data.request_kem_recipient,
             )?;
             anyhow::ensure!(
-                recipient.suite_id
-                    == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
+                recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
                     && recipient.eks.len() == recipient.suite_id.components().len(),
                 "identity-bound announcement requires suite-complete hybrid KEM material"
             );
@@ -6520,6 +6818,29 @@ impl DiscoveryHandler for DiscoveryService {
             );
         }
 
+        // Legacy clients omit identity expiry (Cap'n Proto defaults it to 0).
+        // Only identity-bound announcements carry a signed expiry constraint;
+        // backend receipt time sets the legacy application expiry and lease.
+        let expires_at_unix_ms = if identity_bound {
+            data.expires_at_unix_ms
+        } else {
+            0
+        };
+        let mut live_until_unix_ms = if identity_bound { expires_at_unix_ms } else { i64::MAX };
+        if identity_bound {
+            if let Some(source) = &self.accepted_state_source {
+                let state = source
+                    .accepted_state(data.service_did.as_str())?
+                    .ok_or_else(|| anyhow::anyhow!("announcement DID has no accepted-current state"))?;
+                anyhow::ensure!(
+                    state.epoch == data.accepted_state_epoch
+                        && state.head_digest.as_slice() == data.accepted_state_digest.as_slice(),
+                    "announcement does not match accepted-current state"
+                );
+                live_until_unix_ms = live_until_unix_ms.min(accepted_expiry_unix_ms(&state)?);
+            }
+        }
+
         let replacement = AnnouncedEndpoint {
             socket_kind: sock_kind.clone(),
             endpoint: endpoint.clone(),
@@ -6531,19 +6852,15 @@ impl DiscoveryHandler for DiscoveryService {
             response_key_id: data.response_key_id.clone(),
             request_kem_key_id: data.request_kem_key_id.clone(),
             request_kem_recipient: data.request_kem_recipient.clone(),
-            expires_at_unix_ms: data.expires_at_unix_ms,
+            expires_at_unix_ms,
             source_signer: ctx.cnf,
-            last_heartbeat: Instant::now(),
+            live_until_unix_ms,
         };
-
-        let mut endpoints = self.announced_endpoints.write();
-        let entry = endpoints.entry(svc_name).or_default();
-        // Replace existing endpoint for the same socket kind, or add new
-        if let Some(existing) = entry.iter_mut().find(|e| e.socket_kind == sock_kind) {
-            *existing = replacement;
-        } else {
-            entry.push(replacement);
-        }
+        let stored = self.state_store
+            .put_announcement(&svc_name, replacement)
+            .await?;
+        anyhow::ensure!(stored == PutResult::Stored,
+            "announcement was not stored: authority expired or publication superseded");
 
         Ok(DiscoveryResponseVariant::AnnounceResult)
     }
@@ -6587,10 +6904,10 @@ impl DiscoveryHandler for DiscoveryService {
             jwt: data.jwt.clone(),
             fetched_at: unix_seconds_now(),
         };
-        let mut map = self.entity_statements.write();
-        map.insert(data.issuer.clone(), cached);
-        let total = map.len();
-        drop(map);
+        self.state_store
+            .put_entity_statement(&data.issuer, cached)
+            .await?;
+        let total = self.state_store.known_issuer_count().await?;
 
         info!(
             issuer = %data.issuer,
@@ -6608,14 +6925,13 @@ impl DiscoveryHandler for DiscoveryService {
         data: &str,
     ) -> Result<DiscoveryResponseVariant> {
         let issuer = data;
-        let map = self.entity_statements.read();
-        match map.get(issuer) {
+        match self.state_store.entity_statement(issuer).await? {
             Some(cached) => {
                 trace!(issuer = %issuer, "Discovery: entity statement cache hit");
                 Ok(DiscoveryResponseVariant::GetEntityStatementResult(
                     EntityStatement {
                         issuer: issuer.to_owned(),
-                        jwt: cached.jwt.clone(),
+                        jwt: cached.jwt,
                         fetched_at: cached.fetched_at,
                     },
                 ))
@@ -6653,15 +6969,13 @@ impl DiscoveryHandler for DiscoveryService {
             cose_keyset_cbor: data.cose_keyset_cbor.clone(),
             fetched_at: unix_seconds_now(),
         };
-        let mut map = self.envelope_keysets.write();
-        map.insert(data.service_did.as_str().to_owned(), cached);
-        let total = map.len();
-        drop(map);
+        self.state_store
+            .put_envelope_keyset(data.service_did.as_str(), cached)
+            .await?;
 
         info!(
             service_did = %data.service_did,
             caller = %ctx.subject(),
-            total_cached = total,
             "Discovery: envelope keyset registered"
         );
         Ok(DiscoveryResponseVariant::RegisterEnvelopeKeysetResult)
@@ -6674,14 +6988,13 @@ impl DiscoveryHandler for DiscoveryService {
         data: &str,
     ) -> Result<DiscoveryResponseVariant> {
         let service_did = data;
-        let map = self.envelope_keysets.read();
-        match map.get(service_did) {
+        match self.state_store.envelope_keyset(service_did).await? {
             Some(cached) => {
                 trace!(service_did = %service_did, "Discovery: envelope keyset cache hit");
                 Ok(DiscoveryResponseVariant::GetEnvelopeKeysetResult(
                     EnvelopeKeyset {
                         service_did: hyprstream_rpc::identity::Did::new(service_did.to_owned()),
-                        cose_keyset_cbor: cached.cose_keyset_cbor.clone(),
+                        cose_keyset_cbor: cached.cose_keyset_cbor,
                         fetched_at: cached.fetched_at,
                     },
                 ))
@@ -6713,8 +7026,7 @@ impl DiscoveryHandler for DiscoveryService {
                 details: String::new(),
             }));
         }
-        let map = self.entity_statements.read();
-        let issuers: Vec<String> = map.keys().cloned().collect();
+        let issuers = self.state_store.known_issuers().await?;
         Ok(DiscoveryResponseVariant::ListKnownIssuersResult(
             IssuerList { issuers },
         ))
@@ -6875,148 +7187,151 @@ impl DiscoveryHandler for DiscoveryService {
         _request_id: u64,
         data: &QueryCandidatesRequest,
     ) -> Result<DiscoveryResponseVariant> {
-        struct Candidate {
-            did: String,
-            record_uri: String,
-            load_fraction: f32,
-            allocatable: Vec<(String, String)>,
-            last_seen: i64,
-            labels: Vec<(String, String)>,
-        }
-
-        let selectors: Vec<scheduling::LabelSelector> = data
-            .selectors
-            .iter()
-            .map(|s| {
-                scheduling::LabelSelector::new(
-                    s.key.clone(),
-                    to_scheduling_op(s.op),
-                    s.values.clone(),
-                )
-            })
-            .collect();
-        let resources: Vec<scheduling::ResourceRequest> = data
-            .resources
-            .iter()
-            .map(|r| scheduling::ResourceRequest::new(r.name.clone(), r.min_quantity.clone()))
-            .collect();
-
-        // Hard liveness exclusion (decision #1): only nodes with a live,
-        // unexpired `reportNodeLiveness` entry become candidates at all.
-        let candidates: Vec<Candidate> = self
-            .placement_index
-            .known_node_dids()
-            .into_iter()
-            .filter_map(|did| {
-                let live = self.liveness.get(&Did::new(did.clone()))?;
-                let labels = self.placement_index.effective_labels(&did);
-                let record_uri = self.placement_index.record_uri(&did).unwrap_or_default();
-                Some(Candidate {
-                    did,
-                    record_uri,
-                    load_fraction: live.load_fraction,
-                    allocatable: live.allocatable,
-                    last_seen: live.last_seen,
-                    labels,
-                })
-            })
-            .collect();
-
-        let predicates: Vec<scheduling::Predicate<Candidate>> = vec![
-            Box::new({
-                let selectors = selectors.clone();
-                move |c: &Candidate| {
-                    for sel in &selectors {
-                        if !sel.matches(&c.labels) {
-                            return Some(scheduling::RejectionReason(format!(
-                                "label selector on {:?} did not match",
-                                sel.key
-                            )));
-                        }
-                    }
-                    None
-                }
-            }),
-            Box::new({
-                let resources = resources.clone();
-                move |c: &Candidate| {
-                    for req in &resources {
-                        let satisfied = c
-                            .allocatable
-                            .iter()
-                            .find(|(name, _)| name == &req.name)
-                            .is_some_and(|(_, quantity)| req.satisfied_by(quantity));
-                        if !satisfied {
-                            return Some(scheduling::RejectionReason(format!(
-                                "resource {:?} not satisfied",
-                                req.name
-                            )));
-                        }
-                    }
-                    None
-                }
-            }),
-        ];
-
-        let outcomes = scheduling::filter(&candidates, &predicates);
-        let survivors: Vec<&Candidate> = outcomes
-            .iter()
-            .filter(|o| o.passed())
-            .map(|o| o.candidate)
-            .collect();
-
-        // Per-candidate fail-closed authz — async, so it runs as its own pass
-        // rather than inside a (sync) `scheduling::Predicate` closure. A denied
-        // node is silently dropped, never surfaced as an error.
-        let mut authorized: Vec<&Candidate> = Vec::with_capacity(survivors.len());
-        for c in survivors {
-            let resource = format!("placement:candidate:{}", c.did);
-            if self.authorize(ctx, &resource, "query").await.is_ok() {
-                authorized.push(c);
+        use futures::{stream, StreamExt, TryStreamExt};
+        let query = async {
+            let started = Instant::now();
+            struct Candidate {
+                did: String,
+                record_uri: String,
+                load_fraction: f32,
+                allocatable: Vec<(String, String)>,
+                last_seen: i64,
             }
-        }
 
-        // Post-filter, post-authz, pre-bound — so callers can tell truncation
-        // apart from "that's really all of them".
-        let total_matching = authorized.len() as u32;
+            let selectors: Vec<scheduling::LabelSelector> = data
+                .selectors
+                .iter()
+                .map(|s| {
+                    scheduling::LabelSelector::new(
+                        s.key.clone(),
+                        to_scheduling_op(s.op),
+                        s.values.clone(),
+                    )
+                })
+                .collect();
+            let resources: Vec<scheduling::ResourceRequest> = data
+                .resources
+                .iter()
+                .map(|r| scheduling::ResourceRequest::new(r.name.clone(), r.min_quantity.clone()))
+                .collect();
 
-        let ranked = scheduling::rank(authorized, |a, b| {
-            a.load_fraction
-                .partial_cmp(&b.load_fraction)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.did.cmp(&b.did))
-        });
+            // Exact totalMatching requires examining every eligible node, but
+            // not one or two Policy RPCs and a point GET per node. Read bounded
+            // shared snapshots and authorize in bounded vectors instead.
+            let live_nodes = self.state_store.all_liveness(unix_millis_now()).await?;
+            let eligible: Vec<_> = live_nodes.into_iter().filter(|(node, live)| {
+                resources.iter().all(|req| live.allocatable.iter()
+                    .find(|(name, _)| name == &req.name)
+                    .is_some_and(|(_, quantity)| req.satisfied_by(quantity)))
+                    && (self.placement_index.record_uri(node.as_str()).is_none()
+                        || selectors.iter().all(|selector| selector.matches(
+                            &self.placement_index.effective_labels(node.as_str()))))
+            }).map(|(node, _)| node).collect();
+            let authorized = stream::iter(eligible.chunks(256))
+                .map(|nodes| async move {
+                    anyhow::ensure!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
+                        "candidate query deadline exceeded; retry");
+                    let resources: Vec<_> = nodes.iter()
+                        .map(|node| format!("placement:candidate:{node}")).collect();
+                    let decisions = match &self.auth_provider {
+                        Some(auth) => auth.check_batch(&ctx.subject().to_string(), "*",
+                            &resources, "query", ctx.jwt_token()).await?,
+                        None => vec![true; resources.len()],
+                    };
+                    anyhow::ensure!(decisions.len() == nodes.len(), "invalid authorization decision count");
+                    Ok::<_, anyhow::Error>(nodes.iter().zip(decisions)
+                        .filter(|(_, allowed)| *allowed).map(|(node, _)| node.clone()).collect::<Vec<_>>())
+                })
+                .buffer_unordered(CANDIDATE_QUERY_CONCURRENCY)
+                .try_collect::<Vec<_>>().await?
+                .into_iter().flatten().collect::<Vec<_>>();
 
-        let max = if data.max_candidates == 0 {
-            DEFAULT_MAX_CANDIDATES
-        } else {
-            data.max_candidates as usize
+            // No denied node can trigger repository hydration. Completed
+            // verified ingests survive a cold-query timeout, so retries progress.
+            stream::iter(&authorized).map(|node| async move {
+                anyhow::ensure!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
+                    "candidate query deadline exceeded; retry");
+                anyhow::ensure!(self.ensure_placement_ingested(node).await,
+                    "candidate projection ingestion is pending; retry");
+                Ok::<_, anyhow::Error>(())
+            }).buffer_unordered(CANDIDATE_QUERY_CONCURRENCY)
+                .try_collect::<Vec<_>>().await?;
+
+            // Recheck expiry in one shared-clock snapshot after possibly slow
+            // hydration/authz, rather than issuing an awaited GET for each DID.
+            let mut live: std::collections::HashMap<_, _> = self.state_store.all_liveness(unix_millis_now())
+                .await?.into_iter().collect();
+            let mut candidates = Vec::new();
+            for node in authorized {
+                let did = node.as_str().to_owned();
+                let Some(record_uri) = self.placement_index.record_uri(&did) else { continue };
+                let Some(value) = live.remove(&node) else { continue };
+                let labels = self.placement_index.effective_labels(&did);
+                if !selectors.iter().all(|selector| selector.matches(&labels)) ||
+                    !resources.iter().all(|req| value.allocatable.iter()
+                        .find(|(name, _)| name == &req.name)
+                        .is_some_and(|(_, quantity)| req.satisfied_by(quantity))) {
+                    continue;
+                }
+                candidates.push(Candidate {
+                    did, record_uri, load_fraction: value.load_fraction,
+                    allocatable: value.allocatable, last_seen: value.last_seen,
+                });
+            }
+            let authorized: Vec<_> = candidates.iter().collect();
+            anyhow::ensure!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
+                "candidate query deadline exceeded; retry");
+
+            // Post-filter, post-authz, pre-bound — so callers can tell truncation
+            // apart from "that's really all of them".
+            let total_matching = authorized.len() as u32;
+
+            let ranked = scheduling::rank(authorized, |a, b| {
+                a.load_fraction
+                    .partial_cmp(&b.load_fraction)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.did.cmp(&b.did))
+            });
+
+            let max = if data.max_candidates == 0 {
+                DEFAULT_MAX_CANDIDATES
+            } else {
+                data.max_candidates as usize
+            };
+            let candidates_out: Vec<PlacementCandidate> = ranked
+                .into_iter()
+                .take(max)
+                .map(|c| PlacementCandidate {
+                    node: c.did.clone(),
+                    record_uri: c.record_uri.clone(),
+                    load_fraction: c.load_fraction,
+                    allocatable: c
+                        .allocatable
+                        .iter()
+                        .map(|(name, quantity)| Resource {
+                            name: name.clone(),
+                            quantity: quantity.clone(),
+                        })
+                        .collect(),
+                    last_seen: c.last_seen,
+                })
+                .collect();
+
+            Ok(DiscoveryResponseVariant::QueryCandidatesResult(
+                PlacementCandidateSet {
+                    candidates: candidates_out,
+                    total_matching,
+                },
+            ))
         };
-        let candidates_out: Vec<PlacementCandidate> = ranked
-            .into_iter()
-            .take(max)
-            .map(|c| PlacementCandidate {
-                node: c.did.clone(),
-                record_uri: c.record_uri.clone(),
-                load_fraction: c.load_fraction,
-                allocatable: c
-                    .allocatable
-                    .iter()
-                    .map(|(name, quantity)| Resource {
-                        name: name.clone(),
-                        quantity: quantity.clone(),
-                    })
-                    .collect(),
-                last_seen: c.last_seen,
-            })
-            .collect();
-
-        Ok(DiscoveryResponseVariant::QueryCandidatesResult(
-            PlacementCandidateSet {
-                candidates: candidates_out,
-                total_matching,
-            },
-        ))
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            tokio::time::timeout(CANDIDATE_QUERY_TIMEOUT, query)
+                .await
+                .map_err(|_| anyhow::anyhow!("candidate query deadline exceeded; retry"))?
+        }
+        #[cfg(target_arch = "wasm32")]
+        query.await
     }
 
     /// #524 P1 — node liveness heartbeat. The auto-generated dispatch gate
@@ -7060,6 +7375,7 @@ impl DiscoveryHandler for DiscoveryService {
             }));
         }
 
+        let received_at = unix_millis_now();
         let live = LiveAllocatable {
             allocatable: data
                 .allocatable
@@ -7067,35 +7383,14 @@ impl DiscoveryHandler for DiscoveryService {
                 .map(|r| (r.name.clone(), r.quantity.clone()))
                 .collect(),
             load_fraction: data.load_fraction,
-            last_seen: if data.ts != 0 {
-                data.ts
-            } else {
-                unix_millis_now()
-            },
+            // Client clocks can move backwards or be arbitrarily future
+            // skewed. Freshness and ordering describe this admitted receipt.
+            last_seen: received_at,
+            live_until_unix_ms: received_at.saturating_add(LIVENESS_TTL.as_millis() as i64),
         };
-        self.liveness.insert(data.node.clone(), live, LIVENESS_TTL);
+        self.state_store.put_liveness(&data.node, live).await?;
 
-        if self.placement_index.record_uri(&node_did).is_none()
-            && self.placement_ingest_attempts.insert_if_absent(
-                data.node.clone(),
-                (),
-                PLACEMENT_INGEST_RETRY_TTL,
-            )
-        {
-            if let Some(resolver) = &self.record_resolver {
-                if let Err(e) = self
-                    .placement_index
-                    .ingest_did(resolver.as_ref(), &node_did)
-                    .await
-                {
-                    tracing::warn!(
-                        node = %node_did,
-                        error = %e,
-                        "placement directory ingestion failed for heartbeating node (liveness still recorded)"
-                    );
-                }
-            }
-        }
+        self.ensure_placement_ingested(&data.node).await;
 
         Ok(DiscoveryResponseVariant::ReportNodeLivenessResult)
     }
@@ -7645,6 +7940,287 @@ mod query_candidates_tests {
         .with_record_resolver(Arc::new(FixedRepoResolver { repos }))
     }
 
+    struct ConcurrentRepoResolver {
+        inner: FixedRepoResolver,
+        barrier: Option<tokio::sync::Barrier>,
+        stall: std::sync::atomic::AtomicBool,
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        resolved: parking_lot::Mutex<Vec<String>>,
+    }
+
+    struct ActiveResolution<'a>(&'a std::sync::atomic::AtomicUsize);
+    impl Drop for ActiveResolution<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl RecordResolver for ConcurrentRepoResolver {
+        async fn resolve_record(
+            &self,
+            _did: &str,
+            _collection: &str,
+            _rkey: &str,
+        ) -> Result<Option<RecordCarData>> {
+            Ok(None)
+        }
+        async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.resolved.lock().push(did.to_owned());
+            let active = self.active.fetch_add(1, SeqCst) + 1;
+            let _guard = ActiveResolution(&self.active);
+            self.peak.fetch_max(active, SeqCst);
+            if self.stall.load(SeqCst) {
+                futures::future::pending::<()>().await;
+            }
+            if let Some(barrier) = &self.barrier {
+                barrier.wait().await;
+            }
+            self.inner.resolve_repo(did).await
+        }
+        async fn resolve_verifying_key(&self, did: &str) -> Result<Option<P256VerifyingKey>> {
+            self.inner.resolve_verifying_key(did).await
+        }
+    }
+
+    async fn assert_cold_query_concurrency(state: DiscoveryState) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let mut repos = HashMap::new();
+        let now = unix_millis_now();
+        for i in 0..33 {
+            let did = format!("did:web:cold-{i}.example");
+            repos.insert(
+                did.clone(),
+                node_repo_car(&did, &sample_node_record(&did, vec![])),
+            );
+            state
+                .clone()
+                .into_inner()
+                .put_liveness(
+                    &Did::new(did),
+                    LiveAllocatable {
+                        allocatable: vec![],
+                        load_fraction: 0.1,
+                        last_seen: now,
+                        live_until_unix_ms: now + 45_000,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let resolver = Arc::new(ConcurrentRepoResolver {
+            inner: FixedRepoResolver { repos },
+            // A sequential implementation cannot complete even one batch.
+            barrier: Some(tokio::sync::Barrier::new(CANDIDATE_QUERY_CONCURRENCY)),
+            stall: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            resolved: parking_lot::Mutex::new(vec![]),
+        });
+        let denied = "did:web:cold-32.example";
+        let svc = service_with(Box::new(DenyNode(denied.to_owned())), HashMap::new())
+            .with_record_resolver(resolver.clone())
+            .with_state(state);
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(1)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let result = as_set(result);
+        assert_eq!(
+            result.total_matching, 32,
+            "maxCandidates must not hide incomplete hydration"
+        );
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(resolver.peak.load(SeqCst), CANDIDATE_QUERY_CONCURRENCY);
+        assert_eq!(resolver.active.load(SeqCst), 0);
+        assert_eq!(resolver.resolved.lock().len(), 32);
+        assert!(!resolver.resolved.lock().iter().any(|did| did == denied));
+    }
+
+    #[tokio::test]
+    async fn cold_candidate_query_hydrates_concurrently_without_truncation() {
+        let state = DiscoveryState::connect(&crate::DiscoveryStateConfig::default())
+            .await
+            .unwrap();
+        assert_cold_query_concurrency(state).await;
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_capacity_query_batches_exact_count_and_ranking() {
+        use futures::{stream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        struct BatchPolicy(Arc<AtomicUsize>);
+        #[async_trait(?Send)]
+        impl AuthorizationProvider for BatchPolicy {
+            async fn check(&self, _: &str, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<bool> {
+                panic!("capacity query regressed to per-node Policy RPC");
+            }
+            async fn check_batch(&self, _: &str, _: &str, resources: &[String], _: &str, _: Option<&str>) -> Result<Vec<bool>> {
+                assert!(resources.len() <= 256);
+                self.0.fetch_add(1, SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(resources.iter().map(|r| !r.ends_with("capacity-00001.example")).collect())
+            }
+        }
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else { return };
+        let config = crate::DiscoveryStateConfig {
+            backend: crate::DiscoveryStateBackend::Tiered, active_active: true,
+            valkey: crate::ValkeyStateConfig {
+                url, key_prefix: format!("capacity-query-{}-{}", std::process::id(), unix_millis_now()),
+                ..crate::ValkeyStateConfig::default()
+            }, ..crate::DiscoveryStateConfig::default()
+        };
+        let capacity = config.valkey.liveness_capacity;
+        assert_eq!(capacity, 65_536, "exercise advertised capacity without lowering it");
+        let state = DiscoveryState::connect(&config).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let svc = service_with(Box::new(BatchPolicy(calls.clone())), HashMap::new()).with_state(state);
+        // Warm verified placement projection: signature/admission behavior has
+        // separate real-CAR tests; this fixture isolates full-capacity querying.
+        for i in 0..capacity {
+            let did = format!("did:web:capacity-{i:05}.example");
+            svc.placement_index.seed_warm_node_for_test(did.clone(), crate::placement_index::NodeFacts {
+                record_uri: format!("at://{did}/ai.hyprstream.placement.node/3a"),
+                labels: vec![("zone".to_owned(), if i % 2 == 1 { "west" } else { "east" }.to_owned())],
+                ..Default::default()
+            });
+        }
+        stream::iter(0..capacity).map(|i| {
+            let store = &svc.state_store;
+            async move {
+                let now = unix_millis_now();
+                store.put_liveness(&Did::new(format!("did:web:capacity-{i:05}.example")), LiveAllocatable {
+                    allocatable: vec![("cpu".to_owned(), "8".to_owned())],
+                    load_fraction: 1.0 - i as f32 / capacity as f32,
+                    last_seen: now, live_until_unix_ms: now + 45_000,
+                }).await.unwrap();
+            }
+        }).buffer_unordered(256).collect::<Vec<_>>().await;
+        let mut request = empty_query(1);
+        request.selectors = vec![LabelSelector { key: "zone".to_owned(), op: SelectorOp::In, values: vec!["west".to_owned()] }];
+        request.resources = vec![ResourceRequest { name: "cpu".to_owned(), min_quantity: "4".to_owned() }];
+        let started = Instant::now();
+        let result = as_set(svc.handle_query_candidates(&test_ctx(), 1, &request).await.unwrap());
+        assert!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT);
+        assert_eq!(result.total_matching, (capacity / 2 - 1) as u32);
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].node, format!("did:web:capacity-{:05}.example", capacity - 1));
+        assert_eq!(calls.load(SeqCst), capacity / 2 / 256, "warm selector filtering precedes Policy RPC");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_cold_candidate_query_hydrates_concurrently_without_truncation() {
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let config = crate::DiscoveryStateConfig {
+            backend: crate::DiscoveryStateBackend::Tiered,
+            active_active: true,
+            valkey: crate::ValkeyStateConfig {
+                url,
+                key_prefix: format!("cold-query-{}-{}", std::process::id(), unix_millis_now()),
+                ..crate::ValkeyStateConfig::default()
+            },
+            ..crate::DiscoveryStateConfig::default()
+        };
+        assert_cold_query_concurrency(DiscoveryState::connect(&config).await.unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn cold_candidate_deadline_cancels_ingest_and_retry_is_complete() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let did = "did:web:stalled.example";
+        let resolver = Arc::new(ConcurrentRepoResolver {
+            inner: FixedRepoResolver {
+                repos: HashMap::from([(
+                    did.to_owned(),
+                    node_repo_car(did, &sample_node_record(did, vec![])),
+                )]),
+            },
+            barrier: None,
+            stall: AtomicBool::new(true),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            resolved: parking_lot::Mutex::new(vec![]),
+        });
+        let svc =
+            service_with(Box::new(AllowAll), HashMap::new()).with_record_resolver(resolver.clone());
+        let now = unix_millis_now();
+        svc.state_store
+            .put_liveness(
+                &Did::new(did.to_owned()),
+                LiveAllocatable {
+                    allocatable: vec![],
+                    load_fraction: 0.1,
+                    last_seen: now,
+                    live_until_unix_ms: now + 45_000,
+                },
+            )
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(
+            CANDIDATE_QUERY_TIMEOUT + Duration::from_secs(2),
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(1)),
+        )
+        .await
+        .unwrap()
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert_eq!(
+            resolver.active.load(SeqCst),
+            0,
+            "deadline must drop outstanding repository work"
+        );
+        resolver.stall.store(false, SeqCst);
+        let result = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(1))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            result.total_matching, 1,
+            "cancelled ingest must not be cached as absence"
+        );
+        assert_eq!(resolver.resolved.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_uses_receipt_time_after_client_clock_rollback() {
+        let svc = service_with(Box::new(AllowAll), HashMap::new());
+        let node = Did::new("did:web:rollback.example".to_owned());
+        let start = unix_millis_now();
+        for ts in [start + 86_400_000, start - 86_400_000] {
+            let req = NodeLiveness {
+                node: node.clone(),
+                allocatable: vec![],
+                load_fraction: 0.2,
+                ts,
+            };
+            svc.handle_report_node_liveness(&test_ctx(), 1, &req)
+                .await
+                .unwrap();
+            let value = svc
+                .state_store
+                .liveness(&node, unix_millis_now())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(value.last_seen >= start && value.last_seen <= unix_millis_now());
+            assert_eq!(
+                value.live_until_unix_ms,
+                value.last_seen + LIVENESS_TTL.as_millis() as i64
+            );
+        }
+    }
+
     fn test_ctx() -> EnvelopeContext {
         EnvelopeContext::from_callback_service(1, "test-caller")
     }
@@ -7675,6 +8251,174 @@ mod query_candidates_tests {
             resp,
             DiscoveryResponseVariant::ReportNodeLivenessResult
         ));
+    }
+
+    async fn assert_cross_replica_candidates(a: DiscoveryState, b: DiscoveryState) {
+        let did = "did:web:shared-node.example";
+        let rec = sample_node_record(did, vec![("zone", "shared")]);
+        let repos = HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]);
+        let replica_a = service_with(Box::new(AllowAll), repos.clone()).with_state(a);
+        let replica_b = service_with(Box::new(AllowAll), repos.clone()).with_state(b.clone());
+        heartbeat(&replica_a, did, vec![("cpu", "8")], 0.25).await;
+        assert!(replica_b.placement_index.known_node_dids().is_empty());
+        let req = QueryCandidatesRequest {
+            selectors: vec![LabelSelector {
+                key: "zone".to_owned(),
+                op: SelectorOp::In,
+                values: vec!["shared".to_owned()],
+            }],
+            resources: vec![ResourceRequest {
+                name: "cpu".to_owned(),
+                min_quantity: "4".to_owned(),
+            }],
+            max_candidates: 0,
+        };
+        let result = as_set(
+            replica_b
+                .handle_query_candidates(&test_ctx(), 1, &req)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result.total_matching, 1);
+        assert_eq!(result.candidates[0].node, did);
+        assert_eq!(
+            result.candidates[0].record_uri,
+            format!("at://{did}/{}/3a", node::COLLECTION_NSID)
+        );
+        // A restarted replica and a policy-denied replica start without local
+        // placement state too. Only an authorized verified node is surfaced.
+        let restarted = service_with(Box::new(AllowAll), repos.clone()).with_state(b.clone());
+        assert_eq!(
+            as_set(
+                restarted
+                    .handle_query_candidates(&test_ctx(), 1, &req)
+                    .await
+                    .unwrap()
+            )
+            .total_matching,
+            1
+        );
+        let denied = service_with(Box::new(DenyNode(did.to_owned())), repos).with_state(b.clone());
+        assert_eq!(
+            as_set(
+                denied
+                    .handle_query_candidates(&test_ctx(), 1, &empty_query(0))
+                    .await
+                    .unwrap()
+            )
+            .total_matching,
+            0
+        );
+        assert!(denied.placement_index.known_node_dids().is_empty());
+        let missing_repo = service_with(Box::new(AllowAll), HashMap::new()).with_state(b);
+        assert_eq!(
+            as_set(
+                missing_repo
+                    .handle_query_candidates(&test_ctx(), 1, &empty_query(0))
+                    .await
+                    .unwrap()
+            )
+            .total_matching,
+            0
+        );
+        // Expiring the shared record excludes it even from populated indexes.
+        let now = unix_millis_now();
+        replica_a.state_store.put_liveness(&Did::new(did.to_owned()), LiveAllocatable {
+            allocatable: vec![], load_fraction: 0.1,
+            last_seen: now, live_until_unix_ms: now + 20,
+        }).await.unwrap();
+        // The shared clock cannot be advanced by passing a replica timestamp.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            as_set(
+                replica_b
+                    .handle_query_candidates(&test_ctx(), 1, &req)
+                    .await
+                    .unwrap()
+            )
+            .total_matching,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_liveness_seeds_replica_without_local_placement() {
+        let state = DiscoveryState::connect(&crate::DiscoveryStateConfig::default())
+            .await
+            .unwrap();
+        assert_cross_replica_candidates(state.clone(), state).await;
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_shared_liveness_seeds_other_replica_and_restart() {
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        for backend in [
+            crate::DiscoveryStateBackend::Valkey,
+            crate::DiscoveryStateBackend::Tiered,
+        ] {
+            let config = crate::DiscoveryStateConfig {
+                backend,
+                active_active: true,
+                valkey: crate::ValkeyStateConfig {
+                    url: url.clone(),
+                    key_prefix: format!(
+                        "pr1560-candidates-{}-{}-{backend:?}",
+                        std::process::id(),
+                        unix_millis_now()
+                    ),
+                    pool_size: 2,
+                    ..crate::ValkeyStateConfig::default()
+                },
+                ..crate::DiscoveryStateConfig::default()
+            };
+            let a = DiscoveryState::connect(&config).await.unwrap();
+            let b = DiscoveryState::connect(&config).await.unwrap();
+            assert_cross_replica_candidates(a, b).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_announcement_without_identity_expiry_uses_heartbeat_ttl() {
+        let svc = service_with(Box::new(AllowAll), HashMap::new());
+        let request = ServiceAnnouncement {
+            service_name: "legacy".to_owned(),
+            socket_kind: "rep".to_owned(),
+            endpoint: "inproc://legacy".to_owned(),
+            service_jwt: None,
+            service_did: Did::new(String::new()),
+            capabilities: vec![],
+            accepted_state_digest: vec![],
+            accepted_state_epoch: 0,
+            response_key_id: String::new(),
+            request_kem_key_id: String::new(),
+            request_kem_recipient: vec![],
+            expires_at_unix_ms: 0,
+        };
+        let now = unix_millis_now();
+        assert!(matches!(
+            svc.handle_announce(&test_ctx(), 1, &request).await.unwrap(),
+            DiscoveryResponseVariant::AnnounceResult
+        ));
+        let entries = svc
+            .state_store
+            .announcements_for("legacy", now)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].live_until_unix_ms >= now + ANNOUNCED_ENDPOINT_TTL.as_millis() as i64);
+        assert_eq!(entries[0].expires_at_unix_ms, entries[0].live_until_unix_ms);
+        assert!(svc
+            .state_store
+            .announcements_for("legacy", entries[0].live_until_unix_ms)
+            .await
+            .unwrap()
+            .is_empty());
+        let mut bound = request;
+        bound.service_did = Did::new("did:at9p:identity-bound".to_owned());
+        assert!(svc.handle_announce(&test_ctx(), 1, &bound).await.is_err());
     }
 
     /// A denied heartbeat must not create a volatile liveness entry or trigger
@@ -7713,7 +8457,11 @@ mod query_candidates_tests {
             DiscoveryResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "UNAUTHORIZED"
         ));
         assert!(
-            svc.liveness.get(&Did::new(did.to_owned())).is_none(),
+            svc.state_store
+                .liveness(&Did::new(did.to_owned()), unix_millis_now())
+                .await
+                .expect("read liveness")
+                .is_none(),
             "denied DID must not receive a liveness entry"
         );
         assert!(
@@ -7753,8 +8501,10 @@ mod query_candidates_tests {
             "two heartbeats before retry expiry must produce one repo poll"
         );
         let live = svc
-            .liveness
-            .get(&Did::new(did.to_owned()))
+            .state_store
+            .liveness(&Did::new(did.to_owned()), unix_millis_now())
+            .await
+            .expect("read liveness")
             .expect("admitted heartbeat must still refresh liveness");
         assert!((live.load_fraction - 0.1).abs() < f32::EPSILON);
         assert_eq!(live.allocatable, vec![("cpu".to_owned(), "8".to_owned())]);

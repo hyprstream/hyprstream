@@ -9,7 +9,7 @@ use crate::auth::policy_templates;
 use crate::services::{EnvelopeContext, RequestService};
 use crate::services::generated::policy_client::{
     ErrorInfo, PolicyHandler, PolicyResponseVariant, TokenInfo, ScopeList,
-    PolicyCheck, IssueToken,
+    PolicyCheck, PolicyCheckBatch, PolicyCheckBatchResult, IssueToken,
     ApplyTemplate, ApplyDraft, RollbackPolicy, GetHistory, GetDiff,
     PolicyInfo, PolicyRule, Grouping,
     PolicyHistory, PolicyHistoryEntry, DraftStatus,
@@ -519,6 +519,19 @@ impl PolicyHandler for PolicyService {
         } else {
             anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
         }
+    }
+
+    async fn handle_check_batch(
+        &self, ctx: &EnvelopeContext, request_id: u64, data: &PolicyCheckBatch,
+    ) -> Result<PolicyResponseVariant> {
+        anyhow::ensure!(data.checks.len() <= 256, "policy check batch exceeds 256");
+        let mut allowed = Vec::with_capacity(data.checks.len());
+        for check in &data.checks {
+            // Reuse the exact single-check subject/tenant/audit boundary.
+            let result = self.handle_check(ctx, request_id, check).await?;
+            allowed.push(matches!(result, PolicyResponseVariant::CheckResult(true)));
+        }
+        Ok(PolicyResponseVariant::CheckBatchResult(PolicyCheckBatchResult { allowed }))
     }
 
     async fn handle_check(
@@ -2841,6 +2854,8 @@ mod tests {
             .expect("test: per-origin federation grant");
 
         let endpoint = format!("policy-delegation-{}", rand::random::<u64>());
+        manager.add_policy_with_domain("alice", "did:web:tenant-a.example",
+            "placement:candidate:*", "query", "allow").await.expect("capacity grant");
         let policy_key = SigningKey::from_bytes(&[0x70; 32]);
         let actor_key = SigningKey::from_bytes(&[0x71; 32]);
         let actor_verifying_key = actor_key.verifying_key();
@@ -2941,6 +2956,34 @@ mod tests {
             .await
             .expect("test: tenant user decision");
         assert!(allowed, "verified delegated user grant must be effective");
+
+        let provider = crate::services::discovery::PolicyAuthProvider::new(client.clone());
+        let batched = hyprstream_discovery::AuthorizationProvider::check_batch(
+            &provider, "alice", "forged-other-tenant",
+            &["model:allowed".to_owned(), "model:deputy-only".to_owned()],
+            "infer.generate", Some(&user_token),
+        ).await.expect("real batched Policy RPC with delegated identity");
+        assert_eq!(batched, vec![true, false], "batch preserves user authority, not deputy grants");
+        assert!(hyprstream_discovery::AuthorizationProvider::check_batch(
+            &provider, "alice", "*", &["model:allowed".to_owned()], "infer.generate", None,
+        ).await.is_err(), "batch cannot mediate a user without verified bearer");
+        assert!(client.clone().with_delegated_bearer(user_token.clone()).check_batch(&PolicyCheckBatch {
+            checks: vec![PolicyCheck { subject: String::new(), domain: String::new(),
+                resource: "model:allowed".to_owned(), operation: "infer.generate".to_owned() }; 257],
+        }).await.is_err(), "batch bound enforced by server, not only adapter");
+
+        // Exercise the real adapter, generated wire codec and Policy handler
+        // for a full configured fleet, separately from Valkey snapshot timing.
+        use futures::{stream, StreamExt, TryStreamExt};
+        let resources: Vec<_> = (0..65_536).map(|i| format!("placement:candidate:did:web:capacity-{i}.example")).collect();
+        let started = std::time::Instant::now();
+        let decisions = stream::iter(resources.chunks(256)).map(|batch| {
+            hyprstream_discovery::AuthorizationProvider::check_batch(&provider,
+                "alice", "*", batch, "query", Some(&user_token))
+        }).buffer_unordered(16).try_collect::<Vec<_>>().await.expect("full-fleet Policy batch RPC");
+        assert_eq!(decisions.iter().flatten().filter(|allowed| **allowed).count(), 65_536);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5),
+            "healthy Policy batching exceeded candidate deadline: {:?}", started.elapsed());
 
         let cross_tenant = client
             .clone()

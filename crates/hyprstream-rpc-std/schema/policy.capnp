@@ -92,6 +92,9 @@ struct PolicyRequest {
     # Requires 'exchange' permission on 'policy:exchange-wit' in Casbin policy.
     exchangeWit @21 :ExchangeWit
       $scope(manage) $mcpDescription("Exchange the caller's envelope WIT for an OAuth at+jwt; identity from signed envelope");
+    # Bounded vector of the same envelope-authenticated checks (maximum 256).
+    checkBatch @22 :PolicyCheckBatch
+      $scopeExempt("the authz check itself cannot require authz — circular dependency");
   }
 }
 
@@ -108,6 +111,14 @@ struct PolicyCheck {
 
   # Operation being performed (e.g., "infer", "query", "write")
   operation @3 :Text;
+}
+
+struct PolicyCheckBatch {
+  checks @0 :List(PolicyCheck);
+}
+
+struct PolicyCheckBatchResult {
+  allowed @0 :List(Bool);
 }
 
 # JWT token issuance parameters
@@ -256,6 +267,7 @@ struct PolicyResponse {
 
     # at+jwt from exchangeWit
     exchangeWitResult @22 :TokenInfo;
+    checkBatchResult @23 :PolicyCheckBatchResult;
   }
 }
 

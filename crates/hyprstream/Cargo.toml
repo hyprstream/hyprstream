@@ -232,7 +232,8 @@ opentelemetry-stdout = { workspace = true, optional = true }
 # any Hyprstream build from silently omitting this profile.
 default = ["gittorrent", "xet", "systemd", "otel", "kata-vm", "nspawn", "credential-pds"]
 cuda = []
-valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
+valkey = ["dep:fred"]  # Enable legacy Valkey/Redis-backed user and token stores
+discovery-valkey = ["hyprstream-discovery/valkey"]  # Shared/tiered Discovery state
 pglite = ["dep:pglite-rs"]  # Enable PGlite embedded relational UserStore (#1376)
 postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots"]  # Networked Postgres UserStore for RDS (#1401)
 credential-pds = ["pglite"]  # Production credential/PDS service profile; intentionally excludes metrics/DuckDB
