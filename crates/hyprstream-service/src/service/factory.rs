@@ -269,7 +269,11 @@ impl NativeServiceAnnouncement {
         let recipient = hyprstream_rpc::node_identity::derive_mesh_kem_recipient(signer)?.public();
         let announcement = Self {
             service_did: did.clone(),
-            capabilities: vec!["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()],
+            capabilities: if service_name == "event" {
+                vec!["hyprstream-moq/1".to_owned()]
+            } else {
+                vec!["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()]
+            },
             accepted_state_digest: state.head_digest,
             accepted_state_epoch: state.epoch,
             accepted_state_expires_at_unix_ms: expires_at,
@@ -288,7 +292,8 @@ impl NativeServiceAnnouncement {
             "native announcement requires did:at9p identity"
         );
         anyhow::ensure!(
-            !service_name.is_empty() && self.capabilities.iter().any(|c| c == "hyprstream-rpc/1"),
+            !service_name.is_empty() && self.capabilities.iter().any(|c| c ==
+                if service_name == "event" { "hyprstream-moq/1" } else { "hyprstream-rpc/1" }),
             "native announcement lacks canonical service capability"
         );
         anyhow::ensure!(
@@ -554,6 +559,9 @@ pub struct ServiceContext {
     ca_ml_dsa_verifying_key: Option<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>,
 }
 
+/// Owned callback joining carrier binding to the signed announcement lifecycle.
+pub type NativeIrohAnnouncementCallback = Arc<dyn Fn(tokio_util::sync::CancellationToken, [u8; 32]) -> anyhow::Result<()> + Send + Sync>;
+
 impl ServiceContext {
     /// Return an accepted-state-bound admission proof for a service that was
     /// checkpoint-authorized for native network startup.
@@ -568,6 +576,25 @@ impl ServiceContext {
             })
             .transpose()
     }
+    /// Publication callback for a MoQ-only service which has no RPC loop.
+    pub fn native_iroh_announcement_callback(&self, service_name: &str) -> anyhow::Result<NativeIrohAnnouncementCallback> {
+        let shared = self.quic_shared.as_ref().ok_or_else(|| anyhow::anyhow!("native Event configuration missing"))?;
+        let publisher = shared.native_announcement_publisher.clone();
+        anyhow::ensure!(publisher.is_some(), "native announcement publisher missing");
+        let accepted = self.native_announcements.get(service_name).cloned();
+        anyhow::ensure!(accepted.is_some(), "native accepted announcement missing for {service_name}");
+        let signing_key = self.service_signing_key(service_name);
+        let trust = crate::service::trust_store::global_trust_store();
+        let jwt = trust.get(&signing_key.verifying_key()).and_then(|att| att.jwt);
+        let policy = trust.resolve_one("policy").ok_or_else(|| anyhow::anyhow!("policy key missing"))?;
+        let discovery = trust.resolve_one("discovery").ok_or_else(|| anyhow::anyhow!("discovery key missing"))?;
+        let service_name = service_name.to_owned();
+        Ok(Arc::new(move |cancellation, node_id| publish_native_announcement(
+            publisher.clone(), cancellation, service_name.clone(), NativeAnnouncementReach::Iroh { node_id },
+            signing_key.clone(), jwt.clone(), policy, discovery, accepted.clone(),
+        )))
+    }
+
     /// Create a new service context.
     pub fn new(
         signing_key: SigningKey,

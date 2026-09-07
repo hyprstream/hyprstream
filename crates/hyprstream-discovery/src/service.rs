@@ -7,6 +7,10 @@
 #[path = "network_bootstrap_tests.rs"]
 mod network_bootstrap_tests;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "event_network_bootstrap_tests.rs"]
+mod event_network_bootstrap_tests;
+
 use async_trait::async_trait;
 use hyprstream_rpc::browser_provisioning::{
     BrowserCarrierProfile, BrowserCurrentnessVerifier, BrowserProvisioningDocument,
@@ -33,7 +37,7 @@ use crate::placement_index::PlacementIndex;
 use crate::scheduling;
 use crate::state_store::{
     unix_millis_now, AnnouncedEndpoint, CachedEntityStatement, CachedEnvelopeKeyset,
-    DiscoveryState, DiscoveryStateStore, LiveAllocatable, MemoryStateStore, PutResult,
+    DiscoveryState, DiscoveryStateStore, LiveAllocatable, MemoryStateStore,
     ANNOUNCED_ENDPOINT_TTL,
 };
 
@@ -1836,6 +1840,44 @@ static PROCESS_BOOTSTRAP_CARRIER: std::sync::OnceLock<hyprstream_rpc::transport:
 /// Transport profile selected by authenticated process bootstrap.
 pub fn native_network_required() -> bool {
     PROCESS_NATIVE_NETWORK_REQUIRED.get().copied().unwrap_or(false)
+}
+
+/// Resolve native Event reach and its accepted-current server witness together.
+pub async fn production_moq_event_target() -> Result<(TransportConfig, hyprstream_rpc::stream_info::MoqlServerIdentity)> {
+    let resolver = PRODUCTION_RESOLVER.get().ok_or_else(|| anyhow::anyhow!("production resolver is not installed"))?;
+    let resolved = resolver.resolve_service_candidates(ServiceQuery::network_moq("event")?).await?
+        .into_iter().next().ok_or_else(|| anyhow::anyhow!("no native Event reach"))?;
+    resolver.ensure_current(&resolved).await?;
+    Ok((resolved.transport().clone(), hyprstream_rpc::stream_info::MoqlServerIdentity {
+        did: resolved.service_did().as_str().to_owned(),
+        epoch: resolved.evidence().accepted_state_epoch,
+        head_digest: resolved.evidence().accepted_state_digest.to_vec(),
+        expires_at_unix_ms: resolved.expires_at_unix_ms(),
+        ed25519: resolved.response_verifying_key().to_bytes(),
+        ml_dsa65: resolved.response_ml_dsa65().to_vec(),
+    }))
+}
+
+/// Project only bounded, valid checkpoint state into the MoQL authority.
+/// Every admission and live-session recheck rereads the pinned source.
+pub fn production_moql_accepted_state_authority() -> Result<Arc<dyn hyprstream_rpc::transport::moql_admission::AcceptedStateAuthority>> {
+    let source = PROCESS_ACCEPTED_STATE_SOURCE.get().cloned()
+        .ok_or_else(|| anyhow::anyhow!("production accepted-state authority is not installed"))?;
+    Ok(Arc::new(move |did: &str| {
+        use hyprstream_rpc::transport::moql_admission::{AcceptedIdentityState, AcceptedSubjectKey};
+        let state = source.accepted_state(did).ok().flatten()?;
+        let expires = chrono::DateTime::parse_from_rfc3339(state.expires_at.as_deref()?).ok()?.timestamp_millis();
+        let subject_keys = state.current.subject_keys.iter().map(|key| {
+            Some(AcceptedSubjectKey {
+                ed25519: key.ed25519_pub.as_slice().try_into().ok()?,
+                ml_dsa_65: (!key.mldsa65_pub.is_empty()).then(|| key.mldsa65_pub.clone())?,
+            })
+        }).collect::<Option<Vec<_>>>()?;
+        (!subject_keys.is_empty()).then_some(AcceptedIdentityState {
+            epoch: state.epoch, head_digest: state.head_digest, subject_keys,
+            expires_at_unix_ms: Some(expires),
+        })
+    }))
 }
 
 const DEPLOYMENT_CA_ROOT_PATH: &str = "/etc/hyprstream/trust/deployment-ca.hybrid";
@@ -3973,6 +4015,7 @@ impl ProductionRpcClient {
 #[doc(hidden)]
 pub mod test_fixtures {
     use super::*;
+    use crate::state_store::PutResult;
     use hyprstream_crypto::pq::ml_dsa_sk_to_vk_bytes;
     use hyprstream_pds::at9p::{
         CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType,
