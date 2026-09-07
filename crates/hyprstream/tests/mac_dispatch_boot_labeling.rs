@@ -192,7 +192,11 @@ async fn fresh_state_register_service_key_passes_production_dispatch_pep() -> Re
     // Causal twin: identical caller, identical service, undeclared leaf.
     // `resolveServiceKey` is a real policy method (discriminant 17) that this
     // slice deliberately does NOT declare — declaration, not schema, is the
-    // authority. It must deny before handler entry with UnlabeledObject.
+    // authority. It must deny before handler entry. Per the v16 §14.2
+    // uniform-denial rule the wire error is opaque ("dispatch denied") so the
+    // response cannot leak which gate fired; the specific UnlabeledObject
+    // reason is asserted at the PEP unit level (mac::dispatch_labels and
+    // mac::cas_pep tests) and in the audit trail.
     let undeclared = client
         .resolve_service_key(&ResolveServiceKey {
             service_name: "registry".to_owned(),
@@ -200,8 +204,8 @@ async fn fresh_state_register_service_key_passes_production_dispatch_pep() -> Re
         .await;
     let error = undeclared.expect_err("undeclared leaf must deny");
     assert!(
-        format!("{error:?}").contains("UnlabeledObject"),
-        "undeclared leaf must deny UnlabeledObject, got: {error:?}"
+        format!("{error:?}").contains(hyprstream_rpc::service::dispatch::DISPATCH_DENIED),
+        "undeclared leaf must deny through the uniform dispatch denial, got: {error:?}"
     );
 
     assert!(

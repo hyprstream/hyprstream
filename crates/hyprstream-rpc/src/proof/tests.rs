@@ -29,10 +29,11 @@ pub(crate) fn load_positive_vectors() -> Vec<(String, Vec<u8>)> {
 // The gate-2 key roster is the enrollment source for the authenticated and
 // response vectors. Two *separate* deployments are modelled, because the
 // profile forbids one component key from being enrolled for both a hybrid and
-// a standalone suite: the hybrid deployment enrols `client-ed25519-1` +
-// `client-mldsa65-1` as one WNS signer, the classical deployment enrols
-// `client-ed25519-1` alone. A vector accepted by one MUST be denied by the
-// other — that is the cross-suite separation the profile requires.
+// a standalone suite: the hybrid deployment enrols `client-ed25519-hy-1` +
+// `client-mldsa65-1` as one WNS signer (the roster's HYBRID credential
+// cnf-bound key), the classical deployment enrols `client-ed25519-1` alone.
+// A vector accepted by one MUST be denied by the other — that is the
+// cross-suite separation the profile requires.
 // ---------------------------------------------------------------------------
 
 use crate::proof::enrollment::{
@@ -104,17 +105,18 @@ fn record(
     }
 }
 
-/// A deployment that enrols the client as one WNS hybrid signer (P-2).
+/// A deployment that enrols the client as one WNS hybrid signer (P-2), under
+/// the roster's HYBRID credential cnf-bound key `client-ed25519-hy-1`.
 pub(crate) fn hybrid_enrollment() -> InMemoryEnrollmentResolver {
     let mut resolver = InMemoryEnrollmentResolver::new();
     resolver
         .enrol_primary(
-            &ed25519_public("client-ed25519-1"),
+            &ed25519_public("client-ed25519-hy-1"),
             record(
                 "client",
                 crate::proof::SUITE_HYBRID,
                 vec![
-                    ed_component("client-ed25519-1"),
+                    ed_component("client-ed25519-hy-1"),
                     mldsa_component("client-mldsa65-1"),
                 ],
                 SignerRole::Primary,
@@ -183,40 +185,14 @@ fn load_negative_vectors() -> Vec<(String, Vec<u8>, String)> {
 // Full-vector parametric tests
 // ---------------------------------------------------------------------------
 
-/// Positive vectors that this C lane's amended parser intentionally no longer
-/// accepts as frozen, pending WS-A re-issuing the fixture at the amended wire
-/// value.
+/// Every positive vector MUST be accepted by the parser.
 ///
-/// P-4 encodes the **pre-amendment** three-field `response_binding`
-/// (`{1: schema, 2: combined-mode, 3: kem}`). Gate-2 amendments 3+4 replace it
-/// with the orthogonal four-field map
-/// (`{1: root_type_id, 2: response_kind, 3: protection_mode, 4: kem}`), which
-/// this lane now enforces. The four-field decode correctly rejects the old
-/// three-field shape, so P-4-as-frozen no longer parses. WS-A owns
-/// `docs/standards/v16/vectors/` and re-issues the deterministic fixture at the
-/// amended value; C must not hand-edit A's fixtures. Until that handoff lands,
-/// P-4 is a tracked residual blocker, and the amended decode is proven instead
-/// by the inline unit tests in `proof::response` (four-field accept, three-field
-/// reject, exact −70200 enforcement).
-const A_REISSUE_PENDING_POSITIVE_VECTORS: &[&str] = &["P-4"];
-
-/// Every positive vector MUST be accepted by the parser, except those awaiting
-/// a WS-A fixture re-issue at an amended Gate-2 wire value (see the constant).
+/// (The merged v16-A fixture re-issued P-4 at the amended four-field
+/// `response_binding`, closing the former A-reissue exception: the whole
+/// canonical set now parses under this lane's amended parser.)
 #[test]
 fn all_positive_vectors_accept() {
     for (id, cbor) in load_positive_vectors() {
-        if A_REISSUE_PENDING_POSITIVE_VECTORS.contains(&id.as_str()) {
-            // Assert the reason is exactly the amended-binding mismatch, so this
-            // skip cannot silently mask an unrelated regression in P-4.
-            let result = crate::proof::parser::ParsedProof::parse(&cbor);
-            assert!(
-                result.is_err(),
-                "{id} is expected to fail against the amended four-field response_binding \
-                 until WS-A re-issues it; if it now parses, the fixture was re-issued and this \
-                 skip should be removed"
-            );
-            continue;
-        }
         let result = crate::proof::parser::ParsedProof::parse(&cbor);
         assert!(
             result.is_ok(),
@@ -276,42 +252,229 @@ fn deny_reason_tokens(deny_class: &str) -> &'static [&'static str] {
 
 /// Every negative vector MUST be denied, and — F-E — for the declared reason.
 ///
-/// Two are denied by the verifier rather than the parser, because they are
-/// context-dependent: N-2 is P-2's exact bytes presented in the credential
-/// slot, and N-22 is a well-formed response proof answering a different
-/// request. Both are covered by dedicated tests below, so nothing is merely
-/// skipped.
+/// Four are denied by the verifier rather than the parser, because they are
+/// context-dependent or cross-field: N-2 is P-2's exact bytes presented in
+/// the credential slot, N-22 is a well-formed response proof answering a
+/// different request, N-32 is a locally valid response proof whose
+/// `response_binding` differs from the originating request's, and N-31's
+/// `-70002` vs binding `root_type_id` equality only holds at the response
+/// verifier. All four are covered by dedicated tests below, so nothing is
+/// merely skipped.
+///
+/// A further set is denied by the signature/freshness verifier rather than
+/// the parser — locally well-formed bytes whose denial needs the verifier
+/// clock or an enrollment/key-set resolution; see
+/// `verifier_context_negatives_deny` (which covers N-35/N-38, N-43,
+/// N-54..N-57, and N-58/N-59/N-60) and `context_bound_expiry_negatives` for
+/// N-50/N-51/N-61, whose credential/session-expiry bounds live in the
+/// dispatch context that carries the authoritative records, not in the
+/// stateless signature verifier.
 #[test]
 fn all_negative_vectors_deny() {
-    let verifier_side = ["N-2", "N-22"];
-    // Negative vectors whose *denial reason* (not the denial itself) is masked
-    // by the pre-amendment three-field `response_binding` they still carry: the
-    // amended claims decode rejects that binding before reaching the vector's
-    // intended (later) check. They still deny fail-closed — only the reason
-    // binding is deferred until WS-A re-issues them at the four-field value.
-    // Tracked as a residual blocker alongside P-4 (see status-mac-v16-c.md).
-    let reason_pending_a_reissue = ["N-10f"];
+    let verifier_side = [
+        "N-2", "N-22", "N-31", "N-32", "N-35", "N-38", "N-43", "N-50", "N-51", "N-54", "N-55",
+        "N-56", "N-57", "N-58", "N-59", "N-60", "N-61",
+    ];
+    let mut accepted = Vec::new();
+    let mut reason_mismatches = Vec::new();
     for (id, cbor, deny_class) in load_negative_vectors() {
         if verifier_side.contains(&id.as_str()) {
             continue;
         }
         let result = crate::proof::parser::ParsedProof::parse(&cbor);
         let err = match result {
-            Ok(_) => panic!("negative vector {id} ({deny_class}) should deny, but was accepted"),
+            Ok(_) => {
+                accepted.push(format!("{id} ({deny_class})"));
+                continue;
+            }
             Err(e) => format!("{e:#}"),
         };
-        if reason_pending_a_reissue.contains(&id.as_str()) {
-            // Still must deny; the reason binding is deferred (see above).
-            continue;
-        }
         let tokens = deny_reason_tokens(&deny_class);
-        if !tokens.is_empty() {
-            assert!(
-                tokens.iter().any(|t| err.contains(t)),
-                "negative vector {id} denied, but the reason does not match its declared \
-                 deny_class '{deny_class}'. Expected one of {tokens:?}; got: {err}"
-            );
+        if !tokens.is_empty() && !tokens.iter().any(|t| err.contains(t)) {
+            reason_mismatches.push(format!(
+                "{id} ({deny_class}): expected one of {tokens:?}, got: {err}"
+            ));
         }
+    }
+    assert!(
+        accepted.is_empty() && reason_mismatches.is_empty(),
+        "accepted: {accepted:?}; reason-mismatched: {reason_mismatches:?}"
+    );
+}
+
+/// The context-dependent negatives that parse cleanly but must deny at the
+/// signature/freshness/response verifiers, proven through the real entry
+/// points:
+///
+/// - **N-35 / N-38** — unattributed key sets that do not match the signing
+///   key (or are reordered hybrid elements) fail signature verification;
+/// - **N-43 / N-58 / N-59 / N-60** — a response proof for another service
+///   domain, signed by a non-enrolled key, for an unenrolled audience, or
+///   carrying two signer groups, denies at `verify_response_proof`;
+/// - **N-54..N-57** — expired, future-issued, and over-lifetime proofs deny
+///   at the §4.5 verifier-clock freshness bounds (Authenticated 300s,
+///   Unattributed 30s, skew 30s), evaluated at the injected clock.
+#[test]
+fn verifier_context_negatives_deny() {
+    let vectors = load_negative_vectors();
+    let parse_neg = |id: &str| {
+        let bytes = &vectors
+            .iter()
+            .find(|(vid, _, _)| vid == id)
+            .unwrap_or_else(|| panic!("{id} must exist"))
+            .1;
+        crate::proof::parser::ParsedProof::parse(bytes)
+            .unwrap_or_else(|e| panic!("{id} must parse (its denial is verifier-level): {e}"))
+    };
+    let now = FIXTURE_NOW;
+    let classical = classical_enrollment();
+
+    // N-35 / N-38: unattributed proofs whose embedded key set cannot verify
+    // the signature (foreign key / reordered hybrid elements).
+    for id in ["N-35", "N-38"] {
+        let proof = parse_neg(id);
+        assert!(
+            proof.disposition == crate::proof::ProofDisposition::Unattributed,
+            "{id} is an unattributed negative"
+        );
+        assert!(
+            crate::proof::verify::verify_proof_signatures(&proof, None, None, now).is_err(),
+            "{id} must deny at unattributed signature verification"
+        );
+    }
+
+    // N-43: response proof whose aud differs from the addressed service.
+    let n43 = parse_neg("N-43");
+    assert_ne!(
+        n43.claims.aud, "registry.svc.hyprstream.test",
+        "N-43's aud is deliberately not the addressed domain"
+    );
+    assert!(
+        crate::proof::verify::verify_response_proof(
+            &n43,
+            "registry.svc.hyprstream.test",
+            &FIXTURE_REQUEST_ID,
+            None,
+            &classical,
+            now,
+        )
+        .is_err(),
+        "N-43 must deny at the addressed-service check"
+    );
+
+    // N-58: response proof signed by the client key, not the enrolled service
+    // signer — same domain, wrong signer.
+    let n58 = parse_neg("N-58");
+    assert!(
+        crate::proof::verify::verify_response_proof(
+            &n58,
+            "registry.svc.hyprstream.test",
+            &FIXTURE_REQUEST_ID,
+            None,
+            &classical,
+            now,
+        )
+        .is_err(),
+        "N-58 must deny at the enrolled-service-signer check"
+    );
+
+    // N-59: service-signed response proof for an unenrolled audience.
+    let n59 = parse_neg("N-59");
+    assert!(
+        crate::proof::verify::verify_response_proof(
+            &n59,
+            "other.svc.hyprstream.test",
+            &FIXTURE_REQUEST_ID,
+            None,
+            &classical,
+            now,
+        )
+        .is_err(),
+        "N-59 must deny at the enrollment lookup"
+    );
+
+    // N-60: two-group response COSE_Sign — violates exactly-one response
+    // signer.
+    let n60 = parse_neg("N-60");
+    assert!(
+        crate::proof::verify::verify_response_proof(
+            &n60,
+            "registry.svc.hyprstream.test",
+            &FIXTURE_REQUEST_ID,
+            None,
+            &classical,
+            now,
+        )
+        .is_err(),
+        "N-60 must deny at the exactly-one response signer check"
+    );
+
+    // N-54..N-57: verifier-clock freshness (design §4.5).
+    // N-54: expired (exp at/before verifier_now).
+    assert!(
+        crate::proof::verify::verify_proof_signatures(
+            &parse_neg("N-54"),
+            Some(&ed25519_public("client-ed25519-1")),
+            Some(&classical),
+            now,
+        )
+        .is_err(),
+        "N-54 (expired) must deny at the freshness check"
+    );
+    // N-55: future-issued (iat more than one skew window after now).
+    assert!(
+        crate::proof::verify::verify_proof_signatures(
+            &parse_neg("N-55"),
+            Some(&ed25519_public("client-ed25519-1")),
+            Some(&classical),
+            now,
+        )
+        .is_err(),
+        "N-55 (future iat) must deny at the freshness check"
+    );
+    // N-56: authenticated remaining lifetime 301s > 300s max.
+    assert!(
+        crate::proof::verify::verify_proof_signatures(
+            &parse_neg("N-56"),
+            Some(&ed25519_public("client-ed25519-1")),
+            Some(&classical),
+            now,
+        )
+        .is_err(),
+        "N-56 (over-limit authenticated) must deny at the freshness check"
+    );
+    // N-57: unattributed remaining lifetime 45s > 30s max.
+    assert!(
+        crate::proof::verify::verify_proof_signatures(&parse_neg("N-57"), None, None, now)
+            .is_err(),
+        "N-57 (over-limit unattributed) must deny at the freshness check"
+    );
+}
+
+/// The credential/session-expiry bounds (N-50/N-51/N-61) are dispatch-context
+/// rules: the proof is locally well-formed and its denial needs the
+/// authoritative credential or session record — state the stateless signature
+/// verifier does not carry. They are enforced by the v16-A gate's
+/// authenticated-context loop and the §12 causality inventory
+/// (docs/standards/v16/tools/validate_profile.py), and by the dispatch MAC PEP
+/// once the credential is resolved. This pins that they remain locally
+/// parseable (so the denial cannot silently migrate into the parser) while
+/// the bound itself stays with the record holder.
+#[test]
+fn context_bound_expiry_negatives() {
+    let vectors = load_negative_vectors();
+    for id in ["N-50", "N-51", "N-61"] {
+        let entry = vectors
+            .iter()
+            .find(|(vid, _, _)| vid == id)
+            .unwrap_or_else(|| panic!("{id} must exist"));
+        let proof = crate::proof::parser::ParsedProof::parse(&entry.1)
+            .unwrap_or_else(|e| panic!("{id} must parse (its bound is context-side): {e}"));
+        assert!(
+            matches!(entry.2.as_str(), "proof-credential-expiry" | "proof-session-expiry"),
+            "{id} is a context-bound expiry negative"
+        );
+        let _ = proof;
     }
 }
 
@@ -335,11 +498,123 @@ fn n22_response_proof_for_another_request_denies() {
             &proof,
             "registry.svc.hyprstream.test",
             &FIXTURE_REQUEST_ID,
+            // N-22 denies at the request-ID check before binding comparison.
+            None,
             &resolver,
             FIXTURE_NOW,
         )
         .is_err(),
         "a response proof can never verify for another request ID"
+    );
+}
+
+/// N-32 — a response proof whose `response_binding` differs from the
+/// originating request's, yet is locally valid (a cleartext stream-setup map),
+/// must deny against the request it answers; its causal twin P-7 — identical
+/// except the binding equals the request's field-for-field — must verify.
+#[test]
+fn n32_response_binding_mismatch_against_its_request_denies() {
+    let positives = load_positive_vectors();
+    let parse_pos = |id: &str| {
+        let bytes = &positives
+            .iter()
+            .find(|(vid, _)| vid == id)
+            .unwrap_or_else(|| panic!("{id} must exist"))
+            .1;
+        crate::proof::parser::ParsedProof::parse(bytes)
+            .unwrap_or_else(|e| panic!("{id} must parse: {e}"))
+    };
+    // The originating request (P-4) and its exact response binding.
+    let request = parse_pos("P-4");
+    let expected_binding = request.claims.response_binding.clone();
+
+    // Positive control: P-7 answers P-4 with the equal binding and verifies.
+    let p7 = parse_pos("P-7");
+    let resolver = classical_enrollment();
+    crate::proof::verify::verify_response_proof(
+        &p7,
+        "registry.svc.hyprstream.test",
+        &FIXTURE_REQUEST_ID,
+        expected_binding.as_ref(),
+        &resolver,
+        FIXTURE_NOW,
+    )
+    .expect("P-7 (binding equal to its request) must verify");
+
+    // N-32 carries a locally valid but differing binding and must deny.
+    let vectors = load_negative_vectors();
+    let n32 = vectors
+        .iter()
+        .find(|(id, _, _)| id == "N-32")
+        .expect("N-32 must exist");
+    let proof = crate::proof::parser::ParsedProof::parse(&n32.1)
+        .expect("N-32 parses; its denial is against the request it answers");
+    assert_ne!(
+        proof.claims.response_binding, request.claims.response_binding,
+        "N-32's binding is deliberately different from its request's"
+    );
+    let err = crate::proof::verify::verify_response_proof(
+        &proof,
+        "registry.svc.hyprstream.test",
+        &FIXTURE_REQUEST_ID,
+        expected_binding.as_ref(),
+        &resolver,
+        FIXTURE_NOW,
+    )
+    .expect_err("a response binding that differs from its request must deny");
+    assert!(
+        err.to_string().contains("field-for-field"),
+        "N-32 must deny on the binding-equality rule, got: {err:#}"
+    );
+}
+
+/// N-31 — a bound response proof whose signed `-70002` differs from the
+/// realized binding's `root_type_id` denies at the response verifier, though
+/// its binding map itself still equals the originating request's (P-4's).
+#[test]
+fn n31_response_schema_id_mismatch_denies() {
+    let positives = load_positive_vectors();
+    let parse_pos = |id: &str| {
+        let bytes = &positives
+            .iter()
+            .find(|(vid, _)| vid == id)
+            .unwrap_or_else(|| panic!("{id} must exist"))
+            .1;
+        crate::proof::parser::ParsedProof::parse(bytes)
+            .unwrap_or_else(|e| panic!("{id} must parse: {e}"))
+    };
+    let request = parse_pos("P-4");
+    let expected_binding = request.claims.response_binding.clone();
+
+    let vectors = load_negative_vectors();
+    let n31 = vectors
+        .iter()
+        .find(|(id, _, _)| id == "N-31")
+        .expect("N-31 must exist");
+    let proof = crate::proof::parser::ParsedProof::parse(&n31.1)
+        .expect("N-31 parses; its denial is the -70002 vs root_type_id cross-field rule");
+    // The binding map still equals the request's; only -70002 differs.
+    assert_eq!(
+        proof.claims.response_binding, request.claims.response_binding,
+        "N-31's binding deliberately equals its request's"
+    );
+    assert_ne!(
+        proof.claims.capnp_schema_id,
+        proof.claims.response_binding.as_ref().unwrap().root_type_id,
+        "N-31's -70002 deliberately differs from the binding root_type_id"
+    );
+    let err = crate::proof::verify::verify_response_proof(
+        &proof,
+        "registry.svc.hyprstream.test",
+        &FIXTURE_REQUEST_ID,
+        expected_binding.as_ref(),
+        &classical_enrollment(),
+        FIXTURE_NOW,
+    )
+    .expect_err("a mismatched schema id must deny");
+    assert!(
+        err.to_string().contains("root_type_id"),
+        "N-31 must deny on the schema-id/root_type_id rule, got: {err:#}"
     );
 }
 
@@ -587,6 +862,7 @@ fn frozen_vectors_satisfy_only_their_matching_method_policy() {
     let classical = classical_enrollment();
     let hybrid = hybrid_enrollment();
     let cnf = ed25519_public("client-ed25519-1");
+    let hybrid_cnf = ed25519_public("client-ed25519-hy-1");
     let parse = |id: &str| {
         let v = load_positive_vectors();
         let bytes = &v.iter().find(|(vid, _)| vid == id).unwrap().1;
@@ -626,9 +902,13 @@ fn frozen_vectors_satisfy_only_their_matching_method_policy() {
 
     // P-2: authenticated hybrid, one logical signer, no approvers.
     let p2 = parse("P-2");
-    let p2_v =
-        crate::proof::verify::verify_proof_signatures(&p2, Some(&cnf), Some(&hybrid), FIXTURE_NOW)
-            .unwrap();
+    let p2_v = crate::proof::verify::verify_proof_signatures(
+        &p2,
+        Some(&hybrid_cnf),
+        Some(&hybrid),
+        FIXTURE_NOW,
+    )
+    .unwrap();
     assert_eq!(p2_v.primary_suite, crate::proof::SUITE_HYBRID);
     assert!(p2_v.approvers.is_empty());
     assert!(evaluate(

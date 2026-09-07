@@ -85,6 +85,41 @@ pub fn verify_proof_signatures(
     if proof.kind != ProofKind::Request {
         bail!("verify_proof_signatures: only request proofs; use verify_response_proof");
     }
+    // W1: verifier-clock freshness (design §4.5) — iat within skew on BOTH
+    // sides, not expired, and remaining lifetime within the disposition
+    // maximum. Every bound is evaluated at the injected verifier clock `now`,
+    // never issued lifetime (canonical vectors N-54..N-57).
+    let (max_remaining, disposition) = match proof.disposition {
+        ProofDisposition::Unattributed => (
+            super::MAX_REMAINING_LIFETIME_UNATTRIBUTED_SECS,
+            "unattributed",
+        ),
+        ProofDisposition::Authenticated => (
+            super::MAX_REMAINING_LIFETIME_AUTHENTICATED_SECS,
+            "authenticated",
+        ),
+    };
+    let future_skew = proof.claims.iat.saturating_sub(now);
+    let past_skew = now.saturating_sub(proof.claims.iat);
+    if future_skew > super::MAX_CLOCK_SKEW_SECS || past_skew > super::MAX_CLOCK_SKEW_SECS {
+        bail!(
+            "proof iat out of verifier-clock skew: |iat {} - verifier_now {now}| > {}s ({disposition})",
+            proof.claims.iat,
+            super::MAX_CLOCK_SKEW_SECS
+        );
+    }
+    if now >= proof.claims.exp {
+        bail!(
+            "proof expired: verifier_now {now} >= exp {}",
+            proof.claims.exp
+        );
+    }
+    if proof.claims.exp - now > max_remaining {
+        bail!(
+            "proof over-lifetime: exp - verifier_now {}s > {disposition} max {max_remaining}s",
+            proof.claims.exp - now
+        );
+    }
     match proof.disposition {
         ProofDisposition::Unattributed => {
             verify_unattributed(proof)?;
@@ -134,6 +169,7 @@ pub fn verify_response_proof(
     proof: &ParsedProof,
     expected_service_domain: &str,
     expected_request_id: &super::RequestId,
+    expected_response_binding: Option<&super::response::ResponseBinding>,
     resolver: &dyn EnrollmentResolver,
     now: u64,
 ) -> Result<VerifiedProof> {
@@ -154,6 +190,28 @@ pub fn verify_response_proof(
             proof.claims.aud,
             expected_service_domain
         );
+    }
+    // The response binding must equal the originating request's binding
+    // field-for-field — locally valid maps still deny against the wrong
+    // request (canonical vector N-32).
+    if proof.claims.response_binding.as_ref() != expected_response_binding {
+        bail!(
+            "response proof response_binding does not equal the originating \
+             request's binding field-for-field (N-32)"
+        );
+    }
+    // For a bound response proof, the signed schema id must name the realized
+    // binding's root type — a cross-field equality CDDL cannot express
+    // (canonical vector N-31).
+    if let Some(binding) = &proof.claims.response_binding {
+        if proof.claims.capnp_schema_id != binding.root_type_id {
+            bail!(
+                "response proof -70002 ({}) must equal the realized response_binding's \
+                 root_type_id ({}) (N-31)",
+                proof.claims.capnp_schema_id,
+                binding.root_type_id
+            );
+        }
     }
 
     let record = resolver.resolve_service(expected_service_domain).ok_or_else(|| {
@@ -722,6 +780,13 @@ mod tests {
         ed25519_public("client-ed25519-1")
     }
 
+    /// The canonical roster's HYBRID credential cnf-bound key: the Ed25519
+    /// component of the WNS hybrid signer (P-2), distinct from the classical
+    /// client key by construction.
+    fn hybrid_client_cnf() -> ed25519_dalek::VerifyingKey {
+        ed25519_public("client-ed25519-hy-1")
+    }
+
     // -- unattributed ------------------------------------------------------
 
     #[test]
@@ -758,22 +823,17 @@ mod tests {
         assert_eq!(proof.signatures.len(), 2);
         let resolver = hybrid_enrollment();
         let verified =
-            verify_proof_signatures(&proof, Some(&client_cnf()), Some(&resolver), FIXTURE_NOW)
+            verify_proof_signatures(&proof, Some(&hybrid_client_cnf()), Some(&resolver), FIXTURE_NOW)
                 .expect("P-2 must verify: both Ed25519 and ML-DSA-65 components");
         assert_eq!(verified.primary_principal.as_deref(), Some("client"));
     }
 
-    // P-4 (the sole authenticated classical *single-group* Sign1 vector) still
-    // encodes the pre-amendment three-field `response_binding`, which this
-    // lane's four-field parser correctly rejects. Positive/topology tests that
-    // are specifically about P-4 are blocked until WS-A re-issues the fixture
-    // (with a fresh signature over the amended payload); denial-path tests that
-    // only need *an* authenticated classical proof are retargeted to P-5 below.
-    // See status-mac-v16-c.md (residual blocker) and the inline four-field
-    // conformance tests in `proof::response`.
+    // P-4 is the sole authenticated classical *single-group* Sign1 vector; the
+    // merged v16-A fixture re-issued it at the amended four-field
+    // `response_binding`, so it now parses and verifies under this lane's
+    // amended parser (see the inline four-field conformance tests in
+    // `proof::response`).
     #[test]
-    #[ignore = "blocked on WS-A re-issuing P-4 at the amended 4-field response_binding; \
-                P-4 currently encodes the pre-amendment 3-field binding and cannot parse"]
     fn p4_classical_sign1_verifies_under_its_enrolled_suite() {
         let proof = parse("P-4");
         let resolver = classical_enrollment();
@@ -796,10 +856,8 @@ mod tests {
     /// is admitted under one namespace whether or not approvers are present.
     ///
     /// This one compares P-4's single-group thumbprint against P-5's, so it
-    /// needs P-4 specifically — blocked on the WS-A P-4 re-issue (see the note
-    /// on `p4_classical_sign1_verifies_under_its_enrolled_suite`).
+    /// needs P-4 specifically.
     #[test]
-    #[ignore = "blocked on WS-A re-issuing P-4 at the amended 4-field response_binding"]
     fn approver_groups_do_not_change_the_replay_namespace() {
         let resolver = classical_enrollment();
         let p4 = verify_proof_signatures(
@@ -824,8 +882,7 @@ mod tests {
     fn unattributed_and_authenticated_namespaces_are_disjoint() {
         let resolver = classical_enrollment();
         let unattributed = verify_proof_signatures(&parse("P-1"), None, None, FIXTURE_NOW).unwrap();
-        // P-5 (also authenticated classical) stands in for P-4 while P-4 awaits
-        // the WS-A re-issue; this test only needs *an* authenticated proof.
+        // Any authenticated classical proof serves; P-5 is the multi-group one.
         let authenticated = verify_proof_signatures(
             &parse("P-5"),
             Some(&client_cnf()),
@@ -846,8 +903,8 @@ mod tests {
     /// self-asserted branch.
     #[test]
     fn missing_resolver_or_enrollment_denies() {
-        // P-5 substitutes for P-4 (blocked on WS-A re-issue): any authenticated
-        // proof exercises the missing-resolver / empty-enrollment denials.
+        // Any authenticated proof exercises the missing-resolver /
+        // empty-enrollment denials.
         let proof = parse("P-5");
         assert!(
             verify_proof_signatures(&proof, Some(&client_cnf()), None, FIXTURE_NOW).is_err(),
@@ -869,9 +926,10 @@ mod tests {
     #[test]
     fn missing_credential_denies() {
         let resolver = classical_enrollment();
-        // P-4 omitted while it awaits the WS-A re-issue; P-2 and P-5 keep the
-        // no-credential denial covered across both suites and topologies.
-        for id in ["P-2", "P-5"] {
+        // P-2 (hybrid Sign), P-4 (classical Sign1), and P-5 (classical
+        // two-group Sign) keep the no-credential denial covered across both
+        // suites and topologies.
+        for id in ["P-2", "P-4", "P-5"] {
             assert!(
                 verify_proof_signatures(&parse(id), None, Some(&resolver), FIXTURE_NOW).is_err(),
                 "{id} with no credential must deny"
@@ -885,7 +943,6 @@ mod tests {
     fn unenrolled_credential_denies() {
         let stranger = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key();
         let resolver = classical_enrollment();
-        // P-5 substitutes for P-4 (blocked on WS-A re-issue).
         assert!(
             verify_proof_signatures(&parse("P-5"), Some(&stranger), Some(&resolver), FIXTURE_NOW)
                 .is_err()
@@ -932,7 +989,7 @@ mod tests {
         proof.signatures[idx].signature[0] ^= 0xFF;
         let resolver = hybrid_enrollment();
         assert!(
-            verify_proof_signatures(&proof, Some(&client_cnf()), Some(&resolver), FIXTURE_NOW)
+            verify_proof_signatures(&proof, Some(&hybrid_client_cnf()), Some(&resolver), FIXTURE_NOW)
                 .is_err(),
             "a corrupted ML-DSA-65 component must deny"
         );
@@ -950,7 +1007,7 @@ mod tests {
         proof.signatures[idx].signature[0] ^= 0xFF;
         let resolver = hybrid_enrollment();
         assert!(
-            verify_proof_signatures(&proof, Some(&client_cnf()), Some(&resolver), FIXTURE_NOW)
+            verify_proof_signatures(&proof, Some(&hybrid_client_cnf()), Some(&resolver), FIXTURE_NOW)
                 .is_err()
         );
     }
@@ -959,9 +1016,8 @@ mod tests {
     /// and a proof that would outlive its credential.
     #[test]
     fn revoked_expired_or_overlong_enrollment_denies() {
-        // P-5 substitutes for P-4 (blocked on WS-A re-issue): the revoked /
-        // expired / proof-outlives-credential denials apply to any
-        // credential-bound proof under the same enrollment.
+        // The revoked / expired / proof-outlives-credential denials apply to
+        // any credential-bound proof under the same enrollment.
         let proof = parse("P-5");
         let cnf = client_cnf();
 
@@ -1101,6 +1157,7 @@ mod tests {
             &proof,
             "registry.svc.hyprstream.test",
             &FIXTURE_REQUEST_ID,
+            None,
             &resolver,
             FIXTURE_NOW,
         )
@@ -1122,6 +1179,7 @@ mod tests {
                 &proof,
                 "other.svc.hyprstream.test",
                 &FIXTURE_REQUEST_ID,
+                None,
                 &resolver,
                 FIXTURE_NOW
             )
@@ -1134,12 +1192,12 @@ mod tests {
             "a response proof must never verify through the request path"
         );
         assert!(
-            // P-5 substitutes for P-4 (blocked on WS-A re-issue): any request
-            // proof must be refused through the response path.
+            // Any request proof must be refused through the response path.
             verify_response_proof(
                 &parse("P-5"),
                 "registry.svc.hyprstream.test",
                 &FIXTURE_REQUEST_ID,
+                None,
                 &resolver,
                 FIXTURE_NOW
             )
@@ -1181,6 +1239,7 @@ mod tests {
             &parse("P-3"),
             "registry.svc.hyprstream.test",
             &FIXTURE_REQUEST_ID,
+            None,
             &resolver,
             FIXTURE_NOW
         )
@@ -1194,6 +1253,7 @@ mod tests {
             &parse("P-3"),
             "registry.svc.hyprstream.test",
             &FIXTURE_REQUEST_ID,
+            None,
             &resolver,
             FIXTURE_NOW
         )

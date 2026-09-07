@@ -86,7 +86,13 @@ impl ProofClaims {
             };
             match ik {
                 x if x == CWT_CLAIM_AUD as i128 => {
-                    aud = Some(decode_text(val, "aud", 1, MAX_SERVICE_DOMAIN_BYTES)?);
+                    let domain = decode_text(val, "aud", 1, MAX_SERVICE_DOMAIN_BYTES)?;
+                    // The aud names a canonical service domain: the shared
+                    // `validate_service_domain` syntax (lowercase ASCII,
+                    // constrained punctuation), never normalized here —
+                    // canonical vectors N-29/N-30 deny on this rule.
+                    crate::envelope::validate_service_domain(&domain)?;
+                    aud = Some(domain);
                 }
                 x if x == CWT_CLAIM_EXP as i128 => {
                     exp = Some(decode_uint(val, "exp")?);

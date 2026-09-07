@@ -11,6 +11,9 @@
 //! 4: kem_recipient-or-null}`, with `response_kind = {1: unary, 2: stream_setup}`
 //! and `protection_mode = {1: cleartext, 2: encrypted}`. The KEM recipient is
 //! non-null iff `protection_mode == encrypted`, independent of `response_kind`.
+//! The cleartext MAP alternative is stream_setup-only: a cleartext unary
+//! response is neither encrypted nor streamed and is encoded as a null
+//! `response_binding`, never a map (canonical vector N-27).
 
 use anyhow::{bail, Result};
 use ciborium::value::Value as CborValue;
@@ -149,6 +152,16 @@ impl ResponseBinding {
                 if kem_recipient.is_some() {
                     bail!(
                         "response_binding: cleartext protection_mode must not carry kem_recipient"
+                    );
+                }
+                // The cleartext MAP alternative is streamed-but-not-encrypted
+                // only: a cleartext UNARY response is neither encrypted nor
+                // streamed, so it uses the null `response_binding` encoding,
+                // never a map (canonical vector N-27).
+                if response_kind != ResponseKind::StreamSetup {
+                    bail!(
+                        "response_binding: cleartext unary must use the null encoding; \
+                         the map form is stream_setup only"
                     );
                 }
             }
@@ -303,22 +316,40 @@ mod tests {
 
     /// Cleartext binding carries no recipient at key 4.
     #[test]
-    fn cleartext_unary_binding_forbids_recipient() {
+    fn cleartext_stream_setup_binding_forbids_recipient() {
         let ok = CborValue::Map(vec![
             (CborValue::Integer(1.into()), CborValue::Integer(9.into())),
-            (CborValue::Integer(2.into()), CborValue::Integer(1.into())),
-            (CborValue::Integer(3.into()), CborValue::Integer(1.into())),
+            (CborValue::Integer(2.into()), CborValue::Integer(2.into())), // stream_setup
+            (CborValue::Integer(3.into()), CborValue::Integer(1.into())), // cleartext
             (CborValue::Integer(4.into()), CborValue::Null),
         ]);
         assert!(ResponseBinding::decode(&ok).unwrap().is_some());
 
         let bad = CborValue::Map(vec![
             (CborValue::Integer(1.into()), CborValue::Integer(9.into())),
-            (CborValue::Integer(2.into()), CborValue::Integer(1.into())),
+            (CborValue::Integer(2.into()), CborValue::Integer(2.into())), // stream_setup
             (CborValue::Integer(3.into()), CborValue::Integer(1.into())), // cleartext
             (CborValue::Integer(4.into()), kem_map(ALG_ML_KEM_768)),
         ]);
         assert!(ResponseBinding::decode(&bad).is_err());
+    }
+
+    /// The cleartext MAP alternative is stream_setup-only: a cleartext unary
+    /// response is neither encrypted nor streamed and is encoded as a null
+    /// `response_binding`, never a map (canonical vector N-27).
+    #[test]
+    fn cleartext_unary_map_denies() {
+        let v = CborValue::Map(vec![
+            (CborValue::Integer(1.into()), CborValue::Integer(9.into())),
+            (CborValue::Integer(2.into()), CborValue::Integer(1.into())), // unary
+            (CborValue::Integer(3.into()), CborValue::Integer(1.into())), // cleartext
+            (CborValue::Integer(4.into()), CborValue::Null),
+        ]);
+        let err = ResponseBinding::decode(&v).unwrap_err().to_string();
+        assert!(
+            err.contains("null encoding"),
+            "cleartext unary map must deny on the null-encoding rule, got: {err}"
+        );
     }
 
     /// Encrypted binding without a recipient denies.

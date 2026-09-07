@@ -22,6 +22,7 @@ Usage:  python3 gen_proof_vectors.py [output_dir]
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -125,6 +126,16 @@ SUITE_HYBRID = "hs-cose-sign-ed25519-mldsa65-wns-v1"
 ALG_ED25519 = -19
 ALG_EDDSA_DEPRECATED = -8
 ALG_ML_DSA_65 = -49
+# Project-private ML-KEM-768 identifier hs-kem-ml-kem-768-v1 (Gate-2 §19 #5).
+ALG_HS_KEM_ML_KEM_768 = -70200
+
+# Orthogonal response-binding axes (Gate-2 §19 #4).
+KIND_UNARY, KIND_STREAM_SETUP = 1, 2
+PROTECTION_CLEARTEXT, PROTECTION_ENCRYPTED = 1, 2
+
+# A deliberately-unallocated private-use CWT claim key, used only by the
+# unknown-claim-key negative. It is in no allocated block (see the registry).
+UNKNOWN_CLAIM_KEY = -70050
 
 H_ALG, H_CRIT, H_KID, H_TYP = 1, 2, 4, 16
 H_DOMAIN, H_PLAN, H_GROUP, H_KEYSET = -70100, -70101, -70102, -70103
@@ -159,9 +170,71 @@ CAPNP_REQUEST_BYTES = bytes.fromhex(
 CAPNP_RESPONSE_BYTES = bytes.fromhex(
     "0000000000000000010000000f000000020003000000000000"
 )
-CREDENTIAL_BYTES = b"eyJhbGciOiJFZERTQSIsInR5cCI6ImF0K2p3dCJ9.FIXTURE.FIXTURE"
-CREDENTIAL_HASH = hashlib.sha256(CREDENTIAL_BYTES).digest()
+# F2: the authenticated positives hash a REAL, deterministic, profile-valid
+# at+jwt access token signed by the seeded credential-issuer Ed25519 key. The
+# tokens are built inside main() (they need the seeded keys); CREDENTIAL_HASH
+# (classical primary) and CREDENTIAL_HASH_HYBRID are bound there. No placeholder.
+# F1: dispositions are evaluated at this exact instant, injected by a conformance
+# runner instead of wall clock. iat=1786000000 <= verifier_now < exp=1786000030.
+VERIFIER_NOW = 1786000015
+ISSUER_ISS = "https://issuer.hyprstream.test"
+# RFC 9068 §2.2.1 requires `client_id` in an at+jwt access token: the OAuth client
+# the token was issued to. JWT-only (the CWT credential N-1 is not an RFC 9068 JWT).
+CREDENTIAL_CLIENT_ID = "hyprstream-oauth-client-1"
+CREDENTIAL_SUBJECT = "user-1"
+CREDENTIAL_TENANT = "tenant-alpha"           # JWT text name for the -70005 tenant claim
+# K1: an OIDC user session (§3.2). The authoritative session expiry lives in the
+# authority's session state keyed by (iss, sid) — NOT on the credential wire. It is
+# EARLIER than the credential expiry (1786000030) but still after verifier_now
+# (1786000015), so the session is active yet a longer-lived proof outlives it.
+SESSION_ID = "sess-6b1e0a7c9d2f4a08"
+SESSION_EXP = 1786000020
+# Y1: a workload credential family (§3.3) carries a `workload_session_id` in a
+# DISJOINT namespace keyed by (iss, workload_session_id) — never OIDC `sid`. Its
+# authoritative session has session_kind == "workload". Distinct subject from the
+# user-session fixture so subject-binding is exercised.
+WORKLOAD_SESSION_ID = "ws-family-3d90c1a7"
+WORKLOAD_SESSION_EXP = 1786000022
+WORKLOAD_SUBJECT = "workload-1"
+# Y1: signed-CWT-control sessions — each resolves EXACTLY ONE
+# cwt_workload_session_controls entry and is defective in exactly one field
+# (revoked / expired / wrong-kind / cross-tenant, §3.3), so that control's sole
+# denial cause and its store repair are both pinned. Distinct ids keep the one
+# shared session store from cross-contaminating controls.
+WORKLOAD_SESSION_REVOKED_ID = "ws-ctl-revoked-4c81"
+WORKLOAD_SESSION_EXPIRED_ID = "ws-ctl-expired-9d02"
+WORKLOAD_SESSION_WRONG_KIND_ID = "ws-ctl-kind-7a33"
+WORKLOAD_SESSION_CROSS_TENANT_ID = "ws-ctl-tenant-5e88"
+# W1: proof freshness at the frozen verifier clock (mac-1499-design-v16.md §4.5;
+# matches the landed C dispatch constants). All three bounds are VERIFIER-CLOCK
+# bounds, NOT issued-lifetime (`exp - iat`). A proof is fresh iff
+#   |iat - verifier_now| <= MAX_CLOCK_SKEW_SECS   (iat within skew, BOTH sides),
+#   verifier_now < exp                            (not expired), and
+#   exp - verifier_now <= the disposition maximum (remaining lifetime within bound).
+# The remaining-lifetime maximum is pinned EXPLICITLY per proof disposition
+# (Authenticated 300s, Unattributed 30s), matching C. Every shipped positive has
+# iat=1786000000 (|iat-now|=15 <= 30) and exp in {1786000020, 1786000030}: unexpired
+# at verifier_now=1786000015 with exp-now in {5, 15} — within both disposition bounds.
+MAX_CLOCK_SKEW_SECS = 30
+PROOF_MAX_REMAINING_LIFETIME_SECS = {
+    "authenticated": 300,
+    "unattributed": 30,
+}
+CREDENTIAL_CLEARANCE = [2, [5, 7]]           # [level, compartments]; -70006 (JWT text: clearance)
 ML_KEM_768_RECIPIENT = bytes(range(256)) * 4 + bytes(range(160))  # 1184 bytes
+
+
+def b64u(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+
+def signer_suite_thumbprint(suite_id: str, pubkeys: list) -> bytes:
+    """The cnf-resolved signer-suite record (credential-profile §5): SHA-256 over
+    the RFC 8949 deterministic encoding of [suite_id, [ordered raw component
+    public keys]]. Uniformly covers a classical (1-key) and a hybrid (2-key)
+    primary group. Distinct from the C1 replay thumbprint (no domain separator,
+    no enrollment epoch): this binds key material, replay binds the enrollment."""
+    return hashlib.sha256(enc([suite_id, list(pubkeys)])).digest()
 
 
 # --------------------------------------------------------------------------
@@ -226,11 +299,18 @@ class MlDsaKey:
 
 
 KID_CLIENT_ED = b"client-ed25519-1"
+# V1 (CDDL §6, cross-suite component-key non-reuse): the hybrid suite's Ed25519
+# component is a DISTINCT enrolled key from the standalone classical enrollment's
+# key, so no component public key is enrolled for two suites at once.
+KID_CLIENT_ED_HY = b"client-ed25519-hy-1"
+KID_CLIENT_ED_WL = b"client-ed25519-wl-1"  # A1: workload-1 primary key
 KID_CLIENT_ML = b"client-mldsa65-1"
 KID_APPROVER_ED = b"approver-ed25519-1"
 KID_SERVICE_ED = b"service-ed25519-1"
+KID_SERVICE_ED_2 = b"service-ed25519-2"  # A3: second enrolled response-service signer
 KID_UNATTRIBUTED_ED = b"unattributed-ed25519-1"
 KID_UNATTRIBUTED_ML = b"unattributed-mldsa65-1"
+KID_ISSUER_ED = b"issuer-ed25519-1"  # credential issuer (type-confusion vectors)
 
 
 # --------------------------------------------------------------------------
@@ -284,14 +364,17 @@ def request_claims(
     return claims
 
 
-def response_binding(mode: int, kem=None) -> dict:
-    return {1: SCHEMA_ID_RESPONSE, 2: mode, 3: kem}
+def response_binding(kind: int, protection: int, kem=None) -> dict:
+    # Frozen 4-key closed map (Gate-2 §19 #3/#4): root type id, orthogonal
+    # response_kind and protection_mode axes, and the KEM recipient (non-null
+    # iff protection_mode is encrypted).
+    return {1: SCHEMA_ID_RESPONSE, 2: kind, 3: protection, 4: kem}
 
 
 def kem_recipient() -> dict:
-    # alg slot carries the profile's ML-KEM-768 identifier; PROPOSED pending
-    # the draft-ietf-cose-hpke-pq-pqt registration (see the CDDL).
-    return {1: -70200, 2: ML_KEM_768_RECIPIENT, 3: b"service-mlkem768-1"}
+    # The alg slot carries the profile's frozen project-private ML-KEM-768
+    # identifier -70200 (Gate-2 §19 #5). The exact value is REQUIRED.
+    return {1: ALG_HS_KEM_ML_KEM_768, 2: ML_KEM_768_RECIPIENT, 3: b"service-mlkem768-1"}
 
 
 def sig_structure_sign1(body_protected: bytes, payload: bytes) -> bytes:
@@ -318,13 +401,127 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         seed_c_ed, sk_c_ed = ed25519_key(0x00)
+        seed_c_ed_hy, sk_c_ed_hy = ed25519_key(0x01)  # V1: distinct hybrid-suite Ed25519 component
+        seed_c_ed_wl, sk_c_ed_wl = ed25519_key(0x02)  # A1: workload-1 primary key (distinct)
         seed_a_ed, sk_a_ed = ed25519_key(0x40)
         seed_s_ed, sk_s_ed = ed25519_key(0x60)
+        seed_s_ed_2, sk_s_ed_2 = ed25519_key(0x61)    # A3: second response-service signer key
         seed_u_ed, sk_u_ed = ed25519_key(0x80)
+        seed_i_ed, sk_i_ed = ed25519_key(0xC0)  # credential issuer
+        # Q2: nine independent Ed25519 signers for the isolated group-cap negative N-6.
+        cap_signers = [ed25519_key(0xD0 + i) for i in range(9)]  # (seed, sk) per group
+        cap_kids = [f"cap-signer-{i + 1}".encode() for i in range(9)]
         ml_client = MlDsaKey(bytes((0x20 + i) & 0xFF for i in range(32)), work, "client")
         ml_unattributed = MlDsaKey(
             bytes((0xA0 + i) & 0xFF for i in range(32)), work, "unattributed"
         )
+
+        # ---- F2: deterministic profile-valid at+jwt credential context --------
+        issuer_pub = sk_i_ed.public_key().public_bytes_raw()
+        client_ed_pub = sk_c_ed.public_key().public_bytes_raw()
+        client_ed_hy_pub = sk_c_ed_hy.public_key().public_bytes_raw()  # V1: hybrid Ed25519 component
+        approver_ed_pub = sk_a_ed.public_key().public_bytes_raw()  # Q1 approver enrollment
+        service_ed_pub = sk_s_ed.public_key().public_bytes_raw()   # Z1 response-signer enrollment
+        # cnf-resolved signer-suite records for the authenticated positives'
+        # PRIMARY groups: classical = [client Ed25519]; hybrid = [client Ed25519 (hy),
+        # client ML-DSA-65] (approver groups bind their own enrollment, never cnf).
+        # V1 (CDDL §6): the hybrid Ed25519 component is a DISTINCT enrolled key from
+        # the standalone classical enrollment — no component key is enrolled twice.
+        cnf_classical = signer_suite_thumbprint(SUITE_CLASSICAL, [client_ed_pub])
+        cnf_hybrid = signer_suite_thumbprint(SUITE_HYBRID, [client_ed_hy_pub, ml_client.public])
+
+        # T1: authoritative off-wire PRIMARY enrollment records for the authenticated
+        # credential path, keyed by cryptographic content (suite + ordered public
+        # keys). The credential cnf binds to exactly this record, and the
+        # authenticated replay thumbprint's enrollment_epoch is DERIVED from it (not a
+        # fixture literal). Distinct from approver_enrollments (role "primary").
+        PRIMARY_ENROLLMENT_EPOCH = 1
+
+        def primary_enrollment(suite, pubs, principal=CREDENTIAL_SUBJECT):
+            return {
+                "suite_id": suite,
+                "component_public_keys_hex": [p.hex() for p in pubs],
+                "thumbprint_b64": b64u(signer_suite_thumbprint(suite, pubs)),
+                "role": "primary",
+                "tenant": CREDENTIAL_TENANT,
+                "principal": principal,
+                "status": "active",
+                "expires_at": 1786000060,
+                "enrollment_epoch": PRIMARY_ENROLLMENT_EPOCH,
+            }
+
+        primary_enrollment_classical = primary_enrollment(SUITE_CLASSICAL, [client_ed_pub])
+        primary_enrollment_hybrid = primary_enrollment(SUITE_HYBRID, [client_ed_hy_pub, ml_client.public])
+        # A1: a workload-specific primary key + enrollment whose principal is exactly
+        # `workload-1` (never reusing another enrollment's component key), so the
+        # workload credential's cnf resolves a coherent primary record.
+        workload_ed_pub = sk_c_ed_wl.public_key().public_bytes_raw()
+        cnf_workload = signer_suite_thumbprint(SUITE_CLASSICAL, [workload_ed_pub])
+        primary_enrollment_workload = primary_enrollment(
+            SUITE_CLASSICAL, [workload_ed_pub], principal=WORKLOAD_SUBJECT)
+        service_ed_2_pub = sk_s_ed_2.public_key().public_bytes_raw()  # A3 second response signer
+
+        def build_at_jwt(jti: str, cnf_thumbprint: bytes, *, sid: str = None, exp: int = EXP,
+                         sub: str = CREDENTIAL_SUBJECT, workload_session_id: str = None,
+                         aud: str = SERVICE_DOMAIN):
+            """A compact JWS (RFC 7519/8725) access token: exact at+jwt header,
+            EdDSA over the seeded issuer key, and every required v16
+            authenticated-dispatch claim. Ed25519 + canonical JSON => byte-stable.
+            A user-session credential carries the OIDC `sid` (§3.2); a workload-family
+            credential carries `workload_session_id` (§3.3) in a disjoint namespace.
+            `exp`/`sub` override the credential expiry/subject."""
+            header = {"alg": "EdDSA", "kid": KID_ISSUER_ED.decode(), "typ": "at+jwt"}
+            claims = {
+                "iss": ISSUER_ISS,
+                "sub": sub,
+                "aud": aud,
+                "iat": IAT,
+                "exp": exp,
+                "jti": jti,
+                "client_id": CREDENTIAL_CLIENT_ID,
+                "tenant": CREDENTIAL_TENANT,
+                "clearance": CREDENTIAL_CLEARANCE,
+                "cnf": {"hs_signer_suite": b64u(cnf_thumbprint)},
+            }
+            if sid is not None:
+                claims["sid"] = sid
+            if workload_session_id is not None:
+                claims["workload_session_id"] = workload_session_id
+            hp = b64u(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
+            pp = b64u(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
+            signing_input = f"{hp}.{pp}".encode("ascii")
+            sig = sk_i_ed.sign(signing_input)
+            token = f"{hp}.{pp}.{b64u(sig)}"
+            return token, header, claims
+
+        cred_classical, hdr_classical, claims_classical = build_at_jwt("cred-classical-1", cnf_classical)
+        cred_hybrid, hdr_hybrid, claims_hybrid = build_at_jwt("cred-hybrid-1", cnf_hybrid)
+        other_aud = "other.svc.hyprstream.test"
+        cred_other, hdr_other, claims_other = build_at_jwt(
+            "cred-other-audience-1", cnf_classical, aud=other_aud)
+        credential_hash_other = hashlib.sha256(cred_other.encode("ascii")).digest()
+        # K1: a user-session at+jwt credential carrying OIDC `sid`; its authoritative
+        # session record (below) has an EARLIER expiry than the credential, so a proof
+        # can be within the credential bound yet outlive the session.
+        cred_session, hdr_session, claims_session = build_at_jwt(
+            "cred-session-1", cnf_classical, sid=SESSION_ID)
+        # W1: a long-lived, otherwise-valid classical credential (exp = 1786000415,
+        # i.e. verifier_now + 400) that hosts the authenticated freshness negatives
+        # whose exp must reach beyond verifier_now + 300 (the Authenticated maximum)
+        # without tripping the credential-expiry bound. Not mapped to any positive.
+        CREDENTIAL_LONGLIVED_EXP = 1786000415
+        cred_longlived, hdr_longlived, claims_longlived = build_at_jwt(
+            "cred-longlived-1", cnf_classical, exp=CREDENTIAL_LONGLIVED_EXP)
+        # Y1: a workload-family credential carrying `workload_session_id` (no `sid`),
+        # bound to an authoritative workload session (session_kind == "workload").
+        cred_workload, hdr_workload, claims_workload = build_at_jwt(
+            "cred-workload-1", cnf_workload, sub=WORKLOAD_SUBJECT,
+            workload_session_id=WORKLOAD_SESSION_ID)
+        CREDENTIAL_HASH = hashlib.sha256(cred_classical.encode("ascii")).digest()
+        CREDENTIAL_HASH_HYBRID = hashlib.sha256(cred_hybrid.encode("ascii")).digest()
+        CREDENTIAL_HASH_SESSION = hashlib.sha256(cred_session.encode("ascii")).digest()
+        CREDENTIAL_HASH_LONGLIVED = hashlib.sha256(cred_longlived.encode("ascii")).digest()
+        CREDENTIAL_HASH_WORKLOAD = hashlib.sha256(cred_workload.encode("ascii")).digest()
 
         keys_doc = {
             "warning": (
@@ -333,11 +530,25 @@ def main() -> None:
             ),
             "ed25519": [
                 {
-                    "role": "authenticated primary signer (credential cnf-bound)",
+                    "role": "authenticated primary signer (classical credential cnf-bound)",
                     "kid_hex": KID_CLIENT_ED.hex(),
                     "kid_ascii": KID_CLIENT_ED.decode(),
                     "seed_hex": seed_c_ed.hex(),
                     "public_hex": sk_c_ed.public_key().public_bytes_raw().hex(),
+                },
+                {
+                    "role": "authenticated primary signer (HYBRID credential cnf-bound, V1 distinct Ed25519 component)",
+                    "kid_hex": KID_CLIENT_ED_HY.hex(),
+                    "kid_ascii": KID_CLIENT_ED_HY.decode(),
+                    "seed_hex": seed_c_ed_hy.hex(),
+                    "public_hex": sk_c_ed_hy.public_key().public_bytes_raw().hex(),
+                },
+                {
+                    "role": "authenticated primary signer (WORKLOAD credential cnf-bound, A1 workload-1 principal)",
+                    "kid_hex": KID_CLIENT_ED_WL.hex(),
+                    "kid_ascii": KID_CLIENT_ED_WL.decode(),
+                    "seed_hex": seed_c_ed_wl.hex(),
+                    "public_hex": sk_c_ed_wl.public_key().public_bytes_raw().hex(),
                 },
                 {
                     "role": "approver signer group 2",
@@ -354,12 +565,36 @@ def main() -> None:
                     "public_hex": sk_s_ed.public_key().public_bytes_raw().hex(),
                 },
                 {
+                    "role": "second enrolled service response signer (A3 exactly-one negative)",
+                    "kid_hex": KID_SERVICE_ED_2.hex(),
+                    "kid_ascii": KID_SERVICE_ED_2.decode(),
+                    "seed_hex": seed_s_ed_2.hex(),
+                    "public_hex": sk_s_ed_2.public_key().public_bytes_raw().hex(),
+                },
+                {
                     "role": "unattributed self-asserted signer",
                     "kid_hex": KID_UNATTRIBUTED_ED.hex(),
                     "kid_ascii": KID_UNATTRIBUTED_ED.decode(),
                     "seed_hex": seed_u_ed.hex(),
                     "public_hex": sk_u_ed.public_key().public_bytes_raw().hex(),
                 },
+                {
+                    "role": "credential issuer (type-confusion vectors N-1/N-2)",
+                    "kid_hex": KID_ISSUER_ED.hex(),
+                    "kid_ascii": KID_ISSUER_ED.decode(),
+                    "seed_hex": seed_i_ed.hex(),
+                    "public_hex": sk_i_ed.public_key().public_bytes_raw().hex(),
+                },
+                *[
+                    {
+                        "role": f"group-cap signer {i + 1} (N-6, Q2)",
+                        "kid_hex": cap_kids[i].hex(),
+                        "kid_ascii": cap_kids[i].decode(),
+                        "seed_hex": cap_signers[i][0].hex(),
+                        "public_hex": cap_signers[i][1].public_key().public_bytes_raw().hex(),
+                    }
+                    for i in range(9)
+                ],
             ],
             "ml_dsa_65": [
                 {
@@ -394,8 +629,9 @@ def main() -> None:
                 "capnp_schema_id_response": SCHEMA_ID_RESPONSE,
                 "capnp_request_bytes_hex": CAPNP_REQUEST_BYTES.hex(),
                 "capnp_response_bytes_hex": CAPNP_RESPONSE_BYTES.hex(),
-                "credential_bytes_ascii": CREDENTIAL_BYTES.decode(),
-                "credential_hash_hex": CREDENTIAL_HASH.hex(),
+                "verifier_now": VERIFIER_NOW,
+                "credential_hash_classical_hex": CREDENTIAL_HASH.hex(),
+                "credential_hash_hybrid_hex": CREDENTIAL_HASH_HYBRID.hex(),
                 "external_aad": "zero-length",
             },
         }
@@ -482,12 +718,14 @@ def main() -> None:
         )
 
         # ---------------- P-2: authenticated hybrid COSE_Sign ---------------
+        # V1: the Ed25519 component is the DISTINCT hybrid-suite key (KID_CLIENT_ED_HY),
+        # matching the hybrid primary enrollment / cnf — never the classical key.
         plan_hybrid = [
             group(
                 1,
                 SUITE_HYBRID,
                 [
-                    component(ALG_ED25519, KID_CLIENT_ED),
+                    component(ALG_ED25519, KID_CLIENT_ED_HY),
                     component(ALG_ML_DSA_65, KID_CLIENT_ML),
                 ],
             )
@@ -498,16 +736,16 @@ def main() -> None:
             H_DOMAIN: DOMAIN_REQUEST,
             H_PLAN: plan_hybrid,
         }
-        p2_claims = request_claims(credential_hash=CREDENTIAL_HASH)
+        p2_claims = request_claims(credential_hash=CREDENTIAL_HASH_HYBRID)
         p2_entries = [
             (
                 {
                     H_ALG: ALG_ED25519,
                     H_CRIT: CRIT_SIGN_SIGNATURE,
-                    H_KID: KID_CLIENT_ED,
+                    H_KID: KID_CLIENT_ED_HY,
                     H_GROUP: 1,
                 },
-                sk_c_ed,
+                sk_c_ed_hy,
             ),
             (
                 {
@@ -563,10 +801,13 @@ def main() -> None:
             p3,
             protected_hex=p3_prot.hex(),
             payload_hex=p3_payload.hex(),
+            originating_request="P-2",  # L2: an exact null-binding originating request
             notes=(
                 "cti echoes the request_id; capnp_schema_id/body carry the response "
                 "root type and exact response bytes; hs_unattributed_key_set is "
-                "forbidden in this profile."
+                "forbidden in this profile. Its originating request (P-2) carries a "
+                "null response_binding, so a full response verifier runs aud/cti/"
+                "schema/null-binding comparisons (all equal)."
             ),
         )
 
@@ -583,21 +824,56 @@ def main() -> None:
             H_PLAN: plan_classical_client,
             H_GROUP: 1,
         }
+        # The originating request's response_binding (reused by the bound
+        # response proof P-7 and the mismatch negative N-32 for field-for-field
+        # equality testing).
+        p4_response_binding = response_binding(
+            KIND_UNARY, PROTECTION_ENCRYPTED, kem_recipient()
+        )
         p4_claims = request_claims(
             credential_hash=CREDENTIAL_HASH,
-            response_binding=response_binding(2, kem_recipient()),
+            response_binding=p4_response_binding,
         )
         p4, p4_prot, p4_payload = sign1(p4_protected, p4_claims, sk_c_ed)
         record(
             positives,
             "P-4",
-            "Authenticated COSE_Sign1 with a non-null response_binding (encrypted response)",
+            "Authenticated COSE_Sign1 with an encrypted response_binding (unary, ML-KEM-768)",
             "accept",
             "COSE_Sign1",
             p4,
             protected_hex=p4_prot.hex(),
             payload_hex=p4_payload.hex(),
-            notes="response_binding carries the response schema id, mode, and KEM recipient.",
+            notes=(
+                "response_binding: root type id, response_kind=unary, "
+                "protection_mode=encrypted, and the ML-KEM-768 recipient (alg -70200)."
+            ),
+        )
+
+        # ---------------- P-6: cleartext stream-setup response binding ------
+        # Exercises the orthogonal axes (Gate-2 §19 #4): response_kind=stream_setup
+        # combined with protection_mode=cleartext and a null recipient.
+        p6_protected = dict(p4_protected)
+        p6_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH,
+            response_binding=response_binding(
+                KIND_STREAM_SETUP, PROTECTION_CLEARTEXT, None
+            ),
+        )
+        p6, p6_prot, p6_payload = sign1(p6_protected, p6_claims, sk_c_ed)
+        record(
+            positives,
+            "P-6",
+            "Authenticated COSE_Sign1 with a cleartext stream-setup response_binding",
+            "accept",
+            "COSE_Sign1",
+            p6,
+            protected_hex=p6_prot.hex(),
+            payload_hex=p6_payload.hex(),
+            notes=(
+                "response_kind=stream_setup and protection_mode=cleartext are "
+                "orthogonal; a cleartext binding carries a null KEM recipient."
+            ),
         )
 
         # ---------------- P-5: multi-party authorization --------------------
@@ -646,43 +922,248 @@ def main() -> None:
             notes="Two groups, two principals, one approval each; not a countersignature.",
         )
 
+        # ---------------- P-7: BOUND response proof -------------------------
+        # A response proof whose realized response_binding equals the originating
+        # request's (P-4) field-for-field. This exercises §4's rule that the
+        # response proof's binding MUST equal the request's map where both are
+        # present — not merely local map shape.
+        p7_protected = dict(p3_protected)  # response typ/domain, service key, classical plan
+        p7_claims = request_claims(
+            credential_hash=None,
+            schema_id=SCHEMA_ID_RESPONSE,
+            body=CAPNP_RESPONSE_BYTES,
+            response_binding=p4_response_binding,   # identical to the request's binding
+        )
+        p7, p7_prot, p7_payload = sign1(p7_protected, p7_claims, sk_s_ed)
+        record(
+            positives,
+            "P-7",
+            "Bound response proof whose response_binding equals the originating request (P-4)",
+            "accept",
+            "COSE_Sign1",
+            p7,
+            protected_hex=p7_prot.hex(),
+            payload_hex=p7_payload.hex(),
+            originating_request="P-4",
+            notes=(
+                "Realized response binding equals P-4's request binding "
+                "field-for-field; cti echoes the request_id."
+            ),
+        )
+
+        # ---------------- P-8: hybrid UNATTRIBUTED COSE_Sign ----------------
+        # A hybrid unattributed proof: one logical signer group, two components
+        # (Ed25519 + ML-DSA-65). Its self-asserted key set carries both public
+        # keys in the plan's component order; each signature is verified against
+        # its EMBEDDED key, so this exercises multi-key keyset correspondence.
+        plan_unatt_hybrid = [
+            group(1, SUITE_HYBRID, [
+                component(ALG_ED25519, KID_UNATTRIBUTED_ED),
+                component(ALG_ML_DSA_65, KID_UNATTRIBUTED_ML),
+            ])
+        ]
+        keyset_unatt_hybrid = [
+            cose_key_okp_ed25519(KID_UNATTRIBUTED_ED, sk_u_ed.public_key().public_bytes_raw()),
+            cose_key_akp_mldsa65(KID_UNATTRIBUTED_ML, ml_unattributed.public),
+        ]
+        p8_body = {
+            H_CRIT: CRIT_SIGN_BODY_UNATTRIBUTED,
+            H_TYP: TYP_REQUEST,
+            H_DOMAIN: DOMAIN_REQUEST,
+            H_PLAN: plan_unatt_hybrid,
+            H_KEYSET: keyset_unatt_hybrid,
+        }
+        p8_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_UNATTRIBUTED_ED, H_GROUP: 1}, sk_u_ed),
+            ({H_ALG: ALG_ML_DSA_65, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_UNATTRIBUTED_ML, H_GROUP: 1}, ml_unattributed),
+        ]
+        p8, p8_body_prot, p8_payload = sign_multi(
+            p8_body, request_claims(credential_hash=None, nonce=CHALLENGE), p8_entries
+        )
+        record(
+            positives,
+            "P-8",
+            "Hybrid unattributed COSE_Sign; two embedded keys in plan order, verified 1:1",
+            "accept",
+            "COSE_Sign",
+            p8,
+            protected_hex=p8_body_prot.hex(),
+            payload_hex=p8_payload.hex(),
+            notes=(
+                "hs_unattributed_key_set carries the Ed25519 then ML-DSA-65 public "
+                "keys in the plan's component order; each signature verifies against "
+                "its embedded key."
+            ),
+        )
+
+        # ---------------- P-9: session-bound classical proof (K1) -----------
+        # An authenticated classical proof bound to the user-session credential.
+        # Its exp equals the authoritative session expiry (1786000020) — within BOTH
+        # the credential exp (1786000030) and the session exp — so it accepts. It is
+        # the boundary-accept counterpart to N-51 (which outlives the session).
+        p9_claims = request_claims(credential_hash=CREDENTIAL_HASH_SESSION, extra={C_EXP: SESSION_EXP})
+        p9, p9_prot, p9_payload = sign1(p4_protected, p9_claims, sk_c_ed)
+        record(
+            positives, "P-9",
+            "Session-bound classical proof whose exp equals the authoritative session expiry",
+            "accept", "COSE_Sign1", p9,
+            protected_hex=p9_prot.hex(),
+            payload_hex=p9_payload.hex(),
+            notes=(
+                "Bound to the user-session credential (sid); proof exp 1786000020 <= "
+                "session exp 1786000020 <= credential exp 1786000030, valid at "
+                "verifier_now 1786000015."
+            ),
+        )
+
+        # ---------------- P-10: workload-session-bound classical proof (A1) --
+        # An authenticated classical proof bound to the WORKLOAD credential, signed by
+        # the workload-specific primary key. Its cnf resolves the workload primary
+        # enrollment (principal `workload-1`), and its exp is within the workload
+        # session bound (1786000022) and the credential exp (1786000030). This makes
+        # the workload credential's terminal-principal / signer-suite / workload-session
+        # / tenant / clearance-epoch / proof-expiry coherence LOAD-BEARING in both
+        # layers (previously `workload` was in no positive→credential mapping).
+        p10_plan = [group(1, SUITE_CLASSICAL, [component(ALG_ED25519, KID_CLIENT_ED_WL)])]
+        p10_protected = {
+            H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN1_AUTH, H_KID: KID_CLIENT_ED_WL,
+            H_TYP: TYP_REQUEST, H_DOMAIN: DOMAIN_REQUEST, H_PLAN: p10_plan, H_GROUP: 1,
+        }
+        p10_claims = request_claims(credential_hash=CREDENTIAL_HASH_WORKLOAD, extra={C_EXP: WORKLOAD_SESSION_EXP})
+        p10, p10_prot, p10_payload = sign1(p10_protected, p10_claims, sk_c_ed_wl)
+        record(
+            positives, "P-10",
+            "Workload-session-bound classical proof (workload primary key; exp within the workload session)",
+            "accept", "COSE_Sign1", p10,
+            protected_hex=p10_prot.hex(),
+            payload_hex=p10_payload.hex(),
+            notes=(
+                "Bound to the workload credential (workload_session_id); cnf resolves the "
+                "workload primary enrollment (principal workload-1); proof exp 1786000022 "
+                "<= workload session exp 1786000022 <= credential exp 1786000030."
+            ),
+        )
+
+        # P-11 supplies N-59's real authenticated request context. Both request and
+        # credential target the alternate audience; only RESPONSE enrollment is absent.
+        p11_claims = request_claims(credential_hash=credential_hash_other, aud=other_aud)
+        p11, p11_prot, p11_payload = sign1(p4_protected, p11_claims, sk_c_ed)
+        record(
+            positives, "P-11", "Authenticated request for N-59's alternate audience",
+            "accept", "COSE_Sign1", p11,
+            protected_hex=p11_prot.hex(), payload_hex=p11_payload.hex(),
+            notes="Valid issuer-signed alternate-audience credential, enrolled classical primary, and null response binding; no response signer is enrolled for this audience.",
+        )
+
         # =================== NEGATIVE VECTORS ===============================
 
-        # N-1: credential presented in the proof slot.
+        # N-1: a genuinely VALID CWT credential presented in the proof slot.
+        # This is a real issuer-signed CWT access token (COSE_Sign1, typ
+        # application/cwt per RFC 8392, signed by the ISSUER key over registered
+        # claims) — not a proof-shaped object signed with a request-proof key.
+        # Only its presentation context is wrong: presented in the proof slot it
+        # denies because its typ is not the proof typ and it is issuer-signed
+        # rather than cnf-bound, so the vector exercises credential-in-proof-slot
+        # rejection of a well-formed credential (not merely a malformed token).
         n1_protected = {
             H_ALG: ALG_ED25519,
-            H_KID: KID_CLIENT_ED,
-            H_TYP: "application/at+jwt",
+            H_KID: KID_ISSUER_ED,
+            H_TYP: "application/cwt",
         }
-        n1_claims = {1: "https://issuer.hyprstream.test", 2: "user-1", C_AUD: SERVICE_DOMAIN, C_EXP: EXP, C_IAT: IAT, C_CTI: REQUEST_ID}
-        n1, _, _ = sign1(n1_protected, n1_claims, sk_c_ed)
+        # A PROFILE-VALID v16 credential: registered claims plus the frozen
+        # amendment-10 credential claims. cnf (8) is a valid RFC 8747 PoP binding
+        # (a COSE_Key confirmation to the client's Ed25519 key); -70005 tenant and
+        # -70006 clearance ([level, compartments]; value 11) are the frozen
+        # credential keys. v16 credentials are Reusable-only, so there is no
+        # use-profile field at all; only its presentation slot is wrong.
+        n1_claims = {
+            1: "https://issuer.hyprstream.test",  # iss
+            2: "user-1",                          # sub
+            C_AUD: SERVICE_DOMAIN,                # aud
+            C_EXP: EXP,
+            C_IAT: IAT,
+            C_CTI: bytes.fromhex("a1b2c3d4e5f60718293a4b5c6d7e8f90"),  # cti
+            8: {1: cose_key_okp_ed25519(          # cnf: RFC 8747 COSE_Key PoP binding
+                KID_CLIENT_ED, sk_c_ed.public_key().public_bytes_raw()
+            )},
+            -70005: "tenant-alpha",               # tenant (amendment 10)
+            -70006: [2, [5, 7]],                  # clearance [level, compartments]; assurance absent
+        }
+        n1, _, _ = sign1(n1_protected, n1_claims, sk_i_ed)
+        # Typed revocation controls keep every N-1 credential field except cti.
+        # JWT-like bytes must not collide with the revoked textual jti, and a
+        # non-UTF8 cti proves binary identifiers remain lossless.
+        cwt_revocation_controls = []
+        for ident, revoked in ((b"cred-revoked-1", False), (b"\xffcwt-revoked-1", True)):
+            raw, _, _ = sign1(n1_protected, {**n1_claims, C_CTI: ident}, sk_i_ed)
+            cwt_revocation_controls.append({"cbor_hex": raw.hex(), "expect_revoked": revoked})
+        # Y1: signed CWT workload-session controls (§3.3). Every control binds the
+        # same workload-family claims (sub workload-1, tenant-alpha, the workload
+        # cnf key) and differs ONLY in the -70007 session id (or the claim's null
+        # type), so each defect denies on that sole cause and its store repair
+        # admits. The valid control resolves the shipped workload session; a
+        # credential with NO -70007 claim at all is the shipped N-1 (sessionless).
+        workload_ws_claims = {
+            1: ISSUER_ISS,
+            2: WORKLOAD_SUBJECT,
+            C_AUD: SERVICE_DOMAIN,
+            C_EXP: EXP,
+            C_IAT: IAT,
+            C_CTI: bytes.fromhex("b7c1d2e3f405162738495a6b7c8d9e0f"),
+            8: {1: cose_key_okp_ed25519(
+                KID_CLIENT_ED_WL, sk_c_ed_wl.public_key().public_bytes_raw()
+            )},
+            -70005: CREDENTIAL_TENANT,
+            -70006: CREDENTIAL_CLEARANCE,
+        }
+        cwt_workload_session_controls = []
+        for ws_id, expect in (
+            (WORKLOAD_SESSION_ID, "valid"),
+            (WORKLOAD_SESSION_REVOKED_ID, "revoked"),
+            (WORKLOAD_SESSION_EXPIRED_ID, "expired"),
+            (WORKLOAD_SESSION_WRONG_KIND_ID, "wrong_kind"),
+            (WORKLOAD_SESSION_CROSS_TENANT_ID, "cross_tenant"),
+            (None, "present_null"),
+        ):
+            raw, _, _ = sign1(n1_protected, {**workload_ws_claims, -70007: ws_id}, sk_i_ed)
+            cwt_workload_session_controls.append({"cbor_hex": raw.hex(), "expect": expect})
         record(
             negatives,
             "N-1",
-            "Credential (access token) presented in the proof slot",
+            "Profile-valid issuer-signed CWT credential (cnf/tenant/clearance) presented in the proof slot",
             "deny",
             "COSE_Sign1",
             n1,
             deny_class="type-confusion",
-            deny_rule="protected typ is not application/vnd.hyprstream.proof+cwt",
-            notes="Denies before any claim is interpreted.",
+            deny_rule=(
+                "a valid credential (typ application/cwt, issuer-signed, with cnf, "
+                "tenant, and clearance) is not a request proof: its typ is not "
+                "application/vnd.hyprstream.proof+cwt and it is not signed by a "
+                "cnf-bound proof key"
+            ),
+            notes=(
+                "A profile-valid v16 (Reusable) credential: registered claims, "
+                "RFC 8747 cnf PoP binding, tenant -70005, clearance -70006, and no "
+                "use-profile field. Only its presentation slot is wrong."
+            ),
         )
 
-        # N-2: proof CWT presented as a credential.
+        # N-2: the proof CWT (the two-entry COSE_Sign P-2) presented in the
+        # credential/authorization slot. Labelled COSE_Sign to match its bytes.
         record(
             negatives,
             "N-2",
-            "Proof CWT presented in the credential/authorization slot",
+            "Proof CWT (COSE_Sign) presented in the credential/authorization slot",
             "deny",
-            "COSE_Sign1",
+            "COSE_Sign",
             p2,
             deny_class="type-confusion",
             deny_rule=(
-                "credential verification requires the at+jwt or CWT access-token "
-                "type and an issuer key; the proof carries the proof typ and is "
-                "signed by a cnf-bound request-proof key"
+                "credential verification requires the credential typ "
+                "(application/cwt or at+jwt) and an issuer key; the proof carries "
+                "the proof typ and is signed by a cnf-bound request-proof key"
             ),
-            notes="Same bytes as P-2, presented in the wrong slot.",
+            notes="Same bytes as P-2 (a COSE_Sign), presented in the wrong slot.",
         )
 
         # N-3: missing typ.
@@ -715,19 +1196,21 @@ def main() -> None:
             deny_rule="typ and hs_domain must both match the request-proof profile",
         )
 
-        # N-5: stripped ML-DSA component.
+        # N-5: stripped ML-DSA component. The retained Ed25519 entry matches the
+        # hybrid plan's Ed25519 component (V1 distinct hybrid key), so only the ML
+        # component is left uncovered.
         n5_body = enc(p2_body)
         n5_first_prot = enc(
             {
                 H_ALG: ALG_ED25519,
                 H_CRIT: CRIT_SIGN_SIGNATURE,
-                H_KID: KID_CLIENT_ED,
+                H_KID: KID_CLIENT_ED_HY,
                 H_GROUP: 1,
             }
         )
         n5_tbs = sig_structure_sign(n5_body, n5_first_prot, p2_payload)
         n5 = enc(
-            [n5_body, {}, p2_payload, [[n5_first_prot, {}, sk_c_ed.sign(n5_tbs)]]]
+            [n5_body, {}, p2_payload, [[n5_first_prot, {}, sk_c_ed_hy.sign(n5_tbs)]]]
         )
         record(
             negatives,
@@ -745,27 +1228,50 @@ def main() -> None:
             notes="The surviving Ed25519 signature is cryptographically valid over the mutated object.",
         )
 
-        # N-6: ninth signer group.
-        plan_nine = [
-            group(i, SUITE_CLASSICAL, [component(ALG_ED25519, KID_CLIENT_ED + bytes([0x30 + i]))])
-            for i in range(1, 10)
+        # N-6 (Q2): a fully otherwise-valid NINE-group COSE_Sign — every group uses a
+        # known suite (classical) with matching ordered key material, every component
+        # has a matching valid Ed25519 signature, all (alg,kid) pairs and group_ids are
+        # unique and ascending. A cap-less verifier accepts it; the frozen 1*8 signer-
+        # group cap is its SOLE denial (truncating to 8 groups validates the plan).
+        n6_plan = [
+            group(i + 1, SUITE_CLASSICAL, [component(ALG_ED25519, cap_kids[i])])
+            for i in range(9)
         ]
-        n6_protected = dict(p4_protected)
-        n6_protected[H_PLAN] = plan_nine
-        n6, _, _ = sign1(n6_protected, p4_claims, sk_c_ed)
+        n6_body = {
+            H_CRIT: CRIT_SIGN_BODY_AUTH,
+            H_TYP: TYP_REQUEST,
+            H_DOMAIN: DOMAIN_REQUEST,
+            H_PLAN: n6_plan,
+        }
+        n6_entries = [
+            (
+                {H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: cap_kids[i], H_GROUP: i + 1},
+                cap_signers[i][1],
+            )
+            for i in range(9)
+        ]
+        n6, _, _ = sign_multi(n6_body, p4_claims, n6_entries)
         record(
             negatives,
             "N-6",
-            "signature_plan with nine signer groups",
+            "Otherwise-valid nine signer-group COSE_Sign, over the 1*8 group cap",
             "deny",
-            "COSE_Sign1",
+            "COSE_Sign",
             n6,
             deny_class="parser-cap",
             deny_rule="proof-v1 cap: 1*8 signer groups",
+            notes="Every group is a known suite with a matching valid signature; only the >8-group cap denies.",
         )
 
-        # N-7: third component in one group.
-        plan_three = [
+        # N-7 (W2, isolated like N-6): a fully otherwise-valid COSE_Sign whose single
+        # signer group has THREE components, each carrying a matching valid signature
+        # (client Ed25519 + client ML-DSA-65 + approver Ed25519). Coverage is complete
+        # and every (alg,kid) is unique, so a coverage-enforcing verifier still admits
+        # it — the SOLE denial is the frozen 1*2-components-per-group cap (truncating
+        # the group to its first two components validates). This mirrors N-6's group-cap
+        # isolation and removes the earlier multi-causality (a single Ed25519 signature
+        # over a three-component plan also failed exact coverage).
+        n7_plan = [
             group(
                 1,
                 SUITE_HYBRID,
@@ -776,29 +1282,46 @@ def main() -> None:
                 ],
             )
         ]
-        n7_protected = dict(p4_protected)
-        n7_protected[H_PLAN] = plan_three
-        n7, _, _ = sign1(n7_protected, p4_claims, sk_c_ed)
+        n7_body = {
+            H_CRIT: CRIT_SIGN_BODY_AUTH,
+            H_TYP: TYP_REQUEST,
+            H_DOMAIN: DOMAIN_REQUEST,
+            H_PLAN: n7_plan,
+        }
+        n7_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_CLIENT_ED, H_GROUP: 1}, sk_c_ed),
+            ({H_ALG: ALG_ML_DSA_65, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_CLIENT_ML, H_GROUP: 1}, ml_client),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_APPROVER_ED, H_GROUP: 1}, sk_a_ed),
+        ]
+        n7, _, _ = sign_multi(n7_body, p4_claims, n7_entries)
         record(
             negatives,
             "N-7",
-            "signer group with three components",
+            "Fully-signed three-component signer group, over the 1*2 component cap",
             "deny",
-            "COSE_Sign1",
+            "COSE_Sign",
             n7,
             deny_class="parser-cap",
             deny_rule="proof-v1 cap: 1*2 components per signer group",
+            notes=(
+                "Every component carries a matching valid signature (coverage complete) "
+                "and every (alg,kid) is unique; only the >2-component cap denies "
+                "(truncating the group to two components validates)."
+            ),
         )
 
-        # N-8: unknown claim key.
+        # N-8: unknown claim key. -70050 is in no allocated block; the proof
+        # claims set is closed at -70001..-70004 (credential claim keys
+        # -70005..-70007 live in a disjoint claim set and are equally unknown
+        # to a proof).
         n8_claims = request_claims(
-            credential_hash=CREDENTIAL_HASH, extra={-70005: "unregistered"}
+            credential_hash=CREDENTIAL_HASH, extra={UNKNOWN_CLAIM_KEY: "unregistered"}
         )
         n8, _, _ = sign1(p4_protected, n8_claims, sk_c_ed)
         record(
             negatives,
             "N-8",
-            "Unknown private-use claim key -70005 in the claims set",
+            "Unknown private-use claim key -70050 in the claims set",
             "deny",
             "COSE_Sign1",
             n8,
@@ -1005,21 +1528,75 @@ def main() -> None:
             deny_rule="RFC 9864 fully-specified algorithms: Ed25519 components use -19",
         )
 
-        # N-12: suite ID longer than 64 bytes.
+        # N-12 (O1): an IN-RANGE (<= 64 bytes) unknown suite_id outside the closed
+        # suite set. Every sibling requirement is satisfied — deterministic CBOR,
+        # size caps, typ/domain, plan structure, and a valid Ed25519 signature — so
+        # its SOLE denial reason is that the suite is not in the frozen registry
+        # (swapping in a known suite makes the same plan valid). The >64-byte rule
+        # is proven separately by N-52.
+        UNKNOWN_SUITE = "hs-cose-sign-unknown-suite-v1"   # 29 bytes; not registered
         n12_protected = dict(p4_protected)
         n12_protected[H_PLAN] = [
-            group(1, "h" * 65, [component(ALG_ED25519, KID_CLIENT_ED)])
+            group(1, UNKNOWN_SUITE, [component(ALG_ED25519, KID_CLIENT_ED)])
         ]
         n12, _, _ = sign1(n12_protected, p4_claims, sk_c_ed)
         record(
             negatives,
             "N-12",
-            "suite_id of 65 encoded bytes",
+            "In-range (<=64B) unknown suite_id outside the closed suite set",
             "deny",
             "COSE_Sign1",
             n12,
+            deny_class="suite-plan",
+            deny_rule="the suite registry is closed; an unknown suite_id denies (registry closure only)",
+            notes="All non-registry predicates pass; swapping in a known suite validates the same plan.",
+        )
+
+        # N-52 (O1): the SEPARATE suite_id size-boundary negative — a 65-byte suite
+        # over the 64-byte cap — the sole proof of the >64-byte rule.
+        n52_protected = dict(p4_protected)
+        n52_protected[H_PLAN] = [group(1, "h" * 65, [component(ALG_ED25519, KID_CLIENT_ED)])]
+        n52, _, _ = sign1(n52_protected, p4_claims, sk_c_ed)
+        record(
+            negatives,
+            "N-52",
+            "suite_id of 65 bytes, over the 64-byte cap",
+            "deny",
+            "COSE_Sign1",
+            n52,
             deny_class="parser-cap",
-            deny_rule="proof-v1 cap: suite_id 1..64 encoded bytes",
+            deny_rule="proof-v1 cap: suite_id 1..64 bytes",
+        )
+
+        # N-53 (S1): ONE Ed25519 public key published under two different kids in two
+        # logical signer groups, signing both entries — an otherwise-valid two-group
+        # COSE_Sign (distinct (alg,kid) labels, both signatures cryptographically
+        # valid, group_ids unique + ascending, known suites) whose SOLE defect is that
+        # the same RESOLVED public-key identity participates in two groups (a key
+        # alias defeating multi-logical-group independence).
+        n53_body = {
+            H_CRIT: CRIT_SIGN_BODY_UNATTRIBUTED,
+            H_TYP: TYP_REQUEST, H_DOMAIN: DOMAIN_REQUEST,
+            H_PLAN: [group(1, SUITE_CLASSICAL, [component(ALG_ED25519, b"alias-x-1")]),
+                     group(2, SUITE_CLASSICAL, [component(ALG_ED25519, b"alias-y-1")])],
+            H_KEYSET: [cose_key_okp_ed25519(b"alias-x-1", sk_u_ed.public_key().public_bytes_raw()),
+                       cose_key_okp_ed25519(b"alias-y-1", sk_u_ed.public_key().public_bytes_raw())],
+        }
+        n53_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: b"alias-x-1", H_GROUP: 1}, sk_u_ed),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: b"alias-y-1", H_GROUP: 2}, sk_u_ed),
+        ]
+        n53, _, _ = sign_multi(n53_body, request_claims(credential_hash=None, nonce=CHALLENGE), n53_entries)
+        record(
+            negatives,
+            "N-53",
+            "One Ed25519 key under two kids/groups (cross-group resolved-key alias)",
+            "deny",
+            "COSE_Sign",
+            n53,
+            deny_class="cross-group-key-alias",
+            deny_rule="a resolved public-key identity (alg + raw public key) may participate in at most one signer group",
+            notes="Both signatures valid; (alg,kid) labels unique; only the resolved-key identity is aliased across groups.",
         )
 
         # N-13: kid longer than 64 bytes.
@@ -1082,8 +1659,8 @@ def main() -> None:
             "deny",
             "COSE_Sign1",
             n16,
-            deny_class="freshness",
-            deny_rule="the challenge is REQUIRED for unattributed proofs, before any replay-store insertion",
+            deny_class="unattributed-nonce-required",
+            deny_rule="the challenge Nonce is REQUIRED for unattributed proofs, before any replay-store insertion",
         )
 
         # N-17: alg and kid only in the unprotected header.
@@ -1211,32 +1788,1209 @@ def main() -> None:
             deny_rule="this closed profile carries no tags; the typ header performs object typing",
         )
 
-        # N-22: request/response cti substitution.
+        # N-22 (C5): a response proof whose cti does NOT echo the originating
+        # request's request_id. It carries the originating-request id so the
+        # suite can assert the contextual cti mismatch (mirroring N-31/N-32),
+        # not merely that its bytes differ from a positive. The signature is
+        # valid over the mutated cti, so it denies solely on the request binding.
         n22_claims = request_claims(
             credential_hash=None,
             schema_id=SCHEMA_ID_RESPONSE,
             body=CAPNP_RESPONSE_BYTES,
-            cti=bytes.fromhex("00112233445566778899aabbccddeeff"),
+            cti=bytes.fromhex("00112233445566778899aabbccddeeff"),  # != P-4's request_id
+            response_binding=p4_response_binding,  # L1: keep binding == P-4's so ONLY cti_eq flips
         )
         n22, _, _ = sign1(p3_protected, n22_claims, sk_s_ed)
         record(
             negatives,
             "N-22",
-            "Response proof whose cti does not match the request_id",
+            "Response proof whose cti does not echo the originating request's request_id",
             "deny",
             "COSE_Sign1",
             n22,
+            deny_class="response-cti-binding",
+            deny_rule="a response proof's cti MUST equal the originating request's request_id",
+            originating_request="P-4",
+            notes="Signature valid over the mutated cti; denies on the contextual request-ID mismatch.",
+        )
+
+        # N-23: encrypted response binding with a null KEM recipient.
+        n23_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH,
+            response_binding={
+                1: SCHEMA_ID_RESPONSE,
+                2: KIND_UNARY,
+                3: PROTECTION_ENCRYPTED,
+                4: None,
+            },
+        )
+        n23, _, _ = sign1(p4_protected, n23_claims, sk_c_ed)
+        record(
+            negatives,
+            "N-23",
+            "Encrypted response_binding (protection_mode 2) with a null KEM recipient",
+            "deny",
+            "COSE_Sign1",
+            n23,
             deny_class="response-binding",
-            deny_rule="a response proof can never verify for another request ID",
+            deny_rule="recipient is non-null iff protection_mode is encrypted",
+            notes="Gate-2 §19 #4: the encrypted shape requires a present kem-recipient.",
+        )
+
+        # N-24: cleartext response binding carrying a KEM recipient.
+        n24_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH,
+            response_binding={
+                1: SCHEMA_ID_RESPONSE,
+                2: KIND_UNARY,
+                3: PROTECTION_CLEARTEXT,
+                4: kem_recipient(),
+            },
+        )
+        n24, _, _ = sign1(p4_protected, n24_claims, sk_c_ed)
+        record(
+            negatives,
+            "N-24",
+            "Cleartext response_binding (protection_mode 1) carrying a KEM recipient",
+            "deny",
+            "COSE_Sign1",
+            n24,
+            deny_class="response-binding",
+            deny_rule="recipient is null iff protection_mode is cleartext",
+            notes="Gate-2 §19 #4: the cleartext shape forbids a kem-recipient.",
+        )
+
+        # N-25: response_kind outside the closed enum.
+        n25_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH,
+            response_binding={
+                1: SCHEMA_ID_RESPONSE,
+                2: 3,  # neither unary(1) nor stream_setup(2)
+                3: PROTECTION_CLEARTEXT,
+                4: None,
+            },
+        )
+        n25, _, _ = sign1(p4_protected, n25_claims, sk_c_ed)
+        record(
+            negatives,
+            "N-25",
+            "response_kind value 3 outside the closed enum {1 unary, 2 stream_setup}",
+            "deny",
+            "COSE_Sign1",
+            n25,
+            deny_class="response-binding",
+            deny_rule="response_kind is a closed enum: 1 unary or 2 stream_setup",
+        )
+
+        # N-26: aud exceeding the shared MAX_SERVICE_DOMAIN_BYTES cap of 128.
+        n26_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH, aud="a" * 129
+        )
+        n26, _, _ = sign1(p4_protected, n26_claims, sk_c_ed)
+        record(
+            negatives,
+            "N-26",
+            "aud of 129 bytes, over the 128-byte MAX_SERVICE_DOMAIN_BYTES cap",
+            "deny",
+            "COSE_Sign1",
+            n26,
+            deny_class="parser-cap",
+            deny_rule="aud is 1..128 bytes (Gate-2 §19 #7; shared MAX_SERVICE_DOMAIN_BYTES)",
+        )
+
+        # N-27: cleartext-unary response_binding carried as a non-null map.
+        # response_binding is null exactly when the response is neither encrypted
+        # nor streamed; a cleartext unary response is neither, so the map form is
+        # forbidden — only stream_setup may be a cleartext (non-null) binding.
+        n27_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH,
+            response_binding={
+                1: SCHEMA_ID_RESPONSE,
+                2: KIND_UNARY,          # unary
+                3: PROTECTION_CLEARTEXT,  # cleartext
+                4: None,
+            },
+        )
+        n27, _, _ = sign1(p4_protected, n27_claims, sk_c_ed)
+        record(
+            negatives,
+            "N-27",
+            "Cleartext unary response_binding carried as a non-null map",
+            "deny",
+            "COSE_Sign1",
+            n27,
+            deny_class="response-binding",
+            deny_rule="cleartext unary uses a null response_binding; the map form is stream_setup only",
+            notes="Canonical single encoding: cleartext unary is null, never a map.",
+        )
+
+        # N-28: hybrid-to-classical downgrade. A COSE_Sign1 plan declares the
+        # hybrid suite but supplies only one Ed25519 component (dropping the
+        # ML-DSA-65 component). The suite is bound to its exact component plan,
+        # so a hybrid group with one component denies — the WNS hybrid cannot be
+        # silently downgraded to the standalone classical suite.
+        n28_protected = dict(p4_protected)
+        n28_protected[H_PLAN] = [
+            group(1, SUITE_HYBRID, [component(ALG_ED25519, KID_CLIENT_ED)])
+        ]
+        n28, _, _ = sign1(n28_protected, p4_claims, sk_c_ed)
+        record(
+            negatives,
+            "N-28",
+            "Hybrid suite plan with only one Ed25519 component (hybrid→classical downgrade)",
+            "deny",
+            "COSE_Sign1",
+            n28,
+            deny_class="suite-plan",
+            deny_rule=(
+                "hs-cose-sign-ed25519-mldsa65-wns-v1 requires exactly two ordered "
+                "components (Ed25519 then ML-DSA-65); a single-component hybrid group denies"
+            ),
+            notes="Causal hybrid-to-classical downgrade: the suite is bound to its exact plan.",
+        )
+
+        # N-29: aud with an uppercase byte ("Registry.svc"). The canonical
+        # service-domain syntax (validate_service_domain) is lowercase-only, so a
+        # CDDL/gate-driven verifier must reject it — its audience namespace must
+        # not be broader than the transport's.
+        n29_claims = request_claims(credential_hash=CREDENTIAL_HASH, aud="Registry.svc")
+        n29, _, _ = sign1(p4_protected, n29_claims, sk_c_ed)
+        record(
+            negatives,
+            "N-29",
+            "aud with an uppercase byte (Registry.svc), rejected by the service-domain syntax",
+            "deny",
+            "COSE_Sign1",
+            n29,
+            deny_class="aud-syntax",
+            deny_rule="canonical service domain is lowercase ASCII only (validate_service_domain)",
+        )
+
+        # N-30: aud whose first byte is illegal ("-registry.svc"). The first byte
+        # MUST be a lowercase ASCII letter or digit.
+        n30_claims = request_claims(credential_hash=CREDENTIAL_HASH, aud="-registry.svc")
+        n30, _, _ = sign1(p4_protected, n30_claims, sk_c_ed)
+        record(
+            negatives,
+            "N-30",
+            "aud with an illegal first byte ('-registry.svc')",
+            "deny",
+            "COSE_Sign1",
+            n30,
+            deny_class="aud-syntax",
+            deny_rule="the first byte must be a lowercase ASCII letter or digit (validate_service_domain)",
+        )
+
+        # N-32: a response proof whose response_binding does NOT match the
+        # originating request's (P-4) binding. To flip ONLY binding_eq (L1), it
+        # differs in the response_kind/protection_mode axes while KEEPING
+        # root_type_id == SCHEMA_ID_RESPONSE == its own -70002, so schema_eq stays
+        # true; aud and cti still equal P-4's. It is a structurally valid response
+        # binding (stream_setup + cleartext + null recipient, like P-6), so it
+        # denies only under field-for-field equality with the request it answers.
+        n32_binding = response_binding(KIND_STREAM_SETUP, PROTECTION_CLEARTEXT, None)
+        n32_claims = request_claims(
+            credential_hash=None,
+            schema_id=SCHEMA_ID_RESPONSE,
+            body=CAPNP_RESPONSE_BYTES,
+            response_binding=n32_binding,
+        )
+        n32, _, _ = sign1(p3_protected, n32_claims, sk_s_ed)
+        record(
+            negatives,
+            "N-32",
+            "Response proof whose response_binding mismatches the originating request (P-4)",
+            "deny",
+            "COSE_Sign1",
+            n32,
+            deny_class="response-binding-equality",
+            deny_rule=(
+                "a response proof's response_binding MUST equal the originating "
+                "request's map field-for-field; a differing root_type_id denies"
+            ),
+            originating_request="P-4",
+            notes="Locally valid map shape; denies only against the request it answers.",
+        )
+
+        # N-31 (B1): bound response proof whose -70002 (response root type ID)
+        # does NOT equal its realized response_binding[1] (root_type_id). The
+        # response_binding map is left EQUAL to P-4's (so the equality gate and a
+        # map-shape check still pass); only -70002 is changed, and it is re-signed
+        # by the service key (valid signature). It denies solely because a bound
+        # response proof's -70002 MUST equal the realized binding's root_type_id.
+        n31_claims = request_claims(
+            credential_hash=None,
+            schema_id=0xDEADBEEF,                 # != response_binding[1]
+            body=CAPNP_RESPONSE_BYTES,
+            response_binding=p4_response_binding,  # binding still equals P-4's
+        )
+        n31, _, _ = sign1(p3_protected, n31_claims, sk_s_ed)
+        record(
+            negatives,
+            "N-31",
+            "Bound response proof whose -70002 mismatches the realized response_binding root_type_id",
+            "deny",
+            "COSE_Sign1",
+            n31,
+            deny_class="response-schema-binding",
+            deny_rule=(
+                "for a non-null response_binding, claim -70002 MUST equal the "
+                "binding's root_type_id (key 1)"
+            ),
+            originating_request="P-4",
+            notes="Only -70002 differs; the binding map still equals P-4's and the signature is valid.",
+        )
+
+        # N-33 (B2): a fully signature-valid COSE_Sign whose plan repeats one
+        # (alg, kid) in two logical groups. Both entries are signed by the same
+        # client key, so a verifier that counts groups could satisfy a
+        # multi-party rule (P-5's shape) with a single signer. It denies because
+        # (alg, kid) MUST be unique across the whole plan, regardless of group ID.
+        n33_plan = [
+            group(1, SUITE_CLASSICAL, [component(ALG_ED25519, KID_CLIENT_ED)]),
+            group(2, SUITE_CLASSICAL, [component(ALG_ED25519, KID_CLIENT_ED)]),  # duplicate (alg,kid)
+        ]
+        n33_body = {
+            H_CRIT: CRIT_SIGN_BODY_AUTH,
+            H_TYP: TYP_REQUEST,
+            H_DOMAIN: DOMAIN_REQUEST,
+            H_PLAN: n33_plan,
+        }
+        n33_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_CLIENT_ED, H_GROUP: 1}, sk_c_ed),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_CLIENT_ED, H_GROUP: 2}, sk_c_ed),
+        ]
+        n33, _, _ = sign_multi(
+            n33_body, request_claims(credential_hash=CREDENTIAL_HASH), n33_entries
+        )
+        record(
+            negatives,
+            "N-33",
+            "COSE_Sign plan repeating one (alg, kid) across two logical groups",
+            "deny",
+            "COSE_Sign",
+            n33,
+            deny_class="plan-key-uniqueness",
+            deny_rule="every (alg, kid) pair MUST be unique across the whole plan, regardless of group ID",
+            notes="Both signatures are valid; a single signer must not satisfy a two-group policy.",
+        )
+
+        # N-35 (B4): unattributed proof whose EMBEDDED public key does not match
+        # the signing key. The key set element keeps the correct kid/alg/crv but
+        # carries a DIFFERENT public key (the approver's); the proof is re-signed
+        # with the real unattributed key over the mutated protected bucket. It
+        # denies because each unattributed signature MUST verify against its
+        # embedded key — not a key resolved out of band.
+        n35_protected = dict(p1_protected)
+        n35_protected[H_KEYSET] = [
+            cose_key_okp_ed25519(
+                KID_UNATTRIBUTED_ED, sk_a_ed.public_key().public_bytes_raw()  # wrong key
+            )
+        ]
+        n35, _, _ = sign1(n35_protected, p1_claims, sk_u_ed)  # signed by the REAL key
+        record(
+            negatives,
+            "N-35",
+            "Unattributed proof whose embedded key set does not match the signing key",
+            "deny",
+            "COSE_Sign1",
+            n35,
+            deny_class="unattributed-keyset",
+            deny_rule="each unattributed signature MUST verify against its embedded key set key",
+            notes=(
+                "Correct kid/alg/crv but a different public key; re-signed with the "
+                "real key over the mutated bucket, so it denies at embedded-key "
+                "verification, not by a plan-shape or self-signature failure."
+            ),
+        )
+
+        # N-37 (B4): hybrid unattributed key set whose second element duplicates
+        # the first (Ed25519) instead of the ML-DSA-65 key — element 1 does not
+        # correspond to the plan's ML-DSA-65 component.
+        n37_body = dict(p8_body)
+        n37_body[H_KEYSET] = [
+            cose_key_okp_ed25519(KID_UNATTRIBUTED_ED, sk_u_ed.public_key().public_bytes_raw()),
+            cose_key_okp_ed25519(KID_UNATTRIBUTED_ED, sk_u_ed.public_key().public_bytes_raw()),
+        ]
+        n37, _, _ = sign_multi(
+            n37_body, request_claims(credential_hash=None, nonce=CHALLENGE), p8_entries
+        )
+        record(
+            negatives,
+            "N-37",
+            "Hybrid unattributed key set duplicating the Ed25519 element (no ML-DSA-65 key)",
+            "deny",
+            "COSE_Sign",
+            n37,
+            deny_class="unattributed-keyset",
+            deny_rule="key set element i MUST correspond to plan component i by kid/alg/kty",
+            notes="Element 1 is Ed25519 where the plan's component 1 is ML-DSA-65.",
+        )
+
+        # N-38 (B4): hybrid unattributed key set with the two elements REORDERED
+        # (ML-DSA-65 first, Ed25519 second) — out of the plan's component order.
+        n38_body = dict(p8_body)
+        n38_body[H_KEYSET] = [
+            cose_key_akp_mldsa65(KID_UNATTRIBUTED_ML, ml_unattributed.public),
+            cose_key_okp_ed25519(KID_UNATTRIBUTED_ED, sk_u_ed.public_key().public_bytes_raw()),
+        ]
+        n38, _, _ = sign_multi(
+            n38_body, request_claims(credential_hash=None, nonce=CHALLENGE), p8_entries
+        )
+        record(
+            negatives,
+            "N-38",
+            "Hybrid unattributed key set with elements reordered out of plan component order",
+            "deny",
+            "COSE_Sign",
+            n38,
+            deny_class="unattributed-keyset",
+            deny_rule="key set elements MUST be in the plan's exact component order",
+            notes="Element 0 is ML-DSA-65 where component 0 is Ed25519.",
+        )
+
+        # N-40 (B6): two logical groups sharing one group_id. Both signatures are
+        # valid and the (alg, kid) pairs are distinct (so B2 passes), but the two
+        # groups collapse to a single group_id — a single logical group can then
+        # masquerade as two for a multi-party policy.
+        n40_plan = [
+            group(1, SUITE_CLASSICAL, [component(ALG_ED25519, KID_CLIENT_ED)]),
+            group(1, SUITE_CLASSICAL, [component(ALG_ED25519, KID_APPROVER_ED)]),  # duplicate group_id
+        ]
+        n40_body = {H_CRIT: CRIT_SIGN_BODY_AUTH, H_TYP: TYP_REQUEST, H_DOMAIN: DOMAIN_REQUEST, H_PLAN: n40_plan}
+        n40_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_CLIENT_ED, H_GROUP: 1}, sk_c_ed),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_APPROVER_ED, H_GROUP: 1}, sk_a_ed),
+        ]
+        n40, _, _ = sign_multi(n40_body, request_claims(credential_hash=CREDENTIAL_HASH), n40_entries)
+        record(
+            negatives, "N-40",
+            "signature_plan with two groups sharing one group_id",
+            "deny", "COSE_Sign", n40,
+            deny_class="group-id-order",
+            deny_rule="group IDs MUST be unique and strictly ascending across the plan",
+            notes="Both signatures valid; distinct (alg,kid); denies solely on the duplicate group_id.",
+        )
+
+        # N-41 (B6): group IDs out of ascending order (2 then 1).
+        n41_plan = [
+            group(2, SUITE_CLASSICAL, [component(ALG_ED25519, KID_CLIENT_ED)]),
+            group(1, SUITE_CLASSICAL, [component(ALG_ED25519, KID_APPROVER_ED)]),  # descending
+        ]
+        n41_body = {H_CRIT: CRIT_SIGN_BODY_AUTH, H_TYP: TYP_REQUEST, H_DOMAIN: DOMAIN_REQUEST, H_PLAN: n41_plan}
+        n41_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_CLIENT_ED, H_GROUP: 2}, sk_c_ed),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_APPROVER_ED, H_GROUP: 1}, sk_a_ed),
+        ]
+        n41, _, _ = sign_multi(n41_body, request_claims(credential_hash=CREDENTIAL_HASH), n41_entries)
+        record(
+            negatives, "N-41",
+            "signature_plan with group IDs out of ascending order",
+            "deny", "COSE_Sign", n41,
+            deny_class="group-id-order",
+            deny_rule="group IDs MUST be strictly ascending across the plan",
+            notes="Both signatures valid; groups are 2 then 1.",
+        )
+
+        # N-42 (B8): unattributed key set with three elements, over the frozen
+        # 1..2 element ceiling (the pycddl AKP workaround drops the `1*2` bound,
+        # so the gate/checker re-impose it). Three classical groups, three
+        # embedded OKP keys, all signatures valid.
+        n42_plan = [
+            group(1, SUITE_CLASSICAL, [component(ALG_ED25519, b"unattributed-ed25519-1")]),
+            group(2, SUITE_CLASSICAL, [component(ALG_ED25519, b"unattributed-ed25519-2")]),
+            group(3, SUITE_CLASSICAL, [component(ALG_ED25519, b"unattributed-ed25519-3")]),
+        ]
+        n42_keyset = [
+            cose_key_okp_ed25519(b"unattributed-ed25519-1", sk_u_ed.public_key().public_bytes_raw()),
+            cose_key_okp_ed25519(b"unattributed-ed25519-2", sk_a_ed.public_key().public_bytes_raw()),
+            cose_key_okp_ed25519(b"unattributed-ed25519-3", sk_s_ed.public_key().public_bytes_raw()),
+        ]
+        n42_body = {
+            H_CRIT: CRIT_SIGN_BODY_UNATTRIBUTED, H_TYP: TYP_REQUEST, H_DOMAIN: DOMAIN_REQUEST,
+            H_PLAN: n42_plan, H_KEYSET: n42_keyset,
+        }
+        n42_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: b"unattributed-ed25519-1", H_GROUP: 1}, sk_u_ed),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: b"unattributed-ed25519-2", H_GROUP: 2}, sk_a_ed),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: b"unattributed-ed25519-3", H_GROUP: 3}, sk_s_ed),
+        ]
+        n42, _, _ = sign_multi(n42_body, request_claims(credential_hash=None, nonce=CHALLENGE), n42_entries)
+        record(
+            negatives, "N-42",
+            "Unattributed key set with three elements, over the 1..2 ceiling",
+            "deny", "COSE_Sign", n42,
+            deny_class="unattributed-keyset",
+            deny_rule="the unattributed key set carries 1..2 elements (frozen cap)",
+            notes="All signatures valid; denies solely on the over-ceiling key-set size.",
+        )
+
+        # N-43 (D2): a response proof issued for a DIFFERENT service domain than
+        # the originating request. Everything else (cti, response_binding) still
+        # equals P-4's; only aud differs, and the signature is valid — so it
+        # denies solely on response-aud contextual binding (aud MUST equal the
+        # originating request's aud).
+        n43_claims = request_claims(
+            credential_hash=None,
+            aud="other.svc.hyprstream.test",   # != P-4's aud
+            schema_id=SCHEMA_ID_RESPONSE,
+            body=CAPNP_RESPONSE_BYTES,
+            response_binding=p4_response_binding,   # binding still equals P-4's
+        )
+        n43, _, _ = sign1(p3_protected, n43_claims, sk_s_ed)
+        record(
+            negatives, "N-43",
+            "Response proof whose aud differs from the originating request's service domain",
+            "deny", "COSE_Sign1", n43,
+            deny_class="response-aud-binding",
+            deny_rule="a response proof's aud MUST equal the originating request's aud",
+            originating_request="P-4",
+            notes="Only aud differs; cti and response_binding still equal P-4's; signature valid.",
+        )
+
+        # ---- E1: byte-range boundary negatives for the stripped .size ranges ----
+        # The pinned pycddl 0.3.0 strips every `.size (LO..HI)` control, so each
+        # stripped range needs a causal boundary negative that the numeric gate
+        # rejects. suite_id/kid/aud uppers are N-12/N-13/N-26; these close the
+        # remaining boundaries (body upper, Nonce lower+upper, kid lower).
+
+        # N-44: capnp_body_bytes one byte over the 1 MiB cap (upper boundary of
+        # capnp-body-bytes = bstr .size (0..1048576)). The whole object still fits
+        # under the 2 MiB object cap, so it denies solely on the body-length rule.
+        n44_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH, body=b"\x00" * (1048576 + 1)
+        )
+        n44, _, _ = sign1(p4_protected, n44_claims, sk_c_ed)
+        record(
+            negatives, "N-44",
+            "capnp_body_bytes of 1 MiB + 1, one byte over the 1048576 cap",
+            "deny", "COSE_Sign1", n44,
+            deny_class="parser-cap",
+            deny_rule="capnp-body-bytes is 0..1048576 (1 MiB body cap)",
+            notes="Object stays under the 2 MiB cap; denies solely on the body-length rule.",
+        )
+
+        # N-45: Nonce (server challenge) of 15 bytes, one under the 16-byte floor
+        # (lower boundary of server-challenge = bstr .size (16..64)).
+        n45_claims = request_claims(credential_hash=None, nonce=b"\x00" * 15)
+        n45, _, _ = sign1(p1_protected, n45_claims, sk_u_ed)
+        record(
+            negatives, "N-45",
+            "Unattributed proof whose Nonce is 15 bytes, under the 16-byte floor",
+            "deny", "COSE_Sign1", n45,
+            deny_class="nonce-length",
+            deny_rule="server-challenge is 16..64 bytes",
+            notes="Valid unattributed structure/signature; denies solely on the Nonce lower bound.",
+        )
+
+        # N-46: Nonce of 65 bytes, one over the 64-byte ceiling (upper boundary).
+        n46_claims = request_claims(credential_hash=None, nonce=b"\x00" * 65)
+        n46, _, _ = sign1(p1_protected, n46_claims, sk_u_ed)
+        record(
+            negatives, "N-46",
+            "Unattributed proof whose Nonce is 65 bytes, over the 64-byte ceiling",
+            "deny", "COSE_Sign1", n46,
+            deny_class="nonce-length",
+            deny_rule="server-challenge is 16..64 bytes",
+            notes="Valid unattributed structure/signature; denies solely on the Nonce upper bound.",
+        )
+
+        # N-47: empty kid, under the 1-byte floor (lower boundary of
+        # kid = bstr .size (1..64)); mirrors N-13 (kid upper) with a 0-length kid.
+        n47_protected = dict(p4_protected)
+        n47_protected[H_KID] = b""
+        n47_protected[H_PLAN] = [
+            group(1, SUITE_CLASSICAL, [component(ALG_ED25519, b"")])
+        ]
+        n47, _, _ = sign1(n47_protected, p4_claims, sk_c_ed)
+        record(
+            negatives, "N-47",
+            "kid of 0 bytes, under the 1-byte floor",
+            "deny", "COSE_Sign1", n47,
+            deny_class="parser-cap",
+            deny_rule="proof-v1 cap: kid 1..64 bytes",
+            notes="Empty kid violates the kid lower bound independently of the aud .regexp.",
+        )
+
+        # N-48 (E2): P-3 with its trailing Ed25519 signature bstr header widened
+        # from `58 40` (64 bytes) to `58 41` (65 bytes) with NO byte added — the
+        # declared length exceeds the bytes present, so the strict decoder MUST
+        # reject the truncation (the reviewer's exact exploit). This is the
+        # `58 41` + 64 bytes shape; a lenient slicing decoder would "decode" and
+        # even verify the surviving signature.
+        assert p3[-66:-64] == b"\x58\x40", "P-3 must end with a 64-byte Ed25519 sig bstr header"
+        n48 = p3[:-66] + b"\x58\x41" + p3[-64:]
+        record(
+            negatives, "N-48",
+            "Truncated CBOR: response signature bstr header declares 65 bytes with 64 present",
+            "deny", "COSE_Sign1", n48,
+            deny_class="cbor-truncation",
+            deny_rule="a length-delimited value must have at least the declared number of bytes",
+            notes="Header widened 58 40 -> 58 41, no byte added; strict decoder rejects (len(rest) < val).",
+        )
+
+        # N-49 (G2): a proof whose claims payload carries a TRUNCATED integer
+        # argument — the `iat` value is `19 00` (ai=25 declares a 2-byte argument
+        # with only 1 byte present). The outer COSE_Sign1 array decodes, but the
+        # payload's integer argument is truncated, so a fail-closed strict decoder
+        # rejects it (len(rest) < n); a lenient decoder would read a short/zero
+        # value. `a1 06 19 00` = {6: <truncated int>}. The de-fanged exact-length
+        # counterpart `a1 06 19 01 00` = {6: 256} decodes cleanly.
+        n49_payload = b"\xa1\x06\x19\x00"
+        n49 = enc([p4_prot, {}, n49_payload, b"\x00" * 64])
+        record(
+            negatives, "N-49",
+            "Truncated CBOR integer: claims iat argument `19 00` declares 2 bytes with 1 present",
+            "deny", "COSE_Sign1", n49,
+            deny_class="integer-truncation",
+            deny_rule="a CBOR additional-information argument (ai 24/25/26/27) must carry its full 1/2/4/8-byte length",
+            notes="Outer array decodes; the payload integer argument is truncated (ai=25, 1 of 2 bytes).",
+        )
+
+        # N-50 (H1): a correctly-signed authenticated proof whose own `exp`
+        # (1786000060) EXCEEDS its mapped credential's `exp` (1786000030). Both are
+        # still valid at verifier_now (1786000015), so a verifier that merely checks
+        # each artifact against the clock accepts it; the rule "a proof exp MUST NOT
+        # exceed credential/session expiry" (credential-profile §5) denies it. Bound
+        # to the classical credential via credential_hash.
+        n50_claims = request_claims(credential_hash=CREDENTIAL_HASH, extra={C_EXP: 1786000060})
+        n50, _, _ = sign1(p4_protected, n50_claims, sk_c_ed)
+        record(
+            negatives, "N-50",
+            "Authenticated proof whose exp (1786000060) exceeds its mapped credential's exp (1786000030)",
+            "deny", "COSE_Sign1", n50,
+            deny_class="proof-credential-expiry",
+            deny_rule="a proof exp MUST NOT exceed the mapped credential (or session) expiry",
+            notes="Both proof and credential are valid at verifier_now; denies solely on the expiry-binding rule.",
+        )
+
+        # N-51 (K1): a correctly-signed proof bound to the user-session credential
+        # whose exp (1786000025) is WITHIN the credential exp (1786000030) but LATER
+        # than the authoritative session exp (1786000020). Proof, credential, and
+        # session are all unexpired at verifier_now (1786000015), so it denies solely
+        # on the session-expiry bound — the credential bound is satisfied.
+        n51_claims = request_claims(credential_hash=CREDENTIAL_HASH_SESSION, extra={C_EXP: 1786000025})
+        n51, _, _ = sign1(p4_protected, n51_claims, sk_c_ed)
+        record(
+            negatives, "N-51",
+            "Session-bound proof whose exp (1786000025) exceeds the authoritative session exp (1786000020)",
+            "deny", "COSE_Sign1", n51,
+            deny_class="proof-session-expiry",
+            deny_rule="a proof exp MUST NOT exceed the authoritative session expiry for a sid-bearing credential",
+            notes="proof exp <= credential exp but > session exp; the credential bound is satisfied, only the session bound denies.",
+        )
+
+        # ---- W1: proof-freshness negatives at the frozen verifier clock (design
+        # §4.5). Each is a correctly-signed, context-valid proof that denies SOLELY on
+        # one freshness axis under the verifier-clock rule (|iat-now| <= 30 both sides;
+        # now < exp; exp - now <= the disposition maximum, Authenticated 300 /
+        # Unattributed 30). N-54/N-55/N-56 are authenticated proofs bound to the
+        # long-lived credential (exp 1786000415) so their exp can reach past the
+        # Authenticated maximum without also tripping the credential-expiry bound; N-57
+        # is unattributed. All four are single-cause signed bytes — no synthetic probe.
+        #
+        # N-54: expired — exp (1786000010) <= verifier_now (1786000015).
+        n54_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH_LONGLIVED, extra={C_IAT: 1786000000, C_EXP: 1786000010})
+        n54, _, _ = sign1(p4_protected, n54_claims, sk_c_ed)
+        record(
+            negatives, "N-54",
+            "Expired proof: exp (1786000010) is at/before verifier_now (1786000015)",
+            "deny", "COSE_Sign1", n54,
+            deny_class="proof-freshness",
+            deny_rule="a proof is fresh only while verifier_now < exp; an expired proof denies",
+            notes="Authenticated, iat within skew, remaining lifetime in bound; denies solely on expiry at verifier_now.",
+        )
+        # N-55: future-issued beyond skew — iat (1786000046) > verifier_now + 30
+        # (1786000045). exp is unexpired and remaining lifetime (85s) is within the
+        # Authenticated maximum (300s), so only the skew rule denies.
+        n55_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH_LONGLIVED, extra={C_IAT: 1786000046, C_EXP: 1786000100})
+        n55, _, _ = sign1(p4_protected, n55_claims, sk_c_ed)
+        record(
+            negatives, "N-55",
+            "Future-issued proof: iat (1786000046) is more than 30s after verifier_now (1786000015)",
+            "deny", "COSE_Sign1", n55,
+            deny_class="proof-freshness",
+            deny_rule="a proof is fresh only while |iat - verifier_now| <= max_clock_skew; a future iat beyond skew denies",
+            notes="Authenticated, unexpired, remaining lifetime 85s (<= 300s auth), exp within the long-lived credential; denies solely on the future iat (31s > 30s skew).",
+        )
+        # N-56: over-limit AUTHENTICATED remaining lifetime — exp - verifier_now (301s)
+        # exceeds the Authenticated maximum (300s). iat is in skew, exp is unexpired and
+        # within the long-lived credential (1786000415), so only the lifetime rule denies.
+        n56_claims = request_claims(
+            credential_hash=CREDENTIAL_HASH_LONGLIVED, extra={C_IAT: 1786000000, C_EXP: 1786000316})
+        n56, _, _ = sign1(p4_protected, n56_claims, sk_c_ed)
+        record(
+            negatives, "N-56",
+            "Over-limit authenticated proof: exp - verifier_now (301s) exceeds the Authenticated maximum (300s)",
+            "deny", "COSE_Sign1", n56,
+            deny_class="proof-freshness",
+            deny_rule="a proof's exp - verifier_now MUST NOT exceed its disposition's max remaining lifetime (Authenticated 300s)",
+            notes="Authenticated, iat within skew, unexpired, exp within the long-lived credential; denies solely on the over-long remaining lifetime for its disposition.",
+        )
+        # N-57: over-limit UNATTRIBUTED remaining lifetime — exp - verifier_now (45s)
+        # exceeds the Unattributed maximum (30s). Unattributed proofs carry no
+        # credential expiry cap, so this maximum is isolable directly. iat in skew,
+        # exp unexpired, Nonce present, so only the lifetime rule denies.
+        n57_claims = request_claims(
+            credential_hash=None, nonce=CHALLENGE, extra={C_IAT: 1786000000, C_EXP: 1786000060})
+        n57, _, _ = sign1(p1_protected, n57_claims, sk_u_ed)
+        record(
+            negatives, "N-57",
+            "Over-limit unattributed proof: exp - verifier_now (45s) exceeds the Unattributed maximum (30s)",
+            "deny", "COSE_Sign1", n57,
+            deny_class="proof-freshness",
+            deny_rule="a proof's exp - verifier_now MUST NOT exceed its disposition's max remaining lifetime (Unattributed 30s)",
+            notes="Unattributed (Nonce present), iat within skew, unexpired; denies solely on the over-long remaining lifetime for its disposition.",
+        )
+
+        # ---- Z1: response-signer authorization negatives. A RESPONSE proof's signer
+        # must resolve to an authoritative `response-service` enrollment bound to the
+        # response audience; a generic known-key/known-kid lookup is insufficient.
+        # N-58 (wrong role): a self-consistent response proof signed ENTIRELY by the
+        # CLIENT key (plan component, protected kid, and signature all the client key).
+        # Its realized signer is not an authorized response signer for the audience, so
+        # it denies — the exact shape that was accepted before the resolver existed.
+        n58_plan = [group(1, SUITE_CLASSICAL, [component(ALG_ED25519, KID_CLIENT_ED)])]
+        n58_protected = {
+            H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN1_AUTH, H_KID: KID_CLIENT_ED,
+            H_TYP: TYP_RESPONSE, H_DOMAIN: DOMAIN_RESPONSE, H_PLAN: n58_plan, H_GROUP: 1,
+        }
+        n58_claims = request_claims(credential_hash=None, schema_id=SCHEMA_ID_RESPONSE, body=CAPNP_RESPONSE_BYTES)
+        n58, _, _ = sign1(n58_protected, n58_claims, sk_c_ed)
+        record(
+            negatives, "N-58",
+            "Response proof signed by the client key (not the enrolled response service signer)",
+            "deny", "COSE_Sign1", n58,
+            originating_request="P-2",
+            deny_class="response-signer",
+            deny_rule="a response proof's realized signer must resolve to an authoritative response-service enrollment for its audience",
+            notes="Self-consistent client-key response (plan/kid/signature all the client key); denies solely because the client is not an authorized response signer for the audience.",
+        )
+        # N-59 (wrong audience): a correctly SERVICE-signed response proof whose `aud`
+        # is a valid but UNENROLLED service domain. The realized signer matches the
+        # service suite/keys, but no response-signer enrollment exists for that
+        # audience, so it denies solely on the audience binding.
+        n59_claims = request_claims(credential_hash=None, schema_id=SCHEMA_ID_RESPONSE,
+                                    body=CAPNP_RESPONSE_BYTES, aud=other_aud)
+        n59, _, _ = sign1(p3_protected, n59_claims, sk_s_ed)
+        record(
+            negatives, "N-59",
+            "Service-signed response proof for an unenrolled audience (other.svc.hyprstream.test)",
+            "deny", "COSE_Sign1", n59,
+            originating_request="P-11",
+            deny_class="response-signer",
+            deny_rule="a response proof's realized signer must resolve to an authoritative response-service enrollment for its EXACT audience",
+            notes="Correctly service-signed, but no response-signer enrollment exists for this audience; denies solely on the audience-bound resolution.",
+        )
+        # N-60 (A3): a fully valid, CDDL-clean TWO-group COSE_Sign response. Both groups
+        # are enrolled response-service signers for the SAME audience (service + the
+        # second service key), both signatures verify, coverage is complete — so the
+        # SOLE defect is the exactly-one-response-signer-group rule (a response proof's
+        # realized plan must resolve exactly one signer group/record). General non-
+        # response 1*8-group semantics are unaffected.
+        n60_plan = [
+            group(1, SUITE_CLASSICAL, [component(ALG_ED25519, KID_SERVICE_ED)]),
+            group(2, SUITE_CLASSICAL, [component(ALG_ED25519, KID_SERVICE_ED_2)]),
+        ]
+        n60_body = {
+            H_CRIT: CRIT_SIGN_BODY_AUTH,
+            H_TYP: TYP_RESPONSE,
+            H_DOMAIN: DOMAIN_RESPONSE,
+            H_PLAN: n60_plan,
+        }
+        n60_claims = request_claims(credential_hash=None, schema_id=SCHEMA_ID_RESPONSE, body=CAPNP_RESPONSE_BYTES)
+        n60_entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_SERVICE_ED, H_GROUP: 1}, sk_s_ed),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: KID_SERVICE_ED_2, H_GROUP: 2}, sk_s_ed_2),
+        ]
+        n60, _, _ = sign_multi(n60_body, n60_claims, n60_entries)
+        record(
+            negatives, "N-60",
+            "Two-group response COSE_Sign (both groups enrolled) — violates exactly-one response signer",
+            "deny", "COSE_Sign", n60,
+            originating_request="P-2",
+            deny_class="response-signer",
+            deny_rule="a response proof's realized plan MUST contain exactly one signer group resolving one active response-service enrollment for its audience",
+            notes="Both groups are enrolled response-service signers for the audience and both signatures verify (coverage complete); denies solely on the exactly-one response-signer-group rule.",
+        )
+        # N-61 (B3): the WORKLOAD-path proof.exp <= session.expiry bound, mirroring N-51
+        # for the sid path. An otherwise-valid workload-bound proof (workload primary
+        # key, workload credential_hash) whose exp (1786000025) is WITHIN the workload
+        # credential exp (1786000030) but LATER than the authoritative workload session
+        # expiry (1786000022). Proof, credential, and session are all unexpired at
+        # verifier_now (1786000015), so it denies solely on the workload session bound.
+        n61_claims = request_claims(credential_hash=CREDENTIAL_HASH_WORKLOAD, extra={C_EXP: 1786000025})
+        n61, _, _ = sign1(p10_protected, n61_claims, sk_c_ed_wl)
+        record(
+            negatives, "N-61",
+            "Workload-session-bound proof whose exp (1786000025) exceeds the authoritative workload session exp (1786000022)",
+            "deny", "COSE_Sign1", n61,
+            deny_class="proof-session-expiry",
+            deny_rule="a proof exp MUST NOT exceed the authoritative session expiry for a workload_session_id credential",
+            notes="proof exp <= workload credential exp (1786000030) but > workload session exp (1786000022); the credential bound is satisfied, only the workload session bound denies.",
         )
 
     meta = {
         "vector_set_version": 1,
         "profile": "hs-rpc-proof-v1",
-        "status": "gate-2 input draft; not operator-approved",
+        "status": "frozen by the Gate-2 vote (v16 §19, 2026-08-19); not production-closed",
         "encoding": "RFC 8949 core deterministic encoding; untagged COSE structures",
         "external_aad": "zero-length for every Sig_structure in this profile",
+        "verifier_now": VERIFIER_NOW,
+        # W1: pinned proof-freshness parameters, evaluated at verifier_now
+        # (verifier-clock bounds per design §4.5; exp - verifier_now, NOT exp - iat).
+        "max_clock_skew_secs": MAX_CLOCK_SKEW_SECS,
+        "proof_max_remaining_lifetime_secs": PROOF_MAX_REMAINING_LIFETIME_SECS,
         "generator": "docs/standards/v16/tools/gen_proof_vectors.py",
+    }
+
+    # ---- F1/F2: verifier clock + authenticated credential context ------------
+    credentials_doc = {
+        **meta,
+        "kind": "authenticated-credential-context",
+        "verifier_now": VERIFIER_NOW,
+        "verifier_now_note": (
+            "Accept/reject dispositions are evaluated at this exact integer instant. "
+            "A conformance runner MUST inject it as the verifier clock instead of "
+            "using wall-clock time; iat <= verifier_now < exp for every advertised "
+            "positive and every credential below."
+        ),
+        "issuer": {
+            # U2: the CONFIGURED trusted issuer. Full credential verification MUST
+            # require the signed JWT `iss` to equal this exactly — never merely be
+            # non-empty, and never inferred from possession of the signing key. This
+            # is the same issuer namespace that scopes (iss, jti) credential
+            # revocation and (iss, sid) session resolution below.
+            "iss": ISSUER_ISS,
+            "kid": KID_ISSUER_ED.decode(),
+            "alg": "EdDSA",
+            "typ": "at+jwt",
+            "public_hex": issuer_pub.hex(),
+        },
+        "cnf_model": {
+            "member": "hs_signer_suite",
+            "value": "base64url(SHA-256(RFC 8949 det-CBOR [suite_id, [ordered raw component public keys]]))",
+            "note": (
+                "A profile-defined RFC 8747 confirmation method resolving to the "
+                "credential-profile §5 signer-suite record (suite ID + exact ordered "
+                "component keys of the PRIMARY signer group). Approver groups bind "
+                "their own enrollment and are never placed in cnf. Distinct from the "
+                "C1 replay thumbprint (no domain separator, no enrollment epoch)."
+            ),
+        },
+        "encoding_matrix": {
+            "note": (
+                "G1 (credential-profile §1.1): a HYBRID (multi-key) primary group has "
+                "no v16 CWT confirmation method, so hybrid credentials are at+jwt (JWT) "
+                "only via cnf.hs_signer_suite. The CWT cnf is a single RFC 8747 COSE_Key "
+                "and binds a CLASSICAL (single-key) primary only (N-1 is that shape). No "
+                "multi-key CWT confirmation label/shape is allocated or reserved."
+            ),
+            "hybrid_encoding": "at+jwt-only",
+            "cwt_cnf": "single RFC 8747 COSE_Key; classical (single-key) primary only",
+            "cwt_hybrid": "deferred (no v16 method)",
+        },
+        "credentials": {
+            "classical": {
+                "encoding": "at+jwt",
+                "credential_kind": "rfc8693",
+                "token": cred_classical,
+                "header": hdr_classical,
+                "claims": claims_classical,
+                "primary_suite": SUITE_CLASSICAL,
+                "cnf_preimage_hex": enc([SUITE_CLASSICAL, [client_ed_pub]]).hex(),
+                "cnf_thumbprint_b64": b64u(cnf_classical),
+                "token_sha256": CREDENTIAL_HASH.hex(),
+            },
+            "other_audience": {
+                "encoding": "at+jwt",
+                "credential_kind": "rfc8693",
+                "token": cred_other,
+                "header": hdr_other,
+                "claims": claims_other,
+                "primary_suite": SUITE_CLASSICAL,
+                "cnf_preimage_hex": enc([SUITE_CLASSICAL, [client_ed_pub]]).hex(),
+                "cnf_thumbprint_b64": b64u(cnf_classical),
+                "token_sha256": credential_hash_other.hex(),
+            },
+            "hybrid": {
+                "encoding": "at+jwt",
+                "credential_kind": "rfc8693",
+                "token": cred_hybrid,
+                "header": hdr_hybrid,
+                "claims": claims_hybrid,
+                "primary_suite": SUITE_HYBRID,
+                "cnf_preimage_hex": enc([SUITE_HYBRID, [client_ed_hy_pub, ml_client.public]]).hex(),
+                "cnf_thumbprint_b64": b64u(cnf_hybrid),
+                "token_sha256": CREDENTIAL_HASH_HYBRID.hex(),
+            },
+            "session": {
+                "encoding": "at+jwt",
+                "credential_kind": "user-session",
+                "token": cred_session,
+                "header": hdr_session,
+                "claims": claims_session,
+                "primary_suite": SUITE_CLASSICAL,
+                "cnf_preimage_hex": enc([SUITE_CLASSICAL, [client_ed_pub]]).hex(),
+                "cnf_thumbprint_b64": b64u(cnf_classical),
+                "token_sha256": CREDENTIAL_HASH_SESSION.hex(),
+                "session_id": SESSION_ID,
+            },
+            "longlived": {
+                # W1: a long-lived, otherwise-valid classical credential (exp beyond
+                # verifier_now + 300) that hosts the authenticated freshness negatives
+                # N-54/N-55/N-56. Not mapped to any positive; exists so an authenticated
+                # freshness proof can reach past the Authenticated maximum without also
+                # tripping the credential-expiry bound.
+                "encoding": "at+jwt",
+                "credential_kind": "rfc8693",
+                "token": cred_longlived,
+                "header": hdr_longlived,
+                "claims": claims_longlived,
+                "primary_suite": SUITE_CLASSICAL,
+                "cnf_preimage_hex": enc([SUITE_CLASSICAL, [client_ed_pub]]).hex(),
+                "cnf_thumbprint_b64": b64u(cnf_classical),
+                "token_sha256": CREDENTIAL_HASH_LONGLIVED.hex(),
+            },
+            "workload": {
+                # Y1: a workload-family credential (§3.3). Carries `workload_session_id`
+                # in a DISJOINT namespace keyed by (iss, workload_session_id); no OIDC
+                # `sid`. Its authoritative session has session_kind == "workload".
+                "encoding": "at+jwt",
+                "credential_kind": "workload",
+                "token": cred_workload,
+                "header": hdr_workload,
+                "claims": claims_workload,
+                "primary_suite": SUITE_CLASSICAL,
+                "cnf_preimage_hex": enc([SUITE_CLASSICAL, [workload_ed_pub]]).hex(),
+                "cnf_thumbprint_b64": b64u(cnf_workload),
+                "token_sha256": CREDENTIAL_HASH_WORKLOAD.hex(),
+                "workload_session_id": WORKLOAD_SESSION_ID,
+            },
+        },
+        "session_model": {
+            "note": (
+                "K1: a user-session credential carries the OIDC `sid` (§3.2). The "
+                "AUTHORITATIVE session expiry is the authority's session state keyed "
+                "by (iss, sid) (§3.4) — NOT a credential/wire claim. A proof's exp MUST "
+                "NOT exceed BOTH the credential exp and the session exp; an unknown, "
+                "revoked, expired, or (iss/sub/tenant)-mismatched session denies. The "
+                "session state also carries a deterministic integer clearance_epoch "
+                "(§3.4, L3) — off-wire authority state, never a credential claim; a "
+                "missing/non-integer/negative clearance_epoch denies. A sid-keyed "
+                "session is a user session, so session_kind MUST be 'interactive' (M2); "
+                "missing/wrong-type/empty/workload/service session_kind denies."
+            ),
+            "credential_kind_note": (
+                "sid presence is unambiguous by classification (metadata aligned with "
+                "B's IssueTokenProfile enum, NOT a wire claim): a `user-session` "
+                "credential is an interactive OIDC session token and MUST carry sid "
+                "(session). A `rfc8693` / `rfc7523` credential is a NON-INTERACTIVE "
+                "token-exchange / JWT-bearer profile that MUST NOT carry sid (classical, "
+                "hybrid — user subject, no interactive session). A `service` credential "
+                "(none shipped) has a `service:`-prefixed subject and no sid. §3.2/§3.3."
+            ),
+        },
+        "sessions": [
+            {
+                "iss": ISSUER_ISS,
+                "sid": SESSION_ID,
+                "sub": CREDENTIAL_SUBJECT,
+                "tenant": CREDENTIAL_TENANT,
+                "session_kind": "interactive",
+                "created": IAT,
+                "expiry": SESSION_EXP,
+                "status": "active",
+                # L3 (§3.4): the authoritative session's clearance epoch — a
+                # deterministic off-wire integer, never a credential/wire claim.
+                "clearance_epoch": 3,
+            },
+            {
+                # Y1: the authoritative WORKLOAD session, keyed by
+                # (iss, workload_session_id) — a namespace DISJOINT from user `sid`.
+                "iss": ISSUER_ISS,
+                "workload_session_id": WORKLOAD_SESSION_ID,
+                "sub": WORKLOAD_SUBJECT,
+                "tenant": CREDENTIAL_TENANT,
+                "session_kind": "workload",
+                "created": IAT,
+                "expiry": WORKLOAD_SESSION_EXP,
+                "status": "active",
+                "clearance_epoch": 4,
+            },
+            {
+                # Y1 signed-CWT-control sessions (§3.3): each resolves exactly one
+                # cwt_workload_session_controls entry and is defective in exactly
+                # one field, so that control denies solely on that cause and a
+                # single-field repair admits the unchanged credential. Expired:
+                # created < expiry but expiry <= verifier_now.
+                "iss": ISSUER_ISS,
+                "workload_session_id": WORKLOAD_SESSION_REVOKED_ID,
+                "sub": WORKLOAD_SUBJECT,
+                "tenant": CREDENTIAL_TENANT,
+                "session_kind": "workload",
+                "created": IAT,
+                "expiry": WORKLOAD_SESSION_EXP,
+                "status": "revoked",
+                "clearance_epoch": 4,
+            },
+            {
+                "iss": ISSUER_ISS,
+                "workload_session_id": WORKLOAD_SESSION_EXPIRED_ID,
+                "sub": WORKLOAD_SUBJECT,
+                "tenant": CREDENTIAL_TENANT,
+                "session_kind": "workload",
+                "created": IAT,
+                "expiry": IAT + 1,
+                "status": "active",
+                "clearance_epoch": 4,
+            },
+            {
+                "iss": ISSUER_ISS,
+                "workload_session_id": WORKLOAD_SESSION_WRONG_KIND_ID,
+                "sub": WORKLOAD_SUBJECT,
+                "tenant": CREDENTIAL_TENANT,
+                "session_kind": "interactive",
+                "created": IAT,
+                "expiry": WORKLOAD_SESSION_EXP,
+                "status": "active",
+                "clearance_epoch": 4,
+            },
+            {
+                "iss": ISSUER_ISS,
+                "workload_session_id": WORKLOAD_SESSION_CROSS_TENANT_ID,
+                "sub": WORKLOAD_SUBJECT,
+                "tenant": "tenant-beta",
+                "session_kind": "workload",
+                "created": IAT,
+                "expiry": WORKLOAD_SESSION_EXP,
+                "status": "active",
+                "clearance_epoch": 4,
+            },
+        ],
+        "approver_enrollment_model": {
+            "note": (
+                "Q1: a TokenBoundAndApproved proof's ADDITIONAL (approver) logical signer "
+                "groups bind to their OWN enrolled keys, NOT the credential cnf "
+                "(credential-profile §5). The authority holds an off-wire approver "
+                "enrollment record keyed by CRYPTOGRAPHIC CONTENT — the group's signer-"
+                "suite record thumbprint (suite_id + ordered public keys), the same "
+                "content-bound discipline as cnf/M1 — never the attacker-chosen group_id "
+                "or kid. It is validated for role, active status, tenant coherence, and a "
+                "non-negative integer enrollment_epoch. Unknown, key/suite-mismatched, "
+                "revoked/inactive, or cross-tenant/role-mismatched enrollment denies. Not "
+                "a credential/wire claim; no allocation."
+            ),
+            "thumbprint": "base64url(SHA-256(RFC 8949 det-CBOR [suite_id, [ordered raw component public keys]]))",
+        },
+        "primary_enrollment_model": {
+            "note": (
+                "T1: the authenticated credential path binds its cnf to an authoritative "
+                "off-wire PRIMARY enrollment record keyed by cryptographic content (the "
+                "primary signer-suite thumbprint over suite_id + ordered public keys, "
+                "recomputed from the record's OWN suite/keys, never labels). It carries "
+                "role=primary, tenant, principal, active status, expiry, and the "
+                "enrollment_epoch that the authenticated replay thumbprint is DERIVED from "
+                "(SHA-256([domain, suite_id, [ordered keys], enrollment_epoch])). An "
+                "unknown, tampered, wrong-role/tenant/principal, inactive/expired, or "
+                "epoch-changed record denies. Distinct from approver_enrollments."
+            ),
+        },
+        "primary_enrollments": [primary_enrollment_classical, primary_enrollment_hybrid, primary_enrollment_workload],
+        "approver_enrollments": [
+            {
+                "suite_id": SUITE_CLASSICAL,
+                "component_public_keys_hex": [approver_ed_pub.hex()],
+                "thumbprint_b64": b64u(signer_suite_thumbprint(SUITE_CLASSICAL, [approver_ed_pub])),
+                "role": "approver",
+                "principal": "approver-1",
+                "tenant": CREDENTIAL_TENANT,
+                "status": "active",
+                # Authoritative validity window checked against the injected
+                # verifier_now (1786000015); active and unexpired.
+                "expires_at": 1786000060,
+                "enrollment_epoch": 2,
+            },
+        ],
+        "response_signer_model": {
+            "note": (
+                "Z1: a RESPONSE proof's signer is authorized ONLY through authoritative "
+                "off-wire service trust state bound to the response AUDIENCE — never a "
+                "generic known-kid lookup or the prose `role` string in the key fixture. "
+                "Each record is keyed by the exact response `aud` + the signer-suite "
+                "content (suite_id + ordered public keys, recomputed thumbprint), with an "
+                "explicit `response-service` role, active status, expiry, and a `tenant` "
+                "bound to the tenant DERIVED FROM THE ORIGINATING AUTHENTICATED REQUEST "
+                "(B2). The response proof's realized plan MUST contain EXACTLY ONE signer "
+                "group resolving EXACTLY ONE active record for its audience; unknown, "
+                "wrong-role, wrong-audience, wrong-tenant, inactive/expired, "
+                "key/suite-mismatched, ambiguous, or multi-group responses deny. Not a "
+                "wire/proof field; no registry/IANA allocation."
+            ),
+        },
+        "response_signer_enrollments": [
+            {
+                "aud": SERVICE_DOMAIN,
+                "suite_id": SUITE_CLASSICAL,
+                "component_public_keys_hex": [service_ed_pub.hex()],
+                "thumbprint_b64": b64u(signer_suite_thumbprint(SUITE_CLASSICAL, [service_ed_pub])),
+                "role": "response-service",
+                "tenant": CREDENTIAL_TENANT,
+                "status": "active",
+                "expires_at": 1786000060,
+            },
+            {
+                # A3: a SECOND, distinct response-service signer enrolled for the SAME
+                # audience. It exists so the two-group response negative (N-60) has both
+                # groups otherwise-enrolled, isolating the exactly-one-signer-group rule.
+                "aud": SERVICE_DOMAIN,
+                "suite_id": SUITE_CLASSICAL,
+                "component_public_keys_hex": [service_ed_2_pub.hex()],
+                "thumbprint_b64": b64u(signer_suite_thumbprint(SUITE_CLASSICAL, [service_ed_2_pub])),
+                "role": "response-service",
+                "tenant": CREDENTIAL_TENANT,
+                "status": "active",
+                "expires_at": 1786000060,
+            },
+        ],
+        "credential_revocation_model": {
+            "note": (
+                "U1 (credential-profile §6/§3.3): individual credential revocation is "
+                "normative and affects EXACTLY ONE token, keyed by the credential "
+                "typed identity tuple (iss, kind, identifier): JWT jti text or CWT cti bytes. This authoritative off-wire store is "
+                "consulted AFTER issuer-signature and profile validation; an otherwise-"
+                "valid, unexpired credential whose typed identity is listed fails closed. "
+                "The match is the EXACT tuple — a different identifier, kind or issuer "
+                "does NOT match. CWT cti_hex is decoded to bytes, never UTF-8 or jti text. "
+                "This is DISTINCT from session-wide revocation (a session status = "
+                "'revoked', keyed by (iss, sid)) and from enrollment revocation (an "
+                "enrollment status = 'revoked'/'inactive'). It is not a wire claim and "
+                "adds no consume-once behavior; a Reusable credential ID is never "
+                "consumed. The shipped live credentials are NOT listed (positive "
+                "unrevoked evidence); `cred-revoked-1` is a revoked identity a "
+                "conformance runner re-signs to exercise the JWT deny path. Separate signed "
+                "CWT controls prove binary-cti revocation and JWT/CWT namespace separation."
+            ),
+            "tuple": "(iss, kind, identifier): jti text or cti bytes",
+        },
+        "credential_revocations": [
+            {"iss": ISSUER_ISS, "kind": "jti", "jti": "cred-revoked-1"},
+            {"iss": ISSUER_ISS, "kind": "cti", "cti_hex": b"\xffcwt-revoked-1".hex()},
+        ],
+        "cwt_revocation_controls": cwt_revocation_controls,
+        "cwt_workload_session_controls": cwt_workload_session_controls,
+        "positive_to_credential": {
+            "P-2": "hybrid",
+            "P-4": "classical",
+            "P-5": "classical",
+            "P-6": "classical",
+            "P-9": "session",
+            "P-10": "workload",
+            "P-11": "other_audience",
+        },
+    }
+
+    # ---- C1: frozen replay-namespace thumbprint vectors ----------------------
+    # SHA-256 over the RFC 8949 core-deterministic encoding of a CBOR array whose
+    # first element is the domain-separator text (see the CDDL §7.1).
+    replay_domain_authenticated = "hs-rpc-replay-primary-suite-v1"
+    replay_domain_key_set = "hs-rpc-replay-key-set-v1"
+    # T1: the authenticated replay epoch is DERIVED from the cnf-resolved PRIMARY
+    # enrollment record (the hybrid primary example here), not a fixture literal.
+    enrollment_epoch = primary_enrollment_hybrid["enrollment_epoch"]
+    client_ed_pub = sk_c_ed.public_key().public_bytes_raw()
+    client_ed_hy_pub = sk_c_ed_hy.public_key().public_bytes_raw()
+    # Authenticated example: the hybrid primary group (P-2's suite + ordered
+    # public component keys), approver groups excluded. V1: the Ed25519 component
+    # is the DISTINCT hybrid-suite key.
+    auth_preimage = enc([
+        replay_domain_authenticated,
+        SUITE_HYBRID,
+        [client_ed_hy_pub, ml_client.public],
+        enrollment_epoch,
+    ])
+    auth_thumbprint = hashlib.sha256(auth_preimage).digest()
+    # Unattributed example (M1): CONTENT-BOUND over P-1's suite + ordered public
+    # keys; the attacker-chosen group_id/kid labels are normalized OUT (mirroring the
+    # authenticated derivation), so a self-asserted signer cannot mint a fresh replay
+    # namespace by permuting labels over identical key material.
+    from check_proof_vectors import unattributed_replay_preimage
+    unatt_pub = sk_u_ed.public_key().public_bytes_raw()
+    keyset_preimage = unattributed_replay_preimage(
+        replay_domain_key_set, plan_unattributed, keyset_unattributed)
+    keyset_thumbprint = hashlib.sha256(keyset_preimage).digest()
+
+    # R1: two cryptographically valid 2-group unattributed proofs — the SAME signer
+    # content {A,B}, in REVERSED plan order (A,B vs B,A) with fresh signatures — that
+    # canonically content-sort to the IDENTICAL replay preimage/namespace.
+    order_A = (b"unatt-order-a-1", sk_u_ed, sk_u_ed.public_key().public_bytes_raw())
+    order_B = (b"unatt-order-b-1", sk_a_ed, sk_a_ed.public_key().public_bytes_raw())
+
+    def two_group_unatt(first, second):
+        (kid1, key1, pub1), (kid2, key2, pub2) = first, second
+        plan = [group(1, SUITE_CLASSICAL, [component(ALG_ED25519, kid1)]),
+                group(2, SUITE_CLASSICAL, [component(ALG_ED25519, kid2)])]
+        keyset = [cose_key_okp_ed25519(kid1, pub1), cose_key_okp_ed25519(kid2, pub2)]
+        body = {
+            H_CRIT: CRIT_SIGN_BODY_UNATTRIBUTED,
+            H_TYP: TYP_REQUEST, H_DOMAIN: DOMAIN_REQUEST,
+            H_PLAN: plan, H_KEYSET: keyset,
+        }
+        entries = [
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: kid1, H_GROUP: 1}, key1),
+            ({H_ALG: ALG_ED25519, H_CRIT: CRIT_SIGN_SIGNATURE, H_KID: kid2, H_GROUP: 2}, key2),
+        ]
+        obj, _bp, _pl = sign_multi(body, request_claims(credential_hash=None, nonce=CHALLENGE), entries)
+        pre = unattributed_replay_preimage(replay_domain_key_set, plan, keyset)
+        return obj, pre
+
+    order_ab, pre_ab = two_group_unatt(order_A, order_B)
+    order_ba, pre_ba = two_group_unatt(order_B, order_A)
+    thumbprints = {
+        **meta,
+        "kind": "replay-thumbprints",
+        "domain_separators": {
+            "authenticated": replay_domain_authenticated,
+            "key_set": replay_domain_key_set,
+        },
+        "sha256_of": "the RFC 8949 core-deterministic encoding of a CBOR array; domain separator is element 0",
+        "authenticated": {
+            "note": "credential-bound primary signer-suite thumbprint (design §4.5/§4.6); approver groups excluded",
+            "suite_id": SUITE_HYBRID,
+            "component_public_keys_hex": [client_ed_hy_pub.hex(), ml_client.public.hex()],
+            "enrollment_epoch": enrollment_epoch,
+            "preimage_hex": auth_preimage.hex(),
+            "thumbprint_sha256": auth_thumbprint.hex(),
+        },
+        "unattributed": {
+            "note": ("unattributed proof-key-set thumbprint (design §4.7/§7), CONTENT-BOUND "
+                     "over per-group (suite_id, ordered public keys); attacker-chosen "
+                     "group_id/kid labels are normalized OUT (M1). Relabeling (group_id-only "
+                     "or kid-only) with identical suite/keys yields the SAME thumbprint, so "
+                     "the replay key (thumbprint, cti) is unchanged and the second use is "
+                     "rejected as replay; a different suite, public-key byte, or group/key "
+                     "ordering yields a DIFFERENT thumbprint (identities are not over-collapsed)."),
+            "from_vector": "P-1",
+            "suite_id": SUITE_CLASSICAL,
+            "component_public_keys_hex": [unatt_pub.hex()],
+            "preimage_hex": keyset_preimage.hex(),
+            "thumbprint_sha256": keyset_thumbprint.hex(),
+        },
+        "group_order_canonicalization": {
+            "note": ("R1: the per-group content records [suite_id, [ordered public keys]] are "
+                     "sorted by their RFC 8949 deterministic-CBOR encoding as unsigned byte "
+                     "strings BEFORE hashing — never on group_id/kid/plan position. So the same "
+                     "signer set {A,B} in ANY plan order maps to ONE replay namespace. Component "
+                     "keys inside each group keep their suite-plan order. A different key or "
+                     "suite, or a different multiset, changes the namespace (no over-collapse)."),
+            "order_ab": {"cbor_hex": order_ab.hex(), "preimage_hex": pre_ab.hex(),
+                         "thumbprint_sha256": hashlib.sha256(pre_ab).hexdigest()},
+            "order_ba": {"cbor_hex": order_ba.hex(), "preimage_hex": pre_ba.hex(),
+                         "thumbprint_sha256": hashlib.sha256(pre_ba).hexdigest()},
+            "same_namespace": pre_ab == pre_ba,
+        },
     }
 
     (out_dir / "proof-v1-keys.json").write_text(
@@ -1247,6 +3001,12 @@ def main() -> None:
     )
     (out_dir / "proof-v1-negative.json").write_text(
         json.dumps({**meta, "kind": "negative", "vectors": negatives}, indent=2) + "\n"
+    )
+    (out_dir / "proof-v1-thumbprints.json").write_text(
+        json.dumps(thumbprints, indent=2) + "\n"
+    )
+    (out_dir / "proof-v1-credentials.json").write_text(
+        json.dumps(credentials_doc, indent=2) + "\n"
     )
     print(f"wrote {len(positives)} positive and {len(negatives)} negative vectors to {out_dir}")
 

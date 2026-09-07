@@ -95,6 +95,16 @@ pub const MIN_CHALLENGE_BYTES: usize = 16;
 /// Maximum server-challenge size in bytes.
 pub const MAX_CHALLENGE_BYTES: usize = 64;
 
+/// W1 (design §4.5) verifier-clock freshness bounds. All three are
+/// VERIFIER-CLOCK bounds, never issued lifetime (`exp - iat`): a proof is
+/// fresh iff `|iat - now| <= MAX_CLOCK_SKEW_SECS`, `now < exp`, and
+/// `exp - now` is within the disposition maximum.
+pub const MAX_CLOCK_SKEW_SECS: u64 = 30;
+/// Maximum remaining lifetime for an authenticated (credential-bound) proof.
+pub const MAX_REMAINING_LIFETIME_AUTHENTICATED_SECS: u64 = 300;
+/// Maximum remaining lifetime for an unattributed (self-asserted) proof.
+pub const MAX_REMAINING_LIFETIME_UNATTRIBUTED_SECS: u64 = 30;
+
 // --- private-use CWT claim keys (checked registry) ---
 
 pub const CLAIM_CREDENTIAL_HASH: i64 = -70001;
