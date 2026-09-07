@@ -1465,6 +1465,7 @@ impl InferenceService {
             qos: stream_ctx.qos().clone(),
             broadcast_path,
             announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
+            moql_server_identity: stream_ctx.moql_server_identity(),
             kem_ciphertexts: Vec::new(), // #554: classical stream (dh_public path), no hybrid KEM
         };
 
@@ -2339,6 +2340,7 @@ impl InferenceHandler for InferenceService {
             qos: <hyprstream_rpc::stream_info::Job as hyprstream_rpc::stream_info::StreamOptPreset>::stream_opt(),
             broadcast_path,
             announced_at: reach,
+            moql_server_identity: Default::default(),
             kem_ciphertexts: Vec::new(), // #554: classical stream (dh_public path), no hybrid KEM
         };
 
@@ -2568,6 +2570,7 @@ impl InferenceHandler for InferenceService {
             qos: stream_ctx.qos().clone(),
             broadcast_path,
             announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
+            moql_server_identity: stream_ctx.moql_server_identity(),
             kem_ciphertexts: Vec::new(), // #554: classical stream (dh_public path), no hybrid KEM
         };
 
@@ -2859,6 +2862,7 @@ pub struct InferenceServiceConfig {
     /// created in the caller's runtime will fail with "Tokio context being shutdown" when
     /// used on a different thread's runtime.
     policy_signing_key: SigningKey,
+    policy_transport: hyprstream_rpc::transport::TransportConfig,
     transport: hyprstream_rpc::transport::TransportConfig,
     fs: Option<WorktreeClient>,
     /// Expected audience for JWT validation (resource URL)
@@ -2901,6 +2905,7 @@ impl InferenceServiceConfig {
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
         transport: hyprstream_rpc::transport::TransportConfig,
+        policy_transport: hyprstream_rpc::transport::TransportConfig,
         fs: Option<WorktreeClient>,
     ) -> Self {
         let policy_signing_key = signing_key.clone();
@@ -2911,6 +2916,7 @@ impl InferenceServiceConfig {
             server_pubkey,
             signing_key,
             policy_signing_key,
+            policy_transport,
             transport,
             fs,
             expected_audience: None,
@@ -3131,6 +3137,8 @@ async fn serve_inference_bridged(
         hyprstream_rpc::moq_stream::serve_origin_to_relay_background(
             origin.producer().clone(),
             relay,
+            qc.moq_admission_proof.clone(),
+            qc.moq_relay_server_identity.take(),
         );
     }
 
@@ -3229,6 +3237,7 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                 server_pubkey,
                 signing_key: svc_signing_key,
                 policy_signing_key,
+                policy_transport,
                 transport: _transport,
                 fs,
                 expected_audience,
@@ -3279,8 +3288,19 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                         .ok_or_else(|| {
                             anyhow::anyhow!("trust store has no policy key — startup must populate it")
                         })?;
-                    let policy_client =
-                        crate::services::policy_client_for_process(policy_signing_key, policy_vk, None)?;
+                    // Required profile resolves through the checkpoint-backed
+                    // discovery resolver; compatibility dials the factory-
+                    // resolved deterministic IPC transport.
+                    let policy_client = if hyprstream_discovery::native_network_required() {
+                        PolicyClient::from_resolver(policy_signing_key, None)?
+                    } else {
+                        PolicyClient::for_local_transport_bootstrap(
+                            &policy_transport,
+                            policy_signing_key,
+                            policy_vk,
+                            None,
+                        )?
+                    };
                     let service = InferenceService::initialize(
                         model_path,
                         config,
@@ -3495,6 +3515,7 @@ mod tenant_binding_tests {
             hyprstream_rpc::transport::TransportConfig::inproc(
                 "inference-stream-plane-test",
             ),
+            hyprstream_rpc::transport::TransportConfig::inproc("policy"),
             None,
         )
         .with_stream_plane(Arc::clone(&reach), Arc::clone(&origin));
@@ -3516,6 +3537,7 @@ mod tenant_binding_tests {
             hyprstream_rpc::transport::TransportConfig::inproc(
                 "inference-legacy-readiness-test",
             ),
+            hyprstream_rpc::transport::TransportConfig::inproc("policy"),
             None,
         );
 

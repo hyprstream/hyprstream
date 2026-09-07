@@ -1339,6 +1339,28 @@ pub struct QuicLoopConfig {
     /// drift. `None` = direct-only (the S1/S2 behaviour). Native-only.
     #[cfg(not(target_arch = "wasm32"))]
     pub moq_relay: Option<crate::stream_info::TransportConfig>,
+    /// Resolver-verified accepted-state witness for `moq_relay`. Iroh relay
+    /// links require this distinct remote identity for mutual admission.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_relay_server_identity: Option<crate::stream_info::MoqlServerIdentity>,
+    /// #1027: optional inside-carrier admission authenticator for the iroh
+    /// `moql` accept path. When set, every accepted `moql` connection must
+    /// prove an accepted current Ed25519 + ML-DSA-65 identity (fresh
+    /// challenge/response binding epoch/head/nonces) before the moq handshake;
+    /// the admitted peer is served only its resolved tenant's scope. When
+    /// `None`, the pre-#1027 posture stands: anonymous carriers are refused.
+    /// Native-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_admission:
+        Option<Arc<crate::transport::moql_admission::MoqlAdmissionAuthenticator>>,
+    /// Optional service-owned ingress authorization. The spawner forwards it
+    /// unchanged to the Iroh MoQL handler; absence is deliberately read-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_ingress_authorizer:
+        Option<crate::transport::iroh_moq::SharedIngressAuthorizer>,
+    /// Native client proof for authenticated Iroh `moql` dials in this process.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_admission_proof: Option<crate::transport::moql_admission::MoqlAdmissionProof>,
 }
 
 /// Handle for a running service

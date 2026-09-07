@@ -432,9 +432,15 @@ pub struct OAuthService {
     account_config: crate::account::AccountZoneConfig,
     /// Global QUIC configuration for cert-hash publication in DID doc (#185).
     quic_config: Option<crate::config::QuicConfig>,
-    /// Signing key for creating the PolicyClient inside `run()`.
+    /// Signing key for creating RPC clients inside `run()`.
     signing_key: hyprstream_rpc::prelude::SigningKey,
     control_transport: TransportConfig,
+    /// Policy transport resolved by the factory. This is an IPC socket when
+    /// OAuth runs in its own rootless Quadlet process.
+    policy_transport: TransportConfig,
+    /// Discovery transport resolved by the factory. This is an IPC socket when
+    /// OAuth runs in its own rootless Quadlet process.
+    discovery_transport: TransportConfig,
     #[allow(dead_code)]
     verifying_key: ed25519_dalek::VerifyingKey,
     /// JWT verifying key (CA key) for JWKS endpoint. This is the key that verifies
@@ -456,6 +462,8 @@ impl OAuthService {
         account_config: crate::account::AccountZoneConfig,
         signing_key: hyprstream_rpc::prelude::SigningKey,
         control_transport: TransportConfig,
+        policy_transport: TransportConfig,
+        discovery_transport: TransportConfig,
         verifying_key: ed25519_dalek::VerifyingKey,
         jwt_verifying_key: ed25519_dalek::VerifyingKey,
     ) -> Self {
@@ -466,6 +474,8 @@ impl OAuthService {
             quic_config: None,
             signing_key,
             control_transport,
+            policy_transport,
+            discovery_transport,
             verifying_key,
             jwt_verifying_key: jwt_verifying_key.to_bytes(),
             jti_blocklist: None,
@@ -508,6 +518,7 @@ impl OAuthService {
     }
 }
 
+#[cfg(test)]
 fn runtime_clients(
     signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<(PolicyClient, crate::services::DiscoveryClient)> {
@@ -571,12 +582,54 @@ impl Spawnable for OAuthService {
             // async I/O (TMQ) registers socket FDs with THIS runtime's epoll.
             // Creating them in the factory (main runtime) would cause hangs.
 
-            let (policy_client, discovery_client) = runtime_clients(&self.signing_key)
-                .map_err(|error| {
-                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
-                        "failed to create OAuth runtime clients: {error}"
-                    ))
-                })?;
+            // Bootstrap: get service verifying keys from the trust store,
+            // populated during startup by depends_on services. Required profile
+            // resolves through the checkpoint-backed discovery resolver;
+            // compatibility dials the deterministic per-process IPC transports
+            // the factory resolved (available to a separate Quadlet process).
+            let policy_vk = match hyprstream_service::global_trust_store().resolve_one("policy") {
+                Some(vk) => vk,
+                None => {
+                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "trust store has no policy key — startup must populate it".to_owned(),
+                    ));
+                }
+            };
+            let policy_client = if hyprstream_discovery::native_network_required() {
+                PolicyClient::from_resolver(self.signing_key.clone(), None)
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create PolicyClient: {e}")))?
+            } else {
+                PolicyClient::for_local_transport_bootstrap(
+                    &self.policy_transport,
+                    self.signing_key.clone(),
+                    policy_vk,
+                    None,
+                ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                    format!("failed to create PolicyClient: {e}"),
+                ))?
+            };
+
+            let discovery_vk = match hyprstream_service::global_trust_store().resolve_one("discovery") {
+                Some(vk) => vk,
+                None => {
+                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "trust store has no discovery key — ensure discovery is in depends_on".to_owned(),
+                    ));
+                }
+            };
+            let discovery_client = if hyprstream_discovery::native_network_required() {
+                crate::services::DiscoveryClient::from_resolver(self.signing_key.clone(), None)
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create DiscoveryClient: {e}")))?
+            } else {
+                crate::services::DiscoveryClient::for_local_transport_bootstrap(
+                    &self.discovery_transport,
+                    self.signing_key.clone(),
+                    discovery_vk,
+                    None,
+                ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                    format!("failed to create DiscoveryClient: {e}"),
+                ))?
+            };
 
             let credentials_dir = crate::auth::identity_store::credentials_dir().map_err(|e| {
                 hyprstream_rpc::error::RpcError::SpawnFailed(
@@ -1100,6 +1153,38 @@ pub fn protected_resource_metadata(
 mod tests {
     use super::registration::validate_redirect_uri;
     use super::*;
+
+    /// OAuth owns a separate runtime, so its peer clients are made in `run`.
+    /// The production path must retain the factory-resolved IPC transports;
+    /// process-local bootstrap cannot see Policy or Discovery across rootless
+    /// Quadlet process boundaries.
+    #[test]
+    fn oauth_run_uses_factory_resolved_peer_transports() {
+        let source = include_str!("mod.rs");
+        let production = source
+            .split("// Tests")
+            .next()
+            .expect("tests banner must bound production source");
+        let run_start = production
+            .find("impl Spawnable for OAuthService")
+            .expect("OAuthService must implement Spawnable");
+        let run = &production[run_start..];
+
+        assert!(run.contains(
+            "PolicyClient::for_local_transport_bootstrap(\n                &self.policy_transport,"
+        ));
+        assert!(run.contains(
+            "DiscoveryClient::for_local_transport_bootstrap(\n                &self.discovery_transport,"
+        ));
+        assert!(
+            !run.contains("PolicyClient::for_local_bootstrap("),
+            "OAuth must not use the process-local Policy registry"
+        );
+        assert!(
+            !run.contains("DiscoveryClient::for_local_bootstrap("),
+            "OAuth must not use the process-local Discovery registry"
+        );
+    }
 
     fn encode_form(fields: &[(&str, &str)]) -> String {
         let mut serializer = url::form_urlencoded::Serializer::new(String::new());

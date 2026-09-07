@@ -14,6 +14,8 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, HashMap};
 use std::sync::Arc;
 
+pub(crate) const ANNOUNCED_ENDPOINT_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DiscoveryStateBackend {
@@ -172,15 +174,27 @@ pub(crate) struct AnnouncedEndpoint {
     pub(crate) response_key_id: String,
     pub(crate) request_kem_key_id: String,
     pub(crate) request_kem_recipient: Vec<u8>,
-    /// Signed/application expiry carried by the announcement.
+    /// Signed/application expiry carried by the announcement. Zero on a
+    /// legacy write requests a backend-receipt-bounded application expiry.
     pub(crate) expires_at_unix_ms: i64,
     pub(crate) source_signer: [u8; 32],
-    /// Effective cache lifetime: no later than heartbeat, signed artifact, and
-    /// accepted-current-state expiry.
+    /// On write: independently verified signed/current-state authority ceiling.
+    /// On read: effective lifetime, also capped by the backend's receipt + TTL.
     pub(crate) live_until_unix_ms: i64,
 }
 
 impl AnnouncedEndpoint {
+    fn receipt_lease(mut self, now: i64) -> Option<Self> {
+        let heartbeat_expiry = now.saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64);
+        if self.expires_at_unix_ms == 0 {
+            self.expires_at_unix_ms = heartbeat_expiry;
+        }
+        self.live_until_unix_ms = heartbeat_expiry
+            .min(self.expires_at_unix_ms)
+            .min(self.live_until_unix_ms);
+        self.is_live_at(now).then_some(self)
+    }
+
     pub(crate) fn is_live_at(&self, now_unix_ms: i64) -> bool {
         now_unix_ms < self.live_until_unix_ms && now_unix_ms < self.expires_at_unix_ms
     }
@@ -194,6 +208,7 @@ impl AnnouncedEndpoint {
 pub(crate) struct LiveAllocatable {
     pub(crate) allocatable: Vec<(String, String)>,
     pub(crate) load_fraction: f32,
+    /// Server receipt time, never the reporting node's clock.
     pub(crate) last_seen: i64,
     pub(crate) live_until_unix_ms: i64,
 }
@@ -246,6 +261,7 @@ pub(crate) trait DiscoveryStateStore: Send + Sync {
     ) -> Result<Vec<(String, Vec<AnnouncedEndpoint>)>>;
 
     async fn put_liveness(&self, node: &Did, value: LiveAllocatable) -> Result<PutResult>;
+    #[cfg(test)]
     async fn liveness(&self, node: &Did, now_unix_ms: i64) -> Result<Option<LiveAllocatable>>;
     /// Bounded enumeration of live nodes from the authoritative backend.
     async fn all_liveness(&self, now_unix_ms: i64) -> Result<Vec<(Did, LiveAllocatable)>>;
@@ -253,6 +269,7 @@ pub(crate) trait DiscoveryStateStore: Send + Sync {
     async fn put_entity_statement(&self, issuer: &str, value: CachedEntityStatement) -> Result<()>;
     async fn entity_statement(&self, issuer: &str) -> Result<Option<CachedEntityStatement>>;
     async fn known_issuers(&self) -> Result<Vec<String>>;
+    async fn known_issuer_count(&self) -> Result<usize>;
 
     async fn put_envelope_keyset(
         &self,
@@ -411,13 +428,23 @@ impl MemoryStateStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn put_announcement_sync(
         &self,
         service_name: &str,
         endpoint: AnnouncedEndpoint,
     ) -> Result<PutResult> {
+        self.put_announcement_at(service_name, endpoint, unix_millis_now())
+    }
+
+    fn put_announcement_at(
+        &self,
+        service_name: &str,
+        endpoint: AnnouncedEndpoint,
+        now_unix_ms: i64,
+    ) -> Result<PutResult> {
         let mut inner = self.inner.lock();
-        Self::reap(&mut inner, unix_millis_now());
+        Self::reap(&mut inner, now_unix_ms);
         let key = AnnouncementKey {
             service_name: service_name.to_owned(),
             socket_kind: endpoint.socket_kind.clone(),
@@ -501,7 +528,7 @@ impl MemoryStateStore {
             .collect()
     }
 
-    #[cfg(any(feature = "valkey", test, feature = "test-fixtures"))]
+    #[cfg(feature = "valkey")]
     pub(crate) fn clear_announcements_sync(&self, service_name: &str) {
         let mut inner = self.inner.lock();
         let Some(socket_kinds) = inner.service_index.remove(service_name) else {
@@ -548,7 +575,11 @@ impl DiscoveryStateStore for MemoryStateStore {
         service_name: &str,
         endpoint: AnnouncedEndpoint,
     ) -> Result<PutResult> {
-        self.put_announcement_sync(service_name, endpoint)
+        let now = unix_millis_now();
+        let Some(endpoint) = endpoint.receipt_lease(now) else {
+            return Ok(PutResult::IgnoredOlder);
+        };
+        self.put_announcement_at(service_name, endpoint, now)
     }
 
     async fn announcements_for(
@@ -571,7 +602,12 @@ impl DiscoveryStateStore for MemoryStateStore {
         Self::reap(&mut inner, unix_millis_now());
         let node = node.as_str().to_owned();
         if let Some(existing) = inner.liveness.get(&node) {
-            if existing.value.last_seen > value.last_seen {
+            // Both fields derive from receipt time. A newer receipt may
+            // shorten lifetime; a newer lifetime also supersedes legacy
+            // client-clock skew without waiting for the old value to expire.
+            if existing.value.last_seen > value.last_seen
+                && existing.value.live_until_unix_ms >= value.live_until_unix_ms
+            {
                 return Ok(PutResult::IgnoredOlder);
             }
         } else if inner.liveness.len() >= self.liveness_capacity {
@@ -588,6 +624,7 @@ impl DiscoveryStateStore for MemoryStateStore {
         Ok(PutResult::Stored)
     }
 
+    #[cfg(test)]
     async fn liveness(&self, node: &Did, now_unix_ms: i64) -> Result<Option<LiveAllocatable>> {
         let mut inner = self.inner.lock();
         Self::reap(&mut inner, now_unix_ms);
@@ -614,7 +651,16 @@ impl DiscoveryStateStore for MemoryStateStore {
         if !inner.entity_statements.contains_key(issuer)
             && inner.entity_statements.len() >= self.artifact_capacity
         {
-            bail!("Discovery memory federation artifact capacity exhausted");
+            // These are inert artifacts, verified again at use. Retain the
+            // newest fetched entries without interpreting JWT expiry as trust.
+            if let Some(oldest) = inner
+                .entity_statements
+                .iter()
+                .min_by_key(|(name, value)| (value.fetched_at, *name))
+                .map(|(name, _)| name.clone())
+            {
+                inner.entity_statements.remove(&oldest);
+            }
         }
         inner.entity_statements.insert(issuer.to_owned(), value);
         Ok(())
@@ -632,6 +678,10 @@ impl DiscoveryStateStore for MemoryStateStore {
             .keys()
             .cloned()
             .collect())
+    }
+
+    async fn known_issuer_count(&self) -> Result<usize> {
+        Ok(self.inner.lock().entity_statements.len())
     }
 
     async fn put_envelope_keyset(
@@ -658,6 +708,8 @@ impl DiscoveryStateStore for MemoryStateStore {
 #[derive(Serialize, Deserialize)]
 struct StoredLiveness {
     node: Did,
+    #[serde(default)]
+    shared_receipt: bool,
     #[serde(flatten)]
     value: LiveAllocatable,
 }
@@ -698,6 +750,9 @@ impl ValkeyStateStore {
                 && config.artifact_capacity > 0,
             "Discovery Valkey capacities must be positive"
         );
+        // Fred's URL parser constructs a rustls config. Initialize the existing
+        // external TLS policy first, including in standalone state-store use.
+        hyprstream_rpc::transport::pq_provider::install_pq_crypto_provider()?;
         let redis = RedisConfig::from_url(&config.url).context("invalid Discovery Valkey URL")?;
         let mut builder = Builder::from_config(redis);
         builder.with_performance_config(|performance| {
@@ -802,11 +857,13 @@ impl ValkeyStateStore {
     // Persistent family-wide generations bound revision storage independently
     // of identity churn. Never expire/reset these counters: recreating a scope
     // must not reuse a revision still attached to another replica's L1 value.
+    #[cfg(test)]
     async fn announcement_revision(&self) -> Result<u64> {
         self.revision(self.key("announcement-global-revision"))
             .await
     }
 
+    #[cfg(test)]
     async fn liveness_revision(&self) -> Result<u64> {
         self.revision(self.key("liveness-global-revision")).await
     }
@@ -816,7 +873,9 @@ impl ValkeyStateStore {
     // plus the last expired cohort; no historical service-name scan is needed.
     // All derived keys retain the deployment's cluster hash tag.
     const REAP_ANNOUNCEMENTS: &str = r#"
-local function reap(expiry, services, names, revision, now)
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local function reap(expiry, services, names, revision)
   local expired = redis.call('ZRANGEBYSCORE', expiry, '-inf', now)
   if #expired > 0 then redis.call('INCR', revision) end
   for _, key in ipairs(expired) do
@@ -833,13 +892,22 @@ local function reap(expiry, services, names, revision, now)
 end
 "#;
 
-    async fn entity_revision(&self, issuer: &str) -> Result<u64> {
-        self.revision(format!(
-            "{}:entity-revision:{}",
-            self.prefix,
-            Self::digest(issuer)
-        ))
-        .await
+    async fn announcement_revision_at_shared_time(&self) -> Result<(u64, i64)> {
+        use fred::prelude::*;
+        // Cache hits need the same expiry clock as L2. Reap before reading the
+        // generation so an expired L2 value cannot remain valid in another L1.
+        self.pool.eval(
+            format!("{}\nreap(KEYS[1], KEYS[2], KEYS[3], KEYS[4])\nreturn {{redis.call('GET', KEYS[4]) or '0', now}}", Self::REAP_ANNOUNCEMENTS),
+            vec![self.key("announcement-expiry"), self.key("services"),
+                self.key("service-names"), self.key("announcement-global-revision")],
+            Vec::<String>::new(),
+        ).await.map_err(Into::into)
+    }
+
+    async fn entity_revision(&self) -> Result<u64> {
+        // Survives eviction/reinsertion: no per-issuer tombstones and no ABA
+        // when another replica still has an evicted artifact in L1.
+        self.revision(self.key("entity-global-revision")).await
     }
 
     async fn envelope_revision(&self, service_did: &str) -> Result<u64> {
@@ -854,7 +922,6 @@ end
     async fn announcements_for_inner(
         &self,
         service_name: &str,
-        now_unix_ms: i64,
     ) -> Result<Vec<AnnouncedEndpoint>> {
         use fred::prelude::*;
 
@@ -862,14 +929,14 @@ end
         // refresh the same key, so GET followed by a separate DEL/SREM can
         // delete its newer value or remove its live index membership.
         const LIST: &str = r#"
-reap(KEYS[4], KEYS[2], KEYS[3], KEYS[5], ARGV[1])
+reap(KEYS[4], KEYS[2], KEYS[3], KEYS[5])
 local live = {}
 for _, key in ipairs(redis.call('SMEMBERS', KEYS[1])) do
   local encoded = redis.call('GET', key)
   if encoded then
     local ok, value = pcall(cjson.decode, encoded)
     if not ok then return redis.error_reply('corrupt Discovery announcement') end
-    if tonumber(value.live_until_unix_ms) > tonumber(ARGV[1]) and tonumber(value.expires_at_unix_ms) > tonumber(ARGV[1]) then
+    if tonumber(value.live_until_unix_ms) > now and tonumber(value.expires_at_unix_ms) > now then
       table.insert(live, encoded)
     else
       redis.call('INCR', KEYS[5])
@@ -883,8 +950,8 @@ for _, key in ipairs(redis.call('SMEMBERS', KEYS[1])) do
   end
 end
 if redis.call('SCARD', KEYS[1]) == 0 then
-  redis.call('SREM', KEYS[2], ARGV[2])
-  redis.call('HDEL', KEYS[3], ARGV[2])
+  redis.call('SREM', KEYS[2], ARGV[1])
+  redis.call('HDEL', KEYS[3], ARGV[1])
 end
 return live
 "#;
@@ -899,7 +966,7 @@ return live
                     self.key("announcement-expiry"),
                     self.key("announcement-global-revision"),
                 ],
-                vec![now_unix_ms.to_string(), Self::service_id(service_name)],
+                vec![Self::service_id(service_name)],
             )
             .await?;
         encoded
@@ -920,9 +987,14 @@ impl DiscoveryStateStore for ValkeyStateStore {
         use fred::prelude::*;
 
         const PUT: &str = r#"
-reap(KEYS[6], KEYS[3], KEYS[4], KEYS[5], ARGV[7])
+reap(KEYS[6], KEYS[3], KEYS[4], KEYS[5])
+local signed_expiry = tonumber(ARGV[3])
+local heartbeat_expiry = now + tonumber(ARGV[8])
+if signed_expiry == 0 then signed_expiry = heartbeat_expiry end
+local expiry = math.min(heartbeat_expiry, signed_expiry, tonumber(ARGV[4]))
+if expiry <= now then return 0 end
 local current = redis.call('GET', KEYS[1])
-if not current and redis.call('ZCARD', KEYS[6]) >= tonumber(ARGV[8]) then
+if not current and redis.call('ZCARD', KEYS[6]) >= tonumber(ARGV[7]) then
   return redis.error_reply('Discovery Valkey announcement capacity exhausted')
 end
 if current then
@@ -931,21 +1003,35 @@ if current then
   local old_epoch = tonumber(decoded.accepted_state_epoch) or 0
   local old_exp = tonumber(decoded.expires_at_unix_ms) or 0
   local new_epoch = tonumber(ARGV[2])
-  local new_exp = tonumber(ARGV[3])
+  local new_exp = signed_expiry
   if old_epoch > new_epoch or (old_epoch == new_epoch and old_exp > new_exp) then
     return 0
   end
 end
-redis.call('SET', KEYS[1], ARGV[1], 'PXAT', ARGV[4])
+-- Only the effective lease (and legacy application expiry) is computed here.
+-- Preserve all other JSON fields/arrays exactly as encoded by Rust, not cjson.
+local encoded = string.sub(ARGV[1], 1, -2) .. ',"live_until_unix_ms":' .. string.format('%.0f', expiry)
+if tonumber(ARGV[3]) == 0 then
+  encoded = encoded .. ',"expires_at_unix_ms":' .. string.format('%.0f', signed_expiry)
+end
+encoded = encoded .. '}'
+redis.call('SET', KEYS[1], encoded, 'PXAT', expiry)
 redis.call('SADD', KEYS[2], KEYS[1])
 redis.call('SADD', KEYS[3], ARGV[5])
 redis.call('HSET', KEYS[4], ARGV[5], ARGV[6])
 redis.call('INCR', KEYS[5])
-redis.call('ZADD', KEYS[6], ARGV[4], KEYS[1])
+redis.call('ZADD', KEYS[6], expiry, KEYS[1])
 return 1
 "#;
         let service_id = Self::service_id(service_name);
-        let encoded = serde_json::to_string(&endpoint)?;
+        let mut payload = serde_json::to_value(&endpoint)?;
+        let fields = payload.as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("announcement must encode as an object"))?;
+        fields.remove("live_until_unix_ms");
+        if endpoint.expires_at_unix_ms == 0 {
+            fields.remove("expires_at_unix_ms");
+        }
+        let encoded = serde_json::to_string(&payload)?;
         let stored: i64 = self
             .pool
             .eval(
@@ -962,14 +1048,11 @@ return 1
                     encoded,
                     endpoint.accepted_state_epoch.to_string(),
                     endpoint.expires_at_unix_ms.to_string(),
-                    endpoint
-                        .live_until_unix_ms
-                        .min(endpoint.expires_at_unix_ms)
-                        .to_string(),
+                    endpoint.live_until_unix_ms.to_string(),
                     service_id,
                     service_name.to_owned(),
-                    unix_millis_now().to_string(),
                     self.announcement_capacity.to_string(),
+                    ANNOUNCED_ENDPOINT_TTL.as_millis().to_string(),
                 ],
             )
             .await?;
@@ -983,61 +1066,78 @@ return 1
     async fn announcements_for(
         &self,
         service_name: &str,
-        now_unix_ms: i64,
+        _now_unix_ms: i64,
     ) -> Result<Vec<AnnouncedEndpoint>> {
-        self.announcements_for_inner(service_name, now_unix_ms)
+        self.announcements_for_inner(service_name)
             .await
     }
 
     async fn all_announcements(
         &self,
-        now_unix_ms: i64,
+        _now_unix_ms: i64,
     ) -> Result<Vec<(String, Vec<AnnouncedEndpoint>)>> {
         use fred::prelude::*;
 
-        // Reap before enumerating names, so listing work is bounded by current
-        // capacity rather than every identity that has ever announced.
-        let service_ids: Vec<String> = self.pool.eval(
-            format!("{}\nreap(KEYS[1], KEYS[2], KEYS[3], KEYS[4], ARGV[1])\nreturn redis.call('SMEMBERS', KEYS[2])", Self::REAP_ANNOUNCEMENTS),
-            vec![self.key("announcement-expiry"), self.key("services"), self.key("service-names"), self.key("announcement-global-revision")],
-            vec![now_unix_ms.to_string()],
-        ).await?;
-        let mut all = Vec::with_capacity(service_ids.len());
-        for service_id in service_ids {
-            let service_name: Option<String> = self
-                .pool
-                .hget(self.key("service-names"), &service_id)
-                .await?;
-            let Some(service_name) = service_name else {
-                continue;
-            };
-            let entries = self
-                .announcements_for_inner(&service_name, now_unix_ms)
-                .await?;
-            if !entries.is_empty() {
-                all.push((service_name, entries));
-            }
+        // One transaction returns names and values from the capacity-bounded
+        // expiry index. Reap and refresh still serialize, and a listing never
+        // labels an L1 snapshot or performs round trips per service.
+        const LIST: &str = r#"
+reap(KEYS[1], KEYS[2], KEYS[3], KEYS[4])
+local values = {}
+for _, key in ipairs(redis.call('ZRANGE', KEYS[1], 0, -1)) do
+  local value = redis.call('GET', key)
+  if value then
+    local ok, decoded = pcall(cjson.decode, value)
+    if not ok then return redis.error_reply('corrupt Discovery announcement') end
+    if tonumber(decoded.live_until_unix_ms) > now and tonumber(decoded.expires_at_unix_ms) > now then
+      local service = string.match(key, ':announcement:([^:]+):[^:]+$')
+      local name = redis.call('HGET', KEYS[3], service)
+      if not name then return redis.error_reply('missing Discovery service name') end
+      table.insert(values, {name, value})
+    end
+  end
+end
+return values
+"#;
+        let encoded: Vec<(String, String)> = self
+            .pool
+            .eval(
+                format!("{}{LIST}", Self::REAP_ANNOUNCEMENTS),
+                vec![
+                    self.key("announcement-expiry"),
+                    self.key("services"),
+                    self.key("service-names"),
+                    self.key("announcement-global-revision"),
+                ],
+                Vec::<String>::new(),
+            )
+            .await?;
+        let mut all: HashMap<String, Vec<AnnouncedEndpoint>> = HashMap::new();
+        for (name, value) in encoded {
+            let endpoint: AnnouncedEndpoint = serde_json::from_str(&value)?;
+            all.entry(name).or_default().push(endpoint);
         }
-        Ok(all)
+        Ok(all.into_iter().collect())
     }
 
     async fn put_liveness(&self, node: &Did, value: LiveAllocatable) -> Result<PutResult> {
         use fred::prelude::*;
 
         const PUT: &str = r#"
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
 local current = redis.call('GET', KEYS[1])
-redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', ARGV[4])
-if not current and redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[5]) then
+redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now)
+if not current and redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[3]) then
   return redis.error_reply('Discovery Valkey liveness capacity exhausted')
 end
-if current then
-  local ok, decoded = pcall(cjson.decode, current)
-  if not ok then return redis.error_reply('corrupt Discovery liveness') end
-  if (tonumber(decoded.last_seen) or 0) > tonumber(ARGV[2]) then return 0 end
-end
-redis.call('SET', KEYS[1], ARGV[1], 'PXAT', ARGV[3])
+local expiry = now + tonumber(ARGV[2])
+-- Preserve JSON arrays/numeric payload exactly: Lua cjson turns [] into {}.
+local encoded = string.sub(ARGV[1], 1, -2) .. ',"last_seen":' .. string.format('%.0f', now)
+  .. ',"live_until_unix_ms":' .. string.format('%.0f', expiry) .. '}'
+redis.call('SET', KEYS[1], encoded, 'PXAT', expiry)
 redis.call('INCR', KEYS[2])
-redis.call('ZADD', KEYS[3], ARGV[3], KEYS[1])
+redis.call('ZADD', KEYS[3], expiry, KEYS[1])
 return 1
 "#;
         let node_id = Self::digest(node.as_str());
@@ -1051,13 +1151,11 @@ return 1
                     self.key("liveness-expiry"),
                 ],
                 vec![
-                    serde_json::to_string(&StoredLiveness {
-                        node: node.clone(),
-                        value: value.clone(),
-                    })?,
-                    value.last_seen.to_string(),
-                    value.live_until_unix_ms.to_string(),
-                    unix_millis_now().to_string(),
+                    serde_json::to_string(&serde_json::json!({
+                        "node": node, "allocatable": value.allocatable,
+                        "load_fraction": value.load_fraction, "shared_receipt": true,
+                    }))?,
+                    value.live_until_unix_ms.saturating_sub(value.last_seen).clamp(1, 45_000).to_string(),
                     self.liveness_capacity.to_string(),
                 ],
             )
@@ -1069,7 +1167,8 @@ return 1
         })
     }
 
-    async fn liveness(&self, node: &Did, now_unix_ms: i64) -> Result<Option<LiveAllocatable>> {
+    #[cfg(test)]
+    async fn liveness(&self, node: &Did, _now_unix_ms: i64) -> Result<Option<LiveAllocatable>> {
         use fred::prelude::*;
         let encoded: Option<String> = self
             .pool
@@ -1080,22 +1179,34 @@ return 1
             ))
             .await?;
         Ok(encoded
-            .map(|encoded| serde_json::from_str(&encoded))
-            .transpose()?
-            .filter(|value: &LiveAllocatable| value.is_live_at(now_unix_ms)))
+            .map(|encoded| serde_json::from_str::<StoredLiveness>(&encoded))
+            .transpose()?.filter(|record| record.shared_receipt).map(|record| record.value))
     }
 
-    async fn all_liveness(&self, now_unix_ms: i64) -> Result<Vec<(Did, LiveAllocatable)>> {
+    async fn all_liveness(&self, _now_unix_ms: i64) -> Result<Vec<(Did, LiveAllocatable)>> {
         use fred::prelude::*;
         // The expiry index is capacity-bounded on every write. Enumerate it
         // atomically with the values so concurrent expiry/replacement cannot
         // leave a process-local candidate seed out of sync with shared state.
         const LIST: &str = r#"
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
 local values = {}
 for _, key in ipairs(redis.call('ZRANGE', KEYS[1], 0, -1)) do
   local value = redis.call('GET', key)
-  if value then table.insert(values, value) end
+  if value then
+    local record = cjson.decode(value)
+    if record.shared_receipt == true then
+      table.insert(values, value)
+    else
+      -- Legacy replica-clock rows have no trustworthy shared lifetime. Retire
+      -- only this volatile row; the next admitted heartbeat recreates it.
+      redis.call('DEL', key)
+      redis.call('ZREM', KEYS[1], key)
+      redis.call('INCR', KEYS[2])
+    end
+  end
 end
 return values
 "#;
@@ -1103,16 +1214,14 @@ return values
             .pool
             .eval(
                 LIST,
-                vec![self.key("liveness-expiry")],
-                vec![now_unix_ms.to_string()],
+                vec![self.key("liveness-expiry"), self.key("liveness-global-revision")],
+                Vec::<String>::new(),
             )
             .await?;
         let mut live = Vec::with_capacity(encoded.len());
         for value in encoded {
             let record: StoredLiveness = serde_json::from_str(&value)?;
-            if record.value.is_live_at(now_unix_ms) {
-                live.push((record.node, record.value));
-            }
+            live.push((record.node, record.value));
         }
         Ok(live)
     }
@@ -1121,13 +1230,19 @@ return values
         use fred::prelude::*;
         const PUT: &str = r#"
 if redis.call('EXISTS', KEYS[1]) == 0 and redis.call('SCARD', KEYS[2]) >= tonumber(ARGV[4]) then
-  return redis.error_reply('Discovery Valkey federation artifact capacity exhausted')
+  local oldest = redis.call('ZRANGE', KEYS[5], 0, 0)[1]
+  if not oldest then return redis.error_reply('Discovery issuer cache index is inconsistent') end
+  local oldkey = string.gsub(KEYS[1], ':entity:[^:]+$', ':entity:' .. oldest)
+  redis.call('DEL', oldkey)
+  redis.call('SREM', KEYS[2], oldest)
+  redis.call('HDEL', KEYS[3], oldest)
+  redis.call('ZREM', KEYS[5], oldest)
 end
 redis.call('SET', KEYS[1], ARGV[1])
 redis.call('SADD', KEYS[2], ARGV[2])
 redis.call('HSET', KEYS[3], ARGV[2], ARGV[3])
 redis.call('INCR', KEYS[4])
-redis.call('INCR', KEYS[5])
+redis.call('ZADD', KEYS[5], ARGV[5], ARGV[2])
 return 1
 "#;
         let id = Self::digest(issuer);
@@ -1139,14 +1254,15 @@ return 1
                     format!("{}:entity:{id}", self.prefix),
                     self.key("issuers"),
                     self.key("issuer-names"),
-                    format!("{}:entity-revision:{id}", self.prefix),
                     self.key("entity-global-revision"),
+                    self.key("issuer-fetched"),
                 ],
                 vec![
                     serde_json::to_string(&value)?,
                     id,
                     issuer.to_owned(),
                     self.artifact_capacity.to_string(),
+                    value.fetched_at.to_string(),
                 ],
             )
             .await?;
@@ -1166,18 +1282,12 @@ return 1
 
     async fn known_issuers(&self) -> Result<Vec<String>> {
         use fred::prelude::*;
-        let ids: Vec<String> = self.pool.smembers(self.key("issuers")).await?;
-        let mut issuers = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(issuer) = self
-                .pool
-                .hget::<Option<String>, _, _>(self.key("issuer-names"), &id)
-                .await?
-            {
-                issuers.push(issuer);
-            }
-        }
-        Ok(issuers)
+        Ok(self.pool.hvals(self.key("issuer-names")).await?)
+    }
+
+    async fn known_issuer_count(&self) -> Result<usize> {
+        use fred::prelude::*;
+        Ok(self.pool.scard(self.key("issuers")).await?)
     }
 
     async fn put_envelope_keyset(
@@ -1243,8 +1353,10 @@ struct TieredStateStore {
     valkey: Arc<ValkeyStateStore>,
     l1_max_ttl_ms: i64,
     observed: Mutex<HashMap<String, ObservedRevision>>,
-    // Keep cache contents and revision labels in one local operation order.
-    operation: tokio::sync::Mutex<()>,
+    // Serialize cache contents/revision labels within a scope, while unrelated
+    // network reads and heartbeats can use the pool concurrently. Fixed storage
+    // avoids accumulating a mutex for every historical identity.
+    operations: [tokio::sync::Mutex<()>; 64],
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
@@ -1259,12 +1371,17 @@ impl TieredStateStore {
             valkey,
             l1_max_ttl_ms: i64::try_from(l1_max_ttl_ms).unwrap_or(i64::MAX),
             observed: Mutex::new(HashMap::new()),
-            operation: tokio::sync::Mutex::new(()),
+            operations: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
         }
     }
 
     fn scope(kind: &str, value: &str) -> String {
         format!("{kind}:{value}")
+    }
+
+    fn operation(&self, kind: &str, value: &str) -> &tokio::sync::Mutex<()> {
+        let digest = blake3::hash(Self::scope(kind, value).as_bytes());
+        &self.operations[usize::from(digest.as_bytes()[0]) % self.operations.len()]
     }
 
     fn is_observed(&self, scope: &str, revision: u64, now_unix_ms: i64) -> bool {
@@ -1304,12 +1421,6 @@ impl TieredStateStore {
         endpoint
     }
 
-    fn l1_liveness(&self, mut value: LiveAllocatable, now_unix_ms: i64) -> LiveAllocatable {
-        value.live_until_unix_ms = value
-            .live_until_unix_ms
-            .min(now_unix_ms.saturating_add(self.l1_max_ttl_ms));
-        value
-    }
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
@@ -1320,7 +1431,7 @@ impl DiscoveryStateStore for TieredStateStore {
         service_name: &str,
         endpoint: AnnouncedEndpoint,
     ) -> Result<PutResult> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("announcement", service_name).lock().await;
         // Invalidate before the command, including on ambiguous write errors
         // or cancellation. Never tag a caller's value with a later revision.
         self.observed
@@ -1333,11 +1444,11 @@ impl DiscoveryStateStore for TieredStateStore {
     async fn announcements_for(
         &self,
         service_name: &str,
-        now_unix_ms: i64,
+        _now_unix_ms: i64,
     ) -> Result<Vec<AnnouncedEndpoint>> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("announcement", service_name).lock().await;
         let scope = Self::scope("announcement", service_name);
-        let revision = self.valkey.announcement_revision().await?;
+        let (revision, now_unix_ms) = self.valkey.announcement_revision_at_shared_time().await?;
         if self.is_observed(&scope, revision, now_unix_ms) {
             return self
                 .memory
@@ -1355,11 +1466,11 @@ impl DiscoveryStateStore for TieredStateStore {
         for value in &values {
             if self
                 .memory
-                .put_announcement(
+                .put_announcement_at(
                     service_name,
                     self.l1_announcement(value.clone(), now_unix_ms),
+                    now_unix_ms,
                 )
-                .await
                 .is_err()
             {
                 self.memory.clear_announcements_sync(service_name);
@@ -1382,7 +1493,7 @@ impl DiscoveryStateStore for TieredStateStore {
     }
 
     async fn put_liveness(&self, node: &Did, value: LiveAllocatable) -> Result<PutResult> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("liveness", node.as_str()).lock().await;
         self.observed
             .lock()
             .remove(&Self::scope("liveness", node.as_str()));
@@ -1390,27 +1501,12 @@ impl DiscoveryStateStore for TieredStateStore {
         self.valkey.put_liveness(node, value).await
     }
 
+    #[cfg(test)]
     async fn liveness(&self, node: &Did, now_unix_ms: i64) -> Result<Option<LiveAllocatable>> {
-        let _operation = self.operation.lock().await;
-        let scope = Self::scope("liveness", node.as_str());
-        let revision = self.valkey.liveness_revision().await?;
-        if self.is_observed(&scope, revision, now_unix_ms) {
-            return self.memory.liveness(node, now_unix_ms).await;
-        }
-        let value = self.valkey.liveness(node, now_unix_ms).await?;
-        self.observed.lock().remove(&scope);
-        self.memory.clear_liveness_sync(node);
-        if let Some(value) = &value {
-            if self
-                .memory
-                .put_liveness(node, self.l1_liveness(value.clone(), now_unix_ms))
-                .await
-                .is_ok()
-            {
-                self.observe(scope, revision, now_unix_ms);
-            }
-        }
-        Ok(value)
+        let _operation = self.operation("liveness", node.as_str()).lock().await;
+        // One authoritative GET is cheaper than revision + value on a miss,
+        // and leaves expiry entirely on the shared clock, even with host skew.
+        self.valkey.liveness(node, now_unix_ms).await
     }
 
     async fn all_liveness(&self, now_unix_ms: i64) -> Result<Vec<(Did, LiveAllocatable)>> {
@@ -1418,19 +1514,23 @@ impl DiscoveryStateStore for TieredStateStore {
     }
 
     async fn put_entity_statement(&self, issuer: &str, value: CachedEntityStatement) -> Result<()> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("entity", issuer).lock().await;
         self.observed.lock().remove(&Self::scope("entity", issuer));
         self.memory.clear_entity_statement_sync(issuer);
         self.valkey.put_entity_statement(issuer, value).await
     }
 
     async fn entity_statement(&self, issuer: &str) -> Result<Option<CachedEntityStatement>> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("entity", issuer).lock().await;
         let now = unix_millis_now();
         let scope = Self::scope("entity", issuer);
-        let revision = self.valkey.entity_revision(issuer).await?;
+        let revision = self.valkey.entity_revision().await?;
         if self.is_observed(&scope, revision, now) {
-            return self.memory.entity_statement(issuer).await;
+            // A fill of a different issuer can evict this L1 entry without a
+            // shared write. Missing L1 data is a miss, never cached absence.
+            if let Some(value) = self.memory.entity_statement(issuer).await? {
+                return Ok(Some(value));
+            }
         }
         let value = self.valkey.entity_statement(issuer).await?;
         self.observed.lock().remove(&scope);
@@ -1452,12 +1552,16 @@ impl DiscoveryStateStore for TieredStateStore {
         self.valkey.known_issuers().await
     }
 
+    async fn known_issuer_count(&self) -> Result<usize> {
+        self.valkey.known_issuer_count().await
+    }
+
     async fn put_envelope_keyset(
         &self,
         service_did: &str,
         value: CachedEnvelopeKeyset,
     ) -> Result<()> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("envelope", service_did).lock().await;
         self.observed
             .lock()
             .remove(&Self::scope("envelope", service_did));
@@ -1466,7 +1570,7 @@ impl DiscoveryStateStore for TieredStateStore {
     }
 
     async fn envelope_keyset(&self, service_did: &str) -> Result<Option<CachedEnvelopeKeyset>> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation("envelope", service_did).lock().await;
         let now = unix_millis_now();
         let scope = Self::scope("envelope", service_did);
         let revision = self.valkey.envelope_revision(service_did).await?;
@@ -1490,7 +1594,18 @@ impl DiscoveryStateStore for TieredStateStore {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    // Used only by current-thread clock-skew tests; never changes the host or
+    // the clock of another concurrently running test/Valkey driver thread.
+    static TEST_REPLICA_TIME: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
 pub(crate) fn unix_millis_now() -> i64 {
+    #[cfg(test)]
+    if let Some(now) = TEST_REPLICA_TIME.with(std::cell::Cell::get) {
+        return now;
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1499,7 +1614,7 @@ pub(crate) fn unix_millis_now() -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
     use super::*;
@@ -1563,6 +1678,203 @@ mod tests {
     #[tokio::test]
     async fn memory_satisfies_announcement_backend_contract() {
         assert_announcement_backend_contract(&MemoryStateStore::new(1, 1, 1)).await;
+    }
+
+    async fn assert_receipt_ordered_liveness(store: &dyn DiscoveryStateStore) {
+        let node = Did::new("did:web:clock-rollback.example".to_owned());
+        let now = unix_millis_now();
+        let mut value = LiveAllocatable {
+            allocatable: vec![("cpu".to_owned(), "1".to_owned())],
+            load_fraction: 0.9,
+            // Legacy client-clock record must not poison subsequent receipts.
+            last_seen: now + 86_400_000,
+            live_until_unix_ms: now + 100,
+        };
+        store.put_liveness(&node, value.clone()).await.unwrap();
+        value.last_seen = now;
+        value.load_fraction = 0.2;
+        value.allocatable[0].1 = "8".to_owned();
+        value.live_until_unix_ms = now + 500;
+        assert_eq!(
+            store.put_liveness(&node, value.clone()).await.unwrap(),
+            PutResult::Stored
+        );
+        assert_eq!(
+            store.liveness(&node, now + 200).await.unwrap(),
+            Some(value.clone())
+        );
+        let mut delayed = value.clone();
+        delayed.last_seen = now - 1;
+        delayed.live_until_unix_ms = now + 300;
+        delayed.load_fraction = 1.0;
+        assert_eq!(
+            store.put_liveness(&node, delayed).await.unwrap(),
+            PutResult::IgnoredOlder
+        );
+        assert_eq!(store.liveness(&node, now + 200).await.unwrap(), Some(value));
+        assert!(store.liveness(&node, now + 501).await.unwrap().is_none());
+
+        // Liveness refreshes do not renew a signed announcement's authority.
+        store
+            .put_announcement("clock", endpoint("iroh", 1, now + 50, now + 500))
+            .await
+            .unwrap();
+        assert!(store
+            .announcements_for("clock", now + 51)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_heartbeat_receipt_survives_clock_rollback() {
+        assert_receipt_ordered_liveness(&MemoryStateStore::new(8, 8, 8)).await;
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_heartbeat_receipt_survives_clock_rollback() {
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        use fred::prelude::*;
+        let config = valkey_config(url, "rollback");
+        let shared = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
+        let other = ValkeyStateStore::connect(&config).await.unwrap();
+        let tiered = TieredStateStore::new(Arc::new(MemoryStateStore::new(8, 8, 8)), shared.clone(), 1000);
+        let node = Did::new("did:web:skew.example".to_owned());
+        let now = unix_millis_now();
+        let mut value = LiveAllocatable {
+            allocatable: vec![], load_fraction: 0.9,
+            last_seen: now + 86_400_000, live_until_unix_ms: now + 86_400_400,
+        };
+        tiered.put_liveness(&node, value.clone()).await.unwrap();
+        let first = tiered.liveness(&node, i64::MAX).await.unwrap().unwrap();
+        assert!((first.last_seen - now).abs() < 5000);
+        value.last_seen = now - 86_400_000;
+        value.live_until_unix_ms = value.last_seen + 400;
+        value.load_fraction = 0.2;
+        value.allocatable = vec![("cpu".to_owned(), "8".to_owned())];
+        assert_eq!(other.put_liveness(&node, value).await.unwrap(), PutResult::Stored);
+        let latest = tiered.liveness(&node, i64::MAX).await.unwrap().unwrap();
+        assert!(latest.last_seen >= first.last_seen);
+        assert_eq!(latest.load_fraction, 0.2);
+        assert_eq!(latest.allocatable[0].1, "8");
+        assert_eq!(latest.live_until_unix_ms - latest.last_seen, 400);
+        assert_eq!(tiered.all_liveness(i64::MAX).await.unwrap().len(), 1);
+        let ttl: i64 = shared.pool.pttl(format!("{}:liveness:{}", shared.prefix, ValkeyStateStore::digest(node.as_str()))).await.unwrap();
+        assert!((1..=400).contains(&ttl), "expiry uses shared receipt, not ahead host time");
+        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+        assert!(tiered.liveness(&node, i64::MIN).await.unwrap().is_none());
+        assert!(tiered.all_liveness(i64::MIN).await.unwrap().is_empty());
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn rediss_uses_tls_and_rejects_plaintext_valkey() {
+        use fred::prelude::RedisConfig;
+        hyprstream_rpc::transport::install_pq_crypto_provider().unwrap();
+        assert!(RedisConfig::from_url("rediss://localhost:6379")
+            .unwrap()
+            .tls
+            .is_some());
+        assert!(RedisConfig::from_url("redis://localhost:6379")
+            .unwrap()
+            .tls
+            .is_none());
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let mut config = valkey_config(url.clone(), "tls");
+        let plaintext = ValkeyStateStore::connect(&config).await.unwrap();
+        assert!(plaintext
+            .all_announcements(unix_millis_now())
+            .await
+            .unwrap()
+            .is_empty());
+        config.url = url.replacen("redis://", "rediss://", 1);
+        let start = std::time::Instant::now();
+        assert!(
+            ValkeyStateStore::connect(&config).await.is_err(),
+            "TLS must not downgrade to plaintext"
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_batched_listing_preserves_names_values_and_cleanup() {
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let mut config = valkey_config(url, "batched-list");
+        config.announcement_capacity = 512;
+        let writer = ValkeyStateStore::connect(&config).await.unwrap();
+        let reader = TieredStateStore::new(
+            Arc::new(MemoryStateStore::new(1, 1, 1)),
+            Arc::new(ValkeyStateStore::connect(&config).await.unwrap()),
+            10_000,
+        );
+        let now = unix_millis_now();
+        let cohort_expiry = now + 5_000;
+        for i in 0..256 {
+            let name = format!("service:{i}:λ");
+            for kind in ["iroh", "quic"] {
+                writer
+                    .put_announcement(&name, endpoint(kind, 1, cohort_expiry, cohort_expiry))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            reader
+                .announcements_for("service:0:λ", now)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        let entries = reader.all_announcements(now).await.unwrap();
+        assert_eq!(entries.len(), 256);
+        assert!(entries
+            .iter()
+            .all(|(name, values)| name.starts_with("service:") && values.len() == 2));
+        writer
+            .put_announcement(
+                "service:0:λ",
+                endpoint("iroh", 2, now + 90_000, now + 90_000),
+            )
+            .await
+            .unwrap();
+        // Caller time cannot expire shared values. Keep the original name,
+        // value, index cleanup, and capacity assertions, but wait for the
+        // cohort's real server-side lease instead of advancing a replica.
+        assert_eq!(reader.all_announcements(now + 60_001).await.unwrap().len(), 256);
+        tokio::time::sleep(std::time::Duration::from_millis(
+            (cohort_expiry + 50 - unix_millis_now()).max(0) as u64,
+        )).await;
+        let remaining = reader.all_announcements(now + 60_001).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "service:0:λ");
+        assert_eq!(remaining[0].1.len(), 1);
+        assert_eq!(remaining[0].1[0].accepted_state_epoch, 2);
+        // Reaping restores live capacity and cannot populate/poison point L1.
+        writer
+            .put_announcement("new", endpoint("iroh", 1, now + 90_000, now + 90_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader
+                .announcements_for("service:0:λ", now + 60_001)
+                .await
+                .unwrap()[0]
+                .accepted_state_epoch,
+            2
+        );
+        assert_eq!(
+            reader.all_announcements(now + 60_001).await.unwrap().len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -1664,6 +1976,190 @@ mod tests {
         assert!(error.to_string().contains("l1_max_ttl_ms must be positive"));
     }
 
+    async fn assert_issuer_eviction_contract(store: &dyn DiscoveryStateStore) {
+        for (issuer, fetched_at) in [
+            ("old", 1),
+            ("refresh", 2),
+            ("keep", 3),
+            ("refresh", 4),
+            ("new", 5),
+        ] {
+            store
+                .put_entity_statement(
+                    issuer,
+                    CachedEntityStatement {
+                        jwt: format!("inert:{issuer}:{fetched_at}"),
+                        fetched_at,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.known_issuer_count().await.unwrap(), 3);
+        let mut names = store.known_issuers().await.unwrap();
+        names.sort();
+        assert_eq!(names, ["keep", "new", "refresh"]);
+        assert!(store.entity_statement("old").await.unwrap().is_none());
+        assert_eq!(
+            store
+                .entity_statement("refresh")
+                .await
+                .unwrap()
+                .unwrap()
+                .fetched_at,
+            4
+        );
+        store
+            .put_entity_statement(
+                "old",
+                CachedEntityStatement {
+                    jwt: "reinserted".to_owned(),
+                    fetched_at: 6,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store.entity_statement("keep").await.unwrap().is_none());
+        assert_eq!(
+            store.entity_statement("old").await.unwrap().unwrap().jwt,
+            "reinserted"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_issuer_cache_evicts_oldest_and_accepts_reinsertion() {
+        assert_issuer_eviction_contract(&MemoryStateStore::new(1, 1, 3)).await;
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_issuer_cache_churn_bounds_metadata_and_invalidates_other_l1() {
+        use fred::prelude::*;
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let mut config = valkey_config(url, "issuer-churn");
+        config.artifact_capacity = 3;
+        let writer = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
+        assert_issuer_eviction_contract(writer.as_ref()).await;
+        let reader = TieredStateStore::new(
+            Arc::new(MemoryStateStore::new(1, 1, 1)),
+            Arc::new(ValkeyStateStore::connect(&config).await.unwrap()),
+            60_000,
+        );
+        // A smaller L1 must refetch entries evicted by other fills even if L2
+        // has not changed. Previously an observed-but-missing entry returned None.
+        for issuer in ["old", "refresh", "old"] {
+            assert!(reader.entity_statement(issuer).await.unwrap().is_some());
+        }
+        let generation = writer.entity_revision().await.unwrap();
+        for i in 0..96 {
+            writer
+                .put_entity_statement(
+                    &format!("issuer-{i}"),
+                    CachedEntityStatement {
+                        jwt: format!("inert-{i}"),
+                        fetched_at: 100 + i,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(writer.known_issuer_count().await.unwrap(), 3);
+        }
+        assert!(reader.entity_statement("old").await.unwrap().is_none());
+        let counts: Vec<usize> = writer.pool.eval(
+            "return {redis.call('SCARD', KEYS[1]), redis.call('HLEN', KEYS[2]), redis.call('ZCARD', KEYS[3]), #redis.call('KEYS', ARGV[1]), #redis.call('KEYS', ARGV[2])}",
+            vec![writer.key("issuers"), writer.key("issuer-names"), writer.key("issuer-fetched")],
+            vec![writer.key("*"), writer.key("*revision*")],
+        ).await.unwrap();
+        assert_eq!(counts, [3, 3, 3, 7, 1]);
+        assert!(writer.entity_revision().await.unwrap() > generation);
+        writer
+            .put_entity_statement(
+                "old",
+                CachedEntityStatement {
+                    jwt: "new-generation".to_owned(),
+                    fetched_at: 1000,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.entity_statement("old").await.unwrap().unwrap().jwt,
+            "new-generation"
+        );
+        // Retain a positive old snapshot across eviction AND reinsertion (ABA).
+        for i in 0..3 {
+            writer
+                .put_entity_statement(
+                    &format!("replacement-{i}"),
+                    CachedEntityStatement {
+                        jwt: "other".to_owned(),
+                        fetched_at: 2000 + i,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        writer
+            .put_entity_statement(
+                "old",
+                CachedEntityStatement {
+                    jwt: "after-aba".to_owned(),
+                    fetched_at: 3000,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.entity_statement("old").await.unwrap().unwrap().jwt,
+            "after-aba"
+        );
+        assert!(reader.observed.lock().len() <= 4);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_issuer_listing_and_count_return_complete_bounded_cache() {
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let mut config = valkey_config(url, "issuer-list-count");
+        config.artifact_capacity = 128;
+        let writer = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
+        let reader = TieredStateStore::new(
+            Arc::new(MemoryStateStore::new(1, 1, 1)),
+            writer.clone(),
+            60_000,
+        );
+        let mut expected = Vec::new();
+        for i in 0..256 {
+            let name = format!("https://issuer:{i}:λ.example");
+            writer
+                .put_entity_statement(
+                    &name,
+                    CachedEntityStatement {
+                        jwt: "inert".to_owned(),
+                        fetched_at: i,
+                    },
+                )
+                .await
+                .unwrap();
+            if i >= 128 {
+                expected.push(name);
+            }
+        }
+        expected.sort();
+        for _ in 0..2 {
+            let mut actual = reader.known_issuers().await.unwrap();
+            actual.sort();
+            assert_eq!(actual, expected);
+            assert_eq!(reader.known_issuer_count().await.unwrap(), 128);
+        }
+        assert!(reader.memory.inner.lock().entity_statements.is_empty());
+        assert!(reader.observed.lock().is_empty());
+    }
+
     #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
     fn valkey_config(url: String, suffix: &str) -> ValkeyStateConfig {
         ValkeyStateConfig {
@@ -1679,6 +2175,151 @@ mod tests {
             artifact_capacity: 64,
             command_timeout_ms: 250,
         }
+    }
+
+    pub(crate) struct ReplicaClock;
+
+    impl ReplicaClock {
+        pub(crate) fn at(now: i64) -> Self {
+            TEST_REPLICA_TIME.with(|clock| {
+                assert!(clock.replace(Some(now)).is_none());
+            });
+            Self
+        }
+    }
+
+    impl Drop for ReplicaClock {
+        fn drop(&mut self) {
+            TEST_REPLICA_TIME.with(|clock| clock.set(None));
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_announcement_lease_uses_receipt_and_preserves_payload() {
+        use fred::prelude::*;
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else { return; };
+        let store = ValkeyStateStore::connect(&valkey_config(url, "announcement-write-lease")).await.unwrap();
+        let now: i64 = store.pool.eval(
+            "local t = redis.call('TIME'); return tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)",
+            Vec::<String>::new(), Vec::<String>::new(),
+        ).await.unwrap();
+        for skew in [-3_600_000, 3_600_000] {
+            let name = format!("lease-{skew}");
+            let mut value = endpoint("iroh", 1, now + 7_200_000, now + 7_200_000);
+            value.capabilities.clear();
+            value.service_jwt = "payload with \"live_until_unix_ms\":123 and λ".to_owned();
+            value.source_signer = [255; 32];
+            let mut expected = serde_json::to_value(&value).unwrap();
+            expected.as_object_mut().unwrap().remove("live_until_unix_ms");
+            let _clock = ReplicaClock::at(now + skew);
+            assert_eq!(store.put_announcement(&name, value).await.unwrap(), PutResult::Stored);
+            let rows: (String, i64, i64, i64) = store.pool.eval(
+                "local t = redis.call('TIME'); return {redis.call('GET', KEYS[1]), redis.call('PEXPIRETIME', KEYS[1]), tonumber(redis.call('ZSCORE', KEYS[2], KEYS[1])), tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)}",
+                vec![store.announcement_key(&name, "iroh"), store.key("announcement-expiry")], Vec::<String>::new(),
+            ).await.unwrap();
+            let mut actual: serde_json::Value = serde_json::from_str(&rows.0).unwrap();
+            let encoded_expiry = actual.as_object_mut().unwrap().remove("live_until_unix_ms").unwrap().as_i64().unwrap();
+            assert_eq!(actual, expected, "only the effective lease field may change");
+            assert_eq!(encoded_expiry, rows.1);
+            assert_eq!(encoded_expiry, rows.2);
+            assert!((89_000..=90_000).contains(&(encoded_expiry - rows.3)), "bounded shared receipt lease, independent of replica skew");
+            assert_eq!(store.announcements_for(&name, now + skew).await.unwrap().len(), 1);
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_announcement_reaping_ignores_replica_clock_skew() {
+        use fred::prelude::*;
+
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        // Each entry point gets its own still-live anchor. The clock guard
+        // also affects put_announcement's implicit host-clock call before the
+        // repair, not just the explicit timestamp arguments on read methods.
+        for operation in ["put", "point", "list", "tiered"] {
+            let config = valkey_config(url.clone(), operation);
+            let shared = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
+            let replica = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
+            let tiered = TieredStateStore::new(
+                Arc::new(MemoryStateStore::new(8, 8, 8)), replica.clone(), 30_000,
+            );
+            let now: i64 = shared.pool.eval(
+                "local t = redis.call('TIME'); return tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)",
+                Vec::<String>::new(), Vec::<String>::new(),
+            ).await.unwrap();
+            shared.put_announcement("anchor", endpoint("iroh", 1, now + 60_000, now + 30_000)).await.unwrap();
+            if operation == "tiered" {
+                assert_eq!(tiered.announcements_for("anchor", now).await.unwrap().len(), 1);
+            }
+            let revision = shared.announcement_revision().await.unwrap();
+            let ahead = now + 3_600_000;
+            {
+                let _clock = ReplicaClock::at(ahead);
+                match operation {
+                    "put" => {
+                        replica.put_announcement("writer", endpoint("iroh", 1, ahead + 60_000, ahead + 30_000)).await.unwrap();
+                    }
+                    "point" => assert_eq!(replica.announcements_for("anchor", ahead).await.unwrap().len(), 1),
+                    "list" => assert_eq!(replica.all_announcements(ahead).await.unwrap().len(), 1),
+                    "tiered" => assert_eq!(tiered.announcements_for("anchor", ahead).await.unwrap().len(), 1),
+                    _ => unreachable!(),
+                }
+            }
+            assert_eq!(shared.announcements_for("anchor", now).await.unwrap().len(), 1, "{operation} deleted another replica's live announcement");
+            let exists: bool = shared.pool.exists(shared.announcement_key("anchor", "iroh")).await.unwrap();
+            assert!(exists);
+            assert_eq!(shared.announcement_revision().await.unwrap(), revision + u64::from(operation == "put"));
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_announcement_shared_expiry_rejects_behind_replica_revival() {
+        use fred::prelude::*;
+
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let config = valkey_config(url, "announcement-expiry-clock");
+        let shared = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
+        let tiered = TieredStateStore::new(
+            Arc::new(MemoryStateStore::new(8, 8, 8)), shared.clone(), 30_000,
+        );
+        let now: i64 = shared.pool.eval(
+            "local t = redis.call('TIME'); return tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)",
+            Vec::<String>::new(), Vec::<String>::new(),
+        ).await.unwrap();
+        // Either signed/accepted authority or the shorter effective heartbeat
+        // lease can expire first; neither becomes a new receipt-relative lease.
+        let expiry = now + 300;
+        for (name, signed, live) in [("signed", expiry, now + 60_000), ("lease", now + 60_000, expiry)] {
+            shared.put_announcement(name, endpoint("iroh", 1, signed, live)).await.unwrap();
+            let pxat: i64 = shared.pool.eval("return redis.call('PEXPIRETIME', KEYS[1])",
+                vec![shared.announcement_key(name, "iroh")], Vec::<String>::new()).await.unwrap();
+            assert_eq!(pxat, expiry, "preserve the absolute authority/lease ceiling");
+            assert_eq!(tiered.announcements_for(name, now).await.unwrap().len(), 1);
+        }
+        let revision = shared.announcement_revision().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let behind = now - 3_600_000;
+        let _clock = ReplicaClock::at(behind);
+        for name in ["signed", "lease"] {
+            // Exercise an already-populated L1 before any separate listing
+            // reaps L2 or invalidates its revision for us.
+            assert!(tiered.announcements_for(name, behind).await.unwrap().is_empty());
+            assert!(shared.announcements_for(name, behind).await.unwrap().is_empty());
+            assert_eq!(shared.put_announcement(name, endpoint("iroh", 2, expiry, now + 60_000)).await.unwrap(), PutResult::IgnoredOlder);
+        }
+        assert!(shared.all_announcements(behind).await.unwrap().is_empty());
+        assert!(shared.announcement_revision().await.unwrap() > revision);
+        let metadata: Vec<usize> = shared.pool.eval(
+            "return {redis.call('ZCARD', KEYS[1]), redis.call('SCARD', KEYS[2]), redis.call('HLEN', KEYS[3])}",
+            vec![shared.key("announcement-expiry"), shared.key("services"), shared.key("service-names")], Vec::<String>::new(),
+        ).await.unwrap();
+        assert_eq!(metadata, vec![0, 0, 0], "expired writes must not resurrect secondary indexes");
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
@@ -1996,6 +2637,136 @@ mod tests {
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
     #[tokio::test]
+    async fn tiered_scoped_operations_allow_unrelated_liveness_and_heartbeats_to_progress() {
+        use futures::{stream, StreamExt};
+        use std::time::Duration;
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let shared = Arc::new(
+            ValkeyStateStore::connect(&valkey_config(url, "striped-concurrency"))
+                .await
+                .unwrap(),
+        );
+        let tier = TieredStateStore::new(
+            Arc::new(MemoryStateStore::new(64, 64, 64)),
+            shared.clone(),
+            60_000,
+        );
+        let now = unix_millis_now();
+        // Pick sixteen distinct stripes so the regression is deterministic,
+        // including when the hash happens to collide for adjacent node names.
+        let mut nodes: Vec<Did> = Vec::new();
+        for i in 0..1024 {
+            let node = Did::new(format!("did:web:concurrent-{i}.example"));
+            if nodes.iter().all(|other| {
+                !std::ptr::eq(
+                    tier.operation("liveness", other.as_str()),
+                    tier.operation("liveness", node.as_str()),
+                )
+            }) {
+                nodes.push(node);
+            }
+            if nodes.len() == 16 {
+                break;
+            }
+        }
+        assert_eq!(nodes.len(), 16);
+        for node in &nodes {
+            shared
+                .put_liveness(
+                    node,
+                    LiveAllocatable {
+                        allocatable: vec![],
+                        load_fraction: 0.1,
+                        last_seen: now,
+                        live_until_unix_ms: now + 60_000,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        // Hold one scope exactly as a delayed read/write does across its L2
+        // awaits. A store-wide mutex prevents every other operation below from
+        // finishing; striped ordering lets all fifteen real Valkey reads pass.
+        let stalled = tier.operation("liveness", nodes[0].as_str()).lock().await;
+        let mut reads = stream::iter(
+            nodes
+                .iter()
+                .map(|node| {
+                    let tier = &tier;
+                    async move { (node, tier.liveness(node, now).await) }
+                }),
+        )
+        .buffer_unordered(16);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..15 {
+                let (node, result) = reads.next().await.unwrap();
+                assert_ne!(node, &nodes[0]);
+                assert_eq!(result.unwrap().unwrap().load_fraction, 0.1);
+            }
+        })
+        .await
+        .expect("unrelated tiered liveness reads serialized behind a stalled scope");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), reads.next())
+                .await
+                .is_err()
+        );
+
+        let heartbeat = LiveAllocatable {
+            allocatable: vec![],
+            load_fraction: 0.8,
+            last_seen: now + 1,
+            live_until_unix_ms: now + 60_001,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tier.put_liveness(&nodes[1], heartbeat.clone()),
+        )
+        .await
+        .expect("unrelated heartbeat serialized behind a stalled scope")
+        .unwrap();
+        // Same-scope writes still wait. Cancelling a queued operation must not
+        // corrupt the cache or leave the stripe permanently locked.
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            tier.put_liveness(&nodes[0], heartbeat.clone())
+        )
+        .await
+        .is_err());
+        drop(reads);
+        drop(stalled);
+        assert_eq!(
+            tier.liveness(&nodes[0], now)
+                .await
+                .unwrap()
+                .unwrap()
+                .load_fraction,
+            0.1
+        );
+        tier.put_liveness(&nodes[0], heartbeat).await.unwrap();
+        assert_eq!(
+            tier.liveness(&nodes[0], now)
+                .await
+                .unwrap()
+                .unwrap()
+                .load_fraction,
+            0.8
+        );
+        assert_eq!(
+            tier.liveness(&nodes[1], now)
+                .await
+                .unwrap()
+                .unwrap()
+                .load_fraction,
+            0.8
+        );
+        assert_eq!(tier.operations.len(), 64);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
     async fn tiered_capacity_never_limits_authoritative_results_or_writes() {
         let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
             return;
@@ -2297,7 +3068,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .load_fraction,
-                b.load_fraction
+                other.liveness(&node, now).await.unwrap().unwrap().load_fraction
             );
             let a = CachedEntityStatement {
                 jwt: "a".to_owned(),
@@ -2375,9 +3146,8 @@ mod tests {
         assert!(store
             .all_liveness(now)
             .await
-            .unwrap_err()
-            .to_string()
-            .contains("node"));
+            .unwrap()
+            .is_empty());
         store.put_liveness(&node, value).await.unwrap();
         assert_eq!(store.all_liveness(now).await.unwrap()[0].0, node);
     }

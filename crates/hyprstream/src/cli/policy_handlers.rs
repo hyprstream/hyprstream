@@ -27,17 +27,33 @@ use std::process::Command;
 
 /// Create a PolicyClient for RPC calls.
 ///
-/// Bootstrap: PolicyService key needed to create the PolicyClient for peer key resolution.
+/// Required profile resolves through the checkpoint-backed discovery resolver;
+/// compatibility bootstrap dials the deterministic same-host PolicyService IPC
+/// endpoint, which unlike `registered_endpoint` is available to a separate
+/// `podman exec` process that did not start the PolicyService itself.
 pub(crate) fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
     if hyprstream_discovery::native_network_required() {
         return PolicyClient::from_resolver(signing_key.clone(), None);
     }
-    PolicyClient::for_local_bootstrap(
+    let registry = hyprstream_rpc::registry::try_global()
+        .ok_or_else(|| anyhow::anyhow!("EndpointRegistry not initialized"))?;
+    let transport = policy_ipc_transport(&registry)?;
+    PolicyClient::for_local_transport_bootstrap(
+        &transport,
         signing_key.clone(),
-        // Bootstrap: PolicyService uses the root key
         signing_key.verifying_key(),
         None,
     )
+}
+
+/// Resolve the deterministic same-host PolicyService REP socket without
+/// requiring a process-local service registration.
+fn policy_ipc_transport(
+    registry: &hyprstream_rpc::registry::EndpointRegistry,
+) -> Result<hyprstream_rpc::transport::TransportConfig> {
+    registry
+        .try_endpoint("policy", hyprstream_rpc::registry::SocketKind::Rep)
+        .context("resolve local PolicyService IPC endpoint")
 }
 
 /// Handle `policy show` - Display the running policy via RPC
@@ -694,5 +710,26 @@ mod tests {
         let claims = hyprstream_rpc::auth::decode_unverified(&token)
             .expect("minted token must decode");
         assert_eq!(claims.sub, "alice");
+    }
+
+    #[test]
+    fn policy_cli_uses_ipc_default_without_process_local_registration() {
+        let registry = hyprstream_rpc::registry::EndpointRegistry::new(
+            hyprstream_rpc::registry::EndpointMode::Ipc,
+            Some(std::path::PathBuf::from("/run/hyprstream")),
+        );
+
+        assert!(
+            registry
+                .registered_endpoint("policy", hyprstream_rpc::registry::SocketKind::Rep)
+                .is_none(),
+            "this simulates the distinct podman-exec CLI process"
+        );
+        let transport = policy_ipc_transport(&registry)
+            .expect("IPC mode must provide the deterministic policy REP socket");
+        assert_eq!(
+            transport.endpoint_string(),
+            "ipc:///run/hyprstream/policy.sock",
+        );
     }
 }

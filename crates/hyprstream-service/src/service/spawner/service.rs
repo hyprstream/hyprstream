@@ -18,6 +18,19 @@ use hyprstream_rpc::transport::TransportConfig;
 // Import anyhow! macro for error creation in ServiceManager impl
 use anyhow::anyhow;
 
+/// Build the exact MoQL authorization configuration installed on the Iroh
+/// handler. Keeping this at the production seam makes it impossible for a
+/// shared-config field to be silently dropped between service setup and the
+/// handler; absence of a service-owned ingress grant remains deny-by-default.
+fn production_moq_authz(
+    admission: Arc<hyprstream_rpc::transport::moql_admission::MoqlAdmissionAuthenticator>,
+    ingress_authorizer: Option<hyprstream_rpc::transport::iroh_moq::SharedIngressAuthorizer>,
+) -> hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig {
+    hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig::default()
+        .with_admission(admission)
+        .with_ingress_authorizer_option(ingress_authorizer)
+}
+
 // Re-export Spawnable trait from hyprstream-rpc (where it's defined so
 // types in that crate can implement it without circular deps).
 pub use hyprstream_rpc::service::Spawnable;
@@ -41,7 +54,10 @@ pub struct UnifiedServiceConfig<S: RequestService + Send + 'static> {
 impl<S: RequestService + Send + 'static> UnifiedServiceConfig<S> {
     /// Create a unified service config with optional QUIC.
     pub fn new(service: S, quic_config: Option<hyprstream_rpc::service::QuicLoopConfig>) -> Self {
-        Self { service, quic_config }
+        Self {
+            service,
+            quic_config,
+        }
     }
 }
 
@@ -125,7 +141,10 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
     }
 
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
-        vec![(SocketKind::Rep, RequestService::transport(&self.service).clone())]
+        vec![(
+            SocketKind::Rep,
+            RequestService::transport(&self.service).clone(),
+        )]
     }
 
     fn run(
@@ -135,7 +154,10 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
     ) -> Result<()> {
         use hyprstream_rpc::transport::rpc_session::IrohRequestProcessor;
 
-        let UnifiedServiceConfig { service, quic_config } = *self;
+        let UnifiedServiceConfig {
+            service,
+            quic_config,
+        } = *self;
         let transport = RequestService::transport(&service).clone();
         let signing_key = RequestService::signing_key(&service);
         let server_pubkey = signing_key.verifying_key();
@@ -163,6 +185,20 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                 let announcement_cancellation = qc.announcement_cancellation.clone();
                 let _announcement_guard = announcement_cancellation.clone().drop_guard();
                 validate_required_iroh_enabled(&qc)?;
+                // The native client proof is projected from the same
+                // checkpoint-verified local accepted state that StreamInfo
+                // advertises. Reuse its private halves for the server's mutual
+                // confirmation; never manufacture a separate MoQ identity.
+                let moq_server_identity = qc
+                    .moq_admission_proof
+                    .as_ref()
+                    .map(hyprstream_rpc::transport::moql_admission::MoqlServerIdentityProof::from_local_admission_proof)
+                    .transpose()
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "MoQ server confirmation identity: {error}"
+                        ))
+                    })?;
                 // web-transport-quinn has no per-builder provider hook and
                 // resolves rustls's process default. Install and validate it at
                 // the actual bind seam so task/thread/subprocess startup cannot
@@ -285,7 +321,13 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     );
                 }
                 if let Some(handle) = &reach_config_handle {
+                    let moql_server_identity = qc
+                        .moq_admission_proof
+                        .as_ref()
+                        .map(|proof| proof.expected_server.clone());
                     *handle.write() = hyprstream_rpc::moq_stream::ProducerReachConfig {
+                        moql_server_identity,
+                        relay_moql_server_identity: qc.moq_relay_server_identity.clone(),
                         iroh_node_id: None,
                         quic_reach: Some(hyprstream_rpc::moq_stream::NodeStreamReach {
                         addr: advertise_addr,
@@ -299,6 +341,14 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     cb(service_name.clone(), advertise_addr, qc.server_name.clone());
                 }
 
+                // Install an accepted-state-bound proof before any native
+                // subscriber or relay dial. It is absent for browser/local
+                // profiles, where no Iroh admission is attempted.
+                let relay_admission_proof = qc.moq_admission_proof.clone();
+                if let Some(proof) = relay_admission_proof.clone() {
+                    let _ = hyprstream_rpc::moq_stream::init_global_moq_admission_proof(proof);
+                }
+
                 // Link a relay only to this service's scoped origin. The shared
                 // process origin would leak other services' broadcasts into it.
                 if let Some(relay) = qc.moq_relay.take() {
@@ -306,6 +356,8 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         hyprstream_rpc::moq_stream::serve_origin_to_relay_background(
                             origin.producer().clone(),
                             relay,
+                            relay_admission_proof,
+                            qc.moq_relay_server_identity.take(),
                         );
                         tracing::info!(
                             service = %service_name,
@@ -344,6 +396,34 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                             hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::with_origin(shared)
                         }
                         None => hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new(),
+                    };
+                    // #1027: when the daemon threaded an admission authenticator
+                    // through `QuicLoopConfig`, install it so every accepted
+                    // `moql` connection must prove an accepted current
+                    // Ed25519 + ML-DSA-65 identity inside the carrier before the
+                    // moq handshake. Without it the accept path stays in its
+                    // fail-closed anonymous posture.
+                    let moq_ingress_authorizer = qc.moq_ingress_authorizer.take();
+                    let moq_handler = match qc.moq_admission.take() {
+                        Some(admission) => {
+                            let server_identity = moq_server_identity.ok_or_else(|| {
+                                hyprstream_rpc::error::RpcError::SpawnFailed(
+                                    "MoQ admission enabled without checkpointed server confirmation identity"
+                                        .to_owned(),
+                                )
+                            })?;
+                            admission
+                                .install_server_identity(server_identity, node_id)
+                                .map_err(|error| {
+                                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                                        "MoQ server confirmation identity: {error}"
+                                    ))
+                            })?;
+                            moq_handler.with_authz(
+                                production_moq_authz(admission, moq_ingress_authorizer),
+                            )
+                        }
+                        None => moq_handler,
                     };
                     // RPC plane: same processor + signing key as the quinn path.
                     let rpc_handler =
@@ -598,7 +678,8 @@ impl ServiceSpawner {
             ServiceMode::Tokio => self.spawn_tokio(service, registration).await,
             ServiceMode::Thread => self.spawn_thread(service, registration).await,
             ServiceMode::Subprocess { binary } => {
-                self.spawn_subprocess(service, binary.clone(), registration).await
+                self.spawn_subprocess(service, binary.clone(), registration)
+                    .await
             }
         }
     }
@@ -671,7 +752,9 @@ impl ServiceSpawner {
                     tracing::error!("Service {} failed: {}", name_for_thread, e);
                 }
             })
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("thread spawn: {e}")))?;
+            .map_err(|e| {
+                hyprstream_rpc::error::RpcError::SpawnFailed(format!("thread spawn: {e}"))
+            })?;
 
         // Wait for ready signal (sent by service after socket binds)
         if ready_rx.await.is_err() {
@@ -707,8 +790,7 @@ impl ServiceSpawner {
             }
         };
 
-        let process_config =
-            ProcessConfig::new(&name, binary).args(["service", &name]);
+        let process_config = ProcessConfig::new(&name, binary).args(["service", &name]);
 
         let process = spawner.spawn(process_config).await?;
 
@@ -728,14 +810,10 @@ impl ServiceSpawner {
 
         Ok(SpawnedService {
             id: process.id.clone(),
-            kind: ServiceKind::Subprocess {
-                process,
-                pid_file,
-            },
+            kind: ServiceKind::Subprocess { process, pid_file },
             _registration: registration,
         })
     }
-
 }
 
 impl Default for ServiceSpawner {
@@ -793,10 +871,7 @@ impl SpawnedService {
     pub fn subprocess(id: String, process: SpawnedProcess, pid_file: PathBuf) -> Self {
         Self {
             id,
-            kind: ServiceKind::Subprocess {
-                process,
-                pid_file,
-            },
+            kind: ServiceKind::Subprocess { process, pid_file },
             _registration: None,
         }
     }
@@ -810,10 +885,7 @@ impl SpawnedService {
     ) -> Self {
         Self {
             id,
-            kind: ServiceKind::Thread {
-                handle,
-                shutdown,
-            },
+            kind: ServiceKind::Thread { handle, shutdown },
             _registration: registration,
         }
     }
@@ -826,9 +898,10 @@ impl SpawnedService {
     /// Check if the service is running.
     pub fn is_running(&self) -> bool {
         match &self.kind {
-            ServiceKind::TokioTask { handle } => {
-                handle.as_ref().map(hyprstream_rpc::service::ServiceHandle::is_running).unwrap_or(false)
-            }
+            ServiceKind::TokioTask { handle } => handle
+                .as_ref()
+                .map(hyprstream_rpc::service::ServiceHandle::is_running)
+                .unwrap_or(false),
             ServiceKind::Thread { handle, .. } => {
                 handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
             }
@@ -837,11 +910,8 @@ impl SpawnedService {
                 if let Ok(pid_str) = std::fs::read_to_string(pid_file) {
                     if let Ok(pid) = pid_str.trim().parse::<i32>() {
                         // Signal 0 checks if process exists without sending a signal
-                        return nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(pid),
-                            None,
-                        )
-                        .is_ok();
+                        return nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                            .is_ok();
                     }
                 }
                 false
@@ -872,7 +942,11 @@ impl SpawnedService {
                 // Read PID from file and send SIGTERM
                 if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
                     if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                        tracing::info!("Sending SIGTERM to subprocess {} (PID {})", process.id, pid);
+                        tracing::info!(
+                            "Sending SIGTERM to subprocess {} (PID {})",
+                            process.id,
+                            pid
+                        );
                         if let Err(e) = nix::sys::signal::kill(
                             nix::unistd::Pid::from_raw(pid),
                             nix::sys::signal::Signal::SIGTERM,
@@ -1081,10 +1155,41 @@ impl Spawnable for DualSpawnable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result as AnyhowResult;
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::prelude::SigningKey;
     use hyprstream_rpc::service::RequestService;
-    use anyhow::Result as AnyhowResult;
+
+    #[test]
+    fn production_moq_handler_preserves_explicit_ingress_and_defaults_to_denial() {
+        let admission = Arc::new(
+            hyprstream_rpc::transport::moql_admission::MoqlAdmissionAuthenticator::new(
+                Arc::new(|_: &str| None),
+                Arc::new(|_: &hyprstream_rpc::moq_authz::PeerIdentity| None),
+            ),
+        );
+        let producer = hyprstream_rpc::moq_authz::PeerIdentity::authenticated("did:at9p:producer");
+        let authorizer = Arc::new(
+            |peer: &hyprstream_rpc::moq_authz::PeerIdentity, tenant: &str| {
+                peer.subject.as_deref() == Some("did:at9p:producer") && tenant == "local"
+            },
+        );
+
+        let granted = hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new()
+            .with_authz(production_moq_authz(
+                Arc::clone(&admission),
+                Some(authorizer),
+            ));
+        assert!(granted.authorizes_ingress(&producer, "local"));
+        assert!(!granted.authorizes_ingress(&producer, "other"));
+
+        let absent = hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new()
+            .with_authz(production_moq_authz(admission, None));
+        assert!(
+            !absent.authorizes_ingress(&producer, "local"),
+            "an admission-only production handler must remain read-only"
+        );
+    }
 
     /// Test service that includes infrastructure (new pattern)
     struct EchoService {
@@ -1094,7 +1199,10 @@ mod tests {
 
     impl EchoService {
         fn new(transport: TransportConfig, signing_key: SigningKey) -> Self {
-            Self { transport, signing_key }
+            Self {
+                transport,
+                signing_key,
+            }
         }
     }
 
@@ -1140,6 +1248,10 @@ mod tests {
             iroh_required,
             on_iroh_bound,
             moq_relay: None,
+            moq_relay_server_identity: None,
+            moq_admission: None,
+            moq_ingress_authorizer: None,
+            moq_admission_proof: None,
         }
     }
 

@@ -56,6 +56,16 @@ fn service_token(signing_key: &SigningKey) -> Option<String> {
         .and_then(|att| att.jwt)
 }
 
+
+fn policy_client_for_transport(
+    transport: &hyprstream_rpc::transport::TransportConfig,
+    signing_key: SigningKey,
+    policy_vk: hyprstream_rpc::crypto::VerifyingKey,
+    token: Option<String>,
+) -> anyhow::Result<PolicyClient> {
+    PolicyClient::for_local_transport_bootstrap(transport, signing_key, policy_vk, token)
+}
+
 /// Shared Git2DB registry instance. Lazily initialized by the first factory
 /// that needs it. Both PolicyService and RegistryService share this instance.
 static SHARED_GIT2DB: std::sync::OnceLock<Arc<RwLock<Git2DB>>> = std::sync::OnceLock::new();
@@ -393,14 +403,27 @@ fn register_service_key(
 
     if ctx.iroh_required() {
         schedule_network_service_key_registration(service_name, signing_key.clone(), jwt.clone());
-        spawn_jwt_renewal_task(service_name, signing_key.clone(), creds_dir, secrets_profile, true);
+        spawn_jwt_renewal_task(
+            service_name,
+            signing_key.clone(),
+            creds_dir,
+            secrets_profile,
+            true,
+            ctx.transport("policy", SocketKind::Rep),
+        );
         return Ok(());
     }
 
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = legacy_policy_client(signing_key.clone(), policy_vk, Some(jwt.clone()))?;
+    let policy_transport = ctx.transport("policy", SocketKind::Rep);
+    let policy_client = policy_client_for_transport(
+        &policy_transport,
+        signing_key.clone(),
+        policy_vk,
+        Some(jwt.clone()),
+    )?;
 
     let request = RegisterServiceKey {
         service_name: service_name.to_owned(),
@@ -426,6 +449,7 @@ fn register_service_key(
         creds_dir,
         secrets_profile,
         false,
+        policy_transport,
     );
 
     Ok(())
@@ -440,16 +464,16 @@ fn policy_client_for_deployment(
     if ctx.iroh_required() {
         PolicyClient::from_resolver(signing_key, token)
     } else {
-        legacy_policy_client(signing_key, policy_verifying_key, token)
+        // Deterministic same-host PolicyService IPC endpoint: unlike
+        // `registered_endpoint`, it is available to a separate `podman exec`
+        // process that did not start the PolicyService itself.
+        PolicyClient::for_local_transport_bootstrap(
+            &ctx.transport("policy", SocketKind::Rep),
+            signing_key,
+            policy_verifying_key,
+            token,
+        )
     }
-}
-
-fn legacy_policy_client(
-    signing_key: SigningKey,
-    policy_verifying_key: VerifyingKey,
-    token: Option<String>,
-) -> anyhow::Result<PolicyClient> {
-    PolicyClient::for_local_bootstrap(signing_key, policy_verifying_key, token)
 }
 
 fn schedule_network_service_key_registration(
@@ -506,6 +530,7 @@ fn spawn_jwt_renewal_task(
     credentials_dir: std::path::PathBuf,
     secrets_profile: crate::auth::identity_store::SecretsProfile,
     iroh_required: bool,
+    policy_transport: hyprstream_rpc::transport::TransportConfig,
 ) {
     let service_name = service_name.to_owned();
     tokio::spawn(async move {
@@ -563,11 +588,16 @@ fn spawn_jwt_renewal_task(
                 (vk, svc_jwt)
             };
 
-            let policy_client = match if iroh_required {
-                PolicyClient::from_resolver(signing_key.clone(), Some(current_jwt))
-            } else {
-                legacy_policy_client(signing_key.clone(), policy_vk, Some(current_jwt))
-            } {
+    let policy_client = match if iroh_required {
+        PolicyClient::from_resolver(signing_key.clone(), Some(current_jwt))
+    } else {
+        policy_client_for_transport(
+            &policy_transport,
+            signing_key.clone(),
+            policy_vk,
+            Some(current_jwt),
+        )
+    } {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(service = service_name, error = %e, "failed to create PolicyClient; skipping JWT renewal");
@@ -1334,6 +1364,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
                 policy_client,
                 registry_client,
                 ctx.transport("model", SocketKind::Rep),
+                ctx.transport("policy", SocketKind::Rep),
             )
         })
     })?;
@@ -1408,6 +1439,7 @@ fn create_inference_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
         sk.verifying_key(),
         sk.clone(),
         ctx.transport(&instance_name, SocketKind::Rep),
+        ctx.transport("policy", SocketKind::Rep),
         None,
     )
     .with_instance_identity(
@@ -2017,6 +2049,8 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         config.account.clone(),
         sk,
         ctx.transport("oauth", SocketKind::Rep),
+        ctx.transport("policy", SocketKind::Rep),
+        ctx.transport("discovery", SocketKind::Rep),
         ctx.verifying_key(),
         ctx.jwt_verifying_key(),
     )
@@ -2068,6 +2102,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         verifying_key: ctx.verifying_key(),
         signing_key: sk.clone(),
         transport: ctx.transport("mcp", SocketKind::Rep),
+        policy_transport: ctx.transport("policy", SocketKind::Rep),
         ctx: None, // ServiceContext not yet available as Arc — handlers use signing_key directly
         policy_verifying_key: policy_vk,
         expected_audience: Some(config.mcp.resource_url()),
@@ -2921,6 +2956,28 @@ fn compute_tls_endorsement(
 mod tests {
     use super::*;
 
+    /// Rootless Quadlets run each service in a distinct process, so the
+    /// process-local endpoint registry cannot resolve Policy for Discovery or
+    /// its downstream peers. The typed IPC transport remains lazy: creating a
+    /// client for the shared socket must not require a co-located registration.
+    #[test]
+    fn policy_client_accepts_unregistered_ipc_transport() {
+        let signing_key = SigningKey::from_bytes(&[0x63; 32]);
+        let transport =
+            hyprstream_rpc::transport::TransportConfig::ipc("/run/hyprstream/policy.sock");
+
+        let client = policy_client_for_transport(
+            &transport,
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            None,
+        );
+        assert!(
+            client.is_ok(),
+            "IPC policy client must be lazy at first boot"
+        );
+    }
+
     #[test]
     fn checkpointed_service_selection_uses_canonical_id_and_current_signer() {
         use hyprstream_pds::at9p::{
@@ -3160,6 +3217,8 @@ mod tests {
                 base_ip: std::net::Ipv4Addr::LOCALHOST.into(), server_name: "policy.test".to_owned(),
                 oauth_issuer_url: None, jwt_verifying_key: None, iroh_enabled: true, iroh_required: true,
                 moq_relay: None, native_announcement_publisher: None,
+                moq_relay_server_identity: None, moq_admission: None,
+                moq_ingress_authorizer: None, moq_admission_proof: None,
             });
         assert!(register_service_key(&ctx, "policy", &signer).is_err());
         let now = chrono::Utc::now().timestamp();

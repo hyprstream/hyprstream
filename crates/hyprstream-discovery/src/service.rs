@@ -33,7 +33,8 @@ use crate::placement_index::PlacementIndex;
 use crate::scheduling;
 use crate::state_store::{
     unix_millis_now, AnnouncedEndpoint, CachedEntityStatement, CachedEnvelopeKeyset,
-    DiscoveryState, DiscoveryStateStore, LiveAllocatable, MemoryStateStore,
+    DiscoveryState, DiscoveryStateStore, LiveAllocatable, MemoryStateStore, PutResult,
+    ANNOUNCED_ENDPOINT_TTL,
 };
 
 use anyhow::{Context, Result};
@@ -65,7 +66,26 @@ const LIVENESS_CACHE_REAP_BUDGET: usize = 32;
 /// not yet contain a node record. This prevents heartbeat-rate resolver polls
 /// while allowing eventual recovery when a placement record is later published.
 const PLACEMENT_INGEST_RETRY_TTL: Duration = Duration::from_secs(300);
-const ANNOUNCED_ENDPOINT_TTL: Duration = Duration::from_secs(90);
+const CANDIDATE_QUERY_CONCURRENCY: usize = 16;
+const CANDIDATE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlacementIngestStatus {
+    Pending,
+    Complete,
+    Cancelled,
+}
+
+struct PlacementIngestGuard(Arc<parking_lot::Mutex<PlacementIngestStatus>>);
+
+impl Drop for PlacementIngestGuard {
+    fn drop(&mut self) {
+        let mut status = self.0.lock();
+        if *status == PlacementIngestStatus::Pending {
+            *status = PlacementIngestStatus::Cancelled;
+        }
+    }
+}
 
 /// Default bound applied to `queryCandidates` when the caller passes
 /// `maxCandidates == 0` (unspecified) — keeps an unscoped query from returning
@@ -498,6 +518,20 @@ fn to_scheduling_op(op: crate::generated::discovery_client::SelectorOp) -> sched
 /// provides a `PolicyAuthProvider` that wraps `PolicyClient`.
 #[async_trait(?Send)]
 pub trait AuthorizationProvider: Send + Sync {
+    /// One bounded authorization vector; implementations may amortize RPC
+    /// overhead but must retain one decision per resource in input order.
+    async fn check_batch(
+        &self, subject: &str, domain: &str, resources: &[String],
+        operation: &str, bearer: Option<&str>,
+    ) -> Result<Vec<bool>> {
+        anyhow::ensure!(resources.len() <= 256, "authorization batch exceeds 256");
+        let mut allowed = Vec::with_capacity(resources.len());
+        for resource in resources {
+            allowed.push(self.check(subject, domain, resource, operation, bearer).await.unwrap_or(false));
+        }
+        Ok(allowed)
+    }
+
     /// Check if a subject is authorized for the given operation on a resource.
     async fn check(
         &self,
@@ -763,7 +797,7 @@ pub struct DiscoveryService {
     /// Bounded retry gate for first-seen placement repository polls. A DID is
     /// marked before resolver access, so absent/invalid/non-node repos cannot
     /// turn heartbeat frequency into unbounded work.
-    placement_ingest_attempts: TtlCache<Did, ()>,
+    placement_ingest_attempts: TtlCache<Did, Arc<parking_lot::Mutex<PlacementIngestStatus>>>,
     // Infrastructure (for Spawnable)
     transport: TransportConfig,
 }
@@ -1002,28 +1036,49 @@ impl DiscoveryService {
 
     /// Populate this replica's verified placement projection for an admitted
     /// shared live node. Failed/absent repos use the existing bounded retry gate.
-    async fn ensure_placement_ingested(&self, node: &Did) {
-        if self.placement_index.record_uri(node.as_str()).is_none()
-            && self.placement_ingest_attempts.insert_if_absent(
-                node.clone(),
-                (),
-                PLACEMENT_INGEST_RETRY_TTL,
-            )
-        {
-            if let Some(resolver) = &self.record_resolver {
-                if let Err(e) = self
-                    .placement_index
-                    .ingest_did(resolver.as_ref(), node.as_str())
-                    .await
-                {
-                    tracing::warn!(
-                        node = %node,
-                        error = %e,
-                        "placement directory ingestion failed for live node (liveness still recorded)"
-                    );
+    async fn ensure_placement_ingested(&self, node: &Did) -> bool {
+        if self.placement_index.record_uri(node.as_str()).is_some() {
+            return true;
+        }
+        let attempt = Arc::new(parking_lot::Mutex::new(PlacementIngestStatus::Pending));
+        let attempt = if self.placement_ingest_attempts.insert_if_absent(
+            node.clone(),
+            Arc::clone(&attempt),
+            PLACEMENT_INGEST_RETRY_TTL,
+        ) {
+            attempt
+        } else {
+            let Some(existing) = self.placement_ingest_attempts.get(node) else {
+                return false;
+            };
+            {
+                let mut status = existing.lock();
+                match *status {
+                    PlacementIngestStatus::Complete => return true,
+                    PlacementIngestStatus::Pending => return false,
+                    PlacementIngestStatus::Cancelled => *status = PlacementIngestStatus::Pending,
                 }
             }
+            existing
+        };
+        // A cancelled query must not turn an unfinished ingest into a cached
+        // absence. Its next query can retry; concurrent queries fail closed.
+        let _guard = PlacementIngestGuard(Arc::clone(&attempt));
+        if let Some(resolver) = &self.record_resolver {
+            if let Err(e) = self
+                .placement_index
+                .ingest_did(resolver.as_ref(), node.as_str())
+                .await
+            {
+                tracing::warn!(
+                    node = %node,
+                    error = %e,
+                    "placement directory ingestion failed for live node (liveness still recorded)"
+                );
+            }
         }
+        *attempt.lock() = PlacementIngestStatus::Complete;
+        true
     }
 
     /// Create a new discovery service with infrastructure.
@@ -1471,8 +1526,9 @@ impl DiscoveryServiceResolver {
 
         let mut candidates = Vec::new();
         for entry in entries {
-            if !entry.is_live_at(unix_millis_now())
-                || entry.service_did.as_str().is_empty()
+            // The backend/remote Discovery already checked the volatile lease
+            // on its receipt clock. Signed/current authority is checked below.
+            if entry.service_did.as_str().is_empty()
                 || entry.accepted_state_digest.len() != 64
             {
                 continue;
@@ -1809,6 +1865,17 @@ const MAX_AUTHORITY_LOG_OPERATIONS: usize = 128;
 const MAX_REGISTRY_DELEGATION_BYTES: usize = 256 * 1024;
 const MAX_DEPLOYMENT_CLOUD_SECRET_BYTES: usize = 64 * 1024;
 const REGISTRY_DELEGATION_ABILITY: &str = "mint-registry-jwt";
+const SERVICE_KEY_ENROLLMENT_SCHEMA: &str = "hyprstream.service-key-enrollment.v1";
+const SERVICE_KEY_ENROLLMENT_ABILITY: &str = "enroll-service-key";
+const SERVICE_KEY_ENROLLMENT_KEY_TYPE: &str = "hybrid-ed25519-mldsa65";
+const SERVICE_KEY_ENROLLMENT_MAX_TTL_SECONDS: i64 = 3_600;
+/// Signature context (AAD) binding an enrollment attestation to its schema.
+const SERVICE_KEY_ENROLLMENT_SIGNATURE_CONTEXT: &[u8] = b"hyprstream.service-key-enrollment.v1";
+/// Fixed allowlist per hyprstream#1562: registry stays JWT-enrolled and
+/// policy-CA/authority keys are out of scope, so exactly these services may be
+/// enrolled by a delegated signer.
+pub const SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES: [&str; 2] = ["discovery", "policy"];
+const MAX_SERVICE_KEY_ENROLLMENT_BYTES: usize = 256 * 1024;
 
 /// Signed DidOp authority history embedded in a registry delegation.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1844,6 +1911,74 @@ pub struct RegistryDelegationArtifact {
     pub authority_log_did: String,
     pub delegated_public_key_b64: String,
     pub ucan_b64: String,
+}
+
+/// Chain-signed attestation binding a discovery/policy service's live hybrid
+/// public key (the exact 1984-byte `bootstrap-pubkeys` entry) to the
+/// deployment authority, minted at activation by the delegated signer
+/// (hyprstream#1562). Public trust material: installed mode 0644, per-service.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceKeyEnrollmentArtifact {
+    pub schema: String,
+    pub deployment_domain: String,
+    pub service: String,
+    /// Base64 of the exact 1984-byte hybrid public key (32-byte Ed25519
+    /// followed by 1952-byte ML-DSA-65).
+    pub hybrid_public_key_b64: String,
+    pub not_before: i64,
+    pub expires_at: i64,
+    /// The two-capability delegation authorizing the signing key.
+    pub delegation: RegistryDelegationArtifact,
+    /// Base64 of the hybrid Ed25519+ML-DSA-65 signature by the delegated
+    /// signer over [`ServiceKeyEnrollmentArtifact::signing_bytes`].
+    pub signature_b64: String,
+}
+
+/// The signed body of a [`ServiceKeyEnrollmentArtifact`]: every field except
+/// the signature, serialized with fixed struct-field order so the mint and the
+/// production verifier derive identical bytes.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceKeyEnrollmentSigningBody {
+    pub schema: String,
+    pub deployment_domain: String,
+    pub service: String,
+    pub hybrid_public_key_b64: String,
+    pub not_before: i64,
+    pub expires_at: i64,
+    pub delegation: RegistryDelegationArtifact,
+}
+
+impl ServiceKeyEnrollmentArtifact {
+    /// The artifact with an empty signature, ready to be signed.
+    pub fn unsigned(body: ServiceKeyEnrollmentSigningBody) -> Self {
+        Self {
+            schema: body.schema,
+            deployment_domain: body.deployment_domain,
+            service: body.service,
+            hybrid_public_key_b64: body.hybrid_public_key_b64,
+            not_before: body.not_before,
+            expires_at: body.expires_at,
+            delegation: body.delegation,
+            signature_b64: String::new(),
+        }
+    }
+
+    /// Canonical bytes the delegated signer signs and the verifier checks.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>> {
+        let body = ServiceKeyEnrollmentSigningBody {
+            schema: self.schema.clone(),
+            deployment_domain: self.deployment_domain.clone(),
+            service: self.service.clone(),
+            hybrid_public_key_b64: self.hybrid_public_key_b64.clone(),
+            not_before: self.not_before,
+            expires_at: self.expires_at,
+            delegation: self.delegation.clone(),
+        };
+        serde_json::to_vec(&body)
+            .map_err(|error| anyhow::anyhow!("encoding enrollment signing body: {error}"))
+    }
 }
 
 /// Non-optional Ed25519 + ML-DSA-65 deployment trust root.
@@ -2373,7 +2508,7 @@ fn validate_registry_deployment_credential_profile(
             active,
             u64::try_from(now).map_err(|_| anyhow::anyhow!("system clock precedes Unix epoch"))?,
         )?;
-        &delegated_ca
+        &delegated_ca.delegated
     } else if let Some((_installed_authority_log, active)) = enrolled.as_ref() {
         anyhow::ensure!(
             active.rotation_keys.iter().any(|key| {
@@ -2447,16 +2582,196 @@ impl hyprstream_rpc::auth::ucan::UcanVerifier for AuthoritySetUcanVerifier<'_> {
     }
 }
 
+/// The exact registry-mint capability every delegation must carry.
+///
+/// Public so the ceremony/mint CLI constructs delegations with the same code
+/// the verifier validates them with (hyprstream#1562 H3) — no second copy to
+/// drift.
+pub fn registry_mint_capability(
+    deployment_domain: &str,
+    delegated_public_key_b64: &str,
+) -> hyprstream_rpc::auth::ucan::Capability {
+    use hyprstream_rpc::auth::ucan::{Ability, Capability, CaveatValue, Caveats, Resource};
+
+    let mut caveats = std::collections::BTreeMap::new();
+    caveats.insert(
+        "audience".to_owned(),
+        CaveatValue::Text(REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE.to_owned()),
+    );
+    caveats.insert(
+        "deployment_domain".to_owned(),
+        CaveatValue::Text(deployment_domain.to_owned()),
+    );
+    caveats.insert(
+        "delegated_public_key_b64".to_owned(),
+        CaveatValue::Text(delegated_public_key_b64.to_owned()),
+    );
+    caveats.insert(
+        "max_ttl_seconds".to_owned(),
+        CaveatValue::Int(REGISTRY_DEPLOYMENT_CREDENTIAL_MAX_TTL_SECONDS),
+    );
+    caveats.insert(
+        "profile".to_owned(),
+        CaveatValue::Text(REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE.to_owned()),
+    );
+    Capability::with_caveats(
+        Resource::new(format!(
+            "hyprstream://deployment/{deployment_domain}/service/registry"
+        )),
+        Ability::new(REGISTRY_DELEGATION_ABILITY),
+        Caveats(caveats),
+    )
+}
+
+/// The exact service-key-enrollment capability (hyprstream#1562): a fixed
+/// allowlist, hybrid-only key type, and a one-hour attestation TTL ceiling.
+///
+/// Public so the ceremony/mint CLI constructs delegations with the same code
+/// the verifier validates them with (hyprstream#1562 H3).
+pub fn service_key_enrollment_capability(
+    deployment_domain: &str,
+    delegated_public_key_b64: &str,
+) -> hyprstream_rpc::auth::ucan::Capability {
+    use hyprstream_rpc::auth::ucan::{Ability, Capability, CaveatValue, Caveats, Resource};
+
+    let mut caveats = std::collections::BTreeMap::new();
+    caveats.insert(
+        "deployment_domain".to_owned(),
+        CaveatValue::Text(deployment_domain.to_owned()),
+    );
+    caveats.insert(
+        "delegated_public_key_b64".to_owned(),
+        CaveatValue::Text(delegated_public_key_b64.to_owned()),
+    );
+    caveats.insert(
+        "allowed_services".to_owned(),
+        CaveatValue::List(
+            SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES
+                .iter()
+                .map(|service| (*service).to_owned())
+                .collect(),
+        ),
+    );
+    caveats.insert(
+        "key_type".to_owned(),
+        CaveatValue::Text(SERVICE_KEY_ENROLLMENT_KEY_TYPE.to_owned()),
+    );
+    caveats.insert(
+        "max_attestation_ttl_seconds".to_owned(),
+        CaveatValue::Int(SERVICE_KEY_ENROLLMENT_MAX_TTL_SECONDS),
+    );
+    Capability::with_caveats(
+        Resource::new(format!(
+            "hyprstream://deployment/{deployment_domain}/service-key-enrollment"
+        )),
+        Ability::new(SERVICE_KEY_ENROLLMENT_ABILITY),
+        Caveats(caveats),
+    )
+}
+
+/// Exact-set capability validation (hyprstream#1562): a delegation is either
+/// the legacy registry-only scope minted before enrollment existed, or exactly
+/// the registry + enrollment pair. Anything narrower, wider, or reordered is
+/// rejected. Returns true when the enrollment capability is present.
+pub fn delegation_capability_set_grants_enrollment(
+    capabilities: &[hyprstream_rpc::auth::ucan::Capability],
+    deployment_domain: &str,
+    delegated_public_key_b64: &str,
+) -> Result<bool> {
+    let registry = registry_mint_capability(deployment_domain, delegated_public_key_b64);
+    let enrollment = service_key_enrollment_capability(deployment_domain, delegated_public_key_b64);
+    if capabilities.len() == 1 && capabilities[0] == registry {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        capabilities.len() == 2
+            && capabilities.contains(&registry)
+            && capabilities.contains(&enrollment),
+        "delegation capability set is not the exact registry or registry+enrollment scope"
+    );
+    Ok(true)
+}
+
+/// Outcome of validating a root-authorized delegation: whether it may enroll
+/// service keys, and the delegation expiry that caps anything it mints.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedDelegation {
+    pub grants_service_key_enrollment: bool,
+    pub expires_at: u64,
+}
+
+/// Validate one root-authorized delegation UCAN (hyprstream#1562): a single
+/// authority-to-signer link (no proofs), signed by an active authority,
+/// addressed to the delegated signer, carrying exactly the registry-mint or
+/// the registry + service-key-enrollment capability set, and expiring.
+///
+/// Public so the ceremony/mint CLI self-checks freshly minted delegations with
+/// the same code the production verifier applies (hyprstream#1562 H3).
+pub fn validate_delegation_ucan(
+    ucan: &hyprstream_rpc::auth::ucan::Ucan,
+    deployment_domain: &str,
+    delegated_public_key_b64: &str,
+    active_keys: &[crate::did_op::HybridRotationKey],
+    now: u64,
+) -> Result<ValidatedDelegation> {
+    use hyprstream_rpc::auth::ucan::validate as validate_ucan;
+
+    anyhow::ensure!(
+        ucan.proofs.is_empty(),
+        "registry delegation must be one authority-to-signer link"
+    );
+    validate_ucan(ucan, &AuthoritySetUcanVerifier { keys: active_keys }, now)
+        .context("validating registry delegation UCAN")?;
+    anyhow::ensure!(
+        active_keys
+            .iter()
+            .any(|key| ucan.issuer().to_ed25519().ok() == Some(key.ed25519_pub)),
+        "registry delegation issuer is not an active authority"
+    );
+    let delegated_public = base64::engine::general_purpose::STANDARD
+        .decode(delegated_public_key_b64)
+        .context("decoding delegated registry-signer public key")?;
+    let delegated_ed: [u8; ED25519_PUBLIC_KEY_BYTES] = delegated_public
+        .get(..ED25519_PUBLIC_KEY_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("delegated registry-signer public key is truncated"))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("delegated Ed25519 key is malformed"))?;
+    anyhow::ensure!(
+        ucan.audience().to_ed25519()? == delegated_ed,
+        "registry delegation audience does not match delegated signer"
+    );
+    let grants_service_key_enrollment = delegation_capability_set_grants_enrollment(
+        ucan.capabilities(),
+        deployment_domain,
+        delegated_public_key_b64,
+    )?;
+    let expires_at = ucan
+        .payload
+        .expiration
+        .ok_or_else(|| anyhow::anyhow!("registry delegation must expire"))?;
+    Ok(ValidatedDelegation {
+        grants_service_key_enrollment,
+        expires_at,
+    })
+}
+
+/// Outcome of validating a delegation artifact: the authenticated delegated
+/// signer, whether it may enroll service keys, and the delegation expiry that
+/// caps anything it mints.
+struct ValidatedRegistryDelegation {
+    delegated: HybridDeploymentCa,
+    grants_service_key_enrollment: bool,
+    expires_at: u64,
+}
+
 fn validate_registry_delegation_artifact(
     root: &HybridDeploymentCa,
     artifact: &RegistryDelegationArtifact,
     installed_authority_log: &DeploymentAuthorityLog,
     active: &crate::did_op::VerifiedDidOpLog,
     now: u64,
-) -> Result<HybridDeploymentCa> {
-    use hyprstream_rpc::auth::ucan::{
-        validate as validate_ucan, Ability, Capability, CaveatValue, Caveats, Resource, Ucan,
-    };
+) -> Result<ValidatedRegistryDelegation> {
+    use hyprstream_rpc::auth::ucan::Ucan;
 
     anyhow::ensure!(
         artifact.schema == REGISTRY_DELEGATION_SCHEMA,
@@ -2492,60 +2807,42 @@ fn validate_registry_delegation_artifact(
         "registry delegation UCAN is too large"
     );
     let ucan = Ucan::from_cbor(&ucan_bytes).context("decoding registry delegation UCAN")?;
-    anyhow::ensure!(
-        ucan.proofs.is_empty(),
-        "registry delegation must be one authority-to-signer link"
-    );
-    validate_ucan(&ucan, &AuthoritySetUcanVerifier { keys: active_keys }, now)
-        .context("validating registry delegation UCAN")?;
-    anyhow::ensure!(
-        active_keys
-            .iter()
-            .any(|key| ucan.issuer().to_ed25519().ok() == Some(key.ed25519_pub)),
-        "registry delegation issuer is not an active authority"
-    );
-    anyhow::ensure!(
-        ucan.audience().to_ed25519()? == delegated.ed25519.to_bytes(),
-        "registry delegation audience does not match delegated signer"
-    );
-    let mut caveats = std::collections::BTreeMap::new();
-    caveats.insert(
-        "audience".to_owned(),
-        CaveatValue::Text(REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE.to_owned()),
-    );
-    caveats.insert(
-        "deployment_domain".to_owned(),
-        CaveatValue::Text(root.domain()),
-    );
-    caveats.insert(
-        "delegated_public_key_b64".to_owned(),
-        CaveatValue::Text(artifact.delegated_public_key_b64.clone()),
-    );
-    caveats.insert(
-        "max_ttl_seconds".to_owned(),
-        CaveatValue::Int(REGISTRY_DEPLOYMENT_CREDENTIAL_MAX_TTL_SECONDS),
-    );
-    caveats.insert(
-        "profile".to_owned(),
-        CaveatValue::Text(REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE.to_owned()),
-    );
-    let expected = Capability::with_caveats(
-        Resource::new(format!(
-            "hyprstream://deployment/{}/service/registry",
-            root.domain()
-        )),
-        Ability::new(REGISTRY_DELEGATION_ABILITY),
-        Caveats(caveats),
-    );
-    anyhow::ensure!(
-        ucan.capabilities() == [expected],
-        "registry delegation capability is not the exact registry-only scope"
-    );
-    anyhow::ensure!(
-        ucan.payload.expiration.is_some(),
-        "registry delegation must expire"
-    );
-    Ok(delegated)
+    let validated = validate_delegation_ucan(
+        &ucan,
+        &artifact.deployment_domain,
+        &artifact.delegated_public_key_b64,
+        active_keys,
+        now,
+    )?;
+    Ok(ValidatedRegistryDelegation {
+        delegated,
+        grants_service_key_enrollment: validated.grants_service_key_enrollment,
+        expires_at: validated.expires_at,
+    })
+}
+
+/// Validate a delegation artifact against the pinned production root and the
+/// installed/current authority log with its independently trusted head
+/// (hyprstream#1562 H3).
+///
+/// This is the ceremony/mint-side entry point: it runs the exact checks the
+/// production verifier applies, so tooling cannot bless a delegation shape
+/// production would reject.
+pub fn validate_registry_delegation(
+    public_ca: &[u8],
+    authority_log: &DeploymentAuthorityLog,
+    authority_checkpoint: &DeploymentAuthorityCheckpoint,
+    artifact: &RegistryDelegationArtifact,
+    now: u64,
+) -> Result<ValidatedDelegation> {
+    let root = HybridDeploymentCa::from_os_pin(public_ca)?;
+    let active = validate_deployment_authority_log(&root, authority_log, authority_checkpoint)?;
+    let validated =
+        validate_registry_delegation_artifact(&root, artifact, authority_log, &active, now)?;
+    Ok(ValidatedDelegation {
+        grants_service_key_enrollment: validated.grants_service_key_enrollment,
+        expires_at: validated.expires_at,
+    })
 }
 
 fn validate_deployment_authority_log(
@@ -2704,6 +3001,180 @@ pub fn verify_deployment_artifacts_with_authority_log(
         registry_public_key,
         expires_at,
     })
+}
+
+/// Result of verifying a service-key enrollment attestation: the authenticated
+/// hybrid public key for one allowlisted service. This exposes no authority or
+/// signing material.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedServiceKeyEnrollment {
+    pub deployment_domain: String,
+    pub service: String,
+    /// The exact 1984-byte `bootstrap-pubkeys` entry (32-byte Ed25519, then
+    /// 1952-byte ML-DSA-65).
+    pub hybrid_public_key: Vec<u8>,
+    pub expires_at: i64,
+}
+
+/// Verify a `hyprstream.service-key-enrollment.v1` attestation against the
+/// public root, the installed/current authority log, and its independently
+/// trusted head (hyprstream#1562).
+///
+/// Fail-closed on: wrong schema/domain, a service outside the fixed
+/// allowlist, a malformed or wrong-length hybrid key, an attestation lifetime
+/// above one hour or past the delegation expiry, expiry at the current time,
+/// a delegation that does not carry the exact enrollment capability, and any
+/// signature half that does not verify against the delegated signer.
+pub fn verify_service_key_enrollment(
+    public_ca: &[u8],
+    authority_log_json: &[u8],
+    authority_checkpoint_json: &[u8],
+    attestation_json: &[u8],
+) -> Result<VerifiedServiceKeyEnrollment> {
+    anyhow::ensure!(
+        authority_log_json.len() <= MAX_DEPLOYMENT_CLOUD_SECRET_BYTES,
+        "installed deployment authority log is too large"
+    );
+    anyhow::ensure!(
+        authority_checkpoint_json.len() <= MAX_DEPLOYMENT_CLOUD_SECRET_BYTES,
+        "installed deployment authority checkpoint is too large"
+    );
+    anyhow::ensure!(
+        attestation_json.len() <= MAX_SERVICE_KEY_ENROLLMENT_BYTES,
+        "service-key enrollment attestation is too large"
+    );
+    let ca = HybridDeploymentCa::from_os_pin(public_ca)?;
+    let authority_log: DeploymentAuthorityLog = serde_json::from_slice(authority_log_json)
+        .map_err(|error| {
+            anyhow::anyhow!("installed deployment authority log is malformed: {error}")
+        })?;
+    let authority_checkpoint: DeploymentAuthorityCheckpoint =
+        serde_json::from_slice(authority_checkpoint_json).map_err(|error| {
+            anyhow::anyhow!("installed deployment authority checkpoint is malformed: {error}")
+        })?;
+    let active = validate_deployment_authority_log(&ca, &authority_log, &authority_checkpoint)?;
+    let attestation: ServiceKeyEnrollmentArtifact = serde_json::from_slice(attestation_json)
+        .map_err(|error| {
+            anyhow::anyhow!("service-key enrollment attestation is malformed: {error}")
+        })?;
+    anyhow::ensure!(
+        attestation.schema == SERVICE_KEY_ENROLLMENT_SCHEMA,
+        "unsupported service-key enrollment schema"
+    );
+    anyhow::ensure!(
+        attestation.deployment_domain == ca.domain(),
+        "enrollment deployment domain does not match pinned root"
+    );
+    anyhow::ensure!(
+        SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES.contains(&attestation.service.as_str()),
+        "enrollment service is outside the fixed discovery/policy allowlist"
+    );
+    let hybrid_public_key = base64::engine::general_purpose::STANDARD
+        .decode(&attestation.hybrid_public_key_b64)
+        .context("decoding enrolled hybrid public key")?;
+    anyhow::ensure!(
+        hybrid_public_key.len() == DEPLOYMENT_CA_ROOT_BYTES,
+        "enrolled hybrid public key must be exactly {DEPLOYMENT_CA_ROOT_BYTES} bytes \
+         (32-byte Ed25519 followed by 1952-byte ML-DSA-65)"
+    );
+    // Well-formedness of both halves; the mint cannot recompute the ML-DSA-65
+    // half from a public sidecar, so a truncated or classical-only key must
+    // fail here rather than at first use.
+    HybridDeploymentCa::from_public_key_bytes(
+        &hybrid_public_key[..ED25519_PUBLIC_KEY_BYTES],
+        &hybrid_public_key[ED25519_PUBLIC_KEY_BYTES..],
+    )?;
+
+    let now = chrono::Utc::now().timestamp();
+    let latest_future_time = now
+        .checked_add(REGISTRY_DEPLOYMENT_CREDENTIAL_CLOCK_SKEW_SECONDS)
+        .ok_or_else(|| anyhow::anyhow!("enrollment clock-skew arithmetic overflow"))?;
+    anyhow::ensure!(
+        attestation.not_before >= 0,
+        "enrollment not_before is negative"
+    );
+    anyhow::ensure!(
+        attestation.not_before <= latest_future_time,
+        "enrollment is not yet valid"
+    );
+    anyhow::ensure!(
+        attestation.not_before < attestation.expires_at,
+        "enrollment not_before is not before expires_at"
+    );
+    let lifetime = attestation
+        .expires_at
+        .checked_sub(attestation.not_before)
+        .ok_or_else(|| anyhow::anyhow!("enrollment lifetime arithmetic overflow"))?;
+    anyhow::ensure!(
+        lifetime <= SERVICE_KEY_ENROLLMENT_MAX_TTL_SECONDS,
+        "enrollment lifetime exceeds the inclusive one-hour limit"
+    );
+    anyhow::ensure!(now < attestation.expires_at, "enrollment has expired");
+
+    let validated = validate_registry_delegation_artifact(
+        &ca,
+        &attestation.delegation,
+        &authority_log,
+        &active,
+        u64::try_from(now).map_err(|_| anyhow::anyhow!("system clock precedes Unix epoch"))?,
+    )?;
+    anyhow::ensure!(
+        validated.grants_service_key_enrollment,
+        "delegation does not carry the service-key-enrollment capability"
+    );
+    anyhow::ensure!(
+        attestation.deployment_domain == attestation.delegation.deployment_domain,
+        "enrollment domain does not match its delegation"
+    );
+    anyhow::ensure!(
+        attestation.expires_at >= 0
+            && u64::try_from(attestation.expires_at)
+                .map_err(|_| anyhow::anyhow!("enrollment expiry conversion failed"))?
+                <= validated.expires_at,
+        "enrollment expiry exceeds the delegation expiry"
+    );
+
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(&attestation.signature_b64)
+        .context("decoding enrollment signature")?;
+    // Signature verification is deliberately last: no parsed material becomes a
+    // trusted key unless the exact artifact is authenticated by the delegated
+    // signer the root authorized.
+    hyprstream_rpc::crypto::cose_sign::verify_composite(
+        &signature,
+        &validated.delegated.ed25519,
+        Some(&validated.delegated.ml_dsa_65),
+        &attestation.signing_bytes()?,
+        SERVICE_KEY_ENROLLMENT_SIGNATURE_CONTEXT,
+        true,
+    )
+    .context("enrollment hybrid signature rejected")?;
+    Ok(VerifiedServiceKeyEnrollment {
+        deployment_domain: attestation.deployment_domain,
+        service: attestation.service,
+        hybrid_public_key,
+        expires_at: attestation.expires_at,
+    })
+}
+
+/// Verify a `hyprstream.service-key-enrollment.v1` attestation against this
+/// node's OS-owned deployment trust chain (hyprstream#1562 H3).
+///
+/// The root, authority log, and checkpoint are read through the same
+/// trusted-artifact seam the process bootstrap uses (root-owned,
+/// symlink-free, not group/world-writable), so the attestation is
+/// authenticated by the ceremony chain — never by pinned key material. Every
+/// failure mode of [`verify_service_key_enrollment`] applies; an unreadable
+/// or untrusted chain artifact is equally fatal.
+pub fn verify_os_owned_service_key_enrollment(
+    attestation_json: &[u8],
+) -> Result<VerifiedServiceKeyEnrollment> {
+    let paths = resolve_deployment_trust_paths()?;
+    let public_ca = read_trusted_artifact(&paths.public_ca, "deployment CA root")?;
+    let authority_log = read_trusted_artifact(&paths.authority_log, "deployment authority log")?;
+    let authority_checkpoint =
+        read_trusted_artifact(&paths.authority_checkpoint, "deployment authority checkpoint")?;
+    verify_service_key_enrollment(&public_ca, &authority_log, &authority_checkpoint, attestation_json)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3529,6 +4000,132 @@ pub mod test_fixtures {
         request_kem_recipient: hyprstream_rpc::crypto::hybrid_kem::RecipientPublic,
     }
 
+    /// Multi-endpoint announcement backend for the fixture. The production
+    /// [`MemoryStateStore`] deliberately keeps one live announcement per
+    /// (service, socket kind) — the single-replica lease model — while
+    /// production retry sets with several same-authority reaches are served
+    /// from the remote Discovery `get_endpoints` fan-out. A resolver fixture
+    /// runs client-less, so it needs a backend that keeps every announced
+    /// endpoint to express those sets.
+    #[derive(Default)]
+    struct FixtureAnnouncementStore {
+        services: parking_lot::Mutex<HashMap<String, Vec<AnnouncedEndpoint>>>,
+    }
+
+    impl FixtureAnnouncementStore {
+        fn put_announcement_sync(&self, service_name: &str, endpoint: AnnouncedEndpoint) {
+            let mut services = self.services.lock();
+            let endpoints = services.entry(service_name.to_owned()).or_default();
+            endpoints.retain(|existing| existing.endpoint != endpoint.endpoint);
+            endpoints.push(endpoint);
+        }
+
+        fn announcements_for_sync(&self, service_name: &str, now_unix_ms: i64) -> Vec<AnnouncedEndpoint> {
+            self.services
+                .lock()
+                .get(service_name)
+                .into_iter()
+                .flatten()
+                .filter(|entry| entry.is_live_at(now_unix_ms))
+                .cloned()
+                .collect()
+        }
+
+        fn clear_announcements_sync(&self, service_name: &str) {
+            self.services.lock().remove(service_name);
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    impl DiscoveryStateStore for FixtureAnnouncementStore {
+        async fn put_announcement(
+            &self,
+            service_name: &str,
+            endpoint: AnnouncedEndpoint,
+        ) -> Result<PutResult> {
+            self.put_announcement_sync(service_name, endpoint);
+            Ok(PutResult::Stored)
+        }
+
+        async fn announcements_for(
+            &self,
+            service_name: &str,
+            now_unix_ms: i64,
+        ) -> Result<Vec<AnnouncedEndpoint>> {
+            Ok(self.announcements_for_sync(service_name, now_unix_ms))
+        }
+
+        async fn all_announcements(
+            &self,
+            now_unix_ms: i64,
+        ) -> Result<Vec<(String, Vec<AnnouncedEndpoint>)>> {
+            Ok(self
+                .services
+                .lock()
+                .iter()
+                .map(|(service_name, endpoints)| {
+                    (
+                        service_name.clone(),
+                        endpoints
+                            .iter()
+                            .filter(|entry| entry.is_live_at(now_unix_ms))
+                            .cloned()
+                            .collect(),
+                    )
+                })
+                .collect())
+        }
+
+        // The resolver fixture exercises only the announcement plane; the
+        // remaining store surface belongs to the Discovery daemon backends and
+        // fails closed here rather than pretending to track it.
+        async fn put_liveness(&self, _node: &Did, _value: LiveAllocatable) -> Result<PutResult> {
+            anyhow::bail!("fixture announcement store does not track liveness")
+        }
+
+        #[cfg(test)]
+        async fn liveness(&self, _node: &Did, _now_unix_ms: i64) -> Result<Option<LiveAllocatable>> {
+            anyhow::bail!("fixture announcement store does not track liveness")
+        }
+
+        async fn all_liveness(&self, _now_unix_ms: i64) -> Result<Vec<(Did, LiveAllocatable)>> {
+            anyhow::bail!("fixture announcement store does not track liveness")
+        }
+
+        async fn put_entity_statement(
+            &self,
+            _issuer: &str,
+            _value: CachedEntityStatement,
+        ) -> Result<()> {
+            anyhow::bail!("fixture announcement store does not track entity statements")
+        }
+
+        async fn entity_statement(&self, _issuer: &str) -> Result<Option<CachedEntityStatement>> {
+            anyhow::bail!("fixture announcement store does not track entity statements")
+        }
+
+        async fn known_issuers(&self) -> Result<Vec<String>> {
+            anyhow::bail!("fixture announcement store does not track entity statements")
+        }
+
+        async fn known_issuer_count(&self) -> Result<usize> {
+            anyhow::bail!("fixture announcement store does not track entity statements")
+        }
+
+        async fn put_envelope_keyset(
+            &self,
+            _service_did: &str,
+            _value: CachedEnvelopeKeyset,
+        ) -> Result<()> {
+            anyhow::bail!("fixture announcement store does not track envelope keysets")
+        }
+
+        async fn envelope_keyset(&self, _service_did: &str) -> Result<Option<CachedEnvelopeKeyset>> {
+            anyhow::bail!("fixture announcement store does not track envelope keysets")
+        }
+    }
+
     /// Mutable handle for one process-global, model-free production resolver
     /// fixture. The resolver and dial hook are installed once; individual tests
     /// reset only the accepted-state and announcement data behind that fixed
@@ -3536,7 +4133,7 @@ pub mod test_fixtures {
     #[derive(Clone)]
     pub struct ProductionInferenceFixture {
         service_name: String,
-        announced: Arc<MemoryStateStore>,
+        announced: Arc<FixtureAnnouncementStore>,
         states: Arc<FixtureAcceptedStates>,
         primary: FixtureAuthority,
         foreign: FixtureAuthority,
@@ -3628,7 +4225,7 @@ pub mod test_fixtures {
                 self.announced.put_announcement_sync(
                     &self.service_name,
                     announcement(&self.primary, transport, Instant::now())?,
-                )?;
+                );
             }
             Ok(())
         }
@@ -3640,8 +4237,7 @@ pub mod test_fixtures {
                 .announcements_for_sync(&self.service_name, unix_millis_now())
             {
                 endpoint.live_until_unix_ms = unix_millis_now() - 1;
-                let _ = self
-                    .announced
+                self.announced
                     .put_announcement_sync(&self.service_name, endpoint);
             }
         }
@@ -3655,7 +4251,7 @@ pub mod test_fixtures {
             self.announced.put_announcement_sync(
                 &self.service_name,
                 announcement(&self.foreign, transport, Instant::now())?,
-            )?;
+            );
             Ok(())
         }
     }
@@ -3676,7 +4272,7 @@ pub mod test_fixtures {
         let states = Arc::new(FixtureAcceptedStates(parking_lot::Mutex::new(
             HashMap::new(),
         )));
-        let announced = Arc::new(MemoryStateStore::default());
+        let announced = Arc::new(FixtureAnnouncementStore::default());
         let fixture = ProductionInferenceFixture {
             service_name: service_name.to_owned(),
             announced: Arc::clone(&announced),
@@ -3963,8 +4559,7 @@ impl DiscoveryService {
             .await?;
         let Some(endpoint) = endpoints
             .iter()
-            .filter(|ep| ep.socket_kind == wanted)
-            .find(|ep| ep.is_live_at(unix_millis_now()))
+            .find(|ep| ep.socket_kind == wanted)
         else {
             return Ok(None);
         };
@@ -4702,6 +5297,10 @@ mod resolver_tests {
     }
 
     fn accepted_state(tag: u8) -> (AcceptedAt9pState, SigningKey) {
+        accepted_state_with_expiry(tag, "2099-01-01T00:00:00Z")
+    }
+
+    fn accepted_state_with_expiry(tag: u8, expiry: &str) -> (AcceptedAt9pState, SigningKey) {
         let signing = SigningKey::from_bytes(&[tag; 32]);
         let pq_signing = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signing);
         let keys = HybridKeyPair::new(
@@ -4725,7 +5324,7 @@ mod resolver_tests {
             1,
             [1; 64],
             body,
-            "2099-01-01T00:00:00Z".to_owned(),
+            expiry.to_owned(),
             &signing,
             &pq_signing,
         )
@@ -5427,6 +6026,116 @@ mod resolver_tests {
         assert!(services.services.iter().all(|summary| summary.name != name));
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_announcement_handler_lease_and_result_follow_shared_time() {
+        use crate::state_store::tests::ReplicaClock;
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else { return; };
+        for backend in [crate::DiscoveryStateBackend::Valkey, crate::DiscoveryStateBackend::Tiered] {
+            let config = crate::DiscoveryStateConfig {
+                backend, active_active: true,
+                valkey: crate::ValkeyStateConfig {
+                    url: url.clone(),
+                    key_prefix: format!("hs-handler-lease-{}-{}-{backend:?}", std::process::id(), unix_millis_now()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (state, signing) = accepted_state(12);
+            let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(state.clone()))));
+            let root = SigningKey::from_bytes(&[0x61; 32]);
+            let service = DiscoveryService::new(Arc::new(root.clone()), root.verifying_key(), TransportConfig::inproc("lease-handler-test"))
+                .with_accepted_state_source(source.clone())
+                .with_state(DiscoveryState::connect(&config).await.unwrap());
+            let claims = hyprstream_rpc::auth::Claims::new("service:model".to_owned(),
+                chrono::Utc::now().timestamp(), chrono::Utc::now().timestamp() + 7_200)
+                .with_cnf_jwk(signing.verifying_key().as_bytes());
+            let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signing);
+            let envelope = hyprstream_rpc::SignedEnvelope::new_signed_hybrid(
+                hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()), &signing, &pq);
+            let ctx = EnvelopeContext::from_verified_as_system(&envelope);
+            let kem = hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&signing).unwrap();
+            let now = unix_millis_now();
+            let mut request = ServiceAnnouncement {
+                service_name: "model".to_owned(), socket_kind: "quic".to_owned(),
+                endpoint: "quic://localhost:127.0.0.1:9".to_owned(),
+                service_jwt: Some(hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &root)),
+                service_did: Did::from(state.did.clone()), capabilities: vec!["hyprstream-rpc/1".to_owned()],
+                accepted_state_digest: state.head_digest.to_vec(), accepted_state_epoch: state.epoch,
+                response_key_id: format!("{}#response-current", state.did),
+                request_kem_key_id: format!("{}#kem-current", state.did),
+                request_kem_recipient: kem.public().encode(), expires_at_unix_ms: now + 7_200_000,
+            };
+            for skew in [3_600_000, -3_600_000] {
+                let _clock = ReplicaClock::at(now + skew);
+                assert!(matches!(service.handle_announce(&ctx, 1, &request).await.unwrap(), DiscoveryResponseVariant::AnnounceResult));
+                let rows = service.state_store.announcements_for("model", now + skew).await.unwrap();
+                assert_eq!(rows.len(), 1, "successful response requires a stored publication");
+                assert!((now + 89_000..=now + 91_000).contains(&rows[0].live_until_unix_ms));
+                assert_eq!(rows[0].expires_at_unix_ms, request.expires_at_unix_ms);
+                assert_eq!(rows[0].request_kem_recipient, request.request_kem_recipient);
+                assert_eq!(rows[0].service_jwt, request.service_jwt.clone().unwrap());
+                // Repeated reads exercise populated L1, not only its first fill.
+                assert!(service.resolve_announced_endpoint("model", SocketKind::Quic).await.unwrap().is_some());
+                assert_eq!(service.state_store.all_announcements(now + skew).await.unwrap().len(), 1);
+                service.production_resolver().unwrap().resolve_service(ServiceQuery::network("model").unwrap()).await.unwrap();
+            }
+            // Legacy publication has no signed expiry, but receives the same
+            // bounded backend lease on both initial publication and refresh.
+            let mut legacy = request.clone();
+            legacy.service_name = "legacy".to_owned();
+            legacy.service_jwt = None;
+            legacy.service_did = Did::default();
+            legacy.capabilities.clear();
+            legacy.accepted_state_digest.clear();
+            legacy.accepted_state_epoch = 0;
+            legacy.response_key_id.clear();
+            legacy.request_kem_key_id.clear();
+            legacy.request_kem_recipient.clear();
+            legacy.expires_at_unix_ms = 0;
+            for skew in [3_600_000, -3_600_000] {
+                let _clock = ReplicaClock::at(now + skew);
+                assert!(matches!(service.handle_announce(&ctx, 1, &legacy).await.unwrap(), DiscoveryResponseVariant::AnnounceResult));
+                let rows = service.state_store.announcements_for("legacy", now + skew).await.unwrap();
+                assert_eq!(rows.len(), 1);
+                assert!((now + 89_000..=now + 91_000).contains(&rows[0].live_until_unix_ms));
+                assert_eq!(rows[0].expires_at_unix_ms, rows[0].live_until_unix_ms);
+            }
+
+            // Signed expiry is still an independent ceiling. A shorter valid
+            // signed deadline with the same epoch is an ignored older write;
+            // the handler must not claim it was published.
+            request.expires_at_unix_ms = now + 20_000;
+            assert!(service.handle_announce(&ctx, 2, &request).await.unwrap_err().to_string().contains("not stored"));
+
+            // Updated signed accepted-state evidence supplies a shorter current-state
+            // ceiling; the backend must not extend it to the receipt TTL.
+            let accepted_limit = (now / 1_000) * 1_000 + 20_000;
+            let accepted_expiry = chrono::DateTime::from_timestamp_millis(accepted_limit).unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let (bounded, _) = accepted_state_with_expiry(12, &accepted_expiry);
+            *source.0.lock() = Some(bounded.clone());
+            request.expires_at_unix_ms = now + 7_200_000;
+            request.accepted_state_digest = bounded.head_digest.to_vec();
+            assert!(matches!(service.handle_announce(&ctx, 3, &request).await.unwrap(), DiscoveryResponseVariant::AnnounceResult));
+            let values = service.state_store.announcements_for("model", now).await.unwrap();
+            assert_eq!(values[0].live_until_unix_ms, accepted_limit);
+
+            // Both signed and accepted expiry reject under a behind clock, and
+            // neither rejection is reported as AnnounceResult.
+            let _clock = ReplicaClock::at(now - 3_600_000);
+            request.expires_at_unix_ms = now - 1;
+            assert!(service.handle_announce(&ctx, 4, &request).await.unwrap_err().to_string().contains("not stored"));
+            let expired_text = chrono::DateTime::from_timestamp_millis(now - 1).unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let (expired, _) = accepted_state_with_expiry(12, &expired_text);
+            *source.0.lock() = Some(expired.clone());
+            request.expires_at_unix_ms = now + 7_200_000;
+            request.accepted_state_digest = expired.head_digest.to_vec();
+            assert!(service.handle_announce(&ctx, 5, &request).await.unwrap_err().to_string().contains("not stored"));
+        }
+    }
+
     #[tokio::test]
     async fn accepted_state_advance_between_selection_and_dial_refuses() {
         let (resolver, source) = native_production_fixture(false);
@@ -6000,6 +6709,32 @@ mod resolver_tests {
         );
     }
 
+    /// H3: the OS-owned enrollment seam reads the chain through the trusted
+    /// artifact policy, so a trust dir without the chain fails closed before
+    /// any attestation bytes are even parsed.
+    #[cfg(unix)]
+    #[test]
+    fn os_owned_enrollment_verification_fails_closed_without_chain() {
+        static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _serial = ENV_LOCK.lock();
+        let fixture = tempfile::Builder::new()
+            .prefix(".enrollment-trust-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("secure fixture directory");
+        let prev = std::env::var_os(DEPLOYMENT_TRUST_DIR_ENV);
+        std::env::set_var(DEPLOYMENT_TRUST_DIR_ENV, fixture.path());
+        let result = verify_os_owned_service_key_enrollment(b"{}");
+        match &prev {
+            Some(value) => std::env::set_var(DEPLOYMENT_TRUST_DIR_ENV, value),
+            None => std::env::remove_var(DEPLOYMENT_TRUST_DIR_ENV),
+        }
+        let error = result.expect_err("attestation verified without a chain");
+        assert!(
+            error.to_string().contains("deployment CA root"),
+            "unexpected failure mode: {error}"
+        );
+    }
+
     #[test]
     fn verified_registry_identity_ignores_policy_and_post_start_environment_mutation() {
         const CHILD: &str = "HYPRSTREAM_TEST_POST_START_REGISTRY_ENV_CHILD";
@@ -6193,14 +6928,18 @@ mod resolver_tests {
     #[tokio::test]
     async fn stale_or_expired_production_evidence_is_rejected() {
         let (resolver, _) = native_production_fixture(false);
-        mutate_endpoint(&resolver, "model", "iroh", |endpoint| {
-            endpoint.live_until_unix_ms = unix_millis_now() - 1;
-        })
-        .await;
-        assert!(resolver
-            .resolve_service(ServiceQuery::network("model").expect("query"))
-            .await
-            .is_err());
+        let expiry = resolver.state_store.announcements_for("model", unix_millis_now())
+            .await.unwrap()[0].live_until_unix_ms;
+        {
+            // Expired writes now correctly leave a prior valid value intact.
+            // Advance this memory backend's clock to expire the real lease
+            // instead of attempting to overwrite it with a rejected write.
+            let _clock = crate::state_store::tests::ReplicaClock::at(expiry);
+            assert!(resolver
+                .resolve_service(ServiceQuery::network("model").expect("query"))
+                .await
+                .is_err());
+        }
 
         let (resolver, source) = native_production_fixture(false);
         source.0.lock().as_mut().expect("fixture state").expires_at =
@@ -6719,7 +7458,7 @@ impl DiscoveryHandler for DiscoveryService {
         self.state_store
             .put_entity_statement(&data.issuer, cached)
             .await?;
-        let total = self.state_store.known_issuers().await?.len();
+        let total = self.state_store.known_issuer_count().await?;
 
         info!(
             issuer = %data.issuer,
@@ -6999,158 +7738,151 @@ impl DiscoveryHandler for DiscoveryService {
         _request_id: u64,
         data: &QueryCandidatesRequest,
     ) -> Result<DiscoveryResponseVariant> {
-        struct Candidate {
-            did: String,
-            record_uri: String,
-            load_fraction: f32,
-            allocatable: Vec<(String, String)>,
-            last_seen: i64,
-            labels: Vec<(String, String)>,
-        }
-
-        let selectors: Vec<scheduling::LabelSelector> = data
-            .selectors
-            .iter()
-            .map(|s| {
-                scheduling::LabelSelector::new(s.key.clone(), to_scheduling_op(s.op), s.values.clone())
-            })
-            .collect();
-        let resources: Vec<scheduling::ResourceRequest> = data
-            .resources
-            .iter()
-            .map(|r| scheduling::ResourceRequest::new(r.name.clone(), r.min_quantity.clone()))
-            .collect();
-
-        // Hard liveness exclusion (decision #1): only nodes with a live,
-        // unexpired `reportNodeLiveness` entry become candidates at all.
-        let mut candidates: Vec<Candidate> = Vec::new();
-        for (node, _) in self.state_store.all_liveness(unix_millis_now()).await? {
-            let did = node.as_str().to_owned();
-            // Authorize before a query can trigger resolver work on this
-            // replica. Liveness is shared, but placement facts still come only
-            // from the verified repository ingestion path.
-            if self
-                .authorize(ctx, &format!("placement:candidate:{did}"), "query")
-                .await
-                .is_err()
-            {
-                continue;
+        use futures::{stream, StreamExt, TryStreamExt};
+        let query = async {
+            let started = Instant::now();
+            struct Candidate {
+                did: String,
+                record_uri: String,
+                load_fraction: f32,
+                allocatable: Vec<(String, String)>,
+                last_seen: i64,
             }
-            self.ensure_placement_ingested(&node).await;
-            let Some(record_uri) = self.placement_index.record_uri(&did) else {
-                continue;
-            };
-            // Repository ingestion can take time; never return a node whose
-            // heartbeat expired while this replica was loading its facts.
-            let Some(live) = self.state_store.liveness(&node, unix_millis_now()).await? else {
-                continue;
-            };
-            let labels = self.placement_index.effective_labels(&did);
-            candidates.push(Candidate {
-                did,
-                record_uri,
-                load_fraction: live.load_fraction,
-                allocatable: live.allocatable,
-                last_seen: live.last_seen,
-                labels,
+
+            let selectors: Vec<scheduling::LabelSelector> = data
+                .selectors
+                .iter()
+                .map(|s| {
+                    scheduling::LabelSelector::new(
+                        s.key.clone(),
+                        to_scheduling_op(s.op),
+                        s.values.clone(),
+                    )
+                })
+                .collect();
+            let resources: Vec<scheduling::ResourceRequest> = data
+                .resources
+                .iter()
+                .map(|r| scheduling::ResourceRequest::new(r.name.clone(), r.min_quantity.clone()))
+                .collect();
+
+            // Exact totalMatching requires examining every eligible node, but
+            // not one or two Policy RPCs and a point GET per node. Read bounded
+            // shared snapshots and authorize in bounded vectors instead.
+            let live_nodes = self.state_store.all_liveness(unix_millis_now()).await?;
+            let eligible: Vec<_> = live_nodes.into_iter().filter(|(node, live)| {
+                resources.iter().all(|req| live.allocatable.iter()
+                    .find(|(name, _)| name == &req.name)
+                    .is_some_and(|(_, quantity)| req.satisfied_by(quantity)))
+                    && (self.placement_index.record_uri(node.as_str()).is_none()
+                        || selectors.iter().all(|selector| selector.matches(
+                            &self.placement_index.effective_labels(node.as_str()))))
+            }).map(|(node, _)| node).collect();
+            let authorized = stream::iter(eligible.chunks(256))
+                .map(|nodes| async move {
+                    anyhow::ensure!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
+                        "candidate query deadline exceeded; retry");
+                    let resources: Vec<_> = nodes.iter()
+                        .map(|node| format!("placement:candidate:{node}")).collect();
+                    let decisions = match &self.auth_provider {
+                        Some(auth) => auth.check_batch(&ctx.subject().to_string(), "*",
+                            &resources, "query", ctx.jwt_token()).await?,
+                        None => vec![true; resources.len()],
+                    };
+                    anyhow::ensure!(decisions.len() == nodes.len(), "invalid authorization decision count");
+                    Ok::<_, anyhow::Error>(nodes.iter().zip(decisions)
+                        .filter(|(_, allowed)| *allowed).map(|(node, _)| node.clone()).collect::<Vec<_>>())
+                })
+                .buffer_unordered(CANDIDATE_QUERY_CONCURRENCY)
+                .try_collect::<Vec<_>>().await?
+                .into_iter().flatten().collect::<Vec<_>>();
+
+            // No denied node can trigger repository hydration. Completed
+            // verified ingests survive a cold-query timeout, so retries progress.
+            stream::iter(&authorized).map(|node| async move {
+                anyhow::ensure!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
+                    "candidate query deadline exceeded; retry");
+                anyhow::ensure!(self.ensure_placement_ingested(node).await,
+                    "candidate projection ingestion is pending; retry");
+                Ok::<_, anyhow::Error>(())
+            }).buffer_unordered(CANDIDATE_QUERY_CONCURRENCY)
+                .try_collect::<Vec<_>>().await?;
+
+            // Recheck expiry in one shared-clock snapshot after possibly slow
+            // hydration/authz, rather than issuing an awaited GET for each DID.
+            let mut live: std::collections::HashMap<_, _> = self.state_store.all_liveness(unix_millis_now())
+                .await?.into_iter().collect();
+            let mut candidates = Vec::new();
+            for node in authorized {
+                let did = node.as_str().to_owned();
+                let Some(record_uri) = self.placement_index.record_uri(&did) else { continue };
+                let Some(value) = live.remove(&node) else { continue };
+                let labels = self.placement_index.effective_labels(&did);
+                if !selectors.iter().all(|selector| selector.matches(&labels)) ||
+                    !resources.iter().all(|req| value.allocatable.iter()
+                        .find(|(name, _)| name == &req.name)
+                        .is_some_and(|(_, quantity)| req.satisfied_by(quantity))) {
+                    continue;
+                }
+                candidates.push(Candidate {
+                    did, record_uri, load_fraction: value.load_fraction,
+                    allocatable: value.allocatable, last_seen: value.last_seen,
+                });
+            }
+            let authorized: Vec<_> = candidates.iter().collect();
+            anyhow::ensure!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
+                "candidate query deadline exceeded; retry");
+
+            // Post-filter, post-authz, pre-bound — so callers can tell truncation
+            // apart from "that's really all of them".
+            let total_matching = authorized.len() as u32;
+
+            let ranked = scheduling::rank(authorized, |a, b| {
+                a.load_fraction
+                    .partial_cmp(&b.load_fraction)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.did.cmp(&b.did))
             });
-        }
 
-        let predicates: Vec<scheduling::Predicate<Candidate>> = vec![
-            Box::new({
-                let selectors = selectors.clone();
-                move |c: &Candidate| {
-                    for sel in &selectors {
-                        if !sel.matches(&c.labels) {
-                            return Some(scheduling::RejectionReason(format!(
-                                "label selector on {:?} did not match",
-                                sel.key
-                            )));
-                        }
-                    }
-                    None
-                }
-            }),
-            Box::new({
-                let resources = resources.clone();
-                move |c: &Candidate| {
-                    for req in &resources {
-                        let satisfied = c
-                            .allocatable
-                            .iter()
-                            .find(|(name, _)| name == &req.name)
-                            .is_some_and(|(_, quantity)| req.satisfied_by(quantity));
-                        if !satisfied {
-                            return Some(scheduling::RejectionReason(format!(
-                                "resource {:?} not satisfied",
-                                req.name
-                            )));
-                        }
-                    }
-                    None
-                }
-            }),
-        ];
+            let max = if data.max_candidates == 0 {
+                DEFAULT_MAX_CANDIDATES
+            } else {
+                data.max_candidates as usize
+            };
+            let candidates_out: Vec<PlacementCandidate> = ranked
+                .into_iter()
+                .take(max)
+                .map(|c| PlacementCandidate {
+                    node: c.did.clone(),
+                    record_uri: c.record_uri.clone(),
+                    load_fraction: c.load_fraction,
+                    allocatable: c
+                        .allocatable
+                        .iter()
+                        .map(|(name, quantity)| Resource {
+                            name: name.clone(),
+                            quantity: quantity.clone(),
+                        })
+                        .collect(),
+                    last_seen: c.last_seen,
+                })
+                .collect();
 
-        let outcomes = scheduling::filter(&candidates, &predicates);
-        let survivors: Vec<&Candidate> = outcomes
-            .iter()
-            .filter(|o| o.passed())
-            .map(|o| o.candidate)
-            .collect();
-
-        // Per-candidate fail-closed authz — async, so it runs as its own pass
-        // rather than inside a (sync) `scheduling::Predicate` closure. A denied
-        // node is silently dropped, never surfaced as an error.
-        let mut authorized: Vec<&Candidate> = Vec::with_capacity(survivors.len());
-        for c in survivors {
-            let resource = format!("placement:candidate:{}", c.did);
-            if self.authorize(ctx, &resource, "query").await.is_ok() {
-                authorized.push(c);
-            }
-        }
-
-        // Post-filter, post-authz, pre-bound — so callers can tell truncation
-        // apart from "that's really all of them".
-        let total_matching = authorized.len() as u32;
-
-        let ranked = scheduling::rank(authorized, |a, b| {
-            a.load_fraction
-                .partial_cmp(&b.load_fraction)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.did.cmp(&b.did))
-        });
-
-        let max = if data.max_candidates == 0 {
-            DEFAULT_MAX_CANDIDATES
-        } else {
-            data.max_candidates as usize
+            Ok(DiscoveryResponseVariant::QueryCandidatesResult(
+                PlacementCandidateSet {
+                    candidates: candidates_out,
+                    total_matching,
+                },
+            ))
         };
-        let candidates_out: Vec<PlacementCandidate> = ranked
-            .into_iter()
-            .take(max)
-            .map(|c| PlacementCandidate {
-                node: c.did.clone(),
-                record_uri: c.record_uri.clone(),
-                load_fraction: c.load_fraction,
-                allocatable: c
-                    .allocatable
-                    .iter()
-                    .map(|(name, quantity)| Resource {
-                        name: name.clone(),
-                        quantity: quantity.clone(),
-                    })
-                    .collect(),
-                last_seen: c.last_seen,
-            })
-            .collect();
-
-        Ok(DiscoveryResponseVariant::QueryCandidatesResult(
-            PlacementCandidateSet {
-                candidates: candidates_out,
-                total_matching,
-            },
-        ))
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            tokio::time::timeout(CANDIDATE_QUERY_TIMEOUT, query)
+                .await
+                .map_err(|_| anyhow::anyhow!("candidate query deadline exceeded; retry"))?
+        }
+        #[cfg(target_arch = "wasm32")]
+        query.await
     }
 
     /// #524 P1 — node liveness heartbeat. The auto-generated dispatch gate
@@ -7194,6 +7926,7 @@ impl DiscoveryHandler for DiscoveryService {
             }));
         }
 
+        let received_at = unix_millis_now();
         let live = LiveAllocatable {
             allocatable: data
                 .allocatable
@@ -7201,13 +7934,10 @@ impl DiscoveryHandler for DiscoveryService {
                 .map(|r| (r.name.clone(), r.quantity.clone()))
                 .collect(),
             load_fraction: data.load_fraction,
-            last_seen: if data.ts != 0 {
-                data.ts
-            } else {
-                unix_millis_now()
-            },
-            live_until_unix_ms: unix_millis_now()
-                .saturating_add(LIVENESS_TTL.as_millis() as i64),
+            // Client clocks can move backwards or be arbitrarily future
+            // skewed. Freshness and ordering describe this admitted receipt.
+            last_seen: received_at,
+            live_until_unix_ms: received_at.saturating_add(LIVENESS_TTL.as_millis() as i64),
         };
         self.state_store.put_liveness(&data.node, live).await?;
 
@@ -7761,6 +8491,287 @@ mod query_candidates_tests {
         .with_record_resolver(Arc::new(FixedRepoResolver { repos }))
     }
 
+    struct ConcurrentRepoResolver {
+        inner: FixedRepoResolver,
+        barrier: Option<tokio::sync::Barrier>,
+        stall: std::sync::atomic::AtomicBool,
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        resolved: parking_lot::Mutex<Vec<String>>,
+    }
+
+    struct ActiveResolution<'a>(&'a std::sync::atomic::AtomicUsize);
+    impl Drop for ActiveResolution<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl RecordResolver for ConcurrentRepoResolver {
+        async fn resolve_record(
+            &self,
+            _did: &str,
+            _collection: &str,
+            _rkey: &str,
+        ) -> Result<Option<RecordCarData>> {
+            Ok(None)
+        }
+        async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.resolved.lock().push(did.to_owned());
+            let active = self.active.fetch_add(1, SeqCst) + 1;
+            let _guard = ActiveResolution(&self.active);
+            self.peak.fetch_max(active, SeqCst);
+            if self.stall.load(SeqCst) {
+                futures::future::pending::<()>().await;
+            }
+            if let Some(barrier) = &self.barrier {
+                barrier.wait().await;
+            }
+            self.inner.resolve_repo(did).await
+        }
+        async fn resolve_verifying_key(&self, did: &str) -> Result<Option<P256VerifyingKey>> {
+            self.inner.resolve_verifying_key(did).await
+        }
+    }
+
+    async fn assert_cold_query_concurrency(state: DiscoveryState) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let mut repos = HashMap::new();
+        let now = unix_millis_now();
+        for i in 0..33 {
+            let did = format!("did:web:cold-{i}.example");
+            repos.insert(
+                did.clone(),
+                node_repo_car(&did, &sample_node_record(&did, vec![])),
+            );
+            state
+                .clone()
+                .into_inner()
+                .put_liveness(
+                    &Did::new(did),
+                    LiveAllocatable {
+                        allocatable: vec![],
+                        load_fraction: 0.1,
+                        last_seen: now,
+                        live_until_unix_ms: now + 45_000,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let resolver = Arc::new(ConcurrentRepoResolver {
+            inner: FixedRepoResolver { repos },
+            // A sequential implementation cannot complete even one batch.
+            barrier: Some(tokio::sync::Barrier::new(CANDIDATE_QUERY_CONCURRENCY)),
+            stall: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            resolved: parking_lot::Mutex::new(vec![]),
+        });
+        let denied = "did:web:cold-32.example";
+        let svc = service_with(Box::new(DenyNode(denied.to_owned())), HashMap::new())
+            .with_record_resolver(resolver.clone())
+            .with_state(state);
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(1)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let result = as_set(result);
+        assert_eq!(
+            result.total_matching, 32,
+            "maxCandidates must not hide incomplete hydration"
+        );
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(resolver.peak.load(SeqCst), CANDIDATE_QUERY_CONCURRENCY);
+        assert_eq!(resolver.active.load(SeqCst), 0);
+        assert_eq!(resolver.resolved.lock().len(), 32);
+        assert!(!resolver.resolved.lock().iter().any(|did| did == denied));
+    }
+
+    #[tokio::test]
+    async fn cold_candidate_query_hydrates_concurrently_without_truncation() {
+        let state = DiscoveryState::connect(&crate::DiscoveryStateConfig::default())
+            .await
+            .unwrap();
+        assert_cold_query_concurrency(state).await;
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_capacity_query_batches_exact_count_and_ranking() {
+        use futures::{stream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        struct BatchPolicy(Arc<AtomicUsize>);
+        #[async_trait(?Send)]
+        impl AuthorizationProvider for BatchPolicy {
+            async fn check(&self, _: &str, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<bool> {
+                panic!("capacity query regressed to per-node Policy RPC");
+            }
+            async fn check_batch(&self, _: &str, _: &str, resources: &[String], _: &str, _: Option<&str>) -> Result<Vec<bool>> {
+                assert!(resources.len() <= 256);
+                self.0.fetch_add(1, SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(resources.iter().map(|r| !r.ends_with("capacity-00001.example")).collect())
+            }
+        }
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else { return };
+        let config = crate::DiscoveryStateConfig {
+            backend: crate::DiscoveryStateBackend::Tiered, active_active: true,
+            valkey: crate::ValkeyStateConfig {
+                url, key_prefix: format!("capacity-query-{}-{}", std::process::id(), unix_millis_now()),
+                ..crate::ValkeyStateConfig::default()
+            }, ..crate::DiscoveryStateConfig::default()
+        };
+        let capacity = config.valkey.liveness_capacity;
+        assert_eq!(capacity, 65_536, "exercise advertised capacity without lowering it");
+        let state = DiscoveryState::connect(&config).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let svc = service_with(Box::new(BatchPolicy(calls.clone())), HashMap::new()).with_state(state);
+        // Warm verified placement projection: signature/admission behavior has
+        // separate real-CAR tests; this fixture isolates full-capacity querying.
+        for i in 0..capacity {
+            let did = format!("did:web:capacity-{i:05}.example");
+            svc.placement_index.seed_warm_node_for_test(did.clone(), crate::placement_index::NodeFacts {
+                record_uri: format!("at://{did}/ai.hyprstream.placement.node/3a"),
+                labels: vec![("zone".to_owned(), if i % 2 == 1 { "west" } else { "east" }.to_owned())],
+                ..Default::default()
+            });
+        }
+        stream::iter(0..capacity).map(|i| {
+            let store = &svc.state_store;
+            async move {
+                let now = unix_millis_now();
+                store.put_liveness(&Did::new(format!("did:web:capacity-{i:05}.example")), LiveAllocatable {
+                    allocatable: vec![("cpu".to_owned(), "8".to_owned())],
+                    load_fraction: 1.0 - i as f32 / capacity as f32,
+                    last_seen: now, live_until_unix_ms: now + 45_000,
+                }).await.unwrap();
+            }
+        }).buffer_unordered(256).collect::<Vec<_>>().await;
+        let mut request = empty_query(1);
+        request.selectors = vec![LabelSelector { key: "zone".to_owned(), op: SelectorOp::In, values: vec!["west".to_owned()] }];
+        request.resources = vec![ResourceRequest { name: "cpu".to_owned(), min_quantity: "4".to_owned() }];
+        let started = Instant::now();
+        let result = as_set(svc.handle_query_candidates(&test_ctx(), 1, &request).await.unwrap());
+        assert!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT);
+        assert_eq!(result.total_matching, (capacity / 2 - 1) as u32);
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].node, format!("did:web:capacity-{:05}.example", capacity - 1));
+        assert_eq!(calls.load(SeqCst), capacity / 2 / 256, "warm selector filtering precedes Policy RPC");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
+    #[tokio::test]
+    async fn valkey_cold_candidate_query_hydrates_concurrently_without_truncation() {
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let config = crate::DiscoveryStateConfig {
+            backend: crate::DiscoveryStateBackend::Tiered,
+            active_active: true,
+            valkey: crate::ValkeyStateConfig {
+                url,
+                key_prefix: format!("cold-query-{}-{}", std::process::id(), unix_millis_now()),
+                ..crate::ValkeyStateConfig::default()
+            },
+            ..crate::DiscoveryStateConfig::default()
+        };
+        assert_cold_query_concurrency(DiscoveryState::connect(&config).await.unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn cold_candidate_deadline_cancels_ingest_and_retry_is_complete() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let did = "did:web:stalled.example";
+        let resolver = Arc::new(ConcurrentRepoResolver {
+            inner: FixedRepoResolver {
+                repos: HashMap::from([(
+                    did.to_owned(),
+                    node_repo_car(did, &sample_node_record(did, vec![])),
+                )]),
+            },
+            barrier: None,
+            stall: AtomicBool::new(true),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            resolved: parking_lot::Mutex::new(vec![]),
+        });
+        let svc =
+            service_with(Box::new(AllowAll), HashMap::new()).with_record_resolver(resolver.clone());
+        let now = unix_millis_now();
+        svc.state_store
+            .put_liveness(
+                &Did::new(did.to_owned()),
+                LiveAllocatable {
+                    allocatable: vec![],
+                    load_fraction: 0.1,
+                    last_seen: now,
+                    live_until_unix_ms: now + 45_000,
+                },
+            )
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(
+            CANDIDATE_QUERY_TIMEOUT + Duration::from_secs(2),
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(1)),
+        )
+        .await
+        .unwrap()
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert_eq!(
+            resolver.active.load(SeqCst),
+            0,
+            "deadline must drop outstanding repository work"
+        );
+        resolver.stall.store(false, SeqCst);
+        let result = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(1))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            result.total_matching, 1,
+            "cancelled ingest must not be cached as absence"
+        );
+        assert_eq!(resolver.resolved.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_uses_receipt_time_after_client_clock_rollback() {
+        let svc = service_with(Box::new(AllowAll), HashMap::new());
+        let node = Did::new("did:web:rollback.example".to_owned());
+        let start = unix_millis_now();
+        for ts in [start + 86_400_000, start - 86_400_000] {
+            let req = NodeLiveness {
+                node: node.clone(),
+                allocatable: vec![],
+                load_fraction: 0.2,
+                ts,
+            };
+            svc.handle_report_node_liveness(&test_ctx(), 1, &req)
+                .await
+                .unwrap();
+            let value = svc
+                .state_store
+                .liveness(&node, unix_millis_now())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(value.last_seen >= start && value.last_seen <= unix_millis_now());
+            assert_eq!(
+                value.live_until_unix_ms,
+                value.last_seen + LIVENESS_TTL.as_millis() as i64
+            );
+        }
+    }
+
     fn test_ctx() -> EnvelopeContext {
         EnvelopeContext::from_callback_service(1, "test-caller")
     }
@@ -7862,11 +8873,13 @@ mod query_candidates_tests {
             0
         );
         // Expiring the shared record excludes it even from populated indexes.
-        replica_a
-            .state_store
-            .all_liveness(unix_millis_now() + LIVENESS_TTL.as_millis() as i64 + 1)
-            .await
-            .unwrap();
+        let now = unix_millis_now();
+        replica_a.state_store.put_liveness(&Did::new(did.to_owned()), LiveAllocatable {
+            allocatable: vec![], load_fraction: 0.1,
+            last_seen: now, live_until_unix_ms: now + 20,
+        }).await.unwrap();
+        // The shared clock cannot be advanced by passing a replica timestamp.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             as_set(
                 replica_b

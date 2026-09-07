@@ -9,7 +9,7 @@ use crate::auth::policy_templates;
 use crate::services::{EnvelopeContext, RequestService};
 use crate::services::generated::policy_client::{
     ErrorInfo, PolicyHandler, PolicyResponseVariant, TokenInfo, ScopeList,
-    PolicyCheck, IssueToken,
+    PolicyCheck, PolicyCheckBatch, PolicyCheckBatchResult, IssueToken,
     ApplyTemplate, ApplyDraft, RollbackPolicy, GetHistory, GetDiff,
     PolicyInfo, PolicyRule, Grouping,
     PolicyHistory, PolicyHistoryEntry, DraftStatus,
@@ -27,7 +27,7 @@ use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::transport::TransportConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, trace, warn};
 
 /// Evaluate a policy check on behalf of an already-verified upstream caller.
@@ -116,6 +116,9 @@ pub struct PolicyService {
     supported_scopes: Vec<String>,
     /// Shared git2db registry for git operations on .registry repo
     git2db: Arc<RwLock<Git2DB>>,
+    /// Serializes role mutation, persistence, rollback, and audit commit as a
+    /// single local control-plane transaction.
+    policy_write_lock: Mutex<()>,
     /// RepoId of the .registry self-tracked entry
     registry_repo_id: RepoId,
     /// Default audience for issued tokens (OAuth issuer URL, shared instance identifier).
@@ -158,6 +161,7 @@ impl PolicyService {
             token_config,
             supported_scopes: compute_supported_scopes(),
             git2db,
+            policy_write_lock: Mutex::new(()),
             registry_repo_id,
             default_audience: None,
             jwt_key_source: None,
@@ -515,6 +519,19 @@ impl PolicyHandler for PolicyService {
         } else {
             anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
         }
+    }
+
+    async fn handle_check_batch(
+        &self, ctx: &EnvelopeContext, request_id: u64, data: &PolicyCheckBatch,
+    ) -> Result<PolicyResponseVariant> {
+        anyhow::ensure!(data.checks.len() <= 256, "policy check batch exceeds 256");
+        let mut allowed = Vec::with_capacity(data.checks.len());
+        for check in &data.checks {
+            // Reuse the exact single-check subject/tenant/audit boundary.
+            let result = self.handle_check(ctx, request_id, check).await?;
+            allowed.push(matches!(result, PolicyResponseVariant::CheckResult(true)));
+        }
+        Ok(PolicyResponseVariant::CheckBatchResult(PolicyCheckBatchResult { allowed }))
     }
 
     async fn handle_check(
@@ -882,7 +899,11 @@ impl PolicyHandler for PolicyService {
         data: &ApplyTemplate,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        // The colocated PolicyService authority bootstraps templates over the
+        // local IPC plane without a tenant-bearing user token. Keep that
+        // authority on the explicit global bootstrap domain, while ordinary
+        // tenantless callers remain denied by `request_domain`.
+        let domain = self.request_domain(ctx)?;
         let allowed = self.policy_manager.check_with_domain(
             &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
@@ -915,6 +936,10 @@ impl PolicyHandler for PolicyService {
                 }));
             }
         };
+
+        // All writers stage the same policies/ tree, so keep the mutation,
+        // save, and commit together with role transactions.
+        let _write_guard = self.policy_write_lock.lock().await;
 
         // Apply template rules via the Casbin enforcer.
         // Base rules are always present (injected at init/reload), so templates
@@ -952,7 +977,7 @@ impl PolicyHandler for PolicyService {
         data: &ApplyDraft,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
         let allowed = self.policy_manager.check_with_domain(
             &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
@@ -963,6 +988,10 @@ impl PolicyHandler for PolicyService {
                 details: String::new(),
             }));
         }
+
+        // Serialize the disk reload and its commit with all other policy
+        // writers, since they share one policies/ tree and Git index.
+        let _write_guard = self.policy_write_lock.lock().await;
 
         info!("Applying draft policy changes");
 
@@ -1004,7 +1033,7 @@ impl PolicyHandler for PolicyService {
         data: &RollbackPolicy,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
         let allowed = self.policy_manager.check_with_domain(
             &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
@@ -1033,6 +1062,10 @@ impl PolicyHandler for PolicyService {
                 }));
             }
         }
+
+        // Checkout, reload, and commit must not race a role transaction or
+        // another whole-tree policy writer.
+        let _write_guard = self.policy_write_lock.lock().await;
 
         // Use git2 escape hatch to checkout policies/ from the target ref
         let reg = self.git2db.read().await;
@@ -1100,7 +1133,7 @@ impl PolicyHandler for PolicyService {
         data: &GetHistory,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
         let allowed = self.policy_manager.check_with_domain(
             &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
@@ -1188,7 +1221,7 @@ impl PolicyHandler for PolicyService {
         data: &GetDiff,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
         let allowed = self.policy_manager.check_with_domain(
             &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
@@ -1246,7 +1279,7 @@ impl PolicyHandler for PolicyService {
         _request_id: u64,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
         let allowed = self.policy_manager.check_with_domain(
             &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
@@ -1295,7 +1328,7 @@ impl PolicyHandler for PolicyService {
         data: &AddGrouping,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
 
         // Fine-grained permission check: caller must have ttt.writeback on policy:roles
         let allowed = self.policy_manager.check_with_domain(
@@ -1349,15 +1382,53 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
-        // Apply the role assignment
-        self.policy_manager
-            .add_role_for_user_in_domain(&data.user, &data.role, &domain)
-            .await
-            .map_err(|e| anyhow!("Failed to add role: {}", e))?;
+        let _write_guard = self.policy_write_lock.lock().await;
+        // Global bootstrap policy stores memberships in Casbin's global `g`
+        // relation; tenant-scoped memberships live in `g2`. Do not turn a
+        // global authority domain into a literal `g2(..., "*")` row.
+        let changed = if domain == "*" {
+            self.policy_manager.add_role_for_user(&data.user, &data.role).await
+        } else {
+            self.policy_manager
+                .add_role_for_user_in_domain(&data.user, &data.role, &domain)
+                .await
+        }
+        .map_err(|e| anyhow!("Failed to add role: {}", e))?;
 
-        // Persist in-memory Casbin state to disk before staging
-        self.policy_manager.save().await
-            .map_err(|e| anyhow!("Failed to save policy after role grant: {}", e))?;
+        if !changed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Role '{}' is already assigned to '{}'", data.role, data.user),
+                code: "NO_CHANGE".to_owned(),
+                details: "No policy update was committed.".to_owned(),
+            }));
+        }
+
+        // Do not leave a failed persistence attempt active only in memory:
+        // subsequent identical requests are legitimate retries and must still
+        // reach the persistence boundary rather than becoming a false no-op.
+        if let Err(error) = self.policy_manager.save().await {
+            let rollback = if domain == "*" {
+                self.policy_manager
+                    .remove_role_for_user(&data.user, &data.role)
+                    .await
+            } else {
+                self.policy_manager
+                    .remove_role_for_user_in_domain(&data.user, &data.role, &domain)
+                    .await
+            };
+            match rollback {
+                Ok(true) => return Err(anyhow!("Failed to save policy after role grant: {}", error)),
+                Ok(false) => return Err(anyhow!(
+                    "Failed to save policy after role grant: {}; rollback was not applied",
+                    error
+                )),
+                Err(rollback_error) => return Err(anyhow!(
+                    "Failed to save policy after role grant: {}; rollback failed: {}",
+                    error,
+                    rollback_error
+                )),
+            }
+        }
 
         // Commit to git
         let commit_msg = format!(
@@ -1367,8 +1438,12 @@ impl PolicyHandler for PolicyService {
         let sha = match self.stage_and_commit_policies(&commit_msg).await {
             Ok(sha) => sha,
             Err(e) => {
-                warn!("Role granted but commit failed: {}", e);
-                format!("(commit failed: {})", e)
+                warn!("Role grant persisted but audit commit failed: {}", e);
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("Role grant persisted but audit commit failed: {e}"),
+                    code: "COMMIT_FAILED".to_owned(),
+                    details: "The role change was retained; investigate the audit repository.".to_owned(),
+                }));
             }
         };
 
@@ -1386,7 +1461,7 @@ impl PolicyHandler for PolicyService {
         data: &RemoveGrouping,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
 
         // Fine-grained permission check: caller must have ttt.writeback on policy:roles
         let allowed = self.policy_manager.check_with_domain(
@@ -1415,15 +1490,51 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
-        // Remove the role assignment
-        self.policy_manager
-            .remove_role_for_user_in_domain(&data.user, &data.role, &domain)
-            .await
-            .map_err(|e| anyhow!("Failed to remove role: {}", e))?;
+        let _write_guard = self.policy_write_lock.lock().await;
+        // Match the grouping relation selected by role grant above. A global
+        // bootstrap membership is `g(user, role)`, not `g2(user, role, "*")`.
+        let changed = if domain == "*" {
+            self.policy_manager
+                .remove_role_for_user(&data.user, &data.role)
+                .await
+        } else {
+            self.policy_manager
+                .remove_role_for_user_in_domain(&data.user, &data.role, &domain)
+                .await
+        }
+        .map_err(|e| anyhow!("Failed to remove role: {}", e))?;
 
-        // Persist in-memory Casbin state to disk before staging
-        self.policy_manager.save().await
-            .map_err(|e| anyhow!("Failed to save policy after role revoke: {}", e))?;
+        if !changed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Role '{}' is not assigned to '{}'", data.role, data.user),
+                code: "NOT_FOUND".to_owned(),
+                details: "No policy update was committed.".to_owned(),
+            }));
+        }
+
+        // Restore the in-memory edge when persistence fails so a later retry
+        // remains a real mutation instead of silently reporting NOT_FOUND.
+        if let Err(error) = self.policy_manager.save().await {
+            let rollback = if domain == "*" {
+                self.policy_manager.add_role_for_user(&data.user, &data.role).await
+            } else {
+                self.policy_manager
+                    .add_role_for_user_in_domain(&data.user, &data.role, &domain)
+                    .await
+            };
+            match rollback {
+                Ok(true) => return Err(anyhow!("Failed to save policy after role revoke: {}", error)),
+                Ok(false) => return Err(anyhow!(
+                    "Failed to save policy after role revoke: {}; rollback was not applied",
+                    error
+                )),
+                Err(rollback_error) => return Err(anyhow!(
+                    "Failed to save policy after role revoke: {}; rollback failed: {}",
+                    error,
+                    rollback_error
+                )),
+            }
+        }
 
         // Commit to git
         let commit_msg = format!(
@@ -1433,8 +1544,12 @@ impl PolicyHandler for PolicyService {
         let sha = match self.stage_and_commit_policies(&commit_msg).await {
             Ok(sha) => sha,
             Err(e) => {
-                warn!("Role revoked but commit failed: {}", e);
-                format!("(commit failed: {})", e)
+                warn!("Role revoke persisted but audit commit failed: {}", e);
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("Role revoke persisted but audit commit failed: {e}"),
+                    code: "COMMIT_FAILED".to_owned(),
+                    details: "The role change was retained; investigate the audit repository.".to_owned(),
+                }));
             }
         };
 
@@ -1469,6 +1584,10 @@ impl PolicyHandler for PolicyService {
                 details: String::new(),
             }));
         }
+
+        // Visibility rules are persisted into the same policies/ tree as role
+        // mutations, so keep this whole operation serialized through commit.
+        let _write_guard = self.policy_write_lock.lock().await;
 
         if data.public {
             // Make public: add wildcard infer+query rules
@@ -2412,6 +2531,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tokenless_local_policy_authority_can_apply_a_template() {
+        let (service, _root) = test_service().await;
+        let context = EnvelopeContext::for_test_authenticated_subject(
+            Subject::new("service:policy"),
+            service.signing_key.verifying_key(),
+        );
+
+        let response = service
+            .handle_apply_template(
+                &context,
+                1,
+                &ApplyTemplate {
+                    name: "public-read".to_owned(),
+                },
+            )
+            .await
+            .expect("PolicyService must return a template response");
+
+        assert!(matches!(
+            response,
+            PolicyResponseVariant::ApplyTemplateResult(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tokenless_local_policy_authority_uses_global_domain_for_policy_control_plane() {
+        let (service, _root) = test_service().await;
+        let context = EnvelopeContext::for_test_authenticated_subject(
+            Subject::new("service:policy"),
+            service.signing_key.verifying_key(),
+        );
+
+        let assert_not_missing_tenant = |operation: &str, result: Result<PolicyResponseVariant>| {
+            if let Err(error) = result {
+                assert!(
+                    !error.to_string().contains("no verified tenant domain"),
+                    "{operation} reached a tenant-only handler path: {error}"
+                );
+            }
+        };
+
+        assert_not_missing_tenant(
+            "apply draft",
+            service
+                .handle_apply_draft(&context, 1, &ApplyDraft { message: None })
+                .await,
+        );
+        assert_not_missing_tenant(
+            "rollback",
+            service
+                .handle_rollback(
+                    &context,
+                    2,
+                    &RollbackPolicy {
+                        git_ref: "HEAD".to_owned(),
+                    },
+                )
+                .await,
+        );
+        assert_not_missing_tenant(
+            "history",
+            service
+                .handle_get_history(&context, 3, &GetHistory { count: 1 })
+                .await,
+        );
+        assert_not_missing_tenant(
+            "diff",
+            service
+                .handle_get_diff(&context, 4, &GetDiff { git_ref: None })
+                .await,
+        );
+        assert_not_missing_tenant(
+            "draft status",
+            service.handle_get_draft_status(&context, 5).await,
+        );
+        let grouping = AddGrouping {
+            user: "bootstrap-user".to_owned(),
+            role: "viewer".to_owned(),
+        };
+        let granted = service
+            .handle_add_grouping(&context, 6, &grouping)
+            .await
+            .expect("global policy authority must grant a global role");
+        assert!(
+            matches!(granted, PolicyResponseVariant::AddGroupingResult(_)) || matches!(
+            granted,
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "COMMIT_FAILED"
+        ));
+        assert!(
+            service
+                .policy_manager
+                .get_grouping_policy()
+                .await
+                .contains(&vec![grouping.user.clone(), grouping.role.clone()]),
+            "a failed audit commit must retain the wildcard bootstrap role"
+        );
+        assert!(
+            !service
+                .policy_manager
+                .get_domain_grouping_policy()
+                .await
+                .contains(&vec![
+                    grouping.user.clone(),
+                    grouping.role.clone(),
+                    "*".to_owned(),
+                ]),
+            "the wildcard bootstrap domain must not create a g2 relation"
+        );
+        let duplicate = service
+            .handle_add_grouping(&context, 7, &grouping)
+            .await
+            .expect("duplicate global role grant must return a policy response");
+        assert!(matches!(
+            duplicate,
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "NO_CHANGE"
+        ));
+
+        let revoked = service
+            .handle_remove_grouping(
+                &context,
+                8,
+                &RemoveGrouping {
+                    user: grouping.user.clone(),
+                    role: grouping.role.clone(),
+                },
+            )
+            .await
+            .expect("global policy authority must revoke a global role");
+        assert!(
+            matches!(revoked, PolicyResponseVariant::RemoveGroupingResult(_)) || matches!(
+            revoked,
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "COMMIT_FAILED"
+        ));
+        assert!(
+            !service
+                .policy_manager
+                .get_grouping_policy()
+                .await
+                .contains(&vec![grouping.user.clone(), grouping.role.clone()]),
+            "a failed audit commit must retain the wildcard bootstrap role removal"
+        );
+        let missing = service
+            .handle_remove_grouping(
+                &context,
+                9,
+                &RemoveGrouping {
+                    user: grouping.user,
+                    role: grouping.role,
+                },
+            )
+            .await
+            .expect("missing global role revoke must return a policy response");
+        assert!(matches!(
+            missing,
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "NOT_FOUND"
+        ));
+    }
+
+    #[tokio::test]
     async fn unauthenticated_policy_check_is_denied() {
         let manager = Arc::new(
             PolicyManager::new_in_memory()
@@ -2576,6 +2854,8 @@ mod tests {
             .expect("test: per-origin federation grant");
 
         let endpoint = format!("policy-delegation-{}", rand::random::<u64>());
+        manager.add_policy_with_domain("alice", "did:web:tenant-a.example",
+            "placement:candidate:*", "query", "allow").await.expect("capacity grant");
         let policy_key = SigningKey::from_bytes(&[0x70; 32]);
         let actor_key = SigningKey::from_bytes(&[0x71; 32]);
         let actor_verifying_key = actor_key.verifying_key();
@@ -2676,6 +2956,34 @@ mod tests {
             .await
             .expect("test: tenant user decision");
         assert!(allowed, "verified delegated user grant must be effective");
+
+        let provider = crate::services::discovery::PolicyAuthProvider::new(client.clone());
+        let batched = hyprstream_discovery::AuthorizationProvider::check_batch(
+            &provider, "alice", "forged-other-tenant",
+            &["model:allowed".to_owned(), "model:deputy-only".to_owned()],
+            "infer.generate", Some(&user_token),
+        ).await.expect("real batched Policy RPC with delegated identity");
+        assert_eq!(batched, vec![true, false], "batch preserves user authority, not deputy grants");
+        assert!(hyprstream_discovery::AuthorizationProvider::check_batch(
+            &provider, "alice", "*", &["model:allowed".to_owned()], "infer.generate", None,
+        ).await.is_err(), "batch cannot mediate a user without verified bearer");
+        assert!(client.clone().with_delegated_bearer(user_token.clone()).check_batch(&PolicyCheckBatch {
+            checks: vec![PolicyCheck { subject: String::new(), domain: String::new(),
+                resource: "model:allowed".to_owned(), operation: "infer.generate".to_owned() }; 257],
+        }).await.is_err(), "batch bound enforced by server, not only adapter");
+
+        // Exercise the real adapter, generated wire codec and Policy handler
+        // for a full configured fleet, separately from Valkey snapshot timing.
+        use futures::{stream, StreamExt, TryStreamExt};
+        let resources: Vec<_> = (0..65_536).map(|i| format!("placement:candidate:did:web:capacity-{i}.example")).collect();
+        let started = std::time::Instant::now();
+        let decisions = stream::iter(resources.chunks(256)).map(|batch| {
+            hyprstream_discovery::AuthorizationProvider::check_batch(&provider,
+                "alice", "*", batch, "query", Some(&user_token))
+        }).buffer_unordered(16).try_collect::<Vec<_>>().await.expect("full-fleet Policy batch RPC");
+        assert_eq!(decisions.iter().flatten().filter(|allowed| **allowed).count(), 65_536);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5),
+            "healthy Policy batching exceeded candidate deadline: {:?}", started.elapsed());
 
         let cross_tenant = client
             .clone()

@@ -135,6 +135,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
             signing_key: oauth.clone(),
             transport: TransportConfig::ipc(directory.path().join("mcp-unused.sock")),
             ctx: None,
+            policy_transport: TransportConfig::ipc(directory.path().join("policy-unused.sock")),
             policy_verifying_key: policy.verifying_key(),
             expected_audience: None,
             jwt_key_source: None,
