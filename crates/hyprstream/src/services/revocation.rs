@@ -106,13 +106,33 @@ fn session_key_to_ref(key: &SessionKey) -> SessionKeyRef {
 /// registry by [`init_process_authority_stores`] in every process that does
 /// not host the policy service.
 pub struct PolicyAuthoritySessionRegistry {
-    client: PolicyClient,
+    client_provider: Arc<dyn Fn() -> anyhow::Result<Arc<PolicyClient>> + Send + Sync>,
 }
 
 impl PolicyAuthoritySessionRegistry {
     /// Wrap a policy client as a session registry.
     pub fn new(client: PolicyClient) -> Self {
-        Self { client }
+        let client = Arc::new(client);
+        Self::with_client_provider(move || Ok(Arc::clone(&client)))
+    }
+
+    /// Resolve a current authenticated client separately for every operation.
+    /// A provider failure denies checks and rejects publications; it never
+    /// falls back to a previously captured token or an anonymous client.
+    pub fn with_client_provider(
+        provider: impl Fn() -> anyhow::Result<Arc<PolicyClient>> + Send + Sync + 'static,
+    ) -> Self {
+        Self { client_provider: Arc::new(provider) }
+    }
+
+    /// Follow the exact service key's renewed trust-store JWT for the process
+    /// lifetime. Resolver authority and remote crypto validation are unchanged.
+    fn for_service(signing_key: SigningKey) -> Self {
+        Self::with_client_provider(move || {
+            let token = crate::services::factories::service_token(&signing_key)
+                .context("current service JWT unavailable for session authority")?;
+            PolicyClient::from_resolver(signing_key.clone(), Some(token)).map(Arc::new)
+        })
     }
 }
 
@@ -136,7 +156,9 @@ impl SessionRegistry for PolicyAuthoritySessionRegistry {
             expires_at: state.expires_at,
             clearance_epoch: state.clearance_epoch,
         };
-        self.client
+        let client = (self.client_provider)()
+            .map_err(|_| -> SessionRegisterError { hyprstream_rpc::auth::SessionPublicationFailed.into() })?;
+        client
             .register_session(&request)
             .await
             .map_err(|e| {
@@ -157,7 +179,8 @@ impl SessionRegistry for PolicyAuthoritySessionRegistry {
         };
         // Publication BEFORE eviction: only after the authority has durably
         // accepted the revocation is the local cache generation flushed.
-        self.client
+        (self.client_provider)()
+            .map_err(|e| SessionRevokeError::new(format!("authority client unavailable: {e}")))?
             .revoke_session(&request)
             .await
             .map_err(|e| SessionRevokeError::new(format!("authority rejected publication: {e}")))?;
@@ -169,7 +192,11 @@ impl SessionRegistry for PolicyAuthoritySessionRegistry {
         let request = CheckSession {
             session: session_key_to_ref(key),
         };
-        match tokio::time::timeout(CHECK_TIMEOUT, self.client.check_session(&request)).await {
+        match tokio::time::timeout(CHECK_TIMEOUT, async {
+            (self.client_provider)()?.check_session(&request).await
+        })
+            .await
+        {
             // true = active and known; anything else is not active.
             Ok(Ok(active)) => !active,
             Ok(Err(e)) => {
@@ -192,13 +219,33 @@ impl SessionRegistry for PolicyAuthoritySessionRegistry {
 /// process-global store by [`init_process_authority_stores`] in
 /// every process that does not host the policy service.
 pub struct PolicyAuthorityRevocationStore {
-    client: PolicyClient,
+    client_provider: Arc<dyn Fn() -> anyhow::Result<Arc<PolicyClient>> + Send + Sync>,
 }
 
 impl PolicyAuthorityRevocationStore {
     /// Wrap a policy client as a revocation store.
     pub fn new(client: PolicyClient) -> Self {
-        Self { client }
+        let client = Arc::new(client);
+        Self::with_client_provider(move || Ok(Arc::clone(&client)))
+    }
+
+    /// Resolve a current authenticated client separately for every operation.
+    /// A provider failure denies checks and rejects publications; it never
+    /// falls back to a previously captured token or an anonymous client.
+    pub fn with_client_provider(
+        provider: impl Fn() -> anyhow::Result<Arc<PolicyClient>> + Send + Sync + 'static,
+    ) -> Self {
+        Self { client_provider: Arc::new(provider) }
+    }
+
+    /// Follow the exact service key's renewed trust-store JWT for the process
+    /// lifetime. Resolver authority and remote crypto validation are unchanged.
+    fn for_service(signing_key: SigningKey) -> Self {
+        Self::with_client_provider(move || {
+            let token = crate::services::factories::service_token(&signing_key)
+                .context("current service JWT unavailable for revocation authority")?;
+            PolicyClient::from_resolver(signing_key.clone(), Some(token)).map(Arc::new)
+        })
     }
 }
 
@@ -208,7 +255,9 @@ impl CredentialRevocationStore for PolicyAuthorityRevocationStore {
         let request = CheckCredentialRevocation {
             credential: credential_id_to_ref(id),
         };
-        match tokio::time::timeout(CHECK_TIMEOUT, self.client.check_credential_revocation(&request))
+        match tokio::time::timeout(CHECK_TIMEOUT, async {
+            (self.client_provider)()?.check_credential_revocation(&request).await
+        })
             .await
         {
             Ok(Ok(revoked)) => revoked,
@@ -237,7 +286,8 @@ impl CredentialRevocationStore for PolicyAuthorityRevocationStore {
         // Publication BEFORE eviction: only after the authority has durably
         // accepted the revocation are cached handles derived from the
         // credential evicted. On failure nothing is evicted.
-        self.client
+        (self.client_provider)()
+            .map_err(|e| RevocationPublishError::new(format!("authority client unavailable: {e}")))?
             .revoke_credential(&request)
             .await
             .map_err(|e| {
@@ -254,10 +304,11 @@ impl CredentialRevocationStore for PolicyAuthorityRevocationStore {
 /// When this process hosts the policy service (`hosts_policy`), it owns both
 /// canonical stores as durable files under the deployment data dir
 /// (`credential-revocations.jsonl`, `sessions.jsonl`). Every other process
-/// builds a [`PolicyClient`] through the production resolver and PROBES the
-/// authority (a freshly generated random credential ID, expected not revoked;
-/// and a random session key, expected not active) before publishing the RPC
-/// client stores, which share the one client.
+/// PROBES the authority (a freshly generated random credential ID, expected
+/// not revoked; and a random session key, expected not active) before
+/// publishing the RPC client stores. Both stores resolve a fresh
+/// [`PolicyClient`] per operation through the production resolver, so a
+/// renewed trust-store service JWT is consumed without a process restart.
 ///
 /// Fail-closed: any error — an unreadable/corrupt durable file, or an
 /// authority unreachable after [`PROBE_ATTEMPTS`] attempts — is propagated
@@ -293,10 +344,8 @@ pub async fn init_process_authority_stores(
         return Ok(());
     }
 
-    let client = PolicyClient::from_resolver(
-        signing_key.clone(),
-        crate::services::factories::service_token(signing_key),
-    )?;
+    let store = PolicyAuthorityRevocationStore::for_service(signing_key.clone());
+    let sessions = PolicyAuthoritySessionRegistry::for_service(signing_key.clone());
     let probe = CredentialId::jwt(
         "https://revocation-probe.invalid",
         format!("probe-{:032x}", rand::random::<u128>()),
@@ -313,19 +362,21 @@ pub async fn init_process_authority_stores(
         let session_request = CheckSession {
             session: session_key_to_ref(&session_probe),
         };
-        let revocation_probe =
-            tokio::time::timeout(CHECK_TIMEOUT, client.check_credential_revocation(&request)).await;
-        let session_probe_result =
-            tokio::time::timeout(CHECK_TIMEOUT, client.check_session(&session_request)).await;
+        let revocation_probe = tokio::time::timeout(CHECK_TIMEOUT, async {
+            (store.client_provider)()?.check_credential_revocation(&request).await
+        })
+        .await;
+        let session_probe_result = tokio::time::timeout(CHECK_TIMEOUT, async {
+            (sessions.client_provider)()?.check_session(&session_request).await
+        })
+        .await;
         match (revocation_probe, session_probe_result) {
             (Ok(Ok(false)), Ok(Ok(false))) => {
                 hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
-                    PolicyAuthorityRevocationStore::new(client.clone()),
+                    store,
                 ))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-                hyprstream_rpc::auth::set_global_session_registry(Arc::new(
-                    PolicyAuthoritySessionRegistry::new(client),
-                ))
+                hyprstream_rpc::auth::set_global_session_registry(Arc::new(sessions))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
                 tracing::info!(
                     "Revocation/session authority reachable; RPC client stores published"

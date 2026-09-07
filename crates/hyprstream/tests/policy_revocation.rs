@@ -452,6 +452,83 @@ async fn unreachable_authority_fails_closed() -> Result<()> {
     Ok(())
 }
 
+/// The same long-lived store consumes replacement credentials on both reads
+/// and writes, through a real Iroh PolicyService rather than a mock response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revocation_client_consumes_renewed_service_jwt() -> Result<()> {
+    use hyprstream_rpc::auth::{Claims, ClusterKeySource};
+    use hyprstream_rpc::node_identity::derive_purpose_key;
+
+    support::install_explicit_dispatch_pep();
+    install_hybrid_verify_config();
+    let authority_dir = TempDir::new()?;
+    let _authority = install_authority_store(&authority_dir)?;
+    let (service, server_key, _data) = make_policy_service().await?;
+    let issuer = "http://127.0.0.1:6791";
+    let ca_key = derive_purpose_key(&server_key, "hyprstream-jwt-v1");
+    let ca_pq = derive_mesh_mldsa_key(&ca_key);
+    let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
+    let key_source = ClusterKeySource::new(ca_key.verifying_key(), issuer.to_owned())
+        .with_ca_composite_key(ca_pq_vk.clone());
+    let (server, address) = serve_over_iroh(
+        service.with_jwt_key_source(Arc::new(key_source)), &server_key,
+    ).await?;
+    let substrate = IrohSubstrate::new(
+        fresh_node_key(), NoopHandler::new("renew-moq"), NoopHandler::new("renew-rpc"),
+    ).await?;
+    let connection = substrate.connect(address, ALPN_HYPRSTREAM_RPC).await?;
+    let signing_key = process_a_signing_key();
+    let now = chrono::Utc::now().timestamp();
+    let token = |issued_at, expires_at| {
+        let claims = Claims::new("service:oauth".to_owned(), issued_at, expires_at)
+            .with_issuer(issuer.to_owned())
+            .with_audience(Some(issuer.to_owned()))
+            .with_cnf_jwk(signing_key.verifying_key().as_bytes());
+        hyprstream_rpc::auth::jwt::encode_service_jwt_hybrid(
+            &claims, &ca_key, &ca_pq, &ca_pq_vk,
+        )
+    };
+    let old = token(now - 7200, now - 3600);
+    let renewed = token(now, now + 3600);
+    let current = Arc::new(parking_lot::RwLock::new(Some(old.clone())));
+    let current_for_client = Arc::clone(&current);
+    let client_key = signing_key.clone();
+    let server_vk = server_key.verifying_key();
+    let kem = request_kem_store(&server_key)?;
+    let store = PolicyAuthorityRevocationStore::with_client_provider(move || {
+        let jwt = current_for_client.read().clone()
+            .ok_or_else(|| anyhow::anyhow!("current credential unavailable"))?;
+        let rpc = RpcClientImpl::new(
+            LocalSigner::new(client_key.clone()),
+            IrohTransport::new(connection.clone()),
+            Some(server_vk),
+        )
+        .with_request_kem_store(Arc::clone(&kem))
+        .with_response_pq_store(pq_trust_store())
+        .with_default_jwt(jwt);
+        Ok(Arc::new(PolicyClient::new(Arc::new(rpc))))
+    });
+    let id = CredentialId::jwt("https://renewal.example", format!("renew-{}", uuid::Uuid::new_v4()));
+    assert!(store.is_revoked(&id).await, "expired credential must fail closed");
+    assert!(store.revoke_credential(id.clone(), now + 3600).await.is_err());
+    *current.write() = Some(renewed.clone());
+    assert!(!store.is_revoked(&id).await, "renewal recovers the same store without restart");
+    store.revoke_credential(id.clone(), now + 3600).await?;
+    assert!(store.is_revoked(&id).await, "renewed publication is visible at the authority");
+    let live = CredentialId::jwt("https://renewal.example", format!("live-{}", uuid::Uuid::new_v4()));
+    *current.write() = Some(old);
+    assert!(store.is_revoked(&live).await, "expired-token causal twin denies");
+    *current.write() = None;
+    assert!(store.is_revoked(&live).await, "missing credential cannot fall back to stale authority");
+    assert!(store.revoke_credential(live.clone(), now + 3600).await.is_err());
+    *current.write() = Some(renewed);
+    assert!(!store.is_revoked(&live).await, "replacement alone restores a live check");
+    drop(store);
+    substrate.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
 /// The authority's durable store: revocations survive a process restart
 /// (drop + re-open from the same path), expired entries are dropped on load,
 /// and a corrupt file fails closed at open.
