@@ -51,6 +51,15 @@ const ISSUER: &str = "http://127.0.0.1:6791";
 /// verification (Hybrid policy) with the PQ anchors of the fixture keys.
 /// These anchors authenticate keys; they grant no authorization.
 fn install_crypto() {
+    // Match the Policy-host startup authority: the dispatch plane fails
+    // closed on jti-bearing service credentials without the process-global
+    // revocation store, even on a fresh deployment. Get-or-init an in-memory
+    // authority for this binary.
+    if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+        let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+            hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+        ));
+    }
     let mut store = KeyedPqTrustStore::new();
     for bytes in [POLICY_ROOT_KEY, DISCOVERY_KEY, GHOST_CLIENT_KEY] {
         let ed = SigningKey::from_bytes(&bytes);
