@@ -936,7 +936,7 @@ impl McpService {
             tool_reg.by_uuid.len(),
         );
 
-        let policy_client = PolicyClient::for_local_bootstrap(
+        let policy_client = crate::services::policy_client_for_process(
             config.signing_key.clone(),
             config.policy_verifying_key,
             None,

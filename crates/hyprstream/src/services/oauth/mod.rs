@@ -508,6 +508,25 @@ impl OAuthService {
     }
 }
 
+fn runtime_clients(
+    signing_key: &ed25519_dalek::SigningKey,
+) -> anyhow::Result<(PolicyClient, crate::services::DiscoveryClient)> {
+    let trust = hyprstream_service::global_trust_store();
+    let policy_key = trust
+        .resolve_one("policy")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated policy key"))?;
+    let discovery_key = trust
+        .resolve_one("discovery")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated discovery key"))?;
+    Ok((
+        crate::services::policy_client_for_process(signing_key.clone(), policy_key, None)?,
+        crate::services::discovery_client_for_process(signing_key.clone(), discovery_key, None)?,
+    ))
+}
+
+#[cfg(test)]
+mod required_consumer_tests;
+
 impl Spawnable for OAuthService {
     fn name(&self) -> &str {
         SERVICE_NAME
@@ -552,41 +571,12 @@ impl Spawnable for OAuthService {
             // async I/O (TMQ) registers socket FDs with THIS runtime's epoll.
             // Creating them in the factory (main runtime) would cause hangs.
 
-            // Bootstrap: Get service verifying keys from trust store.
-            // The trust store is populated during startup by depends_on services.
-            let policy_vk = match hyprstream_service::global_trust_store().resolve_one("policy") {
-                Some(vk) => vk,
-                None => {
-                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                        "trust store has no policy key — startup must populate it".to_owned(),
-                    ));
-                }
-            };
-            let policy_client = PolicyClient::for_local_bootstrap(
-                self.signing_key.clone(),
-                policy_vk,
-                None,
-            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                format!("failed to create PolicyClient: {e}"),
-            ))?;
-
-            // Get discovery key from trust store (populated by depends_on = ["discovery"]).
-            // Using trust store avoids RPC calls which require LocalSet context.
-            let discovery_vk = match hyprstream_service::global_trust_store().resolve_one("discovery") {
-                Some(vk) => vk,
-                None => {
-                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                        "trust store has no discovery key — ensure discovery is in depends_on".to_owned(),
-                    ));
-                }
-            };
-            let discovery_client = crate::services::DiscoveryClient::for_local_bootstrap(
-                self.signing_key.clone(),
-                discovery_vk,
-                None,
-            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                format!("failed to create DiscoveryClient: {e}"),
-            ))?;
+            let (policy_client, discovery_client) = runtime_clients(&self.signing_key)
+                .map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "failed to create OAuth runtime clients: {error}"
+                    ))
+                })?;
 
             let credentials_dir = crate::auth::identity_store::credentials_dir().map_err(|e| {
                 hyprstream_rpc::error::RpcError::SpawnFailed(

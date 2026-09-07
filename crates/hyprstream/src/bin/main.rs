@@ -47,7 +47,7 @@ use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
 // Registry and policy services
-use hyprstream_core::services::{PolicyClient, RegistryClient};
+use hyprstream_core::services::RegistryClient;
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
 #[cfg(feature = "oci-image")]
@@ -1311,7 +1311,7 @@ fn handle_quick_command(
                         )?;
 
                         // Wire up policy-backed authorization
-                        let worker_policy_client = PolicyClient::for_local_bootstrap(
+                        let worker_policy_client = hyprstream_core::services::policy_client_for_process(
                             signing_key.clone(),
                             resolve_service_vk("policy")
                                 .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
