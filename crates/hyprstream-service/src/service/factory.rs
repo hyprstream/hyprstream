@@ -216,6 +216,9 @@ pub struct QuicSharedConfig {
     /// service's [`QuicLoopConfig`] so the spawner advertises a `Role::Relay` reach
     /// and links the origin UP to the relay.
     pub moq_relay: Option<hyprstream_rpc::stream_info::TransportConfig>,
+    /// Resolver-verified identity of the independently operated relay. It is
+    /// intentionally not inferred from the producing service's proof.
+    pub moq_relay_server_identity: Option<hyprstream_rpc::stream_info::MoqlServerIdentity>,
     /// Application-owned publisher. Keeping this callback here avoids making
     /// orchestration depend on the Discovery implementation crate.
     pub native_announcement_publisher: Option<NativeAnnouncementPublisher>,
@@ -271,6 +274,7 @@ impl QuicSharedConfig {
             // #358: thread the producer-chosen relay through so the spawner
             // advertises a Role::Relay reach + links the origin up to the relay.
             moq_relay: self.moq_relay.clone(),
+            moq_relay_server_identity: self.moq_relay_server_identity.clone(),
             // #1027: thread the daemon-owned moql admission authenticator
             // through so the spawner installs it on the iroh `moql` handler.
             moq_admission: self.moq_admission.clone(),

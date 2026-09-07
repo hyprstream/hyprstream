@@ -154,6 +154,10 @@ struct StreamOpt {
 struct Destination {
   role @0 :Role;
   transport @1 :TransportConfig;
+  # Resolver-verified accepted-state identity for THIS destination. Direct
+  # destinations use the producing server's witness; a relay is independently
+  # operated and must carry its own witness for native Iroh mutual admission.
+  moqlServerIdentity @2 :MoqlServerIdentity;
 }
 
 # Whether this reach is the producer itself (direct) or a relay in front of it.

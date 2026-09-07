@@ -57,6 +57,7 @@ use std::sync::Arc;
 // Unified service manager API
 use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
 use hyprstream_rpc::transport::TransportConfig;
+use hyprstream_rpc::registry::SocketKind;
 use hyprstream_rpc::{SigningKey, VerifyingKey};
 
 fn supports_tui() -> bool {
@@ -990,6 +991,7 @@ fn handle_quick_command(
                         };
                         handle_training_infer(
                             registry,
+                            hyprstream_rpc::registry::global().endpoint("policy", SocketKind::Rep),
                             &model,
                             &prompt_text,
                             image,
@@ -1024,6 +1026,7 @@ fn handle_quick_command(
                     } => {
                         handle_training_batch(
                             registry,
+                            hyprstream_rpc::registry::global().endpoint("policy", SocketKind::Rep),
                             &model,
                             input,
                             input_dir,
@@ -1537,6 +1540,35 @@ fn resolve_moq_relay_reach(
         .ok_or_else(|| anyhow::anyhow!("relay URI is not a network-routable transport"))
 }
 
+/// A QUIC process currently owns one native MoQ dialer and its admission-proof
+/// slot. Sharing that slot across separately checkpointed services would make a
+/// later service dial as the first service's DID. Refuse that topology until the
+/// dialer is service-scoped; checkpointed services must run separately.
+fn select_single_process_moql_admission_proof<T>(
+    proofs: impl IntoIterator<Item = (String, Option<T>)>,
+) -> Result<Option<T>> {
+    let proofs: Vec<_> = proofs.into_iter().collect();
+    let authenticated: Vec<_> = proofs
+        .iter()
+        .filter_map(|(service, proof)| proof.as_ref().map(|_| service.as_str()))
+        .collect();
+
+    if authenticated.is_empty() {
+        return Ok(None);
+    }
+    if proofs.len() != 1 {
+        anyhow::bail!(
+            "native MoQ admission proofs are service-scoped, but this QUIC process contains \
+             checkpointed service(s) [{}] with {} total services; run each checkpointed service \
+             in a separate process",
+            authenticated.join(", "),
+            proofs.len(),
+        );
+    }
+
+    Ok(proofs.into_iter().next().and_then(|(_, proof)| proof))
+}
+
 fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
     let trust = hyprstream_service::global_trust_store();
     // Fast path: already populated (service startup seeded it)
@@ -1595,6 +1627,10 @@ async fn install_process_production_resolver(
     signing_key: &SigningKey,
     config: &HyprConfig,
 ) -> Result<bool> {
+    let trust_source = hyprstream_discovery::DeploymentTrustSource::from_anchors(
+        config.cluster_at9p_did.as_deref(),
+        config.cluster_did_web.as_deref(),
+    )?;
     // Every service identity this node provisions is hybrid, so a classical
     // service entry means the node was provisioned by a pre-hybrid wizard and
     // its services can never be anchored for post-quantum verification. Fail
@@ -1608,6 +1644,19 @@ async fn install_process_production_resolver(
         let entries =
             hyprstream_core::auth::identity_store::load_bootstrap_pubkeys_hybrid(&secrets_dir)?;
         hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries)?;
+        // hyprstream#1562 H3: an OS-owned deployment must enroll its discovery/
+        // policy service keys into the ceremony signature chain — unsigned-TOFU
+        // bootstrap-pubkeys are refused. DID-anchored and wizard/dev
+        // deployments are unchanged.
+        if matches!(
+            trust_source,
+            hyprstream_discovery::DeploymentTrustSource::OsOwnedFiles
+        ) {
+            hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_enrolled(
+                &secrets_dir,
+                &entries,
+            )?;
+        }
     }
 
     // The bootstrap pins the discovery service key from the process trust
@@ -1615,10 +1664,6 @@ async fn install_process_production_resolver(
     // the node's own bootstrap-pubkeys (the same source resolve_service_vk
     // uses on first use) — a no-op when already populated or unprovisioned.
     let _ = resolve_service_vk("discovery");
-    let trust_source = hyprstream_discovery::DeploymentTrustSource::from_anchors(
-        config.cluster_at9p_did.as_deref(),
-        config.cluster_did_web.as_deref(),
-    )?;
     // Private-PKI deployments may terminate the did:web host with an internal
     // CA; the extra root is additive (never disables verification), and an
     // unreadable file is a hard configuration error, not a silent skip.
@@ -2256,6 +2301,26 @@ fn main() -> Result<()> {
         }
     }
 
+    // ── `service ensure-key` early dispatch ─────────────────────────────────
+    // Key materialization for provisioning/keygen units: it must work on a
+    // fresh install (before any bootstrap-pubkeys exist) and must not start
+    // any services, so dispatch before the registry bootstrap below — same
+    // rationale as `service repair`.
+    if let Some(("service", sub_m)) = matches.subcommand() {
+        if let Some(("ensure-key", ek_m)) = sub_m.subcommand() {
+            // `name` is a required positional; a missing value is a clap bug,
+            // not operator error, so fail loudly rather than guess.
+            let name = ek_m
+                .get_one::<String>("name")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("service ensure-key: missing required <name>"))?;
+            return hyprstream_core::cli::service_handlers::handle_service_ensure_key(
+                Some(&config),
+                &name,
+            );
+        }
+    }
+
     // Start registry service ONCE at CLI level
     let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2731,12 +2796,16 @@ fn main() -> Result<()> {
                                     // response signer. Use that existing state to prove Iroh
                                     // `moql` admission; do not fabricate credentials or fall
                                     // back to an anonymous Iroh handshake.
-                                    let moq_admission_proof = service_names
-                                        .iter()
-                                        .find_map(|service_name| {
-                                            ctx.moql_admission_proof(service_name).transpose()
-                                        })
-                                        .transpose()?;
+                                    let moq_admission_proof = select_single_process_moql_admission_proof(
+                                        service_names
+                                            .iter()
+                                            .map(|service_name| {
+                                                ctx.moql_admission_proof(service_name)
+                                                    .map(|proof| (service_name.clone(), proof))
+                                            })
+                                            .collect::<Result<Vec<_>>>()?,
+                                    )?;
+                                    let discovery_transport = ctx.transport("discovery", SocketKind::Rep);
                                     let shared = hyprstream_service::QuicSharedConfig {
                                         cert_chain,
                                         key_der,
@@ -2748,6 +2817,10 @@ fn main() -> Result<()> {
                                         iroh_enabled: qc.iroh,
                                         // #358: producer-chosen relay rendezvous (None = direct-only).
                                         moq_relay,
+                                        // A relay's accepted-state witness must be supplied by a
+                                        // verified resolver result; the URI alone is reachability,
+                                        // never an application identity.
+                                        moq_relay_server_identity: None,
                                         // #1027: no moql admission material is provisioned at
                                         // daemon bootstrap yet; the accept path stays in its
                                         // fail-closed anonymous posture until a deployment
@@ -2755,7 +2828,8 @@ fn main() -> Result<()> {
                                         moq_admission: None,
                                         moq_admission_proof,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
-                                            |request: hyprstream_service::NativeAnnouncementRequest| {
+                                            move |request: hyprstream_service::NativeAnnouncementRequest| {
+                                                let discovery_transport = discovery_transport.clone();
                                                 std::thread::spawn(move || {
                                                     let runtime = match tokio::runtime::Builder::new_current_thread()
                                                         .enable_all()
@@ -2768,7 +2842,8 @@ fn main() -> Result<()> {
                                                         }
                                                     };
                                                     runtime.block_on(async move {
-                                                        let client = match hyprstream_discovery::DiscoveryClient::for_local_bootstrap(
+                                                        let client = match hyprstream_discovery::DiscoveryClient::for_local_transport_bootstrap(
+                                                            &discovery_transport,
                                                             request.signing_key,
                                                             request.discovery_verifying_key,
                                                             None,
@@ -3122,6 +3197,16 @@ fn main() -> Result<()> {
                         },
                     )?;
                 }
+
+                ServiceAction::EnsureKey { name } => {
+                    // Normally handled by the early dispatch above (before any
+                    // services start). Defense-in-depth fallback if that
+                    // dispatch is ever bypassed.
+                    hyprstream_core::cli::service_handlers::handle_service_ensure_key(
+                        Some(ctx.config()),
+                        &name,
+                    )?;
+                }
             }
         }
 
@@ -3377,6 +3462,31 @@ fn main() -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod resolver_startup_controls {
+    #[test]
+    fn checkpointed_moq_services_cannot_share_a_process_dial_proof() {
+        let err = super::select_single_process_moql_admission_proof(vec![
+            ("inference".to_owned(), Some(1_u8)),
+            ("registry".to_owned(), Some(2_u8)),
+        ])
+        .expect_err("different checkpointed services need separate dialers");
+        assert!(err.to_string().contains("separate process"));
+
+        let err = super::select_single_process_moql_admission_proof(vec![
+            ("inference".to_owned(), Some(1_u8)),
+            ("metrics".to_owned(), None),
+        ])
+        .expect_err("a proof cannot be inherited by an unauthenticated service");
+        assert!(err.to_string().contains("service-scoped"));
+
+        assert_eq!(
+            super::select_single_process_moql_admission_proof(vec![
+                ("inference".to_owned(), Some(7_u8)),
+            ])
+            .expect("one service has one scoped proof"),
+            Some(7),
+        );
+    }
+
     #[test]
     fn command_and_service_processes_install_before_consumers() {
         let source = include_str!("main.rs");

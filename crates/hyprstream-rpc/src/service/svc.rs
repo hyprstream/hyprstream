@@ -1332,6 +1332,10 @@ pub struct QuicLoopConfig {
     /// drift. `None` = direct-only (the S1/S2 behaviour). Native-only.
     #[cfg(not(target_arch = "wasm32"))]
     pub moq_relay: Option<crate::stream_info::TransportConfig>,
+    /// Resolver-verified accepted-state witness for `moq_relay`. Iroh relay
+    /// links require this distinct remote identity for mutual admission.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_relay_server_identity: Option<crate::stream_info::MoqlServerIdentity>,
     /// #1027: optional inside-carrier admission authenticator for the iroh
     /// `moql` accept path. When set, every accepted `moql` connection must
     /// prove an accepted current Ed25519 + ML-DSA-65 identity (fresh

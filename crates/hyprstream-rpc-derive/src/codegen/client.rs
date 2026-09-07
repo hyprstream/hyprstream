@@ -581,11 +581,12 @@ fn generate_trait_method_impl(
                 let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                     &client_secret, &client_pubkey_bytes, &info.dh_public,
                 )?;
-                // #274: subscribe over the resolved `reach` (the same-host UDS
-                // fast path is preferred automatically when co-located).
+                // #274: subscribe over the resolved `reach`; UDS is available
+                // only when the service advertised no dialable network reach.
                 // #358: pass the service-signed `qos` so direct-vs-relay topology
                 // is selected from it (relay-first for retained/fan-out streams).
-                // #321: enc_key opens the transport-AEAD-sealed Tagged blocks.
+                // #321: enc_key opens the transport-AEAD-sealed Tagged blocks;
+                // retain the RPC-authenticated server witness for Iroh admission.
                 Ok(hyprstream_rpc::moq_stream::MoqStreamHandle::networked_with_server_identity(
                     info.announced_at, &info.qos, info.broadcast_path, mac_key, enc_key, topic,
                     info.moql_server_identity,

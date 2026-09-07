@@ -53,6 +53,7 @@ fn sample_info(qos: StreamOpt) -> StreamInfo {
                 server_name: "hyprstream.local".to_owned(),
                 cert_hashes: vec![vec![0xABu8; 32], vec![0xCDu8; 32]],
             }),
+            moql_server_identity: Default::default(),
         }],
     }
 }
@@ -180,6 +181,7 @@ fn stream_info_iroh_reach_roundtrips() {
                 alpn: "moql".to_owned(),
                 relay_url: "https://r.example".to_owned(),
             }),
+            moql_server_identity: Default::default(),
         }],
     };
     let back = roundtrip(&info);

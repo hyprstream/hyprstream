@@ -1527,6 +1527,7 @@ mod tests {
         let config = |port| -> Result<ProducerReachConfig> {
             Ok(ProducerReachConfig {
                 moql_server_identity: None,
+                relay_moql_server_identity: None,
                 iroh_node_id: None,
                 quic_reach: Some(NodeStreamReach {
                     addr: format!("127.0.0.1:{port}").parse()?,

@@ -585,6 +585,7 @@ impl QuicConfig {
             // #358: relay rendezvous is provisioned by the daemon bootstrap
             // (`QuicSharedConfig`), not this minimal builder. Direct-only here.
             moq_relay: None,
+            moq_relay_server_identity: None,
             // #1027: admission material is provisioned by the daemon bootstrap
             // (`QuicSharedConfig`), not this minimal builder.
             moq_admission: None,

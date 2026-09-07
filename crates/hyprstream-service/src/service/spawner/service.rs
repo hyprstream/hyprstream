@@ -237,6 +237,7 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         .map(|proof| proof.expected_server.clone());
                     *handle.write() = hyprstream_rpc::moq_stream::ProducerReachConfig {
                         moql_server_identity,
+                        relay_moql_server_identity: qc.moq_relay_server_identity.clone(),
                         iroh_node_id: None,
                         quic_reach: Some(hyprstream_rpc::moq_stream::NodeStreamReach {
                         addr: advertise_addr,
@@ -253,7 +254,8 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                 // Install an accepted-state-bound proof before any native
                 // subscriber or relay dial. It is absent for browser/local
                 // profiles, where no Iroh admission is attempted.
-                if let Some(proof) = qc.moq_admission_proof.take() {
+                let relay_admission_proof = qc.moq_admission_proof.clone();
+                if let Some(proof) = relay_admission_proof.clone() {
                     let _ = hyprstream_rpc::moq_stream::init_global_moq_admission_proof(proof);
                 }
 
@@ -264,6 +266,8 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         hyprstream_rpc::moq_stream::serve_origin_to_relay_background(
                             origin.producer().clone(),
                             relay,
+                            relay_admission_proof,
+                            qc.moq_relay_server_identity.take(),
                         );
                         tracing::info!(
                             service = %service_name,

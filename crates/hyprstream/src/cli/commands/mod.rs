@@ -13,9 +13,9 @@ pub use git::{GitAction, GitCommand};
 pub use policy::{PolicyCommand, RoleCommand, TokenCommand};
 pub use training::{TrainingAction, TrainingCommand};
 pub use trust::{
-    DelegateRegistrySignerArgs, InstallDeploymentTrustArgs, MintAnchorCapsuleArgs,
-    MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs, TrustCommand,
-    VerifyDeploymentArgs,
+    DelegateRegistrySignerArgs, EnrollServiceKeyArgs, InstallDeploymentTrustArgs,
+    MintAnchorCapsuleArgs, MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs,
+    TrustCommand, VerifyDeploymentArgs,
 };
 pub use user::{UserCommand, UserKeysCommand, UserKeysImportFormat};
 pub use worker::{ImageCommand, WorkerAction};
@@ -282,5 +282,21 @@ pub enum ServiceAction {
         /// Show verbose output for each check
         #[arg(long, short = 'v')]
         verbose: bool,
+    },
+
+    /// Generate or load a service's signing key and write its public sidecars
+    ///
+    /// Runs the same key loader the service itself uses (with
+    /// `resolve_service_signing_key` semantics, so `policy` resolves to the
+    /// flat node/CA key), then ensures the public sidecars exist next to the
+    /// seed: `signing-key.pub` (32-byte Ed25519 verifying key, 0644) and
+    /// `service-pubkey.hybrid` (1984-byte hybrid bootstrap entry, 0644).
+    ///
+    /// Idempotent: an existing key is loaded, never rotated, and up-to-date
+    /// sidecars are left untouched. Does not start any services — intended
+    /// for provisioning/keygen units that run before service startup.
+    EnsureKey {
+        /// Service name (e.g. registry, discovery, policy)
+        name: String,
     },
 }

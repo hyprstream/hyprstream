@@ -123,7 +123,7 @@ async fn moq_relay_rendezvous() -> Result<()> {
     let link_relay = relay_reach.clone();
     let link_producer = producer_origin.producer().clone();
     let link_task = tokio::spawn(async move {
-        let _ = run_relay_announce_link(&link_producer, &link_relay).await;
+        let _ = run_relay_announce_link(&link_producer, &link_relay, None, None).await;
     });
 
     // No fixed sleep: the `timeout(announced_broadcast)` below is the deterministic
@@ -135,7 +135,11 @@ async fn moq_relay_rendezvous() -> Result<()> {
     // The reach list carries the relay ONLY (no direct producer reach) — a
     // relay-only / anonymized advertisement. The subscriber cannot dial the
     // producer because it was never told where the producer is.
-    let reach = vec![Destination { role: Role::Relay, transport: relay_reach.clone() }];
+    let reach = vec![Destination {
+        role: Role::Relay,
+        transport: relay_reach.clone(),
+        moql_server_identity: Default::default(),
+    }];
 
     // Default qos = Retention::Live; with a relay-only reach there is nothing to
     // promote — the relay is the only dialable option, exercising rendezvous.
@@ -265,6 +269,7 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
     let direct_addr: std::net::SocketAddr = "203.0.113.7:443".parse()?; // TEST-NET-3, unreachable
     let server_cfg = ProducerReachConfig {
         moql_server_identity: None,
+        relay_moql_server_identity: None,
         iroh_node_id: Some(iroh_node_id),
         quic_reach: Some(NodeStreamReach {
             addr: direct_addr,
@@ -330,7 +335,7 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
     let link_relay = relay_reach.clone();
     let link_producer = producer_origin.producer().clone();
     let link_task = tokio::spawn(async move {
-        let _ = run_relay_announce_link(&link_producer, &link_relay).await;
+        let _ = run_relay_announce_link(&link_producer, &link_relay, None, None).await;
     });
     // Wait for the announce link to propagate the producer's broadcast UP to the
     // relay before the subscriber dials, instead of a fixed sleep that can flake
