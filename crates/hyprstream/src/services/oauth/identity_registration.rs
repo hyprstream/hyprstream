@@ -1720,6 +1720,15 @@ mod tests {
         use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
 
         let storage = tempfile::TempDir::new().unwrap();
+        // Bearer-token verification fails closed without the process-global
+        // revocation store (one canonical store; no per-service plumbing).
+        // Install an in-memory authority when no other test in this binary
+        // got there first.
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
         let certified =
             rcgen::generate_simple_self_signed(vec!["pds.example.test".to_owned()]).unwrap();
         let cert_path = storage.path().join("quic-cert.pem");
