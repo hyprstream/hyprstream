@@ -7,6 +7,10 @@
 #[path = "network_bootstrap_tests.rs"]
 mod network_bootstrap_tests;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "event_network_bootstrap_tests.rs"]
+mod event_network_bootstrap_tests;
+
 use async_trait::async_trait;
 use hyprstream_rpc::browser_provisioning::{
     BrowserCarrierProfile, BrowserCurrentnessVerifier, BrowserProvisioningDocument,
