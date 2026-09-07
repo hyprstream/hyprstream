@@ -60,6 +60,11 @@ impl ServiceQuery {
         )
     }
 
+    /// Native MoQ-only capability query (the Event barrier has no RPC surface).
+    pub fn network_moq(service_name: impl Into<String>) -> anyhow::Result<Self> {
+        Self::new(service_name, ["hyprstream-moq/1".to_owned()], ResolverProfile::NativeIrohRequired, 3)
+    }
+
     /// Construct the explicit browser/public-edge query. Browser clients use
     /// WebTransport over QUIC; Iroh is deliberately not a browser carrier.
     pub fn browser(service_name: impl Into<String>) -> anyhow::Result<Self> {

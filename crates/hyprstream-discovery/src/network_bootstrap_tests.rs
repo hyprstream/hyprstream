@@ -79,11 +79,13 @@ async fn network_roundtrip() -> Result<()> {
     let policy = SigningKey::from_bytes(&[0x52; 32]);
     let model = SigningKey::from_bytes(&[0x53; 32]);
     let registry = SigningKey::from_bytes(&[0x54; 32]);
+    let event = SigningKey::from_bytes(&[0x55; 32]);
+    let event_state = admitted("event", &event)?;
     let discovery_state = admitted("discovery", &discovery)?;
     let policy_state = admitted("policy", &policy)?;
     let model_state = admitted("model", &model)?;
     let dir = tempfile::tempdir()?;
-    for state in [&discovery_state, &policy_state, &model_state] {
+    for state in [&discovery_state, &policy_state, &model_state, &event_state] {
         write_test_state(dir.path(), state, &registry)?;
     }
     let source = Arc::new(CheckpointedPdsAcceptedStateSource::open_test(dir.path(), registry.verifying_key())?
@@ -144,11 +146,14 @@ async fn network_roundtrip() -> Result<()> {
     let model_pq = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
         &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&derive_mesh_mldsa_key(&model)))?;
     request_keys.bind(model.verifying_key().to_bytes(), &model_pq);
+    let event_pq = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+        &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&derive_mesh_mldsa_key(&event)))?;
+    request_keys.bind(event.verifying_key().to_bytes(), &event_pq);
     let _ = hyprstream_rpc::envelope::install_verify_config(hyprstream_rpc::envelope::EnvelopeVerifyConfig {
         policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid, pq_store: Some(Arc::new(request_keys)),
     });
     let discovery_client = crate::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
-        "discovery", "discovery", None, model.clone(), None, bootstrap_resolver,
+        "discovery", "discovery", None, model.clone(), None, bootstrap_resolver.clone(),
     )?));
     tokio::time::timeout(Duration::from_secs(10), discovery_client.announce(&announcement(&model_state, "model", &model, &policy))).await??;
     let resolver = DiscoveryServiceResolver {
@@ -159,6 +164,24 @@ async fn network_roundtrip() -> Result<()> {
     assert_eq!(resolved.service_did().as_str(), model_state.did);
     assert_eq!(resolved.response_verifying_key(), model.verifying_key());
     assert_eq!(resolved.request_kem_recipient.recipient.encode(), model_state.current.services[0].endpoint.request_kem.clone().unwrap());
+    // The Event barrier advertises only MoQ. Its authenticated Discovery
+    // announcement resolves under the required carrier profile, and cannot
+    // accidentally satisfy the RPC capability query used by ordinary services.
+    let event_carrier = derive_purpose_key(&event, "hyprstream-iroh-transport-v1");
+    let event_endpoint = IrohSubstrate::new(event_carrier.to_bytes(), RefuseHandler::new("reach fixture"), RefuseHandler::new("Event has no RPC")).await?;
+    let mut event_announcement = announcement(&event_state, "event", &event, &policy);
+    event_announcement.capabilities = vec!["hyprstream-moq/1".to_owned()];
+    let event_discovery_client = crate::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
+        "discovery", "discovery", None, event.clone(), None, bootstrap_resolver,
+    )?));
+    event_discovery_client.announce(&event_announcement).await?;
+    assert!(resolver.resolve_service(ServiceQuery::network("event")?).await.is_err());
+    let resolved_event = resolver.resolve_service(ServiceQuery::network_moq("event")?).await?;
+    resolver.ensure_current(&resolved_event).await?;
+    assert_eq!(resolved_event.service_did().as_str(), event_state.did);
+    assert!(matches!(resolved_event.transport().endpoint, hyprstream_rpc::transport::EndpointType::Iroh { node_id, .. }
+        if node_id == *event_endpoint.endpoint_id().as_bytes()));
+    event_endpoint.shutdown().await?;
     // Loss of the authenticated checkpoint is not repaired by a cached dial
     // or a fresh self heartbeat.
     let db = rocksdb::DB::open_for_read_only(&rocksdb::Options::default(), dir.path(), false)?;

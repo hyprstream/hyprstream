@@ -452,6 +452,14 @@ pub struct QuicConfig {
     #[serde(default)]
     pub native_network_profile: NativeNetworkProfile,
 
+    /// Explicit admitted DID to tenant bindings. Carrier IDs never select a tenant.
+    #[serde(default)]
+    pub moql_subject_tenants: std::collections::BTreeMap<String, String>,
+
+    /// Separate Event producer grants. Tenant membership alone grants no ingress.
+    #[serde(default)]
+    pub event_publishers: std::collections::BTreeSet<String>,
+
     /// #358: the producer-chosen moq RELAY this node rendezvouses through, as a
     /// dialable URI (`https://host:port` for the relay's WebTransport `/moq`
     /// endpoint, or an iroh node URI). Empty = direct-only (the baseline). When
@@ -473,6 +481,8 @@ impl Default for QuicConfig {
             key_path: String::new(),
             iroh: default_iroh_enabled(),
             native_network_profile: NativeNetworkProfile::Compatibility,
+            moql_subject_tenants: Default::default(),
+            event_publishers: Default::default(),
             relay: String::new(),
         }
     }

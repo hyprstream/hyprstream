@@ -3114,6 +3114,11 @@ fn main() -> Result<()> {
                                                 .collect::<Result<Vec<_>>>()
                                         },
                                     )?;
+                                    // Event clients start before factories, so the process
+                                    // proof must be installed before any pre-factory dial.
+                                    if let Some(proof) = moq_admission_proof.clone() {
+                                        let _ = hyprstream_rpc::moq_stream::init_global_moq_admission_proof(proof);
+                                    }
                                     let discovery_transport = ctx.transport("discovery", SocketKind::Rep);
                                     let shared = hyprstream_service::QuicSharedConfig {
                                         cert_chain,
@@ -3404,9 +3409,7 @@ fn main() -> Result<()> {
                                     .iter()
                                     .any(|stage| stage.iter().any(|s| s == "event"));
                                 if !hosts_event_service {
-                                    hyprstream_rpc::moq_event::ensure_event_client_origin(
-                                        hyprstream_rpc::paths::event_socket(),
-                                    );
+                                    hyprstream_core::services::event_network::ensure_event_origin_for_profile()?;
                                 }
 
                                 for stage in &stages {

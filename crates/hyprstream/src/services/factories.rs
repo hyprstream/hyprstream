@@ -679,6 +679,10 @@ fn create_event_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let origin = MoqEventOrigin::new();
     hyprstream_rpc::moq_event::init_global_moq_event_origin(origin.clone());
 
+    if ctx.iroh_required() {
+        return Ok(Box::new(super::event_network::EventNetworkService::new(ctx, &origin)?));
+    }
+
     // #275: serve the event-bus origin over the well-known cross-process UDS path
     // so OTHER service processes (worker, model, ...) can publish/subscribe events
     // to this shared bus. In the same-process (InprocManager) deployment every
