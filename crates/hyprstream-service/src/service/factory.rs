@@ -229,6 +229,11 @@ pub struct QuicSharedConfig {
     /// `moql` handler. `None` keeps the fail-closed anonymous posture.
     pub moq_admission:
         Option<Arc<hyprstream_rpc::transport::moql_admission::MoqlAdmissionAuthenticator>>,
+    /// Optional service-owned decision for remote MoQL ingress. Admission and
+    /// tenant resolution never imply this producer/relay role; `None` leaves
+    /// every admitted peer read-only.
+    pub moq_ingress_authorizer:
+        Option<hyprstream_rpc::transport::iroh_moq::SharedIngressAuthorizer>,
     /// Native client's accepted-state-bound proof for authenticated Iroh `moql`
     /// dials. Quinn/WebTransport uses its distinct CONNECT authentication path.
     pub moq_admission_proof: Option<hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof>,
@@ -278,6 +283,7 @@ impl QuicSharedConfig {
             // #1027: thread the daemon-owned moql admission authenticator
             // through so the spawner installs it on the iroh `moql` handler.
             moq_admission: self.moq_admission.clone(),
+            moq_ingress_authorizer: self.moq_ingress_authorizer.clone(),
             moq_admission_proof: self.moq_admission_proof.clone(),
         }
     }

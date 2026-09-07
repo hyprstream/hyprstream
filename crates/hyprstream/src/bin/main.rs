@@ -2843,6 +2843,7 @@ fn main() -> Result<()> {
                                         // fail-closed anonymous posture until a deployment
                                         // installs an authenticator here.
                                         moq_admission: None,
+                                        moq_ingress_authorizer: None,
                                         moq_admission_proof,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             move |request: hyprstream_service::NativeAnnouncementRequest| {

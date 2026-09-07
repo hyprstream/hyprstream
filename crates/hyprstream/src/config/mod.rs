@@ -589,6 +589,7 @@ impl QuicConfig {
             // #1027: admission material is provisioned by the daemon bootstrap
             // (`QuicSharedConfig`), not this minimal builder.
             moq_admission: None,
+            moq_ingress_authorizer: None,
             moq_admission_proof: None,
         })
     }

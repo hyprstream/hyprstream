@@ -117,6 +117,16 @@ impl MoqAuthzConfig {
         self
     }
 
+    /// Install an optional service-owned ingress decision without converting an
+    /// absent deployment policy into a grant.
+    pub fn with_ingress_authorizer_option(
+        mut self,
+        authorizer: Option<SharedIngressAuthorizer>,
+    ) -> Self {
+        self.ingress_authorizer = authorizer;
+        self
+    }
+
     /// Whether the admitted peer has an explicit trusted ingress grant.
     /// Missing configuration fails closed to read-only delivery.
     pub fn authorizes_ingress(&self, peer: &PeerIdentity, tenant: &str) -> bool {
