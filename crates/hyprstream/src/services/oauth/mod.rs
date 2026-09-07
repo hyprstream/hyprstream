@@ -507,6 +507,26 @@ impl OAuthService {
     }
 }
 
+#[cfg(test)]
+fn runtime_clients(
+    signing_key: &ed25519_dalek::SigningKey,
+) -> anyhow::Result<(PolicyClient, crate::services::DiscoveryClient)> {
+    let trust = hyprstream_service::global_trust_store();
+    let policy_key = trust
+        .resolve_one("policy")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated policy key"))?;
+    let discovery_key = trust
+        .resolve_one("discovery")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated discovery key"))?;
+    Ok((
+        crate::services::policy_client_for_process(signing_key.clone(), policy_key, None)?,
+        crate::services::discovery_client_for_process(signing_key.clone(), discovery_key, None)?,
+    ))
+}
+
+#[cfg(test)]
+mod required_consumer_tests;
+
 impl Spawnable for OAuthService {
     fn name(&self) -> &str {
         SERVICE_NAME
@@ -551,8 +571,11 @@ impl Spawnable for OAuthService {
             // async I/O (TMQ) registers socket FDs with THIS runtime's epoll.
             // Creating them in the factory (main runtime) would cause hangs.
 
-            // Bootstrap: Get service verifying keys from trust store.
-            // The trust store is populated during startup by depends_on services.
+            // Bootstrap: get service verifying keys from the trust store,
+            // populated during startup by depends_on services. Required profile
+            // resolves through the checkpoint-backed discovery resolver;
+            // compatibility dials the deterministic per-process IPC transports
+            // the factory resolved (available to a separate Quadlet process).
             let policy_vk = match hyprstream_service::global_trust_store().resolve_one("policy") {
                 Some(vk) => vk,
                 None => {
@@ -561,17 +584,20 @@ impl Spawnable for OAuthService {
                     ));
                 }
             };
-            let policy_client = PolicyClient::for_local_transport_bootstrap(
-                &self.policy_transport,
-                self.signing_key.clone(),
-                policy_vk,
-                None,
-            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                format!("failed to create PolicyClient: {e}"),
-            ))?;
+            let policy_client = if hyprstream_discovery::native_network_required() {
+                PolicyClient::from_resolver(self.signing_key.clone(), None)
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create PolicyClient: {e}")))?
+            } else {
+                PolicyClient::for_local_transport_bootstrap(
+                    &self.policy_transport,
+                    self.signing_key.clone(),
+                    policy_vk,
+                    None,
+                ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                    format!("failed to create PolicyClient: {e}"),
+                ))?
+            };
 
-            // Get discovery key from trust store (populated by depends_on = ["discovery"]).
-            // Using trust store avoids RPC calls which require LocalSet context.
             let discovery_vk = match hyprstream_service::global_trust_store().resolve_one("discovery") {
                 Some(vk) => vk,
                 None => {
@@ -580,14 +606,19 @@ impl Spawnable for OAuthService {
                     ));
                 }
             };
-            let discovery_client = crate::services::DiscoveryClient::for_local_transport_bootstrap(
-                &self.discovery_transport,
-                self.signing_key.clone(),
-                discovery_vk,
-                None,
-            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                format!("failed to create DiscoveryClient: {e}"),
-            ))?;
+            let discovery_client = if hyprstream_discovery::native_network_required() {
+                crate::services::DiscoveryClient::from_resolver(self.signing_key.clone(), None)
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create DiscoveryClient: {e}")))?
+            } else {
+                crate::services::DiscoveryClient::for_local_transport_bootstrap(
+                    &self.discovery_transport,
+                    self.signing_key.clone(),
+                    discovery_vk,
+                    None,
+                ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                    format!("failed to create DiscoveryClient: {e}"),
+                ))?
+            };
 
             let credentials_dir = crate::auth::identity_store::credentials_dir().map_err(|e| {
                 hyprstream_rpc::error::RpcError::SpawnFailed(
@@ -1125,12 +1156,24 @@ mod tests {
             .expect("OAuthService must implement Spawnable");
         let run = &production[run_start..];
 
+        // Merged required/compat shape: required resolves through the
+        // checkpoint-backed discovery resolver; compat dials the
+        // factory-resolved IPC transports (20-space continuation inside the
+        // profile branch).
         assert!(run.contains(
-            "PolicyClient::for_local_transport_bootstrap(\n                &self.policy_transport,"
+            "PolicyClient::for_local_transport_bootstrap(\n                    &self.policy_transport,"
         ));
         assert!(run.contains(
-            "DiscoveryClient::for_local_transport_bootstrap(\n                &self.discovery_transport,"
+            "DiscoveryClient::for_local_transport_bootstrap(\n                    &self.discovery_transport,"
         ));
+        assert!(
+            run.contains("if hyprstream_discovery::native_network_required() {\n                PolicyClient::from_resolver("),
+            "Required profile must resolve Policy through the checkpoint resolver"
+        );
+        assert!(
+            run.contains("if hyprstream_discovery::native_network_required() {\n                crate::services::DiscoveryClient::from_resolver("),
+            "Required profile must resolve Discovery through the checkpoint resolver"
+        );
         assert!(
             !run.contains("PolicyClient::for_local_bootstrap("),
             "OAuth must not use the process-local Policy registry"

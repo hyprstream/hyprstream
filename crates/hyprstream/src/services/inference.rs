@@ -3288,9 +3288,19 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                         .ok_or_else(|| {
                             anyhow::anyhow!("trust store has no policy key — startup must populate it")
                         })?;
-                    let policy_client = PolicyClient::for_local_transport_bootstrap(
-                        &policy_transport, policy_signing_key, policy_vk, None,
-                    )?;
+                    // Required profile resolves through the checkpoint-backed
+                    // discovery resolver; compatibility dials the factory-
+                    // resolved deterministic IPC transport.
+                    let policy_client = if hyprstream_discovery::native_network_required() {
+                        PolicyClient::from_resolver(policy_signing_key, None)?
+                    } else {
+                        PolicyClient::for_local_transport_bootstrap(
+                            &policy_transport,
+                            policy_signing_key,
+                            policy_vk,
+                            None,
+                        )?
+                    };
                     let service = InferenceService::initialize(
                         model_path,
                         config,

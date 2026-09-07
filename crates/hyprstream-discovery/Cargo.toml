@@ -79,6 +79,7 @@ tokio = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+iroh = { workspace = true }
 # #431 / #524 — build/verify real CAR proofs in getRecord + placement tests.
 p256 = { workspace = true }
 rand = { workspace = true }

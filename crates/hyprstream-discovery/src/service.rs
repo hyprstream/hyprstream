@@ -3,6 +3,10 @@
 //! Allows remote clients to discover registered services, their endpoints,
 //! socket kinds, and schemas via the standard REQ/REP transport.
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "network_bootstrap_tests.rs"]
+mod network_bootstrap_tests;
+
 use async_trait::async_trait;
 use hyprstream_rpc::browser_provisioning::{
     BrowserCarrierProfile, BrowserCurrentnessVerifier, BrowserProvisioningDocument,
@@ -247,6 +251,14 @@ fn network_reach(transport: &TransportConfig) -> bool {
     )
 }
 
+fn native_iroh_reach(transport: &TransportConfig) -> bool {
+    matches!(transport.endpoint, EndpointType::Iroh { .. })
+}
+
+fn browser_webtransport_reach(transport: &TransportConfig) -> bool {
+    matches!(transport.endpoint, EndpointType::Quic { .. })
+}
+
 fn transport_fingerprint(transport: &TransportConfig) -> String {
     blake3::hash(format!("{transport:?}").as_bytes())
         .to_hex()
@@ -339,6 +351,14 @@ fn rejection_reason(
     match query.profile {
         ResolverProfile::NetworkDiscovery if !network_reach(&candidate.transport) => {
             return Some("local-reach-for-network-profile");
+        }
+        ResolverProfile::NativeIrohRequired if !native_iroh_reach(&candidate.transport) => {
+            return Some("non-iroh-reach-for-native-profile");
+        }
+        ResolverProfile::BrowserWebTransport
+            if !browser_webtransport_reach(&candidate.transport) =>
+        {
+            return Some("non-quic-reach-for-browser-profile");
         }
         ResolverProfile::LocalInproc
             if !matches!(candidate.transport.endpoint, EndpointType::Inproc { .. }) =>
@@ -607,6 +627,10 @@ pub(super) trait AcceptedStateSource: Send + Sync {
         &self,
         did: &str,
     ) -> Result<Option<hyprstream_pds::at9p_duplicity::AcceptedAt9pState>>;
+
+    fn bootstrap_endpoints(&self, _service_name: &str) -> Result<Option<Vec<AnnouncedEndpoint>>> {
+        Ok(None)
+    }
 }
 
 /// Opaque production authority minted only while holding the checkpoint/PDS
@@ -778,7 +802,238 @@ pub struct DiscoveryService {
     transport: TransportConfig,
 }
 
+/// Owned publisher sharing Discovery's actual state and verification sources.
+pub struct DiscoverySelfAnnouncer {
+    validator: DiscoveryService,
+}
+
+impl DiscoverySelfAnnouncer {
+    pub async fn publish(&self, announcement: &ServiceAnnouncement) -> Result<()> {
+        anyhow::ensure!(announcement.service_name == "discovery", "self publication is only for Discovery");
+        anyhow::ensure!(announcement.service_did.is_did_at9p(), "self publication requires an accepted identity");
+        let mut ctx = EnvelopeContext::from_callback_service(0, "discovery");
+        ctx.cnf = self.validator.signing_key.verifying_key().to_bytes();
+        self.validator.store_announcement(&ctx, announcement).await?;
+        Ok(())
+    }
+}
+
 impl DiscoveryService {
+    pub fn self_announcer(&self) -> Result<DiscoverySelfAnnouncer> {
+        let source = self.accepted_state_source.clone()
+            .ok_or_else(|| anyhow::anyhow!("self publication requires accepted-state authority"))?;
+        let mut validator = Self::new(self.signing_key.clone(), self.jwt_verifying_key, self.transport.clone());
+        validator.state_store = self.state_store.clone();
+        validator.accepted_state_source = Some(source);
+        validator.jwt_key_source = self.jwt_key_source.clone();
+        validator.expected_audience = self.expected_audience.clone();
+        Ok(DiscoverySelfAnnouncer { validator })
+    }
+
+    async fn store_announcement(&self, ctx: &EnvelopeContext, data: &ServiceAnnouncement) -> Result<DiscoveryResponseVariant> {
+        info!(
+            "Discovery: service '{}' announced {} endpoint: {} (from {})",
+            data.service_name,
+            data.socket_kind,
+            data.endpoint,
+            ctx.subject()
+        );
+
+        let svc_name = data.service_name.clone();
+        let sock_kind = data.socket_kind.clone();
+        let endpoint = data.endpoint.clone();
+        let service_jwt = data.service_jwt.clone().unwrap_or_default();
+        let identity_bound = !data.service_did.as_str().is_empty()
+            || !data.accepted_state_digest.is_empty()
+            || !data.request_kem_recipient.is_empty();
+        if identity_bound {
+            anyhow::ensure!(
+                !service_jwt.is_empty(),
+                "identity-bound announcement requires a verified service JWT"
+            );
+            anyhow::ensure!(
+                data.service_did.is_did_at9p()
+                    && data.accepted_state_digest.len() == 64
+                    && !data.capabilities.is_empty()
+                    && data
+                        .response_key_id
+                        .starts_with(&format!("{}#", data.service_did))
+                    && data
+                        .request_kem_key_id
+                        .starts_with(&format!("{}#", data.service_did))
+                    && data.expires_at_unix_ms > unix_millis_now(),
+                "identity-bound announcement metadata is incomplete or expired"
+            );
+            let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(
+                &data.request_kem_recipient,
+            )?;
+            anyhow::ensure!(
+                recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
+                    && recipient.eks.len() == recipient.suite_id.components().len(),
+                "identity-bound announcement requires suite-complete hybrid KEM material"
+            );
+            match data.socket_kind.as_str() {
+                "quic" => {
+                    parse_announced_quic(&data.endpoint)?;
+                }
+                "iroh" => {
+                    parse_announced_iroh(&data.endpoint)?;
+                }
+                _ => {
+                    anyhow::bail!("identity-bound network announcement requires QUIC or Iroh reach")
+                }
+            }
+        }
+
+        // R3: Verify service JWT signature + subject matches serviceName.
+        // Full JWT verification (not decode_unverified) to prevent forged identities.
+        if !service_jwt.is_empty() {
+            // Service JWTs are minted hybrid (ML-DSA-65-Ed25519); the composite
+            // kid resolves through the key source (ledger pairs + the CA
+            // composite pair). Classical EdDSA remains accepted here for
+            // tokens minted before the hybrid cutover.
+            let is_composite = hyprstream_rpc::auth::jwt::header_alg(&service_jwt)
+                .ok()
+                .flatten()
+                .is_some_and(|alg| alg == "ML-DSA-65-Ed25519");
+            let verified = if is_composite {
+                let dispatch =
+                    hyprstream_rpc::auth::jwt::parse_composite_dispatch(&service_jwt, &["wit+jwt"])
+                        .map_err(|e| {
+                            tracing::warn!("Service JWT dispatch failed in announce: {}", e);
+                            anyhow::anyhow!("Invalid service JWT in announce: {}", e)
+                        })?;
+                let pair = self
+                    .jwt_key_source
+                    .as_ref()
+                    .and_then(|ks| ks.composite_pair(dispatch.kid()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Invalid service JWT in announce: unknown composite kid")
+                    })?;
+                // Signing-domain separation: announcements assert a service
+                // identity, which is certified by the Policy/CA domain only —
+                // the ledger's Policy slot and the derived CA pair (registered
+                // under the Policy role). The OAuth-role pair signs browser
+                // and workload WITs and must not be able to certify a service
+                // announcement.
+                anyhow::ensure!(
+                    pair.role() == hyprstream_rpc::auth::CompositePairRole::Policy,
+                    "Invalid service JWT in announce: composite pair role is not authorized \
+                     for service certification"
+                );
+                hyprstream_rpc::auth::jwt::decode_composite(
+                    &service_jwt,
+                    pair.ml_dsa(),
+                    pair.ed25519(),
+                    self.expected_audience.as_deref(),
+                    &dispatch,
+                )
+                .map_err(|e| {
+                    tracing::warn!("Service JWT verification failed in announce: {}", e);
+                    anyhow::anyhow!("Invalid service JWT in announce: {}", e)
+                })?
+            } else {
+                hyprstream_rpc::auth::jwt::decode_with_key(
+                    &service_jwt,
+                    &self.jwt_verifying_key,
+                    self.expected_audience.as_deref(),
+                )
+                .map_err(|e| {
+                    tracing::warn!("Service JWT verification failed in announce: {}", e);
+                    anyhow::anyhow!("Invalid service JWT in announce: {}", e)
+                })?
+            };
+            // Check that sub matches "service:{serviceName}"
+            let expected_sub = format!("service:{}", svc_name);
+            if verified.sub != expected_sub {
+                anyhow::bail!(
+                    "Service JWT subject mismatch: expected '{}', got '{}'",
+                    expected_sub,
+                    verified.sub
+                );
+            }
+            anyhow::ensure!(
+                verified.cnf_key_bytes() == Some(ctx.cnf),
+                "service JWT confirmation key does not match verified announcement signer"
+            );
+        }
+
+        let now_unix_ms = unix_millis_now();
+        let heartbeat_expiry = now_unix_ms.saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64);
+        // Legacy clients omit identity expiry (Cap'n Proto defaults it to 0).
+        // Only identity-bound announcements carry a signed expiry constraint.
+        let expires_at_unix_ms = if identity_bound {
+            data.expires_at_unix_ms
+        } else {
+            heartbeat_expiry
+        };
+        let mut live_until_unix_ms = expires_at_unix_ms.min(heartbeat_expiry);
+        if identity_bound {
+            if let Some(source) = &self.accepted_state_source {
+                let state = source
+                    .accepted_state(data.service_did.as_str())?
+                    .ok_or_else(|| anyhow::anyhow!("announcement DID has no accepted-current state"))?;
+                anyhow::ensure!(state.current.subject_keys.iter().any(|key| key.ed25519_pub == ctx.cnf),
+                    "announcement signer is not an accepted current subject key");
+                let service = state.current.services.iter().find(|entry| entry.id == format!("#{svc_name}"))
+                    .ok_or_else(|| anyhow::anyhow!("announcement service is not accepted"))?;
+                // Checkpoint discipline (the same rule as the fixed bootstrap
+                // roles): only capsule-signed material binds request
+                // encryption and Iroh reach. A legacy identity whose accepted
+                // entry carries no signed request KEM cannot authorize one, so
+                // an identity-bound announcement over it must not present
+                // unbound KEM or reach material.
+                let kem = service.endpoint.request_kem.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "accepted service entry lacks a signed request KEM; \
+                         reprovision service identity"
+                    )
+                })?;
+                anyhow::ensure!(
+                    kem == &data.request_kem_recipient,
+                    "announcement KEM differs from accepted service"
+                );
+                if data.socket_kind == "iroh" {
+                    anyhow::ensure!(
+                        service.endpoint.address == data.endpoint,
+                        "announcement reach differs from accepted service"
+                    );
+                }
+                anyhow::ensure!(
+                    state.epoch == data.accepted_state_epoch
+                        && state.head_digest.as_slice() == data.accepted_state_digest.as_slice(),
+                    "announcement does not match accepted-current state"
+                );
+                live_until_unix_ms = live_until_unix_ms.min(accepted_expiry_unix_ms(&state)?);
+            }
+        }
+        anyhow::ensure!(
+            live_until_unix_ms > now_unix_ms,
+            "announcement effective lifetime is already expired"
+        );
+
+        let replacement = AnnouncedEndpoint {
+            socket_kind: sock_kind.clone(),
+            endpoint: endpoint.clone(),
+            service_jwt: service_jwt.clone(),
+            service_did: data.service_did.clone(),
+            capabilities: data.capabilities.iter().cloned().collect(),
+            accepted_state_digest: data.accepted_state_digest.clone(),
+            accepted_state_epoch: data.accepted_state_epoch,
+            response_key_id: data.response_key_id.clone(),
+            request_kem_key_id: data.request_kem_key_id.clone(),
+            request_kem_recipient: data.request_kem_recipient.clone(),
+            expires_at_unix_ms,
+            source_signer: ctx.cnf,
+            live_until_unix_ms,
+        };
+        self.state_store
+            .put_announcement(&svc_name, replacement)
+            .await?;
+
+        Ok(DiscoveryResponseVariant::AnnounceResult)
+    }
+
     /// Populate this replica's verified placement projection for an admitted
     /// shared live node. Failed/absent repos use the existing bounded retry gate.
     async fn ensure_placement_ingested(&self, node: &Did) -> bool {
@@ -1081,7 +1336,7 @@ impl DiscoveryService {
                 crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
                     &authority.store_path,
                     identity,
-                )?,
+                )?.with_network_bootstrap(authority.network_required),
             ),
             #[cfg(test)]
             ProcessAcceptanceIdentity::Test(identity) => Arc::new(
@@ -1094,6 +1349,8 @@ impl DiscoveryService {
         PROCESS_ACCEPTED_STATE_SOURCE
             .set(Arc::clone(&source))
             .map_err(|_| anyhow::anyhow!("process Discovery authority is already consumed"))?;
+        PROCESS_NATIVE_NETWORK_REQUIRED.set(authority.network_required)
+            .map_err(|_| anyhow::anyhow!("process native profile is already installed"))?;
         if let Some(identity) = deployment_identity {
             PROCESS_REGISTRY_VERIFIER.set(identity).map_err(|_| {
                 anyhow::anyhow!("deployment registry verifier is already installed")
@@ -1171,6 +1428,48 @@ fn accepted_expiry_unix_ms(
         .timestamp_millis())
 }
 
+/// Fixed bootstrap roles use only checkpoint-authenticated capsule contents.
+/// Carrier addresses and caller-provided public keys never mint authority.
+pub(super) fn project_bootstrap_endpoint(
+    states: &[hyprstream_pds::at9p_duplicity::AcceptedAt9pState],
+    service_name: &str,
+    key: &VerifyingKey,
+) -> Result<AnnouncedEndpoint> {
+    anyhow::ensure!(matches!(service_name, "discovery" | "policy"), "not a fixed bootstrap role");
+    let service_id = format!("#{service_name}");
+    let mut matching = states.iter().filter(|state| {
+        state.current.services.iter().any(|entry| entry.id == service_id)
+            && state.current.subject_keys.iter().any(|subject| subject.ed25519_pub == key.as_bytes())
+    });
+    let state = matching.next().ok_or_else(|| anyhow::anyhow!("no accepted bootstrap identity for {service_name}"))?;
+    anyhow::ensure!(matching.next().is_none(), "ambiguous accepted bootstrap identity for {service_name}");
+    let expiry = accepted_expiry_unix_ms(state)?;
+    anyhow::ensure!(state.epoch > 0 && expiry > unix_millis_now(), "bootstrap identity is unbounded or expired");
+    let entry = state.current.services.iter().find(|entry| entry.id == service_id)
+        .ok_or_else(|| anyhow::anyhow!("bootstrap service disappeared"))?;
+    anyhow::ensure!(entry.endpoint.transport == hyprstream_pds::at9p::Transport::Iroh,
+        "bootstrap service requires signed Iroh reach");
+    parse_announced_iroh(&entry.endpoint.address)?;
+    let kem = entry.endpoint.request_kem.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("bootstrap service lacks signed request KEM; reprovision service identity"))?;
+    let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(kem)?;
+    recipient.validate()?;
+    anyhow::ensure!(recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        "bootstrap requires hybrid KEM");
+    let subject_key = state.current.subject_keys.iter().find(|subject| subject.ed25519_pub == key.as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("bootstrap response key disappeared"))?;
+    hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&subject_key.mldsa65_pub)?;
+    Ok(AnnouncedEndpoint {
+        socket_kind: "iroh".to_owned(), endpoint: entry.endpoint.address.clone(),
+        service_jwt: String::new(), service_did: Did::from(state.did.clone()),
+        capabilities: ["hyprstream-rpc/1".to_owned()].into_iter().collect(),
+        accepted_state_digest: state.head_digest.to_vec(), accepted_state_epoch: state.epoch,
+        response_key_id: format!("{}#response", state.did),
+        request_kem_key_id: format!("{}#mesh-kem", state.did), request_kem_recipient: kem.clone(),
+        expires_at_unix_ms: expiry, source_signer: key.to_bytes(), live_until_unix_ms: expiry,
+    })
+}
+
 impl DiscoveryServiceResolver {
     #[cfg(test)]
     async fn resolve_service(&self, query: ServiceQuery) -> Result<ResolvedService> {
@@ -1187,7 +1486,12 @@ impl DiscoveryServiceResolver {
     }
 
     async fn acquire_candidates(&self, query: &ServiceQuery) -> Result<Vec<ServiceCandidate>> {
-        let entries = if let Some(client) = &self.discovery_client {
+        let bootstrap = if query.profile == ResolverProfile::NativeIrohRequired {
+            self.accepted_state_source.bootstrap_endpoints(&query.service_name)?
+        } else { None };
+        let entries = if let Some(entries) = bootstrap {
+            entries
+        } else if let Some(client) = &self.discovery_client {
             client
                 .get_endpoints(&query.service_name)
                 .await?
@@ -1355,7 +1659,7 @@ impl DiscoveryServiceResolver {
         let query = ServiceQuery::new(
             request.service_name.clone(),
             [request.capability.clone()],
-            ResolverProfile::NetworkDiscovery,
+            ResolverProfile::BrowserWebTransport,
             1,
         )?;
         let resolved = self
@@ -1525,6 +1829,14 @@ static PRODUCTION_RESOLVER: std::sync::OnceLock<Arc<DiscoveryServiceResolver>> =
     std::sync::OnceLock::new();
 static PROCESS_REGISTRY_VERIFIER: std::sync::OnceLock<RegistryDeploymentVerifier> =
     std::sync::OnceLock::new();
+static PROCESS_NATIVE_NETWORK_REQUIRED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+#[cfg(not(target_arch = "wasm32"))]
+static PROCESS_BOOTSTRAP_CARRIER: std::sync::OnceLock<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate> = std::sync::OnceLock::new();
+
+/// Transport profile selected by authenticated process bootstrap.
+pub fn native_network_required() -> bool {
+    PROCESS_NATIVE_NETWORK_REQUIRED.get().copied().unwrap_or(false)
+}
 
 const DEPLOYMENT_CA_ROOT_PATH: &str = "/etc/hyprstream/trust/deployment-ca.hybrid";
 const DEPLOYMENT_AUTHORITY_LOG_PATH: &str = "/etc/hyprstream/trust/deployment-authority.log.json";
@@ -1784,6 +2096,17 @@ pub fn deployment_registry_verifier() -> Result<RegistryDeploymentVerifier> {
         .get()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("deployment registry verifier is not installed"))
+}
+
+/// Authenticate the fixed, OS-owned deployment artifacts for an offline
+/// registry provisioning operation using the same role-specific trusted-file
+/// loader as startup. Returns verification-only evidence, not a raw-key
+/// authority constructor, and does not install a process resolver.
+pub fn authenticate_local_deployment_registry() -> Result<RegistryDeploymentVerifier> {
+    authenticate_registry_deployment_credentials(
+        load_trusted_registry_deployment_credentials()?,
+    )
+    .map(|identity| identity.verifier)
 }
 
 /// Non-cloneable proof privately minted from the fixed CA/JWT pair.
@@ -3099,6 +3422,7 @@ fn authenticate_registry_deployment_credentials(
 struct ProcessBootstrapAuthority {
     store_path: std::path::PathBuf,
     acceptance_identity: ProcessAcceptanceIdentity,
+    network_required: bool,
 }
 
 enum ProcessAcceptanceIdentity {
@@ -3184,13 +3508,15 @@ pub async fn bootstrap_deployment_process(
     signing_key: SigningKey,
     trust_source: crate::DeploymentTrustSource,
     remote_node: bool,
+    network_required: bool,
 ) -> Result<()> {
     let discovery_vk = hyprstream_service::global_trust_store()
         .resolve_one("discovery")
         .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated discovery key"))?;
     let (authority, discovery_client) = match trust_source {
         crate::DeploymentTrustSource::OsOwnedFiles => {
-            let authority = authenticate_deployment_bootstrap()?;
+            let mut authority = authenticate_deployment_bootstrap()?;
+            authority.network_required = network_required;
             // Lazy local discovery client — see `install_local_discovery_client`:
             // the default discovery socket is resolved via `try_endpoint` (not
             // the eager registered_endpoint path), and `dial` connects on first use,
@@ -3198,10 +3524,50 @@ pub async fn bootstrap_deployment_process(
             // process. Trust is not weakened — the checkpoint was already
             // verified by `authenticate_deployment_bootstrap()`, and
             // `discovery_vk` authenticates every lazy response.
-            let discovery_client = install_local_discovery_client(signing_key, discovery_vk)?;
+            let discovery_client = if network_required {
+                #[cfg(not(test))]
+                let ProcessAcceptanceIdentity::Deployment(verifier) = &authority.acceptance_identity;
+                #[cfg(test)]
+                let verifier = match &authority.acceptance_identity {
+                    ProcessAcceptanceIdentity::Deployment(verifier) => verifier,
+                    #[cfg(test)]
+                    ProcessAcceptanceIdentity::Test(_) => anyhow::bail!("native bootstrap requires deployment authority"),
+                };
+                let source = Arc::new(crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
+                    &authority.store_path, verifier.clone(),
+                )?.with_network_bootstrap(true));
+                // Authenticate the fixed bootstrap roles now, but defer I/O:
+                // Discovery and Policy have not necessarily bound yet.
+                source.bootstrap_endpoints("discovery")?;
+                source.bootstrap_endpoints("policy")?;
+                // CLI callers also need an outbound carrier, before any service
+                // binds. Keep this distinct from the service's inbound address.
+                use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, RefuseHandler};
+                let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
+                    &signing_key, "hyprstream-bootstrap-client-transport-v1",
+                );
+                let carrier = IrohSubstrate::new(transport_key.to_bytes(),
+                    RefuseHandler::new("outbound bootstrap only"),
+                    RefuseHandler::new("outbound bootstrap only"),
+                ).await?;
+                let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(carrier.owned_client_endpoint());
+                PROCESS_BOOTSTRAP_CARRIER.set(carrier)
+                    .map_err(|_| anyhow::anyhow!("bootstrap carrier already installed"))?;
+                let resolver = Arc::new(DiscoveryServiceResolver {
+                    state_store: MemoryStateStore::production_default(),
+                    accepted_state_source: source,
+                    discovery_client: None,
+                });
+                crate::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
+                    "discovery", "discovery", None, signing_key, None, resolver,
+                )?))
+            } else {
+                install_local_discovery_client(signing_key, discovery_vk)?
+            };
             (authority, discovery_client)
         }
         crate::DeploymentTrustSource::DidAnchored(anchors) => {
+            anyhow::ensure!(!network_required, "required native bootstrap needs provisioned OS-owned accepted service state");
             let (authority, discovery_transport, mesh_kem_recipient, ml_dsa_65_keys) =
                 authenticate_did_anchored_bootstrap(&anchors).await?;
             let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
@@ -3287,13 +3653,12 @@ fn seal_process_bootstrap_authority() -> Result<()> {
 #[cfg(not(target_arch = "wasm32"))]
 fn authenticate_deployment_bootstrap() -> Result<ProcessBootstrapAuthority> {
     seal_process_bootstrap_authority()?;
-    let witness = authenticate_registry_deployment_credentials(
-        load_trusted_registry_deployment_credentials()?,
-    )?;
+    let verifier = authenticate_local_deployment_registry()?;
     let store_path = hyprstream_service::deployment_data_dir()?.join("pds-store");
     Ok(ProcessBootstrapAuthority {
         store_path,
-        acceptance_identity: ProcessAcceptanceIdentity::Deployment(witness.verifier),
+        acceptance_identity: ProcessAcceptanceIdentity::Deployment(verifier),
+        network_required: false,
     })
 }
 
@@ -3316,6 +3681,7 @@ async fn authenticate_did_anchored_bootstrap(
     let authority = ProcessBootstrapAuthority {
         store_path: hyprstream_service::deployment_data_dir()?.join("pds-store"),
         acceptance_identity: ProcessAcceptanceIdentity::Deployment(verifier),
+        network_required: false,
     };
     Ok((
         authority,
@@ -3371,6 +3737,7 @@ fn authenticate_discovery_bootstrap_identity(
     Ok(ProcessBootstrapAuthority {
         store_path: hyprstream_service::deployment_data_dir()?.join("pds-store"),
         acceptance_identity: ProcessAcceptanceIdentity::Test(acceptance_identity),
+        network_required: false,
     })
 }
 
@@ -3476,6 +3843,11 @@ struct ProductionRpcClient {
     request_id: std::sync::atomic::AtomicU64,
 }
 
+fn production_service_query(service_name: &str, required: bool) -> Result<ServiceQuery> {
+    ServiceQuery::new(service_name, ["hyprstream-rpc/1".to_owned()],
+        if required { ResolverProfile::NativeIrohRequired } else { ResolverProfile::NetworkDiscovery }, 3)
+}
+
 impl ProductionRpcClient {
     fn new(
         resolution_service_name: &str,
@@ -3508,7 +3880,7 @@ impl ProductionRpcClient {
         })
     }
     async fn snapshots(&self) -> Result<Vec<ResolvedService>> {
-        let query = ServiceQuery::network(self.resolution_service_name.clone())?;
+        let query = production_service_query(&self.resolution_service_name, native_network_required())?;
         let max_attempts = query.max_attempts;
         let mut snapshots = self.resolver.resolve_service_candidates(query).await?;
         let authority = snapshots
@@ -3810,12 +4182,13 @@ pub mod test_fixtures {
         transport: &TransportConfig,
         last_heartbeat: Instant,
     ) -> Result<AnnouncedEndpoint> {
-        anyhow::ensure!(
-            matches!(&transport.endpoint, EndpointType::Quic { .. }),
-            "production inference fixture advertises only QUIC candidates"
-        );
+        let socket_kind = match &transport.endpoint {
+            EndpointType::Quic { .. } => "quic",
+            EndpointType::Iroh { .. } => "iroh",
+            _ => anyhow::bail!("production inference fixture advertises only network candidates"),
+        };
         Ok(AnnouncedEndpoint {
-            socket_kind: "quic".to_owned(),
+            socket_kind: socket_kind.to_owned(),
             endpoint: transport.endpoint_string(),
             service_jwt: "fixture-verified".to_owned(),
             service_did: Did::from(authority.state.did.clone()),
@@ -4865,7 +5238,7 @@ mod resolver_tests {
             .next()
             .expect("authentication body");
         assert!(authentication.contains("hyprstream_service::deployment_data_dir()"));
-        assert!(authentication.contains("load_trusted_registry_deployment_credentials()"));
+        assert!(authentication.contains("authenticate_local_deployment_registry()"));
         assert!(authentication.contains("authenticate_registry_deployment_credentials("));
         assert!(!authentication.contains("global_trust_store()"));
         assert!(!authentication.contains("resolve_one("));
@@ -4964,6 +5337,50 @@ mod resolver_tests {
         (state, signing)
     }
 
+    /// Accepted `#model` capsule with an explicit signed Iroh address and an
+    /// optional signed request KEM (`None` models a legacy identity).
+    fn accepted_service_state(
+        tag: u8,
+        address: &str,
+        request_kem: Option<&hyprstream_rpc::crypto::hybrid_kem::RecipientPublic>,
+    ) -> (AcceptedAt9pState, SigningKey) {
+        let signing = SigningKey::from_bytes(&[tag; 32]);
+        let pq_signing = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signing);
+        let keys = HybridKeyPair::new(
+            signing.verifying_key().to_bytes().to_vec(),
+            ml_dsa_sk_to_vk_bytes(&pq_signing),
+        )
+        .unwrap_or_else(|e| panic!("test hybrid keys invalid: {e}"));
+        let mut endpoint = ServiceEndpoint::new(At9pTransport::Iroh, address)
+            .unwrap_or_else(|e| panic!("test endpoint invalid: {e}"));
+        endpoint.request_kem = request_kem.map(hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::encode);
+        let service = ServiceEntry::new("#model", ServiceType::NinePExport, endpoint)
+            .unwrap_or_else(|e| panic!("test service invalid: {e}"));
+        let body = CapsuleBody::new(vec![keys], vec![service])
+            .unwrap_or_else(|e| panic!("test body invalid: {e}"));
+        let genesis = sign_capsule(body.clone(), &signing, &pq_signing)
+            .unwrap_or_else(|e| panic!("test genesis signing failed: {e}"));
+        let subject = genesis
+            .cid512()
+            .unwrap_or_else(|e| panic!("test genesis CID failed: {e}"));
+        let update = sign_update_record(
+            subject,
+            1,
+            [1; 64],
+            body,
+            "2099-01-01T00:00:00Z".to_owned(),
+            &signing,
+            &pq_signing,
+        )
+        .unwrap_or_else(|e| panic!("test update signing failed: {e}"));
+        let bytes = update
+            .to_dag_cbor()
+            .unwrap_or_else(|e| panic!("test update encoding failed: {e}"));
+        let state = AcceptedAt9pState::from_persisted_update(&bytes)
+            .unwrap_or_else(|e| panic!("test accepted state invalid: {e}"));
+        (state, signing)
+    }
+
     struct MutableAcceptedState(parking_lot::Mutex<Option<AcceptedAt9pState>>);
 
     impl AcceptedStateSource for MutableAcceptedState {
@@ -4975,6 +5392,19 @@ mod resolver_tests {
     fn production_fixture(
         local_reach: bool,
     ) -> (DiscoveryServiceResolver, Arc<MutableAcceptedState>) {
+        production_fixture_with_transport(local_reach, false)
+    }
+
+    fn native_production_fixture(
+        local_reach: bool,
+    ) -> (DiscoveryServiceResolver, Arc<MutableAcceptedState>) {
+        production_fixture_with_transport(local_reach, true)
+    }
+
+    fn production_fixture_with_transport(
+        local_reach: bool,
+        native_iroh: bool,
+    ) -> (DiscoveryServiceResolver, Arc<MutableAcceptedState>) {
         let (state, signing) = accepted_state(11);
         let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
             hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
@@ -4982,6 +5412,8 @@ mod resolver_tests {
         .unwrap_or_else(|e| panic!("test KEM generation failed: {e}"));
         let endpoint = if local_reach {
             "inproc://hyprstream/model".to_owned()
+        } else if native_iroh {
+            format!("iroh://{}", hex::encode([0x51; 32]))
         } else {
             "quic://localhost:127.0.0.1:9".to_owned()
         };
@@ -4990,7 +5422,14 @@ mod resolver_tests {
             .put_announcement_sync(
                 "model",
                 AnnouncedEndpoint {
-                socket_kind: if local_reach { "rep" } else { "quic" }.to_owned(),
+                socket_kind: if local_reach {
+                    "rep"
+                } else if native_iroh {
+                    "iroh"
+                } else {
+                    "quic"
+                }
+                .to_owned(),
                 endpoint,
                 service_jwt: "verified-by-handler".to_owned(),
                 service_did: Did::from(state.did.clone()),
@@ -5044,7 +5483,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn production_resolver_joins_announcement_to_current_pds_state() {
-        let (resolver, _) = production_fixture(false);
+        let (resolver, _) = native_production_fixture(false);
         let resolved = resolver
             .resolve_service(ServiceQuery::network("model").expect("query"))
             .await
@@ -5057,6 +5496,21 @@ mod resolver_tests {
             .ensure_current(&resolved)
             .await
             .unwrap_or_else(|e| panic!("unchanged accepted state rejected: {e}"));
+    }
+
+    #[tokio::test]
+    async fn production_profile_preserves_compatibility_quic_without_local_fallback() {
+        let (resolver, _) = production_fixture(false);
+        assert!(resolver.resolve_service(production_service_query("model", false).expect("query")).await.is_ok());
+        assert!(resolver.resolve_service(production_service_query("model", true).expect("query")).await.is_err());
+        let (resolver, _) = native_production_fixture(false);
+        for required in [false, true] {
+            assert!(resolver.resolve_service(production_service_query("model", required).expect("query")).await.is_ok());
+        }
+        let (resolver, _) = production_fixture(true);
+        for required in [false, true] {
+            assert!(resolver.resolve_service(production_service_query("model", required).expect("query")).await.is_err());
+        }
     }
 
     fn owned_browser_request() -> BrowserProvisioningRequest {
@@ -5088,6 +5542,26 @@ mod resolver_tests {
         assert_eq!(validated.service_name(), "model");
         assert_eq!(validated.accepted_state_epoch(), 1);
         assert!(validated.service_did().starts_with("did:at9p:"));
+    }
+
+    #[tokio::test]
+    async fn network_iroh_profile_rejects_quic_and_browser_profile_rejects_iroh() {
+        let (resolver, _) = production_fixture(false);
+        let native = match resolver
+            .resolve_service(ServiceQuery::network("model").expect("native query"))
+            .await
+        {
+            Ok(_) => panic!("native Iroh profile accepted a valid QUIC candidate"),
+            Err(error) => error,
+        };
+        assert!(native.to_string().contains("no validated"));
+
+        let (resolver, _) = native_production_fixture(false);
+        let browser = resolver
+            .browser_provisioning(owned_browser_request())
+            .await
+            .expect_err("browser provisioning must reject Iroh reach");
+        assert!(browser.to_string().contains("no validated"));
     }
 
     #[tokio::test]
@@ -5244,7 +5718,13 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn ordinary_iroh_announcement_handler_populates_production_resolver() {
-        let (state, service_signing) = accepted_state(12);
+        let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .expect("test KEM");
+        let reach = format!("iroh://{}", hex::encode([0x7a; 32]));
+        let (state, service_signing) =
+            accepted_service_state(12, &reach, Some(&kem.public()));
         let root = SigningKey::from_bytes(&[0x61; 32]);
         let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
             state.clone(),
@@ -5270,10 +5750,6 @@ mod resolver_tests {
             &service_pq_signing,
         );
         let ctx = EnvelopeContext::from_verified_as_system(&signed);
-        let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
-            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
-        )
-        .expect("test KEM");
         let response = service
             .handle_announce(
                 &ctx,
@@ -5281,7 +5757,7 @@ mod resolver_tests {
                 &ServiceAnnouncement {
                     service_name: "model".to_owned(),
                     socket_kind: "iroh".to_owned(),
-                    endpoint: format!("iroh://{}", hex::encode([0x7a; 32])),
+                    endpoint: reach,
                     service_jwt: Some(jwt),
                     service_did: Did::from(state.did.clone()),
                     capabilities: vec!["hyprstream-rpc/1".to_owned()],
@@ -5310,6 +5786,193 @@ mod resolver_tests {
                 relay_url: None,
             } if *node_id == [0x7a; 32] && direct_addrs.is_empty()
         ));
+    }
+
+    /// A legacy identity whose accepted entry carries no signed request KEM
+    /// cannot authorize one: an identity-bound announcement presenting an
+    /// arbitrary encryption recipient and Iroh reach over the genuine
+    /// accepted-state digest must be refused, never minted as
+    /// checkpoint-authorized authority.
+    #[tokio::test]
+    async fn identity_bound_announcement_refuses_legacy_identity_without_signed_kem() {
+        let legacy_reach = format!("iroh://{}", hex::encode([0x7c; 32]));
+        let (state, service_signing) = accepted_service_state(13, &legacy_reach, None);
+        let root = SigningKey::from_bytes(&[0x62; 32]);
+        let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
+            state.clone(),
+        ))));
+        let service = DiscoveryService::new(
+            Arc::new(root.clone()),
+            root.verifying_key(),
+            TransportConfig::inproc("legacy-kem-announce-test"),
+        )
+        .with_accepted_state_source(source);
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "service:model".to_owned(),
+            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp() + 3_600,
+        )
+        .with_cnf_jwk(service_signing.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &root);
+        let service_pq_signing =
+            hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&service_signing);
+        let signed = hyprstream_rpc::SignedEnvelope::new_signed_hybrid(
+            hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()),
+            &service_signing,
+            &service_pq_signing,
+        );
+        let ctx = EnvelopeContext::from_verified_as_system(&signed);
+        let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .expect("test KEM");
+        let error = service
+            .handle_announce(
+                &ctx,
+                1,
+                &ServiceAnnouncement {
+                    service_name: "model".to_owned(),
+                    socket_kind: "iroh".to_owned(),
+                    endpoint: format!("iroh://{}", hex::encode([0x7b; 32])),
+                    service_jwt: Some(jwt),
+                    service_did: Did::from(state.did.clone()),
+                    capabilities: vec!["hyprstream-rpc/1".to_owned()],
+                    accepted_state_digest: state.head_digest.to_vec(),
+                    accepted_state_epoch: state.epoch,
+                    response_key_id: format!("{}#response-current", state.did),
+                    request_kem_key_id: format!("{}#kem-current", state.did),
+                    request_kem_recipient: kem.public().encode(),
+                    expires_at_unix_ms: 4_070_908_800_000,
+                },
+            )
+            .await
+            .expect_err("identity-bound announcement over a KEM-less legacy identity must be refused");
+        assert!(error.to_string().contains("signed request KEM"));
+    }
+
+    /// A capsule-bound request KEM must be presented verbatim: a signed
+    /// announcement substituting its own recipient is refused.
+    #[tokio::test]
+    async fn identity_bound_announcement_refuses_kem_outside_accepted_service() {
+        let accepted_kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .expect("test accepted KEM");
+        let reach = format!("iroh://{}", hex::encode([0x7d; 32]));
+        let (state, service_signing) =
+            accepted_service_state(14, &reach, Some(&accepted_kem.public()));
+        let root = SigningKey::from_bytes(&[0x63; 32]);
+        let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
+            state.clone(),
+        ))));
+        let service = DiscoveryService::new(
+            Arc::new(root.clone()),
+            root.verifying_key(),
+            TransportConfig::inproc("foreign-kem-announce-test"),
+        )
+        .with_accepted_state_source(source);
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "service:model".to_owned(),
+            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp() + 3_600,
+        )
+        .with_cnf_jwk(service_signing.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &root);
+        let service_pq_signing =
+            hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&service_signing);
+        let signed = hyprstream_rpc::SignedEnvelope::new_signed_hybrid(
+            hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()),
+            &service_signing,
+            &service_pq_signing,
+        );
+        let ctx = EnvelopeContext::from_verified_as_system(&signed);
+        let foreign_kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .expect("test foreign KEM");
+        let error = service
+            .handle_announce(
+                &ctx,
+                1,
+                &ServiceAnnouncement {
+                    service_name: "model".to_owned(),
+                    socket_kind: "iroh".to_owned(),
+                    endpoint: reach,
+                    service_jwt: Some(jwt),
+                    service_did: Did::from(state.did.clone()),
+                    capabilities: vec!["hyprstream-rpc/1".to_owned()],
+                    accepted_state_digest: state.head_digest.to_vec(),
+                    accepted_state_epoch: state.epoch,
+                    response_key_id: format!("{}#response-current", state.did),
+                    request_kem_key_id: format!("{}#kem-current", state.did),
+                    request_kem_recipient: foreign_kem.public().encode(),
+                    expires_at_unix_ms: 4_070_908_800_000,
+                },
+            )
+            .await
+            .expect_err("announcement KEM outside the accepted service must be refused");
+        assert!(error.to_string().contains("announcement KEM differs"));
+    }
+
+    /// Iroh reach is validated against the signed capsule on its own terms:
+    /// an announcement whose KEM matches but whose reach points elsewhere is
+    /// refused even though the KEM branch succeeded.
+    #[tokio::test]
+    async fn identity_bound_announcement_refuses_iroh_reach_outside_accepted_service() {
+        let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .expect("test KEM");
+        let accepted_reach = format!("iroh://{}", hex::encode([0x7e; 32]));
+        let (state, service_signing) =
+            accepted_service_state(15, &accepted_reach, Some(&kem.public()));
+        let root = SigningKey::from_bytes(&[0x64; 32]);
+        let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
+            state.clone(),
+        ))));
+        let service = DiscoveryService::new(
+            Arc::new(root.clone()),
+            root.verifying_key(),
+            TransportConfig::inproc("foreign-reach-announce-test"),
+        )
+        .with_accepted_state_source(source);
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "service:model".to_owned(),
+            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp() + 3_600,
+        )
+        .with_cnf_jwk(service_signing.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &root);
+        let service_pq_signing =
+            hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&service_signing);
+        let signed = hyprstream_rpc::SignedEnvelope::new_signed_hybrid(
+            hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()),
+            &service_signing,
+            &service_pq_signing,
+        );
+        let ctx = EnvelopeContext::from_verified_as_system(&signed);
+        let error = service
+            .handle_announce(
+                &ctx,
+                1,
+                &ServiceAnnouncement {
+                    service_name: "model".to_owned(),
+                    socket_kind: "iroh".to_owned(),
+                    endpoint: format!("iroh://{}", hex::encode([0x7f; 32])),
+                    service_jwt: Some(jwt),
+                    service_did: Did::from(state.did.clone()),
+                    capabilities: vec!["hyprstream-rpc/1".to_owned()],
+                    accepted_state_digest: state.head_digest.to_vec(),
+                    accepted_state_epoch: state.epoch,
+                    response_key_id: format!("{}#response-current", state.did),
+                    request_kem_key_id: format!("{}#kem-current", state.did),
+                    request_kem_recipient: kem.public().encode(),
+                    expires_at_unix_ms: 4_070_908_800_000,
+                },
+            )
+            .await
+            .expect_err("announcement reach outside the accepted service must be refused");
+        assert!(error.to_string().contains("announcement reach differs"));
     }
 
     #[tokio::test]
@@ -5475,7 +6138,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn accepted_state_advance_between_selection_and_dial_refuses() {
-        let (resolver, source) = production_fixture(false);
+        let (resolver, source) = native_production_fixture(false);
         let resolved = resolver
             .resolve_service(ServiceQuery::network("model").expect("query"))
             .await
@@ -5517,7 +6180,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn live_stream_continuation_fails_closed_after_snapshot_advance() {
-        let (resolver, source) = production_fixture(false);
+        let (resolver, source) = native_production_fixture(false);
         let resolver = Arc::new(resolver);
         let snapshot = resolver
             .resolve_service_candidates(ServiceQuery::network("model").expect("query"))
@@ -5557,7 +6220,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn router_selected_reach_must_match_current_authorized_candidate() {
-        let (resolver, _) = production_fixture(false);
+        let (resolver, _) = native_production_fixture(false);
         let expected = resolver
             .resolve_service_candidates(ServiceQuery::network("model").expect("query"))
             .await
@@ -5579,7 +6242,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn router_selected_reach_rejects_unadvertised_transport_and_wrong_domain() {
-        let (resolver, _) = production_fixture(false);
+        let (resolver, _) = native_production_fixture(false);
         let client = ProductionRpcClient::new(
             "model",
             "inference",
@@ -6264,7 +6927,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn stale_or_expired_production_evidence_is_rejected() {
-        let (resolver, _) = production_fixture(false);
+        let (resolver, _) = native_production_fixture(false);
         let expiry = resolver.state_store.announcements_for("model", unix_millis_now())
             .await.unwrap()[0].live_until_unix_ms;
         {
@@ -6278,7 +6941,7 @@ mod resolver_tests {
                 .is_err());
         }
 
-        let (resolver, source) = production_fixture(false);
+        let (resolver, source) = native_production_fixture(false);
         source.0.lock().as_mut().expect("fixture state").expires_at =
             Some("2000-01-01T00:00:00Z".to_owned());
         assert!(resolver
@@ -6289,7 +6952,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn malformed_candidate_does_not_poison_valid_alternative() {
-        let (resolver, _) = production_fixture(false);
+        let (resolver, _) = native_production_fixture(false);
         let mut malformed = resolver
             .state_store
             .announcements_for("model", unix_millis_now())
@@ -6299,8 +6962,8 @@ mod resolver_tests {
             .next()
             .expect("fixture endpoint");
         malformed.request_kem_recipient = vec![0xff];
-        malformed.socket_kind = "iroh".to_owned();
-        malformed.endpoint = "iroh://invalid".to_owned();
+        malformed.socket_kind = "quic".to_owned();
+        malformed.endpoint = "quic://missing-port".to_owned();
         resolver
             .state_store
             .put_announcement("model", malformed)
@@ -6750,178 +7413,7 @@ impl DiscoveryHandler for DiscoveryService {
         _request_id: u64,
         data: &ServiceAnnouncement,
     ) -> Result<DiscoveryResponseVariant> {
-        info!(
-            "Discovery: service '{}' announced {} endpoint: {} (from {})",
-            data.service_name,
-            data.socket_kind,
-            data.endpoint,
-            ctx.subject()
-        );
-
-        let svc_name = data.service_name.clone();
-        let sock_kind = data.socket_kind.clone();
-        let endpoint = data.endpoint.clone();
-        let service_jwt = data.service_jwt.clone().unwrap_or_default();
-        let identity_bound = !data.service_did.as_str().is_empty()
-            || !data.accepted_state_digest.is_empty()
-            || !data.request_kem_recipient.is_empty();
-        if identity_bound {
-            anyhow::ensure!(
-                !service_jwt.is_empty(),
-                "identity-bound announcement requires a verified service JWT"
-            );
-            anyhow::ensure!(
-                data.service_did.is_did_at9p()
-                    && data.accepted_state_digest.len() == 64
-                    && !data.capabilities.is_empty()
-                    && data
-                        .response_key_id
-                        .starts_with(&format!("{}#", data.service_did))
-                    && data
-                        .request_kem_key_id
-                        .starts_with(&format!("{}#", data.service_did))
-                    && data.expires_at_unix_ms > 0,
-                "identity-bound announcement metadata is incomplete or expired"
-            );
-            let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(
-                &data.request_kem_recipient,
-            )?;
-            anyhow::ensure!(
-                recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
-                    && recipient.eks.len() == recipient.suite_id.components().len(),
-                "identity-bound announcement requires suite-complete hybrid KEM material"
-            );
-            match data.socket_kind.as_str() {
-                "quic" => {
-                    parse_announced_quic(&data.endpoint)?;
-                }
-                "iroh" => {
-                    parse_announced_iroh(&data.endpoint)?;
-                }
-                _ => {
-                    anyhow::bail!("identity-bound network announcement requires QUIC or Iroh reach")
-                }
-            }
-        }
-
-        // R3: Verify service JWT signature + subject matches serviceName.
-        // Full JWT verification (not decode_unverified) to prevent forged identities.
-        if !service_jwt.is_empty() {
-            // Service JWTs are minted hybrid (ML-DSA-65-Ed25519); the composite
-            // kid resolves through the key source (ledger pairs + the CA
-            // composite pair). Classical EdDSA remains accepted here for
-            // tokens minted before the hybrid cutover.
-            let is_composite = hyprstream_rpc::auth::jwt::header_alg(&service_jwt)
-                .ok()
-                .flatten()
-                .is_some_and(|alg| alg == "ML-DSA-65-Ed25519");
-            let verified = if is_composite {
-                let dispatch =
-                    hyprstream_rpc::auth::jwt::parse_composite_dispatch(&service_jwt, &["wit+jwt"])
-                        .map_err(|e| {
-                            tracing::warn!("Service JWT dispatch failed in announce: {}", e);
-                            anyhow::anyhow!("Invalid service JWT in announce: {}", e)
-                        })?;
-                let pair = self
-                    .jwt_key_source
-                    .as_ref()
-                    .and_then(|ks| ks.composite_pair(dispatch.kid()))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Invalid service JWT in announce: unknown composite kid")
-                    })?;
-                // Signing-domain separation: announcements assert a service
-                // identity, which is certified by the Policy/CA domain only —
-                // the ledger's Policy slot and the derived CA pair (registered
-                // under the Policy role). The OAuth-role pair signs browser
-                // and workload WITs and must not be able to certify a service
-                // announcement.
-                anyhow::ensure!(
-                    pair.role() == hyprstream_rpc::auth::CompositePairRole::Policy,
-                    "Invalid service JWT in announce: composite pair role is not authorized \
-                     for service certification"
-                );
-                hyprstream_rpc::auth::jwt::decode_composite(
-                    &service_jwt,
-                    pair.ml_dsa(),
-                    pair.ed25519(),
-                    self.expected_audience.as_deref(),
-                    &dispatch,
-                )
-                .map_err(|e| {
-                    tracing::warn!("Service JWT verification failed in announce: {}", e);
-                    anyhow::anyhow!("Invalid service JWT in announce: {}", e)
-                })?
-            } else {
-                hyprstream_rpc::auth::jwt::decode_with_key(
-                    &service_jwt,
-                    &self.jwt_verifying_key,
-                    self.expected_audience.as_deref(),
-                )
-                .map_err(|e| {
-                    tracing::warn!("Service JWT verification failed in announce: {}", e);
-                    anyhow::anyhow!("Invalid service JWT in announce: {}", e)
-                })?
-            };
-            // Check that sub matches "service:{serviceName}"
-            let expected_sub = format!("service:{}", svc_name);
-            if verified.sub != expected_sub {
-                anyhow::bail!(
-                    "Service JWT subject mismatch: expected '{}', got '{}'",
-                    expected_sub,
-                    verified.sub
-                );
-            }
-            anyhow::ensure!(
-                verified.cnf_key_bytes() == Some(ctx.cnf),
-                "service JWT confirmation key does not match verified announcement signer"
-            );
-        }
-
-        // Legacy clients omit identity expiry (Cap'n Proto defaults it to 0).
-        // Only identity-bound announcements carry a signed expiry constraint;
-        // backend receipt time sets the legacy application expiry and lease.
-        let expires_at_unix_ms = if identity_bound {
-            data.expires_at_unix_ms
-        } else {
-            0
-        };
-        let mut live_until_unix_ms = if identity_bound { expires_at_unix_ms } else { i64::MAX };
-        if identity_bound {
-            if let Some(source) = &self.accepted_state_source {
-                let state = source
-                    .accepted_state(data.service_did.as_str())?
-                    .ok_or_else(|| anyhow::anyhow!("announcement DID has no accepted-current state"))?;
-                anyhow::ensure!(
-                    state.epoch == data.accepted_state_epoch
-                        && state.head_digest.as_slice() == data.accepted_state_digest.as_slice(),
-                    "announcement does not match accepted-current state"
-                );
-                live_until_unix_ms = live_until_unix_ms.min(accepted_expiry_unix_ms(&state)?);
-            }
-        }
-
-        let replacement = AnnouncedEndpoint {
-            socket_kind: sock_kind.clone(),
-            endpoint: endpoint.clone(),
-            service_jwt: service_jwt.clone(),
-            service_did: data.service_did.clone(),
-            capabilities: data.capabilities.iter().cloned().collect(),
-            accepted_state_digest: data.accepted_state_digest.clone(),
-            accepted_state_epoch: data.accepted_state_epoch,
-            response_key_id: data.response_key_id.clone(),
-            request_kem_key_id: data.request_kem_key_id.clone(),
-            request_kem_recipient: data.request_kem_recipient.clone(),
-            expires_at_unix_ms,
-            source_signer: ctx.cnf,
-            live_until_unix_ms,
-        };
-        let stored = self.state_store
-            .put_announcement(&svc_name, replacement)
-            .await?;
-        anyhow::ensure!(stored == PutResult::Stored,
-            "announcement was not stored: authority expired or publication superseded");
-
-        Ok(DiscoveryResponseVariant::AnnounceResult)
+        self.store_announcement(ctx, data).await
     }
 
     // ────────────────────────────────────────────────────────────────────

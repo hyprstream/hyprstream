@@ -47,7 +47,7 @@ use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
 // Registry and policy services
-use hyprstream_core::services::{PolicyClient, RegistryClient};
+use hyprstream_core::services::RegistryClient;
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
 #[cfg(feature = "oci-image")]
@@ -175,6 +175,14 @@ fn build_cli() -> ClapCommand {
             .subcommand(
                 ClapCommand::new("init-deployment-store")
                     .about("Initialize the checkpoint store for an explicitly provisioned fresh deployment"),
+            )
+            .subcommand(
+                ClapCommand::new("provision-services")
+                    .about("Admit existing local service identities before starting the registry")
+                    .arg(Arg::new("service").long("service").required(true)
+                        .action(clap::ArgAction::Append).value_delimiter(','))
+                    .arg(Arg::new("valid-for-seconds").long("valid-for-seconds")
+                        .value_parser(clap::value_parser!(i64)).default_value("86400")),
             )
             .subcommand(
                 ClapCommand::new("join")
@@ -1306,7 +1314,7 @@ fn handle_quick_command(
                         )?;
 
                         // Wire up policy-backed authorization
-                        let worker_policy_client = PolicyClient::for_local_bootstrap(
+                        let worker_policy_client = hyprstream_core::services::policy_client_for_process(
                             signing_key.clone(),
                             resolve_service_vk("policy")
                                 .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
@@ -1724,6 +1732,7 @@ async fn install_process_production_resolver(
         signing_key.clone(),
         trust_source,
         config.cluster_remote_node,
+        config.quic.iroh_required(),
     )
     .await?;
     hyprstream_rpc::envelope::install_browser_currentness_verifier(
@@ -2000,6 +2009,162 @@ where
             _ = tokio::time::sleep(sleep_delay) => {}
         }
     }
+}
+
+/// One-shot sender for the first native-announcement result.
+type NativeAnnouncementFirstResult =
+    std::result::Result<(), String>;
+
+/// Optional one-shot channel passed to the native-announcement loop body so it
+/// can report the result of the first announcement.
+type NativeAnnouncementFirstTx =
+    Option<std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<NativeAnnouncementFirstResult>>>>>;
+
+/// The required first result covers both fresh-authority projection and the
+/// Discovery publication. An authority error must not bypass the handshake.
+async fn publish_native_announcement_attempt<F, Fut>(
+    announcement: anyhow::Result<hyprstream_discovery::ServiceAnnouncement>,
+    announce_tx: NativeAnnouncementFirstTx,
+    publish: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(hyprstream_discovery::ServiceAnnouncement) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let result = match announcement {
+        Ok(announcement) => publish(announcement).await,
+        Err(error) => Err(error),
+    };
+    if let Some(tx) = announce_tx {
+        if let Some(tx) = tx.lock().take() {
+            let report = result.as_ref().map(|_| ()).map_err(std::string::ToString::to_string);
+            let _ = tx.send(report);
+        }
+    }
+    result
+}
+
+/// Spawn the native-announcement refresh loop on its own current-thread Tokio
+/// runtime and return a channel for the first announcement result.
+///
+/// `loop_body` receives an optional one-shot sender for the first result; it
+/// should send at most once. The runtime is kept alive until `loop_body`
+/// completes or the bound service cancels it. Cancellation interrupts both the
+/// first-result wait and subsequent refresh; it never satisfies readiness.
+fn spawn_native_announcement_loop<F, Fut>(
+    require_initial: bool,
+    cancellation: tokio_util::sync::CancellationToken,
+    loop_body: F,
+) -> Option<std::sync::mpsc::Receiver<NativeAnnouncementFirstResult>>
+where
+    F: FnOnce(NativeAnnouncementFirstTx) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (initial_tx, initial_rx) = if require_initial {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    std::thread::spawn(move || {
+        let mut initial_tx = initial_tx;
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::warn!("Failed to create announcement runtime: {error}");
+                if let Some(tx) = initial_tx.take() {
+                    let _ = tx.send(Err(error.to_string()));
+                }
+                return;
+            }
+        };
+
+        runtime.block_on(async move {
+            let (announce_tx, announce_rx) = if require_initial {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                (
+                    Some(std::sync::Arc::new(parking_lot::Mutex::new(Some(tx)))),
+                    Some(rx),
+                )
+            } else {
+                (None, None)
+            };
+
+            let mut task = tokio::spawn(loop_body(announce_tx));
+            if let Some(rx) = announce_rx {
+                let first = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Ok(Err(
+                        "native announcement cancelled before first publication".to_owned(),
+                    )),
+                    result = rx => result,
+                };
+                match first {
+                    Ok(Ok(())) => {
+                        if let Some(tx) = initial_tx.take() {
+                            let result = if cancellation.is_cancelled() {
+                                Err("native announcement cancelled before readiness".to_owned())
+                            } else {
+                                Ok(())
+                            };
+                            let _ = tx.send(result);
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        if let Some(tx) = initial_tx.take() {
+                            let _ = tx.send(Err(error.clone()));
+                        }
+                        task.abort();
+                    }
+                    Err(_) => {
+                        if let Some(tx) = initial_tx.take() {
+                            let _ = tx.send(Err(
+                                "native announcement task exited before first result".to_owned(),
+                            ));
+                        }
+                    }
+                }
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    task.abort();
+                    let _ = task.await;
+                }
+                _ = &mut task => {}
+            }
+        });
+    });
+
+    initial_rx
+}
+
+/// Production publisher startup boundary: only required Iroh waits for a
+/// successful first publication. Compatibility keeps its retry task alive.
+fn start_native_announcement_publisher<F, Fut>(
+    reach: hyprstream_service::NativeAnnouncementReach,
+    network_required: bool,
+    cancellation: tokio_util::sync::CancellationToken,
+    loop_body: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(NativeAnnouncementFirstTx) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let require_initial = network_required
+        && matches!(reach, hyprstream_service::NativeAnnouncementReach::Iroh { .. });
+    if let Some(rx) = spawn_native_announcement_loop(require_initial, cancellation, loop_body) {
+        match rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => anyhow::bail!("initial Iroh announcement failed: {error}"),
+            Err(_) => anyhow::bail!("initial Iroh announcement thread exited"),
+        }
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -2353,6 +2518,19 @@ fn main() -> Result<()> {
                 println!("initialized empty deployment checkpoint store");
                 return Ok(());
             }
+            Some(("provision-services", provision_m)) => {
+                let services = provision_m.get_many::<String>("service")
+                    .context("service roster is required")?.cloned().collect::<Vec<_>>();
+                let lifetime = *provision_m.get_one::<i64>("valid-for-seconds")
+                    .context("service identity lifetime is required")?;
+                hyprstream_core::cli::deployment_bootstrap::provision_services(
+                    &config,
+                    &services,
+                    lifetime,
+                )?;
+                println!("checkpoint-accepted service roster ready ({} services)", services.len());
+                return Ok(());
+            }
             Some(("join", join_m)) => {
                 let pds_url = join_m
                     .get_one::<String>("url")
@@ -2363,7 +2541,7 @@ fn main() -> Result<()> {
                     || hyprstream_core::cli::pds_handlers::handle_pds_join(&config, pds_url, scope),
                 );
             }
-            _ => anyhow::bail!("usage: hyprstream pds init-deployment-store | pds join <PDS_URL> [--scope <SCOPE>]"),
+            _ => anyhow::bail!("usage: hyprstream pds init-deployment-store | pds provision-services --service <NAMES> | pds join <PDS_URL> [--scope <SCOPE>]"),
         }
     }
 
@@ -2600,10 +2778,15 @@ fn main() -> Result<()> {
                                     let mut qc = hyprstream_core::config::QuicConfig::default();
                                     qc.enabled = true;
                                     qc.bind_addr = bind_addr.clone();
+                                    qc.iroh = config.quic.iroh;
+                                    qc.native_network_profile = config.quic.native_network_profile;
                                     qc
                                 } else {
                                     config.quic.clone()
                                 };
+                                quic_cfg
+                                    .validate_native_network_profile()
+                                    .context("invalid native network profile")?;
 
                                 // Determine which services to start
                                 let service_names: Vec<String> = if let Some(ref svc_list) = multi_services {
@@ -2819,6 +3002,11 @@ fn main() -> Result<()> {
                                                 )?;
                                         }
                                         QuicCheckpointPolicy::DeferForFirstBoot => {
+                                                if quic_cfg.iroh_required() {
+                                                    anyhow::bail!(
+                                                        "network-iroh-required requires a checkpoint-verified accepted state and initial Iroh announcement; first-boot local/QUIC deferral is forbidden"
+                                                    );
+                                                }
                                                 // An explicit --quic-bind that cannot be
                                                 // honored (no accepted states exist yet) is
                                                 // an error, never a silent disable.
@@ -2908,6 +3096,7 @@ fn main() -> Result<()> {
                                         jwt_verifying_key: Some(ctx.jwt_verifying_key()),
                                         // #282: bind iroh in parallel to quinn when opted in.
                                         iroh_enabled: qc.iroh,
+                                        iroh_required: qc.iroh_required(),
                                         // #358: producer-chosen relay rendezvous (None = direct-only).
                                         moq_relay,
                                         // A relay's accepted-state witness must be supplied by a
@@ -2924,31 +3113,33 @@ fn main() -> Result<()> {
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             move |request: hyprstream_service::NativeAnnouncementRequest| {
                                                 let discovery_transport = discovery_transport.clone();
-                                                std::thread::spawn(move || {
-                                                    let runtime = match tokio::runtime::Builder::new_current_thread()
-                                                        .enable_all()
-                                                        .build()
-                                                    {
-                                                        Ok(runtime) => runtime,
-                                                        Err(error) => {
-                                                            tracing::warn!("Failed to create announcement runtime: {error}");
-                                                            return;
-                                                        }
-                                                    };
-                                                    runtime.block_on(async move {
+                                                start_native_announcement_publisher(
+                                                    request.reach.clone(),
+                                                    hyprstream_discovery::native_network_required(),
+                                                    request.cancellation.clone(),
+                                                    move |announce_tx| async move {
                                                         let mut request = request;
                                                         let socket_kind = request.reach.socket_kind().to_owned();
                                                         let endpoint = request.reach.endpoint();
                                                         let service_name = request.service_name.clone();
-                                                        let client = match hyprstream_discovery::DiscoveryClient::for_local_transport_bootstrap(
-                                                            &discovery_transport,
-                                                            request.signing_key.clone(),
-                                                            request.discovery_verifying_key,
-                                                            None,
-                                                        ) {
+                                                        let client = match if hyprstream_discovery::native_network_required() {
+                                                            hyprstream_discovery::DiscoveryClient::from_resolver(request.signing_key.clone(), None)
+                                                        } else {
+                                                            hyprstream_discovery::DiscoveryClient::for_local_transport_bootstrap(
+                                                                &discovery_transport,
+                                                                request.signing_key.clone(),
+                                                                request.discovery_verifying_key,
+                                                                None,
+                                                            )
+                                                        } {
                                                             Ok(client) => client,
                                                             Err(error) => {
                                                                 tracing::warn!("Failed to build DiscoveryClient: {error}");
+                                                                if let Some(tx) = announce_tx {
+                                                                    if let Some(tx) = tx.lock().take() {
+                                                                        let _ = tx.send(Err(error.to_string()));
+                                                                    }
+                                                                }
                                                                 return;
                                                             }
                                                         };
@@ -2962,16 +3153,16 @@ fn main() -> Result<()> {
                                                             request.cancellation.clone(),
                                                             || {
                                                                 let announcement = hyprstream_core::services::factories::current_native_announcement(&mut request);
+                                                                let announce_tx = announce_tx.as_ref().map(std::sync::Arc::clone);
                                                                 let client = &client;
-                                                                async move {
-                                                                    let announcement = announcement?;
+                                                                publish_native_announcement_attempt(announcement, announce_tx, move |announcement| async move {
                                                                     client.announce(&announcement).await.map(|_| ())
-                                                                }
+                                                                })
                                                             },
                                                         )
                                                         .await;
-                                                    });
-                                                });
+                                                    },
+                                                )
                                             },
                                         )),
                                     };
@@ -3151,7 +3342,9 @@ fn main() -> Result<()> {
                                 let mut handles = Vec::new();
 
                                 // Compute dependency-aware startup stages.
-                                let stages = hyprstream_service::startup_stages(&service_names);
+                                let stages = hyprstream_service::service::ordering::startup_stages_for_profile(
+                                    &service_names, ctx.iroh_required(),
+                                );
 
                                 // Publish the process-global credential-revocation
                                 // store BEFORE any factory runs. The policy process
@@ -3575,6 +3768,21 @@ fn main() -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod resolver_startup_controls {
+    #[test]
+    fn deployment_bootstrap_cli_requires_roster_and_parses_lifetime() {
+        let matches = super::build_cli().try_get_matches_from([
+            "hyprstream", "pds", "provision-services", "--service", "model,event",
+            "--valid-for-seconds", "3600",
+        ]).expect("bootstrap CLI");
+        let pds = matches.subcommand_matches("pds").expect("pds");
+        let provision = pds.subcommand_matches("provision-services").expect("provision");
+        assert_eq!(provision.get_many::<String>("service").expect("roster")
+            .map(String::as_str).collect::<Vec<_>>(), vec!["model", "event"]);
+        assert_eq!(provision.get_one::<i64>("valid-for-seconds"), Some(&3600));
+        assert!(super::build_cli().try_get_matches_from([
+            "hyprstream", "pds", "provision-services",
+        ]).is_err());
+    }
     const REFRESH_SCHEDULER_TURNS: usize = 32;
 
     async fn assert_publication_ready(
@@ -4014,4 +4222,256 @@ mod resolver_startup_controls {
         );
     }
 
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod native_announcement_wiring {
+    use std::time::Duration;
+
+    #[test]
+    fn production_publisher_profile_controls_first_failure_and_retry() {
+        use hyprstream_service::NativeAnnouncementReach;
+        // Guard the real QuicSharedConfig publisher's inputs in addition to
+        // exercising its extracted startup boundary below. A correct loop
+        // test alone did not catch the old reach-only call-site decision.
+        let source = include_str!("main.rs");
+        let production = source.split("mod native_announcement_wiring").next().unwrap();
+        let compact: String = production.split_whitespace().collect();
+        assert!(compact.contains("start_native_announcement_publisher(request.reach.clone(),hyprstream_discovery::native_network_required(),request.cancellation.clone(),"));
+
+        for network_required in [false, true] {
+            for reach in [
+                NativeAnnouncementReach::Iroh { node_id: [7; 32] },
+                NativeAnnouncementReach::Quic {
+                    address: "127.0.0.1:12345".parse().unwrap(),
+                    server_name: "fixture".to_owned(),
+                },
+            ] {
+                let fatal = network_required && matches!(reach, NativeAnnouncementReach::Iroh { .. });
+                let cancellation = tokio_util::sync::CancellationToken::new();
+                let loop_cancellation = cancellation.clone();
+                let (retry_tx, retry_rx) = std::sync::mpsc::sync_channel(2);
+                let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
+                struct Dropped(std::sync::mpsc::SyncSender<()>);
+                impl Drop for Dropped {
+                    fn drop(&mut self) { let _ = self.0.send(()); }
+                }
+                let result = super::start_native_announcement_publisher(
+                    reach, network_required, cancellation.clone(), move |announce_tx| async move {
+                        let _dropped = Dropped(dropped_tx);
+                        let mut attempts = 0;
+                        super::refresh_native_announcement(
+                            "policy", "iroh", "iroh://fixture", i64::MAX, loop_cancellation,
+                            || {
+                                attempts += 1;
+                                let attempt = attempts;
+                                let tx = announce_tx.clone();
+                                let retry_tx = retry_tx.clone();
+                                async move {
+                                    let outcome = if attempt == 1 {
+                                        Err(anyhow::anyhow!("local Discovery is not bound yet"))
+                                    } else {
+                                        retry_tx.send(attempt).unwrap();
+                                        Ok(())
+                                    };
+                                    send_first_result(&tx, outcome.as_ref().map(|_| ()).map_err(ToString::to_string));
+                                    outcome
+                                }
+                            },
+                        ).await;
+                    },
+                );
+                if fatal {
+                    assert!(result.unwrap_err().to_string().contains("local Discovery is not bound yet"));
+                    dropped_rx.recv_timeout(Duration::from_secs(2)).expect("failed required startup aborts the publisher");
+                    assert!(retry_rx.try_recv().is_err(), "required startup cannot silently retry its first failure");
+                } else {
+                    result.expect("Compatibility/non-Iroh startup is nonfatal");
+                    assert_eq!(retry_rx.recv_timeout(Duration::from_secs(8)).expect("publication retries at the production five-second cadence when Discovery becomes ready"), 2);
+                    cancellation.cancel();
+                    dropped_rx.recv_timeout(Duration::from_secs(2)).expect("service cancellation still owns the retry task");
+                }
+            }
+        }
+    }
+
+    fn send_first_result(
+        announce_tx: &super::NativeAnnouncementFirstTx,
+        result: super::NativeAnnouncementFirstResult,
+    ) {
+        if let Some(tx) = announce_tx {
+            if let Some(tx) = tx.lock().take() {
+                let _ = tx.send(result);
+            }
+        }
+    }
+
+    #[test]
+    fn required_path_handshakes_and_runs_multiple_cycles() {
+        let (cycle_tx, cycle_rx) = std::sync::mpsc::sync_channel(10);
+        let initial_rx = super::spawn_native_announcement_loop(true, tokio_util::sync::CancellationToken::new(), move |announce_tx| {
+            let cycle_tx = cycle_tx.clone();
+            async move {
+                for i in 0..3 {
+                    let announcement = hyprstream_discovery::ServiceAnnouncement {
+                        service_name: "model".to_owned(),
+                        socket_kind: "iroh".to_owned(),
+                        endpoint: "iroh://bound-node".to_owned(),
+                        service_jwt: Some(format!("jwt-{i}")),
+                        service_did: "did:at9p:fixture".into(),
+                        capabilities: vec!["model".to_owned()],
+                        accepted_state_digest: vec![i as u8; 64],
+                        accepted_state_epoch: i,
+                        response_key_id: "#response".to_owned(),
+                        request_kem_key_id: "#kem".to_owned(),
+                        request_kem_recipient: vec![i as u8],
+                        expires_at_unix_ms: 1000 + i as i64,
+                    };
+                    let cycle_tx = cycle_tx.clone();
+                    super::publish_native_announcement_attempt(
+                        Ok(announcement), announce_tx.as_ref().map(std::sync::Arc::clone),
+                        move |announcement| async move {
+                            assert_eq!(announcement.service_jwt, Some(format!("jwt-{i}")));
+                            assert_eq!(announcement.expires_at_unix_ms, 1000 + i as i64);
+                            cycle_tx.send(announcement.accepted_state_epoch).expect("test receiver is live");
+                            Ok(())
+                        },
+                    ).await.expect("publication succeeds");
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        let result = initial_rx
+            .expect("required path has a handshake receiver")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handshake completes");
+        assert!(result.is_ok(), "first announcement should succeed");
+
+        let mut seen = Vec::with_capacity(3);
+        for _ in 0..3 {
+            seen.push(
+                cycle_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("loop continues producing cycles"),
+            );
+        }
+        assert_eq!(seen, vec![0, 1, 2], "observed three full publication cycles");
+    }
+
+    #[test]
+    fn compat_path_publishes_without_handshake() {
+        let (cycle_tx, cycle_rx) = std::sync::mpsc::sync_channel(10);
+        let initial_rx = super::spawn_native_announcement_loop(false, tokio_util::sync::CancellationToken::new(), move |_announce_tx| {
+            let cycle_tx = cycle_tx.clone();
+            async move {
+                cycle_tx.send(0).expect("test receiver is live");
+            }
+        });
+
+        assert!(initial_rx.is_none(), "compat path has no handshake receiver");
+        let got = cycle_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("compat path publishes");
+        assert_eq!(got, 0);
+    }
+
+    #[test]
+    fn required_path_cancels_pending_first_publication() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let loop_cancellation = cancellation.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
+        struct Dropped(std::sync::mpsc::SyncSender<()>);
+        impl Drop for Dropped {
+            fn drop(&mut self) { let _ = self.0.send(()); }
+        }
+        let initial = super::spawn_native_announcement_loop(
+            true, cancellation.clone(), move |announce_tx| async move {
+                let _dropped = Dropped(dropped_tx);
+                super::refresh_native_announcement(
+                    "model", "iroh", "iroh://test", i64::MAX, loop_cancellation,
+                    || {
+                        started_tx.send(()).expect("publication started");
+                        std::future::pending::<Result<(), std::io::Error>>()
+                    },
+                ).await;
+                // Keep the first-result sender alive during the pending RPC.
+                drop(announce_tx);
+            },
+        ).expect("required handshake");
+        started_rx.recv_timeout(Duration::from_secs(2)).expect("first publication entered");
+        cancellation.cancel();
+        assert!(initial.recv_timeout(Duration::from_secs(2)).expect("cancelled handshake must finish").is_err());
+        dropped_rx.recv_timeout(Duration::from_secs(2)).expect("publication task must be dropped");
+    }
+
+    #[test]
+    fn required_path_rejects_success_when_already_cancelled() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let initial = super::spawn_native_announcement_loop(
+            true, cancellation, |announce_tx| async move {
+                send_first_result(&announce_tx, Ok(()));
+            },
+        ).expect("required handshake");
+        assert!(initial.recv_timeout(Duration::from_secs(2)).expect("cancelled handshake must finish").is_err());
+    }
+
+    #[test]
+    fn required_path_aborts_on_first_failure() {
+        let (cycle_tx, cycle_rx) = std::sync::mpsc::sync_channel(10);
+        let initial_rx = super::spawn_native_announcement_loop(true, tokio_util::sync::CancellationToken::new(), move |announce_tx| {
+            let cycle_tx = cycle_tx.clone();
+            async move {
+                send_first_result(&announce_tx, Err("injected".to_owned()));
+                loop {
+                    tokio::task::yield_now().await;
+                    cycle_tx.send(1).expect("test receiver is live");
+                }
+            }
+        });
+
+        let result = initial_rx
+            .expect("required path has a handshake receiver")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handshake completes");
+        assert!(result.is_err(), "first failure must be reported");
+
+        assert!(
+            cycle_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "loop must abort after first failure; extra cycle observed"
+        );
+    }
+
+    #[test]
+    fn required_path_reports_first_authority_failure_without_publication() {
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = published.clone();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let initial = super::spawn_native_announcement_loop(
+            true, cancellation.clone(), move |announce_tx| async move {
+                super::refresh_native_announcement(
+                    "model", "iroh", "iroh://test", i64::MAX, cancellation,
+                    || {
+                        let tx = announce_tx.as_ref().map(std::sync::Arc::clone);
+                        let published = published.clone();
+                        super::publish_native_announcement_attempt(
+                            Err(anyhow::anyhow!("fresh checkpoint unavailable")), tx,
+                            move |_| async move {
+                                published.store(true, std::sync::atomic::Ordering::SeqCst);
+                                Ok(())
+                            },
+                        )
+                    },
+                ).await;
+            },
+        ).expect("required handshake");
+        let error = initial.recv_timeout(Duration::from_secs(2))
+            .expect("authority failure must complete first handshake").expect_err("startup must fail");
+        assert!(error.contains("fresh checkpoint unavailable"));
+        assert!(!observed.load(std::sync::atomic::Ordering::SeqCst),
+            "failed authority projection must never publish stale reach");
+    }
 }

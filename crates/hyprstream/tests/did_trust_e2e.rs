@@ -205,6 +205,7 @@ async fn build_fixture() -> Fixture {
             let _ = addr_tx.send(addr);
         })),
         iroh_enabled: false,
+        iroh_required: false,
         on_iroh_bound: None,
         moq_relay: None,
         moq_relay_server_identity: None,
@@ -278,7 +279,7 @@ async fn did_anchored_bootstrap_boots_end_to_end() {
     hyprstream_discovery::initialize_deployment_checkpoint_store()
         .expect("fresh test deployment must provision its checkpoint store");
     let node_key = SigningKey::from_bytes(&[0x56; 32]);
-    hyprstream_discovery::bootstrap_deployment_process(node_key, fixture.trust_source(), true)
+    hyprstream_discovery::bootstrap_deployment_process(node_key, fixture.trust_source(), true, false)
         .await
         .expect("DID-anchored bootstrap must boot against the real serving side");
 }
