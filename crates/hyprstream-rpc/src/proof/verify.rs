@@ -956,8 +956,13 @@ mod tests {
     fn cross_suite_enrollment_denies() {
         let hybrid = hybrid_enrollment();
         let classical = classical_enrollment();
-        // P-4 omitted pending the WS-A re-issue; P-5 (also standalone suite)
-        // keeps the standalone-under-hybrid-enrollment denial covered.
+        // P-4 and P-5 are both standalone-suite (classical Sign1 and Sign
+        // respectively); each must deny under the hybrid-only enrollment.
+        assert!(
+            verify_proof_signatures(&parse("P-4"), Some(&client_cnf()), Some(&hybrid), FIXTURE_NOW)
+                .is_err(),
+            "P-4 (standalone suite) must deny under a hybrid enrollment"
+        );
         assert!(
             verify_proof_signatures(&parse("P-5"), Some(&client_cnf()), Some(&hybrid), FIXTURE_NOW)
                 .is_err(),

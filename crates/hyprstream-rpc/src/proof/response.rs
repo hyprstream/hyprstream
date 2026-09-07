@@ -377,8 +377,9 @@ mod tests {
     }
 
     /// The pre-amendment three-field encoding (combined mode at key 2, KEM at
-    /// key 3, no protection_mode) is rejected by the four-field parser. This is
-    /// the exact shape frozen vector P-4 still carries until WS-A re-issues it.
+    /// key 3, no protection_mode) is rejected by the four-field parser — the
+    /// exact shape the pre-re-issue P-4 fixture carried, now re-issued at the
+    /// amended four-field binding; the old shape must still deny.
     #[test]
     fn pre_amendment_three_field_binding_is_rejected() {
         let v = CborValue::Map(vec![
