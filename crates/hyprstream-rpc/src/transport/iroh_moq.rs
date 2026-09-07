@@ -39,7 +39,8 @@ use tokio_util::sync::CancellationToken;
 use web_transport_iroh::Session;
 
 use crate::moq_authz::{
-    PeerIdentity, SharedSubscribeAuthorizer, SubscribeDecision, tenant_prefix,
+    PeerIdentity, SharedSubscribeAuthorizer, SubscribeDecision, is_valid_tenant_segment,
+    tenant_prefix,
     tenant_scoped_consumer,
 };
 use crate::transport::moql_admission::MoqlAdmissionAuthenticator;
@@ -390,6 +391,11 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
                 return Ok(());
             }
         };
+        if !is_valid_tenant_segment(&tenant) {
+            tracing::warn!(%tenant, "iroh-moq: invalid tenant scope; refusing");
+            conn.close(0u32.into(), b"valid tenant scope required");
+            return Ok(());
+        }
 
         // An admitted session is a tenant-scoped *subscriber* by default.
         // Admission proves identity and tenant; it is not a producer/relay
