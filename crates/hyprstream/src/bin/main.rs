@@ -3344,7 +3344,9 @@ fn main() -> Result<()> {
                                 let hosts_event_service = stages
                                     .iter()
                                     .any(|stage| stage.iter().any(|s| s == "event"));
-                                if !hosts_event_service {
+                                if !hosts_event_service
+                                    && !hyprstream_discovery::native_network_required()
+                                {
                                     hyprstream_rpc::moq_event::ensure_event_client_origin(
                                         hyprstream_rpc::paths::event_socket(),
                                     );
