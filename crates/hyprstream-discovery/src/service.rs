@@ -1809,6 +1809,43 @@ pub fn production_moql_accepted_state_authority(
     }))
 }
 
+/// One just-resolved Event carrier and the matching accepted-state server
+/// witness. Reach and identity leave the checkpoint resolver together so a
+/// caller cannot pair an Event transport with an unrelated server identity.
+#[derive(Clone)]
+pub struct ResolvedMoqEventTarget {
+    pub transport: TransportConfig,
+    pub server_identity: hyprstream_rpc::stream_info::MoqlServerIdentity,
+}
+
+/// Resolve the native Event service through the installed checkpoint-backed
+/// resolver. Same-host and QUIC reaches are refused by the native query; the
+/// returned Iroh target remains valid only with this exact witness.
+pub async fn production_moq_event_target() -> Result<ResolvedMoqEventTarget> {
+    let resolver = PRODUCTION_RESOLVER
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("checkpoint-backed production resolver is not installed"))?;
+    let resolved = resolver
+        .resolve_service_candidates(ServiceQuery::network("event")?)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("resolver returned no Event reach"))?;
+    resolver.ensure_current(&resolved).await?;
+    Ok(ResolvedMoqEventTarget {
+        transport: resolved.transport().clone(),
+        server_identity: hyprstream_rpc::stream_info::MoqlServerIdentity {
+            did: resolved.service_did().as_str().to_owned(),
+            epoch: resolved.evidence().accepted_state_epoch,
+            head_digest: resolved.evidence().accepted_state_digest.to_vec(),
+            expires_at_unix_ms: resolved.expires_at_unix_ms(),
+            ed25519: resolved.response_verifying_key().to_bytes(),
+            ml_dsa65: resolved.response_ml_dsa65().to_vec(),
+        },
+    })
+}
+
 const DEPLOYMENT_CA_ROOT_PATH: &str = "/etc/hyprstream/trust/deployment-ca.hybrid";
 const DEPLOYMENT_AUTHORITY_LOG_PATH: &str = "/etc/hyprstream/trust/deployment-authority.log.json";
 const DEPLOYMENT_AUTHORITY_CHECKPOINT_PATH: &str =

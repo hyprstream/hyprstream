@@ -3344,12 +3344,50 @@ fn main() -> Result<()> {
                                 let hosts_event_service = stages
                                     .iter()
                                     .any(|stage| stage.iter().any(|s| s == "event"));
-                                if !hosts_event_service
-                                    && !hyprstream_discovery::native_network_required()
-                                {
-                                    hyprstream_rpc::moq_event::ensure_event_client_origin(
-                                        hyprstream_rpc::paths::event_socket(),
-                                    );
+                                if !hosts_event_service {
+                                    if hyprstream_discovery::native_network_required() {
+                                        // The dialer owns one admission-proof slot.  Do not
+                                        // silently select the first service in a combined
+                                        // process: a later service would then identify as a
+                                        // different checkpointed DID on its Event link.
+                                        let proof = select_single_process_moql_admission_proof(
+                                            service_names
+                                                .iter()
+                                                .map(|service_name| {
+                                                    ctx.moql_admission_proof(service_name)
+                                                        .map(|proof| (service_name.clone(), proof))
+                                                })
+                                                .collect::<Result<Vec<_>>>()?,
+                                        )?.ok_or_else(|| anyhow::anyhow!(
+                                            "network-iroh-required Event client has no checkpointed MoQL proof"
+                                        ))?;
+                                        if let Some(origin) = hyprstream_rpc::moq_event::install_event_network_client_origin() {
+                                            tokio::spawn(async move {
+                                                loop {
+                                                    let attempt: anyhow::Result<()> = async {
+                                                        let target = hyprstream_discovery::production_moq_event_target().await?;
+                                                        let mut proof = proof.clone();
+                                                        proof.expected_server = target.server_identity;
+                                                        let stream_session = hyprstream_rpc::dial::dial_stream_authenticated(
+                                                            &target.transport, &proof,
+                                                        ).await?;
+                                                        let client = moq_net::Client::new().with_origin(origin.producer());
+                                                        let session = stream_session.connect_moq(&client).await?;
+                                                        let _ = session.closed().await;
+                                                        anyhow::bail!("authenticated Event MoQ link closed")
+                                                    }.await;
+                                                    if let Err(error) = attempt {
+                                                        tracing::warn!("authenticated Event MoQ link unavailable: {error}");
+                                                    }
+                                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                                }
+                                            });
+                                        }
+                                    } else {
+                                        hyprstream_rpc::moq_event::ensure_event_client_origin(
+                                            hyprstream_rpc::paths::event_socket(),
+                                        );
+                                    }
                                 }
 
                                 for stage in &stages {

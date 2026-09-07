@@ -462,6 +462,17 @@ pub fn ensure_event_client_origin(path: std::path::PathBuf) {
     connect_event_moq_uds_background(origin, path);
 }
 
+/// Install a local Event origin for a native network client without creating a
+/// UDS bridge. The caller owns the authenticated Iroh link and must retain it
+/// for the process lifetime.
+pub fn install_event_network_client_origin() -> Option<MoqEventOrigin> {
+    if global_moq_event_origin().is_some() {
+        return None;
+    }
+    let origin = MoqEventOrigin::new();
+    init_global_moq_event_origin(origin.clone()).then_some(origin)
+}
+
 /// Connect a local event origin to the event service's UDS plane (#275).
 ///
 /// Spawns a background task that connects a `moq_net::Client` (built with
