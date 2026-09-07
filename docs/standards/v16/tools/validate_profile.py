@@ -75,6 +75,7 @@ from check_proof_vectors import (  # noqa: E402
     response_context_bindings,
     validate_signer_suite_confirmation,
     cwt_revocation_control_errors,
+    validate_classical_cwt, decode_proof_object,
 )
 
 # ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
@@ -736,6 +737,19 @@ def gate_caps(cddl: str, positives, negatives) -> None:
               "the constructed object must exceed the 2 MiB cap by its fixed size")
         check(not object_within_cap(oversized),
               "the numeric object-cap must reject a structurally-valid object over 2 MiB")
+        # Exercise the actual checker parser boundary, with decoding replaced by
+        # a trap: oversized bytes must fail specifically at size admission before
+        # malformed signatures or any decoder error can mask a missing cap.
+        from unittest.mock import patch
+        with patch("check_proof_vectors.decode", side_effect=AssertionError("decoder reached before size rejection")):
+            try:
+                decode_proof_object(oversized)
+                check(False, "proof parser accepted an object over the size cap")
+            except StrictError as exc:
+                check(str(exc) == "proof object exceeds 2 MiB size cap",
+                      f"oversized proof must reject at the size gate: {exc}")
+        check(isinstance(decode_proof_object(bytes.fromhex(sign1["cbor_hex"])), list),
+              "within-cap signed proof parser control must admit")
         print(f"   3g over-cap object: {len(oversized)} bytes (fixed), valid structure, "
               f"rejected by size (> {MAX_OBJECT_BYTES})")
 
@@ -948,8 +962,8 @@ def gate_canonical(positives, negatives) -> None:
 
 def gate_type_confusion(negatives) -> None:
     section("7. Type-confusion vectors (N-1 valid credential, N-2 label)")
-    from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from copy import deepcopy
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from check_proof_vectors import enc
 
     keys = load_json("proof-v1-keys.json")["keys"]
@@ -964,39 +978,64 @@ def gate_type_confusion(negatives) -> None:
     n1 = by_id.get("N-1")
     check(n1 is not None, "N-1 must exist")
     if n1 is not None and issuer is not None:
+        creds = _load_credentials()
+        cwt_claims, cwt_errors = validate_classical_cwt(bytes.fromhex(n1["cbor_hex"]), creds,
+            creds["credentials"]["classical"]["claims"]["aud"])
+        check(not cwt_errors, f"N-1 must be a fully valid credential before proof-slot rejection: {cwt_errors}")
+        if cwt_errors:
+            return
         obj = decode(bytes.fromhex(n1["cbor_hex"]))
         pm = decode(obj[0])
         check(pm.get(H_TYP) == "application/cwt",
               "N-1 must be typed application/cwt (a credential encoding)")
         check(pm.get(H_TYP) not in (TYP_REQUEST, TYP_RESPONSE),
               "N-1 typ must not be a request/response proof type")
-        tbs = enc(["Signature1", obj[0], b"", obj[2]])
-        pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(issuer["public_hex"]))
-        try:
-            pub.verify(obj[3], tbs)
-            print("   N-1 issuer signature verifies (typ application/cwt)")
-        except InvalidSignature:
-            check(False, "N-1 issuer signature does not verify — not a well-formed credential")
-        # Finding 4D7u: N-1 must be PROFILE-VALID — cnf PoP binding, tenant
-        # (-70005), clearance (-70006) — so only its presentation slot is wrong.
-        n1c = decode(obj[2])
-        cnf = n1c.get(8)
-        check(isinstance(cnf, dict) and isinstance(cnf.get(1), dict),
-              "N-1 must carry a cnf (8) PoP binding with a COSE_Key confirmation")
-        if isinstance(cnf, dict) and isinstance(cnf.get(1), dict):
-            ck = cnf[1]
-            check(ck.get(1) == 1 and ck.get(3) == -19 and isinstance(ck.get(-2), (bytes, bytearray)),
-                  "N-1 cnf must be a valid OKP/Ed25519 COSE_Key (a PoP key)")
-        # J1: the CWT tenant (-70005) obeys the same non-empty, non-wildcard rule.
-        check(not validate_tenant(n1c.get(-70005)),
-              f"N-1 CWT tenant (-70005) must be a valid tenant: {validate_tenant(n1c.get(-70005))}")
-        check(-70006 in n1c, "N-1 must carry clearance (-70006)")
-        # v16 credentials are Reusable-only: there is no use-profile field, and
-        # -70008 is unallocated (OneShotTransaction deferred to a future
-        # amendment). A v16 credential carries neither.
-        check(-70008 not in n1c, "N-1 must carry no use-profile field (v16 is Reusable-only; -70008 unallocated)")
-        print("   #2 N-1 is a profile-valid v16 Reusable credential "
-              "(cnf PoP + tenant -70005 + clearance -70006; no use-profile field)")
+        # Re-sign each one-field mutation: an invalid signature must never mask
+        # a missing required-claim/header/key check in the credential control.
+        sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(issuer["seed_hex"]))
+        expected_aud = creds["credentials"]["classical"]["claims"]["aud"]
+
+        def signed_cwt(header, claims):
+            protected, payload = enc(header), enc(claims)
+            signature = sk.sign(enc(["Signature1", protected, b"", payload]))
+            return enc([protected, {}, payload, signature])
+
+        mutations = []
+        for key in (1, 2, 3, 4, 6, 7, 8, -70005, -70006):
+            claims = deepcopy(cwt_claims)
+            del claims[key]
+            mutations.append((pm, claims, "required credential claim"))
+        for key, value, diagnostic in (
+            (1, "https://other-issuer.example", "configured issuer"),
+            (3, "other.svc.hyprstream.test", "expected audience"),
+            (2, "", "sub must be non-empty"),
+            (6, True, "NumericDates"), (6, "1786000000", "NumericDates"),
+            (6, None, "NumericDates"), (6, creds["verifier_now"] + 1, "NumericDates"),
+            (4, False, "NumericDates"), (4, "1786000300", "NumericDates"),
+            (4, None, "NumericDates"), (4, creds["verifier_now"], "NumericDates"),
+            (5, True, "nbf"), (5, creds["verifier_now"] + 1, "nbf"),
+            (7, b"", "cti"), (7, "credential-id", "cti"),
+            (-70005, "*", "tenant"), (-70006, None, "clearance"),
+            (-70008, "Reusable", "use-profile"),
+        ):
+            mutations.append((pm, {**cwt_claims, key: value}, diagnostic))
+        for key, value in ((1, 2), (1, True), (-1, 4), (-2, b"short"),
+                           (-2, "x" * 32), (3, -8), (2, b"")):
+            claims = deepcopy(cwt_claims)
+            claims[8][1][key] = value
+            mutations.append((pm, claims, "single classical OKP/Ed25519"))
+        claims = deepcopy(cwt_claims)
+        claims[8][2] = b"second-method"
+        mutations.append((pm, claims, "single classical OKP/Ed25519"))
+        for key, value in ((1, -8), (4, b"other-issuer"), (16, TYP_REQUEST)):
+            mutations.append(({**pm, key: value}, cwt_claims, "CWT header"))
+        for header, claims, diagnostic in mutations:
+            result, errors = validate_classical_cwt(signed_cwt(header, claims), creds, expected_aud)
+            check(result is None and any(diagnostic in e for e in errors),
+                  f"re-signed CWT mutation must deny for {diagnostic}: {errors}")
+        corrected, errors = validate_classical_cwt(signed_cwt(pm, cwt_claims), creds, expected_aud)
+        check(corrected == cwt_claims and not errors, "corrected signed N-1 credential must admit")
+        print(f"   N-1 fully validates as a credential; {len(mutations)} re-signed malformed controls deny")
 
     # N-2 (ary-137m): the two-entry COSE_Sign proof presented as a credential.
     # Its structure label must be COSE_Sign and its bytes must be a COSE_Sign.

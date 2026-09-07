@@ -47,6 +47,16 @@ class StrictError(Exception):
     pass
 
 
+MAX_PROOF_OBJECT_BYTES = 2 * 1024 * 1024
+
+
+def decode_proof_object(data: bytes):
+    """The proof parser's size gate runs before CBOR decoding or cryptography."""
+    if len(data) > MAX_PROOF_OBJECT_BYTES:
+        raise StrictError("proof object exceeds 2 MiB size cap")
+    return decode(data)
+
+
 def decode(data: bytes, *, strict: bool = True):
     value, rest = _decode(data, strict)
     if rest:
@@ -150,6 +160,8 @@ def enc_head(major: int, value: int) -> bytes:
 def enc(obj) -> bytes:
     if obj is None:
         return b"\xf6"
+    if isinstance(obj, bool):
+        return b"\xf5" if obj else b"\xf4"
     if isinstance(obj, int):
         return enc_head(0, obj) if obj >= 0 else enc_head(1, -1 - obj)
     if isinstance(obj, bytes):
@@ -768,42 +780,79 @@ def is_credential_revoked(creds_doc, iss, identifier, *, kind="jti"):
     return False
 
 
+def validate_classical_cwt(raw, creds_doc, expected_aud):
+    """Validate the permitted classical CWT credential before slot/revocation tests."""
+    try:
+        obj = decode(raw)
+        if not isinstance(obj, list) or len(obj) != 4:
+            return None, ["CWT must be a four-element COSE_Sign1"]
+        header, claims = decode(obj[0]), decode(obj[2])
+    except (StrictError, TypeError, ValueError):
+        return None, ["CWT is not deterministic COSE/CBOR"]
+    issuer = creds_doc["issuer"]
+    if header != {1: -19, 4: issuer["kid"].encode(), 16: "application/cwt"} or obj[1] != {}:
+        return None, ["CWT header must name the configured issuer, Ed25519 and application/cwt"]
+    required = {1, 2, 3, 4, 6, 7, 8, -70005, -70006}
+    if not isinstance(claims, dict) or required - claims.keys():
+        return None, ["CWT claims must be an object with every required credential claim"]
+    for key, name in ((1, "iss"), (2, "sub"), (3, "aud")):
+        if not isinstance(claims[key], str) or not claims[key].strip():
+            return None, [f"CWT {name} must be non-empty text"]
+    if claims[1] != configured_issuer(creds_doc):
+        return None, ["CWT iss differs from the configured issuer"]
+    if claims[3] != expected_aud:
+        return None, ["CWT aud differs from the expected audience"]
+    now = creds_doc["verifier_now"]
+    if (not is_numericdate(claims[6]) or not is_numericdate(claims[4])
+            or not claims[6] <= now < claims[4]):
+        return None, ["CWT iat/exp must be valid NumericDates at verifier_now"]
+    if 5 in claims and (not is_numericdate(claims[5]) or claims[5] > now):
+        return None, ["CWT nbf must be a valid NumericDate at verifier_now"]
+    if not isinstance(claims[7], bytes) or not claims[7]:
+        return None, ["CWT cti must be a non-empty byte string"]
+    errors = validate_tenant(claims[-70005]) + validate_clearance_shape(claims[-70006])
+    if -70008 in claims:
+        errors.append("CWT must not carry the deferred credential use-profile claim")
+    cnf = claims[8]
+    key = cnf.get(1) if isinstance(cnf, dict) and set(cnf) == {1} else None
+    if (not isinstance(key, dict) or not {1, -1, -2} <= key.keys()
+            or set(key) - {1, 2, 3, -1, -2}
+            or type(key[1]) is not int or key[1] != 1
+            or type(key[-1]) is not int or key[-1] != 6
+            or not isinstance(key[-2], bytes) or len(key[-2]) != 32
+            or (3 in key and key[3] != -19)
+            or (2 in key and (not isinstance(key[2], bytes) or not 1 <= len(key[2]) <= 64))):
+        return None, errors + ["CWT cnf must be a single classical OKP/Ed25519 COSE_Key"]
+    tp = base64.urlsafe_b64encode(hashlib.sha256(
+        enc(["hs-cose-sign-ed25519-v1", [key[-2]]])).digest()).rstrip(b"=").decode()
+    errors += validate_primary_enrollment(resolve_primary_enrollment(creds_doc, tp),
+                                          tp, claims[-70005], claims[2], now)
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(issuer["public_hex"])).verify(
+            obj[3], enc(["Signature1", obj[0], b"", obj[2]]))
+    except (InvalidSignature, ValueError, TypeError):
+        errors.append("CWT issuer signature invalid")
+    return (claims if not errors else None), errors
+
+
 def cwt_revocation_control_errors(creds_doc, negatives):
     """Signed CWT controls differ from the valid N-1 credential only in cti."""
     errors = []
     base = next(v for v in negatives["vectors"] if v["id"] == "N-1")
-    base_obj = decode(bytes.fromhex(base["cbor_hex"]))
-    base_claims = decode(base_obj[2])
+    expected_aud = creds_doc["credentials"]["classical"]["claims"]["aud"]
+    base_claims, errors = validate_classical_cwt(bytes.fromhex(base["cbor_hex"]), creds_doc, expected_aud)
+    if errors:
+        return errors
     controls = creds_doc.get("cwt_revocation_controls", [])
     if [v.get("expect_revoked") for v in controls] != [False, True]:
         return ["CWT revocation controls must include live and revoked credentials"]
-    pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(creds_doc["issuer"]["public_hex"]))
-    now = creds_doc["verifier_now"]
     for control in controls:
-        obj = decode(bytes.fromhex(control["cbor_hex"]))
-        claims = decode(obj[2])
-        header = decode(obj[0])
-        if header != {1: -19, 4: creds_doc["issuer"]["kid"].encode(), 16: "application/cwt"} or obj[1] != {}:
-            errors.append("CWT control must have the configured issuer's classical credential header")
-        try:
-            pub.verify(obj[3], enc(["Signature1", obj[0], b"", obj[2]]))
-        except InvalidSignature:
-            errors.append("CWT control issuer signature invalid")
+        claims, credential_errors = validate_classical_cwt(bytes.fromhex(control["cbor_hex"]), creds_doc, expected_aud)
+        if credential_errors:
+            errors += credential_errors
+            continue
         if {k: v for k, v in claims.items() if k != 7} != {k: v for k, v in base_claims.items() if k != 7}:
             errors.append("CWT control changed a non-target field of the valid N-1 credential")
-        if (claims.get(1) != configured_issuer(creds_doc)
-                or not isinstance(claims.get(7), bytes) or not claims[7]
-                or not is_numericdate(claims.get(6)) or not is_numericdate(claims.get(4))
-                or not claims[6] <= now < claims[4]):
-            errors.append("CWT control must have valid issuer, byte-string cti and lifetime")
-        errors += validate_tenant(claims.get(-70005))
-        errors += validate_clearance_shape(claims.get(-70006))
-        # The unchanged RFC8747 classical cnf resolves a real primary enrollment.
-        key = claims[8][1]
-        tp = base64.urlsafe_b64encode(hashlib.sha256(
-            enc(["hs-cose-sign-ed25519-v1", [key[-2]]])).digest()).rstrip(b"=").decode()
-        errors += validate_primary_enrollment(resolve_primary_enrollment(creds_doc, tp),
-                                              tp, claims[-70005], claims[2], now)
         if errors:
             continue  # A malformed credential cannot supply causal revocation evidence.
         revoked = is_credential_revoked(creds_doc, claims[1], claims[7], kind="cti")
@@ -1008,7 +1057,7 @@ def main() -> None:
     for vec in crypto_vectors:
         raw = check_digest(vec)
         try:
-            obj = decode(raw)
+            obj = decode_proof_object(raw)
         except StrictError as exc:
             fail(f"{vec['id']}: not deterministic CBOR: {exc}")
             continue
