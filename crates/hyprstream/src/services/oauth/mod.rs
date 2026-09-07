@@ -447,7 +447,6 @@ pub struct OAuthService {
     /// JWTs signed by PolicyService, derived from the root signing key.
     jwt_verifying_key: [u8; 32],
     /// Shared JTI blocklist (same Arc as PolicyService) for cross-plane revocation.
-    jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
     /// Authority-owned hosted-account records for ATProto DID → tenant
     /// resolution. Attached by the PDS service composition layer.
     hosted_account_store: Option<Arc<hyprstream_pds_service::AccountRecordStore>>,
@@ -478,7 +477,6 @@ impl OAuthService {
             discovery_transport,
             verifying_key,
             jwt_verifying_key: jwt_verifying_key.to_bytes(),
-            jti_blocklist: None,
             hosted_account_store: None,
             identity_registration_api: None,
         }
@@ -487,15 +485,6 @@ impl OAuthService {
     /// Attach the global QUIC configuration for DID-doc cert-hash publication (#185).
     pub fn with_quic_config(mut self, quic: crate::config::QuicConfig) -> Self {
         self.quic_config = Some(quic);
-        self
-    }
-
-    /// Attach the shared JTI blocklist (same Arc as PolicyService).
-    pub fn with_jti_blocklist(
-        mut self,
-        bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
-    ) -> Self {
-        self.jti_blocklist = Some(bl);
         self
     }
 
@@ -517,6 +506,26 @@ impl OAuthService {
         self
     }
 }
+
+#[cfg(test)]
+fn runtime_clients(
+    signing_key: &ed25519_dalek::SigningKey,
+) -> anyhow::Result<(PolicyClient, crate::services::DiscoveryClient)> {
+    let trust = hyprstream_service::global_trust_store();
+    let policy_key = trust
+        .resolve_one("policy")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated policy key"))?;
+    let discovery_key = trust
+        .resolve_one("discovery")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated discovery key"))?;
+    Ok((
+        crate::services::policy_client_for_process(signing_key.clone(), policy_key, None)?,
+        crate::services::discovery_client_for_process(signing_key.clone(), discovery_key, None)?,
+    ))
+}
+
+#[cfg(test)]
+mod required_consumer_tests;
 
 impl Spawnable for OAuthService {
     fn name(&self) -> &str {
@@ -562,8 +571,11 @@ impl Spawnable for OAuthService {
             // async I/O (TMQ) registers socket FDs with THIS runtime's epoll.
             // Creating them in the factory (main runtime) would cause hangs.
 
-            // Bootstrap: Get service verifying keys from trust store.
-            // The trust store is populated during startup by depends_on services.
+            // Bootstrap: get service verifying keys from the trust store,
+            // populated during startup by depends_on services. Required profile
+            // resolves through the checkpoint-backed discovery resolver;
+            // compatibility dials the deterministic per-process IPC transports
+            // the factory resolved (available to a separate Quadlet process).
             let policy_vk = match hyprstream_service::global_trust_store().resolve_one("policy") {
                 Some(vk) => vk,
                 None => {
@@ -572,17 +584,20 @@ impl Spawnable for OAuthService {
                     ));
                 }
             };
-            let policy_client = PolicyClient::for_local_transport_bootstrap(
-                &self.policy_transport,
-                self.signing_key.clone(),
-                policy_vk,
-                None,
-            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                format!("failed to create PolicyClient: {e}"),
-            ))?;
+            let policy_client = if hyprstream_discovery::native_network_required() {
+                PolicyClient::from_resolver(self.signing_key.clone(), None)
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create PolicyClient: {e}")))?
+            } else {
+                PolicyClient::for_local_transport_bootstrap(
+                    &self.policy_transport,
+                    self.signing_key.clone(),
+                    policy_vk,
+                    None,
+                ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                    format!("failed to create PolicyClient: {e}"),
+                ))?
+            };
 
-            // Get discovery key from trust store (populated by depends_on = ["discovery"]).
-            // Using trust store avoids RPC calls which require LocalSet context.
             let discovery_vk = match hyprstream_service::global_trust_store().resolve_one("discovery") {
                 Some(vk) => vk,
                 None => {
@@ -591,14 +606,19 @@ impl Spawnable for OAuthService {
                     ));
                 }
             };
-            let discovery_client = crate::services::DiscoveryClient::for_local_transport_bootstrap(
-                &self.discovery_transport,
-                self.signing_key.clone(),
-                discovery_vk,
-                None,
-            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                format!("failed to create DiscoveryClient: {e}"),
-            ))?;
+            let discovery_client = if hyprstream_discovery::native_network_required() {
+                crate::services::DiscoveryClient::from_resolver(self.signing_key.clone(), None)
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create DiscoveryClient: {e}")))?
+            } else {
+                crate::services::DiscoveryClient::for_local_transport_bootstrap(
+                    &self.discovery_transport,
+                    self.signing_key.clone(),
+                    discovery_vk,
+                    None,
+                ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                    format!("failed to create DiscoveryClient: {e}"),
+                ))?
+            };
 
             let credentials_dir = crate::auth::identity_store::credentials_dir().map_err(|e| {
                 hyprstream_rpc::error::RpcError::SpawnFailed(
@@ -825,9 +845,6 @@ impl Spawnable for OAuthService {
             }
             if let Some(sink) = audit_sink {
                 oauth_state = oauth_state.with_audit_sink(sink);
-            }
-            if let Some(bl) = self.jti_blocklist {
-                oauth_state = oauth_state.with_jti_blocklist(bl);
             }
             // Populate legacy JWKS nbf/exp from signing-key file mtime (used when store absent).
             let key_nbf = crate::auth::identity_store::node_signing_key_mtime(&credentials_dir);
@@ -1139,12 +1156,24 @@ mod tests {
             .expect("OAuthService must implement Spawnable");
         let run = &production[run_start..];
 
+        // Merged required/compat shape: required resolves through the
+        // checkpoint-backed discovery resolver; compat dials the
+        // factory-resolved IPC transports (20-space continuation inside the
+        // profile branch).
         assert!(run.contains(
-            "PolicyClient::for_local_transport_bootstrap(\n                &self.policy_transport,"
+            "PolicyClient::for_local_transport_bootstrap(\n                    &self.policy_transport,"
         ));
         assert!(run.contains(
-            "DiscoveryClient::for_local_transport_bootstrap(\n                &self.discovery_transport,"
+            "DiscoveryClient::for_local_transport_bootstrap(\n                    &self.discovery_transport,"
         ));
+        assert!(
+            run.contains("if hyprstream_discovery::native_network_required() {\n                PolicyClient::from_resolver("),
+            "Required profile must resolve Policy through the checkpoint resolver"
+        );
+        assert!(
+            run.contains("if hyprstream_discovery::native_network_required() {\n                crate::services::DiscoveryClient::from_resolver("),
+            "Required profile must resolve Discovery through the checkpoint resolver"
+        );
         assert!(
             !run.contains("PolicyClient::for_local_bootstrap("),
             "OAuth must not use the process-local Policy registry"
@@ -1451,6 +1480,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn oauth_handler_atproto_and_legacy_conformance() -> anyhow::Result<()> {
         crate::mac::install_explicit_test_dispatch_pep();
+        // Interactive OAuth issuance (v16 §3.3) registers a fresh session with
+        // the canonical registry, and the in-process policy authority validates
+        // it before minting; both live in THIS process, so publish one isolated
+        // in-memory session registry (plus a revocation store) — mirroring
+        // production `init_process_authority_stores`, which this bespoke
+        // in-process test bypasses. Guarded so a sibling that published first
+        // keeps its handle; the registrations use distinct keys.
+        if hyprstream_rpc::auth::global_session_registry().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_session_registry(std::sync::Arc::new(
+                hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+            ));
+        }
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(std::sync::Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
         use base64::{
             engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
             Engine as _,
@@ -1469,7 +1515,7 @@ mod tests {
         use super::token_store::RocksDbTokenStore;
         use crate::auth::rocksdb_store::RocksDbUserStore;
         use crate::auth::{PolicyManager, UserProfile, UserStore};
-        use crate::services::generated::policy_client::IssueToken;
+        use crate::services::generated::policy_client::{IssueToken, IssueTokenProfile};
         use crate::services::{DiscoveryClient, PolicyClient, PolicyService};
 
         const ISSUER: &str = "https://pds.example.test:8443";
@@ -1509,6 +1555,16 @@ mod tests {
                 pq_store: None,
             },
         );
+        // Resource-token verification fails closed on jti-bearing bearers
+        // without the process-global revocation store. Install an in-memory
+        // authority when no other test in this binary got there first — this
+        // test must not depend on another test's fixture happening to run
+        // earlier.
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
         configure_test_policy_signing_authority()?;
 
         let service_key = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);
@@ -1525,6 +1581,38 @@ mod tests {
             TransportConfig::inproc(&policy_tag),
         )
         .with_default_audience(GENERIC_ISSUER.to_owned())
+        // Production-equivalent key source: token signing resolves the composite
+        // authority through the configured JwtKeySource (a `ClusterKeySource`
+        // defaults its ledger to the process-global authority configured above).
+        .with_jwt_key_source(Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+            service_key.verifying_key(),
+            GENERIC_ISSUER.to_owned(),
+        )))
+        // v16: a dispatch-capable user `at+jwt` (cnf.jwk) binds its authoritative
+        // Primary suite. Production installs WS-C's enrollment resolver; this
+        // fixture stands in for it, resolving `alice` to the exact verified
+        // OAuth challenge key (`user_key`, [0x63; 32]) the flows bind as `cnf`.
+        .with_primary_enrollment_resolver({
+            struct AliceResolver;
+            impl crate::services::policy::PrimaryEnrollmentResolver for AliceResolver {
+                fn primary_group(
+                    &self,
+                    principal: &str,
+                    _tenant: &str,
+                ) -> Option<crate::services::policy::PrimaryGroup> {
+                    (principal == "alice").then(|| crate::services::policy::PrimaryGroup {
+                        suite_id: hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519.to_owned(),
+                        ordered_component_keys: vec![
+                            ed25519_dalek::SigningKey::from_bytes(&[0x63; 32])
+                                .verifying_key()
+                                .to_bytes()
+                                .to_vec(),
+                        ],
+                    })
+                }
+            }
+            Arc::new(AliceResolver)
+        })
         .with_token_clearance_resolver(Arc::new(|subject| {
             use hyprstream_rpc::auth::mac::{
                 Assurance, CompartmentSet, Level, SecurityLabel,
@@ -2835,6 +2923,9 @@ mod tests {
                 issuer: None,
                 tenant: Some(HOSTED_TENANT.to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2865,6 +2956,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("other.example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2895,6 +2989,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2943,6 +3040,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2998,6 +3098,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3146,6 +3249,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3296,6 +3402,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3346,6 +3455,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3518,6 +3630,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3616,6 +3731,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -3662,6 +3780,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;

@@ -163,10 +163,16 @@ impl VfsFileSystem {
 
     /// Route a path to its mount targets (bind order) + mount-relative
     /// components. Maps a namespace miss to `ENOENT`.
+    ///
+    /// The FUSE/vhost-user session loop is sync (fuse-backend-rs `Filesystem`
+    /// callbacks) and has no async frame per operation, so it cannot run the
+    /// revocation revalidation an armed PEP requires. This plane therefore
+    /// serves only dormant (PEP-less) namespaces; [`Namespace::resolve_targets_dormant`]
+    /// fails closed if an armed namespace is ever wired here.
     fn route(&self, components: &[String]) -> io::Result<(Vec<MountTarget>, Vec<String>)> {
         let path = Self::abs_path(components);
         self.ns
-            .resolve_targets(&path, &self.subject)
+            .resolve_targets_dormant(&path, &self.subject)
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))
     }
 

@@ -290,6 +290,8 @@ criterion.workspace = true
 proptest.workspace = true  # S5 #571 M2: differential faithfulness property tests
 tempfile.workspace = true
 tokio-stream.workspace = true
+# Test-only: paused-time coverage of the production native announcement loop.
+tokio = { workspace = true, features = ["test-util"] }
 # Test-only: iroh substrate types used by `tests/policy_over_iroh.rs`.
 iroh.workspace = true
 web-transport-iroh.workspace = true

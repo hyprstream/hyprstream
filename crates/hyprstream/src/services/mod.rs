@@ -83,6 +83,7 @@ pub mod oauth;
 pub mod oai;
 pub mod policy;
 pub mod registry;
+pub mod revocation;
 pub mod router;
 pub mod xet;
 pub mod xet_provenance;
@@ -155,6 +156,32 @@ pub use image_substrate::{
 pub use flight::FlightService;
 pub use discovery::DiscoveryService;
 pub use generated::discovery_client::DiscoveryClient;
+
+/// Construct on the caller's runtime, using the authenticated process profile.
+pub fn policy_client_for_process(
+    signing_key: ed25519_dalek::SigningKey,
+    compatibility_key: ed25519_dalek::VerifyingKey,
+    token: Option<String>,
+) -> anyhow::Result<PolicyClient> {
+    if hyprstream_discovery::native_network_required() {
+        PolicyClient::from_resolver(signing_key, token)
+    } else {
+        PolicyClient::for_local_bootstrap(signing_key, compatibility_key, token)
+    }
+}
+
+/// Discovery's required reach/evidence comes from the checkpoint-backed resolver.
+pub fn discovery_client_for_process(
+    signing_key: ed25519_dalek::SigningKey,
+    compatibility_key: ed25519_dalek::VerifyingKey,
+    token: Option<String>,
+) -> anyhow::Result<DiscoveryClient> {
+    if hyprstream_discovery::native_network_required() {
+        DiscoveryClient::from_resolver(signing_key, token)
+    } else {
+        DiscoveryClient::for_local_bootstrap(signing_key, compatibility_key, token)
+    }
+}
 pub use mcp_service::{McpConfig, McpService};
 #[cfg(feature = "metrics")]
 pub use metrics::MetricsService;

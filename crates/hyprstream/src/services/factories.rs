@@ -36,7 +36,7 @@ use tracing::info;
 
 use crate::auth::identity_store::credentials_dir;
 use crate::auth::PolicyManager;
-use crate::config::{HyprConfig, TokenConfig};
+use crate::config::HyprConfig;
 use crate::services::generated::policy_client::{RefreshServiceTokenRequest, RegisterServiceKey};
 use crate::services::{
     DiscoveryService, McpConfig, McpService, PolicyClient, PolicyService, RegistryClient,
@@ -49,29 +49,13 @@ fn load_config() -> HyprConfig {
 }
 
 /// Get the JWT bound to this service instance's exact signing key.
-fn service_token(signing_key: &SigningKey) -> Option<String> {
+pub(crate) fn service_token(signing_key: &SigningKey) -> Option<String> {
     let trust = hyprstream_service::global_trust_store();
     trust
         .get(&signing_key.verifying_key())
         .and_then(|att| att.jwt)
 }
 
-/// Construct a Policy client through the service context's resolved transport.
-///
-/// `for_local_bootstrap` reads only the process-local endpoint registry. That
-/// is appropriate for co-located services, but a rootless Quadlet starts each
-/// service in a separate process. `ServiceContext::transport` preserves the
-/// in-process endpoint when applicable and resolves the shared IPC socket when
-/// `--ipc` is selected.
-fn policy_client_for_context(
-    ctx: &ServiceContext,
-    signing_key: SigningKey,
-    policy_vk: hyprstream_rpc::crypto::VerifyingKey,
-    token: Option<String>,
-) -> anyhow::Result<PolicyClient> {
-    let transport = ctx.transport("policy", SocketKind::Rep);
-    PolicyClient::for_local_transport_bootstrap(&transport, signing_key, policy_vk, token)
-}
 
 fn policy_client_for_transport(
     transport: &hyprstream_rpc::transport::TransportConfig,
@@ -85,13 +69,6 @@ fn policy_client_for_transport(
 /// Shared Git2DB registry instance. Lazily initialized by the first factory
 /// that needs it. Both PolicyService and RegistryService share this instance.
 static SHARED_GIT2DB: std::sync::OnceLock<Arc<RwLock<Git2DB>>> = std::sync::OnceLock::new();
-
-/// Shared JTI blocklist Arc — set by `create_policy_service`, read by
-/// `create_oauth_service`. Because PolicyService is always created first
-/// (OAuthService `depends_on = ["policy"]`), the lock is always populated
-/// before `create_oauth_service` runs.
-static SHARED_JTI_BLOCKLIST: std::sync::OnceLock<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>> =
-    std::sync::OnceLock::new();
 
 /// Get or initialize the shared Git2DB registry for the given models directory.
 fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock<Git2DB>>> {
@@ -196,6 +173,79 @@ pub fn classify_pds_store_for_quic(ctx: &ServiceContext) -> anyhow::Result<PdsBo
     )
 }
 
+fn accepted_state_matches_service(
+    state: &hyprstream_pds::at9p_duplicity::AcceptedAt9pState,
+    service_name: &str,
+    verifying_key: &[u8; 32],
+) -> bool {
+    let service_id = format!("#{service_name}");
+    state.current.services.iter().any(|entry| entry.id == service_id)
+        && state
+            .current
+            .subject_keys
+            .iter()
+            .any(|key| key.ed25519_pub.as_slice() == verifying_key)
+}
+
+/// Rebuild one running service's announcement from a fresh checkpoint read
+/// and the latest registered JWT. No stale authority is returned on failure.
+pub fn current_native_announcement(
+    request: &mut hyprstream_service::NativeAnnouncementRequest,
+) -> anyhow::Result<hyprstream_discovery::ServiceAnnouncement> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let verifier = hyprstream_discovery::deployment_registry_verifier()?;
+    let store = crate::services::discovery::PdsRecordStore::open_readonly(
+        &hyprstream_service::deployment_data_dir()?.join("pds-store"),
+    )?.with_at9p_deployment_verifier(verifier);
+    let now = chrono::Utc::now();
+    let state = store.accepted_at9p_state(&request.service_did.to_string(), Some(&now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)))?
+        .ok_or_else(|| anyhow::anyhow!("native announcement accepted state is unavailable"))?;
+    request.refresh_from_accepted_state(&state)?;
+    let service_jwt = hyprstream_service::global_trust_store()
+        .get(&request.signing_key.verifying_key())
+        .and_then(|attestation| attestation.jwt)
+        .or_else(|| request.service_jwt.clone());
+    if let Some(jwt) = service_jwt.as_deref() {
+        let payload = jwt.split('.').nth(1)
+            .ok_or_else(|| anyhow::anyhow!("native announcement JWT is malformed"))?;
+        // Do not include token/claims in diagnostics. Signature verification is
+        // still performed by Discovery; this check bounds local publication.
+        let claims: serde_json::Value = URL_SAFE_NO_PAD.decode(payload).ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or_else(|| anyhow::anyhow!("native announcement JWT is malformed"))?;
+        let expiry = claims["exp"].as_i64()
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .ok_or_else(|| anyhow::anyhow!("native announcement JWT has no bounded expiry"))?;
+        anyhow::ensure!(expiry > now.timestamp_millis(), "native announcement JWT expired");
+    }
+    Ok(hyprstream_discovery::ServiceAnnouncement {
+        service_name: request.service_name.clone(),
+        socket_kind: request.reach.socket_kind().to_owned(),
+        endpoint: request.reach.endpoint(),
+        service_jwt,
+        service_did: request.service_did.clone(),
+        capabilities: request.capabilities.clone(),
+        accepted_state_digest: request.accepted_state_digest.clone(),
+        accepted_state_epoch: request.accepted_state_epoch,
+        response_key_id: request.response_key_id.clone(),
+        request_kem_key_id: request.request_kem_key_id.clone(),
+        request_kem_recipient: request.request_kem_recipient.clone(),
+        expires_at_unix_ms: request.expires_at_unix_ms,
+    })
+}
+
+/// Whether the checkpoint announcement loop must authorize `service_name`.
+///
+/// Compatibility checkpoints may legitimately predate a `#discovery`
+/// identity: the compatibility discovery factory installs its self-publisher
+/// only under `iroh_required`, so no compatibility announcement ever consumes
+/// a `#discovery` bundle and demanding one fails startup for pre-upgrade
+/// stores. Required mode keeps the demand because its owned publication path
+/// refuses to publish without the checkpoint bundle.
+fn checkpoint_announces_service(iroh_required: bool, service_name: &str) -> bool {
+    iroh_required || service_name != "discovery"
+}
+
 /// Populate every ordinary network service announcement from a fresh
 /// checkpoint-verifying PDS read. Missing or ambiguous state fails startup
 /// before any QUIC service can bind and advertise an incomplete bundle.
@@ -207,22 +257,14 @@ pub fn with_checkpointed_native_announcements(
     let store = crate::services::discovery::PdsRecordStore::open_readonly(&pds_store_dir(&ctx)?)?
         .with_at9p_deployment_verifier(acceptance_identity);
     let states = store.accepted_at9p_states()?;
+    let iroh_required = ctx.iroh_required();
     for service_name in service_names
         .iter()
-        .filter(|name| name.as_str() != "discovery")
+        .filter(|name| checkpoint_announces_service(iroh_required, name))
     {
         let signer = ctx.service_signing_key(service_name);
         let mut matching = states.iter().filter(|state| {
-            state
-                .current
-                .services
-                .iter()
-                .any(|entry| entry.id == *service_name)
-                && state
-                    .current
-                    .subject_keys
-                    .iter()
-                    .any(|key| key.ed25519_pub.as_slice() == signer.verifying_key().as_bytes())
+            accepted_state_matches_service(state, service_name, signer.verifying_key().as_bytes())
         });
         let state = matching.next().ok_or_else(|| {
             anyhow::anyhow!(
@@ -305,8 +347,9 @@ fn register_service_key(
     service_name: &str,
     signing_key: &SigningKey,
 ) -> anyhow::Result<()> {
-    // PolicyService doesn't register — it IS the CA.
-    if service_name == "policy" {
+    // Required Policy publication still needs its provisioned service JWT,
+    // although Policy never registers its own key through an RPC.
+    if service_name == "policy" && !ctx.iroh_required() {
         return Ok(());
     }
 
@@ -347,6 +390,23 @@ fn register_service_key(
         trust.insert(vk, att);
     }
 
+    if service_name == "policy" {
+        return Ok(());
+    }
+
+    if ctx.iroh_required() {
+        schedule_network_service_key_registration(service_name, signing_key.clone(), jwt.clone());
+        spawn_jwt_renewal_task(
+            service_name,
+            signing_key.clone(),
+            creds_dir,
+            secrets_profile,
+            true,
+            ctx.transport("policy", SocketKind::Rep),
+        );
+        return Ok(());
+    }
+
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
@@ -381,10 +441,61 @@ fn register_service_key(
         signing_key.clone(),
         creds_dir,
         secrets_profile,
+        false,
         policy_transport,
     );
 
     Ok(())
+}
+
+fn policy_client_for_deployment(
+    ctx: &ServiceContext,
+    signing_key: SigningKey,
+    policy_verifying_key: VerifyingKey,
+    token: Option<String>,
+) -> anyhow::Result<PolicyClient> {
+    if ctx.iroh_required() {
+        PolicyClient::from_resolver(signing_key, token)
+    } else {
+        // Deterministic same-host PolicyService IPC endpoint: unlike
+        // `registered_endpoint`, it is available to a separate `podman exec`
+        // process that did not start the PolicyService itself.
+        PolicyClient::for_local_transport_bootstrap(
+            &ctx.transport("policy", SocketKind::Rep),
+            signing_key,
+            policy_verifying_key,
+            token,
+        )
+    }
+}
+
+fn schedule_network_service_key_registration(
+    service_name: &str,
+    signing_key: SigningKey,
+    service_jwt: String,
+) {
+    let service_name = service_name.to_owned();
+    tokio::spawn(async move {
+        let mut delay = std::time::Duration::from_secs(2);
+        loop {
+            let attempt = async {
+                let client = PolicyClient::from_resolver(signing_key.clone(), Some(service_jwt.clone()))?;
+                client.register_service_key(&RegisterServiceKey {
+                    service_name: service_name.clone(),
+                    verifying_key: signing_key.verifying_key().as_bytes().to_vec(),
+                    service_jwt: service_jwt.clone(),
+                }).await.map_err(|error| anyhow::anyhow!(error))
+            }.await;
+            match attempt {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(service = %service_name, "Policy registration over production resolver is not ready; retrying: {error}");
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(std::time::Duration::from_secs(30));
+                }
+            }
+        }
+    });
 }
 
 /// Decode the `exp` claim from a JWT without verifying the signature.
@@ -411,6 +522,7 @@ fn spawn_jwt_renewal_task(
     signing_key: SigningKey,
     credentials_dir: std::path::PathBuf,
     secrets_profile: crate::auth::identity_store::SecretsProfile,
+    iroh_required: bool,
     policy_transport: hyprstream_rpc::transport::TransportConfig,
 ) {
     let service_name = service_name.to_owned();
@@ -469,12 +581,16 @@ fn spawn_jwt_renewal_task(
                 (vk, svc_jwt)
             };
 
-            let policy_client = match policy_client_for_transport(
-                &policy_transport,
-                signing_key.clone(),
-                policy_vk,
-                Some(current_jwt),
-            ) {
+    let policy_client = match if iroh_required {
+        PolicyClient::from_resolver(signing_key.clone(), Some(current_jwt))
+    } else {
+        policy_client_for_transport(
+            &policy_transport,
+            signing_key.clone(),
+            policy_vk,
+            Some(current_jwt),
+        )
+    } {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(service = service_name, error = %e, "failed to create PolicyClient; skipping JWT renewal");
@@ -820,6 +936,7 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 #[service_factory("policy", schema = "../../../hyprstream-rpc-std/schema/policy.capnp", metadata = crate::services::generated::policy_client::schema_metadata)]
 fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating PolicyService");
+    register_service_key(ctx, "policy", &ctx.service_signing_key("policy"))?;
 
     let policies_dir = ctx.models_dir().join(".registry").join("policies");
 
@@ -881,13 +998,30 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     });
 
     let config = load_config();
+    // Bind issuance and revocation horizons by construction: the revocation
+    // authority's retention bound derives from every configured issuance
+    // maximum (plus one day of clock-skew margin), so an operator raising
+    // token TTLs automatically raises the revocation horizon — no issuable
+    // credential can outlive its revocability. The service-JWT renewal clamp
+    // (policy.capnp RefreshServiceTokenRequest, hard 30 days) has no config
+    // field and is included as a constant.
+    const SERVICE_JWT_MAX_TTL_SECS: u32 = 2_592_000; // 30 days
+    let revocation_max_ttl_secs = i64::from(
+        config
+            .token
+            .max_ttl_seconds
+            .max(config.oauth.token_ttl_seconds)
+            .max(config.oauth.refresh_token_ttl_seconds)
+            .max(SERVICE_JWT_MAX_TTL_SECS),
+    ) + 86_400;
     let mut policy_service = PolicyService::new(
         policy_manager,
         Arc::new(ctx.signing_key().clone()),
-        TokenConfig::default(),
+        config.token.clone(),
         git2db,
         ctx.transport("policy", SocketKind::Rep),
     );
+    policy_service = policy_service.with_revocation_max_ttl_secs(revocation_max_ttl_secs);
     if let Some(issuer) = ctx.oauth_issuer_url() {
         policy_service = policy_service.with_default_audience(issuer.to_owned());
     }
@@ -922,10 +1056,10 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         policy_service = policy_service.with_ml_dsa_key_store(ml_dsa_store);
     }
 
-    // Publish the JTI blocklist Arc so OAuthService (created later) can share it.
-    // This wires POST /oauth/revoke → PolicyService RPC enforcement: a revoked
-    // access token is rejected by both the HTTP path and the RPC auth check.
-    let _ = SHARED_JTI_BLOCKLIST.set(policy_service.jti_blocklist_arc());
+    // The authority stores (credential revocation + session registry) are
+    // published once per process by
+    // `services::revocation::init_process_authority_stores` from
+    // the main.rs startup block, before any factory runs — not here.
 
     Ok(ctx.into_spawnable_quic(policy_service, config.policy.quic_port))
 }
@@ -954,7 +1088,8 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // #910a — the registry service is the sole PDS-record writer AND the sole
     // holder of the `#atproto` private key: it opens the durable store
@@ -1215,7 +1350,8 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // Create registry client
     let registry_client: RegistryClient =
@@ -1468,7 +1604,12 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client = policy_client_for_deployment(
+        ctx,
+        sk.clone(),
+        policy_vk,
+        service_token(&sk),
+    )?;
     worker_service.set_authorize_fn(super::worker::build_authorize_fn(policy_client));
     if let Some(issuer) = ctx.oauth_issuer_url() {
         worker_service.set_expected_audience(issuer.to_owned());
@@ -1543,7 +1684,12 @@ fn create_workflow_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client = policy_client_for_deployment(
+        ctx,
+        sk.clone(),
+        policy_vk,
+        service_token(&sk),
+    )?;
     workflow_service.set_authorize_fn(crate::services::worker::build_authorize_fn(policy_client));
     if let Some(issuer) = ctx.oauth_issuer_url() {
         workflow_service.set_expected_audience(issuer.to_owned());
@@ -1630,7 +1776,8 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // Create registry client
     let registry_client: RegistryClient =
@@ -1674,12 +1821,6 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                 resource_url,
                 oauth_issuer_url,
                 &config.oauth.trusted_issuers,
-                // Share the PolicyService-owned JTI blocklist so POST /oauth/revoke
-                // immediately invalidates tokens at the OAI resource server.
-                SHARED_JTI_BLOCKLIST
-                    .get()
-                    .map(Arc::clone)
-                    .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new())),
                 ninep_decider,
             )
             .await
@@ -1733,21 +1874,17 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     let federation_resolver = Arc::new(
         crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
             .with_policy_client(Arc::new(policy_client)),
     );
-    let jti_blocklist = SHARED_JTI_BLOCKLIST
-        .get()
-        .map(Arc::clone)
-        .context("PolicyService did not publish the shared JTI blocklist before Xet startup")?;
     let auth = ResourceAuthState::new(
         ctx.jwt_verifying_key(),
         config.xet.resource_url(),
         config.oauth.issuer_url(),
         federation_resolver,
-        jti_blocklist,
     );
     let cas_pep = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(crate::mac::production_cas_pep(
@@ -1828,21 +1965,17 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     let federation_resolver = Arc::new(
         crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
             .with_policy_client(Arc::new(policy_client.clone())),
     );
-    let jti_blocklist = SHARED_JTI_BLOCKLIST
-        .get()
-        .map(Arc::clone)
-        .context("PolicyService did not publish the shared JTI blocklist before Flight startup")?;
     let auth = crate::server::state::ResourceAuthState::new(
         ctx.jwt_verifying_key(),
         config.flight.resource_url(),
         config.oauth.issuer_url(),
         federation_resolver,
-        jti_blocklist,
     );
     let authorizer = Arc::new(crate::services::flight::TenantFlightAuthorizer::new(
         auth,
@@ -1904,7 +2037,7 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     // Pass signing key instead of a pre-created PolicyClient.
     // OAuthService runs in its own tokio runtime (separate thread), so the
     // PolicyClient must be created inside that runtime for ZMQ async I/O to work.
-    let mut oauth_service = OAuthService::new(
+    let oauth_service = OAuthService::new(
         config.oauth.clone(),
         config.tls.clone(),
         config.account.clone(),
@@ -1917,13 +2050,6 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     )
     .with_quic_config(config.quic.clone())
     .with_identity_registration_api(identity_registration_api);
-    if let Some(bl) = SHARED_JTI_BLOCKLIST.get() {
-        oauth_service = oauth_service.with_jti_blocklist(Arc::clone(bl));
-    } else {
-        tracing::warn!(
-            "JTI blocklist not set by PolicyService factory — revoked access tokens will not be blocked at RPC layer"
-        );
-    }
 
     Ok(Box::new(oauth_service))
 }
@@ -1992,7 +2118,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         if let Some(fed) = federation_key_source {
             fed
         } else {
-            let fallback_policy_client = std::sync::Arc::new(policy_client_for_context(
+            let fallback_policy_client = std::sync::Arc::new(policy_client_for_deployment(
                 ctx,
                 ctx.service_signing_key("mcp"),
                 policy_vk,
@@ -2057,8 +2183,8 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                     let mcp_oauth_issuer_clone = mcp_oauth_issuer.clone();
                     let mcp_federation_resolver = mcp_federation_resolver.clone();
                     let jwt_key_source = jwt_key_source.clone();
-                    // Capture shared JTI blocklist for revocation checks (RFC 7009)
-                    let mcp_jti_blocklist = SHARED_JTI_BLOCKLIST.get().map(Arc::clone);
+                    // The credential-revocation store is global; no per-service
+                    // capture needed.
                     // DPoP JTI replay cache (separate from OAI server's, RFC 9449).
                     // 1,000 sustained DPoP proofs/s for the admitted 180s
                     // maximum residency (60s future iat skew + 120s), plus
@@ -2076,12 +2202,10 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                         let mcp_oauth_issuer = mcp_oauth_issuer_clone.clone();
                         let federation_resolver = mcp_federation_resolver.clone();
                         let jwt_key_source = jwt_key_source.clone();
-                        let jti_blocklist = mcp_jti_blocklist.clone();
                         let dpop_jti_seen = mcp_dpop_jti_seen.clone();
                         async move {
                             use axum::http::{header, StatusCode};
                             use axum::response::IntoResponse;
-                            use hyprstream_rpc::auth::JtiBlocklist as _;
                             use subtle::ConstantTimeEq as _;
                             let method = req.method().clone();
                             let uri = req.uri().clone();
@@ -2194,10 +2318,31 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                 tracing::warn!(%method, %uri, "MCP auth rejected: invalid subject");
                                 return (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
                             }
-                            // JTI revocation check (RFC 7009)
+                            // Credential revocation check — fail-closed on
+                            // store absence: a token with a jti that cannot
+                            // be checked for revocation is rejected. Local
+                            // tokens MUST carry a jti (profile REQUIRED
+                            // claim); a local token without one is rejected.
+                            let token_is_local =
+                                hyprstream_rpc::auth::is_local_iss(&claims.iss, &local_issuers);
+                            if token_is_local && claims.jti.is_none() {
+                                tracing::warn!(%method, %uri, iss = %claims.iss, "MCP: local token without jti rejected");
+                                let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                    res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                }
+                                return res;
+                            }
                             if let Some(ref jti) = claims.jti {
-                                let revoked = jti_blocklist.as_ref().map(|bl| bl.is_revoked(jti)).unwrap_or(false);
-                                if revoked {
+                                let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
+                                let revoked_or_unavailable = match hyprstream_rpc::auth::global_credential_revocation_store() {
+                                    Some(bl) => bl.is_revoked(&cred_id).await,
+                                    None => {
+                                        tracing::warn!(%method, %uri, %jti, "MCP: no revocation store configured — rejecting token with jti");
+                                        true // fail-closed
+                                    }
+                                };
+                                if revoked_or_unavailable {
                                     tracing::warn!(%method, %uri, %jti, sub = %claims.sub, "MCP: revoked token presented");
                                     let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
                                     if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
@@ -2205,6 +2350,60 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                     }
                                     return res;
                                 }
+                            }
+                            // Session check (v16 §3.3): a local token carrying
+                            // a session ID is rejected when the session is
+                            // revoked, unknown, or cannot be checked.
+                            if token_is_local {
+                                let session_key = match claims.session_key() {
+                                    Ok(key) => key,
+                                    Err(e) => {
+                                        tracing::warn!(%method, %uri, error = %e, "MCP: malformed session claims rejected");
+                                        let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                        if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                            res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                        }
+                                        return res;
+                                    }
+                                };
+                                if let Some(session_key) = session_key {
+                                    let session_inactive = match hyprstream_rpc::auth::global_session_registry() {
+                                        Some(registry) => registry.is_revoked(&session_key).await,
+                                        None => {
+                                            tracing::warn!(%method, %uri, "MCP: no session registry configured — rejecting token with session id");
+                                            true // fail-closed
+                                        }
+                                    };
+                                    if session_inactive {
+                                        tracing::warn!(%method, %uri, sub = %claims.sub, "MCP: token with revoked/unknown session presented");
+                                        let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                        if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                            res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                        }
+                                        return res;
+                                    }
+                                }
+                            }
+                            // RFC 9068 §2.2.1 (v16 credential profile): an
+                            // `at+jwt` access token presented to MCP MUST carry
+                            // a non-empty `client_id`. Positively typed on the
+                            // JOSE `typ`; `wit+jwt`/other types are exempt.
+                            if hyprstream_rpc::auth::parse_protected_header(&t)
+                                .ok()
+                                .is_some_and(|h| {
+                                    hyprstream_rpc::auth::is_rfc9068_access_token_type(&h.typ)
+                                })
+                                && claims
+                                    .client_id
+                                    .as_deref()
+                                    .is_none_or(|c| c.trim().is_empty())
+                            {
+                                tracing::warn!(%method, %uri, sub = %claims.sub, "MCP: at+jwt without client_id rejected");
+                                let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                    res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                }
+                                return res;
                             }
                             // DPoP binding enforcement (RFC 9449 §7):
                             // cnf.jkt tokens MUST be presented with DPoP scheme + proof header.
@@ -2429,7 +2628,8 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     // Build the direct-VFS PEP before exposing the namespace. Failure to open
     // its signed WAL aborts construction; there is no unarmed fallback.
@@ -2521,7 +2721,8 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     let auth_provider = crate::services::discovery::PolicyAuthProvider::new(policy_client);
 
     // #431 — record resolver backing getRecord/getRepo, over the durable
@@ -2619,7 +2820,60 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     // TODO: DiscoveryService federation key source support
     // (federation_key_source not yet implemented on DiscoveryService)
 
-    Ok(ctx.into_spawnable_quic(discovery_service, config.discovery.quic_port))
+    let publisher = if ctx.iroh_required() {
+        Some(discovery_self_publisher(discovery_service.self_announcer()?))
+    } else { None };
+    Ok(ctx.into_spawnable_quic_with_publisher(discovery_service, config.discovery.quic_port, publisher))
+}
+
+fn discovery_self_publisher(owner: hyprstream_discovery::DiscoverySelfAnnouncer) -> hyprstream_service::NativeAnnouncementPublisher {
+    let owner = Arc::new(owner);
+    Arc::new(move |mut request| {
+        let owner = owner.clone();
+        let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime,
+                Err(error) => { let _ = first_tx.send(Err(error.to_string())); return; }
+            };
+            runtime.block_on(async move {
+                let mut first_tx = Some(first_tx);
+                let mut delay = std::time::Duration::from_secs(5);
+                let cancellation = request.cancellation.clone();
+                loop {
+                    let result = tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err(anyhow::anyhow!("Discovery self publication cancelled")),
+                        result = async {
+                            let announcement = current_native_announcement(&mut request)?;
+                            owner.publish(&announcement).await
+                        } => result,
+                    };
+                    if let Some(tx) = first_tx.take() {
+                        let _ = tx.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                        if result.is_err() { return; }
+                    }
+                    if cancellation.is_cancelled() { return; }
+                    let wait = match result {
+                        Ok(()) => { delay = std::time::Duration::from_secs(5); std::time::Duration::from_secs(25) }
+                        Err(error) => {
+                            tracing::warn!("Discovery self publication refresh failed: {error}");
+                            let wait = delay;
+                            delay = delay.saturating_mul(2).min(std::time::Duration::from_secs(25));
+                            wait
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => return,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                }
+            });
+        });
+        first_rx.recv().map_err(|_| anyhow::anyhow!("Discovery self publication ended before readiness"))?
+            .map_err(anyhow::Error::msg)
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2678,7 +2932,8 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = policy_client_for_context(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client =
+        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
 
     let mut metrics_service = MetricsService::new(
         orchestrator,
@@ -2784,6 +3039,102 @@ mod tests {
     }
 
     #[test]
+    fn checkpointed_service_selection_uses_canonical_id_and_current_signer() {
+        use hyprstream_pds::at9p::{
+            CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
+        };
+        use hyprstream_pds::at9p_duplicity::AcceptedAt9pState;
+        use hyprstream_pds::at9p_gate::verify_genesis_capsule;
+        use hyprstream_pds::at9p_sign::sign_capsule;
+        use hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes;
+
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signer);
+        let key = HybridKeyPair::new(
+            signer.verifying_key().to_bytes().to_vec(),
+            ml_dsa_sk_to_vk_bytes(&pq),
+        )
+        .unwrap();
+        let endpoint = ServiceEndpoint::new(
+            Transport::Iroh,
+            format!("iroh://{}", hex::encode([0x72; 32])),
+        )
+        .unwrap();
+        let service = ServiceEntry::new("#model", ServiceType::NinePExport, endpoint).unwrap();
+        let body = CapsuleBody::new(vec![key], vec![service]).unwrap();
+        let genesis = sign_capsule(body, &signer, &pq).unwrap();
+        let verified = verify_genesis_capsule(
+            &genesis.cid512().unwrap(),
+            &genesis.to_dag_cbor().unwrap(),
+        )
+        .unwrap();
+        let state = AcceptedAt9pState::from_verified_genesis(&verified).unwrap();
+        let key = signer.verifying_key().to_bytes();
+        assert!(accepted_state_matches_service(&state, "model", &key));
+        assert!(!accepted_state_matches_service(&state, "#model", &key));
+        assert!(!accepted_state_matches_service(&state, "registry", &key));
+        assert!(!accepted_state_matches_service(&state, "model", &[0x73; 32]));
+        // Selection does not weaken the separate bounded-successor gate.
+        let error = hyprstream_service::NativeServiceAnnouncement::from_accepted_state(
+            "model", &signer, &state,
+        )
+        .err()
+        .expect("genesis alone cannot authorize a production announcement");
+        assert!(error.to_string().contains("bounded production expiry"));
+    }
+
+    /// Compatibility checkpoints may legitimately predate a `#discovery`
+    /// identity (the compatibility discovery factory installs its
+    /// self-publisher only under `iroh_required`), so the checkpoint
+    /// announcement loop must exempt Discovery outside the required profile
+    /// while required mode keeps demanding the checkpoint.
+    #[test]
+    fn checkpoint_announcements_keep_discovery_optional_outside_required_profile() {
+        assert!(!checkpoint_announces_service(false, "discovery"));
+        assert!(checkpoint_announces_service(false, "model"));
+        assert!(checkpoint_announces_service(false, "policy"));
+        // Required mode stays strict: the owned publication path refuses to
+        // publish without the checkpoint bundle, so Discovery stays gated.
+        assert!(checkpoint_announces_service(true, "discovery"));
+        assert!(checkpoint_announces_service(true, "model"));
+
+        // The exemption must live inside the loop itself, not beside it: the
+        // loop routes every service through the compatibility decision.
+        let source = include_str!("factories.rs");
+        let start = source
+            .find("pub fn with_checkpointed_native_announcements(")
+            .expect("checkpoint announcement loop");
+        let rest = &source[start..];
+        let end = rest.find("\npub fn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("checkpoint_announces_service(iroh_required, name)"),
+            "the checkpoint loop must route services through the compatibility decision"
+        );
+    }
+
+    #[test]
+    fn native_deployment_chain_has_no_local_policy_bootstrap() {
+        let source = include_str!("factories.rs");
+        for function in [
+            "fn register_service_key(",
+            "fn create_registry_service(",
+            "fn create_model_service(",
+            "fn create_oai_service(",
+        ] {
+            let start = source.find(function).expect("production factory function");
+            let rest = &source[start..];
+            let end = rest.find("\nfn ").unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                !body.contains("for_local_bootstrap"),
+                "{function} must not construct a local Policy client in the deployed chain"
+            );
+        }
+        assert!(source.contains("PolicyClient::from_resolver"));
+    }
+
+    #[test]
     fn at9p_verify_factory_uses_canonical_service_name() {
         let factory =
             hyprstream_service::get_factory(crate::services::at9p_verify::SERVICE_NAME)
@@ -2822,6 +3173,19 @@ mod tests {
             factory.metadata.is_some(),
             "workflow factory must expose schema_metadata for scope discovery"
         );
+    }
+
+    #[test]
+    fn required_startup_uses_discovery_before_policy_from_real_inventory() {
+        use hyprstream_service::service::ordering::startup_stages_for_profile;
+        let roster = ["discovery", "policy", "registry", "model"];
+        for required in [false, true] {
+            let stages = startup_stages_for_profile(&roster, required);
+            let stage = |name: &str| stages.iter().position(|items| items.iter().any(|item| item == name)).expect("registered service");
+            assert_eq!(stage("discovery") < stage("policy"), required);
+            assert!(stage("registry") > stage("discovery"));
+            assert!(stage("model") > stage("policy"));
+        }
     }
 
     /// The Phase-0 namespace skeleton mounts `/bin`, `/env`, `/out` for the
@@ -2891,6 +3255,42 @@ mod tests {
             msg.contains("cannot register its signing key"),
             "error names the real cause: {msg}",
         );
+    }
+
+    #[test]
+    fn required_policy_loads_provisioned_jwt_without_self_rpc() -> anyhow::Result<()> {
+        const CHILD: &str = "HYPRSTREAM_POLICY_REGISTRATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "services::factories::tests::required_policy_loads_provisioned_jwt_without_self_rpc", "--nocapture"])
+                .env(CHILD, "1").status()?;
+            anyhow::ensure!(status.success(), "isolated Policy credential test failed");
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        std::env::set_var("HYPRSTREAM__SECRETS__PATH", dir.path());
+        std::env::remove_var(crate::auth::identity_store::SECRETS_PROFILE_ENV);
+        let signer = SigningKey::from_bytes(&[0x69; 32]);
+        let ctx = ServiceContext::new(signer.clone(), signer.verifying_key(), true, dir.path().to_owned())
+            .with_quic(hyprstream_service::QuicSharedConfig {
+                cert_chain: Vec::new(), key_der: zeroize::Zeroizing::new(Vec::new()),
+                base_ip: std::net::Ipv4Addr::LOCALHOST.into(), server_name: "policy.test".to_owned(),
+                oauth_issuer_url: None, jwt_verifying_key: None, iroh_enabled: true, iroh_required: true,
+                moq_relay: None, native_announcement_publisher: None,
+                moq_relay_server_identity: None, moq_admission: None,
+                moq_ingress_authorizer: None, moq_admission_proof: None,
+            });
+        assert!(register_service_key(&ctx, "policy", &signer).is_err());
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new("service:policy".to_owned(), now, now + 3600)
+            .with_cnf_jwk(signer.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &signer);
+        crate::auth::identity_store::write_service_jwt(dir.path(), "policy", &jwt)?;
+        // No runtime, resolver or RPC endpoint exists in this child.
+        register_service_key(&ctx, "policy", &signer)?;
+        assert_eq!(hyprstream_service::global_trust_store().get(&signer.verifying_key())
+            .and_then(|attestation| attestation.jwt), Some(jwt));
+        Ok(())
     }
 
     /// A JWT already present in the trust store is used directly (no disk read).

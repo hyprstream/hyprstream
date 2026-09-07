@@ -534,6 +534,7 @@ fn register_scoped_tools_recursive(
                                 dh_public,
                                 reach,
                                 broadcast_path,
+                                moql_server_identity,
                             } = decode_stream_reach(stream_info)?;
                             // #321: derive_client_stream_keys yields the AEAD enc_key.
                             let (mac_key, enc_key, topic) =
@@ -544,13 +545,14 @@ fn register_scoped_tools_recursive(
                                 )?;
                             // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
                             let qos = hyprstream_rpc::stream_info::StreamOpt::default();
-                            let handle = MoqStreamHandle::networked(
+                            let handle = MoqStreamHandle::networked_with_server_identity(
                                 reach,
                                 &qos,
                                 broadcast_path,
                                 mac_key,
                                 enc_key,
                                 topic,
+                                moql_server_identity,
                             );
 
                             Ok(ToolResult::Stream(Box::new(handle)))
@@ -712,6 +714,7 @@ fn register_streaming_tool(
                     dh_public,
                     reach,
                     broadcast_path,
+                    moql_server_identity,
                 } = decode_stream_reach(stream_info)?;
                 // #321: derive_client_stream_keys yields the AEAD enc_key.
                 let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
@@ -721,13 +724,14 @@ fn register_streaming_tool(
                 )?;
                 // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
                 let qos = hyprstream_rpc::stream_info::StreamOpt::default();
-                let handle = MoqStreamHandle::networked(
+                let handle = MoqStreamHandle::networked_with_server_identity(
                     reach,
                     &qos,
                     broadcast_path,
                     mac_key,
                     enc_key,
                     topic,
+                    moql_server_identity,
                 );
 
                 Ok(ToolResult::Stream(Box::new(handle)))
@@ -788,6 +792,8 @@ struct DecodedStreamReach {
     dh_public: [u8; 32],
     reach: Vec<hyprstream_rpc::stream_info::Destination>,
     broadcast_path: String,
+    /// Resolver-verified identity of the server that signed this response.
+    moql_server_identity: hyprstream_rpc::stream_info::MoqlServerIdentity,
 }
 
 /// Decode a streaming response into its moq reach (#356).
@@ -812,6 +818,7 @@ fn decode_stream_reach(
         dh_public: info.dh_public,
         reach: info.announced_at,
         broadcast_path: info.broadcast_path,
+        moql_server_identity: info.moql_server_identity,
     })
 }
 
@@ -939,12 +946,20 @@ impl McpService {
             tool_reg.by_uuid.len(),
         );
 
-        let policy_client = PolicyClient::for_local_transport_bootstrap(
-            &config.policy_transport,
-            config.signing_key.clone(),
-            config.policy_verifying_key,
-            None,
-        )?;
+        // Required profile resolves through the checkpoint-backed discovery
+        // resolver; compatibility dials the factory-resolved deterministic
+        // IPC transport — registry-free, so a separate rootless Quadlet
+        // process can reach the PolicyService socket.
+        let policy_client = if hyprstream_discovery::native_network_required() {
+            PolicyClient::from_resolver(config.signing_key.clone(), None)?
+        } else {
+            PolicyClient::for_local_transport_bootstrap(
+                &config.policy_transport,
+                config.signing_key.clone(),
+                config.policy_verifying_key,
+                None,
+            )?
+        };
 
         Ok(Self {
             registry: Arc::new(RwLock::new(tool_reg)),

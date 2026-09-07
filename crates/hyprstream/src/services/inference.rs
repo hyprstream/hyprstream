@@ -1465,6 +1465,7 @@ impl InferenceService {
             qos: stream_ctx.qos().clone(),
             broadcast_path,
             announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
+            moql_server_identity: stream_ctx.moql_server_identity(),
             kem_ciphertexts: Vec::new(), // #554: classical stream (dh_public path), no hybrid KEM
         };
 
@@ -2339,6 +2340,7 @@ impl InferenceHandler for InferenceService {
             qos: <hyprstream_rpc::stream_info::Job as hyprstream_rpc::stream_info::StreamOptPreset>::stream_opt(),
             broadcast_path,
             announced_at: reach,
+            moql_server_identity: Default::default(),
             kem_ciphertexts: Vec::new(), // #554: classical stream (dh_public path), no hybrid KEM
         };
 
@@ -2568,6 +2570,7 @@ impl InferenceHandler for InferenceService {
             qos: stream_ctx.qos().clone(),
             broadcast_path,
             announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
+            moql_server_identity: stream_ctx.moql_server_identity(),
             kem_ciphertexts: Vec::new(), // #554: classical stream (dh_public path), no hybrid KEM
         };
 
@@ -3144,6 +3147,8 @@ async fn serve_inference_bridged(
         hyprstream_rpc::moq_stream::serve_origin_to_relay_background(
             origin.producer().clone(),
             relay,
+            qc.moq_admission_proof.clone(),
+            qc.moq_relay_server_identity.take(),
         );
     }
 
@@ -3293,9 +3298,19 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                         .ok_or_else(|| {
                             anyhow::anyhow!("trust store has no policy key — startup must populate it")
                         })?;
-                    let policy_client = PolicyClient::for_local_transport_bootstrap(
-                        &policy_transport, policy_signing_key, policy_vk, None,
-                    )?;
+                    // Required profile resolves through the checkpoint-backed
+                    // discovery resolver; compatibility dials the factory-
+                    // resolved deterministic IPC transport.
+                    let policy_client = if hyprstream_discovery::native_network_required() {
+                        PolicyClient::from_resolver(policy_signing_key, None)?
+                    } else {
+                        PolicyClient::for_local_transport_bootstrap(
+                            &policy_transport,
+                            policy_signing_key,
+                            policy_vk,
+                            None,
+                        )?
+                    };
                     let service = InferenceService::initialize(
                         model_path,
                         config,

@@ -27,12 +27,14 @@ use std::process::Command;
 
 /// Create a PolicyClient for RPC calls.
 ///
-/// PolicyService's identity is the node root/CA key, so the local bootstrap
-/// caller and the target response verifier intentionally use the same pinned
-/// key. The endpoint registry's IPC default is deterministic from the runtime
-/// directory; unlike `registered_endpoint`, it is available to a separate
+/// Required profile resolves through the checkpoint-backed discovery resolver;
+/// compatibility bootstrap dials the deterministic same-host PolicyService IPC
+/// endpoint, which unlike `registered_endpoint` is available to a separate
 /// `podman exec` process that did not start the PolicyService itself.
-fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
+pub(crate) fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
+    if hyprstream_discovery::native_network_required() {
+        return PolicyClient::from_resolver(signing_key.clone(), None);
+    }
     let registry = hyprstream_rpc::registry::try_global()
         .ok_or_else(|| anyhow::anyhow!("EndpointRegistry not initialized"))?;
     let transport = policy_ipc_transport(&registry)?;

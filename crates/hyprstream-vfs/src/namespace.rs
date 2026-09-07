@@ -154,7 +154,7 @@ impl Namespace {
     /// Fail-closed when armed: any unresolvable clearance/label or failed
     /// `can_access` yields [`NamespaceError::Denied`].
     #[cfg(not(target_arch = "wasm32"))]
-    fn enforce(&self, subject: &Subject, path: &str, action: NamespaceAction) -> Result<(), NamespaceError> {
+    async fn enforce(&self, subject: &Subject, path: &str, action: NamespaceAction) -> Result<(), NamespaceError> {
         let Some(pep) = &self.pep else {
             return Ok(());
         };
@@ -163,11 +163,11 @@ impl Namespace {
         // performs prefix matching against genesis/bind-label carriers; the
         // namespace supplies only the path, never a caller-authored label.
         let normalized = normalize_path(path);
-        pep.authorize(subject, &normalized, action)
+        pep.authorize(subject, &normalized, action).await
     }
 
     #[cfg(target_arch = "wasm32")]
-    const fn enforce(
+    async fn enforce(
         &self,
         _subject: &Subject,
         _path: &str,
@@ -189,13 +189,13 @@ impl Namespace {
     }
 
     /// Subject-mediated `mount` — the runtime path under an armed PEP (#1272).
-    pub fn mount_as(
+    pub async fn mount_as(
         &mut self,
         prefix: &str,
         target: MountTarget,
         subject: &Subject,
     ) -> Result<(), NamespaceError> {
-        self.enforce(subject, prefix, NamespaceAction::Mount)?;
+        self.enforce(subject, prefix, NamespaceAction::Mount).await?;
         self.bind_mount_inner(prefix, target, BindFlag::Replace)
     }
 
@@ -224,14 +224,14 @@ impl Namespace {
     }
 
     /// Subject-mediated `bind_mount` — the runtime path under an armed PEP.
-    pub fn bind_mount_as(
+    pub async fn bind_mount_as(
         &mut self,
         prefix: &str,
         target: MountTarget,
         flag: BindFlag,
         subject: &Subject,
     ) -> Result<(), NamespaceError> {
-        self.enforce(subject, prefix, NamespaceAction::BindMount)?;
+        self.enforce(subject, prefix, NamespaceAction::BindMount).await?;
         self.bind_mount_inner(prefix, target, flag)
     }
 
@@ -300,8 +300,8 @@ impl Namespace {
     }
 
     /// Subject-mediated `unmount` — the runtime path under an armed PEP.
-    pub fn unmount_as(&mut self, prefix: &str, subject: &Subject) -> Result<(), NamespaceError> {
-        self.enforce(subject, prefix, NamespaceAction::Unmount)?;
+    pub async fn unmount_as(&mut self, prefix: &str, subject: &Subject) -> Result<(), NamespaceError> {
+        self.enforce(subject, prefix, NamespaceAction::Unmount).await?;
         let prefix = normalize_prefix(prefix);
         self.mounts.retain(|m| m.prefix != prefix);
         Ok(())
@@ -353,7 +353,7 @@ impl Namespace {
     /// Loops reads until an empty Vec is returned, up to 16MB cap.
     /// With union mounts, tries each target in bind order until one succeeds.
     pub async fn cat(&self, path: &str, caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
-        self.enforce(caller, path, NamespaceAction::Read)?;
+        self.enforce(caller, path, NamespaceAction::Read).await?;
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         let mut last_err = None;
@@ -391,7 +391,7 @@ impl Namespace {
     /// Unlike `cat()` which loops to EOF, this returns after one read call.
     /// For streams, this returns the next available block. Empty bytes = EOF.
     pub async fn read_one(&self, path: &str, caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
-        self.enforce(caller, path, NamespaceAction::Read)?;
+        self.enforce(caller, path, NamespaceAction::Read).await?;
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         let mut last_err = None;
@@ -431,7 +431,7 @@ impl Namespace {
     /// write to a path that resolves through the union dirty-over-committed
     /// tree lands in the upper layer, leaving the committed floor untouched.
     pub async fn echo(&self, path: &str, data: &[u8], caller: &Subject) -> Result<(), NamespaceError> {
-        self.enforce(caller, path, NamespaceAction::Write)?;
+        self.enforce(caller, path, NamespaceAction::Write).await?;
         let (entry, remainder) = self.resolve_entry(path)?;
         let targets = &entry.targets[..];
         let components: Vec<&str> = split_path(&remainder);
@@ -487,7 +487,7 @@ impl Namespace {
         perm: u32,
         caller: &Subject,
     ) -> Result<Stat, NamespaceError> {
-        self.enforce(caller, path, NamespaceAction::Create)?;
+        self.enforce(caller, path, NamespaceAction::Create).await?;
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         if components.is_empty() {
@@ -662,7 +662,7 @@ impl Namespace {
     /// Loops reads until an empty Vec is returned, up to 16MB cap.
     /// With union mounts, tries each target in bind order until one succeeds.
     pub async fn ctl(&self, path: &str, data: &[u8], caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
-        self.enforce(caller, path, NamespaceAction::Write)?;
+        self.enforce(caller, path, NamespaceAction::Write).await?;
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         let mut last_err = None;
@@ -704,7 +704,7 @@ impl Namespace {
     /// With union mounts, merges readdir results from all targets at the prefix,
     /// deduplicating by name (first occurrence wins, preserving bind order).
     pub async fn ls(&self, path: &str, caller: &Subject) -> Result<Vec<DirEntry>, NamespaceError> {
-        self.enforce(caller, path, NamespaceAction::Read)?;
+        self.enforce(caller, path, NamespaceAction::Read).await?;
         // Special case: ls "/" shows all mount prefixes as directories.
         if path == "/" || path.is_empty() {
             return Ok(self.root_dir_entries());
@@ -786,12 +786,50 @@ impl Namespace {
     ///
     /// `path` is normalised (`.`/`..` resolved, leading `/` enforced) before the
     /// longest-prefix match, identical to the convenience helpers.
-    pub fn resolve_targets(
+    ///
+    /// Async because an armed PEP revalidates credential-bearing cached
+    /// subject authority against the canonical revocation authority on every
+    /// call. The sync FUSE/vhost-user plane cannot await and uses
+    /// [`Self::resolve_targets_dormant`] instead.
+    pub async fn resolve_targets(
         &self,
         path: &str,
         caller: &Subject,
     ) -> Result<(Vec<MountTarget>, Vec<String>), NamespaceError> {
-        self.enforce(caller, path, NamespaceAction::ResolveHandle)?;
+        self.enforce(caller, path, NamespaceAction::ResolveHandle).await?;
+        self.route_targets(path)
+    }
+
+    /// Sync routing entry point for planes that serve only dormant (PEP-less)
+    /// namespaces from sync callbacks — the FUSE/vhost-user-fs session loop
+    /// (`hyprstream-vfs-server` over fuse-backend-rs) has no async frame per
+    /// operation, and the authorization revalidation requires an authority
+    /// RPC. An ARMED namespace therefore fails closed on every route through
+    /// this entry point: a plane that cannot revalidate cached authority
+    /// serves nothing rather than serving stale authority.
+    pub fn resolve_targets_dormant(
+        &self,
+        path: &str,
+        caller: &Subject,
+    ) -> Result<(Vec<MountTarget>, Vec<String>), NamespaceError> {
+        if self.pep_armed() {
+            return Err(NamespaceError::Denied(
+                NamespaceAction::ResolveHandle,
+                format!(
+                    "'{}': sync plane cannot revalidate subject authority",
+                    caller.name().unwrap_or("<anonymous>")
+                ),
+            ));
+        }
+        self.route_targets(path)
+    }
+
+    /// Longest-prefix routing shared by the enforcing and dormant entry
+    /// points.
+    fn route_targets(
+        &self,
+        path: &str,
+    ) -> Result<(Vec<MountTarget>, Vec<String>), NamespaceError> {
         let (targets, remainder) = self.resolve(path)?;
         let components = split_path(&remainder).into_iter().map(str::to_owned).collect();
         Ok((targets.to_vec(), components))
@@ -1084,7 +1122,7 @@ mod tests {
         // A longer prefix still wins over the root catch-all.
         assert_eq!(ns.cat("/stream/job/data", &test_subject()).await.unwrap(), b"chunk");
         // The rootfs itself is reachable at "/".
-        assert!(ns.resolve_targets("/", &test_subject()).is_ok());
+        assert!(ns.resolve_targets("/", &test_subject()).await.is_ok());
     }
 
     #[tokio::test]
@@ -1930,8 +1968,9 @@ mod tests {
         name: &'static str,
         ctx: SecurityContext,
     }
+    #[async_trait::async_trait]
     impl SubjectContextResolver for OneSubject {
-        fn resolve(&self, s: &Subject) -> Option<SecurityContext> {
+        async fn resolve(&self, s: &Subject) -> Option<SecurityContext> {
             (s.name() == Some(self.name)).then(|| self.ctx.clone())
         }
     }
@@ -2012,8 +2051,8 @@ mod tests {
     /// A caller cannot bypass an armed PEP by extracting the raw mount target.
     /// The capability boundary must deny before returning a handle when the
     /// caller has no verified clearance.
-    #[test]
-    fn resolve_targets_denies_without_clearance() {
+    #[tokio::test]
+    async fn resolve_targets_denies_without_clearance() {
         let mut ns = Namespace::new();
         ns.mount(
             "/public",
@@ -2023,7 +2062,7 @@ mod tests {
         ns.set_pep(deny_all_pep());
 
         assert!(matches!(
-            ns.resolve_targets("/public/f", &Subject::new("unverified")),
+            ns.resolve_targets("/public/f", &Subject::new("unverified")).await,
             Err(NamespaceError::Denied(
                 NamespaceAction::ResolveHandle,
                 _
@@ -2112,6 +2151,7 @@ mod tests {
         // The mediated `_as` path consults the PEP (deny-all ⇒ denied).
         let err = ns
             .mount_as("/x", Arc::new(MemMount::new(vec![])) as MountTarget, &Subject::new("a"))
+            .await
             .unwrap_err();
         assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Mount, _)));
     }

@@ -850,6 +850,7 @@ impl RegistryService {
             dh_public: *stream_ctx.server_pubkey(),
             broadcast_path,
             announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
+            moql_server_identity: stream_ctx.moql_server_identity(),
             ..Default::default()
         };
 
@@ -1093,6 +1094,7 @@ impl RegistryService {
             dh_public: *stream_ctx.server_pubkey(),
             broadcast_path,
             announced_at: stream_ctx.reach(),
+            moql_server_identity: stream_ctx.moql_server_identity(),
             ..Default::default()
         };
         let cas_pep = Arc::clone(&self.cas_pep);
@@ -1144,7 +1146,7 @@ impl RegistryService {
                 // produces zero bytes of output.
                 let resolver = crate::mac::CasObjectLabelResolver::from_domain(&domain);
                 let decision =
-                    cas_pep.check_read(&subject_id, verified_tenant.as_deref(), &resolver);
+                    cas_pep.check_read(&subject_id, verified_tenant.as_deref(), &resolver).await;
                 if !decision.is_permit() {
                     tracing::warn!(
                         target: "hyprstream.mac.cas_pep",

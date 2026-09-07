@@ -15,6 +15,7 @@ using import "/annotations.capnp".vfsPath;
 # TUI viewer can dial the producer's networked moq plane instead of its own local
 # UDS plane. Shared 1:1 with the inference StreamInfo's reach (streaming.capnp).
 using import "/streaming.capnp".Destination;
+using import "/streaming.capnp".MoqlServerIdentity;
 
 # ═══════════════════════════════════════════════════════════════════
 # Frame Types (streamed via StreamPublisher, not RPC)
@@ -401,6 +402,10 @@ struct StreamInfo {
   # viewers ignore this and use the same-host UDS fast path resolved from LOCAL
   # config (never advertised here).
   announcedAt @3 :List(Destination);
+  # Resolver-verified accepted-state witness for the TUI server that produced
+  # this record. Native Iroh viewers carry it into mutual admission; an empty
+  # witness fails closed rather than being silently replaced by local state.
+  moqlServerIdentity @4 :MoqlServerIdentity;
 }
 
 # Window information

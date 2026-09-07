@@ -187,9 +187,13 @@ impl RpcObjectLabelResolver for CasObjectLabelResolver {
 /// The #698 clearance primitives are available, but until a CAS-specific
 /// adapter is installed [`DenyAllClearanceSource`] returns `None` for every
 /// subject.
+///
+/// Async because the production source revalidates credential-bearing cache
+/// entries against the canonical revocation authority on every read.
+#[async_trait::async_trait]
 pub trait CasClearanceSource: Send + Sync {
     /// Resolve `subject_id` to its MAC clearance, or `None` if unresolvable.
-    fn clearance_for(
+    async fn clearance_for(
         &self,
         subject_id: &str,
         verified_tenant: Option<&str>,
@@ -202,8 +206,9 @@ pub trait CasClearanceSource: Send + Sync {
 /// safe default while no authority-backed CAS adapter is configured.
 pub struct DenyAllClearanceSource;
 
+#[async_trait::async_trait]
 impl CasClearanceSource for DenyAllClearanceSource {
-    fn clearance_for(
+    async fn clearance_for(
         &self,
         _subject_id: &str,
         _verified_tenant: Option<&str>,
@@ -217,8 +222,9 @@ impl CasClearanceSource for DenyAllClearanceSource {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VerifiedClaimsCasClearanceSource;
 
+#[async_trait::async_trait]
 impl CasClearanceSource for VerifiedClaimsCasClearanceSource {
-    fn clearance_for(
+    async fn clearance_for(
         &self,
         subject_id: &str,
         verified_tenant: Option<&str>,
@@ -227,6 +233,7 @@ impl CasClearanceSource for VerifiedClaimsCasClearanceSource {
             &Subject::new(subject_id.to_owned()),
             verified_tenant,
         )
+        .await
     }
 }
 
@@ -277,7 +284,7 @@ impl CasPep {
     /// - missing object label (resolver returns `None`, per #547)
     /// - audit failure (downgraded to deny)
     #[must_use]
-    pub fn check_read(
+    pub async fn check_read(
         &self,
         subject_id: &str,
         verified_tenant: Option<&str>,
@@ -288,10 +295,11 @@ impl CasPep {
             verified_tenant,
             resolver.resolve(CAS_SERVICE_DOMAIN, None),
         )
+        .await
     }
 
     /// Internal: resolve clearance, check dominance, audit.
-    fn check(
+    async fn check(
         &self,
         subject_id: &str,
         verified_tenant: Option<&str>,
@@ -300,6 +308,7 @@ impl CasPep {
         let Some(ctx) = self
             .clearance_source
             .clearance_for(subject_id, verified_tenant)
+            .await
         else {
             return self.audit(
                 subject_id,
@@ -441,8 +450,9 @@ impl MacCasAuthorizer {
     }
 }
 
+#[async_trait::async_trait]
 impl crate::storage::cas::CasMountAuthorizer for MacCasAuthorizer {
-    fn authorize(
+    async fn authorize(
         &self,
         caller: &Subject,
         request: crate::storage::cas::CasMountAuthzRequest<'_>,
@@ -450,7 +460,8 @@ impl crate::storage::cas::CasMountAuthorizer for MacCasAuthorizer {
         let resolver = CasObjectLabelResolver::from_domain(request.domain);
         let decision = self
             .pep
-            .check_read(&caller.to_string(), request.verified_tenant, &resolver);
+            .check_read(&caller.to_string(), request.verified_tenant, &resolver)
+            .await;
         if decision.is_permit() {
             Ok(())
         } else {
@@ -581,28 +592,28 @@ mod tests {
 
     // ── DenyAllClearanceSource ──────────────────────────────────────────────
 
-    #[test]
-    fn deny_all_clearance_source_returns_none() {
+    #[tokio::test]
+    async fn deny_all_clearance_source_returns_none() {
         let src = DenyAllClearanceSource;
-        assert!(src.clearance_for("anyone", Some("tenant-a")).is_none());
-        assert!(src.clearance_for("admin", None).is_none());
+        assert!(src.clearance_for("anyone", Some("tenant-a")).await.is_none());
+        assert!(src.clearance_for("admin", None).await.is_none());
     }
 
     // ── CasPep fail-closed ──────────────────────────────────────────────────
 
-    #[test]
-    fn fail_closed_pep_denies_every_read() {
+    #[tokio::test]
+    async fn fail_closed_pep_denies_every_read() {
         let pep = CasPep::fail_closed();
         let label = domain_label(&DedupDomain::local_default());
         let labeled = CasObjectLabelResolver::new(Some(label));
         assert_eq!(
-            pep.check_read("any-subject", Some("tenant-a"), &labeled),
+            pep.check_read("any-subject", Some("tenant-a"), &labeled).await,
             MacDecision::Deny(MacDenyReason::NoClearance)
         );
         // Unlabeled object also denies.
         let unlabeled = CasObjectLabelResolver::new(None);
         assert_eq!(
-            pep.check_read("any-subject", Some("tenant-a"), &unlabeled),
+            pep.check_read("any-subject", Some("tenant-a"), &unlabeled).await,
             MacDecision::Deny(MacDenyReason::NoClearance)
         );
     }
@@ -614,8 +625,9 @@ mod tests {
         ctx: SecurityContext,
     }
 
+    #[async_trait::async_trait]
     impl CasClearanceSource for FixtureClearance {
-        fn clearance_for(
+        async fn clearance_for(
             &self,
             subject_id: &str,
             _verified_tenant: Option<&str>,
@@ -637,8 +649,9 @@ mod tests {
 
     struct TenantClearance;
 
+    #[async_trait::async_trait]
     impl CasClearanceSource for TenantClearance {
-        fn clearance_for(
+        async fn clearance_for(
             &self,
             subject_id: &str,
             verified_tenant: Option<&str>,
@@ -648,9 +661,9 @@ mod tests {
         }
     }
 
-    fn check(pep: &CasPep, subject_id: &str, label: Option<SecurityLabel>) -> MacDecision {
+    async fn check(pep: &CasPep, subject_id: &str, label: Option<SecurityLabel>) -> MacDecision {
         let resolver = CasObjectLabelResolver::new(label);
-        pep.check_read(subject_id, Some("tenant-a"), &resolver)
+        pep.check_read(subject_id, Some("tenant-a"), &resolver).await
     }
 
     #[derive(Default)]
@@ -665,8 +678,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pep_permits_when_clearance_dominates_label() {
+    #[tokio::test]
+    async fn pep_permits_when_clearance_dominates_label() {
         let sink = Arc::new(SpySink::default());
         let pep = CasPep::new(
             Arc::new(FixtureClearance {
@@ -676,29 +689,29 @@ mod tests {
             sink.clone(),
         );
         let label = domain_label(&DedupDomain::local_default()); // Internal
-        assert_eq!(check(&pep, "secret-user", Some(label)), MacDecision::Permit);
+        assert_eq!(check(&pep, "secret-user", Some(label)).await, MacDecision::Permit);
 
         let records = sink.records.lock();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].decision, Decision::Permit);
     }
 
-    #[test]
-    fn pep_threads_verified_tenant_to_clearance_source() {
+    #[tokio::test]
+    async fn pep_threads_verified_tenant_to_clearance_source() {
         let pep = CasPep::new(Arc::new(TenantClearance), Arc::new(SpySink::default()));
         let resolver = CasObjectLabelResolver::from_domain(&DedupDomain::local_default());
         assert_eq!(
-            pep.check_read("alice", Some("tenant-a"), &resolver),
+            pep.check_read("alice", Some("tenant-a"), &resolver).await,
             MacDecision::Permit
         );
         assert_eq!(
-            pep.check_read("alice", None, &resolver),
+            pep.check_read("alice", None, &resolver).await,
             MacDecision::Deny(MacDenyReason::NoClearance)
         );
     }
 
-    #[test]
-    fn pep_denies_when_clearance_insufficient() {
+    #[tokio::test]
+    async fn pep_denies_when_clearance_insufficient() {
         let sink = Arc::new(SpySink::default());
         let pep = CasPep::new(
             Arc::new(FixtureClearance {
@@ -709,7 +722,7 @@ mod tests {
         );
         let label = domain_label(&DedupDomain::local_default()); // Internal
         assert_eq!(
-            check(&pep, "public-user", Some(label)),
+            check(&pep, "public-user", Some(label)).await,
             MacDecision::Deny(MacDenyReason::FloorDeny)
         );
 
@@ -720,8 +733,8 @@ mod tests {
         assert_eq!(records[0].object_id.as_deref(), Some("tenant-a/cas"));
     }
 
-    #[test]
-    fn pep_denies_unresolvable_subject() {
+    #[tokio::test]
+    async fn pep_denies_unresolvable_subject() {
         let sink = Arc::new(SpySink::default());
         let pep = CasPep::new(
             Arc::new(FixtureClearance {
@@ -732,7 +745,7 @@ mod tests {
         );
         let label = domain_label(&DedupDomain::local_default());
         assert_eq!(
-            check(&pep, "unknown", Some(label)),
+            check(&pep, "unknown", Some(label)).await,
             MacDecision::Deny(MacDenyReason::NoClearance)
         );
 
@@ -740,8 +753,8 @@ mod tests {
         assert_eq!(records[0].reason, DecisionReason::NoClearance);
     }
 
-    #[test]
-    fn pep_denies_unlabeled_object_even_with_clearance() {
+    #[tokio::test]
+    async fn pep_denies_unlabeled_object_even_with_clearance() {
         let sink = Arc::new(SpySink::default());
         let pep = CasPep::new(
             Arc::new(FixtureClearance {
@@ -751,7 +764,7 @@ mod tests {
             sink.clone(),
         );
         assert_eq!(
-            check(&pep, "admin", None),
+            check(&pep, "admin", None).await,
             MacDecision::Deny(MacDenyReason::UnlabeledObject)
         );
 
@@ -761,8 +774,8 @@ mod tests {
 
     // ── MacCasAuthorizer ────────────────────────────────────────────────────
 
-    #[test]
-    fn mac_cas_authorizer_denies_with_fail_closed_pep() {
+    #[tokio::test]
+    async fn mac_cas_authorizer_denies_with_fail_closed_pep() {
         let authz = MacCasAuthorizer::fail_closed();
         let domain = DedupDomain::local_default();
         let req = CasMountAuthzRequest {
@@ -774,11 +787,11 @@ mod tests {
             requested_label: None,
         };
         let subject = Subject::new("user");
-        assert!(authz.authorize(&subject, req).is_err());
+        assert!(authz.authorize(&subject, req).await.is_err());
     }
 
-    #[test]
-    fn mac_cas_authorizer_permits_with_dominating_clearance() {
+    #[tokio::test]
+    async fn mac_cas_authorizer_permits_with_dominating_clearance() {
         let sink = Arc::new(SpySink::default());
         let pep = Arc::new(CasPep::new(
             Arc::new(FixtureClearance {
@@ -798,11 +811,11 @@ mod tests {
             requested_label: None,
         };
         let subject = Subject::new("secret-user");
-        assert!(authz.authorize(&subject, req).is_ok());
+        assert!(authz.authorize(&subject, req).await.is_ok());
     }
 
-    #[test]
-    fn mac_cas_authorizer_uses_verified_http_tenant_for_clearance() {
+    #[tokio::test]
+    async fn mac_cas_authorizer_uses_verified_http_tenant_for_clearance() {
         let pep = Arc::new(CasPep::new(
             Arc::new(TenantClearance),
             Arc::new(SpySink::default()),
@@ -819,7 +832,7 @@ mod tests {
             operation: "read",
             requested_label: None,
         };
-        assert!(authz.authorize(&subject, tenant_a).is_ok());
+        assert!(authz.authorize(&subject, tenant_a).await.is_ok());
 
         let tenant_b = CasMountAuthzRequest {
             kind: CasMountObjectKind::Xorb,
@@ -829,11 +842,11 @@ mod tests {
             operation: "read",
             requested_label: None,
         };
-        assert!(authz.authorize(&subject, tenant_b).is_err());
+        assert!(authz.authorize(&subject, tenant_b).await.is_err());
     }
 
-    #[test]
-    fn mac_cas_authorizer_uses_domain_for_label() {
+    #[tokio::test]
+    async fn mac_cas_authorizer_uses_domain_for_label() {
         // SharedRemote domain → Confidential. A Secret clearance dominates; a
         // Public clearance does not.
         let sink = Arc::new(SpySink::default());
@@ -859,7 +872,7 @@ mod tests {
         };
         let subject = Subject::new("public-user");
         assert!(
-            authz.authorize(&subject, req).is_err(),
+            authz.authorize(&subject, req).await.is_err(),
             "Public clearance must not read Confidential (shared-remote) content"
         );
     }
