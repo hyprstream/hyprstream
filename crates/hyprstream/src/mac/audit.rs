@@ -248,6 +248,10 @@ pub enum DecisionReason {
     MoqNoPepInstalled,
     /// A streaming continuation's MoQ authority was stale or revoked.
     MoqStaleAuthority,
+    /// The MoQ/event boundary coordinate did not decode into a typed
+    /// track/prefix identity (malformed grammar, noncanonical service
+    /// segment, or an internal map key passed as an identity).
+    MoqUnknownObjectIdentity,
     /// Track admission was denied because moq-net has no #276 callback.
     MoqTrackAdmissionHookUnavailable,
 
@@ -294,6 +298,7 @@ impl DecisionReason {
             DecisionReason::MoqUnlabeledSubject => "moq_unlabeled_subject",
             DecisionReason::MoqNoPepInstalled => "moq_no_pep_installed",
             DecisionReason::MoqStaleAuthority => "moq_stale_authority",
+            DecisionReason::MoqUnknownObjectIdentity => "moq_unknown_object_identity",
             DecisionReason::MoqTrackAdmissionHookUnavailable => {
                 "moq_track_admission_hook_unavailable"
             }

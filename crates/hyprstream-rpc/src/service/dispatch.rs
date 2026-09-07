@@ -603,6 +603,17 @@ where
     // a PEP process-globally via `install_mac_dispatch_pep`, this gate denies
     // with `NoPepInstalled`; after installation its decision is authoritative.
     //
+    // **Typed method identity (#1499):** the PEP evaluates the typed
+    // `(service, leaf/method)` identity of the call. The leaf is the canonical
+    // request-union discriminant, decoded once here from the verified payload
+    // (a bounded structural read of the signed body — the value the generated
+    // handler will independently decode and act on). A payload that does not
+    // decode to a canonical request union contributes no method identity:
+    // `None` matches no declared row, so the call fails closed below rather
+    // than at the handler's own decode. The browser commitment
+    // (`browser_method_discriminator`) remains the cross-check input to
+    // `ensure_browser_method` and is unchanged by this decode.
+    //
     // Streaming continuations: the continuation produced by a permitted
     // handler inherits this dispatch-time Permit. Explicit re-check of
     // long-running continuations against revoked authority is a DEFERRED

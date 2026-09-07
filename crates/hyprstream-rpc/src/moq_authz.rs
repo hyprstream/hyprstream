@@ -323,6 +323,10 @@ pub type SharedSubscribeAuthorizer = Arc<dyn SubscribeAuthorizer>;
 /// (the §7.5 DH-derived topic capability) never substitutes for this decision —
 /// it gates metadata visibility, the MAC floor gates the labeled content.
 ///
+/// Typed identity (v16 §10 / #1510): the track name is parsed into the
+/// stream-plane typed identity exactly once at this boundary; a name that
+/// does not decode denies as an unknown identity.
+///
 /// Constructing this adapter installs an active PEP, so missing clearance and
 /// missing labels deny. Leaving the containing transport's authorizer unset is
 /// the dormant pre-activation state and remains pass-through.
@@ -345,7 +349,7 @@ impl SubscribeAuthorizer for MacSubscribeAuthorizer {
         };
         if matches!(
             self.pep
-                .check(&subject, track_name, MoqEventAction::Subscribe),
+                .check_stream_track(&subject, track_name, MoqEventAction::Subscribe),
             MacDecision::Permit
         ) {
             SubscribeDecision::Allow
@@ -604,7 +608,7 @@ mod scope_tests {
     #[test]
     fn mac_subscribe_authorizer_fail_closed_denies_all() {
         use crate::auth::mac::{
-            DenyAllClearanceSource, DenyAllObjectResolver, MoqMacAuditReason, MoqMacAuditRecord,
+            DenyAllClearanceSource, DenyAllMoqEventResolver, MoqMacAuditReason, MoqMacAuditRecord,
             MoqMacAuditSink,
         };
         use parking_lot::Mutex;
@@ -624,7 +628,7 @@ mod scope_tests {
         let audit = Arc::new(RecordingAudit::default());
         let authz = Arc::new(super::MacSubscribeAuthorizer::new(
             crate::auth::mac::MoqEventPep::new(
-                Arc::new(DenyAllObjectResolver),
+                Arc::new(DenyAllMoqEventResolver),
                 Arc::new(DenyAllClearanceSource),
                 audit.clone(),
             ),
