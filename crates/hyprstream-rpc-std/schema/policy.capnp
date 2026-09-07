@@ -93,17 +93,21 @@ struct PolicyRequest {
     exchangeWit @21 :ExchangeWit
       $scope(manage) $mcpDescription("Exchange the caller's envelope WIT for an OAuth at+jwt; identity from signed envelope");
 
+    # Bounded vector of the same envelope-authenticated checks (maximum 256).
+    checkBatch @22 :PolicyCheckBatch
+      $scopeExempt("the authz check itself cannot require authz — circular dependency");
+
     # Publish a credential revocation to the canonical store owned by this service.
     # Restricted to the OAuth revocation authority (service:oauth) by Casbin —
     # the RFC 7009 endpoint is the only legitimate publisher.
-    revokeCredential @22 :RevokeCredential
+    revokeCredential @24 :RevokeCredential
       $scope(manage);
 
     # Ask the revocation authority whether a credential has been revoked.
     # Service-identities only (service:*): every enrolled service process
     # checks revocations on its verification path and probes at startup;
     # anonymous/end-user callers have no legitimate read.
-    checkCredentialRevocation @23 :CheckCredentialRevocation
+    checkCredentialRevocation @25 :CheckCredentialRevocation
       $scope(query);
   }
 }
@@ -121,6 +125,14 @@ struct PolicyCheck {
 
   # Operation being performed (e.g., "infer", "query", "write")
   operation @3 :Text;
+}
+
+struct PolicyCheckBatch {
+  checks @0 :List(PolicyCheck);
+}
+
+struct PolicyCheckBatchResult {
+  allowed @0 :List(Bool);
 }
 
 # JWT token issuance parameters
@@ -270,11 +282,13 @@ struct PolicyResponse {
     # at+jwt from exchangeWit
     exchangeWitResult @22 :TokenInfo;
 
+    checkBatchResult @23 :PolicyCheckBatchResult;
+
     # Revocation publication acknowledged (durable)
-    revokeCredentialResult @23 :Void;
+    revokeCredentialResult @24 :Void;
 
     # Revocation check result (true = revoked or unknown — fail-closed)
-    checkCredentialRevocationResult @24 :Bool;
+    checkCredentialRevocationResult @25 :Bool;
   }
 }
 
