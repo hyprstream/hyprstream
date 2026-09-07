@@ -366,6 +366,11 @@ pub struct QuicSharedConfig {
     /// `moql` handler. `None` keeps the fail-closed anonymous posture.
     pub moq_admission:
         Option<Arc<hyprstream_rpc::transport::moql_admission::MoqlAdmissionAuthenticator>>,
+    /// Optional service-owned decision for remote MoQL ingress. Admission and
+    /// tenant resolution never imply this producer/relay role; `None` leaves
+    /// every admitted peer read-only.
+    pub moq_ingress_authorizer:
+        Option<hyprstream_rpc::transport::iroh_moq::SharedIngressAuthorizer>,
     /// Native client's accepted-state-bound proof for authenticated Iroh `moql`
     /// dials. Quinn/WebTransport uses its distinct CONNECT authentication path.
     pub moq_admission_proof: Option<hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof>,
@@ -417,6 +422,7 @@ impl QuicSharedConfig {
             // #1027: thread the daemon-owned moql admission authenticator
             // through so the spawner installs it on the iroh `moql` handler.
             moq_admission: self.moq_admission.clone(),
+            moq_ingress_authorizer: self.moq_ingress_authorizer.clone(),
             moq_admission_proof: self.moq_admission_proof.clone(),
         }
     }
@@ -1274,6 +1280,26 @@ mod tests {
     use super::*;
     use parking_lot::Mutex;
 
+    #[test]
+    fn quic_shared_config_preserves_optional_moq_ingress_authority() {
+        let authority = Arc::new(|peer: &hyprstream_rpc::moq_authz::PeerIdentity, tenant: &str| {
+            peer.subject.as_deref() == Some("did:at9p:producer") && tenant == "local"
+        });
+        let shared = QuicSharedConfig {
+            cert_chain: Vec::new(), key_der: Zeroizing::new(Vec::new()),
+            base_ip: "127.0.0.1".parse().expect("loopback"), server_name: "test".to_owned(),
+            oauth_issuer_url: None, jwt_verifying_key: None, iroh_enabled: true, iroh_required: true,
+            moq_relay: None, moq_relay_server_identity: None, native_announcement_publisher: None,
+            moq_admission: None, moq_ingress_authorizer: Some(authority), moq_admission_proof: None,
+        };
+        let wired = shared.for_service("event", 0);
+        assert!(wired.moq_ingress_authorizer.as_ref().is_some_and(|a| a.authorize_ingress(
+            &hyprstream_rpc::moq_authz::PeerIdentity::authenticated("did:at9p:producer"), "local"
+        )));
+        let default = QuicSharedConfig { moq_ingress_authorizer: None, ..shared }.for_service("event", 0);
+        assert!(default.moq_ingress_authorizer.is_none(), "absence must stay read-only");
+    }
+
     fn accepted_announcement(
         signer: &SigningKey,
         expires_at_unix_ms: i64,
@@ -1314,6 +1340,7 @@ mod tests {
             moq_relay: None,
             moq_relay_server_identity: None,
             moq_admission: None,
+            moq_ingress_authorizer: None,
             moq_admission_proof: None,
             native_announcement_publisher: publisher,
         }
@@ -1378,7 +1405,7 @@ mod tests {
             oauth_issuer_url: None, jwt_verifying_key: None,
             iroh_enabled: true, iroh_required: false,
             moq_relay: None, moq_relay_server_identity: None,
-            moq_admission: None, moq_admission_proof: None,
+            moq_admission: None, moq_ingress_authorizer: None, moq_admission_proof: None,
             native_announcement_publisher: None,
         });
         assert!(!ctx.service_keys.contains_key("discovery"));
@@ -1526,6 +1553,7 @@ mod tests {
             moq_relay: None,
             moq_relay_server_identity: None,
             moq_admission: None,
+            moq_ingress_authorizer: None,
             moq_admission_proof: None,
             native_announcement_publisher: Some({
                 let published = Arc::clone(&published);

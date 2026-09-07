@@ -390,6 +390,7 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     // Ed25519 + ML-DSA-65 identity inside the carrier before the
                     // moq handshake. Without it the accept path stays in its
                     // fail-closed anonymous posture.
+                    let moq_ingress_authorizer = qc.moq_ingress_authorizer.take();
                     let moq_handler = match qc.moq_admission.take() {
                         Some(admission) => {
                             let server_identity = moq_server_identity.ok_or_else(|| {
@@ -407,7 +408,8 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                                 })?;
                             moq_handler.with_authz(
                                 hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig::default()
-                                    .with_admission(admission),
+                                    .with_admission(admission)
+                                    .with_ingress_authorizer_option(moq_ingress_authorizer),
                             )
                         }
                         None => moq_handler,
@@ -1201,6 +1203,7 @@ mod tests {
             moq_relay: None,
             moq_relay_server_identity: None,
             moq_admission: None,
+            moq_ingress_authorizer: None,
             moq_admission_proof: None,
         }
     }

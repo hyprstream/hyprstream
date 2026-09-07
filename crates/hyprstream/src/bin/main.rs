@@ -3117,6 +3117,7 @@ fn main() -> Result<()> {
                                         // authority plus explicit operator DID→tenant bindings.
                                         // Compatibility leaves anonymous carriers fail-closed.
                                         moq_admission,
+                                        moq_ingress_authorizer: None,
                                         moq_admission_proof,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             |request: hyprstream_service::NativeAnnouncementRequest| {

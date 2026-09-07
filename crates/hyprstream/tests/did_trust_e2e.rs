@@ -210,6 +210,7 @@ async fn build_fixture() -> Fixture {
         moq_relay: None,
         moq_relay_server_identity: None,
         moq_admission: None,
+        moq_ingress_authorizer: None,
         moq_admission_proof: None,
     };
     let service =
