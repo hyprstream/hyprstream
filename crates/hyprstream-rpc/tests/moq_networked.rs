@@ -92,6 +92,7 @@ async fn networked_moq_subscribe_receives_mac_verified_frames() -> Result<()> {
             server_name: "localhost".to_owned(),
             cert_hashes: vec![pin.to_vec()],
         }),
+        moql_server_identity: Default::default(),
     }];
 
     // Announce the broadcast first (creates the moq broadcast/track), then start
@@ -102,7 +103,13 @@ async fn networked_moq_subscribe_receives_mac_verified_frames() -> Result<()> {
     // verifies the chained HMAC, and yields decoded payloads.
     let qos = hyprstream_rpc::stream_info::StreamOpt::default();
     let mut handle = hyprstream_rpc::moq_stream::MoqStreamHandle::networked(
-        reach, &qos, broadcast_path, mac_key, enc_key, topic,
+        reach,
+        &qos,
+        broadcast_path,
+        mac_key,
+        enc_key,
+        topic,
+        Default::default(),
     );
 
     // Give the background task time to dial, handshake, and subscribe to the

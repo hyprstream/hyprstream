@@ -499,6 +499,15 @@ mod tests {
 
     /// Build an XetState over a temp CasStore holding one xorb.
     fn test_state_with_xorb(dir: &std::path::Path, hash: &str, bytes: &[u8]) -> XetState {
+        // Token verification fails closed on jti-bearing bearers without the
+        // process-global revocation store. Install an in-memory authority
+        // when no other test in this binary got there first — under nextest
+        // per-test process isolation no other test can provide it.
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(
+                Arc::new(hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new()),
+            );
+        }
         std::fs::create_dir_all(dir.join("xorbs")).unwrap();
         std::fs::write(dir.join("xorbs").join(format!("default.{hash}")), bytes).unwrap();
 

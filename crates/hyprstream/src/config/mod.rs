@@ -571,6 +571,7 @@ impl QuicConfig {
             serde_json::to_vec(&meta).unwrap_or_default()
         });
         Ok(hyprstream_rpc::service::QuicLoopConfig {
+            announcement_cancellation: tokio_util::sync::CancellationToken::new(),
             cert_chain,
             key_der,
             bind_addr: addr,
@@ -585,6 +586,12 @@ impl QuicConfig {
             // #358: relay rendezvous is provisioned by the daemon bootstrap
             // (`QuicSharedConfig`), not this minimal builder. Direct-only here.
             moq_relay: None,
+            moq_relay_server_identity: None,
+            // #1027: admission material is provisioned by the daemon bootstrap
+            // (`QuicSharedConfig`), not this minimal builder.
+            moq_admission: None,
+            moq_ingress_authorizer: None,
+            moq_admission_proof: None,
         })
     }
 }
@@ -1774,6 +1781,10 @@ pub struct DiscoveryServiceConfig {
     /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
     #[serde(default)]
     pub quic_port: Option<u16>,
+    /// Volatile Discovery state. Memory is the single-process/WASM default;
+    /// active-active deployments must select Valkey or tiered memory+Valkey.
+    #[serde(default)]
+    pub state: hyprstream_discovery::DiscoveryStateConfig,
 }
 
 /// TUI display server configuration.
@@ -3117,6 +3128,30 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discovery_state_documentation_configures_root_backend() {
+        let doc = include_str!("../../../../docs/discovery-state.md");
+        let example = doc
+            .split_once("```toml\n")
+            .unwrap_or_else(|| panic!("TOML example"))
+            .1
+            .split_once("```")
+            .unwrap_or_else(|| panic!("closed TOML example"))
+            .0;
+        let config: HyprConfig = toml::from_str(example).unwrap_or_else(|e| panic!("{e}"));
+        let state = config.discovery.state;
+        assert_eq!(
+            state.backend,
+            hyprstream_discovery::DiscoveryStateBackend::Tiered
+        );
+        assert!(state.active_active);
+        assert_eq!(state.memory.announcement_capacity, 16_384);
+        assert_eq!(state.valkey.announcement_capacity, 65_536);
+        assert_eq!(state.valkey.key_prefix, "production");
+        assert_eq!(state.valkey.url, "rediss://discovery-state.example:6379");
+        assert_eq!(state.tiered.l1_max_ttl_ms, 1_000);
+    }
+
     #[test]
     fn credentials_backend_default_matches_build_profile() {
         let config: CredentialsConfig =

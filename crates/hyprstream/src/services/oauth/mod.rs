@@ -1512,6 +1512,16 @@ mod tests {
                 pq_store: None,
             },
         );
+        // Resource-token verification fails closed on jti-bearing bearers
+        // without the process-global revocation store. Install an in-memory
+        // authority when no other test in this binary got there first — this
+        // test must not depend on another test's fixture happening to run
+        // earlier.
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
         configure_test_policy_signing_authority()?;
 
         let service_key = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);

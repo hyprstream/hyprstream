@@ -16,6 +16,7 @@ hyprstream-pds = { path = "../hyprstream-pds" }
 
 # Async runtime
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 

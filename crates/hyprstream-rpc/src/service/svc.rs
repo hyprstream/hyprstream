@@ -1407,6 +1407,8 @@ pub trait RequestService: 'static {
 ///
 /// QUIC server configuration for the service loop.
 pub struct QuicLoopConfig {
+    /// Cancels all announcements owned by this bound service before teardown.
+    pub announcement_cancellation: tokio_util::sync::CancellationToken,
     /// DER-encoded certificate chain (leaf first, then intermediates/CA)
     pub cert_chain: Vec<Vec<u8>>,
     /// DER-encoded private key — zeroed on drop.
@@ -1447,6 +1449,28 @@ pub struct QuicLoopConfig {
     /// drift. `None` = direct-only (the S1/S2 behaviour). Native-only.
     #[cfg(not(target_arch = "wasm32"))]
     pub moq_relay: Option<crate::stream_info::TransportConfig>,
+    /// Resolver-verified accepted-state witness for `moq_relay`. Iroh relay
+    /// links require this distinct remote identity for mutual admission.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_relay_server_identity: Option<crate::stream_info::MoqlServerIdentity>,
+    /// #1027: optional inside-carrier admission authenticator for the iroh
+    /// `moql` accept path. When set, every accepted `moql` connection must
+    /// prove an accepted current Ed25519 + ML-DSA-65 identity (fresh
+    /// challenge/response binding epoch/head/nonces) before the moq handshake;
+    /// the admitted peer is served only its resolved tenant's scope. When
+    /// `None`, the pre-#1027 posture stands: anonymous carriers are refused.
+    /// Native-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_admission:
+        Option<Arc<crate::transport::moql_admission::MoqlAdmissionAuthenticator>>,
+    /// Optional service-owned ingress authorization. The spawner forwards it
+    /// unchanged to the Iroh MoQL handler; absence is deliberately read-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_ingress_authorizer:
+        Option<crate::transport::iroh_moq::SharedIngressAuthorizer>,
+    /// Native client proof for authenticated Iroh `moql` dials in this process.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_admission_proof: Option<crate::transport::moql_admission::MoqlAdmissionProof>,
 }
 
 /// Handle for a running service
@@ -1659,7 +1683,21 @@ mod empty_iss_gate_tests {
         }
     }
 
+    /// `verify_claims` fails closed on jti-bearing, issuer-bearing tokens
+    /// without the process-global revocation store (`jwt::encode`
+    /// auto-assigns a jti). Install an in-memory authority when no other test
+    /// in this binary got there first — under nextest per-test process
+    /// isolation no other test can provide it.
+    fn ensure_test_revocation_store() {
+        if crate::auth::global_credential_revocation_store().is_none() {
+            let _ = crate::auth::set_global_credential_revocation_store(std::sync::Arc::new(
+                crate::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+    }
+
     fn mock_service() -> (MockService, SigningKey) {
+        ensure_test_revocation_store();
         // The CA key signs the bare-sub (empty-iss) token; the ClusterKeySource
         // anchors that same CA key with an empty local issuer URL (so empty iss
         // is "local").
@@ -1875,6 +1913,7 @@ mod empty_iss_gate_tests {
 
     #[tokio::test]
     async fn federated_issuer_cannot_assert_local_tenant() {
+        ensure_test_revocation_store();
         let local_ca = SigningKey::from_bytes(&[9u8; 32]);
         let federated_signer = SigningKey::from_bytes(&[10u8; 32]);
         let local_issuer = "https://this.node";
@@ -1918,6 +1957,7 @@ mod empty_iss_gate_tests {
 
     #[tokio::test]
     async fn local_issuer_preserves_verified_tenant() {
+        ensure_test_revocation_store();
         let local_ca = SigningKey::from_bytes(&[11u8; 32]);
         let local_issuer = "https://this.node";
         let key_source = std::sync::Arc::new(ClusterKeySource::new(
