@@ -231,6 +231,18 @@ pub fn current_native_announcement(
     })
 }
 
+/// Whether the checkpoint announcement loop must authorize `service_name`.
+///
+/// Compatibility checkpoints may legitimately predate a `#discovery`
+/// identity: the compatibility discovery factory installs its self-publisher
+/// only under `iroh_required`, so no compatibility announcement ever consumes
+/// a `#discovery` bundle and demanding one fails startup for pre-upgrade
+/// stores. Required mode keeps the demand because its owned publication path
+/// refuses to publish without the checkpoint bundle.
+fn checkpoint_announces_service(iroh_required: bool, service_name: &str) -> bool {
+    iroh_required || service_name != "discovery"
+}
+
 /// Populate every ordinary network service announcement from a fresh
 /// checkpoint-verifying PDS read. Missing or ambiguous state fails startup
 /// before any QUIC service can bind and advertise an incomplete bundle.
@@ -242,7 +254,11 @@ pub fn with_checkpointed_native_announcements(
     let store = crate::services::discovery::PdsRecordStore::open_readonly(&pds_store_dir(&ctx)?)?
         .with_at9p_deployment_verifier(acceptance_identity);
     let states = store.accepted_at9p_states()?;
-    for service_name in service_names {
+    let iroh_required = ctx.iroh_required();
+    for service_name in service_names
+        .iter()
+        .filter(|name| checkpoint_announces_service(iroh_required, name))
+    {
         let signer = ctx.service_signing_key(service_name);
         let mut matching = states.iter().filter(|state| {
             accepted_state_matches_service(state, service_name, signer.verifying_key().as_bytes())
@@ -2948,6 +2964,36 @@ mod tests {
         .err()
         .expect("genesis alone cannot authorize a production announcement");
         assert!(error.to_string().contains("bounded production expiry"));
+    }
+
+    /// Compatibility checkpoints may legitimately predate a `#discovery`
+    /// identity (the compatibility discovery factory installs its
+    /// self-publisher only under `iroh_required`), so the checkpoint
+    /// announcement loop must exempt Discovery outside the required profile
+    /// while required mode keeps demanding the checkpoint.
+    #[test]
+    fn checkpoint_announcements_keep_discovery_optional_outside_required_profile() {
+        assert!(!checkpoint_announces_service(false, "discovery"));
+        assert!(checkpoint_announces_service(false, "model"));
+        assert!(checkpoint_announces_service(false, "policy"));
+        // Required mode stays strict: the owned publication path refuses to
+        // publish without the checkpoint bundle, so Discovery stays gated.
+        assert!(checkpoint_announces_service(true, "discovery"));
+        assert!(checkpoint_announces_service(true, "model"));
+
+        // The exemption must live inside the loop itself, not beside it: the
+        // loop routes every service through the compatibility decision.
+        let source = include_str!("factories.rs");
+        let start = source
+            .find("pub fn with_checkpointed_native_announcements(")
+            .expect("checkpoint announcement loop");
+        let rest = &source[start..];
+        let end = rest.find("\npub fn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("checkpoint_announces_service(iroh_required, name)"),
+            "the checkpoint loop must route services through the compatibility decision"
+        );
     }
 
     #[test]

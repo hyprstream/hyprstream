@@ -943,11 +943,27 @@ impl DiscoveryService {
                     "announcement signer is not an accepted current subject key");
                 let service = state.current.services.iter().find(|entry| entry.id == format!("#{svc_name}"))
                     .ok_or_else(|| anyhow::anyhow!("announcement service is not accepted"))?;
-                if let Some(kem) = &service.endpoint.request_kem {
-                    anyhow::ensure!(kem == &data.request_kem_recipient, "announcement KEM differs from accepted service");
-                    if data.socket_kind == "iroh" {
-                        anyhow::ensure!(service.endpoint.address == data.endpoint, "announcement reach differs from accepted service");
-                    }
+                // Checkpoint discipline (the same rule as the fixed bootstrap
+                // roles): only capsule-signed material binds request
+                // encryption and Iroh reach. A legacy identity whose accepted
+                // entry carries no signed request KEM cannot authorize one, so
+                // an identity-bound announcement over it must not present
+                // unbound KEM or reach material.
+                let kem = service.endpoint.request_kem.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "accepted service entry lacks a signed request KEM; \
+                         reprovision service identity"
+                    )
+                })?;
+                anyhow::ensure!(
+                    kem == &data.request_kem_recipient,
+                    "announcement KEM differs from accepted service"
+                );
+                if data.socket_kind == "iroh" {
+                    anyhow::ensure!(
+                        service.endpoint.address == data.endpoint,
+                        "announcement reach differs from accepted service"
+                    );
                 }
                 anyhow::ensure!(
                     state.epoch == data.accepted_state_epoch
@@ -4722,6 +4738,50 @@ mod resolver_tests {
         (state, signing)
     }
 
+    /// Accepted `#model` capsule with an explicit signed Iroh address and an
+    /// optional signed request KEM (`None` models a legacy identity).
+    fn accepted_service_state(
+        tag: u8,
+        address: &str,
+        request_kem: Option<&hyprstream_rpc::crypto::hybrid_kem::RecipientPublic>,
+    ) -> (AcceptedAt9pState, SigningKey) {
+        let signing = SigningKey::from_bytes(&[tag; 32]);
+        let pq_signing = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signing);
+        let keys = HybridKeyPair::new(
+            signing.verifying_key().to_bytes().to_vec(),
+            ml_dsa_sk_to_vk_bytes(&pq_signing),
+        )
+        .unwrap_or_else(|e| panic!("test hybrid keys invalid: {e}"));
+        let mut endpoint = ServiceEndpoint::new(At9pTransport::Iroh, address)
+            .unwrap_or_else(|e| panic!("test endpoint invalid: {e}"));
+        endpoint.request_kem = request_kem.map(hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::encode);
+        let service = ServiceEntry::new("#model", ServiceType::NinePExport, endpoint)
+            .unwrap_or_else(|e| panic!("test service invalid: {e}"));
+        let body = CapsuleBody::new(vec![keys], vec![service])
+            .unwrap_or_else(|e| panic!("test body invalid: {e}"));
+        let genesis = sign_capsule(body.clone(), &signing, &pq_signing)
+            .unwrap_or_else(|e| panic!("test genesis signing failed: {e}"));
+        let subject = genesis
+            .cid512()
+            .unwrap_or_else(|e| panic!("test genesis CID failed: {e}"));
+        let update = sign_update_record(
+            subject,
+            1,
+            [1; 64],
+            body,
+            "2099-01-01T00:00:00Z".to_owned(),
+            &signing,
+            &pq_signing,
+        )
+        .unwrap_or_else(|e| panic!("test update signing failed: {e}"));
+        let bytes = update
+            .to_dag_cbor()
+            .unwrap_or_else(|e| panic!("test update encoding failed: {e}"));
+        let state = AcceptedAt9pState::from_persisted_update(&bytes)
+            .unwrap_or_else(|e| panic!("test accepted state invalid: {e}"));
+        (state, signing)
+    }
+
     struct MutableAcceptedState(parking_lot::Mutex<Option<AcceptedAt9pState>>);
 
     impl AcceptedStateSource for MutableAcceptedState {
@@ -5059,7 +5119,13 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn ordinary_iroh_announcement_handler_populates_production_resolver() {
-        let (state, service_signing) = accepted_state(12);
+        let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .expect("test KEM");
+        let reach = format!("iroh://{}", hex::encode([0x7a; 32]));
+        let (state, service_signing) =
+            accepted_service_state(12, &reach, Some(&kem.public()));
         let root = SigningKey::from_bytes(&[0x61; 32]);
         let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
             state.clone(),
@@ -5085,10 +5151,6 @@ mod resolver_tests {
             &service_pq_signing,
         );
         let ctx = EnvelopeContext::from_verified_as_system(&signed);
-        let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
-            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
-        )
-        .expect("test KEM");
         let response = service
             .handle_announce(
                 &ctx,
@@ -5096,7 +5158,7 @@ mod resolver_tests {
                 &ServiceAnnouncement {
                     service_name: "model".to_owned(),
                     socket_kind: "iroh".to_owned(),
-                    endpoint: format!("iroh://{}", hex::encode([0x7a; 32])),
+                    endpoint: reach,
                     service_jwt: Some(jwt),
                     service_did: Did::from(state.did.clone()),
                     capabilities: vec!["hyprstream-rpc/1".to_owned()],
@@ -5125,6 +5187,193 @@ mod resolver_tests {
                 relay_url: None,
             } if *node_id == [0x7a; 32] && direct_addrs.is_empty()
         ));
+    }
+
+    /// A legacy identity whose accepted entry carries no signed request KEM
+    /// cannot authorize one: an identity-bound announcement presenting an
+    /// arbitrary encryption recipient and Iroh reach over the genuine
+    /// accepted-state digest must be refused, never minted as
+    /// checkpoint-authorized authority.
+    #[tokio::test]
+    async fn identity_bound_announcement_refuses_legacy_identity_without_signed_kem() {
+        let legacy_reach = format!("iroh://{}", hex::encode([0x7c; 32]));
+        let (state, service_signing) = accepted_service_state(13, &legacy_reach, None);
+        let root = SigningKey::from_bytes(&[0x62; 32]);
+        let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
+            state.clone(),
+        ))));
+        let service = DiscoveryService::new(
+            Arc::new(root.clone()),
+            root.verifying_key(),
+            TransportConfig::inproc("legacy-kem-announce-test"),
+        )
+        .with_accepted_state_source(source);
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "service:model".to_owned(),
+            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp() + 3_600,
+        )
+        .with_cnf_jwk(service_signing.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &root);
+        let service_pq_signing =
+            hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&service_signing);
+        let signed = hyprstream_rpc::SignedEnvelope::new_signed_hybrid(
+            hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()),
+            &service_signing,
+            &service_pq_signing,
+        );
+        let ctx = EnvelopeContext::from_verified_as_system(&signed);
+        let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .expect("test KEM");
+        let error = service
+            .handle_announce(
+                &ctx,
+                1,
+                &ServiceAnnouncement {
+                    service_name: "model".to_owned(),
+                    socket_kind: "iroh".to_owned(),
+                    endpoint: format!("iroh://{}", hex::encode([0x7b; 32])),
+                    service_jwt: Some(jwt),
+                    service_did: Did::from(state.did.clone()),
+                    capabilities: vec!["hyprstream-rpc/1".to_owned()],
+                    accepted_state_digest: state.head_digest.to_vec(),
+                    accepted_state_epoch: state.epoch,
+                    response_key_id: format!("{}#response-current", state.did),
+                    request_kem_key_id: format!("{}#kem-current", state.did),
+                    request_kem_recipient: kem.public().encode(),
+                    expires_at_unix_ms: 4_070_908_800_000,
+                },
+            )
+            .await
+            .expect_err("identity-bound announcement over a KEM-less legacy identity must be refused");
+        assert!(error.to_string().contains("signed request KEM"));
+    }
+
+    /// A capsule-bound request KEM must be presented verbatim: a signed
+    /// announcement substituting its own recipient is refused.
+    #[tokio::test]
+    async fn identity_bound_announcement_refuses_kem_outside_accepted_service() {
+        let accepted_kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .expect("test accepted KEM");
+        let reach = format!("iroh://{}", hex::encode([0x7d; 32]));
+        let (state, service_signing) =
+            accepted_service_state(14, &reach, Some(&accepted_kem.public()));
+        let root = SigningKey::from_bytes(&[0x63; 32]);
+        let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
+            state.clone(),
+        ))));
+        let service = DiscoveryService::new(
+            Arc::new(root.clone()),
+            root.verifying_key(),
+            TransportConfig::inproc("foreign-kem-announce-test"),
+        )
+        .with_accepted_state_source(source);
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "service:model".to_owned(),
+            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp() + 3_600,
+        )
+        .with_cnf_jwk(service_signing.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &root);
+        let service_pq_signing =
+            hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&service_signing);
+        let signed = hyprstream_rpc::SignedEnvelope::new_signed_hybrid(
+            hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()),
+            &service_signing,
+            &service_pq_signing,
+        );
+        let ctx = EnvelopeContext::from_verified_as_system(&signed);
+        let foreign_kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .expect("test foreign KEM");
+        let error = service
+            .handle_announce(
+                &ctx,
+                1,
+                &ServiceAnnouncement {
+                    service_name: "model".to_owned(),
+                    socket_kind: "iroh".to_owned(),
+                    endpoint: reach,
+                    service_jwt: Some(jwt),
+                    service_did: Did::from(state.did.clone()),
+                    capabilities: vec!["hyprstream-rpc/1".to_owned()],
+                    accepted_state_digest: state.head_digest.to_vec(),
+                    accepted_state_epoch: state.epoch,
+                    response_key_id: format!("{}#response-current", state.did),
+                    request_kem_key_id: format!("{}#kem-current", state.did),
+                    request_kem_recipient: foreign_kem.public().encode(),
+                    expires_at_unix_ms: 4_070_908_800_000,
+                },
+            )
+            .await
+            .expect_err("announcement KEM outside the accepted service must be refused");
+        assert!(error.to_string().contains("announcement KEM differs"));
+    }
+
+    /// Iroh reach is validated against the signed capsule on its own terms:
+    /// an announcement whose KEM matches but whose reach points elsewhere is
+    /// refused even though the KEM branch succeeded.
+    #[tokio::test]
+    async fn identity_bound_announcement_refuses_iroh_reach_outside_accepted_service() {
+        let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .expect("test KEM");
+        let accepted_reach = format!("iroh://{}", hex::encode([0x7e; 32]));
+        let (state, service_signing) =
+            accepted_service_state(15, &accepted_reach, Some(&kem.public()));
+        let root = SigningKey::from_bytes(&[0x64; 32]);
+        let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
+            state.clone(),
+        ))));
+        let service = DiscoveryService::new(
+            Arc::new(root.clone()),
+            root.verifying_key(),
+            TransportConfig::inproc("foreign-reach-announce-test"),
+        )
+        .with_accepted_state_source(source);
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "service:model".to_owned(),
+            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp() + 3_600,
+        )
+        .with_cnf_jwk(service_signing.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &root);
+        let service_pq_signing =
+            hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&service_signing);
+        let signed = hyprstream_rpc::SignedEnvelope::new_signed_hybrid(
+            hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()),
+            &service_signing,
+            &service_pq_signing,
+        );
+        let ctx = EnvelopeContext::from_verified_as_system(&signed);
+        let error = service
+            .handle_announce(
+                &ctx,
+                1,
+                &ServiceAnnouncement {
+                    service_name: "model".to_owned(),
+                    socket_kind: "iroh".to_owned(),
+                    endpoint: format!("iroh://{}", hex::encode([0x7f; 32])),
+                    service_jwt: Some(jwt),
+                    service_did: Did::from(state.did.clone()),
+                    capabilities: vec!["hyprstream-rpc/1".to_owned()],
+                    accepted_state_digest: state.head_digest.to_vec(),
+                    accepted_state_epoch: state.epoch,
+                    response_key_id: format!("{}#response-current", state.did),
+                    request_kem_key_id: format!("{}#kem-current", state.did),
+                    request_kem_recipient: kem.public().encode(),
+                    expires_at_unix_ms: 4_070_908_800_000,
+                },
+            )
+            .await
+            .expect_err("announcement reach outside the accepted service must be refused");
+        assert!(error.to_string().contains("announcement reach differs"));
     }
 
     #[tokio::test]
