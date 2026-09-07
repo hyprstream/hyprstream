@@ -88,9 +88,10 @@ pub const ASSURANCES: &[&str] = &["unverified", "classical", "pq-hybrid"];
 /// The system-low label text — the exact expansion of `$dispatchPublic`.
 pub const SYSTEM_LOW: &str = "public:unverified";
 
-/// The side-effect-free scope actions (S3 `ScopeAction` Block A: read-class).
-/// Every other action in the closed vocabulary is mutating. This is the
-/// CODEGEN-TIME copy used to derive `MutationSemantics`; the runtime
+/// The read-class authorization actions (S3 `ScopeAction` Block A). A leaf in
+/// this class may still declare a bounded application effect; every other
+/// action requires an explicit mutation policy. This is the CODEGEN-TIME copy;
+/// the runtime
 /// validator keeps its own copy in `hyprstream_rpc::proof::policy`, and the
 /// full-inventory validation test is the drift gate between them: a row
 /// generated under one list fails the other's validation.

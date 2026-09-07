@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use super::mutation_policy::parse_mutation_semantics;
 use super::types::*;
 use crate::util::{to_pascal_case, to_snake_case};
 
@@ -253,6 +254,10 @@ fn parse_cgr(
     // neither annotation; their leaves carry exactly one.
     validate_mandatory_dispatch(service_name, &request_variants, &scoped_clients)?;
 
+    // v16 §4.8/§6.1: mutation semantics are explicit, checked leaf metadata.
+    // A scope cannot imply retry safety.
+    validate_mandatory_mutation_policy(service_name, &request_variants, &scoped_clients)?;
+
     Ok(ParsedSchema {
         request_variants,
         response_variants,
@@ -279,8 +284,8 @@ fn validate_mandatory_scope(
     fn err(service_name: &str, path: &str, name: &str) -> String {
         format!(
             "service `{service_name}`: method `{path}{name}` has no `$scope`/`$capability` annotation \
-             — scope is mandatory (S3, epic #547). Add e.g. `$scope(query)` for a read-only \
-             (side-effect-free) method or `$scope(write)` for a mutating one; or, only if the method \
+             — scope is mandatory (S3, epic #547). Add e.g. `$scope(query)` for query/read authorization \
+             or `$scope(write)` for a mutating authority boundary; separately declare any application effect; or, only if the method \
              genuinely cannot require authorization, declare `$scopeExempt(\"<reason>\")`."
         )
     }
@@ -425,6 +430,81 @@ fn validate_mandatory_dispatch(
             continue;
         }
         check_leaf(service_name, "", v)?;
+    }
+    for sc in scoped_clients {
+        check_scoped(service_name, "", sc)?;
+    }
+    Ok(())
+}
+
+/// Enforce v16 §4.8/§6.1's explicit per-method mutation-policy declaration.
+///
+/// Every non-read scoped leaf must use one of the three closed values. A
+/// read-class (`query`, `subscribe`) leaf may also declare one when it changes
+/// bounded session or subscription state: authorization and effect semantics
+/// are separate axes. Scope exemption likewise records authorization, not an
+/// effect classification. Dispatchers have no handler of their own, so policy
+/// metadata there would be dead and is rejected.
+fn validate_mandatory_mutation_policy(
+    service_name: &str,
+    request_variants: &[UnionVariant],
+    scoped_clients: &[ScopedClient],
+) -> Result<(), String> {
+    fn check_leaf(service_name: &str, path: &str, v: &UnionVariant) -> Result<(), String> {
+        let read_class = crate::schema::dispatch_label::READ_CLASS_ACTIONS
+            .contains(&v.scope.as_str());
+        if read_class && v.mutation_semantics.is_empty() {
+            return Ok(());
+        }
+        // Scope-exempt leaves are not implicitly read-only: a public check may
+        // carry no policy, while a separately authenticated exempt operation
+        // may explicitly declare one. The existing scope gate verifies the
+        // exemption itself is recorded and reviewable.
+        if v.scope.is_empty() && v.mutation_semantics.is_empty() {
+            return Ok(());
+        }
+        parse_mutation_semantics(&v.mutation_semantics).map_err(|e| {
+            format!(
+                "service `{service_name}`: method `{path}{}` (scope `{}`) {e}; declare its actual retry/application-effect policy",
+                v.name, v.scope
+            )
+        })?;
+        Ok(())
+    }
+
+    fn check_dispatcher(service_name: &str, path: &str, v: &UnionVariant) -> Result<(), String> {
+        if !v.mutation_semantics.is_empty() {
+            return Err(format!(
+                "service `{service_name}`: dispatcher `{path}{}` carries `$mutationSemantics`; declare policy on each executable leaf instead",
+                v.name
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_scoped(service_name: &str, path: &str, sc: &ScopedClient) -> Result<(), String> {
+        let here = format!("{path}{} ", sc.factory_name);
+        let nested_names: Vec<&str> = sc.nested_clients.iter().map(|n| n.factory_name.as_str()).collect();
+        for v in &sc.inner_request_variants {
+            if nested_names.contains(&v.name.as_str()) {
+                check_dispatcher(service_name, &here, v)?;
+            } else {
+                check_leaf(service_name, &here, v)?;
+            }
+        }
+        for nested in &sc.nested_clients {
+            check_scoped(service_name, &here, nested)?;
+        }
+        Ok(())
+    }
+
+    let dispatcher_names: Vec<&str> = scoped_clients.iter().map(|sc| sc.factory_name.as_str()).collect();
+    for v in request_variants {
+        if dispatcher_names.contains(&v.name.as_str()) {
+            check_dispatcher(service_name, "", v)?;
+        } else {
+            check_leaf(service_name, "", v)?;
+        }
     }
     for sc in scoped_clients {
         check_scoped(service_name, "", sc)?;
@@ -873,6 +953,7 @@ fn extract_union_variants(
         // Ids resolved inline by node short-name, same as the VFS set above.
         let dispatch_mac_id = annotation_id_by_short_name(node_map, "dispatchMac");
         let dispatch_public_id = annotation_id_by_short_name(node_map, "dispatchPublic");
+        let mutation_semantics_id = annotation_id_by_short_name(node_map, "mutationSemantics");
         let dispatch_mac = extract_annotation_text(
             field.get_annotations().map_err(|e| format!("{e}"))?,
             dispatch_mac_id,
@@ -880,6 +961,10 @@ fn extract_union_variants(
         let dispatch_public = extract_annotation_text(
             field.get_annotations().map_err(|e| format!("{e}"))?,
             dispatch_public_id,
+        );
+        let mutation_semantics = extract_annotation_text(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            mutation_semantics_id,
         );
 
         variants.push(UnionVariant {
@@ -897,6 +982,7 @@ fn extract_union_variants(
             vfs_mac,
             dispatch_mac,
             dispatch_public,
+            mutation_semantics,
         });
     }
 
@@ -1798,6 +1884,7 @@ mod mandatory_scope_tests {
             vfs_mac: String::new(),
             dispatch_mac: String::new(),
             dispatch_public: String::new(),
+            mutation_semantics: String::new(),
         }
     }
 
@@ -1884,6 +1971,7 @@ mod mandatory_dispatch_tests {
             vfs_mac: String::new(),
             dispatch_mac: mac.to_owned(),
             dispatch_public: public.to_owned(),
+            mutation_semantics: String::new(),
         }
     }
 
@@ -1957,5 +2045,67 @@ mod mandatory_dispatch_tests {
         let reqs = vec![variant("p", "", "", "   ")];
         let err = validate_mandatory_dispatch("model", &reqs, &[]).unwrap_err();
         assert!(err.contains("reason"), "{err}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod mandatory_mutation_policy_tests {
+    use super::*;
+
+    fn variant(name: &str, scope: &str, semantics: &str) -> UnionVariant {
+        UnionVariant {
+            name: name.to_owned(),
+            type_name: "Void".to_owned(),
+            description: String::new(),
+            scope: scope.to_owned(),
+            scope_exempt: false,
+            cli_hidden: false,
+            doc_example: String::new(),
+            vfs_path: String::new(),
+            vfs_kind: String::new(),
+            vfs_bulk: false,
+            vfs_hidden: false,
+            vfs_mac: String::new(),
+            dispatch_mac: "internal:pq-hybrid".to_owned(),
+            dispatch_public: String::new(),
+            mutation_semantics: semantics.to_owned(),
+        }
+    }
+
+    #[test]
+    fn mutating_leaves_require_checked_explicit_policy() {
+        let missing = variant("sendInput", "write", "");
+        let err = validate_mandatory_mutation_policy("tui", &[missing], &[]).unwrap_err();
+        assert!(err.contains("missing required"), "{err}");
+
+        let unsupported = variant("sendInput", "write", "automatic");
+        let err = validate_mandatory_mutation_policy("tui", &[unsupported], &[]).unwrap_err();
+        assert!(err.contains("unknown"), "{err}");
+
+        for semantics in [
+            "naturally-idempotent",
+            "idempotency-key-required",
+            "transaction-ledger-required",
+        ] {
+            validate_mandatory_mutation_policy("tui", &[variant("method", "write", semantics)], &[])
+                .unwrap_or_else(|err| panic!("{semantics}: {err}"));
+        }
+    }
+
+    #[test]
+    fn scope_exempt_mutator_can_declare_policy() {
+        let mut exempt = variant("registerServiceKey", "", "naturally-idempotent");
+        exempt.scope_exempt = true;
+        validate_mandatory_mutation_policy("policy", &[exempt], &[]).unwrap();
+    }
+
+    #[test]
+    fn stateful_read_leaves_can_declare_checked_policy() {
+        let read = variant("walk", "query", "idempotency-key-required");
+        validate_mandatory_mutation_policy("registry", &[read], &[]).unwrap();
+
+        let plain_read = variant("list", "query", "");
+        validate_mandatory_mutation_policy("registry", &[plain_read], &[]).unwrap();
     }
 }

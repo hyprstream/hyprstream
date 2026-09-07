@@ -70,6 +70,10 @@ pub struct UnionVariant {
     /// Expands to exactly system low; public is never inherited.
     #[serde(default)]
     pub dispatch_public: String,
+    /// `$mutationSemantics` declaration for a mutating leaf (v16 §4.8/§6.1).
+    /// Empty only for read-class, scope-exempt, or dispatcher variants.
+    #[serde(default)]
+    pub mutation_semantics: String,
 }
 
 /// Payload carried by a tagged-union arm.
@@ -312,6 +316,7 @@ mod vfs_metadata_tests {
             vfs_mac: String::new(),
             dispatch_mac: String::new(),
             dispatch_public: String::new(),
+            mutation_semantics: String::new(),
         };
         let json = serde_json::to_string(&v).expect("serialize");
         let back: UnionVariant = serde_json::from_str(&json).expect("deserialize");

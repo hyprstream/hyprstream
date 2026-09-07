@@ -33,6 +33,9 @@ use quote::{format_ident, quote};
 use hyprstream_rpc_build::schema::dispatch_label::{
     parse_dispatch_mac, parse_dispatch_public_reason, InitialLabelMap, READ_CLASS_ACTIONS,
 };
+use hyprstream_rpc_build::schema::mutation_policy::{
+    parse_mutation_semantics, DeclaredMutationSemantics,
+};
 
 use crate::resolve::ResolvedSchema;
 use crate::schema::types::*;
@@ -55,6 +58,8 @@ pub struct MethodLeaf {
     pub dispatch_mac: String,
     /// `$dispatchPublic` reason text. Empty for `$dispatchMac` leaves.
     pub dispatch_public: String,
+    /// Explicit `$mutationSemantics` metadata for a mutating executable leaf.
+    pub mutation_semantics: String,
 }
 
 /// Per-arm metadata resolved during the walk.
@@ -66,6 +71,7 @@ struct ArmMeta<'a> {
     scope_exempt: bool,
     dispatch_mac: &'a str,
     dispatch_public: &'a str,
+    mutation_semantics: &'a str,
 }
 
 /// Annotation state inherited from the nearest annotated ancestor selector.
@@ -105,6 +111,7 @@ fn level_arms<'a>(
                     scope_exempt: meta.map(|v| v.scope_exempt).unwrap_or(false),
                     dispatch_mac: meta.map(|v| v.dispatch_mac.as_str()).unwrap_or(""),
                     dispatch_public: meta.map(|v| v.dispatch_public.as_str()).unwrap_or(""),
+                    mutation_semantics: meta.map(|v| v.mutation_semantics.as_str()).unwrap_or(""),
                 }
             })
             .collect(),
@@ -119,6 +126,7 @@ fn level_arms<'a>(
                 scope_exempt: v.scope_exempt,
                 dispatch_mac: &v.dispatch_mac,
                 dispatch_public: &v.dispatch_public,
+                mutation_semantics: &v.mutation_semantics,
             })
             .collect(),
     }
@@ -225,6 +233,7 @@ fn walk_level(
                 scope_exempt: effective.scope_exempt,
                 dispatch_mac: effective.dispatch_mac.clone(),
                 dispatch_public: effective.dispatch_public.clone(),
+                mutation_semantics: arm.mutation_semantics.to_owned(),
             });
         }
     }
@@ -317,8 +326,8 @@ pub fn generate_body_decoder(service_name: &str, resolved: &ResolvedSchema) -> T
 ///   Hybrid suite, and a target label parsed HERE against the checked-in
 ///   `InitialLabelMap` (stable bit assignments) — never at runtime;
 /// - every row carries the fixed system-low `transitional_label` (v16 §7.3)
-///   and a `MutationSemantics` derived from the checked `ScopeAction` block
-///   structure (`None` for read-class actions, `Some(..)` for mutating ones).
+///   and checked per-leaf `MutationSemantics` metadata (an explicit declared
+///   variant for every non-read action and any stateful read-class leaf).
 ///   (Credentials are Reusable-only per the 2026-08-20 operator deferral;
 ///   a use-profile field returns only with a future amendment that allocates
 ///   its claim key — it is not carried dormant here.)
@@ -425,23 +434,35 @@ pub fn generate_method_policy_rows(service_name: &str, resolved: &ResolvedSchema
                 }
             };
 
-        // Mutation semantics derive from the checked ScopeAction block
-        // structure (v16 §6.1: "generated from checked schema/policy
-        // metadata, not guessed from method names"): Block A (query,
-        // subscribe) is side-effect-free; every other action is mutating and
-        // requires an explicit semantics — the generated default is
-        // NaturallyIdempotent (retry-safe without extra machinery); the
-        // idempotency-key and ledger variants arrive with WS-L per method.
-        // A public leaf carries no scope action and is exempt from the gate.
-        let mutation_semantics = if leaf.scope.is_empty()
-            || READ_CLASS_ACTIONS.contains(&leaf.scope.as_str())
+        // §4.8/§6.1: authorization scope and application effects are separate
+        // axes. A query/subscribe leaf may explicitly classify bounded session
+        // or subscription state, while every non-read scope needs a declaration.
+        // This is a second gate after the CGR parser validation.
+        let mutation_semantics = if leaf.mutation_semantics.is_empty()
+            && (READ_CLASS_ACTIONS.contains(&leaf.scope.as_str()) || leaf.scope.is_empty())
         {
+            // Ordinary read leaves and scope-exempt public/control-plane reads
+            // remain policy-free. An explicitly classified leaf follows the
+            // checked parser below; authorization never implies retry safety.
             quote! { None }
         } else {
-            quote! {
-                Some(
-                    hyprstream_rpc::proof::policy::MutationSemantics::NaturallyIdempotent
-                )
+            match parse_mutation_semantics(&leaf.mutation_semantics) {
+                Ok(DeclaredMutationSemantics::NaturallyIdempotent) => quote! {
+                    Some(hyprstream_rpc::proof::policy::MutationSemantics::NaturallyIdempotent)
+                },
+                Ok(DeclaredMutationSemantics::IdempotencyKeyRequired) => quote! {
+                    Some(hyprstream_rpc::proof::policy::MutationSemantics::IdempotencyKeyRequired)
+                },
+                Ok(DeclaredMutationSemantics::TransactionLedgerRequired) => quote! {
+                    Some(hyprstream_rpc::proof::policy::MutationSemantics::TransactionLedgerRequired)
+                },
+                Err(e) => {
+                    let msg = format!(
+                        "method leaf '{}.{}' (scope '{}') {e}; mutation retry policy is explicit per leaf",
+                        service_name, leaf.symbolic, leaf.scope
+                    );
+                    return quote! { ::core::compile_error!(#msg); };
+                }
             }
         };
 
@@ -598,6 +619,7 @@ mod tests {
             vfs_mac: String::new(),
             dispatch_mac: String::new(),
             dispatch_public: String::new(),
+            mutation_semantics: String::new(),
         }
     }
 
@@ -781,6 +803,9 @@ mod tests {
         let mut v = variant(name, type_name, scope, false);
         v.dispatch_mac = mac.to_owned();
         v.dispatch_public = public.to_owned();
+        if !scope.is_empty() && !READ_CLASS_ACTIONS.contains(&scope) {
+            v.mutation_semantics = "transaction-ledger-required".to_owned();
+        }
         v
     }
 
@@ -948,7 +973,7 @@ mod tests {
             "SignaturePolicy :: TokenBound",
             "SignaturePolicy :: UnauthenticatedOrTokenBound",
             "CryptoSuite :: Hybrid",
-            "MutationSemantics :: NaturallyIdempotent",
+            "MutationSemantics :: TransactionLedgerRequired",
             "SYSTEM_LOW_LABEL",
             "dispatch_label",
             "Level :: Internal",
@@ -959,11 +984,44 @@ mod tests {
             assert!(generated.contains(needle), "missing `{needle}`:\n{generated}");
         }
 
-        // Read-class rows carry no mutation semantics; the mutating one does.
-        // (Asserted structurally by the runtime validator over the real
-        // inventory; here the counts must line up with the three leaves.)
-        let mutation_count = generated.matches("MutationSemantics :: NaturallyIdempotent").count();
+        // Read-class rows carry no mutation semantics; the declared ledger
+        // requirement is preserved rather than inferred from `write`.
+        let mutation_count = generated.matches("MutationSemantics :: TransactionLedgerRequired").count();
         assert_eq!(mutation_count, 1, "only `commit` (write) is mutating");
+    }
+
+    /// A mutating scope without checked per-leaf metadata never gets a
+    /// retry-safe default; it fails the code-generation boundary.
+    #[test]
+    fn missing_mutating_policy_is_a_compile_error() {
+        let mut missing = dispatch_variant("sendInput", "Text", "write", MAC, "");
+        missing.mutation_semantics.clear();
+        let generated = generate_method_policy_rows("tui", &simple_schema(vec![missing])).to_string();
+        assert!(generated.contains("compile_error"), "{generated}");
+        assert!(generated.contains("missing required"), "{generated}");
+    }
+
+    /// Each declared authoritative value reaches the generated inventory
+    /// unchanged; codegen does not collapse them to NaturallyIdempotent.
+    #[test]
+    fn declared_mutation_policy_is_preserved() {
+        let mut natural = dispatch_variant("focus", "Void", "write", MAC, "");
+        natural.mutation_semantics = "naturally-idempotent".to_owned();
+        let mut keyed = dispatch_variant("update", "Text", "write", MAC, "");
+        keyed.mutation_semantics = "idempotency-key-required".to_owned();
+        let ledger = dispatch_variant("sendInput", "Text", "write", MAC, "");
+        let generated = generate_method_policy_rows(
+            "tui",
+            &simple_schema(vec![natural, keyed, ledger]),
+        )
+        .to_string();
+        for variant in [
+            "MutationSemantics :: NaturallyIdempotent",
+            "MutationSemantics :: IdempotencyKeyRequired",
+            "MutationSemantics :: TransactionLedgerRequired",
+        ] {
+            assert!(generated.contains(variant), "missing {variant}: {generated}");
+        }
     }
 
     /// Opus #1518 F-J drift coverage: an IMPORTED pure-union payload

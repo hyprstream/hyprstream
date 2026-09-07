@@ -5,6 +5,7 @@ using import "/streaming.capnp".StreamInfo;
 using import "/annotations.capnp".optional;
 using import "/annotations.capnp".scope;
 using import "/annotations.capnp".dispatchMac;
+using import "/annotations.capnp".mutationSemantics;
 using import "/annotations.capnp".paramDescription;
 using import "/annotations.capnp".serdeRename;
 using Opt = import "/optional.capnp";
@@ -36,60 +37,60 @@ struct InferenceRequest {
 
   # Request payload (union of request types)
   union {
-    generateStream @1 :GenerationRequest $scope(infer) $dispatchMac("internal:pq-hybrid");
+    generateStream @1 :GenerationRequest $scope(infer) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");
     modelInfo @2 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
     isReady @3 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
     applyChatTemplate @4 :ChatTemplateRequest $scope(query) $dispatchMac("internal:pq-hybrid");
 
     # LoRA operations
-    createLora @5 :LoraConfig $scope(write) $dispatchMac("internal:pq-hybrid");
-    loadLora @6 :Text $scope(write) $dispatchMac("internal:pq-hybrid");       # path
-    saveLora @7 :Text $scope(write) $dispatchMac("internal:pq-hybrid");       # path
-    unloadLora @8 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
+    createLora @5 :LoraConfig $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    loadLora @6 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");       # path
+    saveLora @7 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");       # path
+    unloadLora @8 :Void $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
     hasLora @9 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
 
     # Session operations
-    setSession @10 :Text $scope(write) $dispatchMac("internal:pq-hybrid");    # session_id
-    clearSession @11 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
-    releaseSession @12 :Text $scope(write) $dispatchMac("internal:pq-hybrid");
+    setSession @10 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");    # session_id
+    clearSession @11 :Void $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    releaseSession @12 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
 
     # Health/Lifecycle
     healthCheck @13 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
-    shutdown @14 :Void $scope(manage) $dispatchMac("internal:pq-hybrid");
+    shutdown @14 :Void $scope(manage) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
 
     # Training loop control — tenant-aware TTT (identity from auth envelope)
-    tttWriteback @15 :Void $scope(train) $dispatchMac("internal:pq-hybrid");
-    tttEvict @16 :Void $scope(train) $dispatchMac("internal:pq-hybrid");
-    trainStep @17 :TrainStepRequest $scope(train) $dispatchMac("internal:pq-hybrid");
-    tttZero @18 :Void $scope(manage) $dispatchMac("internal:pq-hybrid");
+    tttWriteback @15 :Void $scope(train) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    tttEvict @16 :Void $scope(train) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    trainStep @17 :TrainStepRequest $scope(train) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    tttZero @18 :Void $scope(manage) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
 
     # Persistence operations (identity from auth envelope)
     getDeltaStatus @19 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
-    saveAdaptation @20 :SaveAdaptationRequest $scope(write) $dispatchMac("internal:pq-hybrid");
-    snapshotDelta @21 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
+    saveAdaptation @20 :SaveAdaptationRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");
+    snapshotDelta @21 :Void $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
 
     # Streaming training (returns immediately, results via PUB/SUB)
-    trainStepStream @22 :TrainStepRequest $scope(train) $dispatchMac("internal:pq-hybrid");
+    trainStepStream @22 :TrainStepRequest $scope(train) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");
 
     # Export delta as PEFT adapter directory (identity from auth envelope)
-    exportPeftAdapter @23 :ExportPeftRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    exportPeftAdapter @23 :ExportPeftRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
 
     # Merge an on-disk adapter into the loaded base_delta
-    mergeLora @24 :MergeLoraRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    mergeLora @24 :MergeLoraRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");
 
     # Streaming variants — return StreamInfo immediately, results via PUB/SUB.
     # Use these instead of the non-streaming versions for operations that may
     # involve significant compute or I/O (GPU alloc, disk writes, merges).
-    createLoraStream @25 :LoraConfig $scope(write) $dispatchMac("internal:pq-hybrid");
-    loadLoraStream @26 :Text $scope(write) $dispatchMac("internal:pq-hybrid");          # path
-    saveLoraStream @27 :Text $scope(write) $dispatchMac("internal:pq-hybrid");          # path
-    saveAdaptationStream @28 :SaveAdaptationRequest $scope(write) $dispatchMac("internal:pq-hybrid");
-    snapshotDeltaStream @29 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
-    exportPeftAdapterStream @30 :ExportPeftRequest $scope(write) $dispatchMac("internal:pq-hybrid");
-    mergeLoraStream @31 :MergeLoraRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    createLoraStream @25 :LoraConfig $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    loadLoraStream @26 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");          # path
+    saveLoraStream @27 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");          # path
+    saveAdaptationStream @28 :SaveAdaptationRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");
+    snapshotDeltaStream @29 :Void $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    exportPeftAdapterStream @30 :ExportPeftRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    mergeLoraStream @31 :MergeLoraRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");
 
     # Vision embeddings (synchronous — returns all embeddings in one response)
-    embed @32 :EmbedImagesRequest $scope(infer) $dispatchMac("internal:pq-hybrid");
+    embed @32 :EmbedImagesRequest $scope(infer) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
 
     # TTN layer profile (returns JSON-encoded LayerProfile for diagnostics/tooling)
     getLayerProfile @33 :Void $scope(query) $dispatchMac("internal:pq-hybrid");

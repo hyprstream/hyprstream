@@ -5,6 +5,7 @@ using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".paramDescription;
 using import "/annotations.capnp".scope;
 using import "/annotations.capnp".dispatchMac;
+using import "/annotations.capnp".mutationSemantics;
 using import "/annotations.capnp".vfsPath;
 
 # Cap'n Proto schema for workflow service (independent service)
@@ -25,19 +26,19 @@ struct WorkflowRequest {
       $vfsPath("{arg}/scan");
     register @2 :WorkflowDef
       $mcpDescription("Register a workflow definition")
-      $scope(write) $dispatchMac("internal:pq-hybrid");
+      $scope(write) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid");
     list @3 :Void
       $mcpDescription("List all registered workflows")
       $scope(query) $dispatchMac("internal:pq-hybrid");
     dispatch @4 :DispatchRequest
       $mcpDescription("Dispatch a workflow run with input parameters")
-      $scope(write) $dispatchMac("internal:pq-hybrid");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
     subscribe @5 :SubscribeRequest
       $mcpDescription("Subscribe to workflow events")
-      $scope(write) $dispatchMac("internal:pq-hybrid");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
     unsubscribe @6 :Text
       $mcpDescription("Unsubscribe from workflow events")
-      $scope(write) $dispatchMac("internal:pq-hybrid");
+      $scope(write) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid");
     getRun @7 :Text
       $mcpDescription("Get status of a workflow run")
       $scope(query) $dispatchMac("internal:pq-hybrid")

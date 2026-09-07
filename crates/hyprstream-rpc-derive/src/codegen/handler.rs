@@ -2420,6 +2420,7 @@ mod browser_method_dispatch_tests {
             vfs_mac: String::new(),
             dispatch_mac: String::new(),
             dispatch_public: String::new(),
+            mutation_semantics: String::new(),
         }
     }
 

@@ -3,6 +3,7 @@
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
 using import "/annotations.capnp".dispatchMac;
+using import "/annotations.capnp".mutationSemantics;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".vfsKind;
 using import "/annotations.capnp".vfsPath;
@@ -57,20 +58,20 @@ struct RegistryRequest {
         $mcpDescription("Get repository information by its display name.")
         $vfsKind(file) $vfsPath("{name}");
     # Clone a model repository from a URL
-    clone @4 :CloneRequest $scope(write) $dispatchMac("internal:pq-hybrid")
+    clone @4 :CloneRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required")
         $mcpDescription("Clone a model repository from a URL into the local registry.")
         $vfsKind(ctl) $vfsPath("ctl");
     # Register an existing local repository
-    register @5 :RegisterRequest $scope(write) $dispatchMac("internal:pq-hybrid") $vfsKind(ctl) $vfsPath("ctl");
+    register @5 :RegisterRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required") $vfsKind(ctl) $vfsPath("ctl");
     # Remove a repository from the registry
-    remove @6 :Text $scope(manage) $dispatchMac("internal:pq-hybrid") $vfsKind(ctl) $vfsPath("ctl");
+    remove @6 :Text $scope(manage) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent") $vfsKind(ctl) $vfsPath("ctl");
     # Check registry service health
     healthCheck @7 :Void $scope(query) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Check if the registry service is healthy and responding.")
         $vfsKind(file) $vfsPath("health")
         $vfsMac("internal:pq-hybrid");
     # Clone a model repository from a URL (streaming progress)
-    cloneStream @8 :CloneRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Clone a model repository from a URL (streaming progress)");
+    cloneStream @8 :CloneRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required") $mcpDescription("Clone a model repository from a URL (streaming progress)");
 
     # Repository-scoped operations (requires repoId)
     repo @9 :RepositoryRequest $vfsKind(dir) $vfsPath("repo/{repoId}");
@@ -92,9 +93,9 @@ struct RegistryRequest {
     # fine-grained handler check authorize(ctx, "model:{repo}", "write") that
     # mirrors authorize_get_blob's per-repo "query" check, one verb up. A read
     # grant never implies write.
-    putBlob @11 :PutBlobRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Ingest content-addressed bytes; server computes the merkle and binds merkle→repo provenance");
+    putBlob @11 :PutBlobRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent") $mcpDescription("Ingest content-addressed bytes; server computes the merkle and binds merkle→repo provenance");
     # #1004: caller supplies untrusted bytes only; GATE/durable predecessor is authority.
-    ingestAt9pCandidate @12 :At9pCandidateRequest $scope(write) $dispatchMac("internal:pq-hybrid")
+    ingestAt9pCandidate @12 :At9pCandidateRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("transaction-ledger-required")
         $mcpDescription("Submit untrusted did:at9p genesis/update bytes to the durable acceptance PEP");
   }
 }
@@ -106,28 +107,28 @@ struct RepositoryRequest {
   repoId @0 :Text;
   union {
     # Create a new worktree for the repository
-    createWorktree @1 :CreateWorktreeRequest $scope(write) $dispatchMac("internal:pq-hybrid")
+    createWorktree @1 :CreateWorktreeRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
         $mcpDescription("Ensure a worktree exists for a branch, creating if needed");
     # List all worktrees for the repository
     listWorktrees @2 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
     # Remove a worktree from the repository
-    removeWorktree @3 :RemoveWorktreeRequest $scope(manage) $dispatchMac("internal:pq-hybrid");
+    removeWorktree @3 :RemoveWorktreeRequest $scope(manage) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
     # Create a new branch in the repository
-    createBranch @4 :BranchRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    createBranch @4 :BranchRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
     # List all branches in the repository
     listBranches @5 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
     # DEPRECATED — moved to WorktreeRequest. Kept for wire compatibility.
     # Handlers return an error directing callers to the worktree-scoped API.
     # Scoped $scope(write) per mandatory-scope (S3): mutating git ops; the
     # deprecated stub still requires a non-public scope so it can't widen access.
-    checkout @6 :CheckoutRequest $scope(write) $dispatchMac("internal:pq-hybrid");
-    stageAll @7 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
-    stageFiles @8 :StageFilesRequest $scope(write) $dispatchMac("internal:pq-hybrid");
-    commit @9 :CommitRequest $scope(write) $dispatchMac("internal:pq-hybrid");
-    merge @10 :MergeRequest $scope(write) $dispatchMac("internal:pq-hybrid");
-    abortMerge @11 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
-    continueMerge @12 :ContinueMergeRequest $scope(write) $dispatchMac("internal:pq-hybrid");
-    quitMerge @13 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
+    checkout @6 :CheckoutRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    stageAll @7 :Void $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    stageFiles @8 :StageFilesRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    commit @9 :CommitRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    merge @10 :MergeRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    abortMerge @11 :Void $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    continueMerge @12 :ContinueMergeRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    quitMerge @13 :Void $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
     # Get the current HEAD reference
     getHead @14 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
     # Get information about a specific reference
@@ -139,27 +140,27 @@ struct RepositoryRequest {
     # List all remotes for the repository
     listRemotes @18 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
     # Add a new remote to the repository
-    addRemote @19 :AddRemoteRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    addRemote @19 :AddRemoteRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
     # Remove a remote from the repository
-    removeRemote @20 :RemoveRemoteRequest $scope(manage) $dispatchMac("internal:pq-hybrid");
+    removeRemote @20 :RemoveRemoteRequest $scope(manage) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
     # Set the URL for a remote
-    setRemoteUrl @21 :SetRemoteUrlRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    setRemoteUrl @21 :SetRemoteUrlRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
     # Rename a remote
-    renameRemote @22 :RenameRemoteRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    renameRemote @22 :RenameRemoteRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
     # Push commits to a remote repository
-    push @23 :PushRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    push @23 :PushRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
     # DEPRECATED — moved to WorktreeRequest. Kept for wire compatibility.
-    amendCommit @24 :AmendCommitRequest $scope(write) $dispatchMac("internal:pq-hybrid");
-    commitWithAuthor @25 :CommitWithAuthorRequest $scope(write) $dispatchMac("internal:pq-hybrid");
-    stageAllIncludingUntracked @26 :Void $scope(write) $dispatchMac("internal:pq-hybrid");
+    amendCommit @24 :AmendCommitRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    commitWithAuthor @25 :CommitWithAuthorRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    stageAllIncludingUntracked @26 :Void $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
     # List all tags in the repository
     listTags @27 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
     # Create a new tag
-    createTag @28 :CreateTagRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    createTag @28 :CreateTagRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
     # Delete a tag from the repository
-    deleteTag @29 :DeleteTagRequest $scope(manage) $dispatchMac("internal:pq-hybrid");
+    deleteTag @29 :DeleteTagRequest $scope(manage) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
     # Pull and update from remote repository
-    update @30 :UpdateRequest $scope(write) $dispatchMac("internal:pq-hybrid");
+    update @30 :UpdateRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
     # Worktree-scoped filesystem operations
     worktree @31 :WorktreeRequest;
   }
@@ -238,34 +239,34 @@ struct WorktreeRequest {
   name @0 :Text;
   union {
     # Walk: resolve path components to get a fid (like 9P Twalk)
-    walk @1 :NpWalk $scope(query) $dispatchMac("internal:pq-hybrid")
+    walk @1 :NpWalk $scope(query) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required")
         $mcpDescription("Resolve path components to a fid (9P walk). Use the returned fid for open (I/O) or ctl operations (git log/diff/blame). Each use requires a separate fid.");
     # Open: open a walked fid for I/O (like 9P Topen)
     # Scope is `write` (NOT `query` like model.capnp's read-only ModelFs.open):
     # a worktree is a mutable git checkout and `NpOpen` may request a write mode,
     # so open is gated at the mutating tier here — fail-safe least-privilege.
-    open @2 :NpOpen $scope(write) $dispatchMac("internal:pq-hybrid")
+    open @2 :NpOpen $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
         $mcpDescription("Open a walked fid for read/write I/O. After open, the fid can only be used for read/write — ctl operations (log, diff, blame) require a separate walked-not-opened fid.");
     # Create: create a file/dir under a walked directory fid (like 9P Tcreate)
-    create @3 :NpCreate $scope(write) $dispatchMac("internal:pq-hybrid")
+    create @3 :NpCreate $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
         $mcpDescription("Create a file or directory under a walked directory fid. The fid is then opened for I/O on the new file.");
     # Read: offset+count read, server clamps to iounit (like 9P Tread)
     read @4 :NpRead $scope(query) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Read file content or directory listing at offset+count (bounded by iounit). For directories, returns entries as binary: name_len(u32) + name + is_dir(u8) + size(u64).");
     # Write: offset+data write, server rejects if > iounit (like 9P Twrite)
-    write @5 :NpWrite $scope(write) $dispatchMac("internal:pq-hybrid")
+    write @5 :NpWrite $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
         $mcpDescription("Write data to an opened file at offset. Data size must not exceed iounit.");
     # Clunk: release a fid (like 9P Tclunk)
-    clunk @6 :NpClunk $scope(query) $dispatchMac("internal:pq-hybrid")
+    clunk @6 :NpClunk $scope(query) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
         $mcpDescription("Release a fid (like close). Frees server resources. Always clunk fids when done.");
     # Remove: clunk + delete file/dir (like 9P Tremove)
-    remove @7 :NpRemove $scope(manage) $dispatchMac("internal:pq-hybrid")
+    remove @7 :NpRemove $scope(manage) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
         $mcpDescription("Remove a file or directory and release its fid.");
     # Stat: get file metadata (like 9P Tstat)
     npStat @8 :NpStatReq $scope(query) $dispatchMac("internal:pq-hybrid")
         $mcpDescription("Get file metadata (size, mode, timestamps). Works on both walked and opened fids.");
     # Wstat: modify file metadata (like 9P Twstat)
-    wstat @9 :NpWstat $scope(write) $dispatchMac("internal:pq-hybrid")
+    wstat @9 :NpWstat $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
         $mcpDescription("Modify file metadata (truncate, rename). Requires an opened fid for truncate.");
     # Flush: cancel pending operation (like 9P Tflush)
     flush @10 :NpFlush $scope(query) $dispatchMac("internal:pq-hybrid")
@@ -275,27 +276,27 @@ struct WorktreeRequest {
 
     # Worktree-scoped git operations
     stageAll @12 :Void
-        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Stage all modified tracked files in this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent") $mcpDescription("Stage all modified tracked files in this worktree");
     stageFiles @13 :StageFilesRequest
-        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Stage specific files in this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent") $mcpDescription("Stage specific files in this worktree");
     stageAllIncludingUntracked @14 :Void
-        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Stage all files including untracked in this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent") $mcpDescription("Stage all files including untracked in this worktree");
     commit @15 :CommitRequest
-        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Commit staged changes in this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required") $mcpDescription("Commit staged changes in this worktree");
     commitWithAuthor @16 :CommitWithAuthorRequest
-        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Commit staged changes with specified author");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required") $mcpDescription("Commit staged changes with specified author");
     amendCommit @17 :AmendCommitRequest
-        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Amend the last commit in this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required") $mcpDescription("Amend the last commit in this worktree");
     checkout @18 :CheckoutRequest
-        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Checkout a ref in this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent") $mcpDescription("Checkout a ref in this worktree");
     merge @19 :MergeRequest
-        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Merge a branch into this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent") $mcpDescription("Merge a branch into this worktree");
     abortMerge @20 :Void
-        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Abort an in-progress merge in this worktree");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent") $mcpDescription("Abort an in-progress merge in this worktree");
     continueMerge @21 :ContinueMergeRequest
-        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Continue a merge after resolving conflicts");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent") $mcpDescription("Continue a merge after resolving conflicts");
     quitMerge @22 :Void
-        $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Exit merge state without committing");
+        $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent") $mcpDescription("Exit merge state without committing");
   }
 }
 
@@ -643,19 +644,19 @@ struct CtlRequest {
     log       @2 :CtlLogRequest      $scope(query) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Commits touching this file. Requires a walked (not opened) fid.");
     diff      @3 :CtlDiffRequest     $scope(query) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Diff this file against a ref. Requires a walked (not opened) fid.");
     blame     @4 :Void               $scope(query) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Git blame for this file. Requires a walked (not opened) fid.");
-    checkout  @5 :CtlCheckoutRequest $scope(write) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Restore file content from a ref");
+    checkout  @5 :CtlCheckoutRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")  $mcpDescription("Restore file content from a ref");
 
     # ── File control ──
     validate  @6 :Void               $scope(query) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Validate file format. Requires a walked (not opened) fid.");
     info      @7 :Void               $scope(query) $dispatchMac("internal:pq-hybrid")  $mcpDescription("File metadata and git state. Requires a walked (not opened) fid.");
 
     # ── CRDT editing ──
-    editOpen  @8  :EditOpenRequest   $scope(write) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Open file for CRDT editing");
+    editOpen  @8  :EditOpenRequest   $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")  $mcpDescription("Open file for CRDT editing");
     editState @9  :Void              $scope(query) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Get current CRDT document state");
-    editApply @10 :EditApplyRequest  $scope(write) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Apply automerge CRDT change");
-    editClose @11 :Void              $scope(write) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Close CRDT editing session");
+    editApply @10 :EditApplyRequest  $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")  $mcpDescription("Apply automerge CRDT change");
+    editClose @11 :Void              $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")  $mcpDescription("Close CRDT editing session");
     # Flush: serialize CRDT state to disk (does NOT stage or commit)
-    ctlFlush  @12 :Void              $scope(write) $dispatchMac("internal:pq-hybrid")  $mcpDescription("Write CRDT state to disk file");
+    ctlFlush  @12 :Void              $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")  $mcpDescription("Write CRDT state to disk file");
   }
 }
 

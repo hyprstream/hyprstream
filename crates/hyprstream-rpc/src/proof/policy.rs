@@ -50,8 +50,9 @@ pub const fn dispatch_label(level: Level, assurance: Assurance, bits: &[u32]) ->
     }
 }
 
-/// The side-effect-free scope actions (S3 `ScopeAction` Block A: read-class).
-/// Every other action in the closed vocabulary is mutating.
+/// The read-class authorization actions (S3 `ScopeAction` Block A). A leaf may
+/// explicitly classify bounded session/subscription state under either action;
+/// every other action requires a mutation policy.
 pub const READ_CLASS_ACTIONS: &[&str] = &["query", "subscribe"];
 
 /// The generated application policy a mutating method declares (v16 §4.8) —
@@ -251,8 +252,8 @@ pub struct GeneratedMethodPolicyRow {
     pub authentication: AuthenticationRequirement,
     /// The signing topology the leaf requires.
     pub signature_policy: SignaturePolicy,
-    /// The application mutation policy a mutating leaf declares (v16 §4.8);
-    /// `None` exactly for read-class (side-effect-free) scope actions.
+    /// The application mutation policy an effectful leaf declares (v16 §4.8).
+    /// `None` means no declared application effect, including ordinary reads.
     pub mutation_semantics: Option<MutationSemantics>,
     /// The migration label: always system low while the transitional column
     /// is selected (v16 §7.3); deleted after the target flip.
@@ -430,30 +431,33 @@ pub fn validate_generated_rows(rows: &[GeneratedMethodPolicyRow]) -> Result<()> 
             );
         }
 
-        // Mutation consistency (v16 §6.1): a mutating scope action requires an
-        // explicit `MutationSemantics`; a read-class action must not claim one.
-        // The gate keys off the checked `ScopeAction` block structure, never a
-        // method name. A public row carries no scope action and is reviewed
-        // through its public reason instead.
+        // Mutation consistency (v16 §6.1): every non-read scope action requires
+        // explicit `MutationSemantics`. A read-class action may carry an
+        // explicit policy for bounded session/subscription state; authorization
+        // and application effects are separate axes. A public row carries no
+        // scope action and is reviewed through its public reason instead.
         if !row.scope_action.is_empty() {
             let is_read_class = READ_CLASS_ACTIONS.contains(&row.scope_action);
-            match (is_read_class, row.mutation_semantics) {
-                (true, Some(_)) => bail!(
-                    "read-class leaf '{}':'{}' (scope '{}') declares mutation semantics — \
-                     read-class actions are side-effect-free",
-                    row.service,
-                    row.symbolic_path,
-                    row.scope_action
-                ),
-                (false, None) => bail!(
+            if !is_read_class && row.mutation_semantics.is_none() {
+                bail!(
                     "mutating leaf '{}':'{}' (scope '{}') has no MutationSemantics — a \
                      mutating scope action requires an explicit one (v16 §6.1)",
                     row.service,
                     row.symbolic_path,
                     row.scope_action
-                ),
-                _ => {}
+                );
             }
+        }
+
+        // A scope-exempt leaf may be public/read-only with no policy, or a
+        // separately authenticated control-plane mutator with an explicit one.
+        // Empty scope alone never erases explicit mutation metadata.
+        if row.scope_action.is_empty() && !row.scope_exempt && row.mutation_semantics.is_some() {
+            bail!(
+                "unscoped non-exempt leaf '{}':'{}' declares MutationSemantics",
+                row.service,
+                row.symbolic_path
+            );
         }
 
         // Approver rules must be satisfiable and exact.
@@ -940,15 +944,16 @@ mod tests {
         assert!(err.to_string().contains("scope-exempt but carries scope action"), "{err}");
     }
 
-    /// Mutation consistency (v16 §6.1): mutating scope actions require an
-    /// explicit `MutationSemantics`; read-class actions must not claim one.
+    /// Mutation consistency (v16 §6.1): non-read scope actions require an
+    /// explicit `MutationSemantics`; stateful read-class leaves may claim one.
     #[test]
     fn mutation_semantics_mismatch_fails_the_build() {
-        // read-class + Some = contradiction.
+        // A query scope may explicitly classify bounded session state while
+        // preserving its existing query authorization.
         let mut read_claiming = valid_row(&[0], "a");
         read_claiming.scope_action = "query";
         read_claiming.mutation_semantics = Some(MutationSemantics::NaturallyIdempotent);
-        assert!(validate_generated_rows(&[read_claiming]).is_err());
+        assert!(validate_generated_rows(&[read_claiming]).is_ok());
 
         // mutating + None = contradiction. A public row (empty scope action)
         // is exempt from this gate — it is reviewed via its public reason.
@@ -957,6 +962,15 @@ mod tests {
         mutating_bare.mutation_semantics = None;
         assert!(validate_generated_rows(&[mutating_bare]).is_err());
         assert!(validate_generated_rows(&[public_row(&[3], "p2")]).is_ok());
+
+        // A control-plane exemption can still be a declared mutator when its
+        // separate authentication gate is documented; empty scope is not an
+        // implicit read classification.
+        let mut exempt_mutator = valid_row(&[4], "registerServiceKey");
+        exempt_mutator.scope_action = "";
+        exempt_mutator.scope_exempt = true;
+        exempt_mutator.mutation_semantics = Some(MutationSemantics::NaturallyIdempotent);
+        assert!(validate_generated_rows(&[exempt_mutator]).is_ok());
 
         // mutating + Some stays green, for each declared variant.
         for semantics in [
@@ -970,11 +984,11 @@ mod tests {
             assert!(validate_generated_rows(&[row]).is_ok());
         }
 
-        // Every scope action outside the read-class block is mutating.
+        // Subscribe can likewise classify effectful subscription state.
         let mut subscribe = valid_row(&[0], "a");
         subscribe.scope_action = "subscribe";
         subscribe.mutation_semantics = Some(MutationSemantics::NaturallyIdempotent);
-        assert!(validate_generated_rows(&[subscribe]).is_err());
+        assert!(validate_generated_rows(&[subscribe]).is_ok());
     }
 
     #[test]

@@ -13,6 +13,7 @@
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
 using import "/annotations.capnp".dispatchMac;
+using import "/annotations.capnp".mutationSemantics;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".domainType;
 
@@ -33,7 +34,7 @@ struct McpRequest {
     getMetrics @3 :Void $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Get MCP service metrics");
 
     # Call an MCP tool internally
-    callTool @4 :CallTool $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Call an MCP tool internally");
+    callTool @4 :CallTool $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Call an MCP tool internally");
   }
 }
 

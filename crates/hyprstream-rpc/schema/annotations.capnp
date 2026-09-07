@@ -27,9 +27,10 @@
 # NAME (not the ordinal), and the runtime `Scope`/`Operation` are keyed on those names,
 # so the names are the stable contract and the ordinals are free to be re-grouped.
 enum ScopeAction {
-  # ── Block A: read-class — side-effect-free (9p read = no side effects).
-  #            TE object-class: "read". Cheap to grant to a group.
-  query      @0;  # read status/state/list           (UCAN cmd: /query)
+  # ── Block A: read-class authorization. TE object-class: "read". A leaf
+  #            may still declare bounded session/subscription effects through
+  #            $mutationSemantics; authorization and effect policy are separate.
+  query      @0;  # query/read authority              (UCAN cmd: /query)
   subscribe  @1;  # subscribe to stream/notification  (UCAN cmd: /subscribe)
   # ── Block B: write/authority-class — mutating or capability-bearing actions on
   #            models/resources. TE object-class: "write". Least-privilege per-node.
@@ -112,6 +113,19 @@ annotation scopeExempt(field) :Text;
 #   - an annotation failure can never produce an unlabeled runtime row.
 annotation dispatchMac(field)    :Text;
 annotation dispatchPublic(field) :Text;
+
+# Explicit replay/application-effect policy for each mutating leaf (v16 §4.8,
+# §6.1). This is checked metadata, never inferred from a scope or method name.
+# A missing declaration means the leaf has no application mutation effect. A
+# `query`/`subscribe` scope may still declare a policy when it changes bounded
+# session or subscription state: authorization and effect semantics are
+# separate axes. The closed values are:
+#   naturally-idempotent       — retry-safe with no extra mechanism
+#   idempotency-key-required   — payload carries an application idempotency key
+#   transaction-ledger-required — atomic ledger/fencing is required before retry
+# The latter two declare required activation work; the annotation does not claim
+# that a key or ledger has already been implemented.
+annotation mutationSemantics(field) :Text;
 
 # Mark as deprecated with reason
 annotation deprecated(field, union, struct, enum) :Text;

@@ -8,6 +8,7 @@
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
 using import "/annotations.capnp".dispatchMac;
+using import "/annotations.capnp".mutationSemantics;
 using import "/annotations.capnp".dispatchPublic;
 using import "/annotations.capnp".scopeExempt;
 using import "/annotations.capnp".mcpDescription;
@@ -28,7 +29,7 @@ struct PolicyRequest {
       $dispatchPublic("the authz check itself cannot require authz without circularity; it is the one leaf dispatched unauthenticated");
 
     # JWT token issuance
-    issueToken @2 :IssueToken $scope(manage) $dispatchMac("internal:pq-hybrid");
+    issueToken @2 :IssueToken $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
 
     # List all supported authorization scopes discovered from service schemas
     listScopes @3 :Void $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("List all supported authorization scopes discovered from service schemas");
@@ -37,13 +38,13 @@ struct PolicyRequest {
     getPolicy @4 :Void $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Get current policy rules and role assignments");
 
     # Apply a built-in template (overwrites policy.csv)
-    applyTemplate @5 :ApplyTemplate $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Apply a built-in policy template");
+    applyTemplate @5 :ApplyTemplate $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Apply a built-in policy template");
 
     # Commit draft changes (uncommitted policy.csv edits)
-    applyDraft @6 :ApplyDraft $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Commit draft policy changes");
+    applyDraft @6 :ApplyDraft $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Commit draft policy changes");
 
     # Rollback to a previous policy version
-    rollback @7 :RollbackPolicy $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Rollback to a previous policy version");
+    rollback @7 :RollbackPolicy $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Rollback to a previous policy version");
 
     # Get policy commit history
     getHistory @8 :GetHistory $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Get policy commit history");
@@ -55,25 +56,25 @@ struct PolicyRequest {
     getDraftStatus @10 :Void $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Check if there are uncommitted policy changes");
 
     # Assign a role to a user
-    addGrouping @11 :AddGrouping $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Assign a role to a user");
+    addGrouping @11 :AddGrouping $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Assign a role to a user");
 
     # Remove a role from a user
-    removeGrouping @12 :RemoveGrouping $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Remove a role from a user");
+    removeGrouping @12 :RemoveGrouping $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Remove a role from a user");
 
     # Set a model branch as public or private
-    setBranchVisibility @13 :SetBranchVisibility $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Set a model branch as public or private");
+    setBranchVisibility @13 :SetBranchVisibility $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Set a model branch as public or private");
 
     # Register an event prefix for publishing
-    registerEventPrefix @14 :RegisterEventPrefix $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Register an event prefix for publishing");
+    registerEventPrefix @14 :RegisterEventPrefix $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Register an event prefix for publishing");
 
     # Subscribe to an event prefix
-    subscribeEventPrefix @15 :SubscribeEventPrefix $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Subscribe to an event prefix");
+    subscribeEventPrefix @15 :SubscribeEventPrefix $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Subscribe to an event prefix");
 
     # Get pending subscribers for a prefix
     getPendingSubscribers @16 :GetPendingSubscribers $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Get pending subscribers for a prefix");
 
     # Deposit wrapped keys for subscribers
-    depositWrappedKeys @17 :DepositWrappedKeys $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Deposit wrapped keys for subscribers");
+    depositWrappedKeys @17 :DepositWrappedKeys $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Deposit wrapped keys for subscribers");
 
     # Resolve a service name to its Ed25519 verifying key
     resolveServiceKey @18 :ResolveServiceKey $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Resolve a service name to its Ed25519 verifying key");
@@ -83,19 +84,20 @@ struct PolicyRequest {
     # No authorization scope required; the JWT itself proves CA attestation.
     registerServiceKey @19 :RegisterServiceKey
       $scopeExempt("gated by CA-signed JWT attestation, not by a scope")
+      $mutationSemantics("naturally-idempotent")
       $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Register a service verifying key with the CA");
 
     # Renew the caller's service JWT. Identity is taken from the signed envelope —
     # no explicit subject field; the CA signs a fresh 30-day JWT for the caller.
     refreshServiceToken @20 :RefreshServiceTokenRequest
-      $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Renew the caller's service JWT; identity from signed envelope");
+      $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Renew the caller's service JWT; identity from signed envelope");
 
     # Exchange the caller's envelope WIT for an OAuth at+jwt.
     # Identity and cnf.jwk are read from the verified envelope — no credential submission.
     # Requires 'exchange' permission on 'policy:exchange-wit' in Casbin policy.
     exchangeWit @21 :ExchangeWit
-      $scope(manage) $dispatchMac("internal:pq-hybrid") $mcpDescription("Exchange the caller's envelope WIT for an OAuth at+jwt; identity from signed envelope");
+      $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Exchange the caller's envelope WIT for an OAuth at+jwt; identity from signed envelope");
 
     # Bounded vector of the same envelope-authenticated checks (maximum 256).
     checkBatch @22 :PolicyCheckBatch
@@ -106,7 +108,7 @@ struct PolicyRequest {
     # Restricted to the OAuth revocation authority (service:oauth) by Casbin —
     # the RFC 7009 endpoint is the only legitimate publisher.
     revokeCredential @23 :RevokeCredential
-      $scope(manage) $dispatchMac("internal:pq-hybrid");
+      $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid");
 
     # Ask the revocation authority whether a credential has been revoked.
     # Service-identities only (service:*): every enrolled service process
@@ -119,12 +121,12 @@ struct PolicyRequest {
     # to the OAuth authority (service:oauth), which owns user-session
     # lifecycle at issuance. Session identifiers are never reassigned.
     registerSession @25 :RegisterSession
-      $scope(manage) $dispatchMac("internal:pq-hybrid");
+      $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid");
 
     # Revoke a session: every credential carrying it is then rejected.
     # Restricted to the OAuth authority (service:oauth).
     revokeSession @26 :RevokeSession
-      $scope(manage) $dispatchMac("internal:pq-hybrid");
+      $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid");
 
     # Ask the session authority whether a session is active.
     # Service-identities only (service:*); the result Bool is true = ACTIVE
@@ -143,7 +145,7 @@ struct PolicyRequest {
     # clearance, attenuated scope, conditional `sid`). Reusable (no
     # consume-once). WS-E calls this for a derived AsOriginator dispatch.
     exchangeDelegated @28 :ExchangeDelegated
-      $scope(manage) $dispatchMac("internal:pq-hybrid");
+      $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
   }
 }
 

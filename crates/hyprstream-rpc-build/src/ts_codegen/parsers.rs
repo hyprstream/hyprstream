@@ -1692,6 +1692,7 @@ struct EmbedImagesResponse {
                 vfs_mac: String::new(),
                 dispatch_mac: String::new(),
                 dispatch_public: String::new(),
+            mutation_semantics: String::new(),
             }],
             structs: vec![],
             scoped_clients: vec![],

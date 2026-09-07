@@ -10,6 +10,7 @@
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
 using import "/annotations.capnp".dispatchMac;
+using import "/annotations.capnp".mutationSemantics;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
 using import "/annotations.capnp".domainType;
@@ -45,27 +46,27 @@ struct DiscoveryRequest {
     # Use StreamChannel::prepare_stream for authenticated streaming.
     # Reserved tombstone wire slots — scoped $manage so the dead handler stays
     # non-public under mandatory-scope (S3, #547).
-    prepareStream @6 :Void $scope(manage) $dispatchMac("internal:pq-hybrid");
+    prepareStream @6 :Void $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid");
 
     # Removed: getStream
-    getStream @7 :Void $scope(manage) $dispatchMac("internal:pq-hybrid");
+    getStream @7 :Void $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid");
 
     # Removed: listStreams
-    listStreams @8 :Void $scope(manage) $dispatchMac("internal:pq-hybrid");
+    listStreams @8 :Void $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid");
 
     # Announce a service endpoint (used by services after QUIC binding)
-    announce @9 :ServiceAnnouncement $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Announce a service endpoint for discovery");
+    announce @9 :ServiceAnnouncement $scope(write) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Announce a service endpoint for discovery");
 
     # Phase 0.5 Stage D — federation directory
     # Push a signed OpenID Federation 1.0 entity statement for an issuer (called by IdP/OAuth service)
-    registerEntityStatement @10 :RegisterEntityStatementRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Register a signed OIDF entity statement for an issuer");
+    registerEntityStatement @10 :RegisterEntityStatementRequest $scope(write) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Register a signed OIDF entity statement for an issuer");
 
     # Fetch a cached signed entity statement for an issuer (used by FederationKeyResolver before HTTPS fallback)
     getEntityStatement @11 :Text $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Fetch cached signed entity statement for issuer URL")
       $vfsPath("{arg}/entity-statement");
 
     # Push a COSE_KeySet (CBOR) for a service's envelope-signing keys (called by each service at startup + rotation)
-    registerEnvelopeKeyset @12 :RegisterEnvelopeKeysetRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Register envelope COSE_KeySet for a service");
+    registerEnvelopeKeyset @12 :RegisterEnvelopeKeysetRequest $scope(write) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Register envelope COSE_KeySet for a service");
 
     # Fetch a cached COSE_KeySet for a service's envelope keys
     getEnvelopeKeyset @13 :Text $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Fetch cached envelope COSE_KeySet for service DID")
@@ -96,7 +97,7 @@ struct DiscoveryRequest {
     # (a node with no live/fresh heartbeat is omitted outright, never just
     # flagged stale). Re-inserting (heartbeating) the same node refreshes its
     # TTL entry.
-    reportNodeLiveness @18 :NodeLiveness $scope(write) $dispatchMac("internal:pq-hybrid") $mcpDescription("Report live node capacity/load for placement candidate liveness");
+    reportNodeLiveness @18 :NodeLiveness $scope(write) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Report live node capacity/load for placement candidate liveness");
   }
 }
 

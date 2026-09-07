@@ -6,6 +6,7 @@ using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".paramDescription;
 using import "/annotations.capnp".scope;
 using import "/annotations.capnp".dispatchMac;
+using import "/annotations.capnp".mutationSemantics;
 using import "/annotations.capnp".cliHidden;
 using import "/streaming.capnp".StreamInfo;
 
@@ -57,13 +58,13 @@ struct SandboxRequest {
   union {
     run @0 :PodSandboxConfig
       $mcpDescription("Create and start a pod sandbox (Kata VM)")
-      $scope(write) $dispatchMac("internal:pq-hybrid");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
     stop @1 :Text
       $mcpDescription("Stop a running pod sandbox")
-      $scope(write) $dispatchMac("internal:pq-hybrid");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
     remove @2 :Text
       $mcpDescription("Remove a pod sandbox")
-      $scope(write) $dispatchMac("internal:pq-hybrid");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
     status @3 :PodSandboxStatusRequest
       $mcpDescription("Get pod sandbox status")
       $scope(query) $dispatchMac("internal:pq-hybrid");
@@ -87,16 +88,16 @@ struct ContainerRequest {
   union {
     create @0 :CreateContainerRequest
       $mcpDescription("Create a container in a pod sandbox")
-      $scope(write) $dispatchMac("internal:pq-hybrid");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
     start @1 :Text
       $mcpDescription("Start a created container")
-      $scope(write) $dispatchMac("internal:pq-hybrid");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
     stop @2 :StopContainerRequest
       $mcpDescription("Stop a running container")
-      $scope(write) $dispatchMac("internal:pq-hybrid");
+      $scope(write) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid");
     remove @3 :Text
       $mcpDescription("Remove a container")
-      $scope(write) $dispatchMac("internal:pq-hybrid");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
     status @4 :ContainerStatusRequest
       $mcpDescription("Get container status")
       $scope(query) $dispatchMac("internal:pq-hybrid");
@@ -111,11 +112,11 @@ struct ContainerRequest {
       $scope(query) $dispatchMac("internal:pq-hybrid");
     exec @8 :ExecSyncRequest
       $mcpDescription("Execute a command synchronously in a container")
-      $scope(write) $dispatchMac("internal:pq-hybrid");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
     attach @9 :AttachRequest
-      $cliHidden $scope(write) $dispatchMac("internal:pq-hybrid");
+      $cliHidden $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
     detach @10 :Text
-      $cliHidden $scope(write) $dispatchMac("internal:pq-hybrid");
+      $cliHidden $scope(write) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid");
   }
 }
 
@@ -133,10 +134,10 @@ struct ImageRequest {
       $scope(query) $dispatchMac("internal:pq-hybrid");
     pull @2 :PullImageRequest
       $mcpDescription("Pull a container image from a registry")
-      $scope(write) $dispatchMac("internal:pq-hybrid");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
     remove @3 :ImageSpec
       $mcpDescription("Remove a container image")
-      $scope(write) $dispatchMac("internal:pq-hybrid");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
     fsInfo @4 :Void
       $mcpDescription("Get filesystem usage information for images")
       $scope(query) $dispatchMac("internal:pq-hybrid");

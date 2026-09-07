@@ -267,29 +267,150 @@ fn the_complete_inventory_carries_the_strict_dispatch_pair() {
 }
 
 /// Mutation semantics are consistent with the checked scope-action blocks
-/// across the whole real inventory — the drift gate between the codegen-time
-/// read-class list and the runtime validator's.
+/// across the whole real inventory. Authorization scope and application-effect
+/// policy are separate: a read-class authorization may explicitly classify a
+/// bounded session/subscription mutation, while non-read scope requires one.
 #[test]
 fn mutation_semantics_follow_the_scope_action_blocks() {
     let rows = policy::collect_generated_rows().expect("inventory collects");
     for row in &rows {
         if row.scope_action.is_empty() {
             assert!(
-                row.mutation_semantics.is_none(),
-                "{}:{} carries no scope action; mutation gate does not apply",
+                row.scope_exempt,
+                "{}:{} has no scope action without its recorded exemption",
                 row.service,
                 row.symbolic_path
             );
             continue;
         }
         let read_class = policy::READ_CLASS_ACTIONS.contains(&row.scope_action);
-        assert_eq!(
-            read_class,
-            row.mutation_semantics.is_none(),
-            "{}:{} (scope {}) read-class ⇔ no mutation semantics",
-            row.service,
-            row.symbolic_path,
-            row.scope_action
-        );
+        if !read_class {
+            assert!(
+                row.mutation_semantics.is_some(),
+                "{}:{} (scope {}) must declare mutation semantics",
+                row.service,
+                row.symbolic_path,
+                row.scope_action
+            );
+        }
+    }
+}
+
+/// TUI declarations follow the actual handler effects: setting focus/size is
+/// convergent, while process input and allocation paths require a future
+/// application idempotency key/result record before retry behavior may be enabled.
+#[test]
+fn tui_mutation_policies_are_explicit_and_handler_accurate() {
+    use policy::MutationSemantics;
+
+    let rows = policy::collect_generated_rows().expect("inventory collects");
+    let semantics = |leaf: &str| {
+        rows.iter()
+            .find(|row| row.service == "tui" && row.symbolic_path == leaf)
+            .unwrap_or_else(|| panic!("missing tui:{leaf}"))
+            .mutation_semantics
+    };
+    assert_eq!(semantics("focusWindow"), Some(MutationSemantics::NaturallyIdempotent));
+    assert_eq!(semantics("focusPane"), Some(MutationSemantics::NaturallyIdempotent));
+    assert_eq!(semantics("resize"), Some(MutationSemantics::NaturallyIdempotent));
+    assert_eq!(
+        semantics("sendInput"),
+        Some(MutationSemantics::IdempotencyKeyRequired),
+        "replaying bytes to a process stdin requires an application idempotency key"
+    );
+    assert_eq!(
+        semantics("createWindow"),
+        Some(MutationSemantics::IdempotencyKeyRequired)
+    );
+}
+
+/// The at9p admission path returns the durably fenced accepted head on an
+/// exact replay. Its atomic watermark/conditional-advance protocol therefore
+/// satisfies the transaction-ledger contract, rather than merely relying on
+/// natural state convergence.
+#[test]
+fn registry_at9p_admission_declares_its_existing_transaction_ledger() {
+    use policy::MutationSemantics;
+
+    let rows = policy::collect_generated_rows().expect("inventory collects");
+    let ingest = rows
+        .iter()
+        .find(|row| row.service == "registry" && row.symbolic_path == "ingestAt9pCandidate")
+        .expect("registry.ingestAt9pCandidate row present");
+    assert_eq!(
+        ingest.mutation_semantics,
+        Some(MutationSemantics::TransactionLedgerRequired)
+    );
+}
+
+/// Fid lifecycle calls preserve their existing query authorization while
+/// declaring their real session effects. Auto-allocation makes `walk` unsafe
+/// to replay without a caller key; releasing an already-gone fid converges.
+#[test]
+fn registry_stateful_query_leaves_declare_their_effects() {
+    use policy::MutationSemantics;
+
+    let rows = policy::collect_generated_rows().expect("inventory collects");
+    let semantics = |leaf: &str| {
+        rows.iter()
+            .find(|row| row.service == "registry" && row.symbolic_path == leaf)
+            .unwrap_or_else(|| panic!("missing registry:{leaf}"))
+            .mutation_semantics
+    };
+    assert_eq!(
+        semantics("repo.worktree.walk"),
+        Some(MutationSemantics::IdempotencyKeyRequired)
+    );
+    assert_eq!(
+        semantics("repo.worktree.clunk"),
+        Some(MutationSemantics::NaturallyIdempotent)
+    );
+}
+
+/// The synthetic model 9P surface has the same bounded fid lifecycle as the
+/// registry worktree surface. `walk` can allocate a fresh handle on a retry;
+/// `open` is a one-way state transition and `clunk` is a convergent release.
+#[test]
+fn model_stateful_query_leaves_declare_their_effects() {
+    use policy::MutationSemantics;
+
+    let rows = policy::collect_generated_rows().expect("inventory collects");
+    let semantics = |leaf: &str| {
+        rows.iter()
+            .find(|row| row.service == "model" && row.symbolic_path == leaf)
+            .unwrap_or_else(|| panic!("missing model:{leaf}"))
+            .mutation_semantics
+    };
+    assert_eq!(
+        semantics("fs.walk"),
+        Some(MutationSemantics::IdempotencyKeyRequired)
+    );
+    assert_eq!(semantics("fs.open"), Some(MutationSemantics::NaturallyIdempotent));
+    assert_eq!(semantics("fs.clunk"), Some(MutationSemantics::NaturallyIdempotent));
+}
+
+/// Scope exemption records an authorization exception, not an implicit
+/// read-only classification. The CA-attested key registration leaf is the
+/// causal control-plane case: it is convergent but still explicitly declares
+/// its mutation behavior, while public authorization checks remain policy-free.
+#[test]
+fn scope_exempt_mutator_is_explicitly_classified() {
+    use policy::MutationSemantics;
+
+    let rows = policy::collect_generated_rows().expect("inventory collects");
+    let lookup = |symbolic: &str| {
+        rows.iter()
+            .find(|row| row.service == "policy" && row.symbolic_path == symbolic)
+            .unwrap_or_else(|| panic!("missing policy:{symbolic}"))
+    };
+    let register = lookup("registerServiceKey");
+    assert!(register.scope_action.is_empty() && register.scope_exempt);
+    assert_eq!(
+        register.mutation_semantics,
+        Some(MutationSemantics::NaturallyIdempotent)
+    );
+    for public in ["check", "checkBatch"] {
+        assert!(lookup(public).scope_action.is_empty());
+        assert_eq!(lookup(public).mutation_semantics, None, "{public}");
     }
 }
