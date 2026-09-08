@@ -688,7 +688,7 @@ pub async fn launch_direct_children(
 /// cancelled launch's historical leak, is unchanged.
 struct RequiredLaunchGuard {
     started: Vec<(String, hyprstream_service::SpawnedProcess)>,
-    /// Children whose graceful async stop FAILED: still fully owned by the
+    /// Children whose async rollback stop FAILED: still fully owned by the
     /// guard (a local collection would recreate the ownership-transfer hole
     /// across the remaining rollback awaits), retried by the synchronous
     /// bounded pass.
@@ -743,12 +743,14 @@ impl RequiredLaunchGuard {
         }
     }
 
-    /// Reverse-order graceful rollback with cancellation-safe ownership: a
-    /// stop that errors demotes the child to guard-owned `failed` state —
-    /// never a local unguarded collection — while confirmed successes are
-    /// released. The `stop` seam is the graceful async stop in production;
-    /// tests inject a controllable boundary.
-    async fn graceful_rollback<S, F>(&mut self, mut stop: S)
+    /// Reverse-order rollback with cancellation-safe ownership: a stop that
+    /// errors demotes the child to guard-owned `failed` state — never a
+    /// local unguarded collection — while confirmed successes are released.
+    /// The `stop` seam is the production async rollback stop (the tracked
+    /// path terminates via the retained handle with SIGKILL and reaps within
+    /// a bounded budget — it is not a graceful TERM shutdown); tests inject
+    /// a controllable boundary.
+    async fn rollback_owned_children<S, F>(&mut self, mut stop: S)
     where
         S: FnMut(hyprstream_service::SpawnedProcess) -> F,
         F: std::future::Future<Output = anyhow::Result<()>>,
@@ -836,8 +838,10 @@ impl Drop for RequiredLaunchGuard {
 /// Required-native cancellation safety: started children stay owned by the
 /// [`RequiredLaunchGuard`] until the whole launch commits, so a cancelled
 /// future still cleans them through the backend's retained child handles; an
-/// explicit failure rolls back through the graceful async stop first, with
-/// the synchronous tracked-child pass as the accurate-residual fallback.
+/// explicit failure runs the async rollback stop first (tracked path
+/// terminates via SIGKILL through the retained handle — not a graceful TERM
+/// shutdown), with the synchronous tracked-child pass as the
+/// accurate-residual fallback.
 async fn launch_planned_children(
     plans: Vec<Vec<(String, hyprstream_service::ProcessConfig)>>,
     iroh_required: bool,
@@ -896,7 +900,7 @@ async fn launch_planned_children(
             // these awaits (or the synchronous pass) still cleans everything
             // unconfirmed through the guard's `Drop`.
             guard
-                .graceful_rollback(|process| async move {
+                .rollback_owned_children(|process| async move {
                     spawner.stop(&process).await.map_err(anyhow::Error::from)
                 })
                 .await;
@@ -3125,8 +3129,11 @@ mod launcher_tests {
             );
         }
         // Fixture hygiene: reap the surviving pair directly (the test is the
-        // parent); not a product-contract assertion.
-        for pid in dropped_pids {
+        // parent); not a product-contract assertion. Afterwards remove only
+        // the matching fixture-owned PID artifacts and establish their
+        // absence, so a passing test leaves no stale files; any replacement
+        // artifact would be preserved.
+        for (name, pid) in [(&c, dropped_pids[0]), (&d, dropped_pids[1])] {
             let raw = nix::unistd::Pid::from_raw(pid as i32);
             let _ = nix::sys::signal::kill(raw, nix::sys::signal::Signal::SIGKILL);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -3142,20 +3149,32 @@ mod launcher_tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
+            let pid_file = hyprstream_rpc::paths::service_pid_file(name);
+            if let Ok(content) = std::fs::read_to_string(&pid_file) {
+                if content.trim() == pid.to_string() {
+                    let _ = std::fs::remove_file(&pid_file);
+                }
+            }
+            assert!(
+                !pid_file.exists(),
+                "fixture hygiene: {name} must leave no stale PID artifact"
+            );
         }
         Ok(())
     }
 
-    /// Cancellation DURING the explicit rollback awaits still cleans owned
-    /// children. The abort is issued as soon as the READY predecessor is
-    /// observed, so it lands somewhere between the later child's startup and
-    /// the rollback stop — the exact landing point is not deterministic, and
-    /// the OWNERSHIP INVARIANT is what is tested: at every landing, the
-    /// predecessor is either stopped by the graceful async rollback or still
-    /// owned by the guard, whose `Drop` synchronously stops it through the
-    /// backend's retained handle.
+    /// Cancellation around a required startup failure cleans the READY
+    /// predecessor at WHATEVER point the abort lands. The predecessor is
+    /// READY-observed (marker-before-READY proves the child ran and sent
+    /// READY) — but marker presence alone does NOT prove the launcher
+    /// adopted it nor that rollback was entered, so the landing point is
+    /// unspecified: the armed startup guard, the transaction guard, or a
+    /// completed explicit rollback each own the cleanup, and all end with
+    /// the predecessor reaped and its artifact removed. The deterministic
+    /// rollback-boundary evidence lives in
+    /// `rollback_failed_and_pending_stops_stay_guard_owned_through_cancellation`.
     #[tokio::test]
-    async fn required_cancellation_during_rollback_still_cleans_owned_children()
+    async fn required_cancellation_around_startup_failure_cleans_predecessor_at_any_landing()
     -> anyhow::Result<()> {
         use hyprstream_service::{ProcessConfig, ProcessReadiness, ProcessSpawner};
         #[allow(unused_imports)]
@@ -3189,7 +3208,7 @@ mod launcher_tests {
                 ProcessConfig::new(&ready_name, &exe)
                     .args([
                         "--exact",
-                        "cli::service_handlers::launcher_tests::required_cancellation_during_rollback_still_cleans_owned_children",
+                        "cli::service_handlers::launcher_tests::required_cancellation_around_startup_failure_cleans_predecessor_at_any_landing",
                         "--nocapture",
                     ])
                     .env(HELPER, marker.display().to_string())
@@ -3208,9 +3227,11 @@ mod launcher_tests {
             launch_planned_children(plans, true, &spawner).await
         });
 
-        // Abort as soon as the predecessor is READY-observed (marker before
-        // READY, so the launcher has at least adopted it and is at or past
-        // the failing child's startup).
+        // Abort as soon as the predecessor is READY-observed. Marker-before-
+        // READY proves the child ran and sent READY, but NOT that the
+        // launcher adopted it or that rollback was entered — the landing
+        // point is unspecified and every landing must clean the
+        // predecessor.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while !marker.exists() {
             anyhow::ensure!(
@@ -3247,7 +3268,7 @@ mod launcher_tests {
     /// FAILS must leave its child guard-owned — never moved into a local
     /// unguarded collection — and a cancellation while a LATER stop is still
     /// PENDING must attempt synchronous cleanup of BOTH. The failure/pending
-    /// boundary is injected at the narrow `graceful_rollback` stop seam; the
+    /// boundary is injected at the narrow `rollback_owned_children` stop seam; the
     /// two children are REAL spawned processes, so ownership and cleanup are
     /// evidenced by observed reaps (ESRCH) and PID-artifact removal.
     #[tokio::test]
@@ -3307,15 +3328,21 @@ mod launcher_tests {
         }
 
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let boundary: std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>> =
+            std::sync::Arc::default();
         let calls_task = calls.clone();
+        let boundary_task = boundary.clone();
         let task = tokio::spawn(async move {
             guard
-                .graceful_rollback(move |_process| {
+                .rollback_owned_children(move |_process| {
                     let call = calls_task.fetch_add(1, Ordering::SeqCst);
+                    let boundary = boundary_task.clone();
                     async move {
                         if call == 0 {
+                            boundary.lock().push("first-stop-failed");
                             Err(anyhow::anyhow!("injected stop failure"))
                         } else {
+                            boundary.lock().push("next-stop-pending-entered");
                             // Pending forever: only the task abort below
                             // ends this await.
                             std::future::pending::<()>().await;
@@ -3327,16 +3354,31 @@ mod launcher_tests {
             // Unreachable under the abort; the guard's Drop owns cleanup.
         });
 
-        // Bounded grace so the rollback reaches the pending second stop;
-        // then cancel — the real cancellation boundary this correction is
-        // about (an earlier landing still cleans both: every unconfirmed
-        // child is guard-owned at every point).
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Deterministic boundary, no sleep-only timing assumption: abort
+        // only after BOTH stop invocations happened — the first returned the
+        // injected failure (its child demoted to guard-owned `failed`) and
+        // the second is suspended inside the pending stop.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while calls.load(Ordering::SeqCst) < 2 {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "rollback never reached the pending second stop"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         task.abort();
         let joined = task.await;
         assert!(
             matches!(&joined, Err(join) if join.is_cancelled()),
             "the rollback future must have been cancelled, got: {joined:?}"
+        );
+        // The claimed causal boundary happened: the first stop FAILED and
+        // the next stop was entered and PENDING at cancellation time.
+        assert_eq!(
+            *boundary.lock(),
+            vec!["first-stop-failed", "next-stop-pending-entered"],
+            "the first stop must have failed and the next pending stop must have been \
+             entered before cancellation"
         );
 
         // BOTH children — the failed-stop one and the pending-stop one — are
