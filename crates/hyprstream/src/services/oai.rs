@@ -31,7 +31,7 @@
 
 use crate::config::{OAIConfig, TlsConfig};
 use crate::server::{create_app, state::ServerState};
-use crate::server::tls::{resolve_rustls_config, serve_app};
+use crate::server::tls::{bind_listener, resolve_rustls_config, serve_bound};
 use anyhow::Result;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::SocketKind;
@@ -154,7 +154,12 @@ impl Spawnable for OAIService {
 
             info!("OpenAI-compatible API available at {scheme}://{addr}/oai/v1");
 
-            // Signal ready
+            // PREBIND the HTTP(S) listener BEFORE any readiness signal: an
+            // occupied port fails here, before the supervisor is told the
+            // service is ready (#1585 YuI7 companion correction).
+            let bound = bind_listener(addr, rustls_config, "OAIService")?;
+
+            // Signal ready — only after the listener is bound.
             if let Some(tx) = on_ready {
                 let _ = tx.send(());
             }
@@ -162,8 +167,9 @@ impl Spawnable for OAIService {
             // Notify systemd that service is ready
             let _ = hyprstream_rpc::notify::ready();
 
-            // Run HTTP(S) server with graceful shutdown
-            serve_app(addr, app, rustls_config, shutdown, "OAIService").await
+            // Run HTTP(S) server with graceful shutdown; the serving result
+            // propagates (post-READY runtime failure — recorded lifecycle gap).
+            serve_bound(bound, app, shutdown, "OAIService").await
         })
     }
 }

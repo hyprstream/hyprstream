@@ -3,9 +3,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 #[path = "../../../tests/fixtures/did_trust.rs"]
-mod did_trust;
+pub(crate) mod did_trust;
 
 use super::runtime_clients;
+use super::{build_oauth_substrate_profile, classify_oauth_endpoint_install, OAuthEndpointInstall};
 use anyhow::Result;
 use ed25519_dalek::SigningKey;
 use hyprstream_rpc::node_identity::{derive_mesh_mldsa_key, derive_purpose_key};
@@ -175,6 +176,28 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
         .await?;
         assert!(hyprstream_discovery::native_network_required());
 
+        // Sol carrier disposition (PR 1585): bind OAuth's own inbound
+        // reach-only substrate via the production profile helper AFTER the
+        // process-global outbound slot is already occupied. Both install
+        // outcomes are valid; the occupied slot is the positive control —
+        // classify it ExistingGlobalRetained, RETAIN the substrate as the
+        // independent inbound owner, and leave the existing global endpoint
+        // untouched. The two carriers' endpoint IDs are deliberately
+        // different (distinct transport purpose keys) and are never compared
+        // in production.
+        let oauth_substrate = build_oauth_substrate_profile(&oauth, true)
+            .await?
+            .expect("Required profile must bind its mandatory inbound substrate");
+        assert!(matches!(
+            classify_oauth_endpoint_install(&oauth_substrate),
+            OAuthEndpointInstall::ExistingGlobalRetained
+        ));
+        assert_ne!(
+            oauth_substrate.endpoint_id(),
+            client_carrier.endpoint_id(),
+            "the two carriers' transport purpose keys are deliberately distinct"
+        );
+
         let manager = Arc::new(crate::auth::PolicyManager::new_in_memory().await?);
         manager
             .add_policy_with_domain("service:oauth", "*", "model:allowed", "query", "allow")
@@ -257,6 +280,21 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
         })
         .await??;
         assert_no_local_peers();
+        // Ownership independence (Sol disposition case 6): shutting down ONLY
+        // the OAuth inbound substrate must not disturb the process-global
+        // outbound carrier — a subsequent real dial still succeeds.
+        oauth_substrate.shutdown().await?;
+        let post_shutdown = crate::services::generated::policy_client::PolicyCheck {
+            subject: "forged-caller".to_owned(),
+            domain: "forged-domain".to_owned(),
+            resource: "model:allowed".to_owned(),
+            operation: "query".to_owned(),
+        };
+        assert!(
+            policy_client.check(&post_shutdown).await?,
+            "outbound dials must survive OAuth substrate shutdown via the \
+             untouched process-global carrier"
+        );
         assert!(!policy_socket.exists());
         assert!(!discovery_socket.exists());
         client_carrier.shutdown().await?;

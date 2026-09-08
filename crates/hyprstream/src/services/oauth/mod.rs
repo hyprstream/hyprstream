@@ -78,6 +78,7 @@ use axum::{
     Router,
 };
 use hyprstream_rpc::registry::SocketKind;
+use hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge;
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_service::Spawnable;
 use tokio::sync::Notify;
@@ -423,6 +424,92 @@ async fn build_oauth_iroh_substrate(
     .await
 }
 
+/// Profile-aware bind of OAuth's inbound reach-only substrate, using the
+/// production substrate builder. See [`bind_oauth_substrate_profile`] — the
+/// builder is a parameter only so causal tests can inject a bind failure at
+/// this exact production boundary.
+async fn build_oauth_substrate_profile(
+    signing_key: &ed25519_dalek::SigningKey,
+    iroh_required: bool,
+) -> Result<
+    Option<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate>,
+    hyprstream_rpc::error::RpcError,
+> {
+    let signing_key = signing_key.clone();
+    bind_oauth_substrate_profile(iroh_required, move || async move {
+        let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
+            &signing_key,
+            "hyprstream-iroh-transport-v1",
+        );
+        build_oauth_iroh_substrate(transport_key.to_bytes()).await
+    })
+    .await
+}
+
+/// Bind POLICY for OAuth's inbound reach-only substrate: Required treats a
+/// bind failure as fatal before READY (the child exits nonzero and the
+/// supervised launcher rolls the spawn back); Compatibility warns and
+/// continues without Iroh (documented degraded mode). Bind policy lives here,
+/// separate from the install disposition ([`classify_oauth_endpoint_install`])
+/// so "mandatory local bind" cannot regress into "must replace the global
+/// dialer".
+async fn bind_oauth_substrate_profile<F, Fut>(
+    iroh_required: bool,
+    build: F,
+) -> Result<
+    Option<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate>,
+    hyprstream_rpc::error::RpcError,
+>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate>>,
+{
+    match build().await {
+        Ok(substrate) => Ok(Some(substrate)),
+        Err(e) if iroh_required => Err(hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+            "network-iroh-required OAuth iroh substrate bind failed: {e:#}"
+        ))),
+        Err(e) => {
+            tracing::warn!(
+                "OAuth iroh substrate bind failed; continuing without iroh (Compatibility): {e:#}"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Disposition of the process-global client-endpoint install for OAuth's
+/// bound substrate. `install_iroh_client_endpoint` is first-write-wins, so an
+/// occupied slot means a DIFFERENT valid endpoint — in real Required startup,
+/// the authenticated OS-owned bootstrap outbound carrier
+/// (`PROCESS_BOOTSTRAP_CARRIER`) — already owns outbound dials. Both outcomes
+/// are valid and expected; neither is ever a startup error. The two carriers'
+/// endpoint IDs are deliberately different (distinct transport purpose keys)
+/// and are never compared; the OAuth substrate is retained in both cases and
+/// the existing global endpoint is never reset or replaced.
+enum OAuthEndpointInstall {
+    /// The empty process-global slot was won by this substrate's endpoint.
+    InstalledHere,
+    /// A previously-installed global endpoint remains the outbound dialer;
+    /// the returned capability clone is dropped and OAuth's substrate stays
+    /// the independent inbound owner.
+    ExistingGlobalRetained,
+}
+
+fn classify_oauth_endpoint_install(
+    substrate: &hyprstream_rpc::transport::iroh_substrate::IrohSubstrate,
+) -> OAuthEndpointInstall {
+    match hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(
+        substrate.owned_client_endpoint(),
+    ) {
+        Ok(()) => OAuthEndpointInstall::InstalledHere,
+        Err(returned) => {
+            drop(returned);
+            OAuthEndpointInstall::ExistingGlobalRetained
+        }
+    }
+}
+
 pub struct OAuthService {
     config: OAuthConfig,
     /// Global TLS configuration (passed from factory, avoids re-loading config)
@@ -526,6 +613,9 @@ fn runtime_clients(
 
 #[cfg(test)]
 mod required_consumer_tests;
+
+#[cfg(test)]
+mod readiness_tests;
 
 impl Spawnable for OAuthService {
     fn name(&self) -> &str {
@@ -962,32 +1052,82 @@ impl Spawnable for OAuthService {
             let state = Arc::new(oauth_state);
             state.spawn_code_sweeper();
 
-            // Phase 0.5 Stage D — publish OIDF entity statement to DiscoveryService
-            // at startup AND periodically thereafter. Periodic re-publish keeps
-            // the cached statement fresh as signing keys rotate and the embedded
-            // JWKS changes; entity statements carry a 24h exp so any longer gap
-            // leaves federation peers falling through to HTTPS unnecessarily.
-            //
-            // Non-fatal on failure: HTTPS fallback continues to work either way.
-            {
-                let publish_state = state.clone();
-                // Re-publish at 1/4 of the entity-statement exp (24h) so we
-                // refresh the cached statement well before consumers reject it
-                // as expired. Concretely: every 6h. Initial publish happens
-                // immediately on the first iteration of the loop.
-                let republish_interval = std::time::Duration::from_secs(6 * 3600);
-                tokio::task::spawn_local(async move {
-                    let mut tick = tokio::time::interval(republish_interval);
-                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    loop {
-                        tick.tick().await;
-                        federation_entity::publish_entity_statement_to_discovery(
-                            publish_state.clone(),
-                        )
-                        .await;
-                    }
-                });
+            // Startup transaction (#1585 YuI7): the HTTP(S) listener is
+            // PREBOUND before any readiness signal and before the irreversible
+            // process-global Iroh endpoint install — an occupied port fails
+            // here, while the supervised launcher still owns the launch.
+            let bound = crate::server::tls::bind_listener(addr, rustls_config, "OAuthService")?;
+
+            // Mandatory inbound reach-only carrier: bound + endpoint-install
+            // classified BEFORE any spawned OAuth task can dial and BEFORE any
+            // readiness signal. Bind policy is profile-aware (Required fatal /
+            // Compatibility warn-continue) and separate from install
+            // classification — both install outcomes are valid and the
+            // substrate is retained either way (see the helper docs).
+            let iroh_required = self
+                .quic_config
+                .as_ref()
+                .is_some_and(crate::config::QuicConfig::iroh_required);
+            let iroh_enabled = self
+                .quic_config
+                .as_ref()
+                .is_some_and(|q| q.enabled && q.iroh);
+            // Defense in depth: `validate_native_network_profile` already
+            // rejects this at config validation before factory creation, but
+            // Required must never silently run without its mandatory carrier.
+            if iroh_required && !iroh_enabled {
+                return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                    "network-iroh-required OAuth service requires [quic] enabled with iroh"
+                        .to_owned(),
+                ));
             }
+            let mut substrate_owned = if iroh_enabled {
+                build_oauth_substrate_profile(&self.signing_key, iroh_required).await?
+            } else {
+                // Compatibility with Iroh disabled: skip the OAuth substrate
+                // entirely — no bind, no install, no global-slot interaction.
+                None
+            };
+            if let Some(substrate) = &substrate_owned {
+                match classify_oauth_endpoint_install(substrate) {
+                    OAuthEndpointInstall::InstalledHere => {
+                        info!(
+                            "OAuth iroh endpoint installed as the process-global outbound dialer"
+                        );
+                    }
+                    OAuthEndpointInstall::ExistingGlobalRetained => {
+                        // Production Required order: the authenticated OS-owned
+                        // bootstrap installed a DISTINCT outbound carrier
+                        // (PROCESS_BOOTSTRAP_CARRIER) before this service
+                        // started. Both carriers are correct and retained —
+                        // OAuth's substrate owns the inbound reach lifecycle;
+                        // the bootstrap global endpoint stays untouched for
+                        // outbound dials. The deliberately different endpoint
+                        // IDs are never compared.
+                        info!(
+                            "OAuth iroh substrate retained as the independent inbound carrier; \
+                             the already-installed process-global outbound endpoint is untouched"
+                        );
+                    }
+                }
+            }
+
+            // Federation publisher: a DIALING task — spawned only after the
+            // final endpoint decision so its discovery dials use the installed
+            // endpoint. Startup-owned: aborted/joined on every terminal path.
+            let publish_state = state.clone();
+            let publisher_handle = tokio::task::spawn_local(async move {
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    federation_entity::publish_entity_statement_to_discovery(
+                        publish_state.clone(),
+                    )
+                    .await;
+                }
+            });
 
             // Create router with configurable CORS
             let app = create_app(state.clone(), &self.config.cors);
@@ -996,100 +1136,190 @@ impl Spawnable for OAuthService {
                 "Authorization server metadata at {scheme}://{addr}/.well-known/oauth-authorization-server",
             );
 
-            if let Some(tx) = on_ready {
-                let _ = tx.send(());
-            }
-
-            let _ = hyprstream_rpc::notify::ready();
-
             // User-CRUD RPC serve, alongside the HTTP server. #136: bridged
-            // dispatch over the registered transport (inproc/ipc) instead of the
-            // ZMQ ROUTER. A dedicated `serve_shutdown` stops it once the HTTP
-            // server exits, so the task joins cleanly.
-            let control_transport = self.control_transport.clone();
-            let rpc_signing_key = self.signing_key.clone();
-            let rpc_state = state.clone();
-            // Bind OAuth's domain-separated outbound iroh carrier when enabled.
-            // Its refused inbound ALPNs are not advertised in the DID document.
-            let iroh_enabled = self.quic_config.as_ref().is_some_and(|q| q.enabled && q.iroh);
+            // dispatch over the registered transport (inproc/ipc). The bridge
+            // RUNTIME + handler construction happen on the bridge thread via
+            // `spawn_with`, whose readiness receiver resolves only after that
+            // construction succeeds — `spawn` alone proves only that the
+            // thread started.
+            let nonce_cache = Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new());
+            let rpc_state_build = state.clone();
+            let control_transport_build = self.control_transport.clone();
+            let rpc_signing_key_build = self.signing_key.clone();
             let serve_shutdown = Arc::new(Notify::new());
             let serve_shutdown_task = Arc::clone(&serve_shutdown);
-            let rpc_loop = tokio::task::spawn_local(async move {
-                let handler = rpc_handler::OAuthRpcHandler::new(
-                    rpc_state,
-                    control_transport.clone(),
-                    rpc_signing_key.clone(),
-                );
-                let nonce_cache = Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new());
-                let bridge = match hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
-                    handler,
-                    nonce_cache,
-                    0,
-                ) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::error!("OAuth RPC bridge spawn error: {}", e);
-                        return;
-                    }
-                };
-                let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> =
-                    Arc::new(bridge);
 
-                // Reach-only iroh endpoint. Both inbound ALPNs refuse before the
-                // OAuth user-CRUD bridge or global MoQ origin can be reached.
-                let _iroh_substrate = if iroh_enabled {
-                    let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
-                        &rpc_signing_key,
-                        "hyprstream-iroh-transport-v1",
-                    );
-                    match build_oauth_iroh_substrate(transport_key.to_bytes()).await {
-                        Ok(substrate) => {
-                            let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(
-                                substrate.owned_client_endpoint(),
-                            );
-                            Some(substrate)
+            // Bridge init phase: thread + runtime + handler construction,
+            // bounded by the readiness receiver. The typed bridge is retained
+            // OUTSIDE the spawned RPC future — the outer owner drives the
+            // bounded shutdown on every terminal path. Init failures are
+            // recorded (not returned) so the single common teardown below
+            // always runs: a bare `?` past the publisher spawn would strand
+            // that task and the bound substrate.
+            let mut bridge_owner: Option<Arc<LocalServiceBridge>> = None;
+            // (join handle, whether the select branch already consumed it).
+            let mut rpc_owner: Option<(tokio::task::JoinHandle<anyhow::Result<()>>, bool)> =
+                None;
+            let bridge_init: Result<Arc<LocalServiceBridge>, hyprstream_rpc::error::RpcError> =
+                async {
+                    let (bridge, bridge_ready_rx) =
+                        match LocalServiceBridge::spawn_with(
+                            "oauth-user-crud",
+                            move || async move {
+                                Ok(rpc_handler::OAuthRpcHandler::new(
+                                    rpc_state_build,
+                                    control_transport_build,
+                                    rpc_signing_key_build,
+                                ))
+                            },
+                            nonce_cache,
+                            0,
+                        ) {
+                            Ok(spawned) => spawned,
+                            Err(e) => {
+                                return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                                    format!("OAuth bridge thread spawn failed: {e}"),
+                                ));
+                            }
+                        };
+                    let bridge = Arc::new(bridge);
+                    bridge_owner = Some(bridge.clone());
+                    // Bridge runtime/handler readiness must resolve BEFORE
+                    // serve_bridged (and therefore the external READY signal)
+                    // is allowed to start — this await, not a comment, imposes
+                    // the ordering. Bounded so a stuck bridge cannot hang the
+                    // process.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        bridge_ready_rx,
+                    )
+                    .await
+                    {
+                        Ok(Ok(Ok(()))) => Ok(bridge),
+                        Ok(Ok(Err(closed))) => {
+                            Err(hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                                "OAuth bridge runtime initialization failed: {closed:#}"
+                            )))
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                "OAuth iroh substrate bind failed; continuing without iroh: {e}"
-                            );
-                            None
+                        // The bridge task ended without ever sending a
+                        // readiness result — a fatal init failure, not
+                        // readiness.
+                        Ok(Err(_)) => Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                            "OAuth bridge runtime initialization receiver closed \
+                             without a readiness result"
+                                .to_owned(),
+                        )),
+                        Err(_) => Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                            "OAuth bridge runtime initialization timed out".to_owned(),
+                        )),
+                    }
+                }
+                .await;
+
+            // Serve phase: register/bind the control transport — serve_bridged's
+            // existing boundary emits the ONLY external readiness signals
+            // (on_ready + kernel READY), now gated on bridge runtime readiness,
+            // substrate bind, and the prebound HTTP(S) listener — then serve
+            // the prebound listener concurrently with the RPC loop. Whichever
+            // side finishes first decides the primary outcome; the actual
+            // serve result propagates (no log-and-swallow).
+            let primary: anyhow::Result<()> = match bridge_init {
+                Err(e) => Err(anyhow::anyhow!("OAuthService startup failed: {e}")),
+                Ok(bridge) => {
+                    let control_transport = self.control_transport.clone();
+                    let rpc_signing_key = self.signing_key.clone();
+                    let processor: Arc<
+                        dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor,
+                    > = bridge.clone();
+                    let mut rpc_loop = tokio::task::spawn_local(async move {
+                        hyprstream_rpc::service::serve::serve_bridged(
+                            &control_transport,
+                            processor,
+                            rpc_signing_key,
+                            serve_shutdown_task,
+                            on_ready,
+                        )
+                        .await
+                    });
+                    let mut rpc_consumed = false;
+                    let outcome = tokio::select! {
+                        http = crate::server::tls::serve_bound(
+                            bound,
+                            app,
+                            shutdown.clone(),
+                            "OAuthService",
+                        ) => http.map_err(|e| anyhow::anyhow!("OAuthService HTTP serve error: {e}")),
+                        rpc = &mut rpc_loop => {
+                            // This select branch consumed the completed
+                            // JoinHandle — the teardown below must not poll it
+                            // again (poll-after-completion panics).
+                            rpc_consumed = true;
+                            match rpc {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(e)) => Err(anyhow::anyhow!(
+                                    "OAuthService RPC serve error: {e}"
+                                )),
+                                Err(join) => Err(anyhow::anyhow!(
+                                    "OAuthService RPC task join error: {join}"
+                                )),
+                            }
                         }
-                    }
-                } else {
-                    None
-                };
-
-                if let Err(e) = hyprstream_rpc::service::serve::serve_bridged(
-                    &control_transport,
-                    processor,
-                    rpc_signing_key,
-                    serve_shutdown_task,
-                    None,
-                )
-                .await
-                {
-                    tracing::error!("OAuth RPC serve error: {}", e);
+                    };
+                    rpc_owner = Some((rpc_loop, rpc_consumed));
+                    outcome
                 }
+            };
 
-                // Drain the iroh substrate (accept loop + handlers) on shutdown.
-                if let Some(substrate) = _iroh_substrate {
-                    if let Err(e) = substrate.shutdown().await {
-                        tracing::warn!("OAuth iroh substrate shutdown error: {e}");
-                    }
-                }
-            });
-
-            // Run HTTP(S) server with graceful shutdown
-            let _ = crate::server::tls::serve_app(addr, app, rustls_config, shutdown, "OAuthService").await;
-
-            // HTTP server stopped — stop the RPC serve and join it. notify_one
-            // (not notify_waiters) stores a permit if the serve task hasn't yet
-            // armed its `notified()` await, so the signal can't be missed even if
-            // the HTTP server exited before the RPC task reached serve_bridged.
+            // ── Single common bounded teardown (the one startup owner): runs
+            // on EVERY terminal path past the publisher spawn — bridge spawn /
+            // readiness failure, HTTP or RPC error, or clean shutdown. The
+            // primary error is preserved; cleanup failures are logged as
+            // context, never masked. ──
             serve_shutdown.notify_one();
-            let _ = rpc_loop.await;
+            if let Some(bridge) = &bridge_owner {
+                bridge.begin_shutdown(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                );
+            }
+            if let Some((mut rpc_loop, rpc_consumed)) = rpc_owner.take() {
+                if !rpc_consumed {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(45),
+                        &mut rpc_loop,
+                    )
+                    .await
+                    {
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(Ok(Err(e))) => {
+                            tracing::warn!("OAuth RPC serve task error during shutdown: {e}");
+                        }
+                        Ok(Err(join)) => {
+                            tracing::warn!(
+                                "OAuth RPC serve task join error during shutdown: {join}"
+                            );
+                        }
+                        Err(_) => {
+                            rpc_loop.abort();
+                            tracing::warn!(
+                                "OAuth RPC serve task did not stop within the shutdown budget; aborted"
+                            );
+                        }
+                    }
+                }
+            }
+            publisher_handle.abort();
+            // Abort alone is not teardown: await the cancelled task so its
+            // future (and its state clones) are actually dropped.
+            let _ = publisher_handle.await;
+            if let Some(substrate) = substrate_owned.take() {
+                if let Err(e) = substrate.shutdown().await {
+                    tracing::warn!("OAuth iroh substrate shutdown error: {e}");
+                }
+            }
 
+            primary.map_err(|e| {
+                hyprstream_rpc::error::RpcError::SpawnFailed(format!("{e:#}"))
+            })?;
             Ok(())
         })
     }
