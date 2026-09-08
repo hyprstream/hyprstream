@@ -3192,37 +3192,23 @@ fn main() -> Result<()> {
 
                                     if name == "policy" {
                                         // PolicyService: signing_key IS the CA key (already loaded).
-                                        ctx = ctx.with_service_key(&name, own_key);
+                                        ctx = ctx.with_service_key(&name, own_key.clone());
                                     } else {
                                         // Non-policy: swap signing_key to service's own independent key.
                                         // CA key is no longer accessible via ctx.signing_key().
                                         ctx = ctx.swap_signing_key(own_key.clone());
                                         ctx = ctx.with_service_key(&name, own_key.clone());
-
-                                        // In systemd mode the credential dir is flat (%d = secrets_dir).
-                                        // Load our own service-jwt from disk and seed the trust store so
-                                        // that register_service_key() finds it on first call — otherwise
-                                        // the trust store only has pubkeys (jwt: None) from bootstrap-pubkeys
-                                        // and registration is silently skipped.
-                                        if let Ok(Some(jwt_str)) = hyprstream_core::auth::identity_store::load_service_jwt_for_profile(
-                                            &secrets_dir,
-                                            &name,
-                                            secrets_profile,
-                                        ) {
-                                            let exp = hyprstream_core::auth::identity_store::decode_jwt_exp_raw(&jwt_str).unwrap_or(0);
-                                            hyprstream_service::global_trust_store().insert(
-                                                own_key.verifying_key(),
-                                                hyprstream_service::Attestation {
-                                                    scopes: std::iter::once(name.clone()).collect(),
-                                                    subject: None,
-                                                    jwt: Some(jwt_str),
-                                                    expires_at: exp,
-                                                    attested_by: None,
-                                                },
-                                            );
-                                            tracing::info!(service = %name, "Seeded trust store with own service-jwt from credential dir");
-                                        }
                                     }
+                                    // Both Policy and non-Policy factories need the
+                                    // provisioned JWT. Policy's required-native factory
+                                    // registers its own key too, so seed after the shared
+                                    // key selection rather than only in the non-Policy arm.
+                                    hyprstream_core::auth::identity_store::seed_service_jwt_into_trust_store(
+                                        &name,
+                                        &own_key,
+                                        &secrets_dir,
+                                        secrets_profile,
+                                    );
                                 } else {
                                     // Single-process mode: load keys from disk (same as IPC).
                                     // Wizard must have run to create credentials.
