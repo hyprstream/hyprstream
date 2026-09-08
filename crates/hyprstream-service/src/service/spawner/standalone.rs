@@ -196,6 +196,33 @@ impl Drop for ChildNotifySocket {
     }
 }
 
+/// What the synchronous startup backstop actually observed and did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackstopOutcome {
+    /// An explicit terminal wait status was observed AND the guarded
+    /// artifact was removed (or was already absent).
+    TerminatedAndCleaned,
+    /// A terminal status was observed, but the artifact removal FAILED:
+    /// the artifact remains on disk as evidence and no cleanup success is
+    /// claimed.
+    TerminatedArtifactKept,
+    /// Termination was NOT observed (kill failure, reap error, budget
+    /// exhausted with a nonterminal status, or no usable handle): nothing
+    /// is discarded and no cleanup is claimed.
+    Unconfirmed,
+}
+
+/// Terminal-status classification for backstop outcome purposes: only a
+/// real exit or kill signal establishes disappearance. StillAlive,
+/// stopped, continued, and ptrace states are nonterminal and never
+/// release ownership.
+fn wait_status_is_terminal(status: &nix::sys::wait::WaitStatus) -> bool {
+    matches!(
+        status,
+        nix::sys::wait::WaitStatus::Exited(..) | nix::sys::wait::WaitStatus::Signaled(..)
+    )
+}
+
 /// Startup ownership of a not-yet-adopted child (#1585).
 ///
 /// Between `spawn` and readiness the launcher — not the process map — owns
@@ -252,21 +279,22 @@ impl StartupChildGuard {
 
     /// Synchronous cancellation backstop (the async reap is unavailable in
     /// `Drop`): SIGKILL the owned child and reap it within a bounded WNOHANG
-    /// budget. Returns whether termination/reap was OBSERVED.
-    ///
-    /// On `true` the owned child handle is released and the guarded artifact
-    /// removed. On `false` — kill failure, reap error, or budget exhaustion —
-    /// NOTHING is discarded: the retained child handle and artifact are the
-    /// failure evidence. Bounded best effort, not a guarantee.
-    fn backstop_cleanup(&mut self) -> bool {
-        let mut observed = false;
+    /// budget. Returns the observed [`BackstopOutcome`]; ownership is
+    /// released only when an explicit TERMINAL wait status (real exit or
+    /// kill signal — or the already-reaped `ECHILD`) is observed, and the
+    /// guarded artifact is removed only when that removal actually
+    /// succeeds. Every nonterminal wait state (still-alive, stopped,
+    /// continued, ptrace) stays inside the same bounded budget and never
+    /// establishes termination. Bounded best effort, not a guarantee.
+    fn backstop_cleanup(&mut self) -> BackstopOutcome {
+        let mut terminated = false;
         if let Some(child) = self.child.as_ref() {
             if let Some(pid) = child.id() {
                 let raw = nix::unistd::Pid::from_raw(pid as i32);
                 match nix::sys::signal::kill(raw, nix::sys::signal::Signal::SIGKILL) {
                     Err(nix::errno::Errno::ESRCH) => {
                         // The process is already gone; nothing to signal.
-                        observed = true;
+                        terminated = true;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -282,21 +310,28 @@ impl StartupChildGuard {
                                 raw,
                                 Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                             ) {
-                                Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                                // Only an explicit terminal status — real
+                                // exit or kill signal — establishes the reap.
+                                Ok(status) if wait_status_is_terminal(&status) => {
+                                    terminated = true;
+                                    break;
+                                }
+                                // StillAlive AND nonterminal stopped/
+                                // continued/ptrace states: NOT termination;
+                                // keep waiting inside the same budget.
+                                Ok(_) => {
                                     if Instant::now() >= deadline {
                                         tracing::warn!(
                                             pid = %pid,
-                                            "reap backstop budget exhausted; child may linger as a zombie"
+                                            "reap backstop budget exhausted with a nonterminal status; child may linger"
                                         );
                                         break;
                                     }
                                     std::thread::sleep(Duration::from_millis(5));
                                 }
-                                // Exited/Signaled: reaped by this wait.
-                                // ECHILD: no longer our child (already
-                                // reaped) — gone either way.
-                                Ok(_) | Err(nix::errno::Errno::ECHILD) => {
-                                    observed = true;
+                                Err(nix::errno::Errno::ECHILD) => {
+                                    // No longer our child: already reaped.
+                                    terminated = true;
                                     break;
                                 }
                                 Err(e) => {
@@ -313,33 +348,58 @@ impl StartupChildGuard {
                 }
             }
         }
-        if observed {
-            self.child = None;
-            if let Some(path) = &self.pid_file {
-                let _ = std::fs::remove_file(path);
-            }
-            self.pid_file = None;
+        if !terminated {
+            return BackstopOutcome::Unconfirmed;
         }
-        observed
+        self.child = None;
+        let Some(path) = self.pid_file.take() else {
+            return BackstopOutcome::TerminatedAndCleaned;
+        };
+        match std::fs::remove_file(&path) {
+            // Removed — or already absent: the artifact is gone either way.
+            Ok(()) => BackstopOutcome::TerminatedAndCleaned,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                BackstopOutcome::TerminatedAndCleaned
+            }
+            Err(e) => {
+                tracing::warn!(
+                    name = %self.name,
+                    path = %path.display(),
+                    error = %e,
+                    "startup backstop could not remove the guarded artifact; retained on disk as evidence"
+                );
+                self.pid_file = Some(path);
+                BackstopOutcome::TerminatedArtifactKept
+            }
+        }
     }
 }
 
 impl Drop for StartupChildGuard {
     fn drop(&mut self) {
         if self.child.is_some() {
-            // Best effort within the budget: the limitation is real (a stuck
-            // child may outlive this backstop), and the log states what was
-            // actually observed — never success on failure.
-            if self.backstop_cleanup() {
-                tracing::warn!(
-                    name = %self.name,
-                    "startup guard dropped with the child still owned; killed, reaped, and cleaned up"
-                );
-            } else {
-                tracing::warn!(
-                    name = %self.name,
-                    "startup guard dropped without confirmed termination; owned artifact retained as evidence"
-                );
+            // Bounded best effort: each outcome is reported exactly as
+            // observed. The fields drop with this struct — no handle or
+            // cleanup survives an unsuccessful backstop.
+            match self.backstop_cleanup() {
+                BackstopOutcome::TerminatedAndCleaned => {
+                    tracing::warn!(
+                        name = %self.name,
+                        "startup guard dropped with the child still owned; terminated, reaped, and cleaned up"
+                    );
+                }
+                BackstopOutcome::TerminatedArtifactKept => {
+                    tracing::warn!(
+                        name = %self.name,
+                        "startup guard dropped: child terminated but artifact removal failed; artifact retained on disk as evidence"
+                    );
+                }
+                BackstopOutcome::Unconfirmed => {
+                    tracing::warn!(
+                        name = %self.name,
+                        "startup guard dropped without confirmed termination; owned artifact retained on disk as evidence; no cleanup guarantee beyond Drop"
+                    );
+                }
             }
         }
     }
@@ -1513,10 +1573,11 @@ mod notify_readiness_tests {
     }
 
     /// Startup-backstop decisions: OBSERVED termination cleans the owned
-    /// artifact; an unobservable outcome must RETAIN the artifact as
-    /// evidence and claim no success. The unobserved branch is exercised
-    /// through the deterministically inducible seam (a handle that yields
-    /// no PID) — no kernel kill failure is forced or claimed.
+    /// artifact (regular file and already-absent paths); an unobservable
+    /// outcome must RETAIN the artifact as evidence and claim no success.
+    /// The unobserved branch is exercised through the deterministically
+    /// inducible seam (a handle that yields no PID) — no kernel kill
+    /// failure is forced or claimed.
     #[tokio::test]
     async fn startup_backstop_cleanup_tracks_observed_termination() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1534,15 +1595,33 @@ mod notify_readiness_tests {
             name: "backstop-observed".to_owned(),
             pid_file: Some(artifact.clone()),
         };
-        assert!(
+        assert_eq!(
             guard.backstop_cleanup(),
-            "live-child backstop must observe termination"
+            BackstopOutcome::TerminatedAndCleaned,
+            "live-child backstop must observe termination and clean its artifact"
         );
         assert!(
             !artifact.exists(),
             "observed cleanup must remove the owned artifact"
         );
         assert_pid_gone(pid);
+
+        // Already-absent path: an armed artifact that does not exist is
+        // gone either way — still a clean, observed outcome.
+        let mut cmd = tokio::process::Command::new("/bin/sleep");
+        cmd.arg("30");
+        let child = cmd.spawn().expect("sleep child");
+        let mut guard = StartupChildGuard {
+            child: Some(child),
+            name: "backstop-absent".to_owned(),
+            pid_file: Some(dir.path().join("never-written.pid")),
+        };
+        assert_eq!(
+            guard.backstop_cleanup(),
+            BackstopOutcome::TerminatedAndCleaned,
+            "a NotFound artifact must not downgrade the observed outcome"
+        );
+        assert!(!guard.pid_file.is_some(), "armed path must be cleared");
 
         // Unobserved path: the handle yields no PID, so the backstop cannot
         // observe anything and must not claim cleanup.
@@ -1556,8 +1635,9 @@ mod notify_readiness_tests {
             name: "backstop-unobserved".to_owned(),
             pid_file: Some(artifact.clone()),
         };
-        assert!(
-            !guard.backstop_cleanup(),
+        assert_eq!(
+            guard.backstop_cleanup(),
+            BackstopOutcome::Unconfirmed,
             "an unobservable outcome must not claim cleanup"
         );
         assert!(
@@ -1565,6 +1645,68 @@ mod notify_readiness_tests {
             "unobserved backstop must retain the owned artifact as evidence"
         );
         Ok(())
+    }
+
+    /// Termination and artifact cleanup are separate observed facts: a
+    /// live child is terminated and reaped, but an artifact that cannot be
+    /// unlinked (a directory squats the armed path) must be reported as
+    /// `TerminatedArtifactKept` and RETAINED on disk — never as a
+    /// cleaned-up success.
+    #[tokio::test]
+    async fn startup_backstop_distinguishes_termination_from_failed_cleanup() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        // A DIRECTORY at the armed path: remove_file fails with EISDIR
+        // (not NotFound) even after the child is genuinely reaped.
+        let squat = dir.path().join("owned.pid");
+        std::fs::create_dir(&squat)?;
+
+        let mut cmd = tokio::process::Command::new("/bin/sleep");
+        cmd.arg("30");
+        let child = cmd.spawn().expect("sleep child");
+        let pid = child.id().expect("live pid");
+        let mut guard = StartupChildGuard {
+            child: Some(child),
+            name: "backstop-kept".to_owned(),
+            pid_file: Some(squat.clone()),
+        };
+        assert_eq!(
+            guard.backstop_cleanup(),
+            BackstopOutcome::TerminatedArtifactKept,
+            "failed artifact removal must be reported separately from termination"
+        );
+        // Termination was observed (reaped) AND the artifact is retained.
+        assert_pid_gone(pid);
+        assert!(
+            squat.is_dir(),
+            "the failed-removal artifact must be retained on disk as evidence"
+        );
+        std::fs::remove_dir(&squat)?;
+        Ok(())
+    }
+
+    /// Narrow classification-helper coverage, honestly labelled: the real
+    /// OS cannot deterministically present a nonterminal wait status under
+    /// WNOHANG after SIGKILL, so this proves only that the classifier
+    /// accepts exactly Exited/Signaled and rejects still-alive, stopped,
+    /// and continued states.
+    #[test]
+    fn wait_status_classification_accepts_only_terminal_statuses() {
+        use nix::sys::signal::Signal;
+        use nix::sys::wait::WaitStatus;
+
+        let pid = nix::unistd::Pid::from_raw(1);
+        assert!(wait_status_is_terminal(&WaitStatus::Exited(pid, 0)));
+        assert!(wait_status_is_terminal(&WaitStatus::Signaled(
+            pid,
+            Signal::SIGKILL,
+            false
+        )));
+        assert!(!wait_status_is_terminal(&WaitStatus::StillAlive));
+        assert!(!wait_status_is_terminal(&WaitStatus::Stopped(
+            pid,
+            Signal::SIGSTOP
+        )));
+        assert!(!wait_status_is_terminal(&WaitStatus::Continued(pid)));
     }
 
     /// UNIT-LEVEL duplicate controls (manual lock hold / manual witness; the
