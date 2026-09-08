@@ -956,13 +956,41 @@ async fn stop_untracked_by_pid(pid: u32, failures: &mut Vec<String>) -> bool {
 /// unlinked — unlinking would break flock identity between concurrent
 /// acquirers. Holding it makes the duplicate precheck, the PID publication,
 /// and any rollback of one launch a deterministic unit against other launches
-/// of the same service; release is the descriptor close on drop. A held lock
-/// is reported as a pending duplicate, deterministically. Scope is honest and
-/// narrow: it coordinates only cooperating notified launches using this
-/// facility and makes no claim of control over noncooperating processes; the
-/// artifact lives in the protected runtime directory.
+/// of the same service. Release is an EXPLICIT `FlockArg::Unlock` in `Drop`
+/// followed by normal close: `flock` lives on the open file description, so
+/// close alone can be prolonged by a concurrently forked process's transient
+/// duplicate of that description (pre-exec), which would transiently and
+/// falsely refuse the next same-service launch; explicit unlock releases the
+/// lock immediately regardless of such copies. A held lock is reported as a
+/// pending duplicate, deterministically. Scope is honest and narrow: it
+/// coordinates only cooperating notified launches using this facility and
+/// makes no claim of control over noncooperating processes; the artifact
+/// lives in the protected runtime directory.
 struct ServiceLaunchLock {
     _file: std::fs::File,
+}
+
+impl Drop for ServiceLaunchLock {
+    fn drop(&mut self) {
+        use nix::fcntl::{flock, FlockArg};
+        use std::os::fd::AsRawFd;
+
+        // Explicit unlock BEFORE close (see the type docs): close alone
+        // waits for every duplicate of this open file description to close,
+        // which a concurrently forked child's pre-exec copy can delay
+        // indefinitely. An unlock failure is logged honestly — the
+        // subsequent close remains the fallback and the next acquirer may
+        // then see a transient in-progress refusal (fail-closed), never a
+        // duplicate acceptance.
+        let fd = self._file.as_raw_fd();
+        if let Err(e) = flock(fd, FlockArg::Unlock) {
+            tracing::warn!(
+                fd = %fd,
+                error = %e,
+                "launch lock explicit unlock failed; falling back to close semantics"
+            );
+        }
+    }
 }
 
 impl ServiceLaunchLock {
@@ -1570,6 +1598,36 @@ mod notify_readiness_tests {
             cleanup_suffix(Err("kill failed: boom".to_owned())),
             "; cleanup: kill failed: boom"
         );
+    }
+
+    /// Explicit-unlock release (P2): `flock` lives on the open file
+    /// description, so a close-only release can be prolonged by any retained
+    /// duplicate of that description — exactly what a concurrently forked
+    /// child's pre-exec descriptor copy is. A safe `dup` of the locked
+    /// descriptor stands in for such a duplicate; after the lock is dropped,
+    /// a fresh same-service acquisition must succeed even though the
+    /// duplicate is still open.
+    #[test]
+    fn launch_lock_releases_despite_retained_description_duplicate() {
+        let unique = std::process::id();
+        let name = format!("notify-unlock-{unique}");
+
+        let held = ServiceLaunchLock::acquire(&name).expect("acquire");
+        // Retained duplicate of the SAME open file description (RAII clone:
+        // an assertion failure cannot leak the demonstration descriptor).
+        let duplicate = held._file.try_clone().expect("try_clone");
+
+        // Explicit-unlock drop: the lock must release despite the still-open
+        // duplicate; close alone would not achieve that.
+        drop(held);
+
+        let reacquired = ServiceLaunchLock::acquire(&name).expect(
+            "lock must release via explicit unlock despite the retained duplicate",
+        );
+        drop(reacquired);
+
+        // The demonstration duplicate is closed by its own RAII drop here.
+        drop(duplicate);
     }
 
     /// Startup-backstop decisions: OBSERVED termination cleans the owned
