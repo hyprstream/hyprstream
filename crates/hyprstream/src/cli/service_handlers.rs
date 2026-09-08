@@ -3163,15 +3163,12 @@ mod launcher_tests {
         Ok(())
     }
 
-    /// Cancellation around a required startup failure cleans the READY
-    /// predecessor at WHATEVER point the abort lands. The predecessor is
-    /// READY-observed (marker-before-READY proves the child ran and sent
-    /// READY) — but marker presence alone does NOT prove the launcher
-    /// adopted it nor that rollback was entered, so the landing point is
-    /// unspecified: the armed startup guard, the transaction guard, or a
-    /// completed explicit rollback each own the cleanup, and all end with
-    /// the predecessor reaped and its artifact removed. The deterministic
-    /// rollback-boundary evidence lives in
+    /// Cancellation around a required startup failure cleans the spawned
+    /// predecessor at the point where abort lands. Its PID marker is written
+    /// before READY, so marker presence proves the child ran and wrote its
+    /// PID; it does not prove READY was sent, that the launcher adopted it,
+    /// or that rollback was entered. The landing is unspecified. The
+    /// deterministic rollback-boundary evidence is provided by
     /// `rollback_failed_and_pending_stops_stay_guard_owned_through_cancellation`.
     #[tokio::test]
     async fn required_cancellation_around_startup_failure_cleans_predecessor_at_any_landing()
@@ -3227,11 +3224,10 @@ mod launcher_tests {
             launch_planned_children(plans, true, &spawner).await
         });
 
-        // Abort as soon as the predecessor is READY-observed. Marker-before-
-        // READY proves the child ran and sent READY, but NOT that the
-        // launcher adopted it or that rollback was entered — the landing
-        // point is unspecified and every landing must clean the
-        // predecessor.
+        // Abort after the predecessor's PID marker appears. The marker
+        // precedes READY; it does not prove notification, adoption, or
+        // rollback entry. This test checks cleanup at the observed,
+        // unspecified cancellation point.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while !marker.exists() {
             anyhow::ensure!(
