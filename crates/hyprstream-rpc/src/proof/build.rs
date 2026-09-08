@@ -18,8 +18,8 @@ use super::{
     CLAIM_CAPNP_SCHEMA_ID, CLAIM_CREDENTIAL_HASH, CLAIM_RESPONSE_BINDING, COSE_HEADER_ALG,
     COSE_HEADER_CRIT, COSE_HEADER_KID, COSE_HEADER_TYP, CWT_CLAIM_AUD, CWT_CLAIM_CTI,
     CWT_CLAIM_EXP, CWT_CLAIM_IAT, HEADER_HS_DOMAIN, HEADER_HS_LOGICAL_SIGNER_GROUP,
-    HEADER_HS_SIGNATURE_PLAN, MAX_BODY_BYTES, MAX_KID_BYTES,
-    MAX_REMAINING_LIFETIME_AUTHENTICATED_SECS, PROOF_TYP, REQUEST_PROOF_DOMAIN, SUITE_HYBRID,
+    HEADER_HS_SIGNATURE_PLAN, MAX_BODY_BYTES, MAX_KID_BYTES, PROOF_TYP, REQUEST_PROOF_DOMAIN,
+    SUITE_HYBRID,
 };
 
 /// Proof-dedicated private components for the sole supported producer suite.
@@ -62,9 +62,13 @@ pub struct AuthenticatedRequestProofInput<'a> {
     /// Exact credential bytes presented with the envelope; hashed as claim
     /// `-70001` without parsing, normalization, or substitution.
     pub credential: &'a [u8],
-    /// Unix seconds used for CWT `iat`.
+    /// Unix seconds used for CWT `iat`. W1 freshness is evaluated by the
+    /// verifier against its injected clock; the producer records this value
+    /// without consulting an ambient clock or imposing an `exp`/`iat` rule.
     pub issued_at: u64,
-    /// Unix seconds used for CWT `exp`.
+    /// Unix seconds used for CWT `exp`. W1 freshness is evaluated by the
+    /// verifier against its injected clock; the producer records this value
+    /// without consulting an ambient clock or imposing an issued-lifetime cap.
     pub expires_at: u64,
     /// Exact Cap'n Proto root schema ID for `capnp_schema_id`.
     pub capnp_schema_id: u64,
@@ -96,16 +100,6 @@ pub fn build_authenticated_hybrid_request_proof(
             MAX_BODY_BYTES
         );
     }
-    if input.expires_at <= input.issued_at {
-        bail!("request proof: exp must be later than iat");
-    }
-    if input.expires_at - input.issued_at > MAX_REMAINING_LIFETIME_AUTHENTICATED_SECS {
-        bail!(
-            "request proof: requested lifetime exceeds authenticated profile maximum of {} seconds",
-            MAX_REMAINING_LIFETIME_AUTHENTICATED_SECS
-        );
-    }
-
     let credential_hash: CredentialHash = Sha256::digest(input.credential).into();
     // The replay identifier is producer-generated, never caller selected.
     // It is the only v16 request ID and is later recovered from the proof for
@@ -516,12 +510,50 @@ mod tests {
     }
 
     #[test]
-    fn producer_rejects_oversize_and_invalid_freshness_before_signing() {
+    fn producer_rejects_oversize_but_leaves_w1_freshness_to_verifier() {
         let (signer, _, _) = fixture();
         let oversized = vec![0; MAX_BODY_BYTES + 1];
         assert!(build_authenticated_hybrid_request_proof(&input(&oversized), &signer).is_err());
-        let mut expired = input(b"body");
-        expired.expires_at = expired.issued_at;
-        assert!(build_authenticated_hybrid_request_proof(&expired, &signer).is_err());
+    }
+
+    #[test]
+    fn producer_parser_verifier_preserve_injected_clock_w1_boundaries() {
+        let cases = [
+            (NOW - 30, NOW + 300, None),
+            (NOW + 30, NOW + 1, None),
+            (NOW, NOW, Some("proof expired:")),
+            (
+                NOW - 31,
+                NOW + 30,
+                Some("proof iat out of verifier-clock skew:"),
+            ),
+            (NOW, NOW + 301, Some("proof over-lifetime:")),
+        ];
+
+        for (issued_at, expires_at, expected_error) in cases {
+            let (signer, resolver, cnf) = fixture();
+            let mut request = input(b"w1-boundary-body");
+            request.issued_at = issued_at;
+            request.expires_at = expires_at;
+            let bytes = build_authenticated_hybrid_request_proof(&request, &signer)
+                .expect("producer accepts caller-supplied timestamps");
+            let proof = ParsedProof::parse(&bytes).expect("parser accepts producer output");
+            let result = verify_proof_signatures(&proof, Some(&cnf), Some(&resolver), NOW);
+
+            match expected_error {
+                None => {
+                    result.expect("verifier accepts W1 boundary");
+                }
+                Some(expected) => {
+                    let error = result
+                        .expect_err("verifier rejects W1 negative")
+                        .to_string();
+                    assert!(
+                        error.contains(expected),
+                        "expected verifier reason {expected:?}, got {error:?}"
+                    );
+                }
+            }
+        }
     }
 }
