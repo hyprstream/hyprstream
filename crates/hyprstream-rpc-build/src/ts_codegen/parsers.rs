@@ -1325,21 +1325,25 @@ struct Payload {
     const SERVICE_SCHEMA: &str = r#"
 @0xbeefcafebeefcafe;
 
-# Mandatory scope (S3, #547) and mandatory dispatch pair (v16 §6, WS-D): a
-# method with no `$scope` or with neither `$dispatchMac`/`$dispatchPublic` is a
-# build error. Minimal local annotations mirror the real annotations.capnp
-# shapes for this fixture.
+# Mandatory scope (S3, #547), mandatory dispatch pair (v16 §6, WS-D), and
+# mandatory mutation semantics (v16 §4.8/§6.1): a method with no `$scope` or
+# with neither `$dispatchMac`/`$dispatchPublic` is a build error, and every
+# non-read scoped leaf must declare `$mutationSemantics`. Minimal local
+# annotations mirror the real annotations.capnp shapes for this fixture.
 enum ScopeAction {
   query @0;
   write @1;
 }
 annotation scope(field) :ScopeAction;
 annotation dispatchMac(field) :Text;
+annotation mutationSemantics(field) :Text;
 
 struct PayloadRequest {
   union {
     ping @0 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
-    echo @1 :Text $scope(write) $dispatchMac("internal:pq-hybrid");
+    # A synthetic pure echo performs no durable application effect, so a
+    # repeated call converges — the `naturally-idempotent` class.
+    echo @1 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
   }
 }
 
