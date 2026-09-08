@@ -177,9 +177,13 @@ struct TuiRequest {
       $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Spawn a shell in a pane");
 
     # Poll for stdin bytes queued for this viewer (alternative to ZMQ SUB relay).
-    # Returns all bytes received since the last poll, concatenated.
+    # Returns all bytes received since the last poll, concatenated. The poll
+    # DRAINS the viewer's queue (pop_front), so a lost reply consumes bytes a
+    # retry cannot redeliver: at-most-once delivery requires an atomic result
+    # ledger or fencing. None is implemented here — this records the required
+    # semantics, not an existing mechanism.
     pollStdin @14 :UInt32  # viewer_id
-      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Poll for stdin bytes queued for this viewer");
+      $scope(query) $mutationSemantics("transaction-ledger-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Poll for stdin bytes queued for this viewer");
 
     # Spawn the ShellApp chrome process inside TuiService so no fork occurs
     # in the client process (avoids ZMQ signaler assertion after fork).

@@ -83,11 +83,22 @@ struct MetricsRequest {
     ingest       @1 :IngestRequest
       $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Ingest metric records into the time-series store");
 
+    # Raw SQL reaches the storage backend verbatim when non-empty, so a
+    # replayed non-SELECT statement re-applies its write. At-most-once
+    # execution requires an atomic result/mutation ledger or fencing; none is
+    # implemented here — this records the required semantics, not an
+    # existing mechanism. (Restricting execution to SELECT is separate
+    # enforcement work, deliberately not attempted in this annotation.)
     query        @2 :MetricQuery
-      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Execute a structured or raw SQL aggregation query");
+      $scope(query) $mutationSemantics("transaction-ledger-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Execute a structured or raw SQL aggregation query");
 
+    # Prepares a server-side third-party interop stream context under the
+    # client's ephemeral pubkey and schedules the query continuation before
+    # the reply is observed, so a replay duplicates the allocation/work.
+    # At-most-once preparation requires an atomic result ledger; none is
+    # implemented here — this records the required semantics.
     queryStream  @3 :MetricQuery
-      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Stream query results as Arrow IPC RecordBatch chunks");
+      $scope(query) $mutationSemantics("transaction-ledger-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Stream query results as Arrow IPC RecordBatch chunks");
 
     createView   @4 :ViewSpec
       $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Create a materialized view over the metrics table");

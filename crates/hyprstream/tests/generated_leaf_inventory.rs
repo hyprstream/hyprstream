@@ -297,8 +297,10 @@ fn mutation_semantics_follow_the_scope_action_blocks() {
 }
 
 /// TUI declarations follow the actual handler effects: setting focus/size is
-/// convergent, while process input and allocation paths require a future
-/// application idempotency key/result record before retry behavior may be enabled.
+/// convergent, process input and allocation paths require a future
+/// application idempotency key/result record before retry behavior may be
+/// enabled, and `pollStdin` is a destructive queue drain — a lost reply
+/// consumes bytes a retry cannot redeliver.
 #[test]
 fn tui_mutation_policies_are_explicit_and_handler_accurate() {
     use policy::MutationSemantics;
@@ -322,6 +324,52 @@ fn tui_mutation_policies_are_explicit_and_handler_accurate() {
         semantics("createWindow"),
         Some(MutationSemantics::IdempotencyKeyRequired)
     );
+    assert_eq!(
+        semantics("pollStdin"),
+        Some(MutationSemantics::TransactionLedgerRequired),
+        "pollStdin drains the viewer stdin queue (pop_front): a lost reply \
+         consumes bytes a retry cannot redeliver, so at-most-once delivery \
+         requires an atomic result ledger or fencing — required semantics; \
+         no ledger machinery is implemented"
+    );
+    // Pure state reads stay policy-free.
+    assert_eq!(semantics("listWindows"), None);
+    assert_eq!(semantics("snapshot"), None);
+}
+
+/// Metrics' read-scope leaves follow their real handler effects: `queryStream`
+/// prepares a server-side third-party interop stream under the client's
+/// ephemeral pubkey and schedules the query continuation before the reply is
+/// observed, and `query` executes caller SQL verbatim through the storage
+/// backend (a replayed non-SELECT re-applies its write). Both are read-class
+/// authorization with declared at-most-once effect semantics — the
+/// declaration records the required ledger/fencing; no such machinery is
+/// implemented here, and restricting execution to SELECT is separate
+/// enforcement work deliberately not attempted in this annotation.
+#[test]
+fn metrics_effectful_query_leaves_declare_required_ledger_semantics() {
+    use policy::MutationSemantics;
+
+    let rows = policy::collect_generated_rows().expect("inventory collects");
+    let semantics = |leaf: &str| {
+        rows.iter()
+            .find(|row| row.service == "metrics" && row.symbolic_path == leaf)
+            .unwrap_or_else(|| panic!("missing metrics:{leaf}"))
+            .mutation_semantics
+    };
+    assert_eq!(
+        semantics("queryStream"),
+        Some(MutationSemantics::TransactionLedgerRequired),
+        "a replayed queryStream duplicates the interop-stream preparation and \
+         scheduled continuation"
+    );
+    assert_eq!(
+        semantics("query"),
+        Some(MutationSemantics::TransactionLedgerRequired),
+        "raw caller SQL reaches the storage backend verbatim"
+    );
+    // Genuine reads stay policy-free.
+    assert_eq!(semantics("listViews"), None);
 }
 
 /// The at9p admission path returns the durably fenced accepted head on an
