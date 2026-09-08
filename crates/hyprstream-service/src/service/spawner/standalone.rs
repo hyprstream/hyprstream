@@ -2331,7 +2331,10 @@ mod notify_refusal_non_linux_tests {
         );
 
         // Observed boundary: the sentinel never ran, no PID artifact was
-        // published, and no per-launch notify runtime directory exists.
+        // published, and no per-launch notify runtime directory exists. An
+        // ABSENT runtime directory is itself a valid refusal state (nothing
+        // created it): only ErrorKind::NotFound is treated as absence; every
+        // other read/entry error propagates.
         assert!(
             !marker.exists(),
             "the sentinel child must not have been spawned by the refused Notify request"
@@ -2340,14 +2343,20 @@ mod notify_refusal_non_linux_tests {
             !pid_file.exists(),
             "a refused Notify request must not publish a PID artifact"
         );
-        for entry in std::fs::read_dir(hyprstream_rpc::paths::runtime_dir())? {
-            let entry = entry?;
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            assert!(
-                !file_name.starts_with(&dir_prefix),
-                "a refused Notify request must not create a notify runtime directory, \
-                 found {file_name}"
-            );
+        match std::fs::read_dir(hyprstream_rpc::paths::runtime_dir()) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    assert!(
+                        !file_name.starts_with(&dir_prefix),
+                        "a refused Notify request must not create a notify runtime \
+                         directory, found {file_name}"
+                    );
+                }
+            }
         }
         Ok(())
     }
