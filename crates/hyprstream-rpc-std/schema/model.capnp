@@ -117,9 +117,15 @@ struct ModelFsResponse {
 struct TttRequest {
   modelRef @0 :Text;
   union {
-    init @1 :LoraConfig $scope(train) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
+    # Proxies inference createLora, whose success bumps lora_generation and
+    # invalidates pending adaptation work on replay. No payload key and no
+    # implemented ledger — this records the required semantics.
+    init @1 :LoraConfig $scope(train) $dispatchMac("internal:pq-hybrid") $mutationSemantics("transaction-ledger-required")
       $mcpDescription("Initialize the training infrastructure (LoRA parameters, optimizer, delta pool) on a loaded model. Required before ttt.train or TTT-enabled inference. Configure rank, alpha, target modules, and learning rate.");
-    train @2 :TrainStepRequest $scope(train) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
+    # Proxies inference trainStep: a replay trains the same input twice and
+    # the per-subject TTT delta diverges. Requires a caller-supplied key
+    # (matching trainStream@3); no key machinery is implemented here.
+    train @2 :TrainStepRequest $scope(train) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required")
       $mcpDescription("Run TTT gradient steps on input text WITHOUT generating a response. Pure training — use for pre-training on domain text before asking questions. Returns loss metrics and recommendation. Use adaptationStrategy=speculative to keep pending, then call ttt.writeback or ttt.evict.");
     trainStream @3 :TrainStepRequest $scope(train) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required")
       $mcpDescription("Stream TTT training on input text. Returns progress and results via streaming. Use for long-running training that would timeout via ttt.train.");
@@ -155,7 +161,10 @@ struct TttRequest {
 struct AdapterRequest {
   modelRef @0 :Text;
   union {
-    load @1 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
+    # Proxies inference loadLora: success bumps lora_generation (guard-
+    # relevant) and a replay re-bumps it. Requires a generation-preserving
+    # ledger; none is implemented — required semantics, not existing.
+    load @1 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("transaction-ledger-required")
       $mcpDescription("Load a PEFT adapter from disk into the base_delta register. Applied to all inference until unloaded. Path is relative within the model worktree (e.g. 'adapters/my-adapter').");
     unload @2 :Void $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
       $mcpDescription("Clear the base_delta register, removing the loaded adapter from GPU/CPU memory.");
