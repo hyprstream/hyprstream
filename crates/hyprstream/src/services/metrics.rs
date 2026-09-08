@@ -1507,6 +1507,106 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_query_stream_no_subscriber_timeout_releases_admission_permit() {
+        let (client, manager, backend) =
+            start_metrics_service("query-stream-no-subscriber-timeout").await;
+        let origin = hyprstream_rpc::moq_stream::global_moq_origin()
+            .expect("metrics test origin initialized");
+        let before_rows = metrics_row_count(&backend).await;
+
+        // Fill the production per-service admission pool with real Metrics
+        // continuations that have no consumer. They must remain in the
+        // demand wait and time out before they can prepare or execute SQL.
+        let mut blocked_streams = Vec::new();
+        for index in 0..hyprstream_rpc::streaming::DEFAULT_MAX_CONCURRENT_STREAMS_PER_SERVICE {
+            let (_client_secret, client_pub) =
+                hyprstream_rpc::crypto::generate_ephemeral_keypair();
+            let stream = client
+                .query_stream(
+                    &MetricQuery {
+                        sql: String::new(),
+                        metric_id: format!("no-subscriber-{index}"),
+                        window_secs: 0,
+                        aggregation: AggregationFunc::Count,
+                        group_by: vec![],
+                        limit_rows: 0,
+                        ephemeral_pubkey: client_pub.to_bytes().to_vec(),
+                    },
+                    [0u8; 32],
+                )
+                .await
+                .expect("blocked structured queryStream");
+            blocked_streams.push(stream);
+        }
+
+        // This real Metrics continuation queues behind the full pool. Its
+        // announcement is therefore a direct admission-release signal: it
+        // cannot be created until a no-subscriber continuation reaches its
+        // bounded timeout and drops its permit.
+        let (_sentinel_secret, sentinel_pub) =
+            hyprstream_rpc::crypto::generate_ephemeral_keypair();
+        let started = std::time::Instant::now();
+        let sentinel = client
+            .query_stream(
+                &MetricQuery {
+                    sql: String::new(),
+                    metric_id: "no-subscriber-sentinel".to_owned(),
+                    window_secs: 0,
+                    aggregation: AggregationFunc::Count,
+                    group_by: vec![],
+                    limit_rows: 0,
+                    ephemeral_pubkey: sentinel_pub.to_bytes().to_vec(),
+                },
+                [0u8; 32],
+            )
+            .await
+            .expect("sentinel structured queryStream");
+        let announcement = tokio::time::timeout(
+            std::time::Duration::from_secs(35),
+            origin
+                .consumer()
+                .announced_broadcast(&sentinel.broadcast_path),
+        )
+        .await
+        .expect("sentinel admission release timeout")
+        .expect("sentinel stream broadcast announcement");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(25),
+            "sentinel bypassed the no-subscriber demand timeout: {elapsed:?}"
+        );
+        assert_eq!(before_rows, metrics_row_count(&backend).await);
+
+        // Attach only after admission is released. This supplies demand to
+        // the sentinel so its own continuation can publish a normal
+        // structured response and finish cleanly.
+        let mut track = announcement
+            .subscribe_track(&Track::new(STREAM_TRACK))
+            .expect("subscribe to sentinel stream");
+        for _ in 0..2 {
+            let mut group = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                track.next_group(),
+            )
+            .await
+            .expect("sentinel stream group timeout")
+            .expect("sentinel stream group read")
+            .expect("sentinel stream ended before terminal frame");
+            tokio::time::timeout(std::time::Duration::from_secs(5), group.read_frame())
+                .await
+                .expect("sentinel stream frame timeout")
+                .expect("sentinel stream frame read")
+                .expect("sentinel stream group had no frame");
+        }
+
+        drop(track);
+        drop(blocked_streams);
+        drop(client);
+        drop(manager);
+        drop(backend);
+    }
+
     // ── view management ───────────────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
