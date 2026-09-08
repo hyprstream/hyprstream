@@ -516,6 +516,31 @@ fn registry_stateful_query_leaves_declare_their_effects() {
     );
 }
 
+/// `getBlob` is query-authorized, but opening its stream allocates a fresh
+/// authenticated StreamContext and schedules a continuation. Keep that
+/// effect classification tied to the generated row so a schema edit cannot
+/// silently drop it while retaining the query/credential gate.
+#[test]
+fn registry_get_blob_stream_opener_declares_required_key_semantics() {
+    use policy::MutationSemantics;
+
+    let rows = policy::collect_generated_rows().expect("inventory collects");
+    let get_blob = rows
+        .iter()
+        .find(|row| row.service == "registry" && row.symbolic_path == "getBlob")
+        .expect("registry.getBlob row present");
+    assert_eq!(get_blob.scope_action, "query");
+    assert_eq!(
+        get_blob.authentication,
+        policy::AuthenticationRequirement::CredentialRequired
+    );
+    assert_eq!(
+        get_blob.mutation_semantics,
+        Some(MutationSemantics::IdempotencyKeyRequired),
+        "stream opening allocates a fresh context and continuation"
+    );
+}
+
 /// The synthetic model 9P surface has the same bounded fid lifecycle as the
 /// registry worktree surface. `walk` can allocate a fresh handle on a retry;
 /// `open` is a one-way state transition and `clunk` is a convergent release.
