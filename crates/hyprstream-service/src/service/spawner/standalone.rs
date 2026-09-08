@@ -950,6 +950,159 @@ async fn stop_untracked_by_pid(pid: u32, failures: &mut Vec<String>) -> bool {
     }
 }
 
+impl StandaloneBackend {
+    /// Synchronous bounded stop for a tracked direct child, run from the
+    /// launch-transaction guard's `Drop` when the orchestration future is
+    /// cancelled (#1585).
+    ///
+    /// This preserves the backend's STRONGER tracked ownership instead of
+    /// downgrading adopted children to a blind by-PID signal: when the child
+    /// is still in the tracking map, termination goes through the retained
+    /// `Child` handle itself (`start_kill` + bounded `try_wait` reaping — the
+    /// sync counterpart of the tracked branch of [`Self::stop`], same 5s
+    /// budget), and the map entry is surrendered only on a CONFIRMED reap. A
+    /// child no longer in the map is either already stopped by an earlier
+    /// confirmed stop or was never this backend's: for a live untracked PID
+    /// this operation deliberately REFUSES to signal (a recycled PID could be
+    /// an unrelated process) and fails honestly instead; an untracked PID
+    /// already gone (`kill(pid, None)` → ESRCH — a liveness probe, never a
+    /// signal) is cleaned up. PID-artifact removal keeps the established
+    /// conditional semantics — the artifact is removed only while it still
+    /// names this child, a newer child's artifact is preserved, and an actual
+    /// IO failure is an error, not success. Best effort within bounded
+    /// budgets, not a guarantee.
+    pub fn stop_tracked_child_by_handle_sync(&self, process: &SpawnedProcess) -> Result<()> {
+        if !process.is_direct() {
+            return Err(RpcError::InvalidOperation(
+                "synchronous cancellation stop requires a direct (PID-tracked) process"
+                    .to_owned(),
+            ));
+        }
+        let pid = process.pid().unwrap_or_default();
+
+        // Tracked branch: the retained Child IS the ownership — no PID
+        // signaling at all.
+        let child_arc = self
+            .processes
+            .get(&process.id)
+            .map(|entry| Arc::clone(entry.value()));
+        if let Some(child_arc) = child_arc {
+            let mut child = match child_arc.try_lock() {
+                Ok(child) => child,
+                Err(_) => {
+                    return Err(RpcError::SpawnFailed(
+                        "cancellation cleanup skipped: child handle lock contended; \
+                         child remains tracked"
+                            .to_owned(),
+                    ));
+                }
+            };
+            let mut failures: Vec<String> = Vec::new();
+            if let Err(e) = child.start_kill() {
+                failures.push(format!("kill failed: {e}"));
+            }
+            // Bounded synchronous reap (mirror of the tracked `stop` branch).
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut confirmed = false;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        confirmed = true;
+                        // Reaped: only now does the backend stop tracking.
+                        self.processes.remove(&process.id);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        failures.push(format!("reap failed: {e}"));
+                        break;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    failures.push("reap timed out; child remains tracked".to_owned());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if !confirmed {
+                failures.push("termination unconfirmed".to_owned());
+                // Unconfirmed: the PID artifact still names a possibly-live
+                // process and cleanup must not claim success.
+                return Err(RpcError::SpawnFailed(format!(
+                    "synchronous cancellation stop of {} did not fully succeed: {}",
+                    process.id,
+                    failures.join("; ")
+                )));
+            }
+            return finish_pid_artifact_sync(process, pid, &mut failures);
+        }
+
+        // Untracked branch: never signal a PID we do not track. Probe-only
+        // liveness (kill(pid, None) is a probe, not a signal): gone → clean
+        // the artifact; alive → fail honestly rather than risk a recycled
+        // PID (the documented untracked exposure is not widened here).
+        let raw = nix::unistd::Pid::from_raw(i32::try_from(pid).unwrap_or_default());
+        match nix::sys::signal::kill(raw, None) {
+            Err(nix::errno::Errno::ESRCH) => {
+                let mut failures: Vec<String> = Vec::new();
+                finish_pid_artifact_sync(process, pid, &mut failures)
+            }
+            Err(e) => Err(RpcError::SpawnFailed(format!(
+                "cancellation liveness probe of untracked {} failed: {e}",
+                process.id
+            ))),
+            Ok(()) => Err(RpcError::SpawnFailed(format!(
+                "cancellation cleanup declined to signal untracked live PID {pid} ({})",
+                process.id
+            ))),
+        }
+    }
+}
+
+/// Conditional PID-artifact removal after a CONFIRMED synchronous stop: the
+/// artifact is removed only while it still names `pid`; a file naming a
+/// different (newer) child is intentionally preserved and is NOT a failure;
+/// an actual IO failure IS a failure — cleanup never claims clean success it
+/// did not achieve (#1585).
+fn finish_pid_artifact_sync(
+    process: &SpawnedProcess,
+    pid: u32,
+    failures: &mut Vec<String>,
+) -> Result<()> {
+    let Some(pid_file) = &process.pid_file else {
+        return Ok(());
+    };
+    match std::fs::read_to_string(pid_file) {
+        Ok(content) => {
+            if content.trim() == pid.to_string() {
+                match std::fs::remove_file(pid_file) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => {
+                        failures.push(format!("PID file removal failed: {e}"));
+                        Err(RpcError::SpawnFailed(format!(
+                            "synchronous stop of {} confirmed termination but the PID \
+                             artifact cleanup failed: {}",
+                            process.id,
+                            failures.join("; ")
+                        )))
+                    }
+                }
+            } else {
+                // The artifact names a different (newer) child: preserving it
+                // is correct, not a failure.
+                Ok(())
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(RpcError::SpawnFailed(format!(
+            "synchronous stop of {} confirmed termination but the PID artifact could \
+             not be read for conditional removal: {e}",
+            process.id
+        ))),
+    }
+}
+
 /// Per-service nonblocking advisory lock for notified launches (#1585).
 ///
 /// The lock file has a STABLE path (and thus stable inode) and is NEVER
@@ -1197,6 +1350,10 @@ impl SpawnerBackend for StandaloneBackend {
                 Ok(false)
             }
         }
+    }
+
+    fn stop_tracked_child_sync(&self, process: &SpawnedProcess) -> Result<()> {
+        Self::stop_tracked_child_by_handle_sync(self, process)
     }
 
     fn backend_type(&self) -> &'static str {

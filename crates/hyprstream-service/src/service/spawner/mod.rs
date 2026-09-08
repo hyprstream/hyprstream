@@ -56,7 +56,7 @@ pub use systemd::SystemdBackend;
 
 use std::path::PathBuf;
 
-use hyprstream_rpc::error::Result;
+use hyprstream_rpc::error::{Result, RpcError};
 
 /// Readiness policy for a spawned child process (#1585).
 ///
@@ -277,6 +277,18 @@ pub trait SpawnerBackend: Send + Sync {
 
     /// Check if a process is still running.
     async fn is_running(&self, process: &SpawnedProcess) -> Result<bool>;
+
+    /// Synchronous bounded stop of a TRACKED direct child, used only by the
+    /// launch-transaction guard's `Drop` for cancellation cleanup where no
+    /// async runtime work is guaranteed (#1585). Backends that retain child
+    /// handles override this to stop through the retained handle — never a
+    /// blind by-PID signal; the default fails honestly.
+    fn stop_tracked_child_sync(&self, process: &SpawnedProcess) -> Result<()> {
+        let _ = process;
+        Err(RpcError::InvalidOperation(
+            "backend does not support synchronous tracked-child stop".to_owned(),
+        ))
+    }
 
     /// Get the backend type name.
     fn backend_type(&self) -> &'static str;

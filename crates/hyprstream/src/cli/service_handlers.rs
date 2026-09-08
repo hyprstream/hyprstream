@@ -669,16 +669,181 @@ pub async fn launch_direct_children(
     launch_planned_children(plans, iroh_required, spawner).await
 }
 
+/// Cancellation-safe ownership of the children of a Required launch
+/// transaction (#1585).
+///
+/// Every child that spawns successfully — including children that already
+/// reached READY and were adopted by the backend — is recorded here until the
+/// WHOLE launch commits. If the orchestration future is cancelled (dropped at
+/// any await: a later child's readiness, or a rollback stop), `Drop` runs the
+/// synchronous bounded tracked-child stop
+/// ([`hyprstream_service::ProcessSpawner::stop_tracked_child_sync`]) over the
+/// children it still owns, newest first: the backend stops them through the
+/// retained `Child` handles (never a blind by-PID signal) and removes their
+/// PID artifacts. That cleanup is plain synchronous code on the drop path —
+/// it does not depend on any async cleanup future surviving runtime shutdown.
+/// On whole-launch success [`Self::commit`] disarms the guard so the adopted
+/// daemons intentionally keep running, stoppable as before. Compatibility
+/// launches are never armed: their historical behavior, including a
+/// cancelled launch's historical leak, is unchanged.
+struct RequiredLaunchGuard {
+    started: Vec<(String, hyprstream_service::SpawnedProcess)>,
+    /// Children whose graceful async stop FAILED: still fully owned by the
+    /// guard (a local collection would recreate the ownership-transfer hole
+    /// across the remaining rollback awaits), retried by the synchronous
+    /// bounded pass.
+    failed: Vec<(String, hyprstream_service::SpawnedProcess)>,
+    /// Clone of the launching spawner: the tracked `Child` handles live in
+    /// its backend, so `Drop` cleanup must go through THIS backend to keep
+    /// the stronger tracked ownership.
+    spawner: hyprstream_service::ProcessSpawner,
+    armed: bool,
+    committed: bool,
+}
+
+impl RequiredLaunchGuard {
+    /// Arm only for Required launches; Compatibility ownership stays exactly
+    /// as it was before #1585's transaction guard.
+    fn arm(iroh_required: bool, spawner: &hyprstream_service::ProcessSpawner) -> Self {
+        Self {
+            started: Vec::new(),
+            failed: Vec::new(),
+            spawner: spawner.clone(),
+            armed: iroh_required,
+            committed: false,
+        }
+    }
+
+    /// Record an adopted child under transaction ownership.
+    fn adopt(&mut self, service: String, process: hyprstream_service::SpawnedProcess) {
+        if self.armed {
+            self.started.push((service, process));
+        }
+    }
+
+    /// The newest owned child, without surrendering ownership: the async stop
+    /// below works on cloned metadata, so a cancellation mid-await leaves the
+    /// original owned and the guard's `Drop` responsible for it.
+    fn newest(&self) -> Option<&(String, hyprstream_service::SpawnedProcess)> {
+        self.started.last()
+    }
+
+    /// Surrender ownership of the newest child — ONLY after a CONFIRMED
+    /// successful stop.
+    fn release_newest(&mut self) {
+        self.started.pop();
+    }
+
+    /// Demote the newest child after a FAILED async stop: it stays
+    /// guard-owned (moved into `failed`) so every later rollback await, and
+    /// cancellation during any of them, still leaves it under `Drop` cleanup.
+    fn demote_newest_to_failed(&mut self) {
+        if let Some(entry) = self.started.pop() {
+            self.failed.push(entry);
+        }
+    }
+
+    /// Reverse-order graceful rollback with cancellation-safe ownership: a
+    /// stop that errors demotes the child to guard-owned `failed` state —
+    /// never a local unguarded collection — while confirmed successes are
+    /// released. The `stop` seam is the graceful async stop in production;
+    /// tests inject a controllable boundary.
+    async fn graceful_rollback<S, F>(&mut self, mut stop: S)
+    where
+        S: FnMut(hyprstream_service::SpawnedProcess) -> F,
+        F: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        while let Some((service, process)) = self.newest().cloned() {
+            print!("  \u{25CB} stopping {} after failed launch... ", service);
+            match stop(process).await {
+                Ok(()) => {
+                    println!("\u{2713}");
+                    self.release_newest();
+                }
+                Err(e) => {
+                    println!("\u{2717} {}", e);
+                    self.demote_newest_to_failed();
+                }
+            }
+        }
+    }
+
+    /// Synchronously stop everything still owned — unreleased children and
+    /// failed-stop demotions, newest first — and disarm. Returns one
+    /// residual-report string per child whose bounded stop did not confirm
+    /// termination or whose PID-artifact cleanup failed (the artifact is then
+    /// deliberately retained — it may still name a live process).
+    fn stop_all_sync_and_disarm(&mut self) -> Vec<String> {
+        let mut residuals = Vec::new();
+        // Deterministic reverse-start-order contract across BOTH ownership
+        // collections: failed demotions were appended newest-first during the
+        // async rollback, so they are revisited in insertion order first,
+        // then the still-unattempted started entries in reverse order.
+        let owned = self
+            .failed
+            .iter()
+            .chain(self.started.iter().rev())
+            .collect::<Vec<_>>();
+        for (service, process) in owned {
+            print!("  \u{25CB} stopping {} (synchronous pass)... ", service);
+            match self.spawner.stop_tracked_child_sync(process) {
+                Ok(()) => println!("\u{2713}"),
+                Err(e) => {
+                    println!("\u{2717} {}", e);
+                    residuals.push(format!("{service}: {e}"));
+                    tracing::error!(
+                        service = %service,
+                        error = %e,
+                        "aborted required launch left residual child state; PID artifact retained"
+                    );
+                }
+            }
+        }
+        self.started.clear();
+        self.failed.clear();
+        self.committed = true;
+        residuals
+    }
+
+    /// Mark the whole launch committed: adopted daemons stay intentionally
+    /// alive and the `Drop` path becomes a no-op.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for RequiredLaunchGuard {
+    fn drop(&mut self) {
+        if self.committed
+            || !self.armed
+            || (self.started.is_empty() && self.failed.is_empty())
+        {
+            return;
+        }
+        // Cancellation (task abort at any await — later-child readiness or a
+        // rollback stop) lands here: the synchronous bounded pass is the
+        // cleanup owner of last resort for everything not yet released,
+        // including children demoted to `failed` by earlier stop errors.
+        self.stop_all_sync_and_disarm();
+    }
+}
+
 /// Serially launch pre-built child plans (stage-ordered) with the
 /// required-native readiness contract and reverse-order rollback. Narrow seam
 /// (#1585): plan building is separate so causal tests can inject concrete
 /// children without the real service binary.
+///
+/// Required-native cancellation safety: started children stay owned by the
+/// [`RequiredLaunchGuard`] until the whole launch commits, so a cancelled
+/// future still cleans them through the backend's retained child handles; an
+/// explicit failure rolls back through the graceful async stop first, with
+/// the synchronous tracked-child pass as the accurate-residual fallback.
 async fn launch_planned_children(
     plans: Vec<Vec<(String, hyprstream_service::ProcessConfig)>>,
     iroh_required: bool,
     spawner: &hyprstream_service::ProcessSpawner,
 ) -> Result<()> {
-    let mut started: Vec<(String, hyprstream_service::SpawnedProcess)> = Vec::new();
+    let mut guard = RequiredLaunchGuard::arm(iroh_required, spawner);
     let mut launch_error: Option<anyhow::Error> = None;
 
     'stages: for stage in &plans {
@@ -689,7 +854,7 @@ async fn launch_planned_children(
                 Ok(process) => {
                     info!("Spawned {} service: {:?}", service, process.kind);
                     println!("\u{2713} (pid {:?})", process.pid());
-                    started.push((service.clone(), process));
+                    guard.adopt(service.clone(), process);
                 }
                 Err(e) => {
                     println!("\u{2717} {}", e);
@@ -725,29 +890,32 @@ async fn launch_planned_children(
     if let Some(error) = launch_error {
         if iroh_required {
             // Deterministic rollback: stop what we started, newest first; each
-            // stop removes that child's PID artifact. Rollback failures are
-            // aggregated onto the original launch failure, never silently
-            // dropped — residual live processes must be reported.
-            let mut rollback_failures = Vec::new();
-            for (service, process) in started.iter().rev() {
-                print!("  \u{25CB} stopping {} after failed launch... ", service);
-                match spawner.stop(process).await {
-                    Ok(_) => println!("\u{2713}"),
-                    Err(e) => {
-                        println!("\u{2717} {}", e);
-                        rollback_failures.push(format!("{service}: {e}"));
-                    }
-                }
-            }
-            if !rollback_failures.is_empty() {
+            // stop removes that child's PID artifact. Every child stays
+            // guard-owned until its stop CONFIRMS — a failed stop is demoted
+            // to guard-owned `failed` state, so a cancellation during ANY of
+            // these awaits (or the synchronous pass) still cleans everything
+            // unconfirmed through the guard's `Drop`.
+            guard
+                .graceful_rollback(|process| async move {
+                    spawner.stop(&process).await.map_err(anyhow::Error::from)
+                })
+                .await;
+            // Synchronous bounded pass over guard-owned state: retries failed
+            // stops and sweeps unreleased children. Only children whose
+            // bounded stop did not confirm termination (or whose PID-artifact
+            // cleanup failed) are residual — reported honestly, never
+            // silently dropped.
+            let residuals = guard.stop_all_sync_and_disarm();
+            if !residuals.is_empty() {
                 return Err(error.context(format!(
                     "launch rollback left residual state: {}",
-                    rollback_failures.join("; ")
+                    residuals.join("; ")
                 )));
             }
         }
         return Err(error);
     }
+    guard.commit();
     Ok(())
 }
 
@@ -2734,6 +2902,454 @@ mod launcher_tests {
             !hyprstream_rpc::paths::service_pid_file(&stage2sentinel).exists(),
             "sentinel must publish no PID file"
         );
+        Ok(())
+    }
+
+    /// Cancellation while a later Required child is pending must retain
+    /// cleanup ownership of the already-adopted READY children: aborting the
+    /// orchestration future (the real cancellation boundary — `BootstrapManager::drop`
+    /// aborts this exact task shape) reaps the adopted child through the
+    /// backend's retained handle and removes its PID artifact. The later
+    /// child is proven genuinely pending: its marker proves it spawned (so
+    /// the first child was adopted), and it never sends READY.
+    #[tokio::test]
+    async fn required_cancellation_reaps_adopted_children_and_artifacts() -> anyhow::Result<()> {
+        use hyprstream_service::{ProcessConfig, ProcessReadiness, ProcessSpawner};
+        #[allow(unused_imports)]
+        use ProcessReadiness as _ProcessReadinessMarker;
+
+        const HELPER: &str = "HYPRSTREAM_LAUNCHER_CANCEL_HELPER";
+        const PENDING: &str = "HYPRSTREAM_LAUNCHER_CANCEL_PENDING";
+
+        // Helper child: writes its PID marker first; the READY variant then
+        // sends READY and stays alive, the pending variant never sends READY.
+        if let Some(path) = std::env::var_os(HELPER) {
+            std::fs::write(&path, std::process::id().to_string())?;
+            if std::env::var_os(PENDING).is_none() {
+                hyprstream_rpc::notify::ready()?;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return Ok(());
+        }
+
+        let exe = std::env::current_exe()?;
+        let dir = tempfile::tempdir()?;
+        let unique = std::process::id();
+        let ready_name = format!("cancel-ready-{unique}");
+        let pending_name = format!("cancel-pending-{unique}");
+        let marker = |name: &str| dir.path().join(format!("{name}.marker"));
+        let marker_pid = |path: &Path| -> anyhow::Result<u32> {
+            std::fs::read_to_string(path)?
+                .trim()
+                .parse::<u32>()
+                .context("marker must hold the child pid")
+        };
+        let assert_reaped = |pid: u32| {
+            let gone = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                None,
+            )
+            .is_err_and(|e| e == nix::errno::Errno::ESRCH);
+            assert!(gone, "cancelled child pid {pid} must be genuinely reaped");
+        };
+        let helper_cfg = |name: &str, pending: bool| {
+            let mut config = ProcessConfig::new(name, &exe)
+                .args([
+                    "--exact",
+                    "cli::service_handlers::launcher_tests::required_cancellation_reaps_adopted_children_and_artifacts",
+                    "--nocapture",
+                ])
+                .env(HELPER, marker(name).display().to_string())
+                .with_notify_ready(std::time::Duration::from_secs(30));
+            if pending {
+                config = config.env(PENDING, "1");
+            }
+            config
+        };
+        let plans = vec![vec![
+            (ready_name.clone(), helper_cfg(&ready_name, false)),
+            (pending_name.clone(), helper_cfg(&pending_name, true)),
+        ]];
+
+        // The spawner lives inside the task exactly as in production
+        // (`handle_service_start` owns it), so cancellation also drops the
+        // backend while the guard's synchronous cleanup runs.
+        let task = tokio::spawn(async move {
+            let spawner = ProcessSpawner::standalone();
+            launch_planned_children(plans, true, &spawner).await
+        });
+
+        // Bounded wait for the cancellation point: the pending child's
+        // marker proves the launcher adopted the READY first child and is
+        // now awaiting the second child's readiness.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !marker(&ready_name).exists() || !marker(&pending_name).exists() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "launch never reached the pending second child"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        task.abort();
+        let joined = task.await;
+        assert!(
+            matches!(&joined, Err(join) if join.is_cancelled()),
+            "the orchestration future must have been cancelled, got: {joined:?}"
+        );
+
+        // Both children reaped (ESRCH — observed termination, not an
+        // artifact absence) and no PID artifacts remain: the adopted READY
+        // child through the transaction guard's synchronous tracked-child
+        // pass, the pending child through its own armed startup guard.
+        assert_reaped(marker_pid(&marker(&ready_name))?);
+        assert_reaped(marker_pid(&marker(&pending_name))?);
+        assert!(
+            !hyprstream_rpc::paths::service_pid_file(&ready_name).exists(),
+            "cancelled READY child must leave no PID artifact"
+        );
+        assert!(
+            !hyprstream_rpc::paths::service_pid_file(&pending_name).exists(),
+            "cancelled pending child must leave no PID artifact"
+        );
+        Ok(())
+    }
+
+    /// Whole-launch success must disarm the transaction guard: adopted
+    /// daemons intentionally survive — both a normal launcher/spawner drop
+    /// and later `stop` through the established contract. (Pair A proves
+    /// stoppability through the launching backend's tracked stop; pair C is
+    /// dropped with its spawner and must still be running afterwards.)
+    #[tokio::test]
+    async fn required_success_commit_leaves_adopted_daemons_alive_and_stoppable()
+    -> anyhow::Result<()> {
+        use hyprstream_service::{
+            ProcessConfig, ProcessKind, ProcessReadiness, ProcessSpawner, SpawnedProcess,
+        };
+        #[allow(unused_imports)]
+        use ProcessReadiness as _ProcessReadinessMarker;
+
+        const HELPER: &str = "HYPRSTREAM_LAUNCHER_COMMIT_HELPER";
+
+        if let Some(path) = std::env::var_os(HELPER) {
+            std::fs::write(&path, std::process::id().to_string())?;
+            hyprstream_rpc::notify::ready()?;
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return Ok(());
+        }
+
+        let exe = std::env::current_exe()?;
+        let dir = tempfile::tempdir()?;
+        let unique = std::process::id();
+        let marker = |name: &str| dir.path().join(format!("{name}.marker"));
+        let marker_pid = |path: &Path| -> anyhow::Result<u32> {
+            std::fs::read_to_string(path)?
+                .trim()
+                .parse::<u32>()
+                .context("marker must hold the child pid")
+        };
+        let alive = |pid: u32| {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+        };
+        let helper_cfg = |name: &str| {
+            ProcessConfig::new(name, &exe)
+                .args([
+                    "--exact",
+                    "cli::service_handlers::launcher_tests::required_success_commit_leaves_adopted_daemons_alive_and_stoppable",
+                    "--nocapture",
+                ])
+                .env(HELPER, marker(name).display().to_string())
+                .with_notify_ready(std::time::Duration::from_secs(30))
+        };
+
+        // Pair A: committed, then stopped through the launching backend.
+        let spawner = ProcessSpawner::standalone();
+        let a = format!("commit-a-{unique}");
+        let b = format!("commit-b-{unique}");
+        launch_planned_children(
+            vec![vec![(a.clone(), helper_cfg(&a)), (b.clone(), helper_cfg(&b))]],
+            true,
+            &spawner,
+        )
+        .await
+        .expect("whole-launch success must commit");
+        // Bounded wait until both helpers recorded their PIDs (the launch
+        // only returns after both are READY, so the markers already exist).
+        for name in [&a, &b] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !marker(name).exists() {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "committed child {name} never recorded its PID"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        // Stop through the launching backend's established tracked contract.
+        for (name, pid) in [(&a, marker_pid(&marker(&a))?), (&b, marker_pid(&marker(&b))?)] {
+            assert!(alive(pid), "committed daemon {name} must still be running");
+            let meta = SpawnedProcess::new(format!("{name}-{pid}"), ProcessKind::Direct(pid))
+                .with_pid_file(hyprstream_rpc::paths::service_pid_file(name));
+            spawner
+                .stop(&meta)
+                .await
+                .expect("committed daemon must remain stoppable");
+            assert!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None)
+                    .is_err_and(|e| e == nix::errno::Errno::ESRCH),
+                "stopped committed daemon {name} must be reaped"
+            );
+            assert!(
+                !hyprstream_rpc::paths::service_pid_file(name).exists(),
+                "stopped committed daemon {name} must leave no PID artifact"
+            );
+        }
+
+        // Pair C: committed, then the launching spawner is dropped normally —
+        // the adopted daemons must survive it (kill_on_drop stays false).
+        let c = format!("commit-c-{unique}");
+        let d = format!("commit-d-{unique}");
+        let drop_spawner = ProcessSpawner::standalone();
+        launch_planned_children(
+            vec![vec![(c.clone(), helper_cfg(&c)), (d.clone(), helper_cfg(&d))]],
+            true,
+            &drop_spawner,
+        )
+        .await
+        .expect("whole-launch success must commit");
+        let dropped_pids = [marker_pid(&marker(&c))?, marker_pid(&marker(&d))?];
+        drop(drop_spawner);
+        for (name, pid) in [(&c, dropped_pids[0]), (&d, dropped_pids[1])] {
+            assert!(
+                alive(pid),
+                "committed daemon {name} must survive a normal launcher drop"
+            );
+        }
+        // Fixture hygiene: reap the surviving pair directly (the test is the
+        // parent); not a product-contract assertion.
+        for pid in dropped_pids {
+            let raw = nix::unistd::Pid::from_raw(pid as i32);
+            let _ = nix::sys::signal::kill(raw, nix::sys::signal::Signal::SIGKILL);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match nix::sys::wait::waitpid(raw, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                    Ok(status) if status != nix::sys::wait::WaitStatus::StillAlive => break,
+                    Err(_) => break,
+                    Ok(_) => {}
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "fixture child {pid} could not be reaped"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        Ok(())
+    }
+
+    /// Cancellation DURING the explicit rollback awaits still cleans owned
+    /// children. The abort is issued as soon as the READY predecessor is
+    /// observed, so it lands somewhere between the later child's startup and
+    /// the rollback stop — the exact landing point is not deterministic, and
+    /// the OWNERSHIP INVARIANT is what is tested: at every landing, the
+    /// predecessor is either stopped by the graceful async rollback or still
+    /// owned by the guard, whose `Drop` synchronously stops it through the
+    /// backend's retained handle.
+    #[tokio::test]
+    async fn required_cancellation_during_rollback_still_cleans_owned_children()
+    -> anyhow::Result<()> {
+        use hyprstream_service::{ProcessConfig, ProcessReadiness, ProcessSpawner};
+        #[allow(unused_imports)]
+        use ProcessReadiness as _ProcessReadinessMarker;
+
+        const HELPER: &str = "HYPRSTREAM_LAUNCHER_CANCEL_ROLLBACK_HELPER";
+
+        if let Some(path) = std::env::var_os(HELPER) {
+            std::fs::write(&path, std::process::id().to_string())?;
+            hyprstream_rpc::notify::ready()?;
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return Ok(());
+        }
+
+        let exe = std::env::current_exe()?;
+        let dir = tempfile::tempdir()?;
+        let unique = std::process::id();
+        let ready_name = format!("cancel-rollback-ready-{unique}");
+        let fail_name = format!("cancel-rollback-fail-{unique}");
+        let marker = dir.path().join(format!("{ready_name}.marker"));
+        let marker_pid = |path: &Path| -> anyhow::Result<u32> {
+            std::fs::read_to_string(path)?
+                .trim()
+                .parse::<u32>()
+                .context("marker must hold the child pid")
+        };
+
+        let plans = vec![vec![
+            (
+                ready_name.clone(),
+                ProcessConfig::new(&ready_name, &exe)
+                    .args([
+                        "--exact",
+                        "cli::service_handlers::launcher_tests::required_cancellation_during_rollback_still_cleans_owned_children",
+                        "--nocapture",
+                    ])
+                    .env(HELPER, marker.display().to_string())
+                    .with_notify_ready(std::time::Duration::from_secs(30)),
+            ),
+            (
+                fail_name.clone(),
+                ProcessConfig::new(&fail_name, Path::new("/bin/sh"))
+                    .args(["-c", "exit 7"])
+                    .with_notify_ready(std::time::Duration::from_secs(10)),
+            ),
+        ]];
+
+        let task = tokio::spawn(async move {
+            let spawner = ProcessSpawner::standalone();
+            launch_planned_children(plans, true, &spawner).await
+        });
+
+        // Abort as soon as the predecessor is READY-observed (marker before
+        // READY, so the launcher has at least adopted it and is at or past
+        // the failing child's startup).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !marker.exists() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "READY predecessor never recorded its PID"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        task.abort();
+        let joined = task.await;
+        // Either the future was cancelled (cancellation cleanup ran) or the
+        // rollback completed before the abort landed (explicit-failure
+        // rollback ran) — both paths must end with the predecessor cleaned.
+        match &joined {
+            Err(join) => assert!(join.is_cancelled(), "unexpected join error: {join:?}"),
+            Ok(Err(error)) => assert!(
+                error.to_string().contains("exited during startup"),
+                "completed rollback must carry the launch error, got: {error}"
+            ),
+            Ok(Ok(())) => panic!("a required launch with a failing child must not succeed"),
+        }
+        let pid = marker_pid(&marker)?;
+        let gone = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None)
+            .is_err_and(|e| e == nix::errno::Errno::ESRCH);
+        assert!(gone, "predecessor pid {pid} must be cleaned at every landing point");
+        assert!(
+            !hyprstream_rpc::paths::service_pid_file(&ready_name).exists(),
+            "predecessor must leave no PID artifact"
+        );
+        Ok(())
+    }
+
+    /// Rollback ownership-boundary regression (root-requested): a stop that
+    /// FAILS must leave its child guard-owned — never moved into a local
+    /// unguarded collection — and a cancellation while a LATER stop is still
+    /// PENDING must attempt synchronous cleanup of BOTH. The failure/pending
+    /// boundary is injected at the narrow `graceful_rollback` stop seam; the
+    /// two children are REAL spawned processes, so ownership and cleanup are
+    /// evidenced by observed reaps (ESRCH) and PID-artifact removal.
+    #[tokio::test]
+    async fn rollback_failed_and_pending_stops_stay_guard_owned_through_cancellation()
+    -> anyhow::Result<()> {
+        use hyprstream_service::{ProcessConfig, ProcessSpawner};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const HELPER: &str = "HYPRSTREAM_LAUNCHER_RBOWN_HELPER";
+
+        if let Some(path) = std::env::var_os(HELPER) {
+            std::fs::write(&path, std::process::id().to_string())?;
+            hyprstream_rpc::notify::ready()?;
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return Ok(());
+        }
+
+        let exe = std::env::current_exe()?;
+        let dir = tempfile::tempdir()?;
+        let unique = std::process::id();
+        let older = format!("rbown-older-{unique}");
+        let newer = format!("rbown-newer-{unique}");
+        let marker = |name: &str| dir.path().join(format!("{name}.marker"));
+        let marker_pid = |path: &Path| -> anyhow::Result<u32> {
+            std::fs::read_to_string(path)?
+                .trim()
+                .parse::<u32>()
+                .context("marker must hold the child pid")
+        };
+        let assert_reaped = |pid: u32| {
+            let gone = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                None,
+            )
+            .is_err_and(|e| e == nix::errno::Errno::ESRCH);
+            assert!(gone, "guard-owned child pid {pid} must be genuinely reaped");
+        };
+        let helper_cfg = |name: &str| {
+            ProcessConfig::new(name, &exe)
+                .args([
+                    "--exact",
+                    "cli::service_handlers::launcher_tests::rollback_failed_and_pending_stops_stay_guard_owned_through_cancellation",
+                    "--nocapture",
+                ])
+                .env(HELPER, marker(name).display().to_string())
+                .with_notify_ready(std::time::Duration::from_secs(30))
+        };
+
+        let spawner = ProcessSpawner::standalone();
+        let mut guard = RequiredLaunchGuard::arm(true, &spawner);
+        // Real adoption, start order older → newer; the rollback walks
+        // newest first, so the NEWER child hits the injected failed stop and
+        // the OLDER child the injected pending stop.
+        for name in [&older, &newer] {
+            let process = spawner.spawn(helper_cfg(name)).await?;
+            guard.adopt(name.to_owned(), process);
+        }
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let calls_task = calls.clone();
+        let task = tokio::spawn(async move {
+            guard
+                .graceful_rollback(move |_process| {
+                    let call = calls_task.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if call == 0 {
+                            Err(anyhow::anyhow!("injected stop failure"))
+                        } else {
+                            // Pending forever: only the task abort below
+                            // ends this await.
+                            std::future::pending::<()>().await;
+                            Ok(())
+                        }
+                    }
+                })
+                .await;
+            // Unreachable under the abort; the guard's Drop owns cleanup.
+        });
+
+        // Bounded grace so the rollback reaches the pending second stop;
+        // then cancel — the real cancellation boundary this correction is
+        // about (an earlier landing still cleans both: every unconfirmed
+        // child is guard-owned at every point).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        task.abort();
+        let joined = task.await;
+        assert!(
+            matches!(&joined, Err(join) if join.is_cancelled()),
+            "the rollback future must have been cancelled, got: {joined:?}"
+        );
+
+        // BOTH children — the failed-stop one and the pending-stop one — are
+        // reaped with their PID artifacts removed by the guard's synchronous
+        // pass through the backend's retained handles.
+        assert_reaped(marker_pid(&marker(&newer))?);
+        assert_reaped(marker_pid(&marker(&older))?);
+        for name in [&older, &newer] {
+            assert!(
+                !hyprstream_rpc::paths::service_pid_file(name).exists(),
+                "cancelled rollback child {name} must leave no PID artifact"
+            );
+        }
         Ok(())
     }
 
