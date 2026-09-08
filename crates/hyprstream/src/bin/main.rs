@@ -1557,6 +1557,49 @@ fn resolve_moq_relay_reach(
         .ok_or_else(|| anyhow::anyhow!("relay URI is not a network-routable transport"))
 }
 
+/// Select the process identity before constructing any resolver/client. Transport
+/// flags do not decide whose identity a required-native split service uses.
+fn native_service_process_name(matches: &clap::ArgMatches, config: &HyprConfig) -> Result<Option<String>> {
+    if !config.quic.iroh_required() {
+        return Ok(None);
+    }
+    let Some(("service", service_matches)) = matches.subcommand() else {
+        return Ok(None);
+    };
+    let action = ServiceAction::from_arg_matches(service_matches)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let ServiceAction::Start { name, foreground, standalone, services, .. } = action else {
+        return Ok(None);
+    };
+    if !foreground && !standalone {
+        return Ok(None);
+    }
+    let names = if standalone {
+        config.services.startup.clone()
+    } else {
+        services.unwrap_or_else(|| name.into_iter().collect())
+    };
+    anyhow::ensure!(names.len() == 1,
+        "network-iroh-required requires exactly one service per foreground process; launch each provisioned service separately");
+    let service = names.into_iter().next().context("native service name missing")?;
+    anyhow::ensure!(hyprstream_service::get_factory(&service).is_some(), "unknown native service: {service}");
+    Ok(Some(service))
+}
+
+/// Required service startup consumes the provisioner's retained key. Missing or
+/// malformed material is never a reason to generate a new identity or use the
+/// CLI/root key. Compatibility commands retain their existing key behavior.
+async fn load_process_signing_key(config: &HyprConfig, native_service: Option<&str>) -> Result<SigningKey> {
+    if let Some(service) = native_service {
+        let secrets = HyprConfig::resolve_secrets_dir_for(Some(config))?;
+        return hyprstream_core::auth::identity_store::load_existing_service_signing_key(
+            &secrets, service, hyprstream_core::auth::identity_store::SecretsProfile::from_env()?,
+        ).with_context(|| format!("load provisioned native identity for {service}"));
+    }
+    let keys_dir = config.models_dir().join(".registry").join("keys");
+    load_or_generate_signing_key(&keys_dir).await
+}
+
 /// A QUIC process currently owns one native MoQ dialer and its admission-proof
 /// slot. Sharing that slot across separately checkpointed services would make a
 /// later service dial as the first service's DID. Refuse that topology until the
@@ -1671,7 +1714,7 @@ async fn install_process_production_resolver(
     //
     // Scoped to this node's OWN service identities. External classical clients
     // and federated peers do not appear in this file and are not affected.
-    if let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir() {
+    if let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir_for(Some(config)) {
         let entries =
             hyprstream_core::auth::identity_store::load_bootstrap_pubkeys_hybrid(&secrets_dir)?;
         hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries)?;
@@ -2852,6 +2895,8 @@ fn main() -> Result<()> {
         }
     }
 
+    let native_service_name = native_service_process_name(&matches, &config)?;
+
     // Start registry service ONCE at CLI level
     let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2866,8 +2911,7 @@ fn main() -> Result<()> {
         bool,
     ) = _registry_runtime
         .block_on(async {
-            let keys_dir = config.models_dir().join(".registry").join("keys");
-            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+            let signing_key = load_process_signing_key(&config, native_service_name.as_deref()).await?;
             let verifying_key = signing_key.verifying_key();
 
             let is_os_owned_bootstrap = install_process_production_resolver(&signing_key, &config).await
@@ -2983,6 +3027,10 @@ fn main() -> Result<()> {
                             }
                         };
 
+                        // --services with one member selects that service's identity,
+                        // never the synthetic "multi"/"standalone" command label.
+                        let name = native_service_name.clone().unwrap_or(name);
+
                         // Standard foreground service startup
                         let rpc_mode = if ipc {
                             hyprstream_rpc::registry::EndpointMode::Ipc
@@ -3019,8 +3067,12 @@ fn main() -> Result<()> {
 
                                 let models_dir = config.models_dir();
                                 let keys_dir = models_dir.join(".registry").join("keys");
-                                let signing_key =
-                                    load_or_generate_signing_key(&keys_dir).await?;
+                                let signing_key = if native_service_name.is_some() {
+                                    // Same retained key already installed in the process resolver.
+                                    signing_key.clone()
+                                } else {
+                                    load_or_generate_signing_key(&keys_dir).await?
+                                };
                                 let verifying_key = signing_key.verifying_key();
 
                                 let fed_src: Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
@@ -3058,8 +3110,8 @@ fn main() -> Result<()> {
                                     vec![name.clone()]
                                 };
 
-                                if ipc {
-                                    // Multi-process mode: each service gets its own independent key.
+                                if ipc || native_service_name.is_some() {
+                                    // Split-service identity is independent of local IPC transport.
                                     //
                                     // #759: resolve via the SAME authoritative path
                                     // `HyprConfig::resolve_secrets_dir()` uses elsewhere in this
@@ -3072,7 +3124,7 @@ fn main() -> Result<()> {
                                     // than this process reads from — the same "consumer silently
                                     // re-derives instead of reading the authoritative record"
                                     // disease #441 targets, just one directory earlier.
-                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
                                     ctx = ctx.with_ca_verifying_key(
                                         hyprstream_core::auth::identity_store::load_ca_verifying_key(
                                             &secrets_dir,
@@ -3116,9 +3168,13 @@ fn main() -> Result<()> {
                                     // secrets profile — see `resolve_service_signing_key` for why.
                                     let secrets_profile =
                                         hyprstream_core::auth::identity_store::SecretsProfile::from_env()?;
-                                    let own_key = hyprstream_core::auth::identity_store::resolve_service_signing_key(
-                                        &secrets_dir, &name, secrets_profile,
-                                    )?;
+                                    let own_key = if native_service_name.is_some() {
+                                        signing_key.clone()
+                                    } else {
+                                        hyprstream_core::auth::identity_store::resolve_service_signing_key(
+                                            &secrets_dir, &name, secrets_profile,
+                                        )?
+                                    };
 
                                     if name == "policy" {
                                         // PolicyService: signing_key IS the CA key (already loaded).
@@ -3159,7 +3215,7 @@ fn main() -> Result<()> {
                                     //
                                     // #759: same authoritative resolver as the `--ipc` branch above —
                                     // see the comment there.
-                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
                                     ctx = ctx.with_ca_verifying_key(
                                         hyprstream_core::auth::identity_store::load_ca_verifying_key(
                                             &secrets_dir,
@@ -3251,7 +3307,7 @@ fn main() -> Result<()> {
                                 // no manifest-backed clearance.
                                 {
                                     let secrets_dir =
-                                        hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
+                                        hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
                                     match hyprstream_core::auth::service_enrollment::ServiceEnrollmentManifest::load_and_validate(&secrets_dir)
                                         .context("service enrollment manifest validation failed")?
                                     {
@@ -3474,7 +3530,7 @@ fn main() -> Result<()> {
 
                                 // Populate ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
                                 {
-                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
                                     let ml_dsa_store = hyprstream_core::auth::key_rotation::global_ml_dsa_key_store(
                                         &secrets_dir,
                                         &config.oauth,
@@ -4064,6 +4120,92 @@ mod resolver_startup_controls {
             vec!["hyprstream", "pds", "inspect-services", "--service", "model", "--valid-for-seconds", "86400"],
             vec!["hyprstream", "pds", "inspect-services", "--service", "model", "--roster-export", "out.json"],
         ] { assert!(super::build_cli().try_get_matches_from(args).is_err()); }
+    }
+
+    #[test]
+    fn native_service_identity_loads_existing_key_without_ipc() -> anyhow::Result<()> {
+        const CHILD: &str = "HYPRSTREAM_NATIVE_SERVICE_IDENTITY_TEST";
+        let Ok(profile) = std::env::var(CHILD) else {
+            for profile in ["shared-directory", "per-service-scoped"] {
+                let status = std::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", "resolver_startup_controls::native_service_identity_loads_existing_key_without_ipc", "--nocapture"])
+                    .env(CHILD, profile)
+                    .env("HYPRSTREAM_SECRETS_PROFILE", profile)
+                    .env_remove("HYPRSTREAM__SECRETS__PATH")
+                    .env_remove("HYPRSTREAM__SIGNING_KEY")
+                    .status()?;
+                anyhow::ensure!(status.success(), "isolated {profile} identity regression failed");
+            }
+            return Ok(());
+        };
+        let root = tempfile::tempdir()?;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        for (service, seed) in [("policy", 31u8), ("model", 32u8), ("registry", 33u8)] {
+            let secrets = root.path().join(format!("{service}-credentials"));
+            std::fs::create_dir_all(secrets.join(service))?;
+            let key_path = if service == "policy" || profile == "per-service-scoped" {
+                // A misleading service subdirectory must not replace a scoped
+                // identity, especially Policy's canonical flat key.
+                std::fs::write(secrets.join(service).join("signing-key"), [99u8; 32])?;
+                secrets.join("signing-key")
+            } else {
+                // A retained root/Policy key must not become a native Model or
+                // Registry process identity merely because --ipc is absent.
+                std::fs::write(secrets.join("signing-key"), [31u8; 32])?;
+                secrets.join(service).join("signing-key")
+            };
+            std::fs::write(&key_path, [seed; 32])?;
+            let mut configured = super::HyprConfig::default();
+            configured.quic.native_network_profile = hyprstream_core::config::NativeNetworkProfile::NetworkIrohRequired;
+            configured.secrets.path = Some(secrets.clone());
+            configured.storage.models_dir = root.path().join(format!("{service}-models"));
+            let config_path = root.path().join(format!("{service}.toml"));
+            configured.to_file(&config_path)?;
+            let matches = super::build_cli().try_get_matches_from([
+                "hyprstream", "--config", config_path.to_str().expect("temporary UTF-8 path"),
+                "service", "start", service, "--foreground",
+            ])?;
+            let config = super::load_config(matches.get_one::<std::path::PathBuf>("config").map(std::path::PathBuf::as_path))?;
+            let selected = super::native_service_process_name(&matches, &config)?;
+            assert_eq!(selected.as_deref(), Some(service));
+            let key = runtime.block_on(super::load_process_signing_key(&config, selected.as_deref()))?;
+            assert_eq!(key.to_bytes(), [seed; 32]);
+            let ctx = super::ServiceContext::new(key.clone(), key.verifying_key(), false, config.models_dir().clone())
+                .with_service_key(service, key.clone());
+            assert_eq!(ctx.signing_key().verifying_key(), key.verifying_key());
+            assert_eq!(ctx.service_signing_key(service).verifying_key(), key.verifying_key());
+            assert!(!config.models_dir().join(".registry/keys").exists(), "native startup must not materialize a CLI/root key");
+            std::fs::remove_file(&key_path)?;
+            assert!(runtime.block_on(super::load_process_signing_key(&config, selected.as_deref())).is_err());
+            assert!(!key_path.exists(), "missing provisioned key must not be regenerated");
+            std::fs::write(&key_path, [seed; 31])?;
+            assert!(runtime.block_on(super::load_process_signing_key(&config, selected.as_deref())).is_err());
+            assert_eq!(std::fs::read(&key_path)?, vec![seed; 31], "malformed key must not be repaired during startup");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_service_identity_rejects_multi_and_selects_single_service_list() -> anyhow::Result<()> {
+        let mut config = super::HyprConfig::default();
+        config.quic.native_network_profile = hyprstream_core::config::NativeNetworkProfile::NetworkIrohRequired;
+        let single = super::build_cli().try_get_matches_from([
+            "hyprstream", "service", "start", "--foreground", "--services", "model",
+        ])?;
+        assert_eq!(super::native_service_process_name(&single, &config)?.as_deref(), Some("model"));
+        let multi = super::build_cli().try_get_matches_from([
+            "hyprstream", "service", "start", "--foreground", "--services", "model,registry",
+        ])?;
+        assert!(super::native_service_process_name(&multi, &config).is_err());
+        let standalone = super::build_cli().try_get_matches_from([
+            "hyprstream", "service", "start", "--standalone",
+        ])?;
+        config.services.startup = vec!["model".into(), "registry".into()];
+        assert!(super::native_service_process_name(&standalone, &config).is_err());
+        config.quic.native_network_profile = hyprstream_core::config::NativeNetworkProfile::Compatibility;
+        assert_eq!(super::native_service_process_name(&multi, &config)?, None);
+        assert_eq!(super::native_service_process_name(&single, &config)?, None);
+        Ok(())
     }
 
     #[test]
