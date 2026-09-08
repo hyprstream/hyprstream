@@ -121,8 +121,14 @@ annotation dispatchPublic(field) :Text;
 # session or subscription state: authorization and effect semantics are
 # separate axes. The closed values are:
 #   naturally-idempotent       — retry-safe with no extra mechanism
-#   idempotency-key-required   — payload carries an application idempotency key
-#   transaction-ledger-required — atomic ledger/fencing is required before retry
+#   idempotency-key-required   — REQUIRED PREREQUISITE: before retry is
+#                                enabled, the payload must carry a caller
+#                                application idempotency key and the result
+#                                must be durably recorded per key
+#   transaction-ledger-required — REQUIRED PREREQUISITE: retry safety
+#                                requires a separately claimed
+#                                exactly-once-visible contract with atomic
+#                                commit/fencing
 # The latter two declare required activation work; the annotation does not claim
 # that a key or ledger has already been implemented.
 annotation mutationSemantics(field) :Text;

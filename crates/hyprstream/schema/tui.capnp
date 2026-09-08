@@ -179,9 +179,11 @@ struct TuiRequest {
     # Poll for stdin bytes queued for this viewer (alternative to ZMQ SUB relay).
     # Returns all bytes received since the last poll, concatenated. The poll
     # DRAINS the viewer's queue (pop_front), so a lost reply consumes bytes a
-    # retry cannot redeliver: at-most-once delivery requires an atomic result
-    # ledger or fencing. None is implemented here — this records the required
-    # semantics, not an existing mechanism.
+    # retry cannot redeliver. The required guarantee is retry-safe delivery of
+    # the exact drained result — dequeue plus recorded result committed
+    # atomically or equivalently fenced (exactly-once-visible behavior); bare
+    # at-most-once delivery would still permit loss. No such mechanism is
+    # implemented — this records the required contract, not an existing one.
     pollStdin @14 :UInt32  # viewer_id
       $scope(query) $mutationSemantics("transaction-ledger-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Poll for stdin bytes queued for this viewer");
 

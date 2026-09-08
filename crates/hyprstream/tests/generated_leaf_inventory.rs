@@ -344,7 +344,8 @@ fn tui_mutation_policies_are_explicit_and_handler_accurate() {
 /// backend (a replayed non-SELECT re-applies its write) — a generic
 /// caller-directed effect, like mcp.callTool or container.exec. Both are
 /// read-class authorization declaring the caller-key/result-record
-/// requirement (v16 §4.8); no key/result-record machinery exists, and
+/// requirement (v16 §4.8); no enforcement consumes these declarations at
+/// this head, and
 /// restricting execution to read-only SQL is separate enforcement work
 /// deliberately not attempted in this annotation.
 #[test]
@@ -385,7 +386,7 @@ fn metrics_effectful_query_leaves_declare_required_key_semantics() {
 /// requires the same, matching its already-keyed stream twin.
 /// Handler-accurate naturals (fixed-path writes, consuming writebacks,
 /// convergent sessions, pure compute) are pinned so the classification stays
-/// handler-accurate. No key/result-record machinery exists.
+/// handler-accurate. No enforcement consumes these declarations at this head.
 #[test]
 fn inference_lora_and_stream_effects_declare_required_semantics() {
     use policy::MutationSemantics;
@@ -436,7 +437,7 @@ fn inference_lora_and_stream_effects_declare_required_semantics() {
 
 /// Model-scoped proxies inherit the callee's classification: `ttt.init`
 /// proxies inference createLora and `adapter.load` proxies inference
-/// loadLora (both ledger), and `ttt.train` proxies inference trainStep
+/// loadLora (both key-required), and `ttt.train` proxies inference trainStep
 /// (keyed, matching `ttt.trainStream`). The consuming/convergent proxies
 /// (`ttt.writeback`, `ttt.evict`, `ttt.zero`) stay natural.
 #[test]

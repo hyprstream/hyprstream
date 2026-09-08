@@ -56,17 +56,25 @@ pub const fn dispatch_label(level: Level, assurance: Assurance, bits: &[u32]) ->
 pub const READ_CLASS_ACTIONS: &[&str] = &["query", "subscribe"];
 
 /// The generated application policy a mutating method declares (v16 §4.8) —
-/// distinct from request-proof replay admission.
+/// distinct from request-proof replay admission. The declaration metadata
+/// describes each method's retry semantics or activation prerequisite; the
+/// annotation itself does not implement enforcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationSemantics {
     /// Retrying the method with the same intent is safe without extra
     /// machinery.
     NaturallyIdempotent,
-    /// The method's payload carries an application idempotency key; the
-    /// idempotency/result ledger returns the recorded result on retry.
+    /// Activation prerequisite: before retry is enabled for the method, its
+    /// payload must carry a caller application idempotency key and the
+    /// service must durably bind that key to the recorded result so the
+    /// retry returns it. This declaration does not establish that the
+    /// key/result mechanism exists; activation must verify the method
+    /// implementation.
     IdempotencyKeyRequired,
-    /// Exactly-once-visible behavior is claimed; the mutation commits with
-    /// the ledger in one transaction or equivalent fencing protocol.
+    /// Reserved for a separately claimed exactly-once-visible contract: the
+    /// mutation commits with the ledger in one transaction or an equivalent
+    /// fencing protocol. The declaration is metadata; the claimed contract
+    /// must exist per method before this label is used.
     TransactionLedgerRequired,
 }
 
