@@ -3240,6 +3240,126 @@ mod tests {
         Ok(())
     }
 
+    /// Build a `HyprConfig` from a private env-source map with the OAuth CORS
+    /// list at `origins`, never mutating the test process environment.
+    fn cors_cfg_from_env(origins: &str) -> anyhow::Result<HyprConfig> {
+        let source = [
+            ("HYPRSTREAM__OAUTH__CORS__ALLOWED_ORIGINS", origins),
+            ("HYPRSTREAM__OAUTH__CORS__ENABLED", "true"),
+            ("HYPRSTREAM__OAUTH__CORS__ALLOW_CREDENTIALS", "true"),
+            ("HYPRSTREAM__OAUTH__CORS__PERMISSIVE_HEADERS", "false"),
+            ("HYPRSTREAM__OAUTH__EXTERNAL_URL", "https://discovery.staging.lab.hyprstream.com"),
+            ("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        Ok(config::Config::builder()
+            .add_source(config::Config::try_from(&HyprConfig::default())?)
+            .add_source(HyprConfig::environment_source().source(Some(source)))
+            .build()?
+            .try_deserialize()?)
+    }
+
+    /// Drive the real `cors_layer` middleware with an `Origin` request and
+    /// return the `(access-control-allow-origin, access-control-allow-credentials)`
+    /// header values it emits.
+    async fn cors_probe(cfg: &HyprConfig, origin: &str) -> anyhow::Result<(Option<String>, Option<String>)> {
+        use axum::{body::Body, http::{header, Request}, routing::get, Router};
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .layer(crate::server::middleware::cors_layer(&cfg.oauth.cors));
+        let response = app
+            .oneshot(Request::builder()
+                .uri("/probe")
+                .header(header::ORIGIN, origin)
+                .body(Body::empty())?)
+            .await?;
+        let header_str = |name: header::HeaderName| {
+            response.headers().get(name).and_then(|value| value.to_str().ok()).map(str::to_owned)
+        };
+        Ok((
+            header_str(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            header_str(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+        ))
+    }
+
+    #[tokio::test]
+    async fn oauth_cors_env_empty_whitespace_or_separator_only_falls_back_to_localhost() -> anyhow::Result<()> {
+        // An empty, whitespace-only, or separators-only value must trim+filter
+        // to an empty vector so the middleware's localhost fallback applies —
+        // the same posture as the legacy `HYPRSTREAM_CORS_ORIGINS` parser.
+        for origins in ["", "   ", ",", " ,\t, "] {
+            let cfg = cors_cfg_from_env(origins)?;
+            assert!(cfg.oauth.cors.allowed_origins.is_empty(), "{origins:?}");
+            assert!(cfg.oauth.cors.enabled);
+            assert!(cfg.oauth.cors.allow_credentials);
+            assert_eq!(cfg.oauth.external_url.as_deref(), Some("https://discovery.staging.lab.hyprstream.com"));
+            assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30));
+
+            // The exact four-origin localhost fallback set is allowed and echoes
+            // credentials; a nearby unlisted port bounds the membership.
+            for origin in [
+                "http://localhost:3000",
+                "http://localhost:3001",
+                "http://127.0.0.1:3000",
+                "http://127.0.0.1:3001",
+            ] {
+                let (acao, credentials) = cors_probe(&cfg, origin).await?;
+                assert_eq!(acao, Some(origin.to_owned()), "{origins:?}");
+                assert_eq!(credentials, Some("true".to_owned()), "{origins:?}");
+            }
+            for denied in ["http://localhost:3002", "https://not-allowed.example"] {
+                // Denial is the absent ACAO; tower-http extends the configured
+                // credentials header independently of the origin match.
+                let (acao, _credentials) = cors_probe(&cfg, denied).await?;
+                assert_eq!(acao, None, "{origins:?} {denied}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oauth_cors_env_mixed_valid_and_empty_entries_drops_empties() -> anyhow::Result<()> {
+        // Empty entries interleaved with real origins are dropped after trimming;
+        // the surviving exact list both serves itself and disables the fallback.
+        let cfg = cors_cfg_from_env(" , https://staging-amp.hyprstream.com ,, https://second.example\t,")?;
+        assert_eq!(
+            cfg.oauth.cors.allowed_origins,
+            vec!["https://staging-amp.hyprstream.com".to_owned(), "https://second.example".to_owned()]
+        );
+        assert!(cfg.oauth.cors.allow_credentials);
+        for origin in ["https://staging-amp.hyprstream.com", "https://second.example"] {
+            let (acao, credentials) = cors_probe(&cfg, origin).await?;
+            assert_eq!(acao, Some(origin.to_owned()));
+            assert_eq!(credentials, Some("true".to_owned()));
+        }
+        // Dropped empties match nothing, the nonempty exact list suppresses the
+        // localhost fallback, and unrelated origins stay denied. Denial is the
+        // absent ACAO; the configured credentials header may still be emitted.
+        for origin in ["", "http://localhost:3000", "https://not-allowed.example"] {
+            let (acao, _credentials) = cors_probe(&cfg, origin).await?;
+            assert_eq!(acao, None, "{origin:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oauth_cors_env_padded_wildcard_selects_wildcard_with_credentials_off() -> anyhow::Result<()> {
+        // Trimming a whitespace-padded star intentionally selects the explicit
+        // wildcard operator, which always disables ambient credentials.
+        let cfg = cors_cfg_from_env(" * ")?;
+        assert_eq!(cfg.oauth.cors.allowed_origins, vec!["*".to_owned()]);
+        assert!(cfg.oauth.cors.allow_credentials);
+        for origin in ["https://anything.example", "http://localhost:3000"] {
+            let (acao, credentials) = cors_probe(&cfg, origin).await?;
+            assert_eq!(acao, Some("*".to_owned()), "{origin}");
+            assert_eq!(credentials, None, "{origin}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn network_iroh_required_is_serialized_and_rejects_iroh_disabled() -> anyhow::Result<()> {
         let mut config = QuicConfig::default();

@@ -64,9 +64,18 @@ where
     D: serde::Deserializer<'de>,
 {
     // Environment list parsing preserves separator whitespace. Normalize only
-    // origin entries so the middleware can still perform exact membership checks.
-    Vec::<String>::deserialize(deserializer)
-        .map(|origins| origins.into_iter().map(|origin| origin.trim().to_owned()).collect())
+    // origin entries so the middleware can still perform exact membership
+    // checks, and drop entries that are empty after trimming — matching the
+    // legacy `HYPRSTREAM_CORS_ORIGINS` parser. An empty, whitespace-only, or
+    // separators-only value then yields an empty vector, restoring the
+    // middleware's localhost fallback instead of admitting nothing.
+    Vec::<String>::deserialize(deserializer).map(|origins| {
+        origins
+            .into_iter()
+            .map(|origin| origin.trim().to_owned())
+            .filter(|origin| !origin.is_empty())
+            .collect()
+    })
 }
 fn default_cors_credentials() -> bool {
     false
