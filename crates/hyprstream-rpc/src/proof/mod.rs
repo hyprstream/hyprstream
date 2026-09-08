@@ -24,6 +24,7 @@
 //! - [`response`] — response proof binding types.
 
 pub mod admission;
+pub mod build;
 pub mod cbor_audit;
 pub mod challenge;
 pub mod claims;
