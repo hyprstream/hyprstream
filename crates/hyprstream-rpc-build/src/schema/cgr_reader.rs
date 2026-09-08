@@ -361,68 +361,465 @@ fn validate_mandatory_dispatch(
     validate_mandatory_dispatch_with_structs(service_name, request_variants, scoped_clients, &[])
 }
 
-#[allow(clippy::possible_missing_else)]
 fn validate_mandatory_dispatch_with_structs(
-    service_name: &str, request_variants: &[UnionVariant], scoped_clients: &[ScopedClient], all_structs: &[StructDef],
+    service_name: &str,
+    request_variants: &[UnionVariant],
+    scoped_clients: &[ScopedClient],
+    all_structs: &[StructDef],
 ) -> Result<(), String> {
-    let labels = crate::schema::dispatch_label::InitialLabelMap::load().map_err(|e| format!("service `{service_name}`: {e}"))?;
+    let labels = crate::schema::dispatch_label::InitialLabelMap::load()
+        .map_err(|e| format!("service `{service_name}`: {e}"))?;
+
     fn pure<'a>(all: &'a [StructDef], name: &str) -> Option<&'a StructDef> {
-        all.iter().find(|s| s.origin_file.is_none() && s.name == name && s.is_pure_union() && s.option_inner_type().is_none())
+        all.iter().find(|s| {
+            s.origin_file.is_none()
+                && s.name == name
+                && s.is_pure_union()
+                && s.option_inner_type().is_none()
+        })
     }
-    fn leaf(service: &str, path: &str, name: &str, scope: &str, mac: &str, macp: bool, public: &str, publicp: bool, labels: &crate::schema::dispatch_label::InitialLabelMap) -> Result<(), String> {
-        match (macp, publicp) {
-            (false, false) => return Err(format!("service `{service}`: method `{path}{name}` has neither a `$dispatchMac` nor a `$dispatchPublic` annotation — the dispatch-policy pair is mandatory on every leaf (v16 §6).")),
-            (true, true) => return Err(format!("service `{service}`: method `{path}{name}` carries BOTH `$dispatchMac` and `$dispatchPublic` — exactly one dispatch annotation per leaf (v16 §6).")),
-            _ => {}
+
+    fn leaf(
+        service: &str,
+        path: &str,
+        name: &str,
+        scope: &str,
+        mac: &str,
+        mac_present: bool,
+        public: &str,
+        public_present: bool,
+        labels: &crate::schema::dispatch_label::InitialLabelMap,
+    ) -> Result<(), String> {
+        match (mac_present, public_present) {
+            (false, false) => Err(format!(
+                "service `{service}`: method `{path}{name}` has neither a `$dispatchMac` nor a `$dispatchPublic` annotation — the dispatch-policy pair is mandatory on every leaf (v16 §6)."
+            )),
+            (true, true) => Err(format!(
+                "service `{service}`: method `{path}{name}` carries BOTH `$dispatchMac` and `$dispatchPublic` — exactly one dispatch annotation per leaf (v16 §6)."
+            )),
+            (false, true) => {
+                if !scope.is_empty() {
+                    return Err(format!(
+                        "service `{service}`: method `{path}{name}` is `$dispatchPublic` but also declares `$scope({scope})`; cannot be dispatch-public"
+                    ));
+                }
+                crate::schema::dispatch_label::parse_dispatch_public_reason(public)
+                    .map(|_| ())
+                    .map_err(|e| format!("service `{service}`: method `{path}{name}`: {e}"))
+            }
+            (true, false) => crate::schema::dispatch_label::parse_dispatch_mac(mac, labels)
+                .map(|_| ())
+                .map_err(|e| {
+                    format!(
+                        "service `{service}`: method `{path}{name}` $dispatchMac {mac:?}: {e}"
+                    )
+                }),
         }
-        if publicp {
-            if !scope.is_empty() { return Err(format!("service `{service}`: method `{path}{name}` is `$dispatchPublic` but also declares the `$scope({scope})` action — a control-plane-scoped method cannot be dispatch-public.")); }
-            crate::schema::dispatch_label::parse_dispatch_public_reason(public).map_err(|e| format!("service `{service}`: method `{path}{name}`: {e}"))?;
+    }
+
+    fn selector<'a>(
+        service: &str,
+        path: &str,
+        name: &str,
+        _scope: &str,
+        mac: &'a str,
+        mac_present: bool,
+        _public: &str,
+        public_present: bool,
+        labels: &crate::schema::dispatch_label::InitialLabelMap,
+    ) -> Result<Option<&'a str>, String> {
+        if mac_present && public_present {
+            return Err(format!(
+                "service `{service}`: dispatcher `{path}{name}` carries BOTH `$dispatchMac` and `$dispatchPublic`"
+            ));
+        }
+        if public_present {
+            return Err(format!(
+                "service `{service}`: dispatcher `{path}{name}` carries `$dispatchPublic`; public is legal only on leaves"
+            ));
+        }
+        if mac_present {
+            crate::schema::dispatch_label::parse_dispatch_mac(mac, labels).map_err(|e| {
+                format!("service `{service}`: dispatcher `{path}{name}` $dispatchMac {mac:?}: {e}")
+            })?;
+            return Ok(Some(mac));
+        }
+        Ok(None)
+    }
+
+    fn walk(
+        service: &str,
+        path: &str,
+        scope: &str,
+        inherited_mac: Option<&str>,
+        sdef: &StructDef,
+        all: &[StructDef],
+        labels: &crate::schema::dispatch_label::InitialLabelMap,
+    ) -> Result<(), String> {
+        for arm in &sdef.union_arms {
+            let arm_path = format!("{path}{}.", arm.name);
+            let nested = match &arm.payload {
+                ArmPayload::Type(name) => pure(all, name),
+                _ => None,
+            };
+            let local_mac = arm
+                .dispatch_mac_present
+                .then_some(arm.dispatch_mac.as_str());
+            let inherited_or_local = local_mac.or(inherited_mac);
+            if let Some(inner) = nested {
+                let next = selector(
+                    service,
+                    &arm_path,
+                    "",
+                    scope,
+                    arm.dispatch_mac.as_str(),
+                    arm.dispatch_mac_present,
+                    arm.dispatch_public.as_str(),
+                    arm.dispatch_public_present,
+                    labels,
+                )?;
+                walk(
+                    service,
+                    &arm_path,
+                    scope,
+                    next.or(inherited_mac),
+                    inner,
+                    all,
+                    labels,
+                )?;
+            } else {
+                let (mac, mac_present) = if arm.dispatch_public_present {
+                    ("", false)
+                } else {
+                    (
+                        inherited_or_local.unwrap_or(""),
+                        inherited_or_local.is_some(),
+                    )
+                };
+                leaf(
+                    service,
+                    &arm_path,
+                    "",
+                    scope,
+                    mac,
+                    mac_present,
+                    &arm.dispatch_public,
+                    arm.dispatch_public_present,
+                    labels,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn scoped(
+        service: &str,
+        path: &str,
+        client: &ScopedClient,
+        all: &[StructDef],
+        labels: &crate::schema::dispatch_label::InitialLabelMap,
+    ) -> Result<(), String> {
+        let here = format!("{path}{} ", client.factory_name);
+        let nested_names: Vec<&str> = client
+            .nested_clients
+            .iter()
+            .map(|n| n.factory_name.as_str())
+            .collect();
+        for variant in &client.inner_request_variants {
+            if nested_names.contains(&variant.name.as_str()) {
+                if variant.dispatch_mac_present || variant.dispatch_public_present {
+                    return Err(format!(
+                        "service `{service}`: dispatcher `{here}{}` carries a dispatch annotation",
+                        variant.name
+                    ));
+                }
+            } else if let Some(inner) = pure(all, &variant.type_name) {
+                let inherited = selector(
+                    service,
+                    &here,
+                    &variant.name,
+                    &variant.scope,
+                    &variant.dispatch_mac,
+                    variant.dispatch_mac_present,
+                    &variant.dispatch_public,
+                    variant.dispatch_public_present,
+                    labels,
+                )?;
+                walk(
+                    service,
+                    &format!("{here}{}.", variant.name),
+                    &variant.scope,
+                    inherited,
+                    inner,
+                    all,
+                    labels,
+                )?;
+            } else {
+                leaf(
+                    service,
+                    &here,
+                    &variant.name,
+                    &variant.scope,
+                    &variant.dispatch_mac,
+                    variant.dispatch_mac_present,
+                    &variant.dispatch_public,
+                    variant.dispatch_public_present,
+                    labels,
+                )?;
+            }
+        }
+        for nested in &client.nested_clients {
+            scoped(service, &here, nested, all, labels)?;
+        }
+        Ok(())
+    }
+
+    let dispatcher_names: Vec<&str> = scoped_clients
+        .iter()
+        .map(|client| client.factory_name.as_str())
+        .collect();
+    for variant in request_variants {
+        if dispatcher_names.contains(&variant.name.as_str()) {
+            if variant.dispatch_mac_present || variant.dispatch_public_present {
+                return Err(format!(
+                    "service `{service_name}`: dispatcher `{}` carries a dispatch annotation",
+                    variant.name
+                ));
+            }
+        } else if let Some(inner) = pure(all_structs, &variant.type_name) {
+            let inherited = selector(
+                service_name,
+                "",
+                &variant.name,
+                &variant.scope,
+                &variant.dispatch_mac,
+                variant.dispatch_mac_present,
+                &variant.dispatch_public,
+                variant.dispatch_public_present,
+                &labels,
+            )?;
+            walk(
+                service_name,
+                &format!("{}.", variant.name),
+                &variant.scope,
+                inherited,
+                inner,
+                all_structs,
+                &labels,
+            )?;
         } else {
-            crate::schema::dispatch_label::parse_dispatch_mac(mac, labels).map_err(|e| format!("service `{service}`: method `{path}{name}` $dispatchMac {mac:?}: {e}"))?;
+            leaf(
+                service_name,
+                "",
+                &variant.name,
+                &variant.scope,
+                &variant.dispatch_mac,
+                variant.dispatch_mac_present,
+                &variant.dispatch_public,
+                variant.dispatch_public_present,
+                &labels,
+            )?;
         }
-        Ok(())
     }
-    fn walk(service: &str, path: &str, scope: &str, inherited: Option<&str>, s: &StructDef, all: &[StructDef], labels: &crate::schema::dispatch_label::InitialLabelMap) -> Result<(), String> {
-        for arm in &s.union_arms {
-            let mac = if arm.dispatch_mac_present { Some(arm.dispatch_mac.as_str()) } else { inherited };
-            let public = arm.dispatch_public_present;
-            let nested = match &arm.payload { ArmPayload::Type(t) => pure(all,t), _ => None };
-            let ap = format!("{path}{}.", arm.name);
-            if let Some(inner) = nested { walk(service, &ap, scope, mac, inner, all, labels)?; }
-            else { leaf(service, &ap, "", scope, mac.unwrap_or(""), mac.is_some(), &arm.dispatch_public, public, labels)?; }
-        }
-        Ok(())
+    for client in scoped_clients {
+        scoped(service_name, "", client, all_structs, &labels)?;
     }
-    fn scoped(service: &str, path: &str, sc: &ScopedClient, all: &[StructDef], labels: &crate::schema::dispatch_label::InitialLabelMap) -> Result<(), String> {
-        let here=format!("{path}{} ",sc.factory_name); let nested: Vec<&str>=sc.nested_clients.iter().map(|n|n.factory_name.as_str()).collect();
-        for v in &sc.inner_request_variants {
-            if nested.contains(&v.name.as_str()) { if v.dispatch_mac_present || v.dispatch_public_present { return Err(format!("service `{service}`: dispatcher `{here}{}` carries a dispatch annotation",v.name)); } }
-            else if let Some(inner)=pure(all,&v.type_name) { if v.dispatch_mac_present && v.dispatch_public_present { return Err(format!("service `{service}`: method `{here}{}` carries BOTH `$dispatchMac` and `$dispatchPublic`",v.name)); } if v.dispatch_public_present { return Err(format!("service `{service}`: dispatcher `{here}{}` carries `$dispatchPublic`; public is legal only on leaves",v.name)); } walk(service,&format!("{here}{}.",v.name),&v.scope,v.dispatch_mac_present.then_some(v.dispatch_mac.as_str()),inner,all,labels)?; }
-            else { leaf(service,&here,&v.name,&v.scope,&v.dispatch_mac,v.dispatch_mac_present,&v.dispatch_public,v.dispatch_public_present,labels)?; }
-        }
-        for n in &sc.nested_clients { scoped(service,&here,n,all,labels)?; } Ok(())
-    }
-    let names: Vec<&str>=scoped_clients.iter().map(|s|s.factory_name.as_str()).collect();
-    for v in request_variants {
-        if names.contains(&v.name.as_str()) { if v.dispatch_mac_present || v.dispatch_public_present { return Err(format!("service `{service_name}`: dispatcher `{}` carries a dispatch annotation",v.name)); } }
-        else if let Some(inner)=pure(all_structs,&v.type_name) { if v.dispatch_mac_present && v.dispatch_public_present { return Err(format!("service `{service_name}`: method `{}` carries BOTH `$dispatchMac` and `$dispatchPublic`",v.name)); } if v.dispatch_public_present { return Err(format!("service `{service_name}`: dispatcher `{}` carries `$dispatchPublic`; public is legal only on leaves",v.name)); } walk(service_name,&format!("{}.",v.name),&v.scope,v.dispatch_mac_present.then_some(v.dispatch_mac.as_str()),inner,all_structs,&labels)?; }
-        else { leaf(service_name,"",&v.name,&v.scope,&v.dispatch_mac,v.dispatch_mac_present,&v.dispatch_public,v.dispatch_public_present,&labels)?; }
-    }
-    for sc in scoped_clients { scoped(service_name,"",sc,all_structs,&labels)?; } Ok(())
+    Ok(())
 }
 
 #[cfg(test)]
-fn validate_mandatory_mutation_policy(service_name: &str, request_variants: &[UnionVariant], scoped_clients: &[ScopedClient]) -> Result<(), String> {
-    validate_mandatory_mutation_policy_with_structs(service_name, request_variants, scoped_clients, &[])
+fn validate_mandatory_mutation_policy(
+    service_name: &str,
+    request_variants: &[UnionVariant],
+    scoped_clients: &[ScopedClient],
+) -> Result<(), String> {
+    validate_mandatory_mutation_policy_with_structs(
+        service_name,
+        request_variants,
+        scoped_clients,
+        &[],
+    )
 }
-#[allow(clippy::possible_missing_else)]
-fn validate_mandatory_mutation_policy_with_structs(service_name: &str, request_variants: &[UnionVariant], scoped_clients: &[ScopedClient], all_structs: &[StructDef]) -> Result<(), String> {
-    fn pure<'a>(all: &'a [StructDef], name: &str) -> Option<&'a StructDef> { all.iter().find(|s|s.origin_file.is_none() && s.name==name && s.is_pure_union() && s.option_inner_type().is_none()) }
-    fn leaf(service:&str,path:&str,name:&str,scope:&str,sem:&str,present:bool)->Result<(),String>{ let read=crate::schema::dispatch_label::READ_CLASS_ACTIONS.contains(&scope); if !present && !read && !scope.is_empty(){return Err(format!("service `{service}`: method `{path}{name}` (scope `{scope}`) is missing required `$mutationSemantics`; declare its actual retry/application-effect policy"));} if !present{return Ok(());} parse_mutation_semantics(sem).map(|_|()).map_err(|e|format!("service `{service}`: method `{path}{name}` (scope `{scope}`) {e}; declare its actual retry/application-effect policy")) }
-    fn walk(service:&str,path:&str,scope:&str,inherited:Option<&str>,s:&StructDef,all:&[StructDef])->Result<(),String>{for arm in &s.union_arms{let sem=if arm.mutation_semantics_present{Some(arm.mutation_semantics.as_str())}else{inherited};let ap=format!("{path}{}.",arm.name);let nested=match &arm.payload{ArmPayload::Type(t)=>pure(all,t),_=>None};if let Some(inner)=nested{walk(service,&ap,scope,sem,inner,all)?}else{leaf(service,&ap,"",scope,sem.unwrap_or(""),sem.is_some())?;}}Ok(())}
-    fn scoped(service:&str,path:&str,sc:&ScopedClient,all:&[StructDef])->Result<(),String>{let here=format!("{path}{} ",sc.factory_name);let nested:Vec<&str>=sc.nested_clients.iter().map(|n|n.factory_name.as_str()).collect();for v in &sc.inner_request_variants{if nested.contains(&v.name.as_str()){if v.mutation_semantics_present{return Err(format!("service `{service}`: dispatcher `{here}{}` carries `$mutationSemantics`",v.name));}}else if let Some(inner)=pure(all,&v.type_name){walk(service,&format!("{here}{}.",v.name),&v.scope,v.mutation_semantics_present.then_some(v.mutation_semantics.as_str()),inner,all)?}else{leaf(service,&here,&v.name,&v.scope,&v.mutation_semantics,v.mutation_semantics_present)?;}}for n in &sc.nested_clients{scoped(service,&here,n,all)?}Ok(())}
-    let names:Vec<&str>=scoped_clients.iter().map(|s|s.factory_name.as_str()).collect();for v in request_variants{if names.contains(&v.name.as_str()){if v.mutation_semantics_present{return Err(format!("service `{service_name}`: dispatcher `{}` carries `$mutationSemantics`",v.name));}}else if let Some(inner)=pure(all_structs,&v.type_name){walk(service_name,&format!("{}.",v.name),&v.scope,v.mutation_semantics_present.then_some(v.mutation_semantics.as_str()),inner,all_structs)?}else{leaf(service_name,"",&v.name,&v.scope,&v.mutation_semantics,v.mutation_semantics_present)?;}}for sc in scoped_clients{scoped(service_name,"",sc,all_structs)?}Ok(())
+
+fn validate_mandatory_mutation_policy_with_structs(
+    service_name: &str,
+    request_variants: &[UnionVariant],
+    scoped_clients: &[ScopedClient],
+    all_structs: &[StructDef],
+) -> Result<(), String> {
+    fn pure<'a>(all: &'a [StructDef], name: &str) -> Option<&'a StructDef> {
+        all.iter().find(|s| {
+            s.origin_file.is_none()
+                && s.name == name
+                && s.is_pure_union()
+                && s.option_inner_type().is_none()
+        })
+    }
+    fn leaf(
+        service: &str,
+        path: &str,
+        name: &str,
+        scope: &str,
+        semantics: &str,
+        present: bool,
+    ) -> Result<(), String> {
+        let read = crate::schema::dispatch_label::READ_CLASS_ACTIONS.contains(&scope);
+        if !present {
+            if !read && !scope.is_empty() {
+                return Err(format!("service `{service}`: method `{path}{name}` (scope `{scope}`) is missing required `$mutationSemantics`; declare its actual retry/application-effect policy"));
+            }
+            return Ok(());
+        }
+        parse_mutation_semantics(semantics).map(|_| ()).map_err(|e| format!("service `{service}`: method `{path}{name}` (scope `{scope}`) {e}; declare its actual retry/application-effect policy"))
+    }
+    fn walk(
+        service: &str,
+        path: &str,
+        scope: &str,
+        inherited: Option<&str>,
+        sdef: &StructDef,
+        all: &[StructDef],
+    ) -> Result<(), String> {
+        for arm in &sdef.union_arms {
+            let semantics = if arm.mutation_semantics_present {
+                Some(arm.mutation_semantics.as_str())
+            } else {
+                inherited
+            };
+            if let Some(inner) = match &arm.payload {
+                ArmPayload::Type(name) => pure(all, name),
+                _ => None,
+            } {
+                if arm.mutation_semantics_present {
+                    parse_mutation_semantics(arm.mutation_semantics.as_str()).map_err(|e| {
+                        format!(
+                            "service `{service}`: dispatcher `{path}{}` $mutationSemantics: {e}",
+                            arm.name
+                        )
+                    })?;
+                }
+                walk(
+                    service,
+                    &format!("{path}{}.", arm.name),
+                    scope,
+                    semantics,
+                    inner,
+                    all,
+                )?;
+            } else {
+                leaf(
+                    service,
+                    &format!("{path}{}.", arm.name),
+                    "",
+                    scope,
+                    semantics.unwrap_or(""),
+                    semantics.is_some(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+    fn scoped(
+        service: &str,
+        path: &str,
+        client: &ScopedClient,
+        all: &[StructDef],
+    ) -> Result<(), String> {
+        let here = format!("{path}{} ", client.factory_name);
+        let nested_names: Vec<&str> = client
+            .nested_clients
+            .iter()
+            .map(|n| n.factory_name.as_str())
+            .collect();
+        for variant in &client.inner_request_variants {
+            if nested_names.contains(&variant.name.as_str()) {
+                if variant.mutation_semantics_present {
+                    return Err(format!(
+                        "service `{service}`: dispatcher `{here}{}` carries `$mutationSemantics`",
+                        variant.name
+                    ));
+                }
+            } else if let Some(inner) = pure(all, &variant.type_name) {
+                if variant.mutation_semantics_present {
+                    parse_mutation_semantics(&variant.mutation_semantics).map_err(|e| {
+                        format!(
+                            "service `{service}`: dispatcher `{here}{}` $mutationSemantics: {e}",
+                            variant.name
+                        )
+                    })?;
+                }
+                walk(
+                    service,
+                    &format!("{here}{}.", variant.name),
+                    &variant.scope,
+                    variant
+                        .mutation_semantics_present
+                        .then_some(variant.mutation_semantics.as_str()),
+                    inner,
+                    all,
+                )?;
+            } else {
+                leaf(
+                    service,
+                    &here,
+                    &variant.name,
+                    &variant.scope,
+                    &variant.mutation_semantics,
+                    variant.mutation_semantics_present,
+                )?;
+            }
+        }
+        for nested in &client.nested_clients {
+            scoped(service, &here, nested, all)?;
+        }
+        Ok(())
+    }
+    let names: Vec<&str> = scoped_clients
+        .iter()
+        .map(|client| client.factory_name.as_str())
+        .collect();
+    for variant in request_variants {
+        if names.contains(&variant.name.as_str()) {
+            if variant.mutation_semantics_present {
+                return Err(format!(
+                    "service `{service_name}`: dispatcher `{}` carries `$mutationSemantics`",
+                    variant.name
+                ));
+            }
+        } else if let Some(inner) = pure(all_structs, &variant.type_name) {
+            if variant.mutation_semantics_present {
+                parse_mutation_semantics(&variant.mutation_semantics).map_err(|e| {
+                    format!(
+                        "service `{service_name}`: dispatcher `{}` $mutationSemantics: {e}",
+                        variant.name
+                    )
+                })?;
+            }
+            walk(
+                service_name,
+                &format!("{}.", variant.name),
+                &variant.scope,
+                variant
+                    .mutation_semantics_present
+                    .then_some(variant.mutation_semantics.as_str()),
+                inner,
+                all_structs,
+            )?;
+        } else {
+            leaf(
+                service_name,
+                "",
+                &variant.name,
+                &variant.scope,
+                &variant.mutation_semantics,
+                variant.mutation_semantics_present,
+            )?;
+        }
+    }
+    for client in scoped_clients {
+        scoped(service_name, "", client, all_structs)?;
+    }
+    Ok(())
 }
 
 // Node lookup helpers

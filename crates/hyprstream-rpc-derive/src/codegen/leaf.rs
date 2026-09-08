@@ -66,6 +66,8 @@ pub struct MethodLeaf {
     /// left with nothing still fails the closed parser at row generation.
     pub mutation_semantics: String,
     pub mutation_semantics_present: bool,
+    /// Validation failure found on this leaf or an ancestor selector.
+    pub validation_error: Option<String>,
 }
 
 /// Per-arm metadata resolved during the walk.
@@ -101,6 +103,7 @@ struct Inherited {
     dispatch_public_present: bool,
     mutation_semantics: String,
     mutation_semantics_present: bool,
+    validation_error: Option<String>,
 }
 
 /// The arms of one union level, in schema declaration order.
@@ -191,8 +194,10 @@ fn descend_struct<'a>(resolved: &'a ResolvedSchema, type_name: &str) -> Option<&
 /// Recursively collect every method leaf of the service's request tree.
 pub fn collect_method_leaves(resolved: &ResolvedSchema) -> Vec<MethodLeaf> {
     let mut out = Vec::new();
+    let label_map = InitialLabelMap::load().ok();
     walk_level(
         resolved,
+        label_map.as_ref(),
         resolved.raw.request_struct.as_ref(),
         &resolved.raw.request_variants,
         &resolved.raw.scoped_clients,
@@ -207,6 +212,7 @@ pub fn collect_method_leaves(resolved: &ResolvedSchema) -> Vec<MethodLeaf> {
 #[allow(clippy::too_many_arguments)]
 fn walk_level(
     resolved: &ResolvedSchema,
+    label_map: Option<&InitialLabelMap>,
     sdef: Option<&StructDef>,
     variants: &[UnionVariant],
     scopes: &[ScopedClient],
@@ -232,7 +238,8 @@ fn walk_level(
         } else {
             format!("{prefix_sym}.{}", arm.name)
         };
-        let arm_annotated = arm.dispatch_mac_present || arm.dispatch_public_present;
+        let nested = scopes.iter().find(|sc| sc.factory_name == arm.name).is_some()
+            || descend_struct(resolved, arm.type_name).is_some();
         let mut effective = inherited.clone();
         if arm.scope.is_empty() && !arm.scope_exempt {
             // scope (and its exemption) inherit from the selector unchanged.
@@ -240,22 +247,53 @@ fn walk_level(
             effective.scope = arm.scope.to_owned();
             effective.scope_exempt = arm.scope_exempt;
         }
-        if arm_annotated {
-            effective.dispatch_mac = arm.dispatch_mac.to_owned();
-            effective.dispatch_mac_present = arm.dispatch_mac_present;
+
+        // Validate every declaration at its own selector/leaf before applying
+        // inheritance. A valid descendant must never shadow an invalid parent.
+        if arm.dispatch_mac_present {
+            if let Some(label_map) = label_map {
+                if let Err(error) = parse_dispatch_mac(arm.dispatch_mac, label_map) {
+                    effective.validation_error.get_or_insert_with(|| {
+                        format!("method leaf '{}': $dispatchMac {:?}: {error}", symbolic, arm.dispatch_mac)
+                    });
+                }
+            }
+        }
+        if arm.dispatch_mac_present && arm.dispatch_public_present {
+            effective.validation_error.get_or_insert_with(|| {
+                format!("method '{}' carries BOTH $dispatchMac and $dispatchPublic", symbolic)
+            });
+        } else if arm.dispatch_public_present && nested {
+            effective.validation_error.get_or_insert_with(|| {
+                format!("method dispatcher '{}' carries $dispatchPublic; public is never inherited and is legal only on leaves", symbolic)
+            });
+        }
+        if arm.mutation_semantics_present {
+            if let Err(error) = parse_mutation_semantics(arm.mutation_semantics) {
+                effective.validation_error.get_or_insert_with(|| {
+                    format!("method '{}': {error}", symbolic)
+                });
+            }
+        }
+
+        if arm.dispatch_public_present {
+            // A local public leaf is an explicit scope-exempt override and
+            // clears any inherited MAC state. Public never propagates.
+            effective.dispatch_mac.clear();
+            effective.dispatch_mac_present = false;
             effective.dispatch_public = arm.dispatch_public.to_owned();
-            effective.dispatch_public_present = arm.dispatch_public_present;
+            effective.dispatch_public_present = true;
+        } else if arm.dispatch_mac_present {
+            effective.dispatch_mac = arm.dispatch_mac.to_owned();
+            effective.dispatch_mac_present = true;
+            effective.dispatch_public.clear();
+            effective.dispatch_public_present = false;
         } else {
-            // An unannotated arm: a `$dispatchMac` selector's label inherits
-            // downward (kept above), but `$dispatchPublic` NEVER inherits —
-            // the arm is left unannotated and its leaf fails the build (v16
-            // §6: public is legal only on leaves, never inherited).
-            effective.dispatch_public = String::new();
+            effective.dispatch_public.clear();
             effective.dispatch_public_present = false;
         }
         if arm.mutation_semantics_present {
-            // Local `$mutationSemantics` wins: the nearest annotated arm is
-            // authoritative over anything inherited (v16 §4.8).
+            // Local `$mutationSemantics` wins over inherited state.
             effective.mutation_semantics = arm.mutation_semantics.to_owned();
             effective.mutation_semantics_present = true;
         }
@@ -273,6 +311,7 @@ fn walk_level(
             // selector nested inside a hand-dispatched pure union).
             walk_level(
                 resolved,
+                label_map,
                 resolved.find_struct(arm.type_name),
                 &sc.inner_request_variants,
                 &sc.nested_clients,
@@ -285,6 +324,7 @@ fn walk_level(
             // A hand-dispatched pure union: its arms are method identity.
             walk_level(
                 resolved,
+                label_map,
                 Some(inner),
                 &[],
                 &[],
@@ -305,6 +345,7 @@ fn walk_level(
                 dispatch_public_present: effective.dispatch_public_present,
                 mutation_semantics: effective.mutation_semantics.clone(),
                 mutation_semantics_present: effective.mutation_semantics_present,
+                validation_error: effective.validation_error.clone(),
             });
         }
     }
@@ -422,6 +463,9 @@ pub fn generate_method_policy_rows(service_name: &str, resolved: &ResolvedSchema
 
     let mut row_tokens: Vec<TokenStream> = Vec::new();
     for leaf in &leaves {
+        if let Some(error) = &leaf.validation_error {
+            return quote! { ::core::compile_error!(#error); };
+        }
         let path = &leaf.path;
         let symbolic = &leaf.symbolic;
         let scope = &leaf.scope;
@@ -999,6 +1043,65 @@ mod tests {
         let generated = generate_method_policy_rows("svc", &resolved).to_string();
         assert!(!generated.contains("compile_error"), "{generated}");
         assert!(generated.contains("Level :: Internal"), "{generated}");
+    }
+
+    #[test]
+    fn a_local_public_leaf_clears_inherited_mac_for_that_leaf_only() {
+        let mut inner = union_struct(
+            "InnerRequest",
+            vec![union_field("public_leaf", "Void", 0), union_field("mac_leaf", "Void", 1)],
+        );
+        inner.union_arms = vec![
+            UnionArm {
+                name: "public_leaf".into(),
+                discriminant_value: 0,
+                description: String::new(),
+                dispatch_mac: String::new(),
+                dispatch_mac_present: false,
+                dispatch_public: "liveness".into(),
+                dispatch_public_present: true,
+                mutation_semantics: String::new(),
+                mutation_semantics_present: false,
+                payload: ArmPayload::Void,
+            },
+            UnionArm {
+                name: "mac_leaf".into(),
+                discriminant_value: 1,
+                description: String::new(),
+                dispatch_mac: String::new(),
+                dispatch_mac_present: false,
+                dispatch_public: String::new(),
+                dispatch_public_present: false,
+                mutation_semantics: String::new(),
+                mutation_semantics_present: false,
+                payload: ArmPayload::Void,
+            },
+        ];
+        let schema = Box::leak(Box::new(ParsedSchema {
+            request_variants: vec![dispatch_variant("outer", "InnerRequest", "", MAC, "")],
+            response_variants: vec![],
+            structs: vec![inner],
+            scoped_clients: vec![],
+            enums: vec![],
+            request_struct: Some(union_struct(
+                "SvcRequest",
+                vec![union_field("outer", "InnerRequest", 0)],
+            )),
+            response_struct: None,
+        }));
+        let leaves = collect_method_leaves(&ResolvedSchema::from(schema));
+        let public = leaves
+            .iter()
+            .find(|leaf| leaf.symbolic == "outer.public_leaf")
+            .expect("public leaf");
+        let mac = leaves
+            .iter()
+            .find(|leaf| leaf.symbolic == "outer.mac_leaf")
+            .expect("MAC leaf");
+        assert!(public.dispatch_public_present && !public.dispatch_mac_present);
+        assert!(!mac.dispatch_public_present && mac.dispatch_mac_present);
+        let generated = generate_method_policy_rows("svc", &ResolvedSchema::from(schema)).to_string();
+        assert!(!generated.contains("compile_error"), "{generated}");
     }
 
     /// P2 (`PRRT_kwDONmv2Pc6gGRV2`) causal regression: a nonread selector's

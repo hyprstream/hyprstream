@@ -1644,6 +1644,127 @@ struct EmptyResponse { union { ok @0 :Void; other @1 :Void; } }
             .contains("mutationSemantics"));
     }
 
+    /// Recursive pure-union selectors must validate their own declarations
+    /// before a valid grandchild can shadow them. This uses the complete
+    /// capnpc -> CGR -> schema-gate path rather than constructing metadata.
+    #[test]
+    fn recursive_selectors_validate_local_declarations_before_inheritance() {
+        fn schema(top: &str, nested: &str, top_mutation: &str) -> String {
+            format!(
+                r#"@0x91a2b3c4d5e6f701;
+
+enum ScopeAction {{ query @0; write @1; }}
+annotation scope(field) :ScopeAction;
+annotation scopeExempt(field) :Text;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+annotation mutationSemantics(field) :Text;
+
+struct Inner {{
+  union {{
+    first @0 :Void $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    second @1 :Void $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+  }}
+}}
+struct Outer {{
+  union {{
+    inner @0 :Inner {nested}
+    sibling @1 :Void $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+  }}
+}}
+struct RecursiveRequest {{
+  union {{
+    route @0 :Outer $scope(write) $dispatchMac("{top}") $mutationSemantics("{top_mutation}");
+    health @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+  }}
+}}
+struct RecursiveResponse {{ union {{ ok @0 :Void; other @1 :Void; }} }}
+"#,
+                nested = nested,
+                top = top,
+                top_mutation = top_mutation,
+            )
+        }
+
+        let top_bad_mac = schema(
+            "not-a-mac",
+            " $dispatchMac(\"internal:pq-hybrid\") $mutationSemantics(\"naturally-idempotent\");",
+            "naturally-idempotent",
+        );
+        let err = try_parse_schema("recursive", &top_bad_mac).unwrap_err();
+        assert!(err.contains("dispatchMac") && err.contains("not-a-mac"), "{err}");
+
+        let top_empty_mutation = schema(
+            "internal:pq-hybrid",
+            " $dispatchMac(\"internal:pq-hybrid\") $mutationSemantics(\"naturally-idempotent\");",
+            "",
+        );
+        let err = try_parse_schema("recursive", &top_empty_mutation).unwrap_err();
+        assert!(err.contains("mutationSemantics"), "{err}");
+
+        let nested_bad_mac = schema(
+            "internal:pq-hybrid",
+            " $dispatchMac(\"not-a-mac\") $mutationSemantics(\"naturally-idempotent\");",
+            "naturally-idempotent",
+        );
+        let err = try_parse_schema("recursive", &nested_bad_mac).unwrap_err();
+        assert!(err.contains("dispatchMac") && err.contains("not-a-mac"), "{err}");
+
+        let nested_empty_mutation = schema(
+            "internal:pq-hybrid",
+            " $dispatchMac(\"internal:pq-hybrid\") $mutationSemantics(\"\");",
+            "naturally-idempotent",
+        );
+        let err = try_parse_schema("recursive", &nested_empty_mutation).unwrap_err();
+        assert!(err.contains("mutationSemantics"), "{err}");
+
+        let nested_public = schema(
+            "internal:pq-hybrid",
+            " $dispatchPublic(\"nested public\") $mutationSemantics(\"naturally-idempotent\");",
+            "naturally-idempotent",
+        );
+        let err = try_parse_schema("recursive", &nested_public).unwrap_err();
+        assert!(err.contains("public is legal only on leaves"), "{err}");
+
+        let nested_both = schema(
+            "internal:pq-hybrid",
+            " $dispatchMac(\"internal:pq-hybrid\") $dispatchPublic(\"nested both\") $mutationSemantics(\"naturally-idempotent\");",
+            "naturally-idempotent",
+        );
+        let err = try_parse_schema("recursive", &nested_both).unwrap_err();
+        assert!(err.contains("BOTH"), "{err}");
+
+        // A local public leaf clears the inherited MAC while its unannotated
+        // sibling keeps that selector MAC. The public leaf is scope-exempt.
+        let valid = r#"@0x91a2b3c4d5e6f702;
+
+enum ScopeAction { query @0; }
+annotation scope(field) :ScopeAction;
+annotation scopeExempt(field) :Text;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+annotation mutationSemantics(field) :Text;
+struct Inner {
+  union {
+    publicLeaf @0 :Void $scopeExempt("liveness") $dispatchPublic("nested public leaf");
+    inheritedLeaf @1 :Void;
+  }
+}
+struct Outer { union { inner @0 :Inner; sibling @1 :Void; } }
+struct ValidRequest {
+  union {
+    route @0 :Outer $scopeExempt("route") $dispatchMac("internal:pq-hybrid");
+    health @1 :Void $scopeExempt("health") $dispatchPublic("valid public control");
+  }
+}
+struct ValidResponse { union { ok @0 :Void; other @1 :Void; } }
+"#;
+        let parsed = try_parse_schema("valid", valid).expect("valid recursive schema");
+        let inner = parsed.structs.iter().find(|s| s.name == "Inner").expect("Inner");
+        assert!(inner.union_arms[0].dispatch_public_present);
+        assert!(!inner.union_arms[1].dispatch_mac_present);
+    }
+
     /// P2 (`PRRT_kwDONmv2Pc6gGRV5`) reason boundaries through the actual
     /// schema gate: a padded reason is a parse error (never silently
     /// trimmed), whitespace-only stays an error, and a trimmed valid reason

@@ -148,3 +148,73 @@ fn ts_cli_rejects_invalid_cgr_without_partial_generation() {
     );
     let _ = std::fs::remove_dir_all(tmp);
 }
+
+
+const VALID_PUBLIC_SCHEMA: &str = r#"
+@0xd15ea5ed15ea5ed1;
+
+annotation scopeExempt(field) :Text;
+annotation dispatchPublic(field) :Text;
+
+struct ValidRequest {
+  union {
+    health @0 :Void $scopeExempt("liveness") $dispatchPublic("valid public control");
+    status @1 :Void $scopeExempt("status") $dispatchPublic("valid public status");
+  }
+}
+struct ValidResponse {
+  union {
+    ok @0 :Void;
+    other @1 :Void;
+  }
+}
+"#;
+
+#[test]
+fn ts_cli_accepts_valid_public_cgr_and_writes_output() {
+    let tmp = std::env::temp_dir().join(format!("hyprstream_ts_cli_valid_{}", std::process::id()));
+    let input_dir = tmp.join("input");
+    std::fs::create_dir_all(&input_dir).expect("create input");
+    let capnp_path = input_dir.join("valid.capnp");
+    std::fs::write(&capnp_path, VALID_PUBLIC_SCHEMA).expect("write valid.capnp");
+    let cgr_path = input_dir.join("valid.cgr");
+    capnpc::CompilerCommand::new()
+        .src_prefix(&input_dir)
+        .file(&capnp_path)
+        .raw_code_generator_request_path(&cgr_path)
+        .run()
+        .expect("compile valid.capnp to CGR");
+
+    let binary = std::env::var_os("CARGO_BIN_EXE_hyprstream_ts_codegen")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let current = std::env::current_exe().expect("test executable path");
+            current
+                .parent()
+                .and_then(Path::parent)
+                .expect("target profile directory")
+                .join("hyprstream-ts-codegen")
+        });
+    let output_dir = tmp.join("output");
+    let output = Command::new(binary)
+        .args([
+            "--input-dir",
+            input_dir.to_str().expect("input path"),
+            "--output-dir",
+            output_dir.to_str().expect("output path"),
+        ])
+        .output()
+        .expect("run TypeScript codegen CLI");
+    assert!(
+        output.status.success(),
+        "valid public CGR must generate successfully: {output:?}"
+    );
+    assert!(
+        output_dir.join("valid.ts").is_file(),
+        "successful CLI run must write valid.ts; entries: {:?}",
+        std::fs::read_dir(&output_dir)
+            .map(|entries| entries.filter_map(Result::ok).map(|e| e.path()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+    let _ = std::fs::remove_dir_all(tmp);
+}
