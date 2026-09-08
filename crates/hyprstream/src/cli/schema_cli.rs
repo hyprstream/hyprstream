@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::services::generated::inference_client::InferenceClient;
 use crate::services::generated::model_client::ModelClient;
 use crate::services::generated::{inference_client, model_client, policy_client, registry_client};
-use crate::services::RegistryClient;
+use crate::services::{DiscoveryClient, RegistryClient};
 use hyprstream_workers::generated::{worker_client, workflow_client};
 use hyprstream_workers::runtime::WorkerClient;
 
@@ -245,6 +245,16 @@ pub fn build_tool_command() -> Command {
         policy_tree,
     ));
 
+    // Discovery intentionally exposes only its read-only health check here.
+    // The remaining generated methods are service/bootstrap operations and are
+    // not part of this diagnostic CLI surface.
+    let discovery = Command::new("discovery")
+        .about("Discovery health check")
+        .subcommand(Command::new("ping").about("Health check"))
+        .subcommand_required(true)
+        .arg_required_else_help(true);
+    tool = tool.subcommand(discovery);
+
     // Worker service + CRI-aligned scoped resources
     let worker_methods = extract_methods!(worker_client::schema_metadata());
     let worker_tree = worker_client::scoped_client_tree();
@@ -270,7 +280,7 @@ pub fn build_tool_command() -> Command {
 pub async fn handle_tool_command(matches: &ArgMatches, signing_key: SigningKey) -> Result<()> {
     let (service_name, service_matches) = matches.subcommand().ok_or_else(|| {
         anyhow::anyhow!(
-            "No service specified. Use: tool <registry|model|inference|policy|worker|workflow> ..."
+            "No service specified. Use: tool <registry|discovery|model|inference|policy|worker|workflow> ..."
         )
     })?;
     handle_schema_command(service_name, service_matches, signing_key).await
@@ -401,6 +411,13 @@ async fn dispatch_top_level(
         }
         "policy" => {
             let client = super::policy_handlers::create_policy_client(&signing_key)?;
+            client.call_method(method, args).await
+        }
+        "discovery" => {
+            if method != "ping" {
+                bail!("Discovery CLI exposes only the ping method")
+            }
+            let client = DiscoveryClient::from_resolver(signing_key, None)?;
             client.call_method(method, args).await
         }
         "worker" => {
@@ -670,5 +687,60 @@ fn format_cell(value: Option<&Value>) -> String {
             items.join(", ")
         }
         Some(Value::Object(obj)) => serde_json::to_string(obj).unwrap_or_else(|_| "{}".to_owned()),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn test_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    #[test]
+    fn discovery_cli_exposes_only_ping() {
+        let command = build_tool_command();
+        command
+            .clone()
+            .try_get_matches_from(["tool", "discovery", "ping"])
+            .expect("discovery ping must be a valid CLI command");
+        command
+            .try_get_matches_from(["tool", "discovery", "list-services"])
+            .expect_err("Discovery management methods must stay outside this CLI");
+        assert!(get_service_tree("discovery").is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_ping_command_denies_without_resolver() {
+        // Run the assertion in a fresh test process so unrelated tests cannot
+        // install a process-global resolver and turn this into a false pass.
+        if std::env::var_os("HYPRSTREAM_DISCOVERY_PING_DENIAL_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::schema_cli::tests::discovery_ping_command_denies_without_resolver",
+                    "--nocapture",
+                ])
+                .env("HYPRSTREAM_DISCOVERY_PING_DENIAL_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated denial child failed: {status}");
+            return;
+        }
+
+        let matches = build_tool_command()
+            .try_get_matches_from(["tool", "discovery", "ping"])
+            .unwrap();
+        let (_, service_matches) = matches.subcommand().unwrap();
+        let error = handle_schema_command("discovery", service_matches, test_signing_key())
+            .await
+            .expect_err("ping must fail closed when no resolver is installed");
+        let text = error.to_string();
+        assert!(
+            text.contains("resolver") || text.contains("Discovery"),
+            "unexpected resolver denial: {text}"
+        );
     }
 }
