@@ -236,16 +236,16 @@ fn run_isolated(case: &str, guard: &str) -> anyhow::Result<()> {
 
 // ── Parent-side cases: no process-global state is touched. ──
 
-/// The bridge runtime readiness barrier run() relies on is real: a build
-/// failure resolves the receiver with Err, and the supervisor's READY
-/// counterpart was never consumed.
+/// Builder-failure propagation at `LocalServiceBridge::spawn_with`: a build
+/// failure resolves the readiness receiver with the preserved error, so the
+/// production ordering (await the receiver before serve_bridged) observes a
+/// fatal init instead of readiness.
 ///
 /// (OAuth's own production builder — `OAuthRpcHandler::new` — is infallible,
 /// so a run()-level bridge-build failure has no injectable seam; this proves
-/// the barrier property at the exact API the transaction gates on.)
+/// error propagation at the exact API the transaction gates on.)
 #[test]
-fn bridge_spawn_with_readiness_failure_gates_ready() -> anyhow::Result<()> {
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+fn bridge_spawn_with_propagates_builder_failure() -> anyhow::Result<()> {
     let (bridge, mut ready) = hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn_with(
         "readiness-fail-echo",
         || async {
@@ -276,11 +276,6 @@ fn bridge_spawn_with_readiness_failure_gates_ready() -> anyhow::Result<()> {
     });
     let _ = bridge.begin_shutdown(tokio::time::Instant::now() + Duration::from_secs(5));
     drop(bridge);
-    assert!(
-        ready_tx.send(()).is_ok(),
-        "on_ready counterpart must still be armed — the barrier consumed nothing"
-    );
-    drop(ready_rx);
     Ok(())
 }
 

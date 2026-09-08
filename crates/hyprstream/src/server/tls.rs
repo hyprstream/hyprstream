@@ -468,3 +468,94 @@ mod acme_tests {
         Ok(())
     }
 }
+
+
+#[cfg(test)]
+mod bound_serve_tests {
+    use super::*;
+    use axum::routing::get;
+    use rustls::pki_types::{CertificateDer, ServerName};
+
+    /// Positive HTTPS regression through the production bind/serve seam:
+    /// `bind_listener` retains the real socket, `serve_bound` hands it to the
+    /// pinned `axum_server::from_tcp_rustls` constructor, a client that
+    /// TRUSTS the served certificate and verifies the hostname normally (no
+    /// verification bypass) completes a real request, and shutdown is
+    /// bounded. Same helper OAuth and OAI call before their readiness
+    /// signals.
+    #[tokio::test]
+    async fn bound_https_serves_verified_client_and_shuts_down_bounded()
+    -> anyhow::Result<()> {
+        hyprstream_rpc::transport::install_pq_crypto_provider()?;
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
+            generated.cert.pem().into_bytes(),
+            generated.key_pair.serialize_pem().into_bytes(),
+        )
+        .await?;
+
+        // Reserve, then bind through the production seam (no second bind).
+        let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = probe.local_addr()?;
+        drop(probe);
+        let bound = bind_listener(addr, Some(rustls_config), "BoundServeTest")?;
+
+        let app = axum::Router::new().route(
+            "/bound-serve-probe",
+            get(|| async { "bound-serve-ok" }),
+        );
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_signal = Arc::clone(&shutdown);
+        let server = tokio::spawn(serve_bound(bound, app, Arc::clone(&shutdown), "BoundServeTest"));
+
+        // Client trusts the served certificate and verifies "localhost"
+        // normally; no dangerous verification-disabling configuration.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(generated.cert.der().clone()))?;
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        // The client runs on a blocking thread over a real socket. `StreamOwned`
+        // implements blocking Read/Write that drives rustls IO internally (the
+        // raw ClientConnection reader only drains buffered plaintext); hostname
+        // and certificate verification stay fully enabled.
+        let client = std::thread::spawn(move || -> anyhow::Result<String> {
+            use std::io::{Read, Write};
+            let mut tcp = std::net::TcpStream::connect(addr)?;
+            tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let tls = rustls::ClientConnection::new(
+                Arc::new(client_config),
+                ServerName::try_from("localhost")?,
+            )?;
+            let mut stream = rustls::StreamOwned::new(tls, tcp);
+            stream.write_all(
+                b"GET /bound-serve-probe HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            Ok(String::from_utf8_lossy(&response).into_owned())
+        });
+
+        let response = tokio::task::spawn_blocking(move || client.join())
+            .await
+            .expect("client joiner must not fail")
+            .expect("client thread must not panic")?;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "verified-TLS client must receive HTTP 200: got {response:?}"
+        );
+        assert!(
+            response.contains("bound-serve-ok"),
+            "exact probe body must be served through the TLS path: got {response:?}"
+        );
+
+        // Bounded shutdown: the retained handle's server ends cleanly.
+        shutdown_signal.notify_one();
+        tokio::time::timeout(Duration::from_secs(30), server)
+            .await
+            .expect("serve_bound must terminate within the shutdown budget")?
+            .expect("graceful shutdown must complete Ok");
+        Ok(())
+    }
+
+}
