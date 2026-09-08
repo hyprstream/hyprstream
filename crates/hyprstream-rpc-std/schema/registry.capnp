@@ -77,7 +77,7 @@ struct RegistryRequest {
     repo @9 :RepositoryRequest $vfsKind(dir) $vfsPath("repo/{repoId}");
 
     # Fetch content-addressed bytes (git OID or XET merkle root) as a stream.
-    getBlob @10 :GetBlobRequest $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Fetch content-addressed bytes (git OID or XET merkle root) as a stream");
+    getBlob @10 :GetBlobRequest $scope(query) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required") $mcpDescription("Fetch content-addressed bytes (git OID or XET merkle root) as a stream");
 
     # Ingest content-addressed bytes IN-BAND (the symmetric write half of getBlob).
     # Epic #654: the missing authenticated upload path. Today writes bypass

@@ -5,13 +5,25 @@
 //! a build error, so code generation cannot infer retry safety from a scope.
 
 /// The explicit semantics declared by `$mutationSemantics` on a mutating leaf.
+///
+/// These variants are checked metadata describing each method's retry
+/// semantics or activation prerequisite; the parser and the generated
+/// inventory enforce only that a well-formed declaration exists — the
+/// annotation itself does not implement enforcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclaredMutationSemantics {
     /// Retrying the same intended operation is safe without extra machinery.
     NaturallyIdempotent,
-    /// The method payload carries an application idempotency key.
+    /// Activation prerequisite: before retry is enabled, the method payload
+    /// must carry a caller application idempotency key and the service must
+    /// durably bind that key to the recorded result. This declaration does
+    /// not establish that the key/result mechanism exists; activation must
+    /// verify the method implementation.
     IdempotencyKeyRequired,
-    /// Correct retry semantics require an atomic result/mutation ledger or fencing.
+    /// Activation prerequisite: retry safety requires a separately claimed
+    /// exactly-once-visible contract with atomic commit/fencing. This
+    /// declaration does not establish that such a contract exists; activation
+    /// must verify the method implementation.
     TransactionLedgerRequired,
 }
 

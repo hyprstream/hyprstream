@@ -225,6 +225,20 @@ fn parse_cgr(
         sc
     };
 
+    // Validate policy metadata while the complete local struct graph is available.
+    validate_mandatory_dispatch_with_structs(
+        service_name,
+        &request_variants,
+        &scoped_clients,
+        &all_structs,
+    )?;
+    validate_mandatory_mutation_policy_with_structs(
+        service_name,
+        &request_variants,
+        &scoped_clients,
+        &all_structs,
+    )?;
+
     // Partition: for data-only schemas keep all structs; otherwise separate request/response
     let (referenced, request_struct, response_struct) = if is_data_only {
         (all_structs, None, None)
@@ -248,15 +262,6 @@ fn parse_cgr(
     // client detection so dispatcher variants (which carry no scope of their own;
     // their leaves do) are correctly exempt.
     validate_mandatory_scope(service_name, &request_variants, &scoped_clients)?;
-
-    // v16 §6 (WS-D, #1505): the dispatch-policy pair is MANDATORY on every
-    // leaf. Same structural walk as the scope gate: scoped dispatchers carry
-    // neither annotation; their leaves carry exactly one.
-    validate_mandatory_dispatch(service_name, &request_variants, &scoped_clients)?;
-
-    // v16 §4.8/§6.1: mutation semantics are explicit, checked leaf metadata.
-    // A scope cannot imply retry safety.
-    validate_mandatory_mutation_policy(service_name, &request_variants, &scoped_clients)?;
 
     Ok(ParsedSchema {
         request_variants,
@@ -347,179 +352,482 @@ fn validate_mandatory_scope(
 /// the same facts and emits `compile_error!` for any leaf this walk cannot
 /// reach (hand-dispatched pure-union arms), so no annotation failure can ever
 /// produce an unlabeled runtime row.
+#[cfg(test)]
 fn validate_mandatory_dispatch(
     service_name: &str,
     request_variants: &[UnionVariant],
     scoped_clients: &[ScopedClient],
 ) -> Result<(), String> {
-    fn check_leaf(service_name: &str, path: &str, v: &UnionVariant) -> Result<(), String> {
-        let has_mac = !v.dispatch_mac.is_empty();
-        let has_public = !v.dispatch_public.is_empty();
-        match (has_mac, has_public) {
-            (false, false) => {
-                return Err(format!(
-                    "service `{service_name}`: method `{path}{}` has neither a `$dispatchMac` nor a \
-                     `$dispatchPublic` annotation — the dispatch-policy pair is mandatory on every \
-                     leaf (v16 §6). Add e.g. `$dispatchMac(\"internal:pq-hybrid\")`, or \
-                     `$dispatchPublic(\"<reason>\")` only for a genuinely unauthenticated leaf.",
-                    v.name
-                ));
-            }
-            (true, true) => {
-                return Err(format!(
-                    "service `{service_name}`: method `{path}{}` carries BOTH `$dispatchMac` and \
-                     `$dispatchPublic` — exactly one dispatch annotation per leaf (v16 §6).",
-                    v.name
-                ));
-            }
-            _ => {}
-        }
-        if has_public {
-            if !v.scope.is_empty() {
-                return Err(format!(
-                    "service `{service_name}`: method `{path}{}` is `$dispatchPublic` but also \
-                     declares the `$scope({})` action — a control-plane-scoped method cannot be \
-                     dispatch-public.",
-                    v.name, v.scope
-                ));
-            }
-            // Strict reason contract (v16 §6): nonempty, and already trimmed.
-            // The declared annotation text IS the recorded inventory reason —
-            // padding is a schema error, never silently rewritten. The same
-            // closed parser runs again at derive codegen; failing here is the
-            // earliest possible gate.
-            if let Err(e) =
-                crate::schema::dispatch_label::parse_dispatch_public_reason(&v.dispatch_public)
-            {
-                return Err(format!(
-                    "service `{service_name}`: method `{path}{}`: {e}",
-                    v.name
-                ));
-            }
-        }
-        Ok(())
+    validate_mandatory_dispatch_with_structs(service_name, request_variants, scoped_clients, &[])
+}
+
+fn validate_mandatory_dispatch_with_structs(
+    service_name: &str,
+    request_variants: &[UnionVariant],
+    scoped_clients: &[ScopedClient],
+    all_structs: &[StructDef],
+) -> Result<(), String> {
+    let labels = crate::schema::dispatch_label::InitialLabelMap::load()
+        .map_err(|e| format!("service `{service_name}`: {e}"))?;
+
+    fn pure<'a>(all: &'a [StructDef], name: &str) -> Option<&'a StructDef> {
+        all.iter().find(|s| {
+            s.origin_file.is_none()
+                && s.name == name
+                && s.is_pure_union()
+                && s.option_inner_type().is_none()
+        })
     }
 
-    fn check_dispatcher(service_name: &str, path: &str, v: &UnionVariant) -> Result<(), String> {
-        if !v.dispatch_mac.is_empty() || !v.dispatch_public.is_empty() {
+    fn leaf(
+        service: &str,
+        path: &str,
+        name: &str,
+        scope: &str,
+        mac: &str,
+        mac_present: bool,
+        public: &str,
+        public_present: bool,
+        labels: &crate::schema::dispatch_label::InitialLabelMap,
+    ) -> Result<(), String> {
+        match (mac_present, public_present) {
+            (false, false) => Err(format!(
+                "service `{service}`: method `{path}{name}` has neither a `$dispatchMac` nor a `$dispatchPublic` annotation — the dispatch-policy pair is mandatory on every leaf (v16 §6)."
+            )),
+            (true, true) => Err(format!(
+                "service `{service}`: method `{path}{name}` carries BOTH `$dispatchMac` and `$dispatchPublic` — exactly one dispatch annotation per leaf (v16 §6)."
+            )),
+            (false, true) => {
+                if !scope.is_empty() {
+                    return Err(format!(
+                        "service `{service}`: method `{path}{name}` is `$dispatchPublic` but also declares `$scope({scope})`; cannot be dispatch-public"
+                    ));
+                }
+                crate::schema::dispatch_label::parse_dispatch_public_reason(public)
+                    .map(|_| ())
+                    .map_err(|e| format!("service `{service}`: method `{path}{name}`: {e}"))
+            }
+            (true, false) => crate::schema::dispatch_label::parse_dispatch_mac(mac, labels)
+                .map(|_| ())
+                .map_err(|e| {
+                    format!(
+                        "service `{service}`: method `{path}{name}` $dispatchMac {mac:?}: {e}"
+                    )
+                }),
+        }
+    }
+
+    fn selector<'a>(
+        service: &str,
+        path: &str,
+        name: &str,
+        _scope: &str,
+        mac: &'a str,
+        mac_present: bool,
+        _public: &str,
+        public_present: bool,
+        labels: &crate::schema::dispatch_label::InitialLabelMap,
+    ) -> Result<Option<&'a str>, String> {
+        if mac_present && public_present {
             return Err(format!(
-                "service `{service_name}`: dispatcher `{path}{}` carries a dispatch annotation — \
-                 scoped dispatcher nodes have neither; their leaves do (v16 §6).",
-                v.name
+                "service `{service}`: dispatcher `{path}{name}` carries BOTH `$dispatchMac` and `$dispatchPublic`"
             ));
         }
-        Ok(())
+        if public_present {
+            return Err(format!(
+                "service `{service}`: dispatcher `{path}{name}` carries `$dispatchPublic`; public is legal only on leaves"
+            ));
+        }
+        if mac_present {
+            crate::schema::dispatch_label::parse_dispatch_mac(mac, labels).map_err(|e| {
+                format!("service `{service}`: dispatcher `{path}{name}` $dispatchMac {mac:?}: {e}")
+            })?;
+            return Ok(Some(mac));
+        }
+        Ok(None)
     }
 
-    // Recurse into a scoped client's leaves + nested dispatchers.
-    fn check_scoped(service_name: &str, path: &str, sc: &ScopedClient) -> Result<(), String> {
-        let here = format!("{path}{} ", sc.factory_name);
-        let nested_names: Vec<&str> =
-            sc.nested_clients.iter().map(|n| n.factory_name.as_str()).collect();
-        for v in &sc.inner_request_variants {
-            if nested_names.contains(&v.name.as_str()) {
-                check_dispatcher(service_name, &here, v)?;
-                continue;
+    fn walk(
+        service: &str,
+        path: &str,
+        scope: &str,
+        inherited_mac: Option<&str>,
+        sdef: &StructDef,
+        all: &[StructDef],
+        labels: &crate::schema::dispatch_label::InitialLabelMap,
+    ) -> Result<(), String> {
+        for arm in &sdef.union_arms {
+            let arm_path = format!("{path}{}.", arm.name);
+            let nested = match &arm.payload {
+                ArmPayload::Type(name) => pure(all, name),
+                _ => None,
+            };
+            let local_mac = arm
+                .dispatch_mac_present
+                .then_some(arm.dispatch_mac.as_str());
+            let inherited_or_local = local_mac.or(inherited_mac);
+            if let Some(inner) = nested {
+                let next = selector(
+                    service,
+                    &arm_path,
+                    "",
+                    scope,
+                    arm.dispatch_mac.as_str(),
+                    arm.dispatch_mac_present,
+                    arm.dispatch_public.as_str(),
+                    arm.dispatch_public_present,
+                    labels,
+                )?;
+                walk(
+                    service,
+                    &arm_path,
+                    scope,
+                    next.or(inherited_mac),
+                    inner,
+                    all,
+                    labels,
+                )?;
+            } else {
+                let (mac, mac_present) = if arm.dispatch_public_present {
+                    // A local MAC remains present so a local MAC/Public pair
+                    // is rejected; a public-only leaf clears inherited MAC.
+                    if arm.dispatch_mac_present {
+                        (arm.dispatch_mac.as_str(), true)
+                    } else {
+                        ("", false)
+                    }
+                } else {
+                    (
+                        inherited_or_local.unwrap_or(""),
+                        inherited_or_local.is_some(),
+                    )
+                };
+                leaf(
+                    service,
+                    &arm_path,
+                    "",
+                    scope,
+                    mac,
+                    mac_present,
+                    &arm.dispatch_public,
+                    arm.dispatch_public_present,
+                    labels,
+                )?;
             }
-            check_leaf(service_name, &here, v)?;
-        }
-        for n in &sc.nested_clients {
-            check_scoped(service_name, &here, n)?;
         }
         Ok(())
     }
 
-    let dispatcher_names: Vec<&str> =
-        scoped_clients.iter().map(|sc| sc.factory_name.as_str()).collect();
-    for v in request_variants {
-        if dispatcher_names.contains(&v.name.as_str()) {
-            check_dispatcher(service_name, "", v)?;
-            continue;
+    fn scoped(
+        service: &str,
+        path: &str,
+        client: &ScopedClient,
+        all: &[StructDef],
+        labels: &crate::schema::dispatch_label::InitialLabelMap,
+    ) -> Result<(), String> {
+        let here = format!("{path}{} ", client.factory_name);
+        let nested_names: Vec<&str> = client
+            .nested_clients
+            .iter()
+            .map(|n| n.factory_name.as_str())
+            .collect();
+        for variant in &client.inner_request_variants {
+            if nested_names.contains(&variant.name.as_str()) {
+                if variant.dispatch_mac_present || variant.dispatch_public_present {
+                    return Err(format!(
+                        "service `{service}`: dispatcher `{here}{}` carries a dispatch annotation",
+                        variant.name
+                    ));
+                }
+            } else if let Some(inner) = pure(all, &variant.type_name) {
+                let inherited = selector(
+                    service,
+                    &here,
+                    &variant.name,
+                    &variant.scope,
+                    &variant.dispatch_mac,
+                    variant.dispatch_mac_present,
+                    &variant.dispatch_public,
+                    variant.dispatch_public_present,
+                    labels,
+                )?;
+                walk(
+                    service,
+                    &format!("{here}{}.", variant.name),
+                    &variant.scope,
+                    inherited,
+                    inner,
+                    all,
+                    labels,
+                )?;
+            } else {
+                leaf(
+                    service,
+                    &here,
+                    &variant.name,
+                    &variant.scope,
+                    &variant.dispatch_mac,
+                    variant.dispatch_mac_present,
+                    &variant.dispatch_public,
+                    variant.dispatch_public_present,
+                    labels,
+                )?;
+            }
         }
-        check_leaf(service_name, "", v)?;
+        for nested in &client.nested_clients {
+            scoped(service, &here, nested, all, labels)?;
+        }
+        Ok(())
     }
-    for sc in scoped_clients {
-        check_scoped(service_name, "", sc)?;
+
+    let dispatcher_names: Vec<&str> = scoped_clients
+        .iter()
+        .map(|client| client.factory_name.as_str())
+        .collect();
+    for variant in request_variants {
+        if dispatcher_names.contains(&variant.name.as_str()) {
+            if variant.dispatch_mac_present || variant.dispatch_public_present {
+                return Err(format!(
+                    "service `{service_name}`: dispatcher `{}` carries a dispatch annotation",
+                    variant.name
+                ));
+            }
+        } else if let Some(inner) = pure(all_structs, &variant.type_name) {
+            let inherited = selector(
+                service_name,
+                "",
+                &variant.name,
+                &variant.scope,
+                &variant.dispatch_mac,
+                variant.dispatch_mac_present,
+                &variant.dispatch_public,
+                variant.dispatch_public_present,
+                &labels,
+            )?;
+            walk(
+                service_name,
+                &format!("{}.", variant.name),
+                &variant.scope,
+                inherited,
+                inner,
+                all_structs,
+                &labels,
+            )?;
+        } else {
+            leaf(
+                service_name,
+                "",
+                &variant.name,
+                &variant.scope,
+                &variant.dispatch_mac,
+                variant.dispatch_mac_present,
+                &variant.dispatch_public,
+                variant.dispatch_public_present,
+                &labels,
+            )?;
+        }
+    }
+    for client in scoped_clients {
+        scoped(service_name, "", client, all_structs, &labels)?;
     }
     Ok(())
 }
 
-/// Enforce v16 §4.8/§6.1's explicit per-method mutation-policy declaration.
-///
-/// Every non-read scoped leaf must use one of the three closed values. A
-/// read-class (`query`, `subscribe`) leaf may also declare one when it changes
-/// bounded session or subscription state: authorization and effect semantics
-/// are separate axes. Scope exemption likewise records authorization, not an
-/// effect classification. Dispatchers have no handler of their own, so policy
-/// metadata there would be dead and is rejected.
+#[cfg(test)]
 fn validate_mandatory_mutation_policy(
     service_name: &str,
     request_variants: &[UnionVariant],
     scoped_clients: &[ScopedClient],
 ) -> Result<(), String> {
-    fn check_leaf(service_name: &str, path: &str, v: &UnionVariant) -> Result<(), String> {
-        let read_class = crate::schema::dispatch_label::READ_CLASS_ACTIONS
-            .contains(&v.scope.as_str());
-        if read_class && v.mutation_semantics.is_empty() {
+    validate_mandatory_mutation_policy_with_structs(
+        service_name,
+        request_variants,
+        scoped_clients,
+        &[],
+    )
+}
+
+fn validate_mandatory_mutation_policy_with_structs(
+    service_name: &str,
+    request_variants: &[UnionVariant],
+    scoped_clients: &[ScopedClient],
+    all_structs: &[StructDef],
+) -> Result<(), String> {
+    fn pure<'a>(all: &'a [StructDef], name: &str) -> Option<&'a StructDef> {
+        all.iter().find(|s| {
+            s.origin_file.is_none()
+                && s.name == name
+                && s.is_pure_union()
+                && s.option_inner_type().is_none()
+        })
+    }
+    fn leaf(
+        service: &str,
+        path: &str,
+        name: &str,
+        scope: &str,
+        semantics: &str,
+        present: bool,
+    ) -> Result<(), String> {
+        let read = crate::schema::dispatch_label::READ_CLASS_ACTIONS.contains(&scope);
+        if !present {
+            if !read && !scope.is_empty() {
+                return Err(format!("service `{service}`: method `{path}{name}` (scope `{scope}`) is missing required `$mutationSemantics`; declare its actual retry/application-effect policy"));
+            }
             return Ok(());
         }
-        // Scope-exempt leaves are not implicitly read-only: a public check may
-        // carry no policy, while a separately authenticated exempt operation
-        // may explicitly declare one. The existing scope gate verifies the
-        // exemption itself is recorded and reviewable.
-        if v.scope.is_empty() && v.mutation_semantics.is_empty() {
-            return Ok(());
-        }
-        parse_mutation_semantics(&v.mutation_semantics).map_err(|e| {
-            format!(
-                "service `{service_name}`: method `{path}{}` (scope `{}`) {e}; declare its actual retry/application-effect policy",
-                v.name, v.scope
-            )
-        })?;
-        Ok(())
+        parse_mutation_semantics(semantics).map(|_| ()).map_err(|e| format!("service `{service}`: method `{path}{name}` (scope `{scope}`) {e}; declare its actual retry/application-effect policy"))
     }
-
-    fn check_dispatcher(service_name: &str, path: &str, v: &UnionVariant) -> Result<(), String> {
-        if !v.mutation_semantics.is_empty() {
-            return Err(format!(
-                "service `{service_name}`: dispatcher `{path}{}` carries `$mutationSemantics`; declare policy on each executable leaf instead",
-                v.name
-            ));
-        }
-        Ok(())
-    }
-
-    fn check_scoped(service_name: &str, path: &str, sc: &ScopedClient) -> Result<(), String> {
-        let here = format!("{path}{} ", sc.factory_name);
-        let nested_names: Vec<&str> = sc.nested_clients.iter().map(|n| n.factory_name.as_str()).collect();
-        for v in &sc.inner_request_variants {
-            if nested_names.contains(&v.name.as_str()) {
-                check_dispatcher(service_name, &here, v)?;
+    fn walk(
+        service: &str,
+        path: &str,
+        scope: &str,
+        inherited: Option<&str>,
+        sdef: &StructDef,
+        all: &[StructDef],
+    ) -> Result<(), String> {
+        for arm in &sdef.union_arms {
+            let semantics = if arm.mutation_semantics_present {
+                Some(arm.mutation_semantics.as_str())
             } else {
-                check_leaf(service_name, &here, v)?;
+                inherited
+            };
+            if let Some(inner) = match &arm.payload {
+                ArmPayload::Type(name) => pure(all, name),
+                _ => None,
+            } {
+                if arm.mutation_semantics_present {
+                    parse_mutation_semantics(arm.mutation_semantics.as_str()).map_err(|e| {
+                        format!(
+                            "service `{service}`: dispatcher `{path}{}` $mutationSemantics: {e}",
+                            arm.name
+                        )
+                    })?;
+                }
+                walk(
+                    service,
+                    &format!("{path}{}.", arm.name),
+                    scope,
+                    semantics,
+                    inner,
+                    all,
+                )?;
+            } else {
+                leaf(
+                    service,
+                    &format!("{path}{}.", arm.name),
+                    "",
+                    scope,
+                    semantics.unwrap_or(""),
+                    semantics.is_some(),
+                )?;
             }
         }
-        for nested in &sc.nested_clients {
-            check_scoped(service_name, &here, nested)?;
+        Ok(())
+    }
+    fn scoped(
+        service: &str,
+        path: &str,
+        client: &ScopedClient,
+        all: &[StructDef],
+    ) -> Result<(), String> {
+        let here = format!("{path}{} ", client.factory_name);
+        let nested_names: Vec<&str> = client
+            .nested_clients
+            .iter()
+            .map(|n| n.factory_name.as_str())
+            .collect();
+        for variant in &client.inner_request_variants {
+            if nested_names.contains(&variant.name.as_str()) {
+                if variant.mutation_semantics_present {
+                    return Err(format!(
+                        "service `{service}`: dispatcher `{here}{}` carries `$mutationSemantics`",
+                        variant.name
+                    ));
+                }
+            } else if let Some(inner) = pure(all, &variant.type_name) {
+                if variant.mutation_semantics_present {
+                    parse_mutation_semantics(&variant.mutation_semantics).map_err(|e| {
+                        format!(
+                            "service `{service}`: dispatcher `{here}{}` $mutationSemantics: {e}",
+                            variant.name
+                        )
+                    })?;
+                }
+                walk(
+                    service,
+                    &format!("{here}{}.", variant.name),
+                    &variant.scope,
+                    variant
+                        .mutation_semantics_present
+                        .then_some(variant.mutation_semantics.as_str()),
+                    inner,
+                    all,
+                )?;
+            } else {
+                leaf(
+                    service,
+                    &here,
+                    &variant.name,
+                    &variant.scope,
+                    &variant.mutation_semantics,
+                    variant.mutation_semantics_present,
+                )?;
+            }
+        }
+        for nested in &client.nested_clients {
+            scoped(service, &here, nested, all)?;
         }
         Ok(())
     }
-
-    let dispatcher_names: Vec<&str> = scoped_clients.iter().map(|sc| sc.factory_name.as_str()).collect();
-    for v in request_variants {
-        if dispatcher_names.contains(&v.name.as_str()) {
-            check_dispatcher(service_name, "", v)?;
+    let names: Vec<&str> = scoped_clients
+        .iter()
+        .map(|client| client.factory_name.as_str())
+        .collect();
+    for variant in request_variants {
+        if names.contains(&variant.name.as_str()) {
+            if variant.mutation_semantics_present {
+                return Err(format!(
+                    "service `{service_name}`: dispatcher `{}` carries `$mutationSemantics`",
+                    variant.name
+                ));
+            }
+        } else if let Some(inner) = pure(all_structs, &variant.type_name) {
+            if variant.mutation_semantics_present {
+                parse_mutation_semantics(&variant.mutation_semantics).map_err(|e| {
+                    format!(
+                        "service `{service_name}`: dispatcher `{}` $mutationSemantics: {e}",
+                        variant.name
+                    )
+                })?;
+            }
+            walk(
+                service_name,
+                &format!("{}.", variant.name),
+                &variant.scope,
+                variant
+                    .mutation_semantics_present
+                    .then_some(variant.mutation_semantics.as_str()),
+                inner,
+                all_structs,
+            )?;
         } else {
-            check_leaf(service_name, "", v)?;
+            leaf(
+                service_name,
+                "",
+                &variant.name,
+                &variant.scope,
+                &variant.mutation_semantics,
+                variant.mutation_semantics_present,
+            )?;
         }
     }
-    for sc in scoped_clients {
-        check_scoped(service_name, "", sc)?;
+    for client in scoped_clients {
+        scoped(service_name, "", client, all_structs)?;
     }
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Node lookup helpers
 // ---------------------------------------------------------------------------
 
@@ -965,11 +1273,23 @@ fn extract_union_variants(
             field.get_annotations().map_err(|e| format!("{e}"))?,
             dispatch_mac_id,
         );
+        let dispatch_mac_present = has_annotation(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            dispatch_mac_id,
+        );
+        let dispatch_public_present = has_annotation(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            dispatch_public_id,
+        );
         let dispatch_public = extract_annotation_text(
             field.get_annotations().map_err(|e| format!("{e}"))?,
             dispatch_public_id,
         );
         let mutation_semantics = extract_annotation_text(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            mutation_semantics_id,
+        );
+        let mutation_semantics_present = has_annotation(
             field.get_annotations().map_err(|e| format!("{e}"))?,
             mutation_semantics_id,
         );
@@ -988,8 +1308,11 @@ fn extract_union_variants(
             vfs_hidden,
             vfs_mac,
             dispatch_mac,
+            dispatch_mac_present,
             dispatch_public,
+            dispatch_public_present,
             mutation_semantics,
+            mutation_semantics_present,
         });
     }
 
@@ -1153,6 +1476,17 @@ fn extract_union_arms(
             }
         };
 
+        let dispatch_mac_id = annotation_id_by_short_name(node_map, "dispatchMac");
+        let dispatch_public_id = annotation_id_by_short_name(node_map, "dispatchPublic");
+        let mutation_semantics_id = annotation_id_by_short_name(node_map, "mutationSemantics");
+        let annotations = field.get_annotations().map_err(|e| format!("{e}"))?;
+        let dispatch_mac_present = has_annotation(annotations, dispatch_mac_id);
+        let dispatch_mac = extract_annotation_text(annotations, dispatch_mac_id);
+        let dispatch_public_present = has_annotation(annotations, dispatch_public_id);
+        let dispatch_public = extract_annotation_text(annotations, dispatch_public_id);
+        let mutation_semantics_present = has_annotation(annotations, mutation_semantics_id);
+        let mutation_semantics = extract_annotation_text(annotations, mutation_semantics_id);
+
         let payload = match field.which() {
             Ok(capnp::schema_capnp::field::Slot(slot)) => {
                 let type_reader = slot.get_type().map_err(|e| format!("{e}"))?;
@@ -1204,6 +1538,12 @@ fn extract_union_arms(
             name,
             discriminant_value: disc,
             description,
+            dispatch_mac,
+            dispatch_mac_present,
+            dispatch_public,
+            dispatch_public_present,
+            mutation_semantics,
+            mutation_semantics_present,
             payload,
         });
     }
@@ -1892,6 +2232,9 @@ mod mandatory_scope_tests {
             dispatch_mac: String::new(),
             dispatch_public: String::new(),
             mutation_semantics: String::new(),
+            dispatch_mac_present: false,
+            dispatch_public_present: false,
+            mutation_semantics_present: false,
         }
     }
 
@@ -1979,6 +2322,9 @@ mod mandatory_dispatch_tests {
             dispatch_mac: mac.to_owned(),
             dispatch_public: public.to_owned(),
             mutation_semantics: String::new(),
+            dispatch_mac_present: !mac.is_empty(),
+            dispatch_public_present: !public.is_empty(),
+            mutation_semantics_present: false,
         }
     }
 
@@ -2077,6 +2423,9 @@ mod mandatory_mutation_policy_tests {
             dispatch_mac: "internal:pq-hybrid".to_owned(),
             dispatch_public: String::new(),
             mutation_semantics: semantics.to_owned(),
+            dispatch_mac_present: true,
+            dispatch_public_present: false,
+            mutation_semantics_present: !semantics.is_empty(),
         }
     }
 

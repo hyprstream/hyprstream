@@ -88,11 +88,13 @@ struct MetricsRequest {
 
     # Prepares a server-side third-party interop stream context under the
     # client's ephemeral pubkey and schedules the query continuation before
-    # the reply is observed, so a replay duplicates the allocation/work.
-    # At-most-once preparation requires an atomic result ledger; none is
-    # implemented here — this records the required semantics.
+    # the reply is observed, so a replay duplicates the allocation/work — the
+    # same allocation/continuation effect already classified key-required for
+    # the other streaming leaves. Retry safety requires a caller-supplied
+    # application idempotency key plus a recorded result; neither exists
+    # today — this declares the missing activation work.
     queryStream  @3 :MetricQuery
-      $scope(query) $mutationSemantics("transaction-ledger-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Stream structured metrics query results as Arrow IPC RecordBatch chunks; raw SQL is rejected");
+      $scope(query) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Stream structured metrics query results as Arrow IPC RecordBatch chunks; raw SQL is rejected");
 
     createView   @4 :ViewSpec
       $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Create a materialized view over the metrics table");

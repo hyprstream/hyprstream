@@ -355,13 +355,112 @@ fn metrics_query_leaves_declare_only_real_effect_semantics() {
     };
     assert_eq!(
         semantics("queryStream"),
-        Some(MutationSemantics::TransactionLedgerRequired),
+        Some(MutationSemantics::IdempotencyKeyRequired),
         "a replayed queryStream duplicates the interop-stream preparation and \
          scheduled continuation"
     );
     assert_eq!(semantics("query"), None, "structured query is a genuine read");
     // Genuine reads stay policy-free.
     assert_eq!(semantics("listViews"), None);
+}
+
+/// Inference LoRA lifecycle and stream-allocation leaves follow their real
+/// handler effects: createLora/loadLora bump `lora_generation` (feeding
+/// GuardStatus -> adaptation_state.resolve, so a replay invalidates pending
+/// adaptation work) and every `*_stream` variant allocates a fresh
+/// third-party interop stream plus a scheduled continuation via
+/// `setup_stream`. Neither effect carries a separately claimed exactly-once
+/// contract, so both declare the caller-key/result-record requirement
+/// (v16 §4.8): a future caller-supplied idempotency key plus recorded
+/// result. `trainStep` advances the per-subject TTT delta per call and
+/// requires the same, matching its already-keyed stream twin.
+/// Handler-accurate naturals (fixed-path writes, consuming writebacks,
+/// convergent sessions, pure compute) are pinned so the classification stays
+/// handler-accurate. No enforcement consumes these declarations at this head.
+#[test]
+fn inference_lora_and_stream_effects_declare_required_semantics() {
+    use policy::MutationSemantics;
+
+    let rows = policy::collect_generated_rows().expect("inventory collects");
+    let semantics = |leaf: &str| {
+        rows.iter()
+            .find(|row| row.service == "inference" && row.symbolic_path == leaf)
+            .unwrap_or_else(|| panic!("missing inference:{leaf}"))
+            .mutation_semantics
+    };
+
+    for leaf in ["createLora", "loadLora"] {
+        assert_eq!(
+            semantics(leaf),
+            Some(MutationSemantics::IdempotencyKeyRequired),
+            "inference.{leaf} bumps lora_generation: replay safety requires a \
+             caller-supplied idempotency key and a recorded result"
+        );
+    }
+    for leaf in [
+        "createLoraStream",
+        "loadLoraStream",
+        "saveLoraStream",
+        "snapshotDeltaStream",
+        "exportPeftAdapterStream",
+    ] {
+        assert_eq!(
+            semantics(leaf),
+            Some(MutationSemantics::IdempotencyKeyRequired),
+            "inference.{leaf} allocates a stream + continuation: replay safety \
+             requires a caller-supplied idempotency key and a recorded result"
+        );
+    }
+    assert_eq!(
+        semantics("trainStep"),
+        Some(MutationSemantics::IdempotencyKeyRequired),
+        "a replayed trainStep advances the TTT delta twice"
+    );
+    for leaf in ["saveLora", "unloadLora", "tttWriteback", "snapshotDelta", "embed"] {
+        assert_eq!(
+            semantics(leaf),
+            Some(MutationSemantics::NaturallyIdempotent),
+            "inference.{leaf} is handler-convergent and must stay natural"
+        );
+    }
+}
+
+/// Model-scoped proxies inherit the callee's classification: `ttt.init`
+/// proxies inference createLora and `adapter.load` proxies inference
+/// loadLora (both key-required), and `ttt.train` proxies inference trainStep
+/// (keyed, matching `ttt.trainStream`). The consuming/convergent proxies
+/// (`ttt.writeback`, `ttt.evict`, `ttt.zero`) stay natural.
+#[test]
+fn model_proxy_leaves_inherit_callee_effect_classes() {
+    use policy::MutationSemantics;
+
+    let rows = policy::collect_generated_rows().expect("inventory collects");
+    let semantics = |leaf: &str| {
+        rows.iter()
+            .find(|row| row.service == "model" && row.symbolic_path == leaf)
+            .unwrap_or_else(|| panic!("missing model:{leaf}"))
+            .mutation_semantics
+    };
+    assert_eq!(
+        semantics("ttt.init"),
+        Some(MutationSemantics::IdempotencyKeyRequired)
+    );
+    assert_eq!(
+        semantics("adapter.load"),
+        Some(MutationSemantics::IdempotencyKeyRequired)
+    );
+    assert_eq!(
+        semantics("ttt.train"),
+        Some(MutationSemantics::IdempotencyKeyRequired)
+    );
+    assert_eq!(
+        semantics("ttt.writeback"),
+        Some(MutationSemantics::NaturallyIdempotent)
+    );
+    assert_eq!(
+        semantics("ttt.evict"),
+        Some(MutationSemantics::NaturallyIdempotent)
+    );
 }
 
 /// The at9p admission path returns the durably fenced accepted head on an
@@ -404,6 +503,31 @@ fn registry_stateful_query_leaves_declare_their_effects() {
     assert_eq!(
         semantics("repo.worktree.clunk"),
         Some(MutationSemantics::NaturallyIdempotent)
+    );
+}
+
+/// `getBlob` is query-authorized, but opening its stream allocates a fresh
+/// authenticated StreamContext and schedules a continuation. Keep that
+/// effect classification tied to the generated row so a schema edit cannot
+/// silently drop it while retaining the query/credential gate.
+#[test]
+fn registry_get_blob_stream_opener_declares_required_key_semantics() {
+    use policy::MutationSemantics;
+
+    let rows = policy::collect_generated_rows().expect("inventory collects");
+    let get_blob = rows
+        .iter()
+        .find(|row| row.service == "registry" && row.symbolic_path == "getBlob")
+        .expect("registry.getBlob row present");
+    assert_eq!(get_blob.scope_action, "query");
+    assert_eq!(
+        get_blob.authentication,
+        policy::AuthenticationRequirement::CredentialRequired
+    );
+    assert_eq!(
+        get_blob.mutation_semantics,
+        Some(MutationSemantics::IdempotencyKeyRequired),
+        "stream opening allocates a fresh context and continuation"
     );
 }
 
