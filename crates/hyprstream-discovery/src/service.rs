@@ -3821,6 +3821,29 @@ pub fn production_rpc_client(
     )?))
 }
 
+/// The authenticated Discovery client this process's own bootstrap installed,
+/// when bootstrap installed one.
+///
+/// Present after required-native bootstrap (checkpoint-backed resolver) and
+/// after both DID-anchored arms — the remote-node network client
+/// (KEM/PQ-bound, liveness-verified at install) and the same-node lazy local
+/// client. `None` when no bootstrap ran, so callers fall back to their own
+/// profile selection.
+///
+/// This — not the native-network profile — carries installed-bootstrap reach:
+/// DID-anchored `remote_node = true` explicitly boots with
+/// `network_required = false`, and the installed network client is the only
+/// Discovery reach a remote node has. The client is authenticated per its
+/// installing arm (pinned discovery key; remote-node additionally KEM/PQ-bound
+/// and liveness-verified before install).
+pub fn installed_bootstrap_discovery_client() -> Option<crate::DiscoveryClient> {
+    PRODUCTION_RESOLVER
+        .get()
+        .cloned()?
+        .discovery_client
+        .clone()
+}
+
 /// Construct a production RPC client pinned to one router-selected advertised
 /// reach while retaining Discovery's opaque identity/currentness authority.
 ///
@@ -4337,6 +4360,32 @@ pub mod test_fixtures {
                 anyhow::anyhow!("production inference fixture resolver is already installed")
             })?;
         Ok(fixture)
+    }
+
+    /// Install a bootstrap-carried Discovery client as the process resolver,
+    /// mirroring the post-`bootstrap_authenticated_process` state: the
+    /// resolver holds the authenticated client bootstrap installed.
+    ///
+    /// Bounds: proves downstream selection/reach wiring only — that callers
+    /// use the installed client rather than re-resolving — and proves nothing
+    /// about deployed Policy/MAC acceptance or the deployment-credential
+    /// chain (candidates are served by the installed client itself).
+    pub fn install_bootstrap_discovery_client_fixture(
+        discovery_client: crate::DiscoveryClient,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            PRODUCTION_RESOLVER.get().is_none(),
+            "production resolver fixture is already installed"
+        );
+        PRODUCTION_RESOLVER
+            .set(Arc::new(DiscoveryServiceResolver {
+                state_store: MemoryStateStore::production_default(),
+                accepted_state_source: Arc::new(FixtureAcceptedStates(
+                    parking_lot::Mutex::new(HashMap::new()),
+                )),
+                discovery_client: Some(discovery_client),
+            }))
+            .map_err(|_| anyhow::anyhow!("production resolver is already installed"))
     }
 
     pub(super) fn dial_override(transport: &TransportConfig) -> Result<Option<Arc<dyn RpcClient>>> {

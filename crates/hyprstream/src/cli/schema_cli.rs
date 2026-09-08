@@ -436,9 +436,12 @@ async fn dispatch_top_level(
 }
 
 /// Construct the Discovery client using the process's already-selected
-/// network profile. Required-native never falls back to a local endpoint;
-/// Compatibility uses the installed service trust key and deterministic local
-/// REP transport, which is the supported standalone CLI bootstrap path.
+/// network profile. An authenticated bootstrap-installed client (required-
+/// native checkpoint-backed resolver, or the DID-anchored reach — including
+/// `remote_node = true`, which boots with `network_required = false`) is
+/// used directly. Required-native never falls back to a local endpoint;
+/// Compatibility standalone uses the installed service trust key and
+/// deterministic local REP transport.
 fn create_discovery_client(signing_key: &SigningKey) -> Result<DiscoveryClient> {
     create_discovery_client_for_profile(signing_key, hyprstream_discovery::native_network_required())
 }
@@ -447,6 +450,17 @@ fn create_discovery_client_for_profile(
     signing_key: &SigningKey,
     network_required: bool,
 ) -> Result<DiscoveryClient> {
+    // The reach this process's own bootstrap installed is authoritative
+    // regardless of the native-network profile: process topology and
+    // transport enforcement are separate axes. DID-anchored `remote_node =
+    // true` bootstrap explicitly runs with `network_required = false` while
+    // installing a signed, liveness-verified network client; branching only
+    // on the profile here would discard that authenticated reach and dial a
+    // local REP socket the remote node does not have.
+    if let Some(installed) = hyprstream_discovery::installed_bootstrap_discovery_client() {
+        return Ok(installed);
+    }
+
     if network_required {
         return DiscoveryClient::from_resolver(signing_key.clone(), None);
     }
@@ -797,6 +811,234 @@ mod tests {
         assert!(
             text.contains("resolver") || text.contains("validated alternative"),
             "unexpected required-native denial: {text}"
+        );
+    }
+
+    /// Selection/signed-response proof over an installed authenticated client:
+    /// with a bootstrap-installed Discovery client present, the ping command
+    /// must use that client — not the profile's local-REP branch — even when a
+    /// local endpoint is registered. The client here rides an IPC stand-in for
+    /// the installed network reach (selection semantics are transport-
+    /// independent); the REAL remote DID bootstrap + network reach + accessor
+    /// integration is proven in `did_trust_e2e.rs`
+    /// (`did_anchored_bootstrap_boots_end_to_end`). Deployed Policy/MAC
+    /// acceptance is out of scope for this fixture.
+    #[tokio::test]
+    async fn installed_client_ping_uses_installed_reach_not_local_decoy() {
+        if std::env::var_os("HYPRSTREAM_DISCOVERY_PING_INSTALLED_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::schema_cli::tests::installed_client_ping_uses_installed_reach_not_local_decoy",
+                    "--nocapture",
+                ])
+                .env("HYPRSTREAM_DISCOVERY_PING_INSTALLED_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated remote-node child failed: {status}");
+            return;
+        }
+
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use tokio::sync::{oneshot, Notify};
+
+        crate::mac::install_explicit_test_dispatch_pep();
+        let service_key = SigningKey::from_bytes(&[9u8; 32]);
+        let caller_key = test_signing_key();
+        let caller_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&caller_key);
+        let caller_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&caller_pq),
+        )
+        .unwrap();
+        let service_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&service_key);
+        let service_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&service_pq),
+        )
+        .unwrap();
+        let mut pq_store = hyprstream_rpc::envelope::KeyedPqTrustStore::new();
+        pq_store.bind(caller_key.verifying_key().to_bytes(), &caller_pq_vk);
+        pq_store.bind(service_key.verifying_key().to_bytes(), &service_pq_vk);
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+                pq_store: Some(Arc::new(pq_store)),
+            },
+        );
+        let mut response_pq_store = hyprstream_rpc::envelope::KeyedPqTrustStore::new();
+        response_pq_store.bind(service_key.verifying_key().to_bytes(), &service_pq_vk);
+        let _ = hyprstream_rpc::envelope::install_response_verify_config(
+            hyprstream_rpc::envelope::ResponseVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+                pq_store: Some(Arc::new(response_pq_store)),
+            },
+        );
+
+        // The installed network reach: a REAL Discovery service serving signed
+        // responses behind the pinned genuine discovery key. Fixture bound:
+        // proves selection and signed-response verification over the installed
+        // client; it does not exercise a remote KEM/PQ dial (bootstrap's own
+        // tested behavior) or deployed Policy/MAC acceptance.
+        let reach_dir = tempfile::tempdir().unwrap();
+        let reach_transport = hyprstream_rpc::transport::TransportConfig::ipc(
+            reach_dir.path().join("remote-discovery.sock"),
+        );
+        hyprstream_service::global_trust_store().insert(
+            service_key.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: HashSet::from(["discovery".to_owned()]),
+                subject: None,
+                jwt: None,
+                expires_at: 0,
+                attested_by: None,
+            },
+        );
+        let service = hyprstream_discovery::DiscoveryService::new(
+            Arc::new(service_key.clone()),
+            service_key.verifying_key(),
+            reach_transport.clone(),
+        )
+        .with_auth_provider(Box::new(CompatAllowAll));
+        let bridge = Arc::new(hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
+            service,
+            Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new()),
+            0,
+        )
+        .unwrap());
+        let shutdown = Arc::new(Notify::new());
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let server_shutdown = Arc::clone(&shutdown);
+        let server_transport = reach_transport.clone();
+        let server_bridge = Arc::clone(&bridge);
+        let service_vk = service_key.verifying_key();
+        let spawn_key = service_key.clone();
+        let server = tokio::spawn(async move {
+            hyprstream_rpc::service::serve::serve_bridged(
+                &server_transport,
+                server_bridge,
+                spawn_key,
+                server_shutdown,
+                Some(ready_tx),
+            )
+            .await
+        });
+        ready_rx.await.unwrap();
+
+        // The client bootstrap installed (authenticated: pinned discovery key)
+        // — in production this is the DID-anchored remote-node network client.
+        let installed = hyprstream_discovery::DiscoveryClient::for_local_transport_bootstrap(
+            &reach_transport,
+            caller_key.clone(),
+            service_vk,
+            None,
+        )
+        .unwrap();
+        hyprstream_discovery::install_bootstrap_discovery_client_fixture(installed)
+            .expect("install bootstrap client fixture");
+
+        // The unusable local decoy: an explicitly registered local Discovery
+        // REP behind which nothing listens. If selection wrongly took the
+        // local branch (the P2 defect), the dial here fails.
+        let decoy_dir = tempfile::tempdir().unwrap();
+        hyprstream_rpc::registry::init(
+            hyprstream_rpc::registry::EndpointMode::Ipc,
+            Some(decoy_dir.path().to_owned()),
+        );
+        hyprstream_rpc::registry::try_global()
+            .unwrap()
+            .register_rep(
+                "discovery",
+                hyprstream_rpc::transport::TransportConfig::ipc(
+                    decoy_dir.path().join("decoy-discovery.sock"),
+                ),
+                None,
+            );
+
+        // Actual command path: ping must succeed over the installed reach.
+        let matches = build_tool_command()
+            .try_get_matches_from(["tool", "discovery", "ping"])
+            .unwrap();
+        let (_, service_matches) = matches.subcommand().unwrap();
+        handle_schema_command("discovery", service_matches, caller_key.clone())
+            .await
+            .expect("ping must use the installed authenticated network reach");
+
+        let args = Value::Object(serde_json::Map::new());
+        let result = dispatch_top_level("discovery", "ping", &args, caller_key)
+            .await
+            .expect("typed Discovery ping over installed reach");
+        assert_eq!(result["status"], "ok");
+
+        shutdown.notify_waiters();
+        server.await.unwrap().unwrap();
+        bridge.shutdown().await.unwrap();
+    }
+
+    /// Dead-endpoint control for the remote-node selection test: the identical
+    /// rig WITHOUT the installed client fails on the dead local decoy, so the
+    /// success above is attributable to the installed reach, not the rig.
+    #[tokio::test]
+    async fn remote_node_selection_without_installed_client_fails_on_dead_local_decoy() {
+        if std::env::var_os("HYPRSTREAM_DISCOVERY_PING_REMOTE_CONTROL_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::schema_cli::tests::remote_node_selection_without_installed_client_fails_on_dead_local_decoy",
+                    "--nocapture",
+                ])
+                .env("HYPRSTREAM_DISCOVERY_PING_REMOTE_CONTROL_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated control child failed: {status}");
+            return;
+        }
+
+        use std::collections::HashSet;
+
+        let service_key = SigningKey::from_bytes(&[9u8; 32]);
+        let caller_key = test_signing_key();
+        hyprstream_service::global_trust_store().insert(
+            service_key.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: HashSet::from(["discovery".to_owned()]),
+                subject: None,
+                jwt: None,
+                expires_at: 0,
+                attested_by: None,
+            },
+        );
+        let decoy_dir = tempfile::tempdir().unwrap();
+        hyprstream_rpc::registry::init(
+            hyprstream_rpc::registry::EndpointMode::Ipc,
+            Some(decoy_dir.path().to_owned()),
+        );
+        hyprstream_rpc::registry::try_global()
+            .unwrap()
+            .register_rep(
+                "discovery",
+                hyprstream_rpc::transport::TransportConfig::ipc(
+                    decoy_dir.path().join("decoy-discovery.sock"),
+                ),
+                None,
+            );
+
+        // No bootstrap client installed: the local branch constructs (trust key
+        // + registered decoy present) and then fails on the dead socket.
+        let result = create_discovery_client_for_profile(&caller_key, false);
+        let client = match result {
+            Ok(client) => client,
+            Err(error) => panic!(
+                "decoy registration must let the local branch construct; it failed earlier: {error}"
+            ),
+        };
+        let error = client
+            .call_method("ping", &serde_json::Value::Null)
+            .await
+            .expect_err("dead local decoy must not serve the ping");
+        let text = error.to_string();
+        assert!(
+            !text.contains("installed"),
+            "unexpected control failure shape: {text}"
         );
     }
 

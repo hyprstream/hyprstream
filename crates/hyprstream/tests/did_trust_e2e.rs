@@ -272,6 +272,13 @@ async fn build_fixture() -> Fixture {
 
 /// THE end-to-end boot: real serving side, real GATE, real credential, real
 /// QUIC discovery, real liveness ping, real resolver install.
+///
+/// Also pins the remote-node topology contract (PR1590 P2): the boot runs
+/// with `remote_node = true, network_required = false`, so afterwards the
+/// native-network profile is FALSE while the bootstrap-installed client is
+/// PRESENT — and that installed client is a working, signed reach to the
+/// real QUIC Discovery service. Selection helpers must consume this client
+/// (process topology), not branch on the profile (transport enforcement).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn did_anchored_bootstrap_boots_end_to_end() {
     support::install_explicit_dispatch_pep();
@@ -282,6 +289,25 @@ async fn did_anchored_bootstrap_boots_end_to_end() {
     hyprstream_discovery::bootstrap_deployment_process(node_key, fixture.trust_source(), true, false)
         .await
         .expect("DID-anchored bootstrap must boot against the real serving side");
+
+    // Mode-confusion guard: a remote-node boot deliberately leaves the
+    // native-network profile FALSE (the DID-anchored arm refuses
+    // required-native mode) while installing a fully authenticated network
+    // client. Both facts must hold simultaneously after this topology.
+    assert!(
+        !hyprstream_discovery::native_network_required(),
+        "remote_node boot must not flip the native-network profile"
+    );
+    let installed = hyprstream_discovery::installed_bootstrap_discovery_client()
+        .expect("remote-node boot must install its authenticated Discovery client");
+
+    // The installed client is a working signed reach to the real QUIC
+    // Discovery service — the only Discovery reach this remote node has.
+    let health = installed
+        .ping()
+        .await
+        .expect("installed client must ping the real QUIC discovery service");
+    assert_eq!(health.status, "ok");
 }
 
 /// A reachable serving side that does NOT serve the capsule must refuse.
