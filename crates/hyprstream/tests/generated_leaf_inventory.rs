@@ -341,13 +341,14 @@ fn tui_mutation_policies_are_explicit_and_handler_accurate() {
 /// prepares a server-side third-party interop stream under the client's
 /// ephemeral pubkey and schedules the query continuation before the reply is
 /// observed, and `query` executes caller SQL verbatim through the storage
-/// backend (a replayed non-SELECT re-applies its write). Both are read-class
-/// authorization with declared at-most-once effect semantics — the
-/// declaration records the required ledger/fencing; no such machinery is
-/// implemented here, and restricting execution to SELECT is separate
-/// enforcement work deliberately not attempted in this annotation.
+/// backend (a replayed non-SELECT re-applies its write) — a generic
+/// caller-directed effect, like mcp.callTool or container.exec. Both are
+/// read-class authorization declaring the caller-key/result-record
+/// requirement (v16 §4.8); no key/result-record machinery exists, and
+/// restricting execution to read-only SQL is separate enforcement work
+/// deliberately not attempted in this annotation.
 #[test]
-fn metrics_effectful_query_leaves_declare_required_ledger_semantics() {
+fn metrics_effectful_query_leaves_declare_required_key_semantics() {
     use policy::MutationSemantics;
 
     let rows = policy::collect_generated_rows().expect("inventory collects");
@@ -359,13 +360,13 @@ fn metrics_effectful_query_leaves_declare_required_ledger_semantics() {
     };
     assert_eq!(
         semantics("queryStream"),
-        Some(MutationSemantics::TransactionLedgerRequired),
+        Some(MutationSemantics::IdempotencyKeyRequired),
         "a replayed queryStream duplicates the interop-stream preparation and \
          scheduled continuation"
     );
     assert_eq!(
         semantics("query"),
-        Some(MutationSemantics::TransactionLedgerRequired),
+        Some(MutationSemantics::IdempotencyKeyRequired),
         "raw caller SQL reaches the storage backend verbatim"
     );
     // Genuine reads stay policy-free.
@@ -377,13 +378,14 @@ fn metrics_effectful_query_leaves_declare_required_ledger_semantics() {
 /// GuardStatus -> adaptation_state.resolve, so a replay invalidates pending
 /// adaptation work) and every `*_stream` variant allocates a fresh
 /// third-party interop stream plus a scheduled continuation via
-/// `setup_stream` — both classes require ledger semantics. `trainStep`
-/// advances the per-subject TTT delta per call and requires a caller key,
-/// matching its already-keyed stream twin. Handler-accurate naturals
-/// (fixed-path writes, consuming writebacks, convergent sessions, pure
-/// compute) are pinned so the classification stays handler-accurate.
-/// Declarations record REQUIRED semantics — no ledger/key machinery is
-/// implemented.
+/// `setup_stream`. Neither effect carries a separately claimed exactly-once
+/// contract, so both declare the caller-key/result-record requirement
+/// (v16 §4.8): a future caller-supplied idempotency key plus recorded
+/// result. `trainStep` advances the per-subject TTT delta per call and
+/// requires the same, matching its already-keyed stream twin.
+/// Handler-accurate naturals (fixed-path writes, consuming writebacks,
+/// convergent sessions, pure compute) are pinned so the classification stays
+/// handler-accurate. No key/result-record machinery exists.
 #[test]
 fn inference_lora_and_stream_effects_declare_required_semantics() {
     use policy::MutationSemantics;
@@ -399,8 +401,9 @@ fn inference_lora_and_stream_effects_declare_required_semantics() {
     for leaf in ["createLora", "loadLora"] {
         assert_eq!(
             semantics(leaf),
-            Some(MutationSemantics::TransactionLedgerRequired),
-            "inference.{leaf} bumps lora_generation and must require ledger semantics"
+            Some(MutationSemantics::IdempotencyKeyRequired),
+            "inference.{leaf} bumps lora_generation: replay safety requires a \
+             caller-supplied idempotency key and a recorded result"
         );
     }
     for leaf in [
@@ -412,8 +415,9 @@ fn inference_lora_and_stream_effects_declare_required_semantics() {
     ] {
         assert_eq!(
             semantics(leaf),
-            Some(MutationSemantics::TransactionLedgerRequired),
-            "inference.{leaf} allocates a stream + continuation and must require ledger semantics"
+            Some(MutationSemantics::IdempotencyKeyRequired),
+            "inference.{leaf} allocates a stream + continuation: replay safety \
+             requires a caller-supplied idempotency key and a recorded result"
         );
     }
     assert_eq!(
@@ -448,11 +452,11 @@ fn model_proxy_leaves_inherit_callee_effect_classes() {
     };
     assert_eq!(
         semantics("ttt.init"),
-        Some(MutationSemantics::TransactionLedgerRequired)
+        Some(MutationSemantics::IdempotencyKeyRequired)
     );
     assert_eq!(
         semantics("adapter.load"),
-        Some(MutationSemantics::TransactionLedgerRequired)
+        Some(MutationSemantics::IdempotencyKeyRequired)
     );
     assert_eq!(
         semantics("ttt.train"),

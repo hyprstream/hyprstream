@@ -44,13 +44,14 @@ struct InferenceRequest {
 
     # LoRA operations
     # createLora/loadLora bump `lora_generation` (fetch_add) on success; that
-    # counter feeds GuardStatus and adaptation_state.resolve, so a retried
-    # call invalidates pending adaptation work instead of converging. Neither
-    # payload carries an application idempotency key: correct retry semantics
-    # require a generation-preserving ledger. None is implemented — these
-    # record required semantics, not an existing mechanism.
-    createLora @5 :LoraConfig $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("transaction-ledger-required");
-    loadLora @6 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("transaction-ledger-required");       # path
+    # counter feeds GuardStatus and adaptation_state.resolve, so a replayed
+    # call invalidates pending adaptation work instead of converging. Retry
+    # safety requires a caller-supplied application idempotency key plus a
+    # recorded result per key (the v16 §4.8 caller-key/result-record
+    # dependency); neither the payload key nor the result record exists
+    # today — this declares the missing activation work.
+    createLora @5 :LoraConfig $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");
+    loadLora @6 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");       # path
     saveLora @7 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");       # path
     unloadLora @8 :Void $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
     hasLora @9 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
@@ -95,15 +96,17 @@ struct InferenceRequest {
     # third-party interop stream under the client's ephemeral pubkey and
     # schedules the work continuation before the reply is observed, so a
     # replayed request duplicates the allocation while the original stream
-    # stays active — the same retry-unsafe stream-allocation pattern already
-    # classified with ledger semantics for metrics.queryStream. No dedup
-    # machinery is implemented; these record required semantics.
-    createLoraStream @25 :LoraConfig $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("transaction-ledger-required");
-    loadLoraStream @26 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("transaction-ledger-required");          # path
-    saveLoraStream @27 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("transaction-ledger-required");          # path
+    # stays active. Retry safety requires a caller-supplied application
+    # idempotency key plus a recorded result (the same allocation/continuation
+    # effect already classified key-required for trainStepStream,
+    # saveAdaptationStream and mergeLoraStream); the key and result record do
+    # not exist today — this declares the missing activation work.
+    createLoraStream @25 :LoraConfig $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");
+    loadLoraStream @26 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");          # path
+    saveLoraStream @27 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");          # path
     saveAdaptationStream @28 :SaveAdaptationRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");
-    snapshotDeltaStream @29 :Void $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("transaction-ledger-required");
-    exportPeftAdapterStream @30 :ExportPeftRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("transaction-ledger-required");
+    snapshotDeltaStream @29 :Void $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");
+    exportPeftAdapterStream @30 :ExportPeftRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");
     mergeLoraStream @31 :MergeLoraRequest $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("idempotency-key-required");
 
     # Vision embeddings (synchronous — returns all embeddings in one response)
