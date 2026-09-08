@@ -150,7 +150,8 @@ pub use plc_directory::{
 };
 pub use service::{
     authenticate_local_deployment_registry,
-    native_network_required, production_moq_event_target, production_moql_accepted_state_authority,
+    native_network_required, installed_bootstrap_discovery_client,
+    production_moq_event_target, production_moql_accepted_state_authority,
     bootstrap_deployment_process, deployment_registry_verifier, resolve_and_authenticate_did_anchors,
     AuthorizationProvider, DiscoveryService, DiscoverySelfAnnouncer, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
     production_browser_currentness_verifier, production_browser_provisioning,
@@ -169,7 +170,8 @@ pub use service::{
 #[cfg(feature = "test-fixtures")]
 #[doc(hidden)]
 pub use service::test_fixtures::{
-    install_production_inference_fixture, ProductionInferenceFixture,
+    install_bootstrap_discovery_client_fixture, install_production_inference_fixture,
+    ProductionInferenceFixture,
 };
 
 // Re-export generated types that consumers need
