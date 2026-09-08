@@ -112,6 +112,14 @@ jobs:
     - name: Pull builder image
       run: podman pull "$BUILDER_IMAGE"
 
+    # The browser-WASM phase runs inside graviton-build-test.sh as the non-root
+    # ci user. Install Chromium and its matching driver while the container is
+    # still root so the real browser test can execute instead of failing when
+    # apt/dnf is attempted after the user switch.
+    - name: Generate browser conformance nonce
+      run: |
+        echo "BROWSER_ATTEST_NONCE=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" >> "$GITHUB_ENV"
+
     - name: Build + test (release, in rust-builder container)
       run: |
         podman run --rm \
@@ -123,11 +131,23 @@ jobs:
           -e LIBTORCH=/opt/libtorch -e LD_LIBRARY_PATH=/opt/libtorch/lib \
           -e LIBTORCH_BYPASS_VERSION_CHECK=1 -e OPENSSL_NO_VENDOR=1 \
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
+          -e BROWSER_ATTEST_NONCE \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
+            bash /build/.github/scripts/install-chromium.sh
             useradd -m ci
             chmod a+rx /root
             chmod -R a+rwX /root/.cargo /root/.rustup
             chown -R ci:ci /build
             runuser -u ci -- bash -euo pipefail /build/.github/scripts/graviton-build-test.sh
           '
+
+    # browser-wasm-test.sh writes this only after the real headless browser
+    # test succeeds. The nonce is fresh for this run, so a missing or stale
+    # receipt cannot satisfy the preflight.
+    - name: Assert browser conformance receipt
+      run: |
+        grep -qx "$BROWSER_ATTEST_NONCE" browser-wasm-receipt.txt || {
+          echo "browser-wasm conformance phase did not execute in this run (receipt missing or stale)" >&2
+          exit 1
+        }
