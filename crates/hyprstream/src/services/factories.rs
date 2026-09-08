@@ -353,7 +353,15 @@ fn register_service_key(
         return Ok(());
     }
 
-    let creds_dir = credentials_dir()?;
+    // The loaded config's `[secrets].path` must win: startup read the retained
+    // key and this very JWT from that directory, and the renewal task spawned
+    // below reads AND persists there every hour. A config-free fallback here
+    // made custom `--config [secrets].path` deployments work at startup and
+    // then silently skip renewal (P1, PR1585).
+    let creds_dir = match ctx.secrets_dir() {
+        Some(dir) => dir.to_path_buf(),
+        None => credentials_dir()?,
+    };
     let secrets_profile = crate::auth::identity_store::SecretsProfile::from_env()?;
 
     // The JWT may already be in the trust store (e.g. seeded by an earlier
