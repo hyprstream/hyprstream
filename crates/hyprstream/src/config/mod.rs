@@ -2652,6 +2652,16 @@ impl HyprConfig {
         HyprConfigBuilder::new()
     }
 
+    // Keep list parsing restricted to fields that are actually lists. In particular,
+    // issuer URLs and other scalar strings must retain their existing parsing.
+    fn environment_source() -> Environment {
+        Environment::with_prefix("HYPRSTREAM")
+            .separator("__")
+            .try_parsing(true)
+            .list_separator(",")
+            .with_list_parse_key("oauth.cors.allowed_origins")
+    }
+
     /// Load configuration using the config crate with XDG directories and environment variables
     pub fn load() -> Result<Self, ConfigError> {
         let storage = StoragePaths::new().map_err(|e| {
@@ -2671,7 +2681,7 @@ impl HyprConfig {
             .add_source(File::from(config_dir.join("config.json")).required(false))
             .add_source(File::from(config_dir.join("config.yaml")).required(false))
             // Load from environment variables with HYPRSTREAM__ prefix (double underscore for nesting)
-            .add_source(Environment::with_prefix("HYPRSTREAM").separator("__").try_parsing(true));
+            .add_source(Self::environment_source());
 
         // Build and deserialize configuration
         let mut hypr_config: HyprConfig = settings.build()?.try_deserialize()?;
@@ -3177,6 +3187,36 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn oauth_cors_origin_list_from_environment_preserves_scalars() -> anyhow::Result<()> {
+        for origins in [
+            "https://staging-amp.hyprstream.com",
+            "https://staging-amp.hyprstream.com,https://second.example",
+        ] {
+            // Use a private source map, never mutate the test process environment.
+            let source = [
+                ("HYPRSTREAM__OAUTH__CORS__ALLOWED_ORIGINS", origins),
+                ("HYPRSTREAM__OAUTH__CORS__ENABLED", "true"),
+                ("HYPRSTREAM__OAUTH__CORS__ALLOW_CREDENTIALS", "true"),
+                ("HYPRSTREAM__OAUTH__CORS__PERMISSIVE_HEADERS", "false"),
+                ("HYPRSTREAM__OAUTH__EXTERNAL_URL", "https://discovery.staging.lab.hyprstream.com"),
+                ("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30"),
+            ].into_iter().map(|(key, value)| (key.to_owned(), value.to_owned())).collect();
+            let cfg: HyprConfig = config::Config::builder()
+                .add_source(config::Config::try_from(&HyprConfig::default())?)
+                .add_source(HyprConfig::environment_source().source(Some(source)))
+                .build()?
+                .try_deserialize()?;
+            assert_eq!(cfg.oauth.cors.allowed_origins, origins.split(',').collect::<Vec<_>>());
+            assert!(cfg.oauth.cors.enabled);
+            assert!(cfg.oauth.cors.allow_credentials);
+            assert!(!cfg.oauth.cors.permissive_headers);
+            assert_eq!(cfg.oauth.external_url.as_deref(), Some("https://discovery.staging.lab.hyprstream.com"));
+            assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30));
+        }
+        Ok(())
+    }
+
     #[test]
     fn network_iroh_required_is_serialized_and_rejects_iroh_disabled() -> anyhow::Result<()> {
         let mut config = QuicConfig::default();
