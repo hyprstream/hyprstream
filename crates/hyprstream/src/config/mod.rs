@@ -3187,11 +3187,15 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn oauth_cors_origin_list_from_environment_preserves_scalars() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn oauth_cors_origin_list_from_environment_preserves_scalars() -> anyhow::Result<()> {
+        use axum::{body::Body, http::{header, Request}, routing::get, Router};
+        use tower::ServiceExt;
+
         for origins in [
             "https://staging-amp.hyprstream.com",
             "https://staging-amp.hyprstream.com,https://second.example",
+            " https://staging-amp.hyprstream.com , https://second.example\t",
         ] {
             // Use a private source map, never mutate the test process environment.
             let source = [
@@ -3207,12 +3211,31 @@ mod tests {
                 .add_source(HyprConfig::environment_source().source(Some(source)))
                 .build()?
                 .try_deserialize()?;
-            assert_eq!(cfg.oauth.cors.allowed_origins, origins.split(',').collect::<Vec<_>>());
+            assert_eq!(cfg.oauth.cors.allowed_origins, origins.split(',').map(str::trim).collect::<Vec<_>>());
             assert!(cfg.oauth.cors.enabled);
             assert!(cfg.oauth.cors.allow_credentials);
             assert!(!cfg.oauth.cors.permissive_headers);
             assert_eq!(cfg.oauth.external_url.as_deref(), Some("https://discovery.staging.lab.hyprstream.com"));
             assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30));
+
+            let app = Router::new()
+                .route("/probe", get(|| async { "ok" }))
+                .layer(crate::server::middleware::cors_layer(&cfg.oauth.cors));
+            for origin in cfg.oauth.cors.allowed_origins.iter().map(String::as_str)
+                .chain(["https://not-allowed.example"])
+            {
+                let response = app.clone().oneshot(Request::builder()
+                    .uri("/probe")
+                    .header(header::ORIGIN, origin)
+                    .body(Body::empty())?).await?;
+                let allowed = cfg.oauth.cors.allowed_origins.iter().any(|value| value == origin);
+                assert_eq!(response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .and_then(|value| value.to_str().ok()), allowed.then_some(origin));
+                if allowed {
+                    assert_eq!(response.headers().get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                        .and_then(|value| value.to_str().ok()), Some("true"));
+                }
+            }
         }
         Ok(())
     }
