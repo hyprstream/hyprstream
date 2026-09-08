@@ -177,12 +177,21 @@ fn build_cli() -> ClapCommand {
                     .about("Initialize the checkpoint store for an explicitly provisioned fresh deployment"),
             )
             .subcommand(
+                ClapCommand::new("inspect-services")
+                    .about("Read existing checkpoint-verified service identities as public JSON without provisioning or renewal")
+                    .arg(Arg::new("service").long("service").required(true)
+                        .action(clap::ArgAction::Append).value_delimiter(',')),
+            )
+            .subcommand(
                 ClapCommand::new("provision-services")
                     .about("Admit existing local service identities before starting the registry")
                     .arg(Arg::new("service").long("service").required(true)
                         .action(clap::ArgAction::Append).value_delimiter(','))
                     .arg(Arg::new("valid-for-seconds").long("valid-for-seconds")
-                        .value_parser(clap::value_parser!(i64)).default_value("86400")),
+                        .value_parser(clap::value_parser!(i64)).default_value("86400"))
+                    .arg(Arg::new("roster-export").long("roster-export").value_name("PATH")
+                        .value_parser(clap::value_parser!(std::path::PathBuf))
+                        .help("Opt-in: atomically write a JSON manifest of the verified accepted roster (public fields only; not a trust root) to PATH. Behavior is unchanged when absent.")),
             )
             .subcommand(
                 ClapCommand::new("join")
@@ -1548,6 +1557,49 @@ fn resolve_moq_relay_reach(
         .ok_or_else(|| anyhow::anyhow!("relay URI is not a network-routable transport"))
 }
 
+/// Select the process identity before constructing any resolver/client. Transport
+/// flags do not decide whose identity a required-native split service uses.
+fn native_service_process_name(matches: &clap::ArgMatches, config: &HyprConfig) -> Result<Option<String>> {
+    if !config.quic.iroh_required() {
+        return Ok(None);
+    }
+    let Some(("service", service_matches)) = matches.subcommand() else {
+        return Ok(None);
+    };
+    let action = ServiceAction::from_arg_matches(service_matches)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let ServiceAction::Start { name, foreground, standalone, services, .. } = action else {
+        return Ok(None);
+    };
+    if !foreground && !standalone {
+        return Ok(None);
+    }
+    let names = if standalone {
+        config.services.startup.clone()
+    } else {
+        services.unwrap_or_else(|| name.into_iter().collect())
+    };
+    anyhow::ensure!(names.len() == 1,
+        "network-iroh-required requires exactly one service per foreground process; launch each provisioned service separately");
+    let service = names.into_iter().next().context("native service name missing")?;
+    anyhow::ensure!(hyprstream_service::get_factory(&service).is_some(), "unknown native service: {service}");
+    Ok(Some(service))
+}
+
+/// Required service startup consumes the provisioner's retained key. Missing or
+/// malformed material is never a reason to generate a new identity or use the
+/// CLI/root key. Compatibility commands retain their existing key behavior.
+async fn load_process_signing_key(config: &HyprConfig, native_service: Option<&str>) -> Result<SigningKey> {
+    if let Some(service) = native_service {
+        let secrets = HyprConfig::resolve_secrets_dir_for(Some(config))?;
+        return hyprstream_core::auth::identity_store::load_existing_service_signing_key(
+            &secrets, service, hyprstream_core::auth::identity_store::SecretsProfile::from_env()?,
+        ).with_context(|| format!("load provisioned native identity for {service}"));
+    }
+    let keys_dir = config.models_dir().join(".registry").join("keys");
+    load_or_generate_signing_key(&keys_dir).await
+}
+
 /// A QUIC process currently owns one native MoQ dialer and its admission-proof
 /// slot. Sharing that slot across separately checkpointed services would make a
 /// later service dial as the first service's DID. Refuse that topology until the
@@ -1662,7 +1714,7 @@ async fn install_process_production_resolver(
     //
     // Scoped to this node's OWN service identities. External classical clients
     // and federated peers do not appear in this file and are not affected.
-    if let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir() {
+    if let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir_for(Some(config)) {
         let entries =
             hyprstream_core::auth::identity_store::load_bootstrap_pubkeys_hybrid(&secrets_dir)?;
         hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries)?;
@@ -1727,6 +1779,9 @@ async fn install_process_production_resolver(
              cluster_did_web (DidAnchored mode) — the OS-owned trust source \
              has no remote-Discovery story and would silently ignore this flag"
         );
+    }
+    if config.quic.iroh_required() {
+        hyprstream_rpc::moq_stream::require_native_iroh();
     }
     hyprstream_discovery::bootstrap_deployment_process(
         signing_key.clone(),
@@ -1880,6 +1935,239 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
     }
 
     install_session_pq_overlay();
+    install_proof_admission(oauth);
+}
+
+/// Install the v16 proof admission substrate: the rotating server challenge
+/// and the replay admission store (§4.6, §4.7).
+///
+/// Called from the same startup path as the envelope verify config, so every
+/// entrypoint that serves RPC installs both. Both registrations are
+/// first-write-wins and neither is auto-installed by dispatch: an absent
+/// challenge manager or replay store denies at admission rather than admitting
+/// under a guarantee nobody made.
+///
+/// **Deployment note.** The in-memory store declares
+/// `SingleVerifierInstance`, which is the honest guarantee for a node that
+/// admits requests for its own service domain by itself. A domain served by
+/// several verifier instances needs a shared linearizable backend installed
+/// here instead — the same trait, a different substrate. Installing this one
+/// across several instances would silently weaken "admitted once per domain"
+/// to "once per node", so the log line below states the guarantee in force.
+fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>) {
+    use hyprstream_rpc::proof::admission::{
+        set_global_challenge_manager, set_global_proof_replay_store, InMemoryProofReplayStore,
+        ProofReplayStore, ReplayDomainGuarantee,
+    };
+    use hyprstream_rpc::proof::challenge::{
+        ChallengeManager, DEFAULT_CHALLENGE_OVERLAP_SECS, DEFAULT_CHALLENGE_WINDOW_SECS,
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // The generated method-policy inventory (v16 §6.1): every linked
+    // generated service module contributed one row per method leaf via
+    // `inventory`; install the validated, deterministically sorted table as
+    // the process policy. A failure installs nothing — proof-bearing dispatch
+    // then denies at policy resolution, never serves a partial table.
+    match hyprstream_rpc::proof::policy::install_generated_method_policy() {
+        Ok(rows) => tracing::info!(
+            "generated dispatch method policy installed ({rows} leaf row(s))"
+        ),
+        Err(e) => tracing::error!(
+            "generated dispatch method policy failed validation/install; \
+             proof-bearing dispatch denies: {e:#}"
+        ),
+    }
+
+    // The replay admission domain is an operator statement about deployment
+    // topology, not something startup may assume. "Admitted once" means once
+    // per service domain, so a node that shares its service domain with other
+    // verifiers cannot satisfy it with a process-local map — and startup
+    // cannot tell the difference by inspection.
+    //
+    // The operator therefore declares it. Absent declaration, nothing is
+    // installed and every proof-bearing request denies at admission, which is
+    // the correct posture for an undeclared topology: it is visible and safe,
+    // rather than a silent per-node guarantee that reads as domain-wide.
+    let declared_domain = std::env::var("HYPRSTREAM_REPLAY_ADMISSION_DOMAIN").ok();
+    let guarantee = match declared_domain.as_deref() {
+        Some("single-verifier-instance") => {
+            // The single-verifier shape is only sound if this process is
+            // genuinely the sole verifier for the domain. A bare env string
+            // cannot establish that — two replicas can each set it. Require an
+            // OS-enforced exclusive lease: acquire it here and hold it for the
+            // process lifetime, so a second replica setting the same string
+            // fails to acquire and its admission stays closed (§4.6).
+            let lease_path = std::env::var("HYPRSTREAM_REPLAY_SINGLE_VERIFIER_LEASE").ok();
+            let Some(lease_path) = lease_path else {
+                tracing::error!(
+                    "HYPRSTREAM_REPLAY_ADMISSION_DOMAIN=single-verifier-instance requires \
+                     HYPRSTREAM_REPLAY_SINGLE_VERIFIER_LEASE=<path> to an exclusive lease \
+                     file: the env string alone cannot prove sole verification. Proof \
+                     admission denies until the lease is configured."
+                );
+                return;
+            };
+            match hyprstream_rpc::proof::admission::SingleVerifierLease::acquire(
+                std::path::Path::new(&lease_path),
+            ) {
+                Ok(lease) => {
+                    tracing::info!(
+                        "acquired exclusive single-verifier lease at {} \
+                         (this process is the sole verifier for its domain)",
+                        lease.path().display()
+                    );
+                    // Park the lease so its exclusive lock lives for the whole
+                    // process, not just this function.
+                    if hyprstream_rpc::proof::admission::hold_single_verifier_lease(lease).is_err() {
+                        tracing::error!(
+                            "a single-verifier lease is already held; proof admission denies"
+                        );
+                        return;
+                    }
+                    Some(ReplayDomainGuarantee::SingleVerifierInstance)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "cannot claim sole-verifier lease; another verifier already holds it or \
+                         the path is unusable. Proof admission denies: {e:#}"
+                    );
+                    return;
+                }
+            }
+        }
+        Some(other) => {
+            tracing::error!(
+                "HYPRSTREAM_REPLAY_ADMISSION_DOMAIN='{other}' names a topology this build \
+                 cannot provide in-process: a shared linearizable backend or \
+                 namespace-affine routing must be installed explicitly. Proof \
+                 admission denies."
+            );
+            None
+        }
+        None => {
+            tracing::warn!(
+                "no HYPRSTREAM_REPLAY_ADMISSION_DOMAIN declared; proof replay admission \
+                 is not installed and proof-bearing requests will deny. Set \
+                 'single-verifier-instance' only when this node is the sole verifier \
+                 for its service domain."
+            );
+            None
+        }
+    };
+
+    let Some(guarantee) = guarantee else {
+        return;
+    };
+
+    // The challenge is scoped to the SAME replay admission domain: one exact
+    // deadline shared by verification and replay collection. A per-process
+    // random challenge can only provide that for a single verifier, so any
+    // other topology gets no challenge manager and unattributed proofs deny.
+    match ChallengeManager::rotating_for_domain(
+        guarantee,
+        DEFAULT_CHALLENGE_WINDOW_SECS,
+        DEFAULT_CHALLENGE_OVERLAP_SECS,
+        now,
+    ) {
+        Some(manager) => {
+            if set_global_challenge_manager(manager).is_ok() {
+                tracing::info!(
+                    "proof challenge manager installed for {guarantee:?}: \
+                     {DEFAULT_CHALLENGE_WINDOW_SECS}s window, \
+                     {DEFAULT_CHALLENGE_OVERLAP_SECS}s acceptance overlap"
+                );
+            }
+        }
+        None => tracing::error!(
+            "replay domain {guarantee:?} needs a domain-wide challenge source; \
+             unattributed proofs deny"
+        ),
+    }
+
+    // Request-proof signers are their own enrollment with their own
+    // lifecycle, loaded from an operator-authored manifest. They are NOT
+    // derived from the mesh/envelope identity: component-key separation is
+    // normative, and a transport key carries no enrollment epoch, validity,
+    // revocation state, approver role, or enrollment-policy identifier.
+    //
+    // The mesh roster is consulted only to learn which keys already belong to
+    // another protocol, so a manifest cannot silently reuse one. Absent
+    // manifest, nothing is enrolled and authenticated proofs deny.
+    {
+        let secrets_dir = HyprConfig::resolve_secrets_dir().ok();
+        let manifest_path = secrets_dir
+            .as_ref()
+            .map(|dir| dir.join("proof-enrollment.toml"));
+        match manifest_path {
+            Some(path) if path.exists() => {
+                match hyprstream_core::auth::proof_enrollment::ProofEnrollmentManifest::load(&path)
+                {
+                    Ok(manifest) => {
+                        // Foreign keys come from every protocol source this
+                        // node holds — the remote mesh roster and its own
+                        // local bootstrap identities alike.
+                        let foreign =
+                            hyprstream_core::auth::proof_enrollment::foreign_protocol_keys(
+                                oauth,
+                                secrets_dir.as_deref(),
+                            );
+                        let entries = manifest.entries.len();
+                        let resolver = hyprstream_core::auth::proof_enrollment::build_resolver(
+                            &manifest,
+                            &foreign,
+                            &Default::default(),
+                            now,
+                        );
+                        if hyprstream_rpc::proof::enrollment::set_global_enrollment_resolver(
+                            Box::new(resolver),
+                        )
+                        .is_ok()
+                        {
+                            tracing::info!(
+                                "proof enrollment manifest loaded from {} ({entries} entr(ies))",
+                                path.display()
+                            );
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        "proof enrollment manifest at {} is unusable; \
+                         authenticated proofs will deny: {e:#}",
+                        path.display()
+                    ),
+                }
+            }
+            _ => tracing::info!(
+                "no proof enrollment manifest present; authenticated proofs deny \
+                 until one is provisioned"
+            ),
+        }
+    }
+
+    // Partitioned by disposition, fail-closed on capacity: an unexpired
+    // accepted record is never evicted to make room.
+    const REPLAY_CAPACITY_PER_PARTITION: usize = 100_000;
+    let store: Box<dyn ProofReplayStore> = match guarantee {
+        ReplayDomainGuarantee::SingleVerifierInstance => Box::new(
+            InMemoryProofReplayStore::single_verifier_instance(REPLAY_CAPACITY_PER_PARTITION),
+        ),
+        // Unreachable today: the declaration parser above accepts no other
+        // value precisely because this build ships no other substrate.
+        other => {
+            tracing::error!("no replay store implementation for {other:?}; admission denies");
+            return;
+        }
+    };
+    if set_global_proof_replay_store(store).is_ok() {
+        tracing::info!(
+            "proof replay store installed: operator-declared {guarantee:?}, \
+             {REPLAY_CAPACITY_PER_PARTITION} records per partition"
+        );
+    }
 }
 
 /// Install the session PQ binding overlay, the runtime anchoring path for
@@ -2304,6 +2592,19 @@ fn main() -> Result<()> {
         .validate()
         .context("Configuration validation failed")?;
 
+    // Read-only accepted-state inspection must precede tracing (which may
+    // create log files), endpoint/runtime initialization and all bootstrap/key
+    // generation paths. Buffer the complete verified roster before stdout.
+    if let Some(("pds", pds)) = matches.subcommand() {
+        if let Some(("inspect-services", inspect)) = pds.subcommand() {
+            let services = inspect.get_many::<String>("service")
+                .context("service roster is required")?.cloned().collect::<Vec<_>>();
+            let bytes = hyprstream_core::cli::deployment_bootstrap::inspect_services(&config, &services)?;
+            std::io::Write::write_all(&mut std::io::stdout().lock(), &bytes)?;
+            return Ok(());
+        }
+    }
+
     // RPC clients are used by ordinary CLI commands (`quick`, `tui`, etc.),
     // not only by service entrypoints. Install both request- and response-side
     // verification defaults before dispatch so every command uses the
@@ -2563,11 +2864,16 @@ fn main() -> Result<()> {
                     .context("service roster is required")?.cloned().collect::<Vec<_>>();
                 let lifetime = *provision_m.get_one::<i64>("valid-for-seconds")
                     .context("service identity lifetime is required")?;
+                let roster_export = provision_m.get_one::<std::path::PathBuf>("roster-export");
                 hyprstream_core::cli::deployment_bootstrap::provision_services(
                     &config,
                     &services,
                     lifetime,
+                    roster_export.map(std::path::PathBuf::as_path),
                 )?;
+                if let Some(path) = roster_export {
+                    println!("verified service roster manifest written to {}", path.display());
+                }
                 println!("checkpoint-accepted service roster ready ({} services)", services.len());
                 return Ok(());
             }
@@ -2629,6 +2935,8 @@ fn main() -> Result<()> {
         }
     }
 
+    let native_service_name = native_service_process_name(&matches, &config)?;
+
     // Start registry service ONCE at CLI level
     let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2643,8 +2951,7 @@ fn main() -> Result<()> {
         bool,
     ) = _registry_runtime
         .block_on(async {
-            let keys_dir = config.models_dir().join(".registry").join("keys");
-            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+            let signing_key = load_process_signing_key(&config, native_service_name.as_deref()).await?;
             let verifying_key = signing_key.verifying_key();
 
             let is_os_owned_bootstrap = install_process_production_resolver(&signing_key, &config).await
@@ -2760,6 +3067,10 @@ fn main() -> Result<()> {
                             }
                         };
 
+                        // --services with one member selects that service's identity,
+                        // never the synthetic "multi"/"standalone" command label.
+                        let name = native_service_name.clone().unwrap_or(name);
+
                         // Standard foreground service startup
                         let rpc_mode = if ipc {
                             hyprstream_rpc::registry::EndpointMode::Ipc
@@ -2796,8 +3107,12 @@ fn main() -> Result<()> {
 
                                 let models_dir = config.models_dir();
                                 let keys_dir = models_dir.join(".registry").join("keys");
-                                let signing_key =
-                                    load_or_generate_signing_key(&keys_dir).await?;
+                                let signing_key = if native_service_name.is_some() {
+                                    // Same retained key already installed in the process resolver.
+                                    signing_key.clone()
+                                } else {
+                                    load_or_generate_signing_key(&keys_dir).await?
+                                };
                                 let verifying_key = signing_key.verifying_key();
 
                                 let fed_src: Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
@@ -2835,8 +3150,8 @@ fn main() -> Result<()> {
                                     vec![name.clone()]
                                 };
 
-                                if ipc {
-                                    // Multi-process mode: each service gets its own independent key.
+                                if ipc || native_service_name.is_some() {
+                                    // Split-service identity is independent of local IPC transport.
                                     //
                                     // #759: resolve via the SAME authoritative path
                                     // `HyprConfig::resolve_secrets_dir()` uses elsewhere in this
@@ -2849,7 +3164,7 @@ fn main() -> Result<()> {
                                     // than this process reads from — the same "consumer silently
                                     // re-derives instead of reading the authoritative record"
                                     // disease #441 targets, just one directory earlier.
-                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
                                     ctx = ctx.with_ca_verifying_key(
                                         hyprstream_core::auth::identity_store::load_ca_verifying_key(
                                             &secrets_dir,
@@ -2893,9 +3208,13 @@ fn main() -> Result<()> {
                                     // secrets profile — see `resolve_service_signing_key` for why.
                                     let secrets_profile =
                                         hyprstream_core::auth::identity_store::SecretsProfile::from_env()?;
-                                    let own_key = hyprstream_core::auth::identity_store::resolve_service_signing_key(
-                                        &secrets_dir, &name, secrets_profile,
-                                    )?;
+                                    let own_key = if native_service_name.is_some() {
+                                        signing_key.clone()
+                                    } else {
+                                        hyprstream_core::auth::identity_store::resolve_service_signing_key(
+                                            &secrets_dir, &name, secrets_profile,
+                                        )?
+                                    };
 
                                     if name == "policy" {
                                         // PolicyService: signing_key IS the CA key (already loaded).
@@ -2936,7 +3255,7 @@ fn main() -> Result<()> {
                                     //
                                     // #759: same authoritative resolver as the `--ipc` branch above —
                                     // see the comment there.
-                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
                                     ctx = ctx.with_ca_verifying_key(
                                         hyprstream_core::auth::identity_store::load_ca_verifying_key(
                                             &secrets_dir,
@@ -3028,7 +3347,7 @@ fn main() -> Result<()> {
                                 // no manifest-backed clearance.
                                 {
                                     let secrets_dir =
-                                        hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
+                                        hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
                                     match hyprstream_core::auth::service_enrollment::ServiceEnrollmentManifest::load_and_validate(&secrets_dir)
                                         .context("service enrollment manifest validation failed")?
                                     {
@@ -3176,12 +3495,10 @@ fn main() -> Result<()> {
                                         // verified resolver result; the URI alone is reachability,
                                         // never an application identity.
                                         moq_relay_server_identity: None,
-                                        // #1027: no moql admission material is provisioned at
-                                        // daemon bootstrap yet; the accept path stays in its
-                                        // fail-closed anonymous posture until a deployment
-                                        // installs an authenticator here.
-                                        moq_admission: None,
-                                        moq_ingress_authorizer: None,
+                                        moq_admission: if moq_admission_proof.is_some() {
+                                            Some(hyprstream_core::services::stream_network::production_stream_admission(&qc)?)
+                                        } else { None },
+                                        moq_ingress_authorizer: Some(hyprstream_core::services::stream_network::stream_ingress_authorizer(&qc)),
                                         moq_admission_proof,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             move |request: hyprstream_service::NativeAnnouncementRequest| {
@@ -3292,26 +3609,14 @@ fn main() -> Result<()> {
                                 {
                                     let issuer_url = config.oauth.issuer_url();
                                     let jwks_url = format!("{}/oauth/jwks", issuer_url.trim_end_matches('/'));
-                                    let fetcher: hyprstream_rpc::auth::JwksFetcher = std::sync::Arc::new(move |url: String| {
-                                        Box::pin(async move {
-                                            let resp = reqwest::Client::builder()
-                                                .danger_accept_invalid_certs(true)
-                                                .build()?
-                                                .get(&url)
-                                                .send()
-                                                .await?
-                                                .error_for_status()?;
-                                            let json: serde_json::Value = resp.json().await?;
-                                            Ok(json)
-                                        })
-                                    });
+                                    let fetcher = hyprstream_core::auth::jwks_fetcher::default_jwks_fetcher();
                                     ctx.set_jwks_fetcher(fetcher);
                                     tracing::debug!("JWKS-backed key source configured: {}", jwks_url);
                                 }
 
                                 // Populate ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
                                 {
-                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
                                     let ml_dsa_store = hyprstream_core::auth::key_rotation::global_ml_dsa_key_store(
                                         &secrets_dir,
                                         &config.oauth,
@@ -3977,6 +4282,108 @@ mod resolver_startup_controls {
     }
 
     #[test]
+    fn readonly_roster_cli_requires_services_and_has_no_mutation_options() {
+        let matches = super::build_cli().try_get_matches_from([
+            "hyprstream", "pds", "inspect-services", "--service", "model,event",
+        ]).expect("read-only roster CLI");
+        let inspect = matches.subcommand_matches("pds").expect("pds")
+            .subcommand_matches("inspect-services").expect("inspect");
+        assert_eq!(inspect.get_many::<String>("service").expect("services")
+            .map(String::as_str).collect::<Vec<_>>(), vec!["model", "event"]);
+        for args in [
+            vec!["hyprstream", "pds", "inspect-services"],
+            vec!["hyprstream", "pds", "inspect-services", "--service", "model", "--valid-for-seconds", "86400"],
+            vec!["hyprstream", "pds", "inspect-services", "--service", "model", "--roster-export", "out.json"],
+        ] { assert!(super::build_cli().try_get_matches_from(args).is_err()); }
+    }
+
+    #[test]
+    fn native_service_identity_loads_existing_key_without_ipc() -> anyhow::Result<()> {
+        const CHILD: &str = "HYPRSTREAM_NATIVE_SERVICE_IDENTITY_TEST";
+        let Ok(profile) = std::env::var(CHILD) else {
+            for profile in ["shared-directory", "per-service-scoped"] {
+                let status = std::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", "resolver_startup_controls::native_service_identity_loads_existing_key_without_ipc", "--nocapture"])
+                    .env(CHILD, profile)
+                    .env("HYPRSTREAM_SECRETS_PROFILE", profile)
+                    .env_remove("HYPRSTREAM__SECRETS__PATH")
+                    .env_remove("HYPRSTREAM__SIGNING_KEY")
+                    .status()?;
+                anyhow::ensure!(status.success(), "isolated {profile} identity regression failed");
+            }
+            return Ok(());
+        };
+        let root = tempfile::tempdir()?;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        for (service, seed) in [("policy", 31u8), ("model", 32u8), ("registry", 33u8)] {
+            let secrets = root.path().join(format!("{service}-credentials"));
+            std::fs::create_dir_all(secrets.join(service))?;
+            let key_path = if service == "policy" || profile == "per-service-scoped" {
+                // A misleading service subdirectory must not replace a scoped
+                // identity, especially Policy's canonical flat key.
+                std::fs::write(secrets.join(service).join("signing-key"), [99u8; 32])?;
+                secrets.join("signing-key")
+            } else {
+                // A retained root/Policy key must not become a native Model or
+                // Registry process identity merely because --ipc is absent.
+                std::fs::write(secrets.join("signing-key"), [31u8; 32])?;
+                secrets.join(service).join("signing-key")
+            };
+            std::fs::write(&key_path, [seed; 32])?;
+            let mut configured = super::HyprConfig::default();
+            configured.quic.native_network_profile = hyprstream_core::config::NativeNetworkProfile::NetworkIrohRequired;
+            configured.secrets.path = Some(secrets.clone());
+            configured.storage.models_dir = root.path().join(format!("{service}-models"));
+            let config_path = root.path().join(format!("{service}.toml"));
+            configured.to_file(&config_path)?;
+            let matches = super::build_cli().try_get_matches_from([
+                "hyprstream", "--config", config_path.to_str().expect("temporary UTF-8 path"),
+                "service", "start", service, "--foreground",
+            ])?;
+            let config = super::load_config(matches.get_one::<std::path::PathBuf>("config").map(std::path::PathBuf::as_path))?;
+            let selected = super::native_service_process_name(&matches, &config)?;
+            assert_eq!(selected.as_deref(), Some(service));
+            let key = runtime.block_on(super::load_process_signing_key(&config, selected.as_deref()))?;
+            assert_eq!(key.to_bytes(), [seed; 32]);
+            let ctx = super::ServiceContext::new(key.clone(), key.verifying_key(), false, config.models_dir().clone())
+                .with_service_key(service, key.clone());
+            assert_eq!(ctx.signing_key().verifying_key(), key.verifying_key());
+            assert_eq!(ctx.service_signing_key(service).verifying_key(), key.verifying_key());
+            assert!(!config.models_dir().join(".registry/keys").exists(), "native startup must not materialize a CLI/root key");
+            std::fs::remove_file(&key_path)?;
+            assert!(runtime.block_on(super::load_process_signing_key(&config, selected.as_deref())).is_err());
+            assert!(!key_path.exists(), "missing provisioned key must not be regenerated");
+            std::fs::write(&key_path, [seed; 31])?;
+            assert!(runtime.block_on(super::load_process_signing_key(&config, selected.as_deref())).is_err());
+            assert_eq!(std::fs::read(&key_path)?, vec![seed; 31], "malformed key must not be repaired during startup");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_service_identity_rejects_multi_and_selects_single_service_list() -> anyhow::Result<()> {
+        let mut config = super::HyprConfig::default();
+        config.quic.native_network_profile = hyprstream_core::config::NativeNetworkProfile::NetworkIrohRequired;
+        let single = super::build_cli().try_get_matches_from([
+            "hyprstream", "service", "start", "--foreground", "--services", "model",
+        ])?;
+        assert_eq!(super::native_service_process_name(&single, &config)?.as_deref(), Some("model"));
+        let multi = super::build_cli().try_get_matches_from([
+            "hyprstream", "service", "start", "--foreground", "--services", "model,registry",
+        ])?;
+        assert!(super::native_service_process_name(&multi, &config).is_err());
+        let standalone = super::build_cli().try_get_matches_from([
+            "hyprstream", "service", "start", "--standalone",
+        ])?;
+        config.services.startup = vec!["model".into(), "registry".into()];
+        assert!(super::native_service_process_name(&standalone, &config).is_err());
+        config.quic.native_network_profile = hyprstream_core::config::NativeNetworkProfile::Compatibility;
+        assert_eq!(super::native_service_process_name(&multi, &config)?, None);
+        assert_eq!(super::native_service_process_name(&single, &config)?, None);
+        Ok(())
+    }
+
+    #[test]
     fn deployment_bootstrap_cli_requires_roster_and_parses_lifetime() {
         let matches = super::build_cli().try_get_matches_from([
             "hyprstream", "pds", "provision-services", "--service", "model,event",
@@ -3987,9 +4394,21 @@ mod resolver_startup_controls {
         assert_eq!(provision.get_many::<String>("service").expect("roster")
             .map(String::as_str).collect::<Vec<_>>(), vec!["model", "event"]);
         assert_eq!(provision.get_one::<i64>("valid-for-seconds"), Some(&3600));
+        assert!(provision.get_one::<std::path::PathBuf>("roster-export").is_none());
         assert!(super::build_cli().try_get_matches_from([
             "hyprstream", "pds", "provision-services",
         ]).is_err());
+        let matches = super::build_cli().try_get_matches_from([
+            "hyprstream", "pds", "provision-services", "--service", "model",
+            "--roster-export", "/tmp/roster.json",
+        ]).expect("bootstrap CLI with roster export");
+        let provision = matches.subcommand_matches("pds").expect("pds")
+            .subcommand_matches("provision-services").expect("provision");
+        assert_eq!(
+            provision.get_one::<std::path::PathBuf>("roster-export")
+                .map(std::path::PathBuf::as_path),
+            Some(std::path::Path::new("/tmp/roster.json"))
+        );
     }
     const REFRESH_SCHEDULER_TURNS: usize = 32;
 

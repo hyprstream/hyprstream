@@ -103,7 +103,7 @@ fn install_gate_crypto() -> Result<()> {
 struct RpcFloorLabels(&'static str);
 
 impl RpcObjectLabelResolver for RpcFloorLabels {
-    fn resolve(&self, service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
+    fn resolve(&self, service_domain: &str, _method: Option<&[u16]>) -> Option<SecurityLabel> {
         (service_domain == self.0).then(|| label(Level::Public, Assurance::Classical))
     }
 }
@@ -120,7 +120,7 @@ impl MacDispatchPep for ExactServiceBootstrapPep {
         &self,
         _ctx: &EnvelopeContext,
         service_domain: &str,
-        _method: Option<u16>,
+        _method: Option<&[u16]>,
     ) -> MacDecision {
         if service_domain == self.0 {
             MacDecision::Permit
@@ -139,13 +139,22 @@ struct GateEchoService {
 
 #[async_trait(?Send)]
 impl RequestService for GateEchoService {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> Result<hyprstream_rpc::service::DecodedRequestBody> {
+        Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(
+            signed_body.to_vec(),
+        ))
+    }
+
     async fn handle_request(
         &self,
         _ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
         self.invocations.fetch_add(1, Ordering::SeqCst);
-        Ok((payload.to_vec(), None))
+        Ok((body.bytes().to_vec(), None))
     }
 
     fn name(&self) -> &str {
@@ -1133,13 +1142,22 @@ struct AuthenticatedGateEcho {
 
 #[async_trait(?Send)]
 impl RequestService for AuthenticatedGateEcho {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> Result<hyprstream_rpc::service::DecodedRequestBody> {
+        Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(
+            signed_body.to_vec(),
+        ))
+    }
+
     async fn handle_request(
         &self,
         _ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
         self.invocations.fetch_add(1, Ordering::SeqCst);
-        Ok((payload.to_vec(), None))
+        Ok((body.bytes().to_vec(), None))
     }
 
     fn name(&self) -> &str {

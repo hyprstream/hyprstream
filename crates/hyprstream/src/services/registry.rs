@@ -3278,6 +3278,16 @@ impl WorktreeHandler for RegistryService {
 
 #[async_trait(?Send)]
 impl RequestService for RegistryService {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        // The ONE bounded decode (v16 §5.2): the generated decoder derives
+        // the full method leaf and returns the decoded message that policy,
+        // MAC, and dispatch below all consume.
+        crate::services::generated::registry_client::decode_registry_request_body(signed_body)
+    }
+
     fn producer_reach_config_handle(&self) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
         Some(self.reach_config.clone())
     }
@@ -3286,8 +3296,8 @@ impl RequestService for RegistryService {
         Some(self.moq_origin.clone())
     }
 
-    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
-        dispatch_registry(self, ctx, payload).await
+    async fn handle_request(&self, ctx: &EnvelopeContext, body: &hyprstream_rpc::service::DecodedRequestBody,) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
+        dispatch_registry(self, ctx, body).await
     }
 
     fn name(&self) -> &str {
@@ -3685,7 +3695,7 @@ mod tests {
             crate::config::TokenConfig::default(), policy_git,
             TransportConfig::inproc("at9p-policy"));
         let manager = InprocManager::new();
-        let policy_handle = manager.spawn(Box::new(policy)).await.unwrap();
+        let mut policy_handle = manager.spawn(Box::new(policy)).await.unwrap();
         let policy_client = PolicyClient::for_local_endpoint_bootstrap("inproc://at9p-policy", key.clone(), key.verifying_key(), None).unwrap();
         let store = Arc::new(crate::services::discovery::PdsRecordStore::open(&pds).unwrap()
             .with_at9p_acceptance_identity(key.verifying_key()));
@@ -3759,8 +3769,17 @@ mod tests {
             did, kind: At9pCandidateKind::Successor,
             record_bytes: after_terminal.to_dag_cbor().unwrap(),
         }).await.is_err());
-        let _ = handle.stop().await;
-        drop(policy_handle);
+        handle.stop().await.unwrap();
+        assert!(!handle.is_running());
+        drop(resolver);
+        // The client may retain the processor; stop must still destroy the
+        // service's publisher/ingest and release its RocksDB ownership first.
+        assert_eq!(Arc::strong_count(&store), 1, "stopped Registry retained its DB");
+        drop(store);
+        let reopened = crate::services::discovery::PdsRecordStore::open(&pds).unwrap();
+        drop(reopened);
+        policy_handle.stop().await.unwrap();
+        assert!(!policy_handle.is_running());
     }
 
     // ── #432 getBlob authz: the hash is NOT a capability ──────────────────────

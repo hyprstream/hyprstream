@@ -31,6 +31,22 @@ fn production_moq_authz(
         .with_ingress_authorizer_option(ingress_authorizer)
 }
 
+/// Native producer reach and channel must refer to the same service-owned tree.
+fn producer_moq_origin(
+    required: bool,
+    relay: Option<hyprstream_rpc::moq_stream::MoqStreamOrigin>,
+    has_producer: bool,
+) -> Option<hyprstream_rpc::moq_stream::MoqStreamOrigin> {
+    relay.or_else(|| {
+        if required {
+            has_producer.then(|| hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
+                .with_prefix(hyprstream_rpc::moq_stream::DEFAULT_PREFIX).build())
+        } else {
+            hyprstream_rpc::moq_stream::global_moq_origin().cloned()
+        }
+    })
+}
+
 // Re-export Spawnable trait from hyprstream-rpc (where it's defined so
 // types in that crate can implement it without circular deps).
 pub use hyprstream_rpc::service::Spawnable;
@@ -179,8 +195,10 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
             let bridge = hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
                 service, Arc::clone(&nonce_cache), 0,
             ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("bridge: {e}")))?;
-            let processor: Arc<dyn IrohRequestProcessor> = Arc::new(bridge);
+            let bridge = Arc::new(bridge);
+            let processor: Arc<dyn IrohRequestProcessor> = bridge.clone();
 
+            let result = async {
             if let Some(mut qc) = quic_config {
                 let announcement_cancellation = qc.announcement_cancellation.clone();
                 let _announcement_guard = announcement_cancellation.clone().drop_guard();
@@ -248,12 +266,11 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         .with_prefix(hyprstream_rpc::moq_stream::DEFAULT_PREFIX)
                         .build()
                 });
+                // Native producers serve only their own stream channel origin.
+                let moq_origin = producer_moq_origin(qc.iroh_required, relay_origin.clone(), moq_origin_handle.is_some());
                 if let Some(handle) = &moq_origin_handle {
-                    *handle.write() = relay_origin.clone();
+                    *handle.write() = moq_origin.clone();
                 }
-                let moq_origin = relay_origin
-                    .clone()
-                    .or_else(|| hyprstream_rpc::moq_stream::global_moq_origin().cloned());
 
                 let mut rpc_server = hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::with_capacity(
                     wt_server,
@@ -352,6 +369,11 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                 // Link a relay only to this service's scoped origin. The shared
                 // process origin would leak other services' broadcasts into it.
                 if let Some(relay) = qc.moq_relay.take() {
+                    if qc.iroh_required && !matches!(relay, hyprstream_rpc::stream_info::TransportConfig::Iroh(_)) {
+                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                            "network-iroh-required rejects non-Iroh stream relay".into(),
+                        ));
+                    }
                     if let Some(origin) = relay_origin {
                         hyprstream_rpc::moq_stream::serve_origin_to_relay_background(
                             origin.producer().clone(),
@@ -527,25 +549,44 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     } => None,
                 };
                 announcement_cancellation.cancel();
+                // All carriers and the independent bridge consume one grace.
+                // Publishing the deadline starts the bridge drain immediately;
+                // the final shutdown below still joins its owned thread/result.
+                let deadline = bridge.begin_shutdown(
+                    tokio::time::Instant::now() + hyprstream_rpc::transport::rpc_session::DRAIN_TIMEOUT,
+                );
                 local_shutdown.notify_one();
-                if let Some(substrate) = _iroh_substrate_guard {
-                    if let Err(error) = substrate.shutdown().await {
-                        tracing::warn!("iroh substrate shutdown error: {error}");
+                drain_token.cancel();
+                let substrate_drain = async {
+                    if let Some(substrate) = _iroh_substrate_guard {
+                        if let Err(error) = substrate.shutdown().await {
+                            tracing::warn!("iroh substrate shutdown error: {error}");
+                        }
                     }
-                }
-                hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown(
-                    &drain_limit, drain_capacity, &drain_token,
-                ).await;
-                let rep_result = match completed_rep {
-                    Some(result) => result,
-                    None => rep_fut.await,
                 };
+                let quinn_drain = hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown_until(
+                    &drain_limit, drain_capacity, &drain_token, deadline,
+                );
+                let rep_drain = async {
+                    match completed_rep {
+                        Some(result) => result,
+                        None => rep_fut.await,
+                    }
+                };
+                let (_, (), rep_result) = tokio::join!(substrate_drain, quinn_drain, rep_drain);
                 rep_result.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
             } else {
                 hyprstream_rpc::service::serve::serve_bridged(
                     &transport, processor, signing_key, shutdown, on_ready,
                 ).await.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
             }
+            }.await;
+            let teardown = bridge.shutdown().await.map_err(|error| {
+                tracing::error!(%error, "bridge shutdown failed");
+                hyprstream_rpc::error::RpcError::SpawnFailed(error.to_string())
+            });
+            // Always join, while retaining the earlier serving error if both fail.
+            result.and(teardown)
         })
     }
 }
@@ -1160,6 +1201,20 @@ mod tests {
     use hyprstream_rpc::prelude::SigningKey;
     use hyprstream_rpc::service::RequestService;
 
+    #[tokio::test]
+    async fn native_producer_origins_do_not_expose_sibling_tracks() -> AnyhowResult<()> {
+        let first = producer_moq_origin(true, None, true).ok_or_else(|| anyhow!("native producer origin missing"))?;
+        let second = producer_moq_origin(true, None, true).ok_or_else(|| anyhow!("native producer origin missing"))?;
+        let _broadcast = first.producer().create_broadcast("local/streams/first").ok_or_else(|| anyhow!("first broadcast missing"))?;
+        assert!(first.consumer().announced_broadcast("local/streams/first").await.is_some());
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100),
+            second.consumer().announced_broadcast("local/streams/first")).await.is_err());
+        assert!(producer_moq_origin(true, None, false).is_none());
+        let relayed = producer_moq_origin(true, Some(first), true).ok_or_else(|| anyhow!("relay origin missing"))?;
+        assert!(relayed.consumer().announced_broadcast("local/streams/first").await.is_some());
+        Ok(())
+    }
+
     #[test]
     fn production_moq_handler_preserves_explicit_ingress_and_defaults_to_denial() {
         let admission = Arc::new(
@@ -1208,12 +1263,21 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl RequestService for EchoService {
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> AnyhowResult<hyprstream_rpc::service::DecodedRequestBody> {
+            Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(
+                signed_body.to_vec(),
+            ))
+        }
+
         async fn handle_request(
             &self,
             _ctx: &hyprstream_rpc::service::EnvelopeContext,
-            payload: &[u8],
+            body: &hyprstream_rpc::service::DecodedRequestBody,
         ) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
-            Ok((payload.to_vec(), None))
+            Ok((body.bytes().to_vec(), None))
         }
 
         fn name(&self) -> &str {
@@ -1227,6 +1291,139 @@ mod tests {
         fn signing_key(&self) -> SigningKey {
             self.signing_key.clone()
         }
+    }
+
+    struct GatedService {
+        echo: EchoService,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        panic_on_drop: bool,
+    }
+
+    impl Drop for GatedService {
+        fn drop(&mut self) {
+            self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(!self.panic_on_drop, "causal service destructor panic");
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl RequestService for GatedService {
+        fn decode_request_body(&self, signed_body: &[u8]) -> AnyhowResult<hyprstream_rpc::service::DecodedRequestBody> {
+            self.echo.decode_request_body(signed_body)
+        }
+        async fn handle_request(
+            &self,
+            _ctx: &hyprstream_rpc::service::EnvelopeContext,
+            body: &hyprstream_rpc::service::DecodedRequestBody,
+        ) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
+            anyhow::bail!("denied request reached handler: {}", body.bytes().len())
+        }
+        async fn verify_claims(&self, _ctx: &mut hyprstream_rpc::service::EnvelopeContext) -> AnyhowResult<()> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            anyhow::bail!("gated claims denial")
+        }
+        fn build_error_payload(&self, _request_id: u64, error: &str) -> Vec<u8> {
+            error.as_bytes().to_vec()
+        }
+        fn name(&self) -> &str { "echo" }
+        fn transport(&self) -> &TransportConfig { &self.echo.transport }
+        fn signing_key(&self) -> SigningKey { self.echo.signing_key.clone() }
+    }
+
+    #[tokio::test]
+    async fn both_inproc_owners_drain_entered_request_with_retained_client() -> AnyhowResult<()> {
+        use hyprstream_rpc::envelope::{EnvelopeVerifyConfig, KeyedPqTrustStore};
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::in_memory::InMemoryTransport;
+        let (key, _) = generate_signing_keypair();
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
+        let mut store = KeyedPqTrustStore::new();
+        store.bind(key.verifying_key().to_bytes(), &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&pq));
+        let store = Arc::new(store);
+        hyprstream_rpc::envelope::install_verify_config(EnvelopeVerifyConfig {
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(store.clone()),
+        })?;
+        for unified in [false, true] {
+            let endpoint = format!("bridge-drain-owner-{unified}");
+            let transport = TransportConfig::inproc(&endpoint);
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let service = GatedService {
+                echo: EchoService::new(transport, key.clone()),
+                entered: entered.clone(), release: release.clone(), dropped: dropped.clone(),
+                panic_on_drop: false,
+            };
+            let owner: Box<dyn Spawnable> = if unified {
+                Box::new(UnifiedServiceConfig::new(service, None))
+            } else { Box::new(service) };
+            let shutdown = Arc::new(Notify::new());
+            struct Cleanup(Arc<Notify>);
+            impl Drop for Cleanup { fn drop(&mut self) { self.0.notify_one(); } }
+            let _cleanup = Cleanup(shutdown.clone());
+            let stopped = shutdown.clone();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::task::spawn_blocking(move || owner.run(stopped, Some(ready_tx)));
+            tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx).await??;
+            let processor = hyprstream_rpc::dial::lookup_inproc(&endpoint)
+                .ok_or_else(|| anyhow::anyhow!("missing ready processor"))?;
+            let client = Arc::new(RpcClientImpl::new(
+                LocalSigner::new(key.clone()), InMemoryTransport::new(processor),
+                Some(key.verifying_key()),
+            ).with_response_pq_store(store.clone()));
+            let caller = client.clone();
+            let response = tokio::spawn(async move { caller.call(b"accepted".to_vec()).await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified()).await?;
+            shutdown.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while hyprstream_rpc::dial::lookup_inproc(&endpoint).is_some() {
+                    tokio::task::yield_now().await;
+                }
+            }).await?;
+            assert!(!task.is_finished(), "owner returned while accepted request is gated");
+            assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+            // Endpoint removal follows admission closure, so this retained
+            // client must be rejected while the accepted call is still gated.
+            assert!(tokio::time::timeout(std::time::Duration::from_secs(5), client.call(b"late".to_vec())).await?.is_err());
+            release.notify_one();
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), response).await???, hyprstream_rpc::service::dispatch::DISPATCH_DENIED.as_bytes());
+            tokio::time::timeout(std::time::Duration::from_secs(5), task).await???;
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "retained client pinned service");
+            assert!(client.call(b"late".to_vec()).await.is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn both_inproc_owners_propagate_destructor_panic() -> AnyhowResult<()> {
+        for unified in [false, true] {
+            let (key, _) = generate_signing_keypair();
+            let service = GatedService {
+                echo: EchoService::new(TransportConfig::inproc(format!("bridge-panic-owner-{unified}")), key),
+                entered: Arc::new(Notify::new()), release: Arc::new(Notify::new()),
+                dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)), panic_on_drop: true,
+            };
+            let owner: Box<dyn Spawnable> = if unified {
+                Box::new(UnifiedServiceConfig::new(service, None))
+            } else { Box::new(service) };
+            let shutdown = Arc::new(Notify::new());
+            struct Cleanup(Arc<Notify>);
+            impl Drop for Cleanup { fn drop(&mut self) { self.0.notify_one(); } }
+            let _cleanup = Cleanup(shutdown.clone());
+            let stopped = shutdown.clone();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::task::spawn_blocking(move || owner.run(stopped, Some(ready_tx)));
+            tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx).await??;
+            shutdown.notify_one();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), task).await??;
+            assert!(result.is_err(), "owner hid bridge destructor panic");
+        }
+        Ok(())
     }
 
     fn loop_config(
