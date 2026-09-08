@@ -3365,6 +3365,61 @@ mod tests {
         Ok(())
     }
 
+    /// The loaded custom `[secrets].path` must reach the factory itself, not
+    /// only the startup trust-store bridge: with the service JWT on disk
+    /// solely at the config-selected directory (no env override, no manual
+    /// seeding), `register_service_key` resolves it there. This is the exact
+    /// selection expression that feeds `spawn_jwt_renewal_task` — the hourly
+    /// renewal reads and persists at this directory — so a config-free
+    /// fallback here makes custom-path deployments renew against the wrong
+    /// directory and silently skip.
+    #[test]
+    fn register_service_key_resolves_custom_config_secrets_dir() -> anyhow::Result<()> {
+        const CHILD: &str = "HYPRSTREAM_POLICY_CTX_SECRETS_DIR_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "services::factories::tests::register_service_key_resolves_custom_config_secrets_dir", "--nocapture"])
+                .env(CHILD, "1")
+                .status()?;
+            anyhow::ensure!(status.success(), "isolated ctx secrets-dir registration test failed");
+            return Ok(());
+        }
+        let root = tempfile::tempdir()?;
+        let custom = root.path().join("custom-credentials");
+        let xdg = root.path().join("xdg-config");
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        std::env::remove_var("HYPRSTREAM__SECRETS__PATH");
+        std::env::remove_var(crate::auth::identity_store::SECRETS_PROFILE_ENV);
+
+        let signer = SigningKey::from_bytes(&[0x6b; 32]);
+        let ctx = ServiceContext::new(signer.clone(), signer.verifying_key(), true, custom.clone())
+            .with_quic(hyprstream_service::QuicSharedConfig {
+                cert_chain: Vec::new(), key_der: zeroize::Zeroizing::new(Vec::new()),
+                base_ip: std::net::Ipv4Addr::LOCALHOST.into(), server_name: "policy.test".to_owned(),
+                oauth_issuer_url: None, jwt_verifying_key: None, iroh_enabled: true, iroh_required: true,
+                moq_relay: None, native_announcement_publisher: None,
+                moq_relay_server_identity: None, moq_admission: None,
+                moq_ingress_authorizer: None, moq_admission_proof: None,
+            })
+            .with_secrets_dir(custom.clone());
+        // No trust-store bridge: the JWT exists only at the config-selected
+        // directory. Registration must resolve it from the context-carried
+        // directory — the same binding handed to the renewal task.
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new("service:policy".to_owned(), now, now + 3600)
+            .with_cnf_jwk(signer.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &signer);
+        crate::auth::identity_store::write_service_jwt(&custom, "policy", &jwt)?;
+        register_service_key(&ctx, "policy", &signer)?;
+        assert_eq!(
+            hyprstream_service::global_trust_store()
+                .get(&signer.verifying_key())
+                .and_then(|attestation| attestation.jwt),
+            Some(jwt),
+        );
+        Ok(())
+    }
+
     /// A JWT already present in the trust store is used directly (no disk read).
     #[test]
     fn resolve_registration_jwt_prefers_trust_store() {

@@ -3100,7 +3100,18 @@ fn main() -> Result<()> {
                                     models_dir.clone(),
                                 )
                                 .with_oauth_issuer(config.oauth.issuer_url())
-                                .with_federation_key_source(fed_src);
+                                .with_federation_key_source(fed_src)
+                                // Same authoritative resolver the startup key/JWT
+                                // seeding above used (#759): without it, factory-time
+                                // key registration and the hourly JWT renewal task
+                                // would resolve a config-free default directory and
+                                // silently skip custom `--config [secrets].path`
+                                // deployments.
+                                .with_secrets_dir(
+                                    hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(
+                                        Some(&config),
+                                    )?,
+                                );
 
                                 // Wire QUIC shared config from --quic-bind or [quic] config
                                 let mut quic_cfg = if let Some(ref bind_addr) = quic_bind {
