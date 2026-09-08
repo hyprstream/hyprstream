@@ -5,10 +5,22 @@
 //! ownership of every child until termination is confirmed; children are
 //! spawned with `kill_on_drop(false)` ON PURPOSE — adopted daemons are
 //! intended to outlive the launcher.
+//!
+//! Platform support: the credential-authenticated notification receiver
+//! (`SO_PASSCRED`/`SCM_CREDENTIALS`, exact child-PID matching) exists on
+//! Linux/Android only. Other targets refuse a supervised Notify request
+//! before any launch side effect; `Immediate` launches are unchanged
+//! everywhere.
 
+// The credential-authenticated notification receiver is Linux/Android-only
+// (see `ChildNotifySocket`); its imports are gated with it. Everything the
+// Immediate path and the stop/cleanup helpers use stays portable.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use tokio::process::{Child, Command};
@@ -24,11 +36,22 @@ use hyprstream_rpc::error::{Result, RpcError};
 /// (via `SO_PASSCRED` sender credentials). This is local lifecycle
 /// supervision, not a service RPC endpoint — nothing dials it and no service
 /// traffic flows through it.
+///
+/// Platform support: the credential combination this receiver is built on —
+/// `SO_PASSCRED` plus `SCM_CREDENTIALS` for kernel-attested sender-PID
+/// matching — is Linux/Android-specific in pinned `nix 0.27.1`, so the
+/// authenticated receiver as implemented requires those targets. (The
+/// datagram creation flags themselves are available on several other Unix
+/// targets; the boundary is the credential contract, not the flags.) Other
+/// platforms refuse supervised Notify launches pre-spawn (see
+/// `spawn_notified`) instead of weakening the sender-PID check.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 struct ChildNotifySocket {
     fd: OwnedFd,
     path: std::path::PathBuf,
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl ChildNotifySocket {
     fn bind(name: &str) -> Result<Self> {
         // Per-attempt private directory, created EXCLUSIVELY (no
@@ -184,6 +207,7 @@ impl ChildNotifySocket {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl Drop for ChildNotifySocket {
     fn drop(&mut self) {
         // OwnedFd closes the descriptor itself; remove the socket inode and
@@ -196,6 +220,7 @@ impl Drop for ChildNotifySocket {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 /// What the synchronous startup backstop actually observed and did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackstopOutcome {
@@ -212,6 +237,7 @@ enum BackstopOutcome {
     Unconfirmed,
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 /// Terminal-status classification for backstop outcome purposes: only a
 /// real exit or kill signal establishes disappearance. StillAlive,
 /// stopped, continued, and ptrace states are nonterminal and never
@@ -223,6 +249,7 @@ fn wait_status_is_terminal(status: &nix::sys::wait::WaitStatus) -> bool {
     )
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 /// Startup ownership of a not-yet-adopted child (#1585).
 ///
 /// Between `spawn` and readiness the launcher — not the process map — owns
@@ -238,6 +265,7 @@ struct StartupChildGuard {
     pid_file: Option<std::path::PathBuf>,
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl StartupChildGuard {
     /// Kill and reap the owned child, honestly reporting every failure.
     ///
@@ -375,6 +403,7 @@ impl StartupChildGuard {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl Drop for StartupChildGuard {
     fn drop(&mut self) {
         if self.child.is_some() {
@@ -507,6 +536,14 @@ impl StandaloneBackend {
     /// the child's own `READY=1` datagram arrives from the child's PID; a
     /// child exit or the hard timeout fails the spawn, the child is
     /// terminated/reaped, and no PID/notify artifact survives.
+    ///
+    /// Platform support: the credential-authenticated receiver
+    /// (`SO_PASSCRED`/`SCM_CREDENTIALS`, exact child-PID matching) exists on
+    /// Linux/Android only. On any other target this request fails closed
+    /// BEFORE spawning the child or creating the notification directory, PID
+    /// artifact, or any other launch side effect — there is no fallback to
+    /// `Immediate` readiness and no unauthenticated receiver.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     async fn spawn_notified(
         &self,
         config: ProcessConfig,
@@ -765,7 +802,28 @@ impl StandaloneBackend {
             .with_pid_file(pid_file))
     }
 
+    /// Non-Linux arm of the Notify-supervised path: an explicit pre-spawn
+    /// refusal (see the Linux/Android arm's contract above). Nothing is
+    /// spawned and no notification directory, child guard, or PID artifact is
+    /// created; there is deliberately no fallback to `Immediate` readiness,
+    /// because a supervised launch whose sender cannot be kernel-attested
+    /// must not report success from an unauthenticated payload.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    async fn spawn_notified(
+        &self,
+        _config: ProcessConfig,
+        _timeout: Duration,
+    ) -> Result<SpawnedProcess> {
+        Err(RpcError::SpawnFailed(
+            "authenticated notification readiness (SO_PASSCRED/SCM_CREDENTIALS) is \
+             supported on Linux/Android only; a supervised Notify launch is refused \
+             on this platform"
+                .to_owned(),
+        ))
+    }
+
     /// Poll the notification endpoint against child exit and the hard timeout.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     async fn await_child_readiness(
         &self,
         child: &mut Child,
@@ -842,6 +900,9 @@ fn process_is_zombie(_pid: i32) -> bool {
 
 /// Format an optional cleanup failure onto a startup error: a cleanup that
 /// itself failed is part of the failure report, never discarded.
+/// Rollback-failure suffix for spawn error messages (used by the
+/// Linux/Android supervised Notify arm only).
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn cleanup_suffix(cleanup: std::result::Result<(), String>) -> String {
     match cleanup {
         Ok(()) => String::new(),
@@ -852,6 +913,7 @@ fn cleanup_suffix(cleanup: std::result::Result<(), String>) -> String {
 /// Outcome of inspecting an existing PID artifact before a launch. Anything
 /// other than a confirmed-missing or confirmed-dead predecessor is ambiguous
 /// and must fail closed: only a verified missing/dead witness may be replaced.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 enum PidWitness {
     /// No artifact: nothing to refuse, nothing to preserve.
     Absent,
@@ -864,6 +926,9 @@ enum PidWitness {
     Ambiguous(String),
 }
 
+/// Inspect an existing PID artifact into a [`PidWitness`] (Linux/Android;
+/// used by the supervised Notify precheck).
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn inspect_pid_file(path: &std::path::Path) -> PidWitness {
     match std::fs::read_to_string(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => PidWitness::Absent,
@@ -1103,6 +1168,7 @@ fn finish_pid_artifact_sync(
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 /// Per-service nonblocking advisory lock for notified launches (#1585).
 ///
 /// The lock file has a STABLE path (and thus stable inode) and is NEVER
@@ -1123,6 +1189,7 @@ struct ServiceLaunchLock {
     _file: std::fs::File,
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl Drop for ServiceLaunchLock {
     fn drop(&mut self) {
         use nix::fcntl::{flock, FlockArg};
@@ -1146,6 +1213,7 @@ impl Drop for ServiceLaunchLock {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl ServiceLaunchLock {
     fn acquire(service: &str) -> Result<Self> {
         use nix::fcntl::{flock, FlockArg};
@@ -1425,6 +1493,14 @@ mod tests {
     }
 }
 
+/// Linux/Android-only coverage of the credential-authenticated receiver:
+/// positive readiness, foreign-PID rejection, timeout/early-exit rollback,
+/// spoofed-sender refusal, and the launcher-side cancellation/rollback
+/// ownership regressions that exercise the supervised Notify path end to
+/// end. These tests RUN on Linux/Android — the cfg only removes them from
+/// non-Linux builds, where the supervised Notify path itself is refused
+/// pre-spawn.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[cfg(test)]
 mod notify_readiness_tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -2178,6 +2254,101 @@ mod notify_readiness_tests {
             notify.try_recv_ready(this_pid)?,
             "the matching sender satisfies readiness"
         );
+        Ok(())
+    }
+}
+
+/// Non-Linux targets only: the supervised Notify request must be refused
+/// before any launch side effect. The configured child is an executable
+/// sentinel — it would write a marker file if it were ever spawned — so
+/// marker, PID-artifact, and notify-runtime-directory absence at the checked
+/// points evidence the boundary. This cfg cannot run on Linux lanes; it
+/// exists for actual non-Linux targets and makes no claim about them from
+/// Linux runs.
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android")),
+    test
+))]
+mod notify_refusal_non_linux_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use crate::service::spawner::ProcessSpawner;
+
+    const REFUSED_SENTINEL: &str = "HYPRSTREAM_NOTIFY_REFUSED_SENTINEL";
+
+    /// A Notify request on an unsupported platform is refused pre-spawn by
+    /// the explicit unsupported branch in `spawn_notified` — that branch
+    /// returns before any launch operation, which is the production
+    /// guarantee. This test observes that boundary: the executable sentinel
+    /// was not observed running, no PID artifact was published, and no
+    /// per-launch notify runtime directory appeared at the checked points.
+    #[tokio::test]
+    async fn notify_request_refused_before_any_launch_side_effect() -> anyhow::Result<()> {
+        if let Some(path) = std::env::var_os(REFUSED_SENTINEL) {
+            // Unreachable if the boundary holds: the refusal must fire before
+            // any child exists.
+            std::fs::write(&path, std::process::id().to_string())?;
+            return Ok(());
+        }
+
+        let exe = std::env::current_exe()?;
+        let dir = tempfile::tempdir()?;
+        let marker = dir.path().join("sentinel.marker");
+        // Unique per-run service name: unrelated runtime artifacts cannot
+        // decide the result, and nothing existing is overwritten or removed.
+        let name = format!("notify-refused-{}", nix::unistd::getpid());
+        let pid_file = hyprstream_rpc::paths::service_pid_file(&name);
+        let dir_prefix = format!("notify-{name}-");
+
+        let spawner = ProcessSpawner::standalone();
+        let error = match spawner
+            .spawn(
+                ProcessConfig::new(&name, &exe)
+                    .args([
+                        "--exact",
+                        "service::spawner::standalone::notify_refusal_non_linux_tests::notify_request_refused_before_any_launch_side_effect",
+                        "--nocapture",
+                    ])
+                    .env(REFUSED_SENTINEL, marker.display().to_string())
+                    .with_notify_ready(std::time::Duration::from_secs(30)),
+            )
+            .await
+        {
+            Ok(process) => {
+                panic!(
+                    "Notify must be refused on non-Linux targets; spawned pid {:?}",
+                    process.pid()
+                );
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("Linux/Android"),
+            "refusal must name the platform boundary, got: {message}"
+        );
+
+        // Observed boundary: the sentinel never ran, no PID artifact was
+        // published, and no per-launch notify runtime directory exists.
+        assert!(
+            !marker.exists(),
+            "the sentinel child must not have been spawned by the refused Notify request"
+        );
+        assert!(
+            !pid_file.exists(),
+            "a refused Notify request must not publish a PID artifact"
+        );
+        for entry in std::fs::read_dir(hyprstream_rpc::paths::runtime_dir())? {
+            let entry = entry?;
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !file_name.starts_with(&dir_prefix),
+                "a refused Notify request must not create a notify runtime directory, \
+                 found {file_name}"
+            );
+        }
         Ok(())
     }
 }

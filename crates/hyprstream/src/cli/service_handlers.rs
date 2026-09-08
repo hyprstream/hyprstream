@@ -2704,6 +2704,7 @@ mod launcher_tests {
     /// Required roster rollback: a later child failing must stop earlier
     /// children in reverse order — proven with real supervised processes via
     /// the injected-plan seam.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn required_rollback_stops_started_children_on_later_failure() -> anyhow::Result<()> {
         use hyprstream_service::{ProcessConfig, ProcessReadiness, ProcessSpawner};
@@ -2779,6 +2780,7 @@ mod launcher_tests {
     /// break). Stop ORDER is not externally observable here: rollback kills
     /// are SIGKILL, so reverse ordering remains a construction guarantee of
     /// `started.iter().rev()`, not an observed event.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn required_stage_failure_aborts_launch_and_never_spawns_later_stages()
     -> anyhow::Result<()> {
@@ -2916,6 +2918,7 @@ mod launcher_tests {
     /// backend's retained handle and removes its PID artifact. The later
     /// child is proven genuinely pending: its marker proves it spawned (so
     /// the first child was adopted), and it never sends READY.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn required_cancellation_reaps_adopted_children_and_artifacts() -> anyhow::Result<()> {
         use hyprstream_service::{ProcessConfig, ProcessReadiness, ProcessSpawner};
@@ -3023,6 +3026,7 @@ mod launcher_tests {
     /// and later `stop` through the established contract. (Pair A proves
     /// stoppability through the launching backend's tracked stop; pair C is
     /// dropped with its spawner and must still be running afterwards.)
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn required_success_commit_leaves_adopted_daemons_alive_and_stoppable()
     -> anyhow::Result<()> {
@@ -3170,6 +3174,7 @@ mod launcher_tests {
     /// or that rollback was entered. The landing is unspecified. The
     /// deterministic rollback-boundary evidence is provided by
     /// `rollback_failed_and_pending_stops_stay_guard_owned_through_cancellation`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn required_cancellation_around_startup_failure_cleans_predecessor_at_any_landing()
     -> anyhow::Result<()> {
@@ -3267,6 +3272,7 @@ mod launcher_tests {
     /// boundary is injected at the narrow `rollback_owned_children` stop seam; the
     /// two children are REAL spawned processes, so ownership and cleanup are
     /// evidenced by observed reaps (ESRCH) and PID-artifact removal.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn rollback_failed_and_pending_stops_stay_guard_owned_through_cancellation()
     -> anyhow::Result<()> {

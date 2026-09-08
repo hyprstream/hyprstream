@@ -70,6 +70,16 @@ pub enum ProcessReadiness {
     /// notification endpoint before reporting success. The sender PID must
     /// match the spawned child; a child exit or the hard timeout fails the
     /// spawn, and the child is terminated/reaped and its artifacts cleaned up.
+    ///
+    /// Platform support: the credential-authenticated receiver
+    /// (`SO_PASSCRED`/`SCM_CREDENTIALS`, exact child-PID matching) is
+    /// implemented for Linux/Android only. On other targets a Notify request
+    /// is refused with an explicit error BEFORE the child is spawned and
+    /// before any launch side effect; it is never silently downgraded to
+    /// [`ProcessReadiness::Immediate`], and no unauthenticated receiver
+    /// exists. This is a launcher lifecycle boundary: the Required
+    /// networking profile itself predates this readiness policy and is a
+    /// distinct concern.
     Notify {
         /// Hard bound on how long the child has to report readiness.
         timeout: std::time::Duration,
