@@ -370,6 +370,8 @@ pub async fn handle_service_install(
     enable: bool,
     target: hyprstream_service::ServiceTarget,
     verbose: bool,
+    explicit_config: Option<&Path>,
+    iroh_required: bool,
 ) -> Result<()> {
     let target_services = services_filter.unwrap_or_else(|| config_services.to_vec());
 
@@ -408,6 +410,27 @@ pub async fn handle_service_install(
 
     // 3. Install/update systemd units if available
     if hyprstream_rpc::has_systemd() {
+        // Installed units run their own stored configuration (fixed ExecStart,
+        // no config provenance, raw dependency order). Installing, enabling,
+        // or starting such a unit under an explicit --config selector or the
+        // required-native profile would silently run a different identity
+        // than this process loaded. Refuse before any unit mutation; the
+        // direct launch path is the supported route.
+        if explicit_config.is_some() || iroh_required {
+            anyhow::bail!(
+                "installed hyprstream service units cannot receive an explicit --config \
+                 selector or the required-native profile, so this command cannot install \
+                 or start units for that configuration. Launch provisioned services \
+                 directly instead, e.g. `hyprstream{} service start <service> --daemon`. \
+                 (Plain `hyprstream service install` without the custom selector or \
+                 required profile still installs default-configuration units.)",
+                match explicit_config {
+                    Some(path) => format!(" --config {}", path.display()),
+                    None => String::new(),
+                }
+            );
+        }
+
         let manager = hyprstream_service::detect_service_manager_with_mode(target).await?;
 
         // Encrypt secrets into the systemd user credstore before generating units.
@@ -421,7 +444,9 @@ pub async fn handle_service_install(
             hyprstream_service::encrypt_credentials_if_available(secrets_dir.as_deref());
         }
 
-        // If --start, stop all target services first so they pick up changes
+        // If --start, stop all target services first so they pick up changes.
+        // Stop is legitimately idempotent here (already-stopped units are the
+        // common case on reinstall), so failures stay non-fatal.
         if start {
             println!("  Stopping services...");
             for service in &target_services {
@@ -432,10 +457,11 @@ pub async fn handle_service_install(
         println!("  Installing systemd units...");
         for service in &target_services {
             print!("    \u{25CB} {}... ", service);
-            match manager.install(service).await {
-                Ok(_) => println!("\u{2713}"),
-                Err(e) => println!("\u{2717} {}", e),
-            }
+            manager
+                .install(service)
+                .await
+                .map_err(|e| anyhow::anyhow!("installing unit for {service}: {e}"))?;
+            println!("\u{2713}");
         }
 
         // If --enable, register units for autostart at boot
@@ -443,26 +469,52 @@ pub async fn handle_service_install(
             println!("  Enabling services for autostart...");
             for service in &target_services {
                 print!("    \u{25CB} {}... ", service);
-                match manager.enable(service).await {
-                    Ok(_) => println!("\u{2713}"),
-                    Err(e) => println!("\u{2717} {}", e),
-                }
+                manager
+                    .enable(service)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("enabling unit for {service}: {e}"))?;
+                println!("\u{2713}");
             }
         }
 
-        // 4. If --start, start all target services
+        // 4. If --start, start all target services. A queued start request is
+        // not success: require the unit to reach the active state (Type=notify)
+        // within the bounded startup budget (#1585).
         if start {
             println!("  Starting services...");
             for service in &target_services {
                 print!("    \u{25CB} {}... ", service);
-                match manager.start(service).await {
-                    Ok(_) => println!("\u{2713}"),
-                    Err(e) => println!("\u{2717} {}", e),
+                manager
+                    .start(service)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("starting {service}: {e}"))?;
+                let deadline = std::time::Instant::now() + CHILD_READINESS_TIMEOUT;
+                loop {
+                    match manager.is_active(service).await {
+                        Ok(true) => break,
+                        Ok(false) => {
+                            if std::time::Instant::now() >= deadline {
+                                anyhow::bail!(
+                                    "service {service} unit did not reach the active state \
+                                     within {}s",
+                                    CHILD_READINESS_TIMEOUT.as_secs()
+                                );
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "active-state check for {service} failed: {e}"
+                            ));
+                        }
+                    }
                 }
+                println!("\u{2713}");
             }
         }
     } else if start {
-        // Standalone mode: use installed binary to spawn processes
+        // No systemd: the same factored direct launch path as `service start`
+        // — profile-aware ordering, config forwarding, notification readiness.
         println!("  Starting services (standalone)...\n");
 
         let exe = hyprstream_rpc::paths::installed_executable_path()
@@ -470,20 +522,14 @@ pub async fn handle_service_install(
 
         let spawner = hyprstream_service::ProcessSpawner::standalone();
 
-        for service in &target_services {
-            print!("    \u{25CB} {}... ", service);
-
-            let config = hyprstream_service::ProcessConfig::new(service, &exe)
-                .args(["service", "start", service, "--foreground", "--ipc"]);
-
-            match spawner.spawn(config).await {
-                Ok(process) => {
-                    info!("Spawned {} service: {:?}", service, process.kind);
-                    println!("\u{2713}");
-                }
-                Err(e) => println!("\u{2717} {}", e),
-            }
-        }
+        launch_direct_children(
+            &target_services,
+            iroh_required,
+            explicit_config,
+            &exe,
+            &spawner,
+        )
+        .await?;
     }
 
     println!("\n\u{2713} Install complete");
@@ -532,11 +578,193 @@ pub async fn handle_service_uninstall(
     Ok(())
 }
 
+/// Budget a spawned child gets to report genuine readiness (#1585).
+const CHILD_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Build one child invocation for the direct launch path (#1585).
+///
+/// Required-native children run `hyprstream [--config PATH] service start NAME
+/// --foreground` — no `--ipc`, no local endpoint fallback; their readiness is
+/// the child's own notification boundary, never a UDS socket. Compatibility
+/// children keep the historical `--ipc` shape. The explicit config path (when
+/// the operator supplied one) is forwarded so the child loads, validates, and
+/// pins the same configuration the launcher did; it is canonical absolute, so
+/// it stays meaningful regardless of the child's working directory, and it is
+/// one argv element, so spaces need no quoting. Config contents, keys, and
+/// JWTs never enter argv or the environment.
+pub fn direct_child_process_config(
+    service: &str,
+    iroh_required: bool,
+    explicit_config: Option<&Path>,
+    exe: &Path,
+) -> Result<hyprstream_service::ProcessConfig> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(config_path) = explicit_config {
+        let rendered = config_path
+            .to_str()
+            .with_context(|| {
+                format!(
+                    "explicit config path {} is not valid UTF-8 and cannot be forwarded",
+                    config_path.display()
+                )
+            })?
+            .to_owned();
+        args.push("--config".to_owned());
+        args.push(rendered);
+    }
+    args.push("service".to_owned());
+    args.push("start".to_owned());
+    args.push(service.to_owned());
+    args.push("--foreground".to_owned());
+    if !iroh_required {
+        args.push("--ipc".to_owned());
+    }
+
+    let mut config = hyprstream_service::ProcessConfig::new(service, exe);
+    config.args = args;
+    if iroh_required {
+        // The child's own authenticated startup boundary is the readiness
+        // signal (sd_notify READY after Iroh bind and first publication).
+        config.readiness =
+            hyprstream_service::ProcessReadiness::Notify { timeout: CHILD_READINESS_TIMEOUT };
+    }
+    Ok(config)
+}
+
+/// Launch children directly in profile-aware dependency order (#1585).
+///
+/// Shared by `service start --daemon`, no-systemd `service start`, and the
+/// no-systemd `service install --start` fallback, so every direct launch gets
+/// the same ordering, config forwarding, and readiness contract.
+///
+/// Required-native: every child must report genuine readiness before the next
+/// child (and stage) starts; any spawn, early-exit, or timeout failure stops
+/// already-started children in reverse start order and returns `Err` — the
+/// caller never prints success for a partial launch. Compatibility keeps the
+/// historical best-effort behavior (per-service error lines, UDS-presence
+/// stage barrier with warn-and-continue) so existing deployments are
+/// unchanged.
+pub async fn launch_direct_children(
+    targets: &[String],
+    iroh_required: bool,
+    explicit_config: Option<&Path>,
+    exe: &Path,
+    spawner: &hyprstream_service::ProcessSpawner,
+) -> Result<()> {
+    let stages = hyprstream_service::startup_stages_for_profile(targets, iroh_required);
+    // Flatten the ordered stages into the serial launch plan (same order the
+    // loop below would spawn in), so the launch core is injectably testable
+    // without the real service binary.
+    let mut plans: Vec<Vec<(String, hyprstream_service::ProcessConfig)>> = Vec::new();
+    for stage in &stages {
+        let mut stage_plans = Vec::new();
+        for service in stage {
+            stage_plans.push((
+                service.clone(),
+                direct_child_process_config(service, iroh_required, explicit_config, exe)?,
+            ));
+        }
+        plans.push(stage_plans);
+    }
+    launch_planned_children(plans, iroh_required, spawner).await
+}
+
+/// Serially launch pre-built child plans (stage-ordered) with the
+/// required-native readiness contract and reverse-order rollback. Narrow seam
+/// (#1585): plan building is separate so causal tests can inject concrete
+/// children without the real service binary.
+async fn launch_planned_children(
+    plans: Vec<Vec<(String, hyprstream_service::ProcessConfig)>>,
+    iroh_required: bool,
+    spawner: &hyprstream_service::ProcessSpawner,
+) -> Result<()> {
+    let mut started: Vec<(String, hyprstream_service::SpawnedProcess)> = Vec::new();
+    let mut launch_error: Option<anyhow::Error> = None;
+
+    'stages: for stage in &plans {
+        for (service, config) in stage {
+            print!("  \u{25CB} {}... ", service);
+
+            match spawner.spawn(config.clone()).await {
+                Ok(process) => {
+                    info!("Spawned {} service: {:?}", service, process.kind);
+                    println!("\u{2713} (pid {:?})", process.pid());
+                    started.push((service.clone(), process));
+                }
+                Err(e) => {
+                    println!("\u{2717} {}", e);
+                    if iroh_required {
+                        // A required-native failure aborts the WHOLE launch:
+                        // later stages depend on earlier ones, so none of
+                        // them may spawn before the rollback runs.
+                        launch_error = Some(e.into());
+                        break 'stages;
+                    }
+                }
+            }
+        }
+
+        // Compatibility stage barrier: wait for IPC sockets before the next
+        // stage. Required-native readiness was already enforced per child
+        // above; it never depends on a service UDS socket.
+        if !iroh_required {
+            let runtime_dir = hyprstream_rpc::paths::runtime_dir();
+            for (service, _) in stage {
+                let sock = runtime_dir.join(format!("{service}.sock"));
+                let deadline = std::time::Instant::now() + CHILD_READINESS_TIMEOUT;
+                while !sock.exists() && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                if !sock.exists() {
+                    tracing::warn!("Timeout waiting for {service} socket; continuing");
+                }
+            }
+        }
+    }
+
+    if let Some(error) = launch_error {
+        if iroh_required {
+            // Deterministic rollback: stop what we started, newest first; each
+            // stop removes that child's PID artifact. Rollback failures are
+            // aggregated onto the original launch failure, never silently
+            // dropped — residual live processes must be reported.
+            let mut rollback_failures = Vec::new();
+            for (service, process) in started.iter().rev() {
+                print!("  \u{25CB} stopping {} after failed launch... ", service);
+                match spawner.stop(process).await {
+                    Ok(_) => println!("\u{2713}"),
+                    Err(e) => {
+                        println!("\u{2717} {}", e);
+                        rollback_failures.push(format!("{service}: {e}"));
+                    }
+                }
+            }
+            if !rollback_failures.is_empty() {
+                return Err(error.context(format!(
+                    "launch rollback left residual state: {}",
+                    rollback_failures.join("; ")
+                )));
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Handle `service start` (non-foreground) - Start via systemd or spawn
+///
+/// `explicit_config` is the operator's canonical absolute `--config` selector
+/// (CLI value or the `HYPRSTREAM_CONFIG` env selector); `iroh_required` is the
+/// loaded config's native-network profile. Required-native or custom-config
+/// starts never select an installed systemd unit — those units encode their
+/// own stored configuration and cannot receive this process's configuration —
+/// and are routed to the direct launch path instead.
 pub async fn handle_service_start(
     config_services: &[String],
     name: Option<String>,
     daemon: bool,
+    explicit_config: Option<&Path>,
+    iroh_required: bool,
 ) -> Result<()> {
     let target_services: Vec<String> = if let Some(name) = name {
         vec![name]
@@ -551,58 +779,85 @@ pub async fn handle_service_start(
 
     // Use systemd if available and --daemon not specified
     if hyprstream_rpc::has_systemd() && !daemon {
+        if explicit_config.is_some() || iroh_required {
+            anyhow::bail!(
+                "installed hyprstream service units run their own stored configuration; \
+                 an explicit --config selector or the required-native profile cannot be \
+                 applied through them. Launch provisioned services directly instead, \
+                 e.g. `hyprstream{} service start <service> --daemon`.",
+                match explicit_config {
+                    Some(path) => format!(" --config {}", path.display()),
+                    None => String::new(),
+                }
+            );
+        }
+
         let manager = hyprstream_service::detect_service_manager().await?;
 
         println!("Starting services (systemd)...\n");
 
-        for service in &target_services {
-            print!("  \u{25CB} {}... ", service);
-            match manager.start(service).await {
-                Ok(_) => println!("\u{2713}"),
-                Err(e) => println!("\u{2717} {}", e),
-            }
-        }
+        start_units_to_active(&*manager, &target_services, CHILD_READINESS_TIMEOUT).await?;
     } else {
-        // Standalone mode: spawn processes in dependency order
+        // Direct launch: profile-aware ordering, config forwarding, and the
+        // per-child notification readiness contract.
         println!("Starting services (standalone)...\n");
 
         let spawner = hyprstream_service::ProcessSpawner::standalone();
         let exe = hyprstream_rpc::paths::executable_path()?;
-        let stages = hyprstream_service::startup_stages(&target_services);
-
-        for stage in &stages {
-            for service in stage {
-                print!("  \u{25CB} {}... ", service);
-
-                let config = hyprstream_service::ProcessConfig::new(service, &exe)
-                    .args(["service", "start", service, "--foreground", "--ipc"]);
-
-                match spawner.spawn(config).await {
-                    Ok(process) => {
-                        info!("Spawned {} service: {:?}", service, process.kind);
-                        println!("\u{2713}");
-                    }
-                    Err(e) => println!("\u{2717} {}", e),
-                }
-            }
-
-            // Wait for this stage's services to be ready before starting the next.
-            // Probe for IPC socket existence as the readiness signal.
-            let runtime_dir = hyprstream_rpc::paths::runtime_dir();
-            for service in stage {
-                let sock = runtime_dir.join(format!("{service}.sock"));
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                while !sock.exists() && std::time::Instant::now() < deadline {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                if !sock.exists() {
-                    tracing::warn!("Timeout waiting for {service} socket; continuing");
-                }
-            }
-        }
+        launch_direct_children(
+            &target_services,
+            iroh_required,
+            explicit_config,
+            &exe,
+            &spawner,
+        )
+        .await?;
     }
 
     println!("\n\u{2713} Start complete");
+    Ok(())
+}
+
+
+/// Start installed units and require each to reach the active state within
+/// `active_timeout` before reporting success (#1585).
+///
+/// The permitted Compatibility-only existing-unit path: mutation failures
+/// propagate (a pre-existing active unit must never mask a failed start), and
+/// a queued start request is not completion — the unit is Type=notify.
+/// Injectable over [`hyprstream_service::ServiceManager`] for causal tests.
+async fn start_units_to_active(
+    manager: &dyn hyprstream_service::ServiceManager,
+    targets: &[String],
+    active_timeout: std::time::Duration,
+) -> Result<()> {
+    for service in targets {
+        print!("  \u{25CB} {}... ", service);
+        // A real mutation failure must surface: continuing here would let a
+        // pre-existing active unit mask the failed start.
+        manager
+            .start(service)
+            .await
+            .map_err(|e| anyhow::anyhow!("starting {service}: {e}"))?;
+
+        let deadline = std::time::Instant::now() + active_timeout;
+        loop {
+            match manager.is_active(service).await {
+                Ok(true) => break,
+                Ok(false) => {
+                    if std::time::Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "service {service} unit did not reach the active state within {}s",
+                            active_timeout.as_secs()
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        println!("\u{2713}");
+    }
     Ok(())
 }
 
@@ -1592,6 +1847,7 @@ fn update_shell_profiles(home: &Path, bin_dir: &Path) -> Result<Vec<String>> {
 }
 
 #[cfg(test)]
+<<<<<<< HEAD
 #[allow(clippy::expect_used)]
 mod offline_policy_provision_tests {
     use super::*;
@@ -1718,10 +1974,158 @@ mod offline_policy_provision_tests {
                 "mesh-readers".to_owned(),
                 "acme".to_owned(),
             ]));
+=======
+mod launcher_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use hyprstream_service::ProcessReadiness;
+
+    #[test]
+    fn direct_child_process_config_builds_profile_specific_invocation() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        // A relative-looking config directory containing spaces: the launcher
+        // hands the child one canonical absolute argv element that keeps the
+        // spaces (no shell splitting, no quoting).
+        let config_path = root.path().join("my configs/custom.toml");
+        std::fs::create_dir_all(config_path.parent().expect("parent"))?;
+        std::fs::write(&config_path, "[secrets]\n")?;
+        let canonical = std::fs::canonicalize(&config_path)?;
+
+        // Required-native: no --ipc, config forwarded, notification readiness.
+        let required = direct_child_process_config(
+            "model",
+            true,
+            Some(&canonical),
+            Path::new("/usr/local/bin/hyprstream"),
+        )?;
+        let expected_tail = [
+            "service".to_owned(),
+            "start".to_owned(),
+            "model".to_owned(),
+            "--foreground".to_owned(),
+        ];
+        assert_eq!(&required.args[required.args.len() - 4..], &expected_tail);
+        assert!(
+            !required.args.iter().any(|arg| arg == "--ipc"),
+            "required-native child must not be forced onto the local IPC endpoint"
+        );
+        assert!(
+            required
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--config" && pair[1] == canonical.to_str().expect("utf-8")),
+            "canonical config path (spaces intact) must be forwarded as one argv element"
+        );
+        assert!(matches!(
+            required.readiness,
+            ProcessReadiness::Notify { .. }
+        ));
+
+        // Compatibility keeps the historical shape and immediate reporting.
+        let compat_with_config = direct_child_process_config(
+            "registry",
+            false,
+            Some(&canonical),
+            Path::new("/usr/local/bin/hyprstream"),
+        )?;
+        assert_eq!(
+            &compat_with_config.args[compat_with_config.args.len() - 5..],
+            &[
+                "service".to_owned(),
+                "start".to_owned(),
+                "registry".to_owned(),
+                "--foreground".to_owned(),
+                "--ipc".to_owned(),
+            ]
+        );
+        assert_eq!(compat_with_config.readiness, ProcessReadiness::Immediate);
+
+        // No explicit selector: argv identical to the legacy launcher.
+        let compat_default =
+            direct_child_process_config("policy", false, None, Path::new("/bin/hyprstream"))?;
+        assert_eq!(
+            compat_default.args,
+            [
+                "service".to_owned(),
+                "start".to_owned(),
+                "policy".to_owned(),
+                "--foreground".to_owned(),
+                "--ipc".to_owned(),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Mock manager: scripted start/is_active behavior for the permitted
+    /// Compatibility unit-start lifecycle contract.
+    struct MockManager {
+        start_error: Option<&'static str>,
+        active_after: std::sync::atomic::AtomicU32,
+    }
+
+    impl MockManager {
+        fn failing() -> Self {
+            Self {
+                start_error: Some("unit is masked"),
+                active_after: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+        fn never_active() -> Self {
+            Self {
+                start_error: None,
+                active_after: std::sync::atomic::AtomicU32::new(u32::MAX),
+            }
+        }
+        fn immediate() -> Self {
+            Self {
+                start_error: None,
+                active_after: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl hyprstream_service::ServiceManager for MockManager {
+        async fn install(&self, _service: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn uninstall(&self, _service: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn start(&self, _service: &str) -> anyhow::Result<()> {
+            match self.start_error {
+                Some(reason) => anyhow::bail!("{reason}"),
+                None => Ok(()),
+            }
+        }
+        async fn stop(&self, _service: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn is_active(&self, _service: &str) -> anyhow::Result<bool> {
+            use std::sync::atomic::Ordering;
+            let remaining = self.active_after.load(Ordering::SeqCst);
+            if remaining > 0 && remaining != u32::MAX {
+                self.active_after.store(remaining - 1, Ordering::SeqCst);
+                return Ok(false);
+            }
+            Ok(remaining == 0)
+        }
+        async fn reload(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn spawn(
+            &self,
+            _spawnable: Box<dyn hyprstream_rpc::Spawnable>,
+        ) -> anyhow::Result<hyprstream_service::SpawnedService> {
+            anyhow::bail!("mock manager does not host services")
+>>>>>>> 37dc8ac74 (fix(launcher): carry config provenance and enforce verified startup ownership)
         }
     }
 
     #[tokio::test]
+<<<<<<< HEAD
     async fn invalid_requests_fail_before_storage_mutation() {
         for templates in [
             vec!["not-a-template".to_owned()],
@@ -1801,10 +2205,25 @@ mod offline_policy_provision_tests {
                     "infer.generate",
                 )
                 .await
+=======
+    async fn unit_start_mutation_failure_propagates_without_active_poll() {
+        let manager = MockManager::failing();
+        let error = start_units_to_active(
+            &manager,
+            &["model".to_owned()],
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("start mutation failure must propagate");
+        assert!(
+            error.to_string().contains("unit is masked"),
+            "real failure expected, got: {error}"
+>>>>>>> 37dc8ac74 (fix(launcher): carry config provenance and enforce verified startup ownership)
         );
     }
 
     #[tokio::test]
+<<<<<<< HEAD
     async fn prepublication_failure_and_retry_preserve_retained_deny() {
         let root = tempfile::tempdir().expect("retained-policy models root");
         let policies_dir = root.path().join(".registry/policies");
@@ -2083,6 +2502,280 @@ mod offline_policy_provision_tests {
                 .await
                 .expect("policy after read failure"),
             original
+=======
+    async fn unit_start_requires_bounded_active_state() {
+        let manager = MockManager::never_active();
+        let error = start_units_to_active(
+            &manager,
+            &["model".to_owned()],
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .expect_err("a unit that never activates must fail the bounded wait");
+        assert!(
+            error
+                .to_string()
+                .contains("did not reach the active state"),
+            "active-state timeout expected, got: {error}"
+        );
+
+        let manager = MockManager::immediate();
+        start_units_to_active(
+            &manager,
+            &["model".to_owned()],
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("immediately-active unit must complete");
+    }
+
+    /// Required roster rollback: a later child failing must stop earlier
+    /// children in reverse order — proven with real supervised processes via
+    /// the injected-plan seam.
+    #[tokio::test]
+    async fn required_rollback_stops_started_children_on_later_failure() -> anyhow::Result<()> {
+        use hyprstream_service::{ProcessConfig, ProcessReadiness, ProcessSpawner};
+        #[allow(unused_imports)]
+        use ProcessReadiness as _ProcessReadinessMarker;
+
+        const ROLLBACK_HELPER: &str = "HYPRSTREAM_LAUNCHER_ROLLBACK_HELPER";
+
+        // Helper child used as the first plan: READY then stays alive.
+        if std::env::var_os(ROLLBACK_HELPER).is_some() {
+            hyprstream_rpc::notify::ready()?;
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return Ok(());
+        }
+
+        let exe = std::env::current_exe()?;
+        let spawner = ProcessSpawner::standalone();
+        let supervisor_a = "rollback-alive";
+        let supervisor_b = "rollback-fail";
+
+        let plans = vec![vec![
+            (
+                supervisor_a.to_owned(),
+                ProcessConfig::new(supervisor_a, &exe)
+                    .args([
+                        "--exact",
+                        "cli::service_handlers::launcher_tests::required_rollback_stops_started_children_on_later_failure",
+                        "--nocapture",
+                    ])
+                    .env(ROLLBACK_HELPER, "1")
+                    .with_notify_ready(std::time::Duration::from_secs(30)),
+            ),
+            (
+                supervisor_b.to_owned(),
+                ProcessConfig::new(supervisor_b, Path::new("/bin/sh"))
+                    .args(["-c", "exit 7"])
+                    .with_notify_ready(std::time::Duration::from_secs(10)),
+            ),
+        ]];
+
+        let error = launch_planned_children(plans, true, &spawner)
+            .await
+            .expect_err("later-child failure must fail the launch");
+        assert!(
+            error.to_string().contains("exited during startup"),
+            "launch failure expected, got: {error}"
+        );
+
+        // The alive first child was stopped by the rollback (reverse order):
+        // its PID file was removed and the process is reaped. The failing
+        // child never published anything.
+        assert!(
+            !hyprstream_rpc::paths::service_pid_file(supervisor_a).exists(),
+            "rolled-back child must leave no PID file"
+        );
+        assert!(
+            !hyprstream_rpc::paths::service_pid_file(supervisor_b).exists(),
+            "failed child must leave no PID file"
+        );
+        Ok(())
+    }
+
+    /// Multi-stage required launch: a failure in one stage must abort the
+    /// WHOLE launch — later dependent stages must never spawn — and every
+    /// already-started child must be genuinely reaped.
+    ///
+    /// Fixture observes, per root dispatch `pr1585-launch-stage-failure-root.md`:
+    /// two live predecessors (each records its own PID to a marker file, so
+    /// termination is confirmed by `kill(pid, 0)` → ESRCH, not by PID-file
+    /// absence alone), the original launch error surfaced unchanged, and a
+    /// sentinel in a LATER stage whose spawn marker must never appear (the
+    /// single-stage test cannot distinguish a full abort from a per-stage
+    /// break). Stop ORDER is not externally observable here: rollback kills
+    /// are SIGKILL, so reverse ordering remains a construction guarantee of
+    /// `started.iter().rev()`, not an observed event.
+    #[tokio::test]
+    async fn required_stage_failure_aborts_launch_and_never_spawns_later_stages()
+    -> anyhow::Result<()> {
+        use hyprstream_service::{ProcessConfig, ProcessReadiness, ProcessSpawner};
+        #[allow(unused_imports)]
+        use ProcessReadiness as _ProcessReadinessMarker;
+
+        const MARKER_HELPER: &str = "HYPRSTREAM_LAUNCHER_MARKER_HELPER";
+
+        // Helper child used as a live predecessor: records its PID to the
+        // marker BEFORE its READY send, so the parent's continuation past
+        // this child deterministically proves the marker exists.
+        if let Some(path) = std::env::var_os(MARKER_HELPER) {
+            std::fs::write(&path, std::process::id().to_string())?;
+            hyprstream_rpc::notify::ready()?;
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return Ok(());
+        }
+
+        let exe = std::env::current_exe()?;
+        let spawner = ProcessSpawner::standalone();
+        let dir = tempfile::tempdir()?;
+        // Unique supervisor names per test process: PID files land in the
+        // shared runtime dir, and libtest runs suites in parallel.
+        let unique = std::process::id();
+        let stage0a = format!("launch-stage-a-{unique}");
+        let stage0b = format!("launch-stage-b-{unique}");
+        let stage1fail = format!("launch-stage-fail-{unique}");
+        let stage2sentinel = format!("launch-stage-sentinel-{unique}");
+
+        let marker = |name: &str| dir.path().join(format!("{name}.marker"));
+        let marker_pid = |path: &Path| -> anyhow::Result<u32> {
+            std::fs::read_to_string(path)?
+                .trim()
+                .parse::<u32>()
+                .context("marker must hold the child pid")
+        };
+        // Reap confirmation: ESRCH, not merely an absent PID file.
+        let assert_reaped = |pid: u32| {
+            let gone = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                None,
+            )
+            .is_err_and(|e| e == nix::errno::Errno::ESRCH);
+            assert!(gone, "child pid {pid} must be reaped after rollback");
+        };
+
+        let plans = vec![
+            // Stage 0: two live predecessors (marker→READY→stay alive) —
+            // both must be rolled back and genuinely reaped.
+            vec![
+                (
+                    stage0a.clone(),
+                    ProcessConfig::new(&stage0a, &exe)
+                        .args([
+                            "--exact",
+                            "cli::service_handlers::launcher_tests::required_stage_failure_aborts_launch_and_never_spawns_later_stages",
+                            "--nocapture",
+                        ])
+                        .env(MARKER_HELPER, marker(&stage0a).display().to_string())
+                        .with_notify_ready(std::time::Duration::from_secs(30)),
+                ),
+                (
+                    stage0b.clone(),
+                    ProcessConfig::new(&stage0b, &exe)
+                        .args([
+                            "--exact",
+                            "cli::service_handlers::launcher_tests::required_stage_failure_aborts_launch_and_never_spawns_later_stages",
+                            "--nocapture",
+                        ])
+                        .env(MARKER_HELPER, marker(&stage0b).display().to_string())
+                        .with_notify_ready(std::time::Duration::from_secs(30)),
+                ),
+            ],
+            // Stage 1: required child fails during startup.
+            vec![(
+                stage1fail.clone(),
+                ProcessConfig::new(&stage1fail, Path::new("/bin/sh"))
+                    .args(["-c", "exit 7"])
+                    .with_notify_ready(std::time::Duration::from_secs(10)),
+            )],
+            // Stage 2 sentinel: same marker-before-READY helper with Notify
+            // readiness. If the abort ever leaked past the failing stage, the
+            // buggy path would WAIT for this child's READY — which the helper
+            // sends only after writing the marker — so an incorrect later-stage
+            // spawn deterministically leaves a marker (an Immediate child could
+            // be SIGKILLed by the buggy rollback before it ever wrote one,
+            // giving a false pass).
+            vec![(
+                stage2sentinel.clone(),
+                ProcessConfig::new(&stage2sentinel, &exe)
+                    .args([
+                        "--exact",
+                        "cli::service_handlers::launcher_tests::required_stage_failure_aborts_launch_and_never_spawns_later_stages",
+                        "--nocapture",
+                    ])
+                    .env(MARKER_HELPER, marker(&stage2sentinel).display().to_string())
+                    .with_notify_ready(std::time::Duration::from_secs(30)),
+            )],
+        ];
+
+        let error = launch_planned_children(plans, true, &spawner)
+            .await
+            .expect_err("stage-1 failure must fail the whole launch");
+        assert!(
+            error.to_string().contains("exited during startup"),
+            "original launch error expected, got: {error}"
+        );
+
+        // Both started predecessors: actually reaped (ESRCH), PID files gone.
+        for (name, path) in [(&stage0a, marker(&stage0a)), (&stage0b, marker(&stage0b))] {
+            assert!(path.exists(), "predecessor {name} must have run");
+            assert_reaped(marker_pid(&path)?);
+            assert!(
+                !hyprstream_rpc::paths::service_pid_file(name).exists(),
+                "rolled-back {name} must leave no PID file"
+            );
+        }
+        // The later-stage sentinel never spawned.
+        assert!(
+            !marker(&stage2sentinel).exists(),
+            "sentinel stage must never spawn after a required stage failure"
+        );
+        assert!(
+            !hyprstream_rpc::paths::service_pid_file(&stage2sentinel).exists(),
+            "sentinel must publish no PID file"
+        );
+        Ok(())
+    }
+
+    /// Installed units encode their own stored configuration; an explicit
+    /// config selector or the required-native profile must be refused on the
+    /// existing-unit path before any unit is started.
+    #[tokio::test]
+    async fn installed_unit_start_rejects_explicit_config_and_required_profile() {
+        if !hyprstream_rpc::has_systemd() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("custom.toml");
+        std::fs::write(&config_path, "[secrets]\n").unwrap();
+
+        let explicit_error = handle_service_start(
+            &["model".to_owned()],
+            Some("model".to_owned()),
+            false,
+            Some(config_path.as_path()),
+            false,
+        )
+        .await
+        .expect_err("explicit config selector must not start an installed unit");
+        assert!(
+            explicit_error.to_string().contains("installed hyprstream service units"),
+            "actionable rejection expected, got: {explicit_error}"
+        );
+
+        let required_error = handle_service_start(
+            &["model".to_owned()],
+            Some("model".to_owned()),
+            false,
+            None,
+            true,
+        )
+        .await
+        .expect_err("required-native profile must not start an installed unit");
+        assert!(
+            required_error.to_string().contains("--daemon"),
+            "rejection must direct the operator to the direct launch path"
+>>>>>>> 37dc8ac74 (fix(launcher): carry config provenance and enforce verified startup ownership)
         );
     }
 }

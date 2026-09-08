@@ -9,7 +9,7 @@
 //! ```text
 //! ProcessSpawner (raw process management)
 //!     ├── StandaloneBackend (tokio::process::Command)
-//!     │   └── .kill_on_drop(true) for cleanup
+//!     │   └── .kill_on_drop(false): adopted daemons outlive the launcher
 //!     │
 //!     └── SystemdBackend (systemd-run)
 //!         └── Transient units in hyprstream-workers.slice
@@ -58,6 +58,24 @@ use std::path::PathBuf;
 
 use hyprstream_rpc::error::Result;
 
+/// Readiness policy for a spawned child process (#1585).
+///
+/// The policy gates when a spawn is reported as successful. It is a
+/// lifecycle gate, not application authentication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessReadiness {
+    /// Report success as soon as the child is spawned (legacy behavior).
+    Immediate,
+    /// Wait for the child's own `READY=1` sd_notify datagram on a per-child
+    /// notification endpoint before reporting success. The sender PID must
+    /// match the spawned child; a child exit or the hard timeout fails the
+    /// spawn, and the child is terminated/reaped and its artifacts cleaned up.
+    Notify {
+        /// Hard bound on how long the child has to report readiness.
+        timeout: std::time::Duration,
+    },
+}
+
 /// Configuration for spawning a daemon process.
 #[derive(Debug, Clone)]
 pub struct ProcessConfig {
@@ -87,6 +105,9 @@ pub struct ProcessConfig {
 
     /// Whether to restart on failure (systemd only).
     pub restart_on_failure: bool,
+
+    /// When the spawn may be reported as started (#1585).
+    pub readiness: ProcessReadiness,
 }
 
 impl ProcessConfig {
@@ -102,7 +123,15 @@ impl ProcessConfig {
             cpu_quota: None,
             unit_properties: Vec::new(),
             restart_on_failure: false,
+            readiness: ProcessReadiness::Immediate,
         }
+    }
+
+    /// Require the child's own `READY=1` notification within `timeout`
+    /// before the spawn reports success (#1585).
+    pub fn with_notify_ready(mut self, timeout: std::time::Duration) -> Self {
+        self.readiness = ProcessReadiness::Notify { timeout };
+        self
     }
 
     /// Set command-line arguments.
@@ -160,6 +189,10 @@ pub struct SpawnedProcess {
 
     /// Process kind (direct or systemd).
     pub kind: ProcessKind,
+
+    /// The PID file this spawn published, if any; `stop` removes it so a
+    /// stopped child leaves no stale artifact (#1585).
+    pub pid_file: Option<PathBuf>,
 }
 
 impl SpawnedProcess {
@@ -168,7 +201,14 @@ impl SpawnedProcess {
         Self {
             id: id.into(),
             kind,
+            pid_file: None,
         }
+    }
+
+    /// Attach the PID file this spawn published, for cleanup on stop (#1585).
+    pub fn with_pid_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.pid_file = Some(path.into());
+        self
     }
 
     /// Get the process ID.

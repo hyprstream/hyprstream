@@ -2547,13 +2547,42 @@ fn main() -> Result<()> {
         .get_one::<std::path::PathBuf>("config")
         .map(std::path::PathBuf::as_path);
 
+    // Canonicalize the explicit selector (CLI `--config` or the
+    // `HYPRSTREAM_CONFIG` env) BEFORE the first load, so the file that is
+    // loaded, the snapshot provenance, and the path forwarded to spawned
+    // children are one and the same value — and a relative selector stays
+    // meaningful regardless of a child's working directory. `None` means
+    // defaults-resolution, which children reproduce on their own.
+    let explicit_config_path: Option<std::path::PathBuf> = match config_path {
+        Some(path) => Some(std::fs::canonicalize(path).with_context(|| {
+            format!("canonicalizing explicit config path {}", path.display())
+        })?),
+        None => None,
+    };
+    // Library-side launchers (bootstrap manager, wizard) forward the same
+    // provenance their process pinned, so every launch path composes.
+    if let Some(canonical) = &explicit_config_path {
+        let _ = hyprstream_core::config::install_explicit_config_path(canonical.clone());
+    }
+
     // Load configuration early
-    let config = load_config(config_path)?;
+    let config = load_config(explicit_config_path.as_deref())?;
 
     // Validate configuration
     config
         .validate()
         .context("Configuration validation failed")?;
+
+    // Pin the validated configuration for the whole process (#1585): every
+    // later `HyprConfig::load()` — service-factory reloads included — observes
+    // this snapshot instead of re-deriving XDG defaults that would silently
+    // drop an explicit `--config` deployment's settings. Write-once, immutable
+    // afterwards; installed before any resolver, factory, or runtime thread.
+    let _ = hyprstream_core::config::install_pinned_config(config.clone());
+
+    // `Option<&Path>` is Copy, so both service arms below can borrow it.
+    let explicit_config: Option<&std::path::Path> = explicit_config_path.as_deref();
+    let iroh_required = config.quic.iroh_required();
 
     // RPC clients are used by ordinary CLI commands (`quick`, `tui`, etc.),
     // not only by service entrypoints. Install both request- and response-side
@@ -2988,7 +3017,7 @@ fn main() -> Result<()> {
                             multi_threaded: true,
                         },
                         || async move {
-                            handle_service_install(&models_dir, &services, filter, start, enable, target, verbose).await
+                            handle_service_install(&models_dir, &services, filter, start, enable, target, verbose, explicit_config, iroh_required).await
                         },
                     )?;
                 }
@@ -3810,7 +3839,7 @@ fn main() -> Result<()> {
                                 multi_threaded: false,
                             },
                             || async move {
-                                handle_service_start(&services, name, daemon).await
+                                handle_service_start(&services, name, daemon, explicit_config, iroh_required).await
                             },
                         )?;
                     }
@@ -5026,5 +5055,252 @@ mod native_announcement_wiring {
         assert!(error.contains("fresh checkpoint unavailable"));
         assert!(!observed.load(std::sync::atomic::Ordering::SeqCst),
             "failed authority projection must never publish stale reach");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod native_launcher {
+    //! Causal coverage for the direct child launch path (#1585): the produced
+    //! child invocation must load the operator's explicit custom config
+    //! (relative path with spaces included), select the provisioned native
+    //! identity — not defaults — through the real parser/identity path, and
+    //! report readiness only through the authenticated notification boundary.
+
+    use super::*;
+    use hyprstream_core::cli::service_handlers::direct_child_process_config;
+    use std::path::Path;
+
+    const CAUSAL_CHILD: &str = "HYPRSTREAM_LAUNCHER_CAUSAL_CHILD";
+    const CAUSAL_MODE: &str = "HYPRSTREAM_LAUNCHER_CAUSAL_MODE";
+    const CAUSAL_ARGV: &str = "HYPRSTREAM_LAUNCHER_CAUSAL_ARGV";
+    const CAUSAL_PROOF: &str = "HYPRSTREAM_LAUNCHER_CAUSAL_PROOF";
+    const CAUSAL_STOP: &str = "HYPRSTREAM_LAUNCHER_CAUSAL_STOP";
+    const SERVICE: &str = "model";
+    const KEY_SEED: u8 = 0x5A;
+
+    fn provision_custom_config(
+        root: &tempfile::TempDir,
+        seed: u8,
+        with_key: bool,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let secrets = root.path().join("custom credentials");
+        if with_key {
+            std::fs::create_dir_all(secrets.join(SERVICE))?;
+            std::fs::write(secrets.join(SERVICE).join("signing-key"), [seed; 32])?;
+        }
+        let mut configured = HyprConfig::default();
+        configured.quic.native_network_profile =
+            hyprstream_core::config::NativeNetworkProfile::NetworkIrohRequired;
+        configured.secrets.path = Some(secrets);
+        configured.storage.models_dir = root.path().join("custom-models");
+        // A relative path containing spaces, relative to the launch directory.
+        let launch_dir = root.path().join("launch dir");
+        let config_dir = launch_dir.join("my configs");
+        std::fs::create_dir_all(&config_dir)?;
+        let config_path = config_dir.join("custom.toml");
+        configured.to_file(&config_path)?;
+        Ok(config_path)
+    }
+
+    async fn launcher_child() -> anyhow::Result<()> {
+        let mode = std::env::var(CAUSAL_MODE).unwrap_or_default();
+        // The exact argv the launcher helper produced for the real binary.
+        let args: Vec<String> = serde_json::from_str(&std::env::var(CAUSAL_ARGV)?)?;
+        let matches = build_cli().try_get_matches_from(
+            std::iter::once("hyprstream".to_owned()).chain(args),
+        )?;
+        let config = load_config(
+            matches
+                .get_one::<std::path::PathBuf>("config")
+                .map(std::path::PathBuf::as_path),
+        )?;
+        config.validate().context("child configuration validation")?;
+        let _ = hyprstream_core::config::install_pinned_config(config.clone());
+
+        let selected = native_service_process_name(&matches, &config)?;
+        anyhow::ensure!(
+            selected.as_deref() == Some(SERVICE),
+            "child selected {selected:?} instead of the configured native service"
+        );
+        if mode == "missing-key" {
+            // Negative control: the provisioned key is absent, so the real
+            // required-native identity path must refuse — never generate.
+            let outcome = load_process_signing_key(&config, selected.as_deref()).await;
+            anyhow::ensure!(
+                outcome.is_err(),
+                "missing provisioned key must fail required-native startup"
+            );
+            anyhow::bail!("missing-key control refused startup as required");
+        }
+
+        let key = load_process_signing_key(&config, selected.as_deref()).await?;
+        // Proof carries the PUBLIC verifying key only — never private material.
+        let proof = std::env::var(CAUSAL_PROOF)?;
+        std::fs::write(&proof, key.verifying_key().to_bytes())?;
+        // Authentic readiness: only after the config/identity assertions.
+        hyprstream_rpc::notify::ready()?;
+        // Stay alive so the supervisor observes a genuinely RUNNING ready
+        // child (its post-READY liveness recheck would otherwise race our
+        // exit), and exit only on the parent's controlled stop signal.
+        let stop_file = std::path::PathBuf::from(std::env::var(CAUSAL_STOP)?);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !stop_file.exists() {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("supervisor stop signal never arrived");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Ok(())
+    }
+
+    async fn spawn_causal_child(
+        supervisor: &hyprstream_service::ProcessSpawner,
+        launch_args: &[String],
+        mode: &str,
+        proof: &Path,
+        stop_file: &Path,
+        working_dir: &Path,
+        child_instance: &str,
+    ) -> anyhow::Result<
+        Result<hyprstream_service::SpawnedProcess, hyprstream_rpc::error::RpcError>,
+    > {
+        let exe = std::env::current_exe()?;
+        // Unique supervisor name: PID artifacts land under a test-owned
+        // namespace, never the shared `model.pid` of a real deployment.
+        let mut child = hyprstream_service::ProcessConfig::new(child_instance, &exe)
+            .args([
+                "--exact",
+                "native_launcher::launcher_child_loads_explicit_config_and_provisioned_identity",
+                "--nocapture",
+            ])
+            .env(CAUSAL_CHILD, "1")
+            .env(CAUSAL_MODE, mode)
+            .env(CAUSAL_ARGV, serde_json::to_string(launch_args)?)
+            .env(CAUSAL_PROOF, proof.display().to_string())
+            .env(CAUSAL_STOP, stop_file.display().to_string())
+            // Deterministic identity layout, isolated runtime namespace.
+            .env("HYPRSTREAM_SECRETS_PROFILE", "shared-directory")
+            .env("HYPRSTREAM_INSTANCE", child_instance)
+            .working_dir(working_dir);
+        child.readiness = hyprstream_service::ProcessReadiness::Notify {
+            timeout: std::time::Duration::from_secs(30),
+        };
+        Ok(supervisor.spawn(child).await)
+    }
+
+    #[tokio::test]
+    async fn launcher_child_loads_explicit_config_and_provisioned_identity() -> anyhow::Result<()> {
+        if std::env::var_os(CAUSAL_CHILD).is_some() {
+            return launcher_child().await;
+        }
+
+        let root = tempfile::tempdir()?;
+        let config_path = provision_custom_config(&root, KEY_SEED, true)?;
+        let canonical = std::fs::canonicalize(&config_path)?;
+        let expected_vk = ed25519_dalek::SigningKey::from_bytes(&[KEY_SEED; 32])
+            .verifying_key()
+            .to_bytes();
+
+        // The exact invocation the launcher builds for the real binary.
+        let plan = direct_child_process_config(
+            SERVICE,
+            true,
+            Some(&canonical),
+            Path::new("hyprstream"),
+        )?;
+        let launch_args = plan.args.clone();
+        assert!(
+            !launch_args.iter().any(|arg| arg == "--ipc"),
+            "required-native child plan must contain no service IPC argument"
+        );
+        assert!(
+            launch_args.windows(2).any(|pair| pair[0] == "--config"
+                && pair[1] == canonical.to_str().expect("utf-8 canonical path")),
+            "canonical absolute config path must be forwarded verbatim"
+        );
+
+        // Child runs from a DIFFERENT working directory than the launcher's
+        // config-relative layout: only the canonical path makes the relative
+        // selector meaningful across the spawner cwd.
+        let proof = root.path().join("proof.vk");
+        let stop_file = root.path().join("stop");
+        let spawner = hyprstream_service::ProcessSpawner::standalone();
+        let supervisor = "launcher-causal-happy";
+        let process = spawn_causal_child(
+            &spawner,
+            &launch_args,
+            "happy",
+            &proof,
+            &stop_file,
+            root.path(),
+            supervisor,
+        )
+        .await?
+        .expect("ready child proves config load, identity selection, and notify barrier");
+        let observed = std::fs::read(&proof)?;
+        assert_eq!(observed, expected_vk, "child selected the provisioned signer");
+        // The READY child is genuinely running (its notification was not a
+        // last-gasp message), with its PID file published under the unique
+        // supervisor name.
+        assert!(
+            spawner.is_running(&process).await?,
+            "the ready child must still be alive after the spawn reports success"
+        );
+        assert!(
+            hyprstream_rpc::paths::service_pid_file(supervisor).exists(),
+            "a ready child publishes its PID file"
+        );
+        // Controlled shutdown: signal stop, wait for the child's own exit,
+        // then have the SAME supervisor stop reap it and remove the PID
+        // artifact — no manual deletion, no second backend.
+        std::fs::write(&stop_file, b"stop")?;
+        let stopped = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while spawner.is_running(&process).await? {
+            if std::time::Instant::now() >= stopped {
+                anyhow::bail!("child did not exit after the controlled stop signal");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        spawner.stop(&process).await?;
+        assert!(!spawner.is_running(&process).await?);
+        assert!(
+            !hyprstream_rpc::paths::service_pid_file(supervisor).exists(),
+            "supervised stop must remove the published PID file"
+        );
+
+        // Negative control: absent provisioned key fails the launch honestly.
+        let missing_root = tempfile::tempdir()?;
+        let missing_config = provision_custom_config(&missing_root, KEY_SEED, false)?;
+        let missing_canonical = std::fs::canonicalize(&missing_config)?;
+        let missing_plan = direct_child_process_config(
+            SERVICE,
+            true,
+            Some(&missing_canonical),
+            Path::new("hyprstream"),
+        )?;
+        let missing_spawner = hyprstream_service::ProcessSpawner::standalone();
+        let missing_supervisor = "launcher-causal-missing";
+        let missing_outcome = spawn_causal_child(
+            &missing_spawner,
+            &missing_plan.args,
+            "missing-key",
+            &missing_root.path().join("unused.vk"),
+            &missing_root.path().join("stop"),
+            missing_root.path(),
+            missing_supervisor,
+        )
+        .await?;
+        let error = missing_outcome
+            .expect_err("launch must fail when the provisioned key is absent");
+        assert!(
+            error.to_string().contains("exited during startup"),
+            "child startup failure must propagate, got: {error}"
+        );
+        assert!(
+            !hyprstream_rpc::paths::service_pid_file(missing_supervisor).exists(),
+            "a never-ready child must not publish a PID file"
+        );
+        Ok(())
     }
 }

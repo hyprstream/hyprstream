@@ -21,7 +21,7 @@ pub mod notify;
 
 // Top-level re-exports for convenience
 pub use service::spawner::{
-    DualSpawnable, ProcessBackend, ProcessConfig, ProcessKind,
+    DualSpawnable, ProcessBackend, ProcessConfig, ProcessKind, ProcessReadiness,
     ProcessSpawner, ServiceKind, ServiceMode, ServiceSpawner,
     Spawnable, SpawnedProcess, SpawnedService, SpawnerBackend, StandaloneBackend,
     SystemdBackend, InprocManager, UnifiedServiceConfig,
@@ -45,4 +45,4 @@ pub use service::manager::systemd::encrypt_credentials_if_available;
 
 pub use service::metadata::{MethodMeta, ParamMeta, SchemaMetadataFn, ScopedSchemaMetadataFn, ScopedClientTreeNode};
 
-pub use service::ordering::startup_stages;
+pub use service::ordering::{startup_stages, startup_stages_for_profile};

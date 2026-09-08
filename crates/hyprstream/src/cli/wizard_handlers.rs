@@ -152,7 +152,25 @@ pub async fn handle_wizard(
 ) -> Result<()> {
     // Install systemd units before entering spawn_blocking (async operation).
     if !options.bootstrap_only && hyprstream_rpc::has_systemd() {
-        handle_service_install(models_dir, config_services, None, false, false, hyprstream_service::ServiceTarget::User, false).await?;
+        // Forward this process's pinned config provenance and native profile:
+        // under an explicit --config or required-native the install handler
+        // refuses unit install with actionable direct-launch guidance (#1585).
+        let explicit_config = crate::config::explicit_config_path().cloned();
+        let iroh_required = crate::config::HyprConfig::load()
+            .map(|c| c.quic.iroh_required())
+            .unwrap_or(false);
+        handle_service_install(
+            models_dir,
+            config_services,
+            None,
+            false,
+            false,
+            hyprstream_service::ServiceTarget::User,
+            false,
+            explicit_config.as_deref(),
+            iroh_required,
+        )
+        .await?;
     }
 
     let rt = tokio::runtime::Handle::current();

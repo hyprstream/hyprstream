@@ -467,10 +467,24 @@ impl WizardBackend for BootstrapManager {
         let (tx, rx) = mpsc::sync_channel(8);
         self.service_rx = Some(rx);
         let services = self.config_services.clone();
+        // Forward this process's pinned config provenance and native profile
+        // so bootstrap-launched children load what the operator loaded (#1585).
+        let explicit_config = crate::config::explicit_config_path().cloned();
+        let iroh_required = crate::config::HyprConfig::load()
+            .map(|c| c.quic.iroh_required())
+            .unwrap_or(false);
 
         self.service_handle = Some(self.rt.spawn(async move {
             let _ = tx.send(OpStatus::InProgress);
-            match crate::cli::handle_service_start(&services, None, false).await {
+            match crate::cli::handle_service_start(
+                &services,
+                None,
+                false,
+                explicit_config.as_deref(),
+                iroh_required,
+            )
+            .await
+            {
                 Ok(()) => {
                     let _ = tx.send(OpStatus::Done);
                 }
