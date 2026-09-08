@@ -472,9 +472,11 @@ mod acme_tests {
 
 #[cfg(test)]
 mod bound_serve_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
     use super::*;
     use axum::routing::get;
-    use rustls::pki_types::{CertificateDer, ServerName};
+    use rustls::pki_types::ServerName;
 
     /// Positive HTTPS regression through the production bind/serve seam:
     /// `bind_listener` retains the real socket, `serve_bound` hands it to the
@@ -511,7 +513,7 @@ mod bound_serve_tests {
         // Client trusts the served certificate and verifies "localhost"
         // normally; no dangerous verification-disabling configuration.
         let mut roots = rustls::RootCertStore::empty();
-        roots.add(CertificateDer::from(generated.cert.der().clone()))?;
+        roots.add(generated.cert.der().clone())?;
         let client_config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -521,7 +523,7 @@ mod bound_serve_tests {
         // and certificate verification stay fully enabled.
         let client = std::thread::spawn(move || -> anyhow::Result<String> {
             use std::io::{Read, Write};
-            let mut tcp = std::net::TcpStream::connect(addr)?;
+            let tcp = std::net::TcpStream::connect(addr)?;
             tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
             let tls = rustls::ClientConnection::new(
                 Arc::new(client_config),
