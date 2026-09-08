@@ -1325,7 +1325,7 @@ fn handle_quick_command(
                         // Wire up policy-backed authorization
                         let worker_policy_client = hyprstream_core::services::policy_client_for_process(
                             signing_key.clone(),
-                            resolve_service_vk("policy")
+                            resolve_service_vk("policy", Some(ctx.config()))
                                 .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
                             None,
                         )?;
@@ -1339,7 +1339,7 @@ fn handle_quick_command(
                         // is in scope here, so the mesh PQ store is empty (#157):
                         // identical to prior behavior (Hybrid fails closed for
                         // unknown peers).
-                        install_envelope_verify_config(None);
+                        install_envelope_verify_config(None, None);
 
                         let manager = InprocManager::new();
                         Some(
@@ -1643,14 +1643,18 @@ fn select_iroh_moql_admission_proof<T>(
     }
 }
 
-fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
+fn resolve_service_vk(
+    service_name: &str,
+    config: Option<&HyprConfig>,
+) -> Option<VerifyingKey> {
     let trust = hyprstream_service::global_trust_store();
     // Fast path: already populated (service startup seeded it)
     if let Some(vk) = trust.resolve_one(service_name) {
         return Some(vk);
     }
-    // CLI mode: seed from bootstrap-pubkeys on first use
-    let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir() else {
+    // CLI mode: seed from bootstrap-pubkeys on first use. When startup already
+    // loaded a config (including --config), keep that path authoritative.
+    let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir_for(config) else {
         return None;
     };
     // Load the full entries so the hybrid requirement can be enforced before
@@ -1737,7 +1741,7 @@ async fn install_process_production_resolver(
     // store; in CLI/service-start mode nothing has seeded it yet. Seed from
     // the node's own bootstrap-pubkeys (the same source resolve_service_vk
     // uses on first use) — a no-op when already populated or unprovisioned.
-    let _ = resolve_service_vk("discovery");
+    let _ = resolve_service_vk("discovery", Some(config));
     // Private-PKI deployments may terminate the did:web host with an internal
     // CA; the extra root is additive (never disables verification), and an
     // unreadable file is a hard configuration error, not a silent skip.
@@ -1839,8 +1843,13 @@ fn quic_checkpoint_policy(
 /// When `oauth` is `Some`, the kid-anchored PQ trust store is populated eagerly
 /// from `mesh_peers` (#157). When `None` (e.g. the standalone worker entrypoint,
 /// which has no config in scope), the store is empty — identical to the prior
-/// behavior. Either way the store is immutable after install.
-fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthConfig>) {
+/// behavior. `config` carries the already-loaded CLI config so its explicit
+/// secrets path remains authoritative. Either way the store is immutable after
+/// install.
+fn install_envelope_verify_config(
+    oauth: Option<&hyprstream_core::config::OAuthConfig>,
+    config: Option<&HyprConfig>,
+) {
     use hyprstream_rpc::envelope::{
         install_response_verify_config, install_verify_config, mandatory_envelope_policy,
         EnvelopeVerifyConfig, KeyedPqTrustStore, PqTrustStore, ResponseVerifyConfig,
@@ -1864,7 +1873,7 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
     // envelope verify path consults, so supplying hybrid material actually
     // turns PQ enforcement on for those services. A classical-only file
     // anchors nothing and changes nothing.
-    if let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir() {
+    if let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir_for(config) {
         let anchored = hyprstream_core::auth::mesh_trust::seed_bootstrap_pq_bindings(
             &mut keyed_store,
             &secrets_dir,
@@ -2570,7 +2579,7 @@ fn main() -> Result<()> {
     // verification defaults before dispatch so every command uses the
     // operator-configured mesh trust store (#1018). The installer is
     // first-write-wins, so the service-specific calls below remain harmless.
-    install_envelope_verify_config(Some(&config.oauth));
+    install_envelope_verify_config(Some(&config.oauth), Some(&config));
 
     // Install the per-service streaming-response concurrency cap from config
     // (#186) before any RPC service starts. First-write-wins; ignore if already
@@ -3637,7 +3646,7 @@ fn main() -> Result<()> {
                                 //
                                 // Policy: Hybrid is mandatory. With no anchored
                                 // peer key the verifier FAILS CLOSED.
-                                install_envelope_verify_config(Some(&config.oauth));
+                                install_envelope_verify_config(Some(&config.oauth), Some(&config));
 
                                 // Install MoQ/event authorization in every
                                 // production service process before any model,
@@ -4205,6 +4214,71 @@ mod resolver_startup_controls {
         config.quic.native_network_profile = hyprstream_core::config::NativeNetworkProfile::Compatibility;
         assert_eq!(super::native_service_process_name(&multi, &config)?, None);
         assert_eq!(super::native_service_process_name(&single, &config)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn native_service_identity_seeds_discovery_from_loaded_config() -> anyhow::Result<()> {
+        const CHILD: &str = "HYPRSTREAM_NATIVE_DISCOVERY_SEED_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "resolver_startup_controls::native_service_identity_seeds_discovery_from_loaded_config",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("HYPRSTREAM__SECRETS__PATH")
+                .env_remove("HYPRSTREAM_SECRETS_PROFILE")
+                .status()?;
+            anyhow::ensure!(status.success(), "isolated discovery seeding regression failed");
+            return Ok(());
+        }
+
+        let root = tempfile::tempdir()?;
+        let xdg_config_home = root.path().join("xdg-config");
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+
+        // Keep a different, valid bootstrap file at the default location so
+        // this catches accidental re-resolution through HyprConfig::load().
+        let default_secrets = xdg_config_home.join("hyprstream/credentials");
+        let default_key = ed25519_dalek::SigningKey::from_bytes(&[91u8; 32]);
+        let mut default_entries = std::collections::HashMap::new();
+        default_entries.insert(
+            "discovery".to_owned(),
+            hyprstream_core::auth::identity_store::BootstrapPubkey::for_service_key(
+                &default_key,
+            )?,
+        );
+        hyprstream_core::auth::identity_store::write_bootstrap_pubkeys_hybrid(
+            &default_secrets,
+            &default_entries,
+        )?;
+
+        let custom_secrets = root.path().join("custom-credentials");
+        let custom_key = ed25519_dalek::SigningKey::from_bytes(&[92u8; 32]);
+        let mut custom_entries = std::collections::HashMap::new();
+        custom_entries.insert(
+            "discovery".to_owned(),
+            hyprstream_core::auth::identity_store::BootstrapPubkey::for_service_key(
+                &custom_key,
+            )?,
+        );
+        hyprstream_core::auth::identity_store::write_bootstrap_pubkeys_hybrid(
+            &custom_secrets,
+            &custom_entries,
+        )?;
+
+        let mut config = super::HyprConfig::default();
+        config.secrets.path = Some(custom_secrets);
+        let selected = super::resolve_service_vk("discovery", Some(&config))
+            .expect("configured bootstrap-pubkeys must seed discovery");
+        assert_eq!(selected, custom_key.verifying_key());
+        assert_ne!(selected, default_key.verifying_key());
+        assert_eq!(
+            hyprstream_service::global_trust_store().resolve_one("discovery"),
+            Some(custom_key.verifying_key()),
+        );
         Ok(())
     }
 
