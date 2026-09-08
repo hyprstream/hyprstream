@@ -685,6 +685,23 @@ pub struct MoqStreamPublisher {
 }
 
 impl MoqStreamPublisher {
+    /// Wait until a subscriber has attached before publishing a short lived
+    /// response. The demand is observable on the producer track, so callers
+    /// can avoid finishing before a late subscriber has a chance to join.
+    pub async fn wait_for_consumer(&self) -> Result<()> {
+        if self.cancel_token.is_cancelled() {
+            anyhow::bail!("stream cancelled before consumer demand");
+        }
+        tokio::select! {
+            _ = self.cancel_token.cancelled() => {
+                anyhow::bail!("stream cancelled before consumer demand");
+            }
+            result = self.track.used() => {
+                result.map_err(|error| anyhow!("stream consumer demand failed: {error}"))
+            }
+        }
+    }
+
     /// Publish an opaque, authenticated control Object under the current epoch,
     /// then atomically advance the producer to the next epoch. The consumer
     /// performs the same verify-before-advance transition from the wire Object.
@@ -721,6 +738,7 @@ impl MoqStreamPublisher {
     /// Publish an error payload (terminal).
     pub async fn publish_error(&mut self, message: &str) -> Result<()> {
         self.write_block(&[StreamPayloadData::Error(message.to_owned())])?;
+        self.track.finish()?;
         self.terminated = true;
         Ok(())
     }
@@ -733,6 +751,7 @@ impl MoqStreamPublisher {
     /// Complete the stream without consuming `self`.
     pub async fn complete_ref(&mut self, metadata: &[u8]) -> Result<()> {
         self.write_block(&[StreamPayloadData::Complete(metadata.to_vec())])?;
+        self.track.finish()?;
         self.terminated = true;
         Ok(())
     }
@@ -2291,6 +2310,105 @@ mod tests {
         assert!(matches!(&got[0], StreamPayload::Data(d) if d == b"hello"));
         assert!(matches!(&got[1], StreamPayload::Data(d) if d == b"world"));
         assert!(matches!(&got[2], StreamPayload::Complete(_)));
+        Ok(())
+    }
+
+    /// A terminal Complete must preserve groups after the publisher is dropped
+    /// while an attached consumer is still draining, then expose clean EOF.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moq_stream_complete_finishes_track_for_attached_consumer() -> Result<()> {
+        let origin = origin();
+        let (_client_secret, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
+        let topic = ctx.topic().to_owned();
+        let mac_key = *ctx.mac_key();
+        let enc_key = *ctx.enc_key().expect("DH ctx has enc_key");
+
+        let mut publisher = origin.publisher(&ctx)?;
+        let broadcast = origin
+            .consumer()
+            .announced_broadcast(origin.broadcast_path(&topic).as_str())
+            .await
+            .ok_or_else(|| anyhow!("consumer did not see completed broadcast"))?;
+        let mut track = broadcast.subscribe_track(&Track::new(STREAM_TRACK))?;
+        publisher.publish_data(b"late-data").await?;
+        publisher.complete_ref(b"{}").await?;
+        drop(publisher);
+
+        let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let mut group = track
+                .next_group()
+                .await?
+                .ok_or_else(|| anyhow!("completed stream omitted a group"))?;
+            let frame = group
+                .read_frame()
+                .await?
+                .ok_or_else(|| anyhow!("completed stream group omitted a frame"))?;
+            got.extend(verify_moq_frame(&mut verifier, &topic, &frame)?);
+        }
+        assert!(matches!(&got[0], StreamPayload::Data(data) if data == b"late-data"));
+        assert!(matches!(&got[1], StreamPayload::Complete(_)));
+        assert!(track.next_group().await?.is_none(), "completed track must EOF cleanly");
+        Ok(())
+    }
+
+    /// An application Error is also a clean terminal track event; dropping
+    /// the publisher must not turn the authenticated error into transport Drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moq_stream_error_finishes_track_for_attached_consumer() -> Result<()> {
+        let origin = origin();
+        let (_client_secret, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
+        let topic = ctx.topic().to_owned();
+        let mac_key = *ctx.mac_key();
+        let enc_key = *ctx.enc_key().expect("DH ctx has enc_key");
+
+        let mut publisher = origin.publisher(&ctx)?;
+        let broadcast = origin
+            .consumer()
+            .announced_broadcast(origin.broadcast_path(&topic).as_str())
+            .await
+            .ok_or_else(|| anyhow!("consumer did not see errored broadcast"))?;
+        let mut track = broadcast.subscribe_track(&Track::new(STREAM_TRACK))?;
+        publisher.publish_data(b"partial").await?;
+        publisher.publish_error("expected failure").await?;
+        drop(publisher);
+
+        let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let mut group = track
+                .next_group()
+                .await?
+                .ok_or_else(|| anyhow!("errored stream omitted a group"))?;
+            let frame = group
+                .read_frame()
+                .await?
+                .ok_or_else(|| anyhow!("errored stream group omitted a frame"))?;
+            got.extend(verify_moq_frame(&mut verifier, &topic, &frame)?);
+        }
+        assert!(matches!(&got[0], StreamPayload::Data(data) if data == b"partial"));
+        assert!(matches!(&got[1], StreamPayload::Error(message) if message == "expected failure"));
+        assert!(track.next_group().await?.is_none(), "errored track must EOF cleanly");
+        Ok(())
+    }
+
+    /// Demand wait must release promptly when the stream is cancelled before
+    /// any consumer attaches; this covers the no-subscriber continuation path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moq_stream_consumer_wait_observes_cancellation() -> Result<()> {
+        let origin = origin();
+        let (_client_secret, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
+        let publisher = origin.publisher(&ctx)?;
+        ctx.cancel_token().cancel();
+        let error = publisher
+            .wait_for_consumer()
+            .await
+            .expect_err("cancelled stream must not wait for a consumer");
+        assert!(error.to_string().contains("cancelled"));
         Ok(())
     }
 
