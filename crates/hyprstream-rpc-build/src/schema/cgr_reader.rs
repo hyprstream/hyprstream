@@ -338,7 +338,8 @@ fn validate_mandatory_scope(
 ///   a dispatcher would be dead, misleading metadata);
 /// - `$dispatchPublic` never coexists with a `$scope` action (a leaf the
 ///   control plane scopes cannot be dispatch-public);
-/// - `$dispatchPublic` requires a trimmed, nonempty reason.
+/// - `$dispatchPublic` requires a nonempty, already-trimmed reason (padding is
+///   a schema error — the recorded reason is the exact annotation text).
 ///
 /// This runs at schema-parse time (build.rs / proc-macro), so an unannotated
 /// or doubly-annotated leaf fails the build of the schema's own crate — the
@@ -382,10 +383,16 @@ fn validate_mandatory_dispatch(
                     v.name, v.scope
                 ));
             }
-            if v.dispatch_public.trim().is_empty() {
+            // Strict reason contract (v16 §6): nonempty, and already trimmed.
+            // The declared annotation text IS the recorded inventory reason —
+            // padding is a schema error, never silently rewritten. The same
+            // closed parser runs again at derive codegen; failing here is the
+            // earliest possible gate.
+            if let Err(e) =
+                crate::schema::dispatch_label::parse_dispatch_public_reason(&v.dispatch_public)
+            {
                 return Err(format!(
-                    "service `{service_name}`: method `{path}{}` has an empty `$dispatchPublic` \
-                     reason — a public leaf carries a mandatory, reviewable reason.",
+                    "service `{service_name}`: method `{path}{}`: {e}",
                     v.name
                 ));
             }

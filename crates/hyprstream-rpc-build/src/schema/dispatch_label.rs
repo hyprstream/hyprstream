@@ -25,7 +25,9 @@
 //!   `$dispatchMac` — that label is exactly what `$dispatchPublic` expands to,
 //!   so spelling it through the MAC annotation is the one form that would let
 //!   a "labeled" row be indistinguishable from a public row; and
-//! - `$dispatchPublic` with an empty or whitespace-only reason.
+//! - `$dispatchPublic` with an empty, whitespace-only, or
+//!   surrounding-whitespace-padded reason (the reason is never trimmed — the
+//!   recorded inventory text is the exact declared annotation text).
 
 use std::collections::HashMap;
 
@@ -352,7 +354,11 @@ fn parse_label_text(text: &str, map: &InitialLabelMap) -> Result<DispatchLabel, 
     })
 }
 
-/// Validate one `$dispatchPublic` reason string (trimmed, nonempty).
+/// Validate one `$dispatchPublic` reason string: nonempty and already trimmed.
+///
+/// The strict contract (annotations.capnp; v16 §6) is a canonical, reviewable
+/// reason. Surrounding whitespace is a schema error, never silently rewritten:
+/// the reason recorded in the generated inventory is the exact declared text.
 pub fn parse_dispatch_public_reason(text: &str) -> Result<&str, String> {
     if text.trim().is_empty() {
         return Err(format!(
@@ -361,10 +367,12 @@ pub fn parse_dispatch_public_reason(text: &str) -> Result<&str, String> {
         ));
     }
     if text.trim() != text {
-        // Permit surrounding whitespace but record it as the trimmed reason;
-        // the wire value is the trimmed text.
+        return Err(format!(
+            "$dispatchPublic reason {text:?} is padded — declare the reason \
+             already trimmed; the inventory records the exact annotation text"
+        ));
     }
-    Ok(text.trim())
+    Ok(text)
 }
 
 /// The label `$dispatchPublic` expands to — always exactly system low.
@@ -493,10 +501,20 @@ mod tests {
 
     #[test]
     fn public_reasons_must_be_trimmed_nonempty() {
+        // A valid trimmed reason passes through EXACTLY as declared.
         assert_eq!(parse_dispatch_public_reason("circularity").unwrap(), "circularity");
-        assert_eq!(parse_dispatch_public_reason("  padded  ").unwrap(), "padded");
+        assert_eq!(
+            parse_dispatch_public_reason("no padding on either side").unwrap(),
+            "no padding on either side"
+        );
+        // Surrounding whitespace of any shape is a schema error, not a trim.
+        for padded in ["  padded  ", " leading", "trailing ", "\ttabbed\t", "\nnew\n"] {
+            let err = parse_dispatch_public_reason(padded).unwrap_err();
+            assert!(err.contains("padded"), "{padded:?}: {err}");
+        }
         for bad in ["", "   ", "\t"] {
-            assert!(parse_dispatch_public_reason(bad).is_err());
+            let err = parse_dispatch_public_reason(bad).unwrap_err();
+            assert!(err.contains("empty or whitespace-only"), "{bad:?}: {err}");
         }
     }
 

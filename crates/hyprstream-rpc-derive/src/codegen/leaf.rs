@@ -58,7 +58,10 @@ pub struct MethodLeaf {
     pub dispatch_mac: String,
     /// `$dispatchPublic` reason text. Empty for `$dispatchMac` leaves.
     pub dispatch_public: String,
-    /// Explicit `$mutationSemantics` metadata for a mutating executable leaf.
+    /// Explicit `$mutationSemantics` metadata for a mutating executable leaf:
+    /// the leaf's own annotation when present, else the declaration inherited
+    /// from its nearest annotated ancestor selector. Never a default — a leaf
+    /// left with nothing still fails the closed parser at row generation.
     pub mutation_semantics: String,
 }
 
@@ -77,15 +80,18 @@ struct ArmMeta<'a> {
 /// Annotation state inherited from the nearest annotated ancestor selector.
 /// Only hand-dispatched pure-union selectors propagate annotations downward
 /// (scoped-client dispatchers carry none by rule); arms below them may carry
-/// their own. `$dispatchPublic` is **never** inherited — it is legal only on
-/// leaves — so only the MAC label flows through here and an inherited public
-/// reason is surfaced as the build error it is (see `walk_level`).
+/// their own, and a local annotation always wins over the inherited one.
+/// `$dispatchPublic` is **never** inherited — it is legal only on leaves — so
+/// only the MAC label and the mutation-semantics declaration flow through
+/// here; an inherited public reason is surfaced as the build error it is
+/// (see `walk_level`).
 #[derive(Clone, Default)]
 struct Inherited {
     scope: String,
     scope_exempt: bool,
     dispatch_mac: String,
     dispatch_public: String,
+    mutation_semantics: String,
 }
 
 /// The arms of one union level, in schema declaration order.
@@ -174,7 +180,9 @@ fn walk_level(
     // arms below a hand-dispatched pure union carry no `$scope` metadata of
     // their own, so they inherit their selector's annotation instead of
     // producing an unannotated (build-failing) row. `$dispatchMac` inherits
-    // the same way; `$dispatchPublic` NEVER does (public is legal only on
+    // the same way, and so does `$mutationSemantics` — a local declaration
+    // always takes precedence over the inherited one, and no default is ever
+    // substituted. `$dispatchPublic` NEVER inherits (public is legal only on
     // leaves) — an ancestor public annotation marks `public_ancestor` so the
     // descendant leaf fails the build rather than silently inheriting public.
     inherited: &Inherited,
@@ -206,6 +214,17 @@ fn walk_level(
             // §6: public is legal only on leaves, never inherited).
             effective.dispatch_public = String::new();
         }
+        if !arm.mutation_semantics.is_empty() {
+            // Local `$mutationSemantics` wins: the nearest annotated arm is
+            // authoritative over anything inherited (v16 §4.8).
+            effective.mutation_semantics = arm.mutation_semantics.to_owned();
+        }
+        // An unannotated arm keeps the nearest annotated ancestor selector's
+        // declaration — the one it reaches here through a hand-dispatched
+        // pure union. No default policy is ever invented: a leaf left with no
+        // declaration at all still fails the closed parser at row generation
+        // (and stays policy-free only where the schema gate already allows
+        // it — read-class scopes and scope-exempt leaves).
 
         if let Some(sc) = scopes.iter().find(|sc| sc.factory_name == arm.name) {
             // A scope selector: descend into its inner method union. Scoped
@@ -233,7 +252,7 @@ fn walk_level(
                 scope_exempt: effective.scope_exempt,
                 dispatch_mac: effective.dispatch_mac.clone(),
                 dispatch_public: effective.dispatch_public.clone(),
-                mutation_semantics: arm.mutation_semantics.to_owned(),
+                mutation_semantics: effective.mutation_semantics.clone(),
             });
         }
     }
@@ -919,6 +938,151 @@ mod tests {
             generated.contains("Level :: Internal"),
             "{generated}"
         );
+    }
+
+    /// P2 (`PRRT_kwDONmv2Pc6gGRV2`) causal regression: a nonread selector's
+    /// `$mutationSemantics` inherits through a hand-dispatched pure union to
+    /// every descendant leaf, exactly like its scope and MAC label — the
+    /// schema gate accepts the selector-level declaration, so the walk must
+    /// carry it instead of dropping it and failing the closed per-leaf gate.
+    #[test]
+    fn mutation_semantics_inherits_through_a_hand_dispatched_selector() {
+        let selector = union_struct(
+            "InnerRequest",
+            vec![
+                union_field("a", "Text", 0),
+                union_field("b", "Void", 1),
+            ],
+        );
+        let mut outer = dispatch_variant("outer", "InnerRequest", "write", MAC, "");
+        outer.mutation_semantics = "idempotency-key-required".to_owned();
+        let schema = Box::leak(Box::new(ParsedSchema {
+            request_variants: vec![outer],
+            response_variants: vec![],
+            structs: vec![selector],
+            scoped_clients: vec![],
+            enums: vec![],
+            request_struct: Some(union_struct(
+                "SvcRequest",
+                vec![union_field("outer", "InnerRequest", 0)],
+            )),
+            response_struct: None,
+        }));
+        let resolved = ResolvedSchema::from(schema);
+        let leaves = collect_method_leaves(&resolved);
+        assert_eq!(leaves.len(), 2, "both pure-union arms are leaves");
+        for leaf in &leaves {
+            assert_eq!(leaf.scope, "write", "scope inheritance is unchanged");
+            assert_eq!(leaf.dispatch_mac, MAC, "MAC inheritance is unchanged");
+            assert_eq!(
+                leaf.mutation_semantics, "idempotency-key-required",
+                "the selector's declaration must reach {}",
+                leaf.symbolic
+            );
+        }
+
+        // The rows are real: the inherited declaration satisfies the closed
+        // per-leaf gate for BOTH descendants — no compile_error, no invented
+        // default (the emitted class is the declared one).
+        let generated = generate_method_policy_rows("svc", &resolved).to_string();
+        assert!(!generated.contains("compile_error"), "{generated}");
+        assert_eq!(
+            generated.matches("MutationSemantics :: IdempotencyKeyRequired").count(),
+            2,
+            "both descendant rows carry the inherited declaration:\n{generated}"
+        );
+    }
+
+    /// The inheritance must not paper over the mandatory gate: a mutating
+    /// pure-union selector with NO declaration at any level still fails the
+    /// build on every descendant leaf.
+    #[test]
+    fn a_pure_union_selector_without_a_declaration_still_fails_closed() {
+        let selector = union_struct("InnerRequest", vec![union_field("a", "Text", 0)]);
+        let mut outer = dispatch_variant("outer", "InnerRequest", "write", MAC, "");
+        outer.mutation_semantics.clear();
+        let schema = Box::leak(Box::new(ParsedSchema {
+            request_variants: vec![outer],
+            response_variants: vec![],
+            structs: vec![selector],
+            scoped_clients: vec![],
+            enums: vec![],
+            request_struct: Some(union_struct(
+                "SvcRequest",
+                vec![union_field("outer", "InnerRequest", 0)],
+            )),
+            response_struct: None,
+        }));
+        let resolved = ResolvedSchema::from(schema);
+        let leaves = collect_method_leaves(&resolved);
+        assert_eq!(leaves.len(), 1);
+        assert!(
+            leaves[0].mutation_semantics.is_empty(),
+            "nothing may be invented for an undeclared selector"
+        );
+        let generated = generate_method_policy_rows("svc", &resolved).to_string();
+        assert!(generated.contains("compile_error"), "{generated}");
+        assert!(generated.contains("missing required"), "{generated}");
+    }
+
+    /// Local annotation precedence: a descendant leaf's own declaration wins
+    /// over the inherited one, while unannotated siblings inherit. (Pipeline
+    /// schemas reject dispatcher-carried metadata at parse time; this pins
+    /// the walk's precedence contract itself — the P2 fix must let a local
+    /// annotation override, not let inheritance shadow it.)
+    #[test]
+    fn a_local_declaration_beats_the_inherited_one() {
+        let mut repo = variant("repo", "RepositoryRequest", "", false);
+        repo.mutation_semantics = "transaction-ledger-required".to_owned();
+        let mut create = dispatch_variant("create", "Text", "write", MAC, "");
+        create.mutation_semantics = "naturally-idempotent".to_owned();
+        let mut remove = dispatch_variant("remove", "Void", "manage", MAC, "");
+        remove.mutation_semantics.clear();
+        let schema = Box::leak(Box::new(ParsedSchema {
+            request_variants: vec![repo],
+            response_variants: vec![],
+            structs: vec![union_struct(
+                "RepositoryRequest",
+                vec![
+                    plain_field("id", "Text"),
+                    union_field("create", "Text", 0),
+                    union_field("remove", "Void", 1),
+                ],
+            )],
+            scoped_clients: vec![ScopedClient {
+                factory_name: "repo".into(),
+                client_name: "RepositoryClient".into(),
+                scope_fields: vec![plain_field("id", "Text")],
+                inner_request_variants: vec![create, remove],
+                inner_response_variants: vec![],
+                capnp_inner_response: "repository_response".into(),
+                nested_clients: vec![],
+            }],
+            enums: vec![],
+            request_struct: Some(union_struct(
+                "SvcRequest",
+                vec![union_field("repo", "RepositoryRequest", 0)],
+            )),
+            response_struct: None,
+        }));
+        let resolved = ResolvedSchema::from(schema);
+        let leaves = collect_method_leaves(&resolved);
+        let by_symbol: std::collections::HashMap<&str, &MethodLeaf> =
+            leaves.iter().map(|l| (l.symbolic.as_str(), l)).collect();
+        assert_eq!(
+            by_symbol["repo.create"].mutation_semantics,
+            "naturally-idempotent",
+            "the leaf's local declaration must win"
+        );
+        assert_eq!(
+            by_symbol["repo.remove"].mutation_semantics,
+            "transaction-ledger-required",
+            "an unannotated sibling must inherit"
+        );
+        let generated = generate_method_policy_rows("svc", &resolved).to_string();
+        assert!(!generated.contains("compile_error"), "{generated}");
+        assert!(generated.contains("MutationSemantics :: NaturallyIdempotent"));
+        assert!(generated.contains("MutationSemantics :: TransactionLedgerRequired"));
     }
 
     /// Grammar failures at codegen are compile errors, never runtime rows:

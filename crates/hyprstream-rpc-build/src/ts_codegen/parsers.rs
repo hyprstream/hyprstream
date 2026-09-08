@@ -1378,6 +1378,28 @@ struct PayloadResponse {
         parsed
     }
 
+    /// [`parse_schema`], but returning the pipeline's own parse error so the
+    /// schema-gate rejection boundaries themselves are testable.
+    fn try_parse_schema(name: &str, schema_src: &str) -> Result<ParsedSchema, String> {
+        let tmp = std::env::temp_dir().join(format!("hyprstream_ts_{name}_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+        let capnp_path = tmp.join(format!("{name}.capnp"));
+        std::fs::write(&capnp_path, schema_src).expect("write capnp");
+
+        let cgr_path = tmp.join(format!("{name}.cgr"));
+        capnpc::CompilerCommand::new()
+            .src_prefix(&tmp)
+            .file(&capnp_path)
+            .raw_code_generator_request_path(&cgr_path)
+            .run()
+            .expect("compile capnp to CGR");
+
+        let parsed = parse_from_cgr_path(Path::new(&cgr_path), name);
+        let _ = std::fs::remove_dir_all(&tmp);
+        parsed
+    }
+
     #[test]
     fn struct_parser_emits_typed_discriminated_union() {
         let schema = parse_schema("structfix", UNION_SCHEMA);
@@ -1465,6 +1487,127 @@ struct PayloadResponse {
         assert!(
             out.contains("variant: 'ok' as const"),
             "variant return missing `as const`:\n{out}"
+        );
+    }
+
+    /// P2 (`PRRT_kwDONmv2Pc6gGRV2`) pipeline fixture: a nonread selector whose
+    /// payload is a local pure union. The actual schema gate (`parse_from_cgr`
+    /// → `validate_mandatory_mutation_policy`) accepts the selector-level
+    /// `$mutationSemantics` — this pins that acceptance and the verbatim
+    /// extraction the derive's leaf walk inherits down to each descendant
+    /// leaf (the inheritance itself is pinned in hyprstream-rpc-derive's
+    /// `mutation_semantics_inherits_through_a_hand_dispatched_selector`).
+    const PURE_UNION_SELECTOR_SCHEMA: &str = r#"
+@0xe5c1ec70e5e1e57a;
+
+enum ScopeAction {
+  query @0;
+  write @1;
+}
+annotation scope(field) :ScopeAction;
+annotation scopeExempt(field) :Text;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+annotation mutationSemantics(field) :Text;
+
+struct BatchOps {
+  union {
+    put @0 :Text;
+    clear @1 :Void;
+  }
+}
+
+struct PipelineRequest {
+  union {
+    batch @0 :BatchOps $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("transaction-ledger-required");
+    ping @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+    health @2 :Void $scopeExempt("unauthenticated liveness read") $dispatchPublic("unauthenticated liveness read for the load balancer");
+  }
+}
+
+struct PipelineResponse {
+  union {
+    ok @0 :Void;
+    fail @1 :Text;
+  }
+}
+"#;
+
+    #[test]
+    fn pure_union_selector_mutation_metadata_passes_the_schema_gate() {
+        let schema = parse_schema("pipeline", PURE_UNION_SELECTOR_SCHEMA);
+        let batch = schema
+            .request_variants
+            .iter()
+            .find(|v| v.name == "batch")
+            .expect("batch variant present");
+        assert_eq!(batch.scope, "write");
+        assert_eq!(
+            batch.mutation_semantics, "transaction-ledger-required",
+            "the selector-level declaration must be extracted verbatim"
+        );
+        let health = schema
+            .request_variants
+            .iter()
+            .find(|v| v.name == "health")
+            .expect("health variant present");
+        assert_eq!(
+            health.dispatch_public,
+            "unauthenticated liveness read for the load balancer",
+            "the public reason is recorded exactly as declared"
+        );
+    }
+
+    /// P2 (`PRRT_kwDONmv2Pc6gGRV5`) reason boundaries through the actual
+    /// schema gate: a padded reason is a parse error (never silently
+    /// trimmed), whitespace-only stays an error, and a trimmed valid reason
+    /// is recorded as its exact declared bytes.
+    fn public_reason_schema(reason: &str) -> String {
+        format!(
+            r#"@0xc0ffee5ed15c1a55;
+
+enum ScopeAction {{
+  query @0;
+  write @1;
+}}
+annotation scope(field) :ScopeAction;
+annotation scopeExempt(field) :Text;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+
+struct ReasonRequest {{
+  union {{
+    health @0 :Void $scopeExempt("unauthenticated liveness read") $dispatchPublic("{reason}");
+    dispatch @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+  }}
+}}
+
+struct ReasonResponse {{
+  union {{
+    ok @0 :Void;
+    fail @1 :Text;
+  }}
+}}
+"#
+        )
+    }
+
+    #[test]
+    fn dispatch_public_reason_boundaries_through_the_schema_gate() {
+        for padded in ["  padded reason  ", " leading", "trailing "] {
+            let err = try_parse_schema("reason", &public_reason_schema(padded))
+                .expect_err("a padded public reason must fail the schema gate");
+            assert!(err.contains("padded"), "{padded:?}: {err}");
+        }
+        let err = try_parse_schema("reason", &public_reason_schema("   "))
+            .expect_err("a whitespace-only reason must fail the schema gate");
+        assert!(err.contains("empty or whitespace-only"), "{err}");
+
+        let ok = try_parse_schema("reason", &public_reason_schema("two exact words"))
+            .expect("a trimmed valid reason parses");
+        assert_eq!(
+            ok.request_variants[0].dispatch_public, "two exact words",
+            "the recorded reason is the exact declared text"
         );
     }
 
