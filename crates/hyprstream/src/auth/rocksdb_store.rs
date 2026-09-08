@@ -10,7 +10,7 @@
 //! The database directory is `credentials_dir/users.db/`.
 
 #![cfg_attr(
-    all(feature = "credential-pds", not(test)),
+    all(feature = "encrypted-account-admission", not(test)),
     allow(dead_code, unused_imports)
 )]
 
@@ -376,7 +376,7 @@ impl RocksDbUserStore {
 impl super::user_store::private::Sealed for RocksDbUserStore {}
 
 #[async_trait]
-#[cfg(any(not(feature = "credential-pds"), test))]
+#[cfg(any(not(feature = "encrypted-account-admission"), test))]
 impl UserStore for RocksDbUserStore {
     async fn get_profile(&self, username: &str) -> Result<Option<UserProfile>> {
         Ok(self.get_raw(username)?.map(|(_, p, _)| p))
