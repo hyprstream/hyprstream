@@ -68,7 +68,7 @@ where
     // checks, and drop entries that are empty after trimming — matching the
     // legacy `HYPRSTREAM_CORS_ORIGINS` parser. An empty, whitespace-only, or
     // separators-only value then yields an empty vector, restoring the
-    // middleware's localhost fallback instead of admitting nothing.
+    // middleware's existing fallback instead of admitting nothing.
     Vec::<String>::deserialize(deserializer).map(|origins| {
         origins
             .into_iter()
