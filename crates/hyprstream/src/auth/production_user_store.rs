@@ -7,7 +7,9 @@
 
 use super::UserStore;
 use crate::config::{CredentialsBackend, CredentialsConfig, HyprConfig};
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(feature = "pglite")]
+use anyhow::Context;
 use std::{ops::Deref, path::Path, sync::Arc};
 
 /// Opaque handle proving that an account store passed production admission.
@@ -86,6 +88,10 @@ impl ProductionUserStore {
         credentials_dir: &Path,
         config: &CredentialsConfig,
     ) -> Result<Self> {
+        // Metrics builds intentionally have no account provider. Keep the
+        // path consumed in the PGlite/default profile while allowing the
+        // provider-absence branch to compile without an unused argument.
+        let _ = credentials_dir;
         config.backend.ensure_allowed_for_build()?;
 
         match config.backend {
@@ -261,12 +267,15 @@ mod tests {
     async fn metrics_profile_rejects_missing_encrypted_provider_before_opening_storage(
     ) -> Result<()> {
         let credentials_dir = tempfile::tempdir()?;
-        let error = ProductionUserStore::open_with_config(
+        let error = match ProductionUserStore::open_with_config(
             credentials_dir.path(),
             &CredentialsConfig::default(),
         )
         .await
-        .expect_err("metrics profile must reject its unavailable PGlite provider");
+        {
+            Ok(_) => panic!("metrics profile admitted an unavailable PGlite provider"),
+            Err(error) => error,
+        };
 
         assert!(
             error.to_string().contains(
