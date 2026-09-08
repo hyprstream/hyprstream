@@ -1325,18 +1325,25 @@ struct Payload {
     const SERVICE_SCHEMA: &str = r#"
 @0xbeefcafebeefcafe;
 
-# Mandatory scope (S3, #547): a method with no $scope is a build error. A minimal
-# local `scope` annotation mirrors the real annotations.capnp shape for this fixture.
+# Mandatory scope (S3, #547), mandatory dispatch pair (v16 §6, WS-D), and
+# mandatory mutation semantics (v16 §4.8/§6.1): a method with no `$scope` or
+# with neither `$dispatchMac`/`$dispatchPublic` is a build error, and every
+# non-read scoped leaf must declare `$mutationSemantics`. Minimal local
+# annotations mirror the real annotations.capnp shapes for this fixture.
 enum ScopeAction {
   query @0;
   write @1;
 }
 annotation scope(field) :ScopeAction;
+annotation dispatchMac(field) :Text;
+annotation mutationSemantics(field) :Text;
 
 struct PayloadRequest {
   union {
-    ping @0 :Void $scope(query);
-    echo @1 :Text $scope(write);
+    ping @0 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+    # A synthetic pure echo performs no durable application effect, so a
+    # repeated call converges — the `naturally-idempotent` class.
+    echo @1 :Text $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
   }
 }
 
@@ -1367,6 +1374,28 @@ struct PayloadResponse {
             .expect("compile capnp to CGR");
 
         let parsed = parse_from_cgr_path(Path::new(&cgr_path), name).expect("parse CGR");
+        let _ = std::fs::remove_dir_all(&tmp);
+        parsed
+    }
+
+    /// [`parse_schema`], but returning the pipeline's own parse error so the
+    /// schema-gate rejection boundaries themselves are testable.
+    fn try_parse_schema(name: &str, schema_src: &str) -> Result<ParsedSchema, String> {
+        let tmp = std::env::temp_dir().join(format!("hyprstream_ts_{name}_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+        let capnp_path = tmp.join(format!("{name}.capnp"));
+        std::fs::write(&capnp_path, schema_src).expect("write capnp");
+
+        let cgr_path = tmp.join(format!("{name}.cgr"));
+        capnpc::CompilerCommand::new()
+            .src_prefix(&tmp)
+            .file(&capnp_path)
+            .raw_code_generator_request_path(&cgr_path)
+            .run()
+            .expect("compile capnp to CGR");
+
+        let parsed = parse_from_cgr_path(Path::new(&cgr_path), name);
         let _ = std::fs::remove_dir_all(&tmp);
         parsed
     }
@@ -1458,6 +1487,383 @@ struct PayloadResponse {
         assert!(
             out.contains("variant: 'ok' as const"),
             "variant return missing `as const`:\n{out}"
+        );
+    }
+
+    /// P2 (`PRRT_kwDONmv2Pc6gGRV2`) pipeline fixture: a nonread selector whose
+    /// payload is a local pure union. The actual schema gate (`parse_from_cgr`
+    /// → `validate_mandatory_mutation_policy`) accepts the selector-level
+    /// `$mutationSemantics` — this pins that acceptance and the verbatim
+    /// extraction the derive's leaf walk inherits down to each descendant
+    /// leaf (the inheritance itself is pinned in hyprstream-rpc-derive's
+    /// `mutation_semantics_inherits_through_a_hand_dispatched_selector`).
+    const PURE_UNION_SELECTOR_SCHEMA: &str = r#"
+@0xe5c1ec70e5e1e57a;
+
+enum ScopeAction {
+  query @0;
+  write @1;
+}
+annotation scope(field) :ScopeAction;
+annotation scopeExempt(field) :Text;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+annotation mutationSemantics(field) :Text;
+
+struct BatchOps {
+  union {
+    put @0 :Text;
+    clear @1 :Void;
+  }
+}
+
+struct PipelineRequest {
+  union {
+    batch @0 :BatchOps $scope(write) $dispatchMac("internal:pq-hybrid") $mutationSemantics("transaction-ledger-required");
+    ping @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+    health @2 :Void $scopeExempt("unauthenticated liveness read") $dispatchPublic("unauthenticated liveness read for the load balancer");
+  }
+}
+
+struct PipelineResponse {
+  union {
+    ok @0 :Void;
+    fail @1 :Text;
+  }
+}
+"#;
+
+    #[test]
+    fn pure_union_selector_mutation_metadata_passes_the_schema_gate() {
+        let schema = parse_schema("pipeline", PURE_UNION_SELECTOR_SCHEMA);
+        let batch = schema
+            .request_variants
+            .iter()
+            .find(|v| v.name == "batch")
+            .expect("batch variant present");
+        assert_eq!(batch.scope, "write");
+        assert_eq!(
+            batch.mutation_semantics, "transaction-ledger-required",
+            "the selector-level declaration must be extracted verbatim"
+        );
+        let health = schema
+            .request_variants
+            .iter()
+            .find(|v| v.name == "health")
+            .expect("health variant present");
+        assert_eq!(
+            health.dispatch_public, "unauthenticated liveness read for the load balancer",
+            "the public reason is recorded exactly as declared"
+        );
+    }
+
+    /// The CGR path must retain arm-local metadata and the fact that an
+    /// annotation exists.  The unannotated sibling inherits the selector's
+    /// MAC/effect policy, while the local arm overrides the inherited values.
+    #[test]
+    fn pure_union_arms_preserve_local_overrides_and_presence() {
+        let schema = parse_schema(
+            "armmetadata",
+            r#"@0x9a1b2c3d4e5f6071;
+
+enum ScopeAction { query @0; write @1; }
+annotation scope(field) :ScopeAction;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+annotation mutationSemantics(field) :Text;
+
+struct BatchOps {
+  union {
+    put @0 :Text $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    clear @1 :Void;
+  }
+}
+struct ArmmetadataRequest {
+  union {
+    batch @0 :BatchOps $scope(write) $dispatchMac("secret:pq-hybrid") $mutationSemantics("transaction-ledger-required");
+    status @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+  }
+}
+struct ArmmetadataResponse { union { ok @0 :Void; other @1 :Void; } }
+"#,
+        );
+        let batch = schema
+            .structs
+            .iter()
+            .find(|s| s.name == "BatchOps")
+            .expect("real CGR retains local pure union");
+        let put = &batch.union_arms[0];
+        assert!(put.dispatch_mac_present && put.mutation_semantics_present);
+        assert_eq!(put.dispatch_mac, "internal:pq-hybrid");
+        let clear = &batch.union_arms[1];
+        assert!(!clear.dispatch_mac_present && !clear.mutation_semantics_present);
+        let selector = &schema.request_variants[0];
+        assert_eq!(selector.dispatch_mac, "secret:pq-hybrid");
+        assert_eq!(selector.mutation_semantics, "transaction-ledger-required");
+    }
+
+    #[test]
+    fn pure_union_cgr_rejects_invalid_mac_both_and_explicit_empty_policy() {
+        let invalid = r#"@0x9a1b2c3d4e5f6072;
+enum ScopeAction { query @0; write @1; }
+annotation scope(field) :ScopeAction;
+annotation dispatchMac(field) :Text;
+annotation mutationSemantics(field) :Text;
+struct Ops { union { bad @0 :Void $dispatchMac("not-a-mac"); good @1 :Void $dispatchMac("internal:pq-hybrid"); } }
+struct InvalidRequest { union { run @0 :Ops $scope(query) $dispatchMac("internal:pq-hybrid"); other @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid"); } }
+struct InvalidResponse { union { ok @0 :Void; other @1 :Void; } }
+"#;
+        assert!(try_parse_schema("invalid", invalid)
+            .unwrap_err()
+            .contains("dispatchMac"));
+
+        let both = r#"@0x9a1b2c3d4e5f6074;
+enum ScopeAction { query @0; write @1; }
+annotation scope(field) :ScopeAction;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+struct Ops { union { bad @0 :Void $dispatchMac("internal:pq-hybrid"); good @1 :Void $dispatchMac("internal:pq-hybrid"); } }
+struct BothRequest { union { run @0 :Ops $scope(query) $dispatchMac("internal:pq-hybrid") $dispatchPublic("reason"); other @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid"); } }
+struct BothResponse { union { ok @0 :Void; other @1 :Void; } }
+"#;
+        assert!(try_parse_schema("both", both)
+            .unwrap_err()
+            .contains("BOTH"));
+
+        let empty = r#"@0x9a1b2c3d4e5f6073;
+enum ScopeAction { query @0; write @1; }
+annotation scope(field) :ScopeAction;
+annotation dispatchMac(field) :Text;
+annotation mutationSemantics(field) :Text;
+struct Ops { union { bad @0 :Void $mutationSemantics(""); good @1 :Void $mutationSemantics("naturally-idempotent"); } }
+struct EmptyRequest { union { run @0 :Ops $scope(write) $dispatchMac("internal:pq-hybrid"); other @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid"); } }
+struct EmptyResponse { union { ok @0 :Void; other @1 :Void; } }
+"#;
+        assert!(try_parse_schema("empty", empty)
+            .unwrap_err()
+            .contains("mutationSemantics"));
+    }
+
+    /// Recursive pure-union selectors must validate their own declarations
+    /// before a valid grandchild can shadow them. This uses the complete
+    /// capnpc -> CGR -> schema-gate path rather than constructing metadata.
+    #[test]
+    fn recursive_selectors_validate_local_declarations_before_inheritance() {
+        fn schema(top: &str, nested: &str, top_mutation: &str) -> String {
+            format!(
+                r#"@0x91a2b3c4d5e6f701;
+
+enum ScopeAction {{ query @0; write @1; }}
+annotation scope(field) :ScopeAction;
+annotation scopeExempt(field) :Text;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+annotation mutationSemantics(field) :Text;
+
+struct Inner {{
+  union {{
+    first @0 :Void $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    second @1 :Void $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+  }}
+}}
+struct Outer {{
+  union {{
+    inner @0 :Inner {nested}
+    sibling @1 :Void $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+  }}
+}}
+struct RecursiveRequest {{
+  union {{
+    route @0 :Outer $scope(write) $dispatchMac("{top}") $mutationSemantics("{top_mutation}");
+    health @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+  }}
+}}
+struct RecursiveResponse {{ union {{ ok @0 :Void; other @1 :Void; }} }}
+"#,
+                nested = nested,
+                top = top,
+                top_mutation = top_mutation,
+            )
+        }
+
+        let top_bad_mac = schema(
+            "not-a-mac",
+            " $dispatchMac(\"internal:pq-hybrid\") $mutationSemantics(\"naturally-idempotent\");",
+            "naturally-idempotent",
+        );
+        let err = try_parse_schema("recursive", &top_bad_mac).unwrap_err();
+        assert!(err.contains("dispatchMac") && err.contains("not-a-mac"), "{err}");
+
+        let top_empty_mutation = schema(
+            "internal:pq-hybrid",
+            " $dispatchMac(\"internal:pq-hybrid\") $mutationSemantics(\"naturally-idempotent\");",
+            "",
+        );
+        let err = try_parse_schema("recursive", &top_empty_mutation).unwrap_err();
+        assert!(err.contains("mutationSemantics"), "{err}");
+
+        let nested_bad_mac = schema(
+            "internal:pq-hybrid",
+            " $dispatchMac(\"not-a-mac\") $mutationSemantics(\"naturally-idempotent\");",
+            "naturally-idempotent",
+        );
+        let err = try_parse_schema("recursive", &nested_bad_mac).unwrap_err();
+        assert!(err.contains("dispatchMac") && err.contains("not-a-mac"), "{err}");
+
+        let nested_empty_mutation = schema(
+            "internal:pq-hybrid",
+            " $dispatchMac(\"internal:pq-hybrid\") $mutationSemantics(\"\");",
+            "naturally-idempotent",
+        );
+        let err = try_parse_schema("recursive", &nested_empty_mutation).unwrap_err();
+        assert!(err.contains("mutationSemantics"), "{err}");
+
+        let nested_public = schema(
+            "internal:pq-hybrid",
+            " $dispatchPublic(\"nested public\") $mutationSemantics(\"naturally-idempotent\");",
+            "naturally-idempotent",
+        );
+        let err = try_parse_schema("recursive", &nested_public).unwrap_err();
+        assert!(err.contains("public is legal only on leaves"), "{err}");
+
+        let nested_both = schema(
+            "internal:pq-hybrid",
+            " $dispatchMac(\"internal:pq-hybrid\") $dispatchPublic(\"nested both\") $mutationSemantics(\"naturally-idempotent\");",
+            "naturally-idempotent",
+        );
+        let err = try_parse_schema("recursive", &nested_both).unwrap_err();
+        assert!(err.contains("BOTH"), "{err}");
+
+        // A local public leaf clears the inherited MAC while its unannotated
+        // sibling keeps that selector MAC. The public leaf is scope-exempt.
+        let valid = r#"@0x91a2b3c4d5e6f702;
+
+enum ScopeAction { query @0; }
+annotation scope(field) :ScopeAction;
+annotation scopeExempt(field) :Text;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+annotation mutationSemantics(field) :Text;
+struct Inner {
+  union {
+    publicLeaf @0 :Void $scopeExempt("liveness") $dispatchPublic("nested public leaf");
+    inheritedLeaf @1 :Void;
+  }
+}
+struct Outer { union { inner @0 :Inner; sibling @1 :Void; } }
+struct ValidRequest {
+  union {
+    route @0 :Outer $scopeExempt("route") $dispatchMac("internal:pq-hybrid");
+    health @1 :Void $scopeExempt("health") $dispatchPublic("valid public control");
+  }
+}
+struct ValidResponse { union { ok @0 :Void; other @1 :Void; } }
+"#;
+        let parsed = try_parse_schema("valid", valid).expect("valid recursive schema");
+        let inner = parsed.structs.iter().find(|s| s.name == "Inner").expect("Inner");
+        assert!(inner.union_arms[0].dispatch_public_present);
+        assert!(!inner.union_arms[1].dispatch_mac_present);
+    }
+
+    /// A local MAC/Public pair must remain contradictory even when public
+    /// would otherwise clear an inherited selector MAC. Presence bits include
+    /// an explicitly empty MAC annotation.
+    #[test]
+    fn local_leaf_dispatch_conflicts_fail_at_direct_and_recursive_depths() {
+        let direct = r#"@0x91a2b3c4d5e6f703;
+annotation scopeExempt(field) :Text;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+struct DirectInner {
+  union {
+    conflict @0 :Void $dispatchMac("") $dispatchPublic("local conflict");
+    sibling @1 :Void $dispatchMac("internal:pq-hybrid");
+  }
+}
+struct DirectRequest {
+  union {
+    run @0 :DirectInner $scopeExempt("control") $dispatchMac("internal:pq-hybrid");
+    health @1 :Void $scopeExempt("health") $dispatchPublic("valid health");
+  }
+}
+struct DirectResponse { union { ok @0 :Void; other @1 :Void; } }
+"#;
+        let err = try_parse_schema("direct", direct).unwrap_err();
+        assert!(err.contains("BOTH") && err.contains("dispatchPublic"), "{err}");
+
+        let nested = r#"@0x91a2b3c4d5e6f704;
+annotation scopeExempt(field) :Text;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+struct NestedLeaf {
+  union {
+    conflict @0 :Void $dispatchMac("internal:pq-hybrid") $dispatchPublic("nested conflict");
+    sibling @1 :Void $dispatchMac("internal:pq-hybrid");
+  }
+}
+struct NestedMiddle { union { descend @0 :NestedLeaf; sibling @1 :Void $dispatchMac("internal:pq-hybrid"); } }
+struct NestedRequest {
+  union {
+    run @0 :NestedMiddle $scopeExempt("control") $dispatchMac("internal:pq-hybrid");
+    health @1 :Void $scopeExempt("health") $dispatchPublic("valid health");
+  }
+}
+struct NestedResponse { union { ok @0 :Void; other @1 :Void; } }
+"#;
+        let err = try_parse_schema("nested", nested).unwrap_err();
+        assert!(err.contains("BOTH") && err.contains("dispatchPublic"), "{err}");
+    }
+
+    /// P2 (`PRRT_kwDONmv2Pc6gGRV5`) reason boundaries through the actual
+    /// schema gate: a padded reason is a parse error (never silently
+    /// trimmed), whitespace-only stays an error, and a trimmed valid reason
+    /// is recorded as its exact declared bytes.
+    fn public_reason_schema(reason: &str) -> String {
+        format!(
+            r#"@0xc0ffee5ed15c1a55;
+
+enum ScopeAction {{
+  query @0;
+  write @1;
+}}
+annotation scope(field) :ScopeAction;
+annotation scopeExempt(field) :Text;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+
+struct ReasonRequest {{
+  union {{
+    health @0 :Void $scopeExempt("unauthenticated liveness read") $dispatchPublic("{reason}");
+    dispatch @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+  }}
+}}
+
+struct ReasonResponse {{
+  union {{
+    ok @0 :Void;
+    fail @1 :Text;
+  }}
+}}
+"#
+        )
+    }
+
+    #[test]
+    fn dispatch_public_reason_boundaries_through_the_schema_gate() {
+        for padded in ["  padded reason  ", " leading", "trailing "] {
+            let err = try_parse_schema("reason", &public_reason_schema(padded))
+                .expect_err("a padded public reason must fail the schema gate");
+            assert!(err.contains("padded"), "{padded:?}: {err}");
+        }
+        let err = try_parse_schema("reason", &public_reason_schema("   "))
+            .expect_err("a whitespace-only reason must fail the schema gate");
+        assert!(err.contains("empty or whitespace-only"), "{err}");
+
+        let ok = try_parse_schema("reason", &public_reason_schema("two exact words"))
+            .expect("a trimmed valid reason parses");
+        assert_eq!(
+            ok.request_variants[0].dispatch_public, "two exact words",
+            "the recorded reason is the exact declared text"
         );
     }
 
@@ -1687,6 +2093,12 @@ struct EmbedImagesResponse {
                 vfs_bulk: false,
                 vfs_hidden: false,
                 vfs_mac: String::new(),
+                dispatch_mac: String::new(),
+                dispatch_public: String::new(),
+                mutation_semantics: String::new(),
+                dispatch_mac_present: false,
+                dispatch_public_present: false,
+                mutation_semantics_present: false,
             }],
             structs: vec![],
             scoped_clients: vec![],

@@ -19,7 +19,64 @@ use std::sync::OnceLock;
 
 use anyhow::{bail, Result};
 
+use crate::auth::mac::{Assurance, CompartmentSet, Level, SecurityLabel};
+
 use super::{verify::VerifiedProof, ProofDisposition, SUITE_CLASSICAL, SUITE_HYBRID};
+
+/// The system-low label — the exact expansion of `$dispatchPublic` and the
+/// mandatory value of every row's `transitional_label` during migration
+/// (v16 §7.3). Public ⇔ `target_label` is exactly this label.
+pub const SYSTEM_LOW_LABEL: SecurityLabel = SecurityLabel {
+    level: Level::Public,
+    assurance: Assurance::Unverified,
+    compartments: CompartmentSet::EMPTY,
+};
+
+/// Construct a dispatch label from its parsed axes (v16 §6). This is the ONE
+/// constructor generated rows use — there is no permissive default and no
+/// string parsing at runtime; the grammar was checked at code generation
+/// against the checked-in `InitialLabelMap`.
+pub const fn dispatch_label(level: Level, assurance: Assurance, bits: &[u32]) -> SecurityLabel {
+    let mut set = CompartmentSet::EMPTY;
+    let mut i = 0;
+    while i < bits.len() {
+        set = set.union(CompartmentSet::single(bits[i]));
+        i += 1;
+    }
+    SecurityLabel {
+        level,
+        assurance,
+        compartments: set,
+    }
+}
+
+/// The read-class authorization actions (S3 `ScopeAction` Block A). A leaf may
+/// explicitly classify bounded session/subscription state under either action;
+/// every other action requires a mutation policy.
+pub const READ_CLASS_ACTIONS: &[&str] = &["query", "subscribe"];
+
+/// The generated application policy a mutating method declares (v16 §4.8) —
+/// distinct from request-proof replay admission. The declaration metadata
+/// describes each method's retry semantics or activation prerequisite; the
+/// annotation itself does not implement enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationSemantics {
+    /// Retrying the method with the same intent is safe without extra
+    /// machinery.
+    NaturallyIdempotent,
+    /// Activation prerequisite: before retry is enabled for the method, its
+    /// payload must carry a caller application idempotency key and the
+    /// service must durably bind that key to the recorded result so the
+    /// retry returns it. This declaration does not establish that the
+    /// key/result mechanism exists; activation must verify the method
+    /// implementation.
+    IdempotencyKeyRequired,
+    /// Reserved for a separately claimed exactly-once-visible contract: the
+    /// mutation commits with the ledger in one transaction or an equivalent
+    /// fencing protocol. The declaration is metadata; the claimed contract
+    /// must exist per method before this label is used.
+    TransactionLedgerRequired,
+}
 
 /// The cryptographic suite a method requires of its primary logical signer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,12 +246,29 @@ pub struct GeneratedMethodPolicyRow {
     pub leaf_path: &'static [u16],
     /// Dotted human-readable path — review metadata, never a lookup key.
     pub symbolic_path: &'static str,
-    /// `$scope`/`$capability` action; empty only for `$scopeExempt` leaves.
+    /// `$scope`/`$capability` action; empty for `$dispatchPublic` leaves and
+    /// for `$dispatchMac` leaves whose control-plane scope is explicitly
+    /// exempted (`$scopeExempt` — the gate is a different mechanism, e.g. a
+    /// CA-signed JWT attestation, documented in the schema).
     pub scope_action: &'static str,
+    /// Whether the leaf's control-plane scope is `$scopeExempt`-exempted. The
+    /// DISPATCH floor is unaffected (a `$scopeExempt` + `$dispatchMac` leaf
+    /// still requires a credential); this records why `scope_action` is empty
+    /// on a credential-required row.
+    pub scope_exempt: bool,
     /// Whether the leaf admits the `Unauthenticated` disposition.
     pub authentication: AuthenticationRequirement,
     /// The signing topology the leaf requires.
     pub signature_policy: SignaturePolicy,
+    /// The application mutation policy an effectful leaf declares (v16 §4.8).
+    /// `None` means no declared application effect, including ordinary reads.
+    pub mutation_semantics: Option<MutationSemantics>,
+    /// The migration label: always system low while the transitional column
+    /// is selected (v16 §7.3); deleted after the target flip.
+    pub transitional_label: SecurityLabel,
+    /// The operator-reviewable target label parsed from `$dispatchMac`, or
+    /// exactly system low for a `$dispatchPublic` leaf.
+    pub target_label: SecurityLabel,
     /// The audited reason a publicly dispatchable leaf is public.
     pub public_reason: Option<&'static str>,
 }
@@ -290,6 +364,16 @@ pub fn validate_generated_rows(rows: &[GeneratedMethodPolicyRow]) -> Result<()> 
                         row.scope_action
                     );
                 }
+                // `$dispatchPublic` expands to exactly system low (v16 §6) —
+                // anything else on a public row is a generation defect.
+                if row.target_label != SYSTEM_LOW_LABEL {
+                    bail!(
+                        "public leaf '{}':'{}' target label {} is not exactly system low",
+                        row.service,
+                        row.symbolic_path,
+                        row.target_label
+                    );
+                }
             }
             AuthenticationRequirement::CredentialRequired => {
                 if row.signature_policy.allows_unattributed() {
@@ -299,14 +383,89 @@ pub fn validate_generated_rows(rows: &[GeneratedMethodPolicyRow]) -> Result<()> 
                         row.symbolic_path
                     );
                 }
-                if row.scope_action.is_empty() {
+                // An empty scope action on a credential-required row is legal
+                // only as a recorded control-plane exemption ($scopeExempt:
+                // the leaf is gated by a different, documented mechanism such
+                // as a CA-signed JWT attestation — the dispatch floor still
+                // requires the credential).
+                if row.scope_action.is_empty() && !row.scope_exempt {
                     bail!(
-                        "credential-required leaf '{}':'{}' has no scope action",
+                        "credential-required leaf '{}':'{}' has no scope action and no recorded \
+                         control-plane exemption",
+                        row.service,
+                        row.symbolic_path
+                    );
+                }
+                if !row.scope_action.is_empty() && row.scope_exempt {
+                    bail!(
+                        "leaf '{}':'{}' is scope-exempt but carries scope action '{}'",
+                        row.service,
+                        row.symbolic_path,
+                        row.scope_action
+                    );
+                }
+                // A MAC'd leaf whose target is exactly system low would be
+                // indistinguishable from a public row — the label grammar
+                // rejects this at codegen; this is the generated-row floor.
+                if row.target_label == SYSTEM_LOW_LABEL {
+                    bail!(
+                        "credential-required leaf '{}':'{}' has the system-low target label — \
+                         system low through the MAC path is a build error (v16 §6)",
+                        row.service,
+                        row.symbolic_path
+                    );
+                }
+                // A public reason belongs to the public branch only.
+                if row.public_reason.is_some() {
+                    bail!(
+                        "credential-required leaf '{}':'{}' carries a public reason",
                         row.service,
                         row.symbolic_path
                     );
                 }
             }
+        }
+
+        // The transitional column is system low for every row while migration
+        // runs (v16 §7.3) — a generated row carrying anything else is a
+        // generation defect, never an operator choice.
+        if row.transitional_label != SYSTEM_LOW_LABEL {
+            bail!(
+                "row '{}':'{}' transitional label {} is not system low — the \
+                 transitional column is fixed until the target flip (v16 §7.3)",
+                row.service,
+                row.symbolic_path,
+                row.transitional_label
+            );
+        }
+
+        // Mutation consistency (v16 §6.1): every non-read scope action requires
+        // explicit `MutationSemantics`. A read-class action may carry an
+        // explicit policy for bounded session/subscription state; authorization
+        // and application effects are separate axes. A public row carries no
+        // scope action and is reviewed through its public reason instead.
+        if !row.scope_action.is_empty() {
+            let is_read_class = READ_CLASS_ACTIONS.contains(&row.scope_action);
+            if !is_read_class && row.mutation_semantics.is_none() {
+                bail!(
+                    "mutating leaf '{}':'{}' (scope '{}') has no MutationSemantics — a \
+                     mutating scope action requires an explicit one (v16 §6.1)",
+                    row.service,
+                    row.symbolic_path,
+                    row.scope_action
+                );
+            }
+        }
+
+        // A scope-exempt leaf may be public/read-only with no policy, or a
+        // separately authenticated control-plane mutator with an explicit one.
+        // Empty scope alone never erases explicit mutation metadata.
+        if row.scope_action.is_empty() && !row.scope_exempt && row.mutation_semantics.is_some() {
+            bail!(
+                "unscoped non-exempt leaf '{}':'{}' declares MutationSemantics",
+                row.service,
+                row.symbolic_path
+            );
         }
 
         // Approver rules must be satisfiable and exact.
@@ -652,10 +811,14 @@ mod tests {
             leaf_path: leaf,
             symbolic_path: symbolic,
             scope_action: "query",
+            scope_exempt: false,
             authentication: AuthenticationRequirement::CredentialRequired,
             signature_policy: SignaturePolicy::TokenBound {
                 suite: CryptoSuite::Hybrid,
             },
+            mutation_semantics: None,
+            transitional_label: SYSTEM_LOW_LABEL,
+            target_label: dispatch_label(Level::Internal, Assurance::PqHybrid, &[]),
             public_reason: None,
         }
     }
@@ -666,11 +829,15 @@ mod tests {
             leaf_path: leaf,
             symbolic_path: symbolic,
             scope_action: "",
+            scope_exempt: true,
             authentication: AuthenticationRequirement::UnauthenticatedAllowed,
             signature_policy: SignaturePolicy::UnauthenticatedOrTokenBound {
                 suite: CryptoSuite::Hybrid,
             },
-            public_reason: Some("declared $scopeExempt in the service schema"),
+            mutation_semantics: None,
+            transitional_label: SYSTEM_LOW_LABEL,
+            target_label: SYSTEM_LOW_LABEL,
+            public_reason: Some("declared $dispatchPublic in the service schema"),
         }
     }
 
@@ -729,6 +896,107 @@ mod tests {
         let mut row = valid_row(&[0], "a");
         row.scope_action = "";
         assert!(validate_generated_rows(&[row]).is_err());
+    }
+
+    /// The `$dispatchMac`/`$dispatchPublic` label gates (v16 §6/§7.3): public
+    /// expands to exactly system low, a MAC'd row may never be system low, and
+    /// the transitional column is fixed at system low until the target flip.
+    #[test]
+    fn label_column_contradictions_fail_the_build() {
+        // A public row whose target is anything but system low.
+        let mut public_labeled = public_row(&[0], "p");
+        public_labeled.target_label = dispatch_label(Level::Internal, Assurance::PqHybrid, &[]);
+        assert!(validate_generated_rows(&[public_labeled]).is_err());
+
+        // A credential-required row whose target IS system low.
+        let mut mac_system_low = valid_row(&[0], "a");
+        mac_system_low.target_label = SYSTEM_LOW_LABEL;
+        assert!(validate_generated_rows(&[mac_system_low]).is_err());
+
+        // Any row whose transitional label left system low during migration.
+        let mut bad_transitional = valid_row(&[0], "a");
+        bad_transitional.transitional_label =
+            dispatch_label(Level::Internal, Assurance::PqHybrid, &[]);
+        assert!(validate_generated_rows(&[bad_transitional]).is_err());
+
+        // Compartments ride along on the target label and validate.
+        let mut compartmented = valid_row(&[0], "a");
+        compartmented.target_label =
+            dispatch_label(Level::Secret, Assurance::PqHybrid, &[0, 3]);
+        assert!(validate_generated_rows(&[compartmented]).is_ok());
+    }
+
+    /// A `$scopeExempt` + `$dispatchMac` leaf (e.g. `policy.registerServiceKey`,
+    /// gated by CA-signed JWT attestation at the control plane) carries an empty
+    /// scope action LEGALLY — but only with the exemption recorded, and never
+    /// together with a scope action.
+    #[test]
+    fn control_plane_exemptions_on_mac_rows_are_recorded_and_exact() {
+        // Exempt + empty scope + credential required: legal.
+        let mut exempt = valid_row(&[0], "a");
+        exempt.scope_action = "";
+        exempt.scope_exempt = true;
+        assert!(validate_generated_rows(&[exempt]).is_ok());
+
+        // Empty scope WITHOUT the recorded exemption: build error.
+        let mut bare = valid_row(&[0], "a");
+        bare.scope_action = "";
+        bare.scope_exempt = false;
+        let err = validate_generated_rows(&[bare]).unwrap_err();
+        assert!(err.to_string().contains("no recorded control-plane exemption"), "{err}");
+
+        // Exempt AND carrying a scope action: contradictory.
+        let mut both = valid_row(&[0], "a");
+        both.scope_exempt = true;
+        let err = validate_generated_rows(&[both]).unwrap_err();
+        assert!(err.to_string().contains("scope-exempt but carries scope action"), "{err}");
+    }
+
+    /// Mutation consistency (v16 §6.1): non-read scope actions require an
+    /// explicit `MutationSemantics`; stateful read-class leaves may claim one.
+    #[test]
+    fn mutation_semantics_mismatch_fails_the_build() {
+        // A query scope may explicitly classify bounded session state while
+        // preserving its existing query authorization.
+        let mut read_claiming = valid_row(&[0], "a");
+        read_claiming.scope_action = "query";
+        read_claiming.mutation_semantics = Some(MutationSemantics::NaturallyIdempotent);
+        assert!(validate_generated_rows(&[read_claiming]).is_ok());
+
+        // mutating + None = contradiction. A public row (empty scope action)
+        // is exempt from this gate — it is reviewed via its public reason.
+        let mut mutating_bare = valid_row(&[0], "a");
+        mutating_bare.scope_action = "write";
+        mutating_bare.mutation_semantics = None;
+        assert!(validate_generated_rows(&[mutating_bare]).is_err());
+        assert!(validate_generated_rows(&[public_row(&[3], "p2")]).is_ok());
+
+        // A control-plane exemption can still be a declared mutator when its
+        // separate authentication gate is documented; empty scope is not an
+        // implicit read classification.
+        let mut exempt_mutator = valid_row(&[4], "registerServiceKey");
+        exempt_mutator.scope_action = "";
+        exempt_mutator.scope_exempt = true;
+        exempt_mutator.mutation_semantics = Some(MutationSemantics::NaturallyIdempotent);
+        assert!(validate_generated_rows(&[exempt_mutator]).is_ok());
+
+        // mutating + Some stays green, for each declared variant.
+        for semantics in [
+            MutationSemantics::NaturallyIdempotent,
+            MutationSemantics::IdempotencyKeyRequired,
+            MutationSemantics::TransactionLedgerRequired,
+        ] {
+            let mut row = valid_row(&[0], "a");
+            row.scope_action = "write";
+            row.mutation_semantics = Some(semantics);
+            assert!(validate_generated_rows(&[row]).is_ok());
+        }
+
+        // Subscribe can likewise classify effectful subscription state.
+        let mut subscribe = valid_row(&[0], "a");
+        subscribe.scope_action = "subscribe";
+        subscribe.mutation_semantics = Some(MutationSemantics::NaturallyIdempotent);
+        assert!(validate_generated_rows(&[subscribe]).is_ok());
     }
 
     #[test]
