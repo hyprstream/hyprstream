@@ -489,7 +489,13 @@ fn validate_mandatory_dispatch_with_structs(
                 )?;
             } else {
                 let (mac, mac_present) = if arm.dispatch_public_present {
-                    ("", false)
+                    // A local MAC remains present so a local MAC/Public pair
+                    // is rejected; a public-only leaf clears inherited MAC.
+                    if arm.dispatch_mac_present {
+                        (arm.dispatch_mac.as_str(), true)
+                    } else {
+                        ("", false)
+                    }
                 } else {
                     (
                         inherited_or_local.unwrap_or(""),

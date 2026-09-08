@@ -218,3 +218,66 @@ fn ts_cli_accepts_valid_public_cgr_and_writes_output() {
     );
     let _ = std::fs::remove_dir_all(tmp);
 }
+
+const INVALID_LOCAL_CONFLICT_SCHEMA: &str = r#"
+@0xd15ea5ed15ea5ed2;
+
+annotation scopeExempt(field) :Text;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+
+struct ConflictRequest {
+  union {
+    run @0 :Void $scopeExempt("control") $dispatchMac("") $dispatchPublic("local conflict");
+    health @1 :Void $scopeExempt("health") $dispatchPublic("valid health");
+  }
+}
+struct ConflictResponse {
+  union {
+    ok @0 :Void;
+    other @1 :Void;
+  }
+}
+"#;
+
+#[test]
+fn ts_cli_rejects_local_mac_public_conflict_without_output() {
+    let tmp = std::env::temp_dir().join(format!("hyprstream_ts_cli_conflict_{}", std::process::id()));
+    let input_dir = tmp.join("input");
+    std::fs::create_dir_all(&input_dir).expect("create input");
+    let capnp_path = input_dir.join("conflict.capnp");
+    std::fs::write(&capnp_path, INVALID_LOCAL_CONFLICT_SCHEMA).expect("write conflict.capnp");
+    let cgr_path = input_dir.join("conflict.cgr");
+    capnpc::CompilerCommand::new()
+        .src_prefix(&input_dir)
+        .file(&capnp_path)
+        .raw_code_generator_request_path(&cgr_path)
+        .run()
+        .expect("compile conflict.capnp to CGR");
+
+    let binary = std::env::var_os("CARGO_BIN_EXE_hyprstream_ts_codegen")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let current = std::env::current_exe().expect("test executable path");
+            current
+                .parent()
+                .and_then(Path::parent)
+                .expect("target profile directory")
+                .join("hyprstream-ts-codegen")
+        });
+    let output_dir = tmp.join("output");
+    let output = Command::new(binary)
+        .args([
+            "--input-dir",
+            input_dir.to_str().expect("input path"),
+            "--output-dir",
+            output_dir.to_str().expect("output path"),
+        ])
+        .output()
+        .expect("run TypeScript codegen CLI");
+    assert!(!output.status.success(), "local MAC/Public conflict must fail: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("BOTH") && stderr.contains("dispatchPublic"), "{stderr}");
+    assert!(!output_dir.exists(), "conflict must not produce partial output");
+    let _ = std::fs::remove_dir_all(tmp);
+}

@@ -1765,6 +1765,55 @@ struct ValidResponse { union { ok @0 :Void; other @1 :Void; } }
         assert!(!inner.union_arms[1].dispatch_mac_present);
     }
 
+    /// A local MAC/Public pair must remain contradictory even when public
+    /// would otherwise clear an inherited selector MAC. Presence bits include
+    /// an explicitly empty MAC annotation.
+    #[test]
+    fn local_leaf_dispatch_conflicts_fail_at_direct_and_recursive_depths() {
+        let direct = r#"@0x91a2b3c4d5e6f703;
+annotation scopeExempt(field) :Text;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+struct DirectInner {
+  union {
+    conflict @0 :Void $dispatchMac("") $dispatchPublic("local conflict");
+    sibling @1 :Void $dispatchMac("internal:pq-hybrid");
+  }
+}
+struct DirectRequest {
+  union {
+    run @0 :DirectInner $scopeExempt("control") $dispatchMac("internal:pq-hybrid");
+    health @1 :Void $scopeExempt("health") $dispatchPublic("valid health");
+  }
+}
+struct DirectResponse { union { ok @0 :Void; other @1 :Void; } }
+"#;
+        let err = try_parse_schema("direct", direct).unwrap_err();
+        assert!(err.contains("BOTH") && err.contains("dispatchPublic"), "{err}");
+
+        let nested = r#"@0x91a2b3c4d5e6f704;
+annotation scopeExempt(field) :Text;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+struct NestedLeaf {
+  union {
+    conflict @0 :Void $dispatchMac("internal:pq-hybrid") $dispatchPublic("nested conflict");
+    sibling @1 :Void $dispatchMac("internal:pq-hybrid");
+  }
+}
+struct NestedMiddle { union { descend @0 :NestedLeaf; sibling @1 :Void $dispatchMac("internal:pq-hybrid"); } }
+struct NestedRequest {
+  union {
+    run @0 :NestedMiddle $scopeExempt("control") $dispatchMac("internal:pq-hybrid");
+    health @1 :Void $scopeExempt("health") $dispatchPublic("valid health");
+  }
+}
+struct NestedResponse { union { ok @0 :Void; other @1 :Void; } }
+"#;
+        let err = try_parse_schema("nested", nested).unwrap_err();
+        assert!(err.contains("BOTH") && err.contains("dispatchPublic"), "{err}");
+    }
+
     /// P2 (`PRRT_kwDONmv2Pc6gGRV5`) reason boundaries through the actual
     /// schema gate: a padded reason is a parse error (never silently
     /// trimmed), whitespace-only stays an error, and a trimmed valid reason
