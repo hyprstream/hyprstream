@@ -23,7 +23,7 @@ struct MetricRecord {
 }
 
 enum AggregationFunc {
-  rawSql @0;   # No aggregation — use sql field or unmodified SELECT
+  rawSql @0;   # Retained for wire compatibility; raw SQL is rejected by query RPCs
   count  @1;
   sum    @2;
   avg    @3;
@@ -32,7 +32,7 @@ enum AggregationFunc {
 }
 
 struct MetricQuery {
-  sql             @0 :Text;          # Raw SQL (takes priority when non-empty)
+  sql             @0 :Text;          # Deprecated raw SQL field; non-empty values are rejected
   metricId        @1 :Text;          # Structured filter (translated to WHERE clause)
   windowSecs      @2 :UInt32;        # Fixed time window seconds (0 = none)
   aggregation     @3 :AggregationFunc;
@@ -83,14 +83,8 @@ struct MetricsRequest {
     ingest       @1 :IngestRequest
       $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Ingest metric records into the time-series store");
 
-    # Raw SQL reaches the storage backend verbatim when non-empty, so a
-    # replayed non-SELECT statement re-applies its write. At-most-once
-    # execution requires an atomic result/mutation ledger or fencing; none is
-    # implemented here — this records the required semantics, not an
-    # existing mechanism. (Restricting execution to SELECT is separate
-    # enforcement work, deliberately not attempted in this annotation.)
     query        @2 :MetricQuery
-      $scope(query) $mutationSemantics("transaction-ledger-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Execute a structured or raw SQL aggregation query");
+      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Execute a structured metrics aggregation query; raw SQL is rejected");
 
     # Prepares a server-side third-party interop stream context under the
     # client's ephemeral pubkey and schedules the query continuation before
@@ -98,7 +92,7 @@ struct MetricsRequest {
     # At-most-once preparation requires an atomic result ledger; none is
     # implemented here — this records the required semantics.
     queryStream  @3 :MetricQuery
-      $scope(query) $mutationSemantics("transaction-ledger-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Stream query results as Arrow IPC RecordBatch chunks");
+      $scope(query) $mutationSemantics("transaction-ledger-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Stream structured metrics query results as Arrow IPC RecordBatch chunks; raw SQL is rejected");
 
     createView   @4 :ViewSpec
       $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Create a materialized view over the metrics table");

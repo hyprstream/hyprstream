@@ -119,8 +119,9 @@ fn validate_identifier(name: &str) -> Result<()> {
 
 fn build_sql(q: &MetricQuery) -> Result<String> {
     if !q.sql.is_empty() {
-        // Raw SQL: caller must have been granted query scope by the dispatcher.
-        return Ok(q.sql.clone());
+        anyhow::bail!(
+            "raw SQL is not supported for metrics query RPCs; use a structured metrics query"
+        );
     }
 
     // Validate group_by column names before interpolating them into SQL.
@@ -146,7 +147,7 @@ fn build_sql(q: &MetricQuery) -> Result<String> {
 
     // For aggregate queries: SELECT value + group_by columns only.
     // timestamp is NOT included — it is not in GROUP BY and can't appear in SELECT with aggregates.
-    // AggregateRow.timestamp will be 0 for structured aggregate queries (use raw SQL to project it).
+    // AggregateRow.timestamp will be 0 for structured aggregate queries.
     // NOTE: timestamp is stored and compared in milliseconds (Unix epoch ms).
     // The MetricRecord.timestamp field, ingest path, and window filter all use ms.
     let mut sql = format!(
@@ -672,7 +673,11 @@ mod tests {
     use hyprstream_metrics::query::QueryOrchestrator;
     use hyprstream_metrics::storage::duckdb::DuckDbBackend;
     use hyprstream_rpc::crypto::generate_signing_keypair;
+    use hyprstream_rpc::moq_stream::{init_global_moq_origin, MoqStreamOrigin, STREAM_TRACK};
+    use hyprstream_rpc::stream_consumer::StreamPayload;
+    use hyprstream_rpc::streaming::{derive_client_stream_keys, StreamVerifier};
     use hyprstream_rpc::transport::TransportConfig;
+    use moq_net::Track;
     use hyprstream_service::{InprocManager, ServiceManager};
 
     use crate::auth::PolicyManager;
@@ -681,10 +686,19 @@ mod tests {
         MetricsClient, ViewSpec,
     };
     use crate::services::{PolicyClient, PolicyService};
-    /// Spin up an in-memory MetricsService and return a typed client + InprocManager handle.
+    /// Spin up an in-memory MetricsService and return its typed client, manager, and backend.
     async fn start_metrics_service(
         tag: &str,
-    ) -> (MetricsClient, InprocManager) {
+    ) -> (MetricsClient, InprocManager, Arc<DuckDbBackend>) {
+        start_metrics_service_on_path(tag, ":memory:".to_owned(), true).await
+    }
+
+    async fn start_metrics_service_on_path(
+        tag: &str,
+        connection_string: String,
+        query_allowed: bool,
+    ) -> (MetricsClient, InprocManager, Arc<DuckDbBackend>) {
+        let _ = init_global_moq_origin(MoqStreamOrigin::standalone().build());
         crate::mac::install_explicit_test_dispatch_pep();
         // Tests use Classical (EdDSA-only) keys — install Classical verify
         // policy on both the request and response arms so the global
@@ -713,13 +727,26 @@ mod tests {
             },
         );
 
-        // Permissive policy service so authorize() always passes.
+        // The default fixture permits all metrics operations; the deny fixture
+        // grants only the service-to-policy check needed to exercise rejection.
         let policy_tag = format!("test-policy-{tag}");
-        let policy_manager = Arc::new(
+        let policy_manager = if query_allowed {
             PolicyManager::permissive()
                 .await
-                .expect("permissive policy manager"),
-        );
+                .expect("permissive policy manager")
+        } else {
+            let manager = PolicyManager::new_in_memory()
+                .await
+                .expect("deny-by-default policy manager");
+            // Permit the metrics service to ask PolicyService, while leaving
+            // metrics:Query and metrics:QueryStream themselves ungranted.
+            manager
+                .add_policy("service:metrics", "policy:Check", "check")
+                .await
+                .expect("policy check grant");
+            manager
+        };
+        let policy_manager = Arc::new(policy_manager);
         let git2db = Arc::new(tokio::sync::RwLock::new(
             git2db::Git2DB::open(tempfile::TempDir::new().unwrap().path())
                 .await
@@ -747,9 +774,10 @@ mod tests {
 
         // In-memory DuckDB backend + metrics table creation.
         let backend = Arc::new(
-            DuckDbBackend::new(":memory:".to_owned(), Default::default(), None)
+            DuckDbBackend::new(connection_string, Default::default(), None)
                 .expect("DuckDbBackend"),
         );
+        let backend_for_tests = Arc::clone(&backend);
         // Create the metrics table before handing backend to orchestrator.
         let schema = hyprstream_metrics::metrics::get_metrics_schema();
         backend
@@ -784,14 +812,28 @@ mod tests {
             None,
         ).expect("create metrics client");
 
-        (client, manager)
+        (client, manager, backend_for_tests)
+    }
+
+    async fn metrics_row_count(backend: &DuckDbBackend) -> i64 {
+        let handle = backend
+            .prepare_sql("SELECT COUNT(*) AS rows FROM metrics")
+            .await
+            .expect("prepare row count");
+        let batch = backend.query_sql(&handle).await.expect("query row count");
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<hyprstream_metrics::arrow::array::Int64Array>()
+            .expect("row count type")
+            .value(0)
     }
 
     // ── health ────────────────────────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_health_fresh_db() {
-        let (client, _mgr) = start_metrics_service("health-fresh").await;
+        let (client, _mgr, _) = start_metrics_service("health-fresh").await;
         let info = client.health().await.expect("health on fresh DB");
         // Table exists (created in test helper) but is empty.
         assert!(info.ok, "expected ok=true — table exists even when empty");
@@ -803,7 +845,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ingest_and_health() {
-        let (client, _mgr) = start_metrics_service("ingest-health").await;
+        let (client, _mgr, _) = start_metrics_service("ingest-health").await;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -840,7 +882,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_query_count() {
-        let (client, _mgr) = start_metrics_service("query-count").await;
+        let (client, _mgr, _) = start_metrics_service("query-count").await;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -875,11 +917,28 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value as u64, 1, "COUNT should be 1");
+
+        // RawSql with an empty wire field retains its historical structured
+        // compatibility behavior; only non-empty caller SQL is rejected.
+        let compatibility_rows = client
+            .query(&MetricQuery {
+                sql: String::new(),
+                metric_id: "mem.rss".to_owned(),
+                window_secs: 0,
+                aggregation: AggregationFunc::RawSql,
+                group_by: vec![],
+                limit_rows: 0,
+                ephemeral_pubkey: vec![],
+            })
+            .await
+            .expect("empty RawSql compatibility query");
+        assert_eq!(compatibility_rows.len(), 1);
+        assert_eq!(compatibility_rows[0].value as u64, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_query_sum() {
-        let (client, _mgr) = start_metrics_service("query-sum").await;
+        let (client, _mgr, _) = start_metrics_service("query-sum").await;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -926,49 +985,219 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_query_raw_sql() {
-        let (client, _mgr) = start_metrics_service("query-raw").await;
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-
-        client
-            .ingest(&IngestRequest {
-                records: vec![CMetricRecord {
-                    metric_id: "net.rx".to_owned(),
-                    timestamp: now,
-                    value_window_sum: 500.0,
-                    value_window_avg: 500.0,
-                    value_window_count: 1,
-                }],
-            })
+    async fn test_query_raw_sql_denied_before_storage() {
+        let db_dir = tempfile::tempdir().expect("temporary metrics database directory");
+        let db_path = db_dir.path().join("metrics.duckdb");
+        let (client, manager, backend) = start_metrics_service_on_path(
+            "query-raw-denied",
+            db_path.to_string_lossy().into_owned(),
+            true,
+        )
+        .await;
+        let before = backend
+            .list_tables()
             .await
-            .expect("ingest");
+            .expect("list tables before raw SQL");
+        let before_rows = metrics_row_count(&backend).await;
 
-        let rows = client
-            .query(&MetricQuery {
-                sql: "SELECT CAST(COUNT(*) AS DOUBLE) AS value FROM metrics".to_owned(),
+        let cases = [
+            "CREATE TABLE query_owned (value INTEGER)",
+            "INSERT INTO metrics VALUES ('raw', 1, 2, 2, 1)",
+            "SELECT 1; CREATE TABLE query_owned_again (value INTEGER)",
+            "SELECT * FROM read_csv('/synthetic/not-a-real-file')",
+            "WITH rows AS (SELECT 1) SELECT * FROM rows",
+            "SELECT * FROM metrics",
+            "-- comment\nSELECT * FROM metrics",
+            "   ",
+        ];
+        for sql in cases {
+            let query = MetricQuery {
+                sql: sql.to_owned(),
                 metric_id: String::new(),
                 window_secs: 0,
                 aggregation: AggregationFunc::RawSql,
                 group_by: vec![],
                 limit_rows: 0,
                 ephemeral_pubkey: vec![],
+            };
+            let error = client
+                .query(&query)
+                .await
+                .expect_err("raw SQL must be denied");
+            assert!(
+                error.to_string().contains("raw SQL is not supported"),
+                "unexpected query denial for {sql:?}: {error}"
+            );
+
+            // The shared builder runs before stream context allocation, so a
+            // rejected queryStream must leave no continuation to consume.
+            let mut stream_query = query.clone();
+            stream_query.ephemeral_pubkey = vec![0u8; 32];
+            let error = client
+                .query_stream(&stream_query, [0u8; 32])
+                .await
+                .expect_err("raw SQL must be denied for queryStream");
+            assert!(
+                error.to_string().contains("raw SQL is not supported"),
+                "unexpected queryStream denial for {sql:?}: {error}"
+            );
+        }
+
+        let after = backend.list_tables().await.expect("list tables after raw SQL");
+        let after_rows = metrics_row_count(&backend).await;
+        assert_eq!(before, after, "raw SQL rejection must precede storage execution");
+        assert_eq!(before_rows, after_rows, "raw SQL rejection must prevent DML");
+        assert!(!after.iter().any(|name| name == "query_owned"));
+
+        drop(client);
+        drop(manager);
+        drop(backend);
+        let reopened = DuckDbBackend::new(
+            db_path.to_string_lossy().into_owned(),
+            Default::default(),
+            None,
+        )
+        .expect("reopen metrics database");
+        let reopened_tables = reopened.list_tables().await.expect("list tables after reopen");
+        let reopened_rows = metrics_row_count(&reopened).await;
+        assert_eq!(before, reopened_tables, "raw SQL must not mutate persisted schema");
+        assert_eq!(before_rows, reopened_rows, "raw SQL must not mutate persisted rows");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_structured_query_requires_query_permission() {
+        let (client, _manager, _) =
+            start_metrics_service_on_path("query-permission-denied", ":memory:".to_owned(), false)
+                .await;
+        let error = client
+            .query(&MetricQuery {
+                sql: String::new(),
+                metric_id: String::new(),
+                window_secs: 0,
+                aggregation: AggregationFunc::Count,
+                group_by: vec![],
+                limit_rows: 0,
+                ephemeral_pubkey: vec![],
             })
             .await
-            .expect("query raw sql");
+            .expect_err("structured query must require query permission");
+        assert!(
+            error.to_string().contains("Unauthorized"),
+            "unexpected insufficient-permission error: {error}"
+        );
+    }
 
-        assert_eq!(rows.len(), 1, "raw SQL COUNT should return one row");
-        assert_eq!(rows[0].value as u64, 1, "raw SQL COUNT should be 1");
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_query_stream_structured_result_is_prepared() {
+        let (client, _mgr, _) = start_metrics_service("query-stream-structured").await;
+        let (client_secret, client_pub) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        client
+            .ingest(&IngestRequest {
+                records: vec![CMetricRecord {
+                    metric_id: "stream.metric".to_owned(),
+                    timestamp: now,
+                    value_window_sum: 11.0,
+                    value_window_avg: 11.0,
+                    value_window_count: 1,
+                }],
+            })
+            .await
+            .expect("ingest");
+        let stream = client
+            .query_stream(&MetricQuery {
+                sql: String::new(),
+                metric_id: "stream.metric".to_owned(),
+                window_secs: 0,
+                aggregation: AggregationFunc::Sum,
+                group_by: vec![],
+                limit_rows: 0,
+                ephemeral_pubkey: client_pub.to_bytes().to_vec(),
+            }, [0u8; 32])
+            .await
+            .expect("structured queryStream");
+        assert!(!stream.stream_id.is_empty(), "queryStream must return a stream id");
+
+        let (mac_key, enc_key, topic) = derive_client_stream_keys(
+            &client_secret,
+            &client_pub.to_bytes(),
+            &stream.dh_public,
+        )
+        .expect("derive stream keys");
+        let origin = hyprstream_rpc::moq_stream::global_moq_origin()
+            .expect("metrics test origin initialized");
+        let broadcast = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            origin
+                .consumer()
+                .announced_broadcast(&stream.broadcast_path),
+        )
+        .await
+        .expect("stream announcement timeout")
+        .expect("stream broadcast announcement");
+        let mut track = broadcast
+            .subscribe_track(&Track::new(STREAM_TRACK))
+            .expect("subscribe to structured query stream");
+        let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
+        let mut payloads = Vec::new();
+        for _ in 0..2 {
+            let mut group = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                track.next_group(),
+            )
+            .await
+            .expect("stream group timeout")
+            .expect("stream group read")
+            .expect("stream ended before terminal frame");
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                group.read_frame(),
+            )
+            .await
+            .expect("stream frame timeout")
+            .expect("stream frame read")
+            .expect("stream group had no frame");
+            payloads.extend(
+                hyprstream_rpc::moq_stream::verify_moq_frame(&mut verifier, &topic, &frame)
+                    .expect("verify stream frame"),
+            );
+        }
+        let data = payloads
+            .iter()
+            .find_map(|payload| match payload {
+                StreamPayload::Data(data) => Some(data.as_slice()),
+                _ => None,
+            })
+            .expect("structured query stream data");
+        let mut reader = hyprstream_metrics::arrow::ipc::reader::StreamReader::try_new(
+            std::io::Cursor::new(data),
+            None,
+        )
+        .expect("read Arrow query stream");
+        let batch = reader
+            .next()
+            .expect("Arrow query stream batch")
+            .expect("Arrow query stream batch decode");
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<hyprstream_metrics::arrow::array::Float64Array>()
+            .expect("structured stream value column");
+        assert_eq!(values.value(0), 11.0, "streamed SUM should be 11.0");
+        assert!(
+            payloads.iter().any(|payload| matches!(payload, StreamPayload::Complete(_))),
+            "structured query stream must terminate after publishing its result"
+        );
     }
 
     // ── view management ───────────────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_create_list_drop_view() {
-        let (client, _mgr) = start_metrics_service("views").await;
+        let (client, _mgr, _) = start_metrics_service("views").await;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1026,7 +1255,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_invalid_identifier_rejected() {
-        let (client, _mgr) = start_metrics_service("validation").await;
+        let (client, _mgr, _) = start_metrics_service("validation").await;
 
         // SQL injection attempt via drop_view name
         let err = client.drop_view("view; DROP TABLE metrics; --").await;

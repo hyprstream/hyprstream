@@ -340,14 +340,10 @@ fn tui_mutation_policies_are_explicit_and_handler_accurate() {
 /// Metrics' read-scope leaves follow their real handler effects: `queryStream`
 /// prepares a server-side third-party interop stream under the client's
 /// ephemeral pubkey and schedules the query continuation before the reply is
-/// observed, and `query` executes caller SQL verbatim through the storage
-/// backend (a replayed non-SELECT re-applies its write). Both are read-class
-/// authorization with declared at-most-once effect semantics — the
-/// declaration records the required ledger/fencing; no such machinery is
-/// implemented here, and restricting execution to SELECT is separate
-/// enforcement work deliberately not attempted in this annotation.
+/// observed, while `query` executes a structured read synchronously. Raw SQL
+/// remains a wire-compatible field but is rejected before storage preparation.
 #[test]
-fn metrics_effectful_query_leaves_declare_required_ledger_semantics() {
+fn metrics_query_leaves_declare_only_real_effect_semantics() {
     use policy::MutationSemantics;
 
     let rows = policy::collect_generated_rows().expect("inventory collects");
@@ -363,11 +359,7 @@ fn metrics_effectful_query_leaves_declare_required_ledger_semantics() {
         "a replayed queryStream duplicates the interop-stream preparation and \
          scheduled continuation"
     );
-    assert_eq!(
-        semantics("query"),
-        Some(MutationSemantics::TransactionLedgerRequired),
-        "raw caller SQL reaches the storage backend verbatim"
-    );
+    assert_eq!(semantics("query"), None, "structured query is a genuine read");
     // Genuine reads stay policy-free.
     assert_eq!(semantics("listViews"), None);
 }
