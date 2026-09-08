@@ -1552,10 +1552,96 @@ struct PipelineResponse {
             .find(|v| v.name == "health")
             .expect("health variant present");
         assert_eq!(
-            health.dispatch_public,
-            "unauthenticated liveness read for the load balancer",
+            health.dispatch_public, "unauthenticated liveness read for the load balancer",
             "the public reason is recorded exactly as declared"
         );
+    }
+
+    /// The CGR path must retain arm-local metadata and the fact that an
+    /// annotation exists.  The unannotated sibling inherits the selector's
+    /// MAC/effect policy, while the local arm overrides the inherited values.
+    #[test]
+    fn pure_union_arms_preserve_local_overrides_and_presence() {
+        let schema = parse_schema(
+            "armmetadata",
+            r#"@0x9a1b2c3d4e5f6071;
+
+enum ScopeAction { query @0; write @1; }
+annotation scope(field) :ScopeAction;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+annotation mutationSemantics(field) :Text;
+
+struct BatchOps {
+  union {
+    put @0 :Text $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    clear @1 :Void;
+  }
+}
+struct ArmmetadataRequest {
+  union {
+    batch @0 :BatchOps $scope(write) $dispatchMac("secret:pq-hybrid") $mutationSemantics("transaction-ledger-required");
+    status @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+  }
+}
+struct ArmmetadataResponse { union { ok @0 :Void; other @1 :Void; } }
+"#,
+        );
+        let batch = schema
+            .structs
+            .iter()
+            .find(|s| s.name == "BatchOps")
+            .expect("real CGR retains local pure union");
+        let put = &batch.union_arms[0];
+        assert!(put.dispatch_mac_present && put.mutation_semantics_present);
+        assert_eq!(put.dispatch_mac, "internal:pq-hybrid");
+        let clear = &batch.union_arms[1];
+        assert!(!clear.dispatch_mac_present && !clear.mutation_semantics_present);
+        let selector = &schema.request_variants[0];
+        assert_eq!(selector.dispatch_mac, "secret:pq-hybrid");
+        assert_eq!(selector.mutation_semantics, "transaction-ledger-required");
+    }
+
+    #[test]
+    fn pure_union_cgr_rejects_invalid_mac_both_and_explicit_empty_policy() {
+        let invalid = r#"@0x9a1b2c3d4e5f6072;
+enum ScopeAction { query @0; write @1; }
+annotation scope(field) :ScopeAction;
+annotation dispatchMac(field) :Text;
+annotation mutationSemantics(field) :Text;
+struct Ops { union { bad @0 :Void $dispatchMac("not-a-mac"); good @1 :Void $dispatchMac("internal:pq-hybrid"); } }
+struct InvalidRequest { union { run @0 :Ops $scope(query) $dispatchMac("internal:pq-hybrid"); other @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid"); } }
+struct InvalidResponse { union { ok @0 :Void; other @1 :Void; } }
+"#;
+        assert!(try_parse_schema("invalid", invalid)
+            .unwrap_err()
+            .contains("dispatchMac"));
+
+        let both = r#"@0x9a1b2c3d4e5f6074;
+enum ScopeAction { query @0; write @1; }
+annotation scope(field) :ScopeAction;
+annotation dispatchMac(field) :Text;
+annotation dispatchPublic(field) :Text;
+struct Ops { union { bad @0 :Void $dispatchMac("internal:pq-hybrid"); good @1 :Void $dispatchMac("internal:pq-hybrid"); } }
+struct BothRequest { union { run @0 :Ops $scope(query) $dispatchMac("internal:pq-hybrid") $dispatchPublic("reason"); other @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid"); } }
+struct BothResponse { union { ok @0 :Void; other @1 :Void; } }
+"#;
+        assert!(try_parse_schema("both", both)
+            .unwrap_err()
+            .contains("BOTH"));
+
+        let empty = r#"@0x9a1b2c3d4e5f6073;
+enum ScopeAction { query @0; write @1; }
+annotation scope(field) :ScopeAction;
+annotation dispatchMac(field) :Text;
+annotation mutationSemantics(field) :Text;
+struct Ops { union { bad @0 :Void $mutationSemantics(""); good @1 :Void $mutationSemantics("naturally-idempotent"); } }
+struct EmptyRequest { union { run @0 :Ops $scope(write) $dispatchMac("internal:pq-hybrid"); other @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid"); } }
+struct EmptyResponse { union { ok @0 :Void; other @1 :Void; } }
+"#;
+        assert!(try_parse_schema("empty", empty)
+            .unwrap_err()
+            .contains("mutationSemantics"));
     }
 
     /// P2 (`PRRT_kwDONmv2Pc6gGRV5`) reason boundaries through the actual
@@ -1839,7 +1925,10 @@ struct EmbedImagesResponse {
                 vfs_mac: String::new(),
                 dispatch_mac: String::new(),
                 dispatch_public: String::new(),
-            mutation_semantics: String::new(),
+                mutation_semantics: String::new(),
+                dispatch_mac_present: false,
+                dispatch_public_present: false,
+                mutation_semantics_present: false,
             }],
             structs: vec![],
             scoped_clients: vec![],

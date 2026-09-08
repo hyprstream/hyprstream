@@ -2421,6 +2421,9 @@ mod browser_method_dispatch_tests {
             dispatch_mac: String::new(),
             dispatch_public: String::new(),
             mutation_semantics: String::new(),
+            dispatch_mac_present: false,
+            dispatch_public_present: false,
+            mutation_semantics_present: false,
         }
     }
 

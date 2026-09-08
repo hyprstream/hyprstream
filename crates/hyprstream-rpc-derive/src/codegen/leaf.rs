@@ -56,13 +56,16 @@ pub struct MethodLeaf {
     /// `$dispatchMac` label text (strict grammar, v16 §6). Empty when the leaf
     /// is `$dispatchPublic` or the annotation is inherited from a selector.
     pub dispatch_mac: String,
+    pub dispatch_mac_present: bool,
     /// `$dispatchPublic` reason text. Empty for `$dispatchMac` leaves.
     pub dispatch_public: String,
+    pub dispatch_public_present: bool,
     /// Explicit `$mutationSemantics` metadata for a mutating executable leaf:
     /// the leaf's own annotation when present, else the declaration inherited
     /// from its nearest annotated ancestor selector. Never a default — a leaf
     /// left with nothing still fails the closed parser at row generation.
     pub mutation_semantics: String,
+    pub mutation_semantics_present: bool,
 }
 
 /// Per-arm metadata resolved during the walk.
@@ -73,8 +76,11 @@ struct ArmMeta<'a> {
     scope: &'a str,
     scope_exempt: bool,
     dispatch_mac: &'a str,
+    dispatch_mac_present: bool,
     dispatch_public: &'a str,
+    dispatch_public_present: bool,
     mutation_semantics: &'a str,
+    mutation_semantics_present: bool,
 }
 
 /// Annotation state inherited from the nearest annotated ancestor selector.
@@ -90,8 +96,11 @@ struct Inherited {
     scope: String,
     scope_exempt: bool,
     dispatch_mac: String,
+    dispatch_mac_present: bool,
     dispatch_public: String,
+    dispatch_public_present: bool,
     mutation_semantics: String,
+    mutation_semantics_present: bool,
 }
 
 /// The arms of one union level, in schema declaration order.
@@ -100,24 +109,48 @@ struct Inherited {
 /// (index fallback for text-parsed schemas without wire info, matching the
 /// existing dispatch discriminator behavior). Scope level: the scope struct's
 /// union fields, with metadata joined from `inner_request_variants`.
-fn level_arms<'a>(
-    sdef: Option<&'a StructDef>,
-    variants: &'a [UnionVariant],
-) -> Vec<ArmMeta<'a>> {
+fn level_arms<'a>(sdef: Option<&'a StructDef>, variants: &'a [UnionVariant]) -> Vec<ArmMeta<'a>> {
     match sdef {
         Some(sdef) => sdef
             .union_fields()
             .map(|f| {
                 let meta = variants.iter().find(|v| v.name == f.name);
+                let union_arm = sdef.union_arms.iter().find(|a| a.name == f.name);
                 ArmMeta {
                     name: &f.name,
                     discriminant: f.discriminant_value,
                     type_name: &f.type_name,
                     scope: meta.map(|v| v.scope.as_str()).unwrap_or(""),
                     scope_exempt: meta.map(|v| v.scope_exempt).unwrap_or(false),
-                    dispatch_mac: meta.map(|v| v.dispatch_mac.as_str()).unwrap_or(""),
-                    dispatch_public: meta.map(|v| v.dispatch_public.as_str()).unwrap_or(""),
-                    mutation_semantics: meta.map(|v| v.mutation_semantics.as_str()).unwrap_or(""),
+                    dispatch_mac: meta
+                        .map(|v| v.dispatch_mac.as_str())
+                        .or_else(|| union_arm.map(|a| a.dispatch_mac.as_str()))
+                        .unwrap_or(""),
+                    dispatch_mac_present: meta.map(|v| v.dispatch_mac_present).unwrap_or_else(
+                        || union_arm.map(|a| a.dispatch_mac_present).unwrap_or(false),
+                    ),
+                    dispatch_public: meta
+                        .map(|v| v.dispatch_public.as_str())
+                        .or_else(|| union_arm.map(|a| a.dispatch_public.as_str()))
+                        .unwrap_or(""),
+                    dispatch_public_present: meta
+                        .map(|v| v.dispatch_public_present)
+                        .unwrap_or_else(|| {
+                            union_arm
+                                .map(|a| a.dispatch_public_present)
+                                .unwrap_or(false)
+                        }),
+                    mutation_semantics: meta
+                        .map(|v| v.mutation_semantics.as_str())
+                        .or_else(|| union_arm.map(|a| a.mutation_semantics.as_str()))
+                        .unwrap_or(""),
+                    mutation_semantics_present: meta
+                        .map(|v| v.mutation_semantics_present)
+                        .unwrap_or_else(|| {
+                            union_arm
+                                .map(|a| a.mutation_semantics_present)
+                                .unwrap_or(false)
+                        }),
                 }
             })
             .collect(),
@@ -131,8 +164,11 @@ fn level_arms<'a>(
                 scope: &v.scope,
                 scope_exempt: v.scope_exempt,
                 dispatch_mac: &v.dispatch_mac,
+                dispatch_mac_present: v.dispatch_mac_present,
                 dispatch_public: &v.dispatch_public,
+                dispatch_public_present: v.dispatch_public_present,
                 mutation_semantics: &v.mutation_semantics,
+                mutation_semantics_present: v.mutation_semantics_present,
             })
             .collect(),
     }
@@ -196,7 +232,7 @@ fn walk_level(
         } else {
             format!("{prefix_sym}.{}", arm.name)
         };
-        let arm_annotated = !arm.dispatch_mac.is_empty() || !arm.dispatch_public.is_empty();
+        let arm_annotated = arm.dispatch_mac_present || arm.dispatch_public_present;
         let mut effective = inherited.clone();
         if arm.scope.is_empty() && !arm.scope_exempt {
             // scope (and its exemption) inherit from the selector unchanged.
@@ -206,18 +242,22 @@ fn walk_level(
         }
         if arm_annotated {
             effective.dispatch_mac = arm.dispatch_mac.to_owned();
+            effective.dispatch_mac_present = arm.dispatch_mac_present;
             effective.dispatch_public = arm.dispatch_public.to_owned();
+            effective.dispatch_public_present = arm.dispatch_public_present;
         } else {
             // An unannotated arm: a `$dispatchMac` selector's label inherits
             // downward (kept above), but `$dispatchPublic` NEVER inherits —
             // the arm is left unannotated and its leaf fails the build (v16
             // §6: public is legal only on leaves, never inherited).
             effective.dispatch_public = String::new();
+            effective.dispatch_public_present = false;
         }
-        if !arm.mutation_semantics.is_empty() {
+        if arm.mutation_semantics_present {
             // Local `$mutationSemantics` wins: the nearest annotated arm is
             // authoritative over anything inherited (v16 §4.8).
             effective.mutation_semantics = arm.mutation_semantics.to_owned();
+            effective.mutation_semantics_present = true;
         }
         // An unannotated arm keeps the nearest annotated ancestor selector's
         // declaration — the one it reaches here through a hand-dispatched
@@ -243,7 +283,16 @@ fn walk_level(
             );
         } else if let Some(inner) = descend_struct(resolved, arm.type_name) {
             // A hand-dispatched pure union: its arms are method identity.
-            walk_level(resolved, Some(inner), &[], &[], &path, &symbolic, &effective, out);
+            walk_level(
+                resolved,
+                Some(inner),
+                &[],
+                &[],
+                &path,
+                &symbolic,
+                &effective,
+                out,
+            );
         } else {
             out.push(MethodLeaf {
                 path,
@@ -251,8 +300,11 @@ fn walk_level(
                 scope: effective.scope.clone(),
                 scope_exempt: effective.scope_exempt,
                 dispatch_mac: effective.dispatch_mac.clone(),
+                dispatch_mac_present: effective.dispatch_mac_present,
                 dispatch_public: effective.dispatch_public.clone(),
+                dispatch_public_present: effective.dispatch_public_present,
                 mutation_semantics: effective.mutation_semantics.clone(),
+                mutation_semantics_present: effective.mutation_semantics_present,
             });
         }
     }
@@ -375,10 +427,11 @@ pub fn generate_method_policy_rows(service_name: &str, resolved: &ResolvedSchema
         let scope = &leaf.scope;
         let scope_exempt = leaf.scope_exempt;
 
-        let has_mac = !leaf.dispatch_mac.is_empty();
-        let has_public = !leaf.dispatch_public.is_empty();
-        let (authentication, signature_policy, public_reason, target_label) =
-            match (has_mac, has_public) {
+        let has_mac = leaf.dispatch_mac_present;
+        let has_public = leaf.dispatch_public_present;
+        let (authentication, signature_policy, public_reason, target_label) = match (
+            has_mac, has_public,
+        ) {
                 (false, false) => {
                     let msg = format!(
                         "method leaf '{}.{}' has neither a $dispatchMac nor a \
@@ -457,7 +510,7 @@ pub fn generate_method_policy_rows(service_name: &str, resolved: &ResolvedSchema
         // axes. A query/subscribe leaf may explicitly classify bounded session
         // or subscription state, while every non-read scope needs a declaration.
         // This is a second gate after the CGR parser validation.
-        let mutation_semantics = if leaf.mutation_semantics.is_empty()
+        let mutation_semantics = if !leaf.mutation_semantics_present
             && (READ_CLASS_ACTIONS.contains(&leaf.scope.as_str()) || leaf.scope.is_empty())
         {
             // Ordinary read leaves and scope-exempt public/control-plane reads
@@ -639,6 +692,9 @@ mod tests {
             dispatch_mac: String::new(),
             dispatch_public: String::new(),
             mutation_semantics: String::new(),
+            dispatch_mac_present: false,
+            dispatch_public_present: false,
+            mutation_semantics_present: false,
         }
     }
 
@@ -665,8 +721,10 @@ mod tests {
     }
 
     fn union_struct(name: &str, fields: Vec<FieldDef>) -> StructDef {
-        let discriminant_count =
-            fields.iter().filter(|f| f.discriminant_value != 0xFFFF).count() as u16;
+        let discriminant_count = fields
+            .iter()
+            .filter(|f| f.discriminant_value != 0xFFFF)
+            .count() as u16;
         StructDef {
             name: name.to_owned(),
             fields,
@@ -745,14 +803,21 @@ mod tests {
 
         let by_symbol: std::collections::HashMap<&str, &MethodLeaf> =
             leaves.iter().map(|l| (l.symbolic.as_str(), l)).collect();
-        assert_eq!(by_symbol.len(), leaves.len(), "no duplicate symbolic leaves");
+        assert_eq!(
+            by_symbol.len(),
+            leaves.len(),
+            "no duplicate symbolic leaves"
+        );
 
         assert_eq!(by_symbol["status"].path, vec![0]);
         assert_eq!(by_symbol["repo.create"].path, vec![1, 0]);
         assert_eq!(by_symbol["repo.worktree.add"].path, vec![1, 1, 0]);
         assert_eq!(by_symbol["repo.worktree.remove"].path, vec![1, 1, 1]);
         assert_eq!(by_symbol["repo.worktree.add"].scope, "write");
-        assert!(!by_symbol.contains_key("repo"), "a scope selector is not a leaf");
+        assert!(
+            !by_symbol.contains_key("repo"),
+            "a scope selector is not a leaf"
+        );
 
         // The generated decoder descends the same tree: nested Which paths
         // and every discriminant push must appear in the emitted code.
@@ -822,8 +887,11 @@ mod tests {
         let mut v = variant(name, type_name, scope, false);
         v.dispatch_mac = mac.to_owned();
         v.dispatch_public = public.to_owned();
+        v.dispatch_mac_present = !mac.is_empty();
+        v.dispatch_public_present = !public.is_empty();
         if !scope.is_empty() && !READ_CLASS_ACTIONS.contains(&scope) {
             v.mutation_semantics = "transaction-ledger-required".to_owned();
+            v.mutation_semantics_present = true;
         }
         v
     }
@@ -855,11 +923,7 @@ mod tests {
     #[test]
     fn both_annotations_on_one_leaf_is_a_compile_error() {
         let resolved = simple_schema(vec![dispatch_variant(
-            "load",
-            "Void",
-            "write",
-            MAC,
-            "reason",
+            "load", "Void", "write", MAC, "reason",
         )]);
         let generated = generate_method_policy_rows("model", &resolved).to_string();
         assert!(generated.contains("BOTH $dispatchMac"), "{generated}");
@@ -871,13 +935,16 @@ mod tests {
     fn public_never_inherits_through_a_hand_dispatched_selector() {
         let selector = union_struct(
             "InnerRequest",
-            vec![
-                union_field("a", "Text", 0),
-                union_field("b", "Void", 1),
-            ],
+            vec![union_field("a", "Text", 0), union_field("b", "Void", 1)],
         );
         let schema = Box::leak(Box::new(ParsedSchema {
-            request_variants: vec![dispatch_variant("outer", "InnerRequest", "", "", "leaf-level reason")],
+            request_variants: vec![dispatch_variant(
+                "outer",
+                "InnerRequest",
+                "",
+                "",
+                "leaf-level reason",
+            )],
             response_variants: vec![],
             structs: vec![selector],
             scoped_clients: vec![],
@@ -909,10 +976,7 @@ mod tests {
     fn a_mac_label_inherits_through_a_hand_dispatched_selector() {
         let selector = union_struct(
             "InnerRequest",
-            vec![
-                union_field("a", "Text", 0),
-                union_field("b", "Void", 1),
-            ],
+            vec![union_field("a", "Text", 0), union_field("b", "Void", 1)],
         );
         let schema = Box::leak(Box::new(ParsedSchema {
             request_variants: vec![dispatch_variant("outer", "InnerRequest", "", MAC, "")],
@@ -934,10 +998,7 @@ mod tests {
         // And both inherited leaves generate real rows — no compile_error.
         let generated = generate_method_policy_rows("svc", &resolved).to_string();
         assert!(!generated.contains("compile_error"), "{generated}");
-        assert!(
-            generated.contains("Level :: Internal"),
-            "{generated}"
-        );
+        assert!(generated.contains("Level :: Internal"), "{generated}");
     }
 
     /// P2 (`PRRT_kwDONmv2Pc6gGRV2`) causal regression: a nonread selector's
@@ -949,10 +1010,7 @@ mod tests {
     fn mutation_semantics_inherits_through_a_hand_dispatched_selector() {
         let selector = union_struct(
             "InnerRequest",
-            vec![
-                union_field("a", "Text", 0),
-                union_field("b", "Void", 1),
-            ],
+            vec![union_field("a", "Text", 0), union_field("b", "Void", 1)],
         );
         let mut outer = dispatch_variant("outer", "InnerRequest", "write", MAC, "");
         outer.mutation_semantics = "idempotency-key-required".to_owned();
@@ -987,7 +1045,9 @@ mod tests {
         let generated = generate_method_policy_rows("svc", &resolved).to_string();
         assert!(!generated.contains("compile_error"), "{generated}");
         assert_eq!(
-            generated.matches("MutationSemantics :: IdempotencyKeyRequired").count(),
+            generated
+                .matches("MutationSemantics :: IdempotencyKeyRequired")
+                .count(),
             2,
             "both descendant rows carry the inherited declaration:\n{generated}"
         );
@@ -1034,10 +1094,13 @@ mod tests {
     fn a_local_declaration_beats_the_inherited_one() {
         let mut repo = variant("repo", "RepositoryRequest", "", false);
         repo.mutation_semantics = "transaction-ledger-required".to_owned();
+        repo.mutation_semantics_present = true;
         let mut create = dispatch_variant("create", "Text", "write", MAC, "");
         create.mutation_semantics = "naturally-idempotent".to_owned();
+        create.mutation_semantics_present = true;
         let mut remove = dispatch_variant("remove", "Void", "manage", MAC, "");
         remove.mutation_semantics.clear();
+        remove.mutation_semantics_present = false;
         let schema = Box::leak(Box::new(ParsedSchema {
             request_variants: vec![repo],
             response_variants: vec![],
@@ -1070,13 +1133,11 @@ mod tests {
         let by_symbol: std::collections::HashMap<&str, &MethodLeaf> =
             leaves.iter().map(|l| (l.symbolic.as_str(), l)).collect();
         assert_eq!(
-            by_symbol["repo.create"].mutation_semantics,
-            "naturally-idempotent",
+            by_symbol["repo.create"].mutation_semantics, "naturally-idempotent",
             "the leaf's local declaration must win"
         );
         assert_eq!(
-            by_symbol["repo.remove"].mutation_semantics,
-            "transaction-ledger-required",
+            by_symbol["repo.remove"].mutation_semantics, "transaction-ledger-required",
             "an unannotated sibling must inherit"
         );
         let generated = generate_method_policy_rows("svc", &resolved).to_string();
@@ -1111,10 +1172,14 @@ mod tests {
         let generated = generate_method_policy_rows("mcp", &empty_reason).to_string();
         assert!(generated.contains("compile_error"), "{generated}");
 
-        let scoped_public =
-            simple_schema(vec![dispatch_variant("ping", "Void", "query", "", "reason")]);
+        let scoped_public = simple_schema(vec![dispatch_variant(
+            "ping", "Void", "query", "", "reason",
+        )]);
         let generated = generate_method_policy_rows("mcp", &scoped_public).to_string();
-        assert!(generated.contains("cannot be dispatch-public"), "{generated}");
+        assert!(
+            generated.contains("cannot be dispatch-public"),
+            "{generated}"
+        );
     }
 
     /// The generated row carries every §6.1 field: auth requirement, Hybrid
@@ -1145,12 +1210,17 @@ mod tests {
             "Level :: Secret",
             "\"genuinely unauthenticated leaf\"",
         ] {
-            assert!(generated.contains(needle), "missing `{needle}`:\n{generated}");
+            assert!(
+                generated.contains(needle),
+                "missing `{needle}`:\n{generated}"
+            );
         }
 
         // Read-class rows carry no mutation semantics; the declared ledger
         // requirement is preserved rather than inferred from `write`.
-        let mutation_count = generated.matches("MutationSemantics :: TransactionLedgerRequired").count();
+        let mutation_count = generated
+            .matches("MutationSemantics :: TransactionLedgerRequired")
+            .count();
         assert_eq!(mutation_count, 1, "only `commit` (write) is mutating");
     }
 
@@ -1160,7 +1230,8 @@ mod tests {
     fn missing_mutating_policy_is_a_compile_error() {
         let mut missing = dispatch_variant("sendInput", "Text", "write", MAC, "");
         missing.mutation_semantics.clear();
-        let generated = generate_method_policy_rows("tui", &simple_schema(vec![missing])).to_string();
+        let generated =
+            generate_method_policy_rows("tui", &simple_schema(vec![missing])).to_string();
         assert!(generated.contains("compile_error"), "{generated}");
         assert!(generated.contains("missing required"), "{generated}");
     }
@@ -1174,17 +1245,18 @@ mod tests {
         let mut keyed = dispatch_variant("update", "Text", "write", MAC, "");
         keyed.mutation_semantics = "idempotency-key-required".to_owned();
         let ledger = dispatch_variant("sendInput", "Text", "write", MAC, "");
-        let generated = generate_method_policy_rows(
-            "tui",
-            &simple_schema(vec![natural, keyed, ledger]),
-        )
+        let generated =
+            generate_method_policy_rows("tui", &simple_schema(vec![natural, keyed, ledger]))
         .to_string();
         for variant in [
             "MutationSemantics :: NaturallyIdempotent",
             "MutationSemantics :: IdempotencyKeyRequired",
             "MutationSemantics :: TransactionLedgerRequired",
         ] {
-            assert!(generated.contains(variant), "missing {variant}: {generated}");
+            assert!(
+                generated.contains(variant),
+                "missing {variant}: {generated}"
+            );
         }
     }
 
@@ -1196,10 +1268,7 @@ mod tests {
     fn an_imported_pure_union_terminates_on_the_annotated_arm() {
         let imported = StructDef {
             name: "ImportedChoice".into(),
-            fields: vec![
-                union_field("x", "Text", 0),
-                union_field("y", "Void", 1),
-            ],
+            fields: vec![union_field("x", "Text", 0), union_field("y", "Void", 1)],
             has_union: true,
             domain_type: None,
             origin_file: Some("streaming".into()),
@@ -1210,7 +1279,13 @@ mod tests {
             union_arms: vec![],
         };
         let schema = Box::leak(Box::new(ParsedSchema {
-            request_variants: vec![dispatch_variant("fetch", "ImportedChoice", "query", MAC, "")],
+            request_variants: vec![dispatch_variant(
+                "fetch",
+                "ImportedChoice",
+                "query",
+                MAC,
+                "",
+            )],
             response_variants: vec![],
             structs: vec![imported],
             scoped_clients: vec![],
@@ -1223,7 +1298,11 @@ mod tests {
         }));
         let resolved = ResolvedSchema::from(schema);
         let leaves = collect_method_leaves(&resolved);
-        assert_eq!(leaves.len(), 1, "imported union arms are payload, not identity");
+        assert_eq!(
+            leaves.len(),
+            1,
+            "imported union arms are payload, not identity"
+        );
         assert_eq!(leaves[0].path, vec![0]);
         assert_eq!(leaves[0].dispatch_mac, MAC);
 

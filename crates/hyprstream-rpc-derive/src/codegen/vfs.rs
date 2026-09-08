@@ -534,6 +534,9 @@ mod tests {
             dispatch_mac: String::new(),
             dispatch_public: String::new(),
             mutation_semantics: String::new(),
+            dispatch_mac_present: false,
+            dispatch_public_present: false,
+            mutation_semantics_present: false,
         };
         let err = resolve_kind(&v, &CapnpType::Struct("CloneRequest".into()), false).unwrap_err();
         assert!(err.contains("bogus"));
@@ -559,6 +562,9 @@ mod tests {
             dispatch_mac: String::new(),
             dispatch_public: String::new(),
             mutation_semantics: String::new(),
+            dispatch_mac_present: false,
+            dispatch_public_present: false,
+            mutation_semantics_present: false,
         };
         let k = resolve_kind(&v, &CapnpType::Text, false).expect("valid kind");
         assert_eq!(k, NodeKind::Query);
@@ -585,6 +591,9 @@ mod tests {
             dispatch_mac: String::new(),
             dispatch_public: String::new(),
             mutation_semantics: String::new(),
+            dispatch_mac_present: false,
+            dispatch_public_present: false,
+            mutation_semantics_present: false,
         }
     }
 

@@ -6,7 +6,8 @@
 //! `FieldDef`s.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use hyprstream_rpc_build::schema::parse_from_cgr_path;
 use hyprstream_rpc_build::schema::types::{ArmPayload, StructDef};
@@ -101,4 +102,49 @@ fn union_arms_capture_void_scalar_and_group() {
         }
         other => panic!("ranged should be Group, got {other:?}"),
     }
+}
+
+#[test]
+fn ts_cli_rejects_invalid_cgr_without_partial_generation() {
+    let tmp =
+        std::env::temp_dir().join(format!("hyprstream_ts_cli_invalid_{}", std::process::id()));
+    std::fs::create_dir_all(tmp.join("input")).expect("create input");
+    std::fs::write(tmp.join("input/bad.cgr"), b"not a CodeGeneratorRequest")
+        .expect("write invalid CGR");
+
+    let binary = std::env::var_os("CARGO_BIN_EXE_hyprstream_ts_codegen")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let current = std::env::current_exe().expect("test executable path");
+            current
+                .parent()
+                .and_then(Path::parent)
+                .expect("target profile directory")
+                .join("hyprstream-ts-codegen")
+        });
+    let output_dir = tmp.join("output");
+    let output = Command::new(binary)
+        .args([
+            "--input-dir",
+            tmp.join("input").to_str().expect("input path"),
+            "--output-dir",
+            output_dir.to_str().expect("output path"),
+        ])
+        .output()
+        .expect("run TypeScript codegen CLI");
+    assert!(
+        !output.status.success(),
+        "invalid CGR must fail closed: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Refusing to generate partial TypeScript output")
+            && stderr.contains("bad.cgr"),
+        "failure must be the CLI's parse-error path: {stderr}"
+    );
+    assert!(
+        !output_dir.exists(),
+        "the CLI must not create partial output after a parse error"
+    );
+    let _ = std::fs::remove_dir_all(tmp);
 }
