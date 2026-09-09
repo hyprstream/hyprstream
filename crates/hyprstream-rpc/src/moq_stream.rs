@@ -46,7 +46,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock, Weak,
+};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use bytes::Bytes;
@@ -509,9 +512,15 @@ impl MoqStreamOriginBuilder {
                 prefix: self.prefix,
                 authorize_signer: self.authorize_signer,
                 broadcasts: Mutex::new(HashMap::new()),
+                next_broadcast_generation: AtomicU64::new(0),
             }),
         }
     }
+}
+
+struct BroadcastEntry {
+    _producer: BroadcastProducer,
+    generation: u64,
 }
 
 struct OriginInner {
@@ -530,7 +539,41 @@ struct OriginInner {
     /// Keyed by broadcast path (replace semantics) so a re-announced topic
     /// drops the old `BroadcastProducer` (unannouncing it) rather than
     /// accumulating unboundedly (#164).
-    broadcasts: Mutex<HashMap<String, BroadcastProducer>>,
+    broadcasts: Mutex<HashMap<String, BroadcastEntry>>,
+    next_broadcast_generation: AtomicU64,
+}
+
+/// Removes the publisher's broadcast entry only while that exact publication
+/// is still current. A weak origin avoids making the publisher/cleanup guard
+/// retain the origin forever, and the generation prevents an old publisher
+/// from removing a newer same-path replacement.
+struct BroadcastCleanup {
+    origin: Weak<OriginInner>,
+    path: String,
+    generation: u64,
+}
+
+impl Drop for BroadcastCleanup {
+    fn drop(&mut self) {
+        let Some(origin) = self.origin.upgrade() else {
+            return;
+        };
+        let removed = {
+            let mut broadcasts = origin.broadcasts.lock();
+            let remove = broadcasts
+                .get(&self.path)
+                .is_some_and(|entry| entry.generation == self.generation);
+            if remove {
+                broadcasts.remove(&self.path)
+            } else {
+                None
+            }
+        };
+        // Drop the BroadcastProducer after releasing the origin mutex. Its
+        // close/unannounce path can notify consumers and must not re-enter the
+        // origin map while the lock is held.
+        drop(removed);
+    }
 }
 
 impl MoqStreamOrigin {
@@ -626,11 +669,25 @@ impl MoqStreamOrigin {
                 .ok_or_else(|| anyhow!("create_broadcast denied for {path}"))?;
             let track = broadcast.create_track(Track::new(STREAM_TRACK))?;
 
+            let generation = self
+                .inner
+                .next_broadcast_generation
+                .fetch_add(1, Ordering::Relaxed);
+
             // Retain the broadcast producer so it stays announced for the
             // publisher's lifetime (dropping it would unannounce the broadcast).
             // Replace-semantics: inserting the same path twice drops the old
             // BroadcastProducer rather than accumulating indefinitely (#164).
-            self.inner.broadcasts.lock().insert(path, broadcast);
+            let replaced = self.inner.broadcasts.lock().insert(
+                path.clone(),
+                BroadcastEntry {
+                    _producer: broadcast,
+                    generation,
+                },
+            );
+            // Replacement closes the old broadcast; keep that potentially
+            // notifying drop outside the origin mutex.
+            drop(replaced);
 
             Ok(MoqStreamPublisher {
                 hmac_state: StreamHmacState::new(*ctx.mac_key(), ctx.topic().to_owned()),
@@ -646,6 +703,11 @@ impl MoqStreamOrigin {
                 cancel_token: ctx.cancel_token().clone(),
                 terminated: false,
                 topic: ctx.topic().to_owned(),
+                _broadcast_cleanup: BroadcastCleanup {
+                    origin: Arc::downgrade(&self.inner),
+                    path,
+                    generation,
+                },
             })
         })
     }
@@ -682,9 +744,27 @@ pub struct MoqStreamPublisher {
     cancel_token: CancellationToken,
     terminated: bool,
     topic: String,
+    _broadcast_cleanup: BroadcastCleanup,
 }
 
 impl MoqStreamPublisher {
+    /// Wait until a subscriber has attached before publishing a short lived
+    /// response. The demand is observable on the producer track, so callers
+    /// can avoid finishing before a late subscriber has a chance to join.
+    pub async fn wait_for_consumer(&self) -> Result<()> {
+        if self.cancel_token.is_cancelled() {
+            anyhow::bail!("stream cancelled before consumer demand");
+        }
+        tokio::select! {
+            _ = self.cancel_token.cancelled() => {
+                anyhow::bail!("stream cancelled before consumer demand");
+            }
+            result = self.track.used() => {
+                result.map_err(|error| anyhow!("stream consumer demand failed: {error}"))
+            }
+        }
+    }
+
     /// Publish an opaque, authenticated control Object under the current epoch,
     /// then atomically advance the producer to the next epoch. The consumer
     /// performs the same verify-before-advance transition from the wire Object.
@@ -721,6 +801,7 @@ impl MoqStreamPublisher {
     /// Publish an error payload (terminal).
     pub async fn publish_error(&mut self, message: &str) -> Result<()> {
         self.write_block(&[StreamPayloadData::Error(message.to_owned())])?;
+        self.track.finish()?;
         self.terminated = true;
         Ok(())
     }
@@ -733,6 +814,7 @@ impl MoqStreamPublisher {
     /// Complete the stream without consuming `self`.
     pub async fn complete_ref(&mut self, metadata: &[u8]) -> Result<()> {
         self.write_block(&[StreamPayloadData::Complete(metadata.to_vec())])?;
+        self.track.finish()?;
         self.terminated = true;
         Ok(())
     }
@@ -2291,6 +2373,224 @@ mod tests {
         assert!(matches!(&got[0], StreamPayload::Data(d) if d == b"hello"));
         assert!(matches!(&got[1], StreamPayload::Data(d) if d == b"world"));
         assert!(matches!(&got[2], StreamPayload::Complete(_)));
+        Ok(())
+    }
+
+    /// A terminal Complete must preserve groups after the publisher is dropped
+    /// while an attached consumer is still draining, then expose clean EOF.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moq_stream_complete_finishes_track_for_attached_consumer() -> Result<()> {
+        let origin = origin();
+        let (_client_secret, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
+        let topic = ctx.topic().to_owned();
+        let mac_key = *ctx.mac_key();
+        let enc_key = *ctx.enc_key().expect("DH ctx has enc_key");
+
+        let mut publisher = origin.publisher(&ctx)?;
+        let broadcast = origin
+            .consumer()
+            .announced_broadcast(origin.broadcast_path(&topic).as_str())
+            .await
+            .ok_or_else(|| anyhow!("consumer did not see completed broadcast"))?;
+        let mut track = broadcast.subscribe_track(&Track::new(STREAM_TRACK))?;
+        publisher.publish_data(b"late-data").await?;
+        publisher.complete_ref(b"{}").await?;
+        drop(publisher);
+
+        let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let mut group = track
+                .next_group()
+                .await?
+                .ok_or_else(|| anyhow!("completed stream omitted a group"))?;
+            let frame = group
+                .read_frame()
+                .await?
+                .ok_or_else(|| anyhow!("completed stream group omitted a frame"))?;
+            got.extend(verify_moq_frame(&mut verifier, &topic, &frame)?);
+        }
+        assert!(matches!(&got[0], StreamPayload::Data(data) if data == b"late-data"));
+        assert!(matches!(&got[1], StreamPayload::Complete(_)));
+        assert!(track.next_group().await?.is_none(), "completed track must EOF cleanly");
+        Ok(())
+    }
+
+    /// An application Error is also a clean terminal track event; dropping
+    /// the publisher must not turn the authenticated error into transport Drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moq_stream_error_finishes_track_for_attached_consumer() -> Result<()> {
+        let origin = origin();
+        let (_client_secret, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
+        let topic = ctx.topic().to_owned();
+        let mac_key = *ctx.mac_key();
+        let enc_key = *ctx.enc_key().expect("DH ctx has enc_key");
+
+        let mut publisher = origin.publisher(&ctx)?;
+        let broadcast = origin
+            .consumer()
+            .announced_broadcast(origin.broadcast_path(&topic).as_str())
+            .await
+            .ok_or_else(|| anyhow!("consumer did not see errored broadcast"))?;
+        let mut track = broadcast.subscribe_track(&Track::new(STREAM_TRACK))?;
+        publisher.publish_data(b"partial").await?;
+        publisher.publish_error("expected failure").await?;
+        drop(publisher);
+
+        let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let mut group = track
+                .next_group()
+                .await?
+                .ok_or_else(|| anyhow!("errored stream omitted a group"))?;
+            let frame = group
+                .read_frame()
+                .await?
+                .ok_or_else(|| anyhow!("errored stream group omitted a frame"))?;
+            got.extend(verify_moq_frame(&mut verifier, &topic, &frame)?);
+        }
+        assert!(matches!(&got[0], StreamPayload::Data(data) if data == b"partial"));
+        assert!(matches!(&got[1], StreamPayload::Error(message) if message == "expected failure"));
+        assert!(track.next_group().await?.is_none(), "errored track must EOF cleanly");
+        Ok(())
+    }
+
+    /// A publisher owns the origin's retained broadcast entry. Removing only
+    /// the matching generation bounds finished-stream retention while an
+    /// already attached consumer keeps its track long enough to drain the
+    /// authenticated terminal group.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moq_stream_finished_broadcast_cleanup_is_exact_and_retains_attached_track()
+    -> Result<()> {
+        let origin = origin();
+
+        let (_complete_secret, complete_pub) = crate::crypto::generate_ephemeral_keypair();
+        let complete_ctx = StreamContext::from_third_party_interop_dh(&complete_pub.to_bytes())?;
+        let complete_topic = complete_ctx.topic().to_owned();
+        let complete_mac_key = *complete_ctx.mac_key();
+        let complete_enc_key = *complete_ctx.enc_key().expect("DH ctx has enc_key");
+        let mut complete_publisher = origin.publisher(&complete_ctx)?;
+        let complete_broadcast = origin
+            .consumer()
+            .announced_broadcast(origin.broadcast_path(&complete_topic).as_str())
+            .await
+            .ok_or_else(|| anyhow!("complete broadcast was not announced"))?;
+        let mut complete_track = complete_broadcast.subscribe_track(&Track::new(STREAM_TRACK))?;
+        complete_publisher
+            .publish_data(b"retained-complete")
+            .await?;
+        complete_publisher.complete_ref(b"{}").await?;
+        drop(complete_publisher);
+        assert_eq!(origin.inner.broadcasts.lock().len(), 0);
+
+        let mut complete_verifier = StreamVerifier::new(complete_mac_key, complete_topic.clone())
+            .with_enc_key(complete_enc_key);
+        let mut complete_payloads = Vec::new();
+        for _ in 0..2 {
+            let mut group = complete_track
+                .next_group()
+                .await?
+                .ok_or_else(|| anyhow!("complete group was not retained for attached consumer"))?;
+            let frame = group
+                .read_frame()
+                .await?
+                .ok_or_else(|| anyhow!("complete frame was not retained"))?;
+            complete_payloads.extend(verify_moq_frame(
+                &mut complete_verifier,
+                &complete_topic,
+                &frame,
+            )?);
+        }
+        assert!(matches!(
+            &complete_payloads[0],
+            StreamPayload::Data(data) if data == b"retained-complete"
+        ));
+        assert!(matches!(&complete_payloads[1], StreamPayload::Complete(_)));
+        assert!(complete_track.next_group().await?.is_none());
+        drop(complete_track);
+
+        let (_error_secret, error_pub) = crate::crypto::generate_ephemeral_keypair();
+        let error_ctx = StreamContext::from_third_party_interop_dh(&error_pub.to_bytes())?;
+        let error_topic = error_ctx.topic().to_owned();
+        let error_mac_key = *error_ctx.mac_key();
+        let error_enc_key = *error_ctx.enc_key().expect("DH ctx has enc_key");
+        let mut error_publisher = origin.publisher(&error_ctx)?;
+        let error_broadcast = origin
+            .consumer()
+            .announced_broadcast(origin.broadcast_path(&error_topic).as_str())
+            .await
+            .ok_or_else(|| anyhow!("error broadcast was not announced"))?;
+        let mut error_track = error_broadcast.subscribe_track(&Track::new(STREAM_TRACK))?;
+        error_publisher.publish_data(b"retained-error").await?;
+        error_publisher.publish_error("retained failure").await?;
+        drop(error_publisher);
+        assert_eq!(origin.inner.broadcasts.lock().len(), 0);
+
+        let mut error_verifier =
+            StreamVerifier::new(error_mac_key, error_topic.clone()).with_enc_key(error_enc_key);
+        let mut error_payloads = Vec::new();
+        for _ in 0..2 {
+            let mut group = error_track
+                .next_group()
+                .await?
+                .ok_or_else(|| anyhow!("error group was not retained for attached consumer"))?;
+            let frame = group
+                .read_frame()
+                .await?
+                .ok_or_else(|| anyhow!("error frame was not retained"))?;
+            error_payloads.extend(verify_moq_frame(&mut error_verifier, &error_topic, &frame)?);
+        }
+        assert!(matches!(
+            &error_payloads[0],
+            StreamPayload::Data(data) if data == b"retained-error"
+        ));
+        assert!(matches!(
+            &error_payloads[1],
+            StreamPayload::Error(message) if message == "retained failure"
+        ));
+        assert!(error_track.next_group().await?.is_none());
+        drop(error_track);
+
+        // A completed stream without a consumer also releases its origin entry.
+        let (_empty_secret, empty_pub) = crate::crypto::generate_ephemeral_keypair();
+        let empty_ctx = StreamContext::from_third_party_interop_dh(&empty_pub.to_bytes())?;
+        let mut empty_publisher = origin.publisher(&empty_ctx)?;
+        empty_publisher.complete_ref(b"{}").await?;
+        drop(empty_publisher);
+        assert_eq!(origin.inner.broadcasts.lock().len(), 0);
+
+        // The old publisher's cleanup must not remove a newer same-path entry.
+        let (_replacement_secret, replacement_pub) = crate::crypto::generate_ephemeral_keypair();
+        let replacement_ctx =
+            StreamContext::from_third_party_interop_dh(&replacement_pub.to_bytes())?;
+        let old_publisher = origin.publisher(&replacement_ctx)?;
+        let mut new_publisher = origin.publisher(&replacement_ctx)?;
+        assert_eq!(origin.inner.broadcasts.lock().len(), 1);
+        drop(old_publisher);
+        assert_eq!(origin.inner.broadcasts.lock().len(), 1);
+        new_publisher.complete_ref(b"{}").await?;
+        drop(new_publisher);
+        assert_eq!(origin.inner.broadcasts.lock().len(), 0);
+        Ok(())
+    }
+
+    /// Demand wait must release promptly when the stream is cancelled before
+    /// any consumer attaches; this covers the no-subscriber continuation path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moq_stream_consumer_wait_observes_cancellation() -> Result<()> {
+        let origin = origin();
+        let (_client_secret, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
+        let publisher = origin.publisher(&ctx)?;
+        ctx.cancel_token().cancel();
+        let error = publisher
+            .wait_for_consumer()
+            .await
+            .expect_err("cancelled stream must not wait for a consumer");
+        assert!(error.to_string().contains("cancelled"));
         Ok(())
     }
 
