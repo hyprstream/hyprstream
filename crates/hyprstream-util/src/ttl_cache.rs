@@ -95,6 +95,22 @@ struct Inner<K, V> {
 
 /// Generic per-entry-TTL cache with lazy version-tagged eviction and a
 /// capacity bound. See the module docs for the design.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use hyprstream_util::TtlCache;
+///
+/// let cache: TtlCache<String, u32> = TtlCache::new(16, 8);
+/// cache.insert("session-1".to_owned(), 42, Duration::from_secs(60));
+/// assert_eq!(cache.get("session-1"), Some(42));
+///
+/// // `insert_if_absent` is the replay-barrier primitive: while the entry
+/// // is live, re-inserting the same key is refused.
+/// assert!(!cache.insert_if_absent("session-1".to_owned(), 7, Duration::from_secs(60)));
+/// ```
 pub struct TtlCache<K, V> {
     inner: Mutex<Inner<K, V>>,
     /// Maximum number of live entries. When full, an insert of a new key

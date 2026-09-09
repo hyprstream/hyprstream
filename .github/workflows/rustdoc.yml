@@ -1,0 +1,78 @@
+name: Rustdoc quality
+
+# Non-blocking documentation-quality lane (policy: docs/rustdoc-quality.md).
+#
+# Scope is deliberately the hyprstream-util PILOT only: `cargo doc` on this one
+# dependency-light leaf crate (parking_lot only) with `--no-deps`. It is NOT a
+# required check and NOT part of the man/protocol/corpus artifact pipeline —
+# the artifacts uploaded here exist solely as review evidence for documentation
+# quality on PRs that touch the pilot. Expanding coverage to further crates is
+# a per-crate, measured, opt-in process documented in docs/rustdoc-quality.md;
+# this workflow must not silently grow into a workspace-wide docs gate.
+#
+# Warning policy: rustdoc GENERATION errors fail the job (a broken build is a
+# failure, not a warning); missing-doc WARNINGS are collected and uploaded as
+# evidence but do not fail the job while the lane is non-blocking. The strict
+# step below runs the same scoped doc with `RUSTDOCFLAGS="-D warnings"` under
+# `continue-on-error` purely to produce machine-checkable evidence of the
+# current warning debt.
+#
+# This workflow runs plain cargo on a GitHub-hosted runner — the pilot crate
+# needs no libtorch and none of the self-hosted rust-builder plumbing that
+# rust.yml drives through podman. Host-side BuildQ is a local development
+# policy and intentionally does not apply to remote CI.
+on:
+  pull_request:
+    paths:
+      - 'crates/hyprstream-util/**'
+      - '.github/workflows/rustdoc.yml'
+      - 'docs/rustdoc-quality.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rustdoc-util:
+    name: rustdoc (hyprstream-util pilot)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Generate rustdoc (generation errors fail; warnings visible in log)
+        run: cargo doc -p hyprstream-util --no-deps
+
+      - name: Collect warning evidence (non-blocking)
+        # Changing RUSTDOCFLAGS invalidates the rustdoc fingerprint, so this
+        # re-runs the scoped doc and re-emits every warning; `-D warnings`
+        # makes their presence observable as a step failure, and
+        # continue-on-error keeps the JOB green while warnings remain.
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          RUSTDOCFLAGS="-D warnings" cargo doc -p hyprstream-util --no-deps 2>&1 | tee rustdoc-warnings.log
+
+      - name: Run documented examples (doctests)
+        run: cargo test -p hyprstream-util --doc
+
+      - name: Upload warning evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdoc-hyprstream-util-warnings
+          path: rustdoc-warnings.log
+          if-no-files-found: warn
+
+      - name: Upload generated API docs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdoc-hyprstream-util-html
+          path: target/doc/
+          if-no-files-found: error
