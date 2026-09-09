@@ -1,7 +1,8 @@
 {
   "schema_version": 1,
   "source_commit": "8b49b050040aece21e48dcc7f362df85fb6430c1",
-  "source_tree": "11a569c4f957f7759d7133459e255994134e4538",
+  "source_tree": "00e8ffe827d800ef6f8521a30c3f9f5eb96925ed",
+  "source_input_digest": "27903b5b0ef8ac49310eead956fe8cf554a1134a6a45754ee785a797c353d6f4",
   "authority": "docs/system-ontology.md",
   "api_manifest": {"version": 1, "path": "api/v1/{service}/{method}.json", "id": "api:{service}:{method}", "integrity": "sha256 of canonical UTF-8 JSON", "limit_bytes": 1048576},
   "corpus_manifest": {"version": 1, "path": "corpus/v1/{document_id}.md", "id": "doc:{repository-relative-path}", "integrity": "sha256 of source bytes", "limit_bytes": 2097152},
@@ -12,6 +13,7 @@
     {"glob":"docs/deployment/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository deployment guide"},
     {"glob":"docs/network/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository network guide"},
     {"glob":"docs/security/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository security guide"},
+    {"glob":"docs/standards/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository standards guide"},
     {"glob":"docs/standards/adr/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository standards ADR"},
     {"glob":"docs/standards/analysis/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository analysis"},
     {"glob":"docs/standards/runbooks/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository runbook"},
