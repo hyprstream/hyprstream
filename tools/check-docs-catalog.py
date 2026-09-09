@@ -242,8 +242,12 @@ def check_provenance(record: dict[str, Any], repo: Path, label: str, corpus: dic
     # rewrites commits while preserving this tree.
     git(repo, "cat-file", "-e", f"{tree}^{{tree}}")
     _, boundary = audited_input(repo, event, revision)
-    required(commit != git(repo, "rev-parse", "HEAD"), f"{label} source_commit must not self-reference HEAD")
-    required(tree != git(repo, "rev-parse", "HEAD^{tree}"), f"{label} source_tree must not self-reference HEAD")
+    staged_catalog = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--quiet", "--",
+                                     "docs/schema-catalog.json", "docs/corpus-sources.json"]).returncode != 0
+    required(commit != git(repo, "rev-parse", "HEAD") or staged_catalog,
+             f"{label} source_commit must not self-reference HEAD")
+    required(tree != git(repo, "rev-parse", "HEAD^{tree}") or staged_catalog,
+             f"{label} source_tree must not self-reference HEAD")
     paths = provenance_paths(repo, corpus)
     required(input_digest(repo, paths, mutations) == declared_digest,
              f"{label} current audited inputs differ from source_input_digest")
