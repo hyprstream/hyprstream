@@ -16,9 +16,10 @@
 //! | GET    | `com.atproto.server.describeServer` | server DID and account-domain policy |
 //! | GET    | `com.atproto.server.getServiceAuth` | protected hosted-account service JWT |
 //!
-//! **Session endpoints (`createSession`/`getSession`) are deliberately NOT in
-//! this PR.** Credential verification (password / app-password) and the OAuth
-//! JWT bridge belong with the #1113/#948 OAuth integration work.
+//! **`createSession` remains out of scope.** Password / app-password
+//! verification and credential minting require the account authority contract.
+//! `getSession` is available only when an explicit native session resolver is
+//! installed and is protected by the existing bearer/DPoP middleware.
 //!
 //! # Feature gate
 //!
@@ -31,7 +32,7 @@
 //!
 //! - `com.atproto.sync.subscribeRepos` (firehose) — issue #1112 defers it.
 //! - Write path (`repo.createRecord` etc.) — sequenced with #910.
-//! - `createSession`/`getSession` — sequenced with #1113/#948.
+//! - `createSession` — sequenced with the account credential contract (#1113/#948).
 
 mod durable_reads;
 mod record_validation;
@@ -88,7 +89,7 @@ const DURABLE_SNAPSHOT_CONCURRENCY: usize = 4;
 // RepoSnapshot + XrpcRepoStore
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The four XRPC read-slice route declarations, as a sub-`Router` parameterised
+/// The five XRPC read-slice route declarations, as a sub-`Router` parameterised
 /// over `Arc<OAuthState>`. This is the single source of truth for the XRPC route
 /// table — `oauth::create_app` merges it conditionally on `xrpc_read_slice`,
 /// and tests mount it directly. Changing the URI or handler here changes both.
@@ -114,6 +115,41 @@ pub fn xrpc_routes() -> axum::Router<Arc<OAuthState>> {
 pub fn xrpc_write_routes() -> axum::Router<Arc<OAuthState>> {
     use axum::routing::post;
     axum::Router::new().route("/xrpc/com.atproto.repo.createRecord", post(create_record))
+}
+
+/// Native account authority's answer for an authenticated `getSession` query.
+/// The resolver owns handle, DID-document and account lifecycle truth; this
+/// adapter never derives a handle from an unverified DID string.
+#[derive(Clone, Debug, Default)]
+pub struct AtprotoSessionInfo {
+    pub handle: String,
+    pub did_doc: Option<Value>,
+    pub email: Option<String>,
+    pub email_confirmed: Option<bool>,
+    pub email_auth_factor: Option<bool>,
+    pub active: bool,
+    pub status: Option<String>,
+}
+
+/// Explicit native authority seam for standard `getSession`.
+///
+/// Implementations must bind the returned handle and lifecycle state to the
+/// requested DID using the authoritative account records. Returning `None`
+/// means the DID is not a locally hosted account. No default implementation is
+/// installed, so adding this interface cannot expose account state by itself.
+#[async_trait::async_trait]
+pub trait AtprotoSessionResolver: Send + Sync {
+    async fn resolve_session(&self, did: &str) -> anyhow::Result<Option<AtprotoSessionInfo>>;
+}
+
+/// Protected standard session read route. It is mounted only when an
+/// authority-provided [`AtprotoSessionResolver`] is installed.
+pub fn xrpc_session_routes() -> axum::Router<Arc<OAuthState>> {
+    use axum::routing::get;
+    axum::Router::new().route(
+        "/xrpc/com.atproto.server.getSession",
+        get(get_session),
+    )
 }
 
 /// An in-memory snapshot of one repo's signed state — enough to answer the
@@ -914,6 +950,117 @@ pub async fn describe_server(State(state): State<Arc<OAuthState>>) -> Response {
         })),
     )
         .into_response()
+}
+
+/// Return the current authenticated ATProto session from the native account
+/// authority. The bearer/DPoP middleware authenticates the request; this
+/// handler revalidates the token and scope before consulting the resolver.
+pub async fn get_session(
+    State(state): State<Arc<OAuthState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Response {
+    let Some(token) = user.token.as_deref() else {
+        return xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            errors::INVALID_REQUEST,
+            "verified OAuth access token is required",
+        );
+    };
+    let claims = match auth::validate_oauth_access_token(&state, token).await {
+        Ok(claims) => claims,
+        Err(_) => {
+            return xrpc_error(
+                StatusCode::UNAUTHORIZED,
+                errors::INVALID_REQUEST,
+                "OAuth access token is invalid or expired",
+            );
+        }
+    };
+    if !claims.has_scope("atproto") {
+        return xrpc_error(
+            StatusCode::FORBIDDEN,
+            "InsufficientScope",
+            "the atproto scope is required",
+        );
+    }
+    if claims.sub != user.user || claims.tenant != user.verified_tenant {
+        return xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            errors::INVALID_REQUEST,
+            "OAuth identity binding is invalid",
+        );
+    }
+    let Some(resolver) = state.atproto_session_resolver.as_ref() else {
+        return xrpc_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            errors::INTERNAL_SERVER_ERROR,
+            "native ATProto session resolver is not configured",
+        );
+    };
+    let info = match resolver.resolve_session(&claims.sub).await {
+        Ok(Some(info)) => info,
+        Ok(None) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::ACCOUNT_NOT_FOUND,
+                "account is not hosted by this PDS",
+            );
+        }
+        Err(error) => {
+            tracing::error!(%error, did = %claims.sub, "ATProto session resolver failed");
+            return xrpc_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                errors::INTERNAL_SERVER_ERROR,
+                "native account state is unavailable",
+            );
+        }
+    };
+    if info.handle.is_empty() || info.handle.chars().any(char::is_whitespace) {
+        tracing::error!(did = %claims.sub, "ATProto session resolver returned invalid handle");
+        return xrpc_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            errors::INTERNAL_SERVER_ERROR,
+            "native account returned an invalid handle",
+        );
+    }
+    if let Some(status) = info.status.as_deref() {
+        if !matches!(status, "takendown" | "suspended" | "deactivated") {
+            tracing::error!(did = %claims.sub, %status, "ATProto session resolver returned invalid status");
+            return xrpc_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                errors::INTERNAL_SERVER_ERROR,
+                "native account returned an invalid status",
+            );
+        }
+    }
+    let mut body = json!({
+        "handle": info.handle,
+        "did": claims.sub,
+        "active": info.active,
+    });
+    let Some(object) = body.as_object_mut() else {
+        return xrpc_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            errors::INTERNAL_SERVER_ERROR,
+            "session response construction failed",
+        );
+    };
+    if let Some(value) = info.did_doc {
+        object.insert("didDoc".to_owned(), value);
+    }
+    if let Some(value) = info.email {
+        object.insert("email".to_owned(), Value::String(value));
+    }
+    if let Some(value) = info.email_confirmed {
+        object.insert("emailConfirmed".to_owned(), Value::Bool(value));
+    }
+    if let Some(value) = info.email_auth_factor {
+        object.insert("emailAuthFactor".to_owned(), Value::Bool(value));
+    }
+    if let Some(value) = info.status {
+        object.insert("status".to_owned(), Value::String(value));
+    }
+    (StatusCode::OK, axum::Json(body)).into_response()
 }
 
 pub async fn resolve_handle(
@@ -3754,6 +3901,16 @@ mod tests {
                 "route {uri} status mismatch when xrpc_read_slice is enabled"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn router_get_session_not_mounted_without_native_resolver() {
+        let app = build_xrpc_router().await;
+        let resp = app
+            .oneshot(req("/xrpc/com.atproto.server.getSession"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // ── Finding 2: routed CID match/mismatch + malformed query ─────────────────
