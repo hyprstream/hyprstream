@@ -11,7 +11,10 @@
 //! production remains operator-gated and floor-only.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-#![cfg_attr(feature = "credential-pds", allow(dead_code, unused_imports))]
+#![cfg_attr(
+    feature = "encrypted-account-admission",
+    allow(dead_code, unused_imports)
+)]
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -468,7 +471,7 @@ async fn unauthorized_subject_is_denied_and_audited_on_rpc_and_9p() -> Result<()
 // Positive acceptance path retained as the executable T8 contract.
 //
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(feature = "credential-pds"))]
+#[cfg(not(feature = "encrypted-account-admission"))]
 async fn verified_atproto_identity_authorizes_rpc_and_9p() -> Result<()> {
     let _globals = GATE_GLOBALS.lock().await;
     let coverage = hyprstream_rpc::auth::mac::GenesisReport {
@@ -549,7 +552,7 @@ struct T8SessionCredential {
     ninep_bytes: Vec<u8>,
 }
 
-#[cfg(not(feature = "credential-pds"))]
+#[cfg(not(feature = "encrypted-account-admission"))]
 async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
     use base64::{
         engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},

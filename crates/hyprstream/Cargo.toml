@@ -236,9 +236,10 @@ valkey = ["dep:fred"]  # Enable legacy Valkey/Redis-backed user and token stores
 discovery-valkey = ["hyprstream-discovery/valkey"]  # Shared/tiered Discovery state
 pglite = ["dep:pglite-rs"]  # Enable PGlite embedded relational UserStore (#1376)
 postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots"]  # Networked Postgres UserStore for RDS (#1401)
-credential-pds = ["pglite"]  # Production credential/PDS service profile; intentionally excludes metrics/DuckDB
+encrypted-account-admission = []  # Mandatory source-level policy: no plaintext account UserStore in production
+credential-pds = ["encrypted-account-admission", "pglite"]  # Production credential/PDS service profile; intentionally excludes metrics/DuckDB
 credential-pds-postgres = ["postgres"]  # Production credential/PDS with RDS Postgres backend (#1401)
-metrics = ["dep:hyprstream-metrics", "dep:hyprstream-flight"]  # Separate DuckDB-backed metrics/inference/Flight service build
+metrics = ["encrypted-account-admission", "dep:hyprstream-metrics", "dep:hyprstream-flight"]  # Separate DuckDB-backed metrics/inference/Flight service build
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
 xet = ["git2db/xet-storage"]  # Enable XET large file storage
 # NOTE: plain dependency names (not `dep:`) — cargo rejects `dep:` references
