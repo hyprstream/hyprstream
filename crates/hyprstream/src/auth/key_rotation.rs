@@ -2275,6 +2275,7 @@ pub use ml_dsa_rotation::{
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
     use tempfile::TempDir;
 
     struct PermitFixtureAccountReads;
@@ -2553,6 +2554,22 @@ mod tests {
 
     fn wait_for_done(dir: &Path) {
         wait_path(&dir.join("done"));
+    }
+
+    /// Publish the completed target snapshot in one rename-visible operation.
+    ///
+    /// The child readers use file existence as their readiness signal, so a
+    /// direct write can expose an empty file between create and completion.
+    /// Keep this helper test-only: it models the completed fixture handoff
+    /// without changing the production authority or rollback paths.
+    fn publish_target_authority(dir: &Path, target: &CompositeCommit) {
+        let bytes = serde_json::to_vec(target).unwrap();
+        let mut temporary = tempfile::NamedTempFile::new_in(dir).unwrap();
+        temporary.write_all(&bytes).unwrap();
+        temporary.flush().unwrap();
+        temporary
+            .persist(dir.join("target-authority.json"))
+            .unwrap();
     }
 
     async fn mutate_authority_for_failure(
@@ -3375,11 +3392,7 @@ mod tests {
             serde_json::to_vec(&ledger_after_rotation).unwrap(),
             "legacy migration changed mutable B before pending C was staged"
         );
-        std::fs::write(
-            dir.path().join("target-authority.json"),
-            serde_json::to_vec(&committed).unwrap(),
-        )
-        .unwrap();
+        publish_target_authority(dir.path(), &committed);
         for process in ["oauth", "policy", "jwks", "rpc"] {
             wait_path(&dir.path().join(format!("converged-{process}")));
         }
