@@ -31,6 +31,7 @@ use std::time::Duration;
 /// Reserve an ephemeral loopback port for a later real bind. There is an
 /// inherent TOCTOU window between the probe and the service bind; that is
 /// accepted (and bounded) by keeping the reserve short-lived.
+#[cfg(test)]
 fn reserve_ephemeral_port() -> SocketAddr {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve ephemeral port");
     l.local_addr().expect("local addr")
@@ -361,6 +362,7 @@ fn run_occupied_http_listener_fails_before_ready() -> anyhow::Result<()> {
 /// Occupied HTTPS listener: the same real collision through the prebound-TLS
 /// branch (real RustlsConfig from a generated self-signed cert), no READY,
 /// no second bind attempt.
+#[cfg(test)]
 #[test]
 fn run_occupied_https_listener_fails_before_ready() -> anyhow::Result<()> {
     const CASE: &str = "services::oauth::readiness_tests::run_occupied_https_listener_fails_before_ready";
