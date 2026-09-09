@@ -3742,15 +3742,22 @@ fn main() -> Result<()> {
                                             &services,
                                             true,
                                         );
-                                    let policy_stage = configured_stages
-                                        .iter()
-                                        .position(|stage| stage.iter().any(|name| name == "policy"));
-                                    policy_stage.is_some_and(|policy_index| {
-                                        configured_stages[..policy_index]
-                                            .iter()
-                                            .flatten()
-                                            .any(|name| service_names[0] == *name)
-                                    })
+                                    let policy_position = configured_stages.iter().enumerate().find_map(
+                                        |(stage_index, stage)| {
+                                            stage.iter().position(|name| name == "policy")
+                                                .map(|service_index| (stage_index, service_index))
+                                        },
+                                    );
+                                    let service_position = configured_stages.iter().enumerate().find_map(
+                                        |(stage_index, stage)| {
+                                            stage.iter().position(|name| name == &service_names[0])
+                                                .map(|service_index| (stage_index, service_index))
+                                        },
+                                    );
+                                    match (service_position, policy_position) {
+                                        (Some(service), Some(policy)) => service < policy,
+                                        _ => false,
+                                    }
                                 } else {
                                     false
                                 };
