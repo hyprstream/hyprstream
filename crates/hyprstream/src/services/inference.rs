@@ -3158,8 +3158,16 @@ async fn serve_inference_bridged(
     let drain_shutdown = Arc::clone(&shutdown);
     let drain_state = Arc::clone(&draining);
     let drain_ready = Arc::clone(&network_ready);
-    tokio::spawn(async move {
-        drain_shutdown.notified().await;
+    let (drain_armed_tx, drain_armed_rx) = tokio::sync::oneshot::channel();
+    let drain_task = tokio::spawn(async move {
+        // Arm before notifying the owner can become possible. `Notify`'s
+        // notify_waiters() does not retain a notification for a waiter that
+        // has not registered yet.
+        let notified = drain_shutdown.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let _ = drain_armed_tx.send(());
+        notified.await;
         drain_state.store(true, Ordering::Release);
         drain_ready.store(false, Ordering::Release);
         hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown(
@@ -3169,6 +3177,10 @@ async fn serve_inference_bridged(
         )
         .await;
     });
+    let drain_owner = QuinnDrainOwner::new(drain_task);
+    // Do not enter the select until the spawned waiter has registered. This
+    // closes the notification-lost race on an immediately failing peer.
+    let _ = drain_armed_rx.await;
 
     let rep = hyprstream_rpc::service::serve::serve_bridged(
         transport,
@@ -3177,12 +3189,32 @@ async fn serve_inference_bridged(
         Arc::clone(&shutdown),
         on_ready,
     );
-    let mut rep = Box::pin(rep);
-    let mut quic = Box::pin(rpc_server.run());
+    let quic = rpc_server.run();
+    run_quinn_lifecycle(rep, quic, shutdown, network_ready, draining, drain_owner).await
+}
+
+async fn run_quinn_lifecycle<Rep, Quic>(
+    rep: Rep,
+    quic: Quic,
+    shutdown: Arc<tokio::sync::Notify>,
+    network_ready: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
+    drain_owner: QuinnDrainOwner,
+) -> hyprstream_rpc::error::Result<()>
+where
+    Rep: std::future::Future<Output = anyhow::Result<()>>,
+    Quic: std::future::Future<Output = anyhow::Result<()>>,
+{
+    tokio::pin!(rep);
+    tokio::pin!(quic);
     tokio::select! {
+        // Poll REP first so `serve_bridged` registers its Notify waiter before
+        // the QUIC-first arm can notify it on an unexpected accept-loop exit.
+        biased;
         rep_result = &mut rep => {
             shutdown.notify_waiters();
             let quic_result = quic.await;
+            drain_owner.join().await;
             network_ready.store(false, Ordering::Release);
             if let Err(error) = quic_result {
                 tracing::warn!(%error, "standalone inference QUIC loop ended during drain");
@@ -3194,16 +3226,54 @@ async fn serve_inference_bridged(
         quic_result = &mut quic => {
             network_ready.store(false, Ordering::Release);
             if draining.load(Ordering::Acquire) {
-                return rep.await.map_err(|error| {
+                let rep_result = rep.await.map_err(|error| {
                     hyprstream_rpc::error::RpcError::SpawnFailed(error.to_string())
                 });
+                drain_owner.join().await;
+                return rep_result;
             }
             shutdown.notify_waiters();
             let detail = match quic_result {
                 Ok(()) => "QUIC server exited unexpectedly".to_owned(),
                 Err(error) => format!("QUIC server failed: {error}"),
             };
+            drain_owner.join().await;
+            // Preserve the unexpected QUIC exit as the primary service error;
+            // the REP side is only driven to stop so its task is not orphaned.
+            let _ = rep.await;
             Err(hyprstream_rpc::error::RpcError::SpawnFailed(detail))
+        }
+    }
+}
+
+/// Owns the QUIC drain waiter for the lifetime of the bridged service.
+///
+/// Normal service exits consume and join this handle. If the owning future is
+/// cancelled before one of those exits, abort the child instead of detaching
+/// it into the runtime.
+struct QuinnDrainOwner {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl QuinnDrainOwner {
+    fn new(task: tokio::task::JoinHandle<()>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    async fn join(mut self) {
+        if let Some(task) = self.task.as_mut() {
+            if let Err(error) = task.await {
+                tracing::warn!(%error, "standalone inference QUIC drain task ended unexpectedly");
+            }
+        }
+        self.task.take();
+    }
+}
+
+impl Drop for QuinnDrainOwner {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
     }
 }
@@ -3624,6 +3694,442 @@ mod tenant_binding_tests {
         assert!(enforce_inference_security_context(Some(subject), &object).is_ok());
     }
 
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod quinn_drain_tests {
+    use super::*;
+    use anyhow::Context as _;
+    use std::future::Future as _;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    struct JoinGuard<T> {
+        task: Option<tokio::task::JoinHandle<T>>,
+    }
+
+    impl<T> JoinGuard<T> {
+        fn new(task: tokio::task::JoinHandle<T>) -> Self {
+            Self { task: Some(task) }
+        }
+
+        fn handle_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
+            self.task.as_mut().expect("join guard task present")
+        }
+
+        async fn join(mut self) -> std::result::Result<T, tokio::task::JoinError> {
+            let result = self.handle_mut().await;
+            self.task.take();
+            result
+        }
+    }
+
+    impl<T> Drop for JoinGuard<T> {
+        fn drop(&mut self) {
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+        }
+    }
+
+    struct ReleaseOnDrop(Arc<tokio::sync::Semaphore>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.add_permits(1);
+        }
+    }
+
+    struct PermitInferenceDispatch;
+
+    impl hyprstream_rpc::auth::mac::MacDispatchPep for PermitInferenceDispatch {
+        fn check(
+            &self,
+            _ctx: &EnvelopeContext,
+            service_domain: &str,
+            _method: Option<&[u16]>,
+        ) -> hyprstream_rpc::auth::mac::MacDecision {
+            if service_domain == "inference" {
+                hyprstream_rpc::auth::mac::MacDecision::Permit
+            } else {
+                hyprstream_rpc::auth::mac::MacDecision::Deny(
+                    hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject,
+                )
+            }
+        }
+    }
+
+    struct DrainGateService {
+        transport: hyprstream_rpc::transport::TransportConfig,
+        signing_key: SigningKey,
+        handler_entered: Arc<tokio::sync::Semaphore>,
+        handler_completed: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl hyprstream_rpc::service::RequestService for DrainGateService {
+        async fn handle_request(
+            &self,
+            _ctx: &EnvelopeContext,
+            _body: &hyprstream_rpc::service::DecodedRequestBody,
+        ) -> Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
+            self.handler_entered.add_permits(1);
+            self.release.acquire().await?.forget();
+            self.handler_completed.add_permits(1);
+            Ok((b"held-response".to_vec(), None))
+        }
+
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> Result<hyprstream_rpc::service::DecodedRequestBody> {
+            crate::services::generated::inference_client::decode_inference_request_body(signed_body)
+        }
+
+        async fn verify_claims(&self, _ctx: &mut EnvelopeContext) -> Result<()> {
+            Ok(())
+        }
+
+        fn build_error_payload(&self, _request_id: u64, _error: &str) -> Vec<u8> {
+            b"error-response".to_vec()
+        }
+
+        fn name(&self) -> &str {
+            "inference"
+        }
+
+        fn transport(&self) -> &hyprstream_rpc::transport::TransportConfig {
+            &self.transport
+        }
+
+        fn signing_key(&self) -> SigningKey {
+            self.signing_key.clone()
+        }
+    }
+
+    fn test_quic_config(port: u16, cert_der: Vec<u8>, key_der: Vec<u8>) -> hyprstream_rpc::service::QuicLoopConfig {
+        hyprstream_rpc::service::QuicLoopConfig {
+            announcement_cancellation: tokio_util::sync::CancellationToken::new(),
+            cert_chain: vec![cert_der],
+            key_der: zeroize::Zeroizing::new(key_der),
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+            server_name: "localhost".to_owned(),
+            protected_resource_json: None,
+            on_quic_bound: None,
+            iroh_enabled: false,
+            iroh_required: false,
+            on_iroh_bound: None,
+            moq_relay: None,
+            moq_relay_server_identity: None,
+            moq_admission: None,
+            moq_ingress_authorizer: None,
+            moq_admission_proof: None,
+        }
+    }
+
+    fn valid_request_body() -> Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut request = message
+                .init_root::<crate::inference_capnp::inference_request::Builder>();
+            request.set_id(7);
+            request.set_is_ready(());
+        }
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    /// Install the process-global verification config in a child test process;
+    /// its OnceLock must not contaminate the rest of the lib test binary.
+    #[test]
+    fn inference_quic_owner_joins_drain_before_returning() -> Result<()> {
+        let executable = std::env::current_exe()?;
+        let mut child = Command::new(executable)
+            .args([
+                "--exact",
+                "services::inference::quinn_drain_tests::inference_quic_owner_joins_drain_before_returning_child",
+                "--nocapture",
+            ])
+            .env("HYPRSTREAM_INFERENCE_DRAIN_CHILD", "1")
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill()?;
+                let _ = child.wait();
+                anyhow::bail!("isolated causal child exceeded 30 second watchdog");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        anyhow::ensure!(status.success(), "isolated causal child exited with {status}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inference_quic_owner_joins_drain_before_returning_child() -> Result<()> {
+        if std::env::var_os("HYPRSTREAM_INFERENCE_DRAIN_CHILD").is_none() {
+            return Ok(());
+        }
+        hyprstream_rpc::transport::install_pq_crypto_provider()?;
+        let cert_key = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let cert_der = cert_key.cert.der().to_vec();
+        let key_der = cert_key.key_pair.serialize_der();
+        let probe = UdpSocket::bind("127.0.0.1:0")?;
+        let port = probe.local_addr()?.port();
+        drop(probe);
+
+        let handler_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let handler_completed = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let _release_cleanup = ReleaseOnDrop(Arc::clone(&release));
+        let service_key = SigningKey::from_bytes(&[0x31; 32]);
+        let client_key = SigningKey::from_bytes(&[0x32; 32]);
+        let mut verify_store = hyprstream_rpc::envelope::KeyedPqTrustStore::new();
+        let client_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&client_key);
+        let client_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&client_pq),
+        )?;
+        verify_store.bind(client_key.verifying_key().to_bytes(), &client_pq_vk);
+        verify_store.bind(
+            service_key.verifying_key().to_bytes(),
+            &hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+                &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(
+                    &hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&service_key),
+                ),
+            )?,
+        );
+        hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+                pq_store: Some(Arc::new(verify_store)),
+            },
+        )?;
+        hyprstream_rpc::auth::mac::install_mac_dispatch_pep(Arc::new(PermitInferenceDispatch));
+        let transport = hyprstream_rpc::transport::TransportConfig::inproc(format!(
+            "inference-drain-test-{port}"
+        ));
+        let bridge = hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
+            DrainGateService {
+                transport: transport.clone(),
+                signing_key: service_key.clone(),
+                handler_entered: Arc::clone(&handler_entered),
+                handler_completed: Arc::clone(&handler_completed),
+                release: Arc::clone(&release),
+            },
+            Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new()),
+            0,
+        )?;
+        let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> =
+            Arc::new(bridge);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let network_ready = Arc::new(AtomicBool::new(false));
+        let draining = Arc::new(AtomicBool::new(false));
+        let producer_reach_config = Arc::new(parking_lot::RwLock::new(
+            hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
+        ));
+        let moq_origin = Arc::new(parking_lot::RwLock::new(Some(
+            hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone().build(),
+        )));
+        let advertised_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)), port);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let owner_transport = transport.clone();
+        let owner_cert_der = cert_der.clone();
+        let owner_shutdown = Arc::clone(&shutdown);
+        let owner_draining = Arc::clone(&draining);
+        let owner_service_key = service_key.clone();
+        let mut owner = JoinGuard::new(tokio::spawn(async move {
+            serve_inference_bridged(
+                "inference",
+                &owner_transport,
+                Arc::clone(&processor),
+                owner_service_key,
+                owner_shutdown,
+                Some(ready_tx),
+                Some(test_quic_config(port, owner_cert_der, key_der)),
+                Some(advertised_addr),
+                Arc::clone(&producer_reach_config),
+                Arc::clone(&moq_origin),
+                Arc::clone(&network_ready),
+                owner_draining,
+            )
+            .await
+        }));
+
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .context("inference owner readiness timeout")??;
+        let session = tokio::time::timeout(
+            Duration::from_secs(5),
+            hyprstream_rpc::transport::quinn_transport::connect_pinned(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                &cert_der,
+            ),
+        )
+        .await
+        .context("QUIC connect timed out")??;
+        let service_vk = service_key.verifying_key();
+        let mut kem_store = hyprstream_rpc::crypto::hybrid_kem::KeyedKemTrustStore::new();
+        kem_store.bind(
+            service_vk.to_bytes(),
+            hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&service_key)?.public(),
+        );
+        let service_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&service_key);
+        let service_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&service_pq),
+        )?;
+        let mut pq_store = hyprstream_rpc::envelope::KeyedPqTrustStore::new();
+        pq_store.bind(service_vk.to_bytes(), &service_pq_vk);
+        let client = hyprstream_rpc::rpc_client::RpcClientImpl::new(
+            hyprstream_rpc::signer::LocalSigner::new(client_key),
+            hyprstream_rpc::transport::quinn_transport::QuinnTransport::new(session),
+            Some(service_vk),
+        )
+        .with_request_kem_store(Arc::new(kem_store))
+        .with_response_pq_store(Arc::new(pq_store));
+        let response = JoinGuard::new(tokio::spawn(async move {
+            client
+                .call_for_service("inference", valid_request_body()?)
+                .await
+        }));
+        let entered_permit = match tokio::time::timeout(Duration::from_secs(5), handler_entered.acquire()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                let response_result = tokio::time::timeout(Duration::from_secs(5), response.join())
+                    .await
+                    .context("held request task cleanup timed out")?
+                    .context("held request task panicked")?;
+                anyhow::bail!("QUIC request did not enter service; response result: {response_result:?}");
+            }
+        };
+        entered_permit.forget();
+
+        shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !draining.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("inference drain did not start")?;
+        let owner_done = tokio::time::timeout(Duration::from_millis(100), owner.handle_mut()).await;
+        assert!(owner_done.is_err(), "inference owner returned before QUIC drain");
+
+        release.add_permits(1);
+        let response_result = tokio::time::timeout(Duration::from_secs(5), response.join())
+            .await
+            .context("held QUIC response did not complete")??;
+        assert_eq!(response_result?, b"held-response");
+        tokio::time::timeout(Duration::from_secs(5), handler_completed.acquire())
+            .await
+            .context("handler completion marker timed out")??
+            .forget();
+        let owner_result = tokio::time::timeout(Duration::from_secs(5), owner.join())
+            .await
+            .context("inference owner did not join QUIC drain")??;
+        owner_result?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unexpected_quic_exit_notifies_unpolled_rep_and_joins_drain() -> Result<()> {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let drain_shutdown = Arc::clone(&shutdown);
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let drain_finished = Arc::new(AtomicBool::new(false));
+        let drain_finished_task = Arc::clone(&drain_finished);
+        let drain_task = tokio::spawn(async move {
+            let notified = drain_shutdown.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let _ = armed_tx.send(());
+            notified.await;
+            drain_finished_task.store(true, Ordering::Release);
+        });
+        tokio::time::timeout(Duration::from_secs(1), armed_rx)
+            .await
+            .context("test drain waiter did not arm")??;
+
+        let rep_started = Arc::new(AtomicBool::new(false));
+        let rep_started_task = Arc::clone(&rep_started);
+        let rep_shutdown = Arc::clone(&shutdown);
+        let rep = async move {
+            rep_started_task.store(true, Ordering::Release);
+            rep_shutdown.notified().await;
+            Ok::<(), anyhow::Error>(())
+        };
+        let quic = async { Err::<(), _>(anyhow::anyhow!("accept-loop sentinel")) };
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_quinn_lifecycle(
+                rep,
+                quic,
+                shutdown,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+                QuinnDrainOwner::new(drain_task),
+            ),
+        )
+        .await
+        .context("unexpected QUIC lifecycle cleanup timed out")?;
+        let error = result.expect_err("unexpected QUIC exit must remain the primary error");
+        assert!(error.to_string().contains("accept-loop sentinel"));
+        assert!(rep_started.load(Ordering::Acquire));
+        assert!(drain_finished.load(Ordering::Acquire));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_drain_join_aborts_owned_waiter() -> Result<()> {
+        struct DropMarker(Arc<AtomicBool>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&dropped);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _marker = DropMarker(marker);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let owner = QuinnDrainOwner::new(task);
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .context("drain child did not start")??;
+        let mut join = Box::pin(owner.join());
+        let mut join_polled = false;
+        let join_was_pending = std::future::poll_fn(|cx| {
+            join_polled = true;
+            match join.as_mut().poll(cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(true),
+                std::task::Poll::Ready(()) => std::task::Poll::Ready(false),
+            }
+        })
+        .await;
+        assert!(join_polled, "owner join was not polled");
+        assert!(join_was_pending, "owner join unexpectedly completed");
+        drop(join);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("cancellation did not abort the owned drain waiter")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
