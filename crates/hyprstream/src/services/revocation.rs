@@ -303,17 +303,22 @@ impl CredentialRevocationStore for PolicyAuthorityRevocationStore {
 ///
 /// When this process hosts the policy service (`hosts_policy`), it owns both
 /// canonical stores as durable files under the deployment data dir
-/// (`credential-revocations.jsonl`, `sessions.jsonl`). Every other process
-/// PROBES the authority (a freshly generated random credential ID, expected
-/// not revoked; and a random session key, expected not active) before
-/// publishing the RPC client stores. Both stores resolve a fresh
+/// (`credential-revocations.jsonl`, `sessions.jsonl`). Every compatibility-mode
+/// process PROBES the authority (a freshly generated random credential ID,
+/// expected not revoked; and a random session key, expected not active) before
+/// publishing the RPC client stores. In the required-native profile, Discovery
+/// starts before Policy so its resolver can publish the bootstrap announcement;
+/// non-Policy processes therefore publish lazy RPC client stores without a
+/// startup probe. Their first operation still fails closed until Policy is
+/// reachable. Both stores resolve a fresh
 /// [`PolicyClient`] per operation through the production resolver, so a
 /// renewed trust-store service JWT is consumed without a process restart.
 ///
-/// Fail-closed: any error — an unreadable/corrupt durable file, or an
-/// authority unreachable after [`PROBE_ATTEMPTS`] attempts — is propagated
-/// and MUST abort startup. A process that cannot check revocations or
-/// sessions must not serve credential verification.
+/// Fail-closed: any error in compatibility-mode probing — an unreadable/corrupt
+/// durable file, or an authority unreachable after [`PROBE_ATTEMPTS`] attempts
+/// — is propagated and MUST abort startup. Required-native clients retain the
+/// same fail-closed operation behavior while allowing the dependency-ordered
+/// Discovery → Policy bootstrap to complete.
 pub async fn init_process_authority_stores(
     ctx: &ServiceContext,
     signing_key: &SigningKey,
@@ -346,6 +351,23 @@ pub async fn init_process_authority_stores(
 
     let store = PolicyAuthorityRevocationStore::for_service(signing_key.clone());
     let sessions = PolicyAuthoritySessionRegistry::for_service(signing_key.clone());
+    // Required-native startup deliberately launches Discovery before Policy so
+    // the native resolver can publish the bootstrap announcement. A cold
+    // single-service child cannot synchronously probe Policy here without
+    // deadlocking that ordering. Publish the lazy clients; each operation
+    // continues to resolve Policy over authenticated Iroh and fails closed on
+    // an unavailable authority.
+    if ctx.iroh_required() {
+        hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(store))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        hyprstream_rpc::auth::set_global_session_registry(Arc::new(sessions))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        tracing::info!(
+            "Required-native profile: lazy revocation/session authority clients published; Policy probe deferred"
+        );
+        return Ok(());
+    }
+
     let probe = CredentialId::jwt(
         "https://revocation-probe.invalid",
         format!("probe-{:032x}", rand::random::<u128>()),
