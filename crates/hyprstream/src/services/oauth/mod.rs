@@ -617,22 +617,18 @@ fn runtime_clients(
     ))
 }
 
-/// Wait until the required native carrier closes or the service receives its
-/// normal shutdown signal. A required-native OAuth process must not continue
-/// serving HTTP after its advertised Iroh endpoint has died; that would leave
-/// discovery pointing at a dead transport while readiness remains green.
+/// Wait until the required native carrier closes. Normal service shutdown is
+/// handled by the outer `tokio::select!`; keeping this watcher independent of
+/// that signal avoids consuming the single shutdown notification before the
+/// HTTP server observes it.
 async fn wait_for_required_iroh_carrier(
     substrate: &hyprstream_rpc::transport::iroh_substrate::IrohSubstrate,
-    shutdown: &Notify,
 ) -> bool {
     loop {
         if substrate.router().is_shutdown() || substrate.endpoint().is_closed() {
             return true;
         }
-        tokio::select! {
-            _ = shutdown.notified() => return false,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 
@@ -1302,24 +1298,15 @@ impl Spawnable for OAuthService {
                                 )),
                             }
                         }
-                        carrier_lost = async {
+                        _carrier_lost = async {
                             match substrate_owned.as_ref() {
-                                Some(substrate) => {
-                                    wait_for_required_iroh_carrier(substrate, shutdown.as_ref()).await
-                                }
+                                Some(substrate) => wait_for_required_iroh_carrier(substrate).await,
                                 None => std::future::pending::<bool>().await,
                             }
                         }, if iroh_required => {
-                            if carrier_lost {
-                                Err(anyhow::anyhow!(
-                                    "OAuth required Iroh carrier terminated unexpectedly"
-                                ))
-                            } else {
-                                // Normal shutdown was consumed by the watcher;
-                                // the common teardown below still owns every
-                                // bridge, publisher, and carrier resource.
-                                Ok(())
-                            }
+                            Err(anyhow::anyhow!(
+                                "OAuth required Iroh carrier terminated unexpectedly"
+                            ))
                         }
                     };
                     rpc_owner = Some((rpc_loop, rpc_consumed));
@@ -4370,14 +4357,12 @@ mod tests {
             NoopHandler::new("oauth watcher rpc"),
         )
         .await?;
-        let shutdown = Notify::new();
-
         // Endpoint::close is the same observable carrier failure that the
         // watcher must convert into a terminal service outcome.
         server.endpoint().close().await;
         let lost = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            wait_for_required_iroh_carrier(&server, &shutdown),
+            wait_for_required_iroh_carrier(&server),
         )
         .await?;
         assert!(lost, "closed required carrier must be reported as lost");
