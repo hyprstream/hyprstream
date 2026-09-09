@@ -145,6 +145,16 @@ struct ChildEnv {
     sock_dir: tempfile::TempDir,
 }
 
+// TEST-ONLY fixed age key material for the isolated UserStore fixture. The
+// merge-gate builder intentionally has no `age-keygen`; this pair protects
+// only PGlite data inside each child's ephemeral tempdir and must never be
+// used for a deployment. UserStore sealing still exercises the real external
+// `age` binary.
+const TEST_ONLY_USERSTORE_AGE_IDENTITY: &str =
+    "AGE-SECRET-KEY-18DUYV5CM8FZ2DPGXFFN0NPA5QZVW6L245K04YN74FGYUDJU2DVYQUL97GF\n";
+const TEST_ONLY_USERSTORE_AGE_RECIPIENT: &str =
+    "age1lpty3rrqge6ql2qu3ppyx2xxvwdwau593v88ffsgjt0lgu5jayqqrzhgqx";
+
 impl ChildEnv {
     fn new(tag: &str) -> Self {
         let dir = tempfile::Builder::new()
@@ -159,34 +169,42 @@ impl ChildEnv {
         std::fs::create_dir_all(&credentials).expect("credentials dir");
         std::env::set_var("CREDENTIALS_DIRECTORY", &credentials);
         std::env::set_var("HYPRSTREAM__SECRETS__PATH", &credentials);
-        // The mandatory encrypted production profile requires the pglite
-        // UserStore backend with real deployment age key material (the same
-        // external-`age` seam production uses; both binaries are on PATH on
-        // the Linux lanes this suite targets).
+        // The mandatory encrypted production profile requires the PGlite
+        // UserStore backend and valid age key material. Write the test-only
+        // identity with the same private mode as age-keygen; the production
+        // sealing path still invokes the real external `age` binary.
         std::env::set_var("HYPRSTREAM__CREDENTIALS__BACKEND", "pglite");
         let key_path = dir.path().join("userstore-age-identity.txt");
-        let keygen = std::process::Command::new("age-keygen")
-            .arg("-o")
-            .arg(&key_path)
-            .output()
-            .expect("run age-keygen for the child UserStore keypair");
-        assert!(
-            keygen.status.success(),
-            "age-keygen failed: {keygen:?}"
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut key_file = options.open(&key_path).expect("create child age identity");
+        key_file
+            .write_all(TEST_ONLY_USERSTORE_AGE_IDENTITY.as_bytes())
+            .expect("write child age identity");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                key_file
+                    .metadata()
+                    .expect("child age identity metadata")
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0,
+                "child age identity must remain private"
+            );
+        }
+        drop(key_file);
+        std::env::set_var(
+            "HYPRSTREAM_USERSTORE_AGE_RECIPIENTS",
+            TEST_ONLY_USERSTORE_AGE_RECIPIENT,
         );
-        let stderr = String::from_utf8(keygen.stderr).expect("age-keygen stderr");
-        let key_file =
-            std::fs::read_to_string(&key_path).expect("read age-keygen identity file");
-        let recipient = stderr
-            .lines()
-            .chain(key_file.lines())
-            .find_map(|l| {
-                l.strip_prefix("Public key: ")
-                    .or_else(|| l.strip_prefix("# public key: "))
-            })
-            .expect("age-keygen must report the public key recipient")
-            .to_owned();
-        std::env::set_var("HYPRSTREAM_USERSTORE_AGE_RECIPIENTS", recipient);
         std::env::set_var("HYPRSTREAM_USERSTORE_AGE_IDENTITIES", &key_path);
         std::env::set_var("XDG_CONFIG_HOME", dir.path().join("xdg-config"));
         std::env::set_var("XDG_DATA_HOME", dir.path().join("xdg-data"));
