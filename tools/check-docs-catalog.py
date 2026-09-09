@@ -170,7 +170,7 @@ def audited_input(repo: Path, event: str | None = None, revision: str | None = N
     if event == "push":
         boundary = revision or git(repo, "rev-parse", "HEAD^")
         required(boundary != git(repo, "rev-parse", "HEAD"), "push audited input must precede pushed HEAD")
-        return event, boundary
+    return event, boundary
     raise CatalogError(f"unsupported docs-catalog event {event}")
 
 
@@ -183,15 +183,18 @@ def check_provenance(record: dict[str, Any], repo: Path, label: str, event: str 
     git(repo, "cat-file", "-e", f"{commit}^{{commit}}")
     required(git(repo, "rev-parse", f"{commit}^{{tree}}") == tree, f"{label} source_tree does not match source_commit")
     topology, boundary = audited_input(repo, event, revision)
-    if topology == "pull_request":
-        required(commit == boundary, f"{label} source_commit does not match audited merge base")
-    else:
-        required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", commit, boundary]).returncode == 0,
-                 f"{label} source_commit is not reachable from push input")
-    audited_paths = tracked(repo, "*.capnp") + list(CGR_ROOTS) + [
+    required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", boundary, "HEAD"]).returncode == 0,
+             f"{label} event input is not reachable from HEAD")
+    if commit == git(repo, "rev-parse", "HEAD"):
+        staged = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--quiet", "--", "docs/schema-catalog.json", "docs/corpus-sources.json"]).returncode != 0
+        required(staged, f"{label} source_commit must not self-reference HEAD")
+    required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", commit, "HEAD"]).returncode == 0,
+             f"{label} source_commit is not reachable from HEAD")
+    audited_paths = tracked(repo, "*.capnp", "docs/**/*.md") + list(CGR_ROOTS) + [
         "crates/hyprstream/src/cli/schema_cli.rs", "crates/hyprstream/src/services/mcp_service.rs",
         "crates/hyprstream/src/services/factories.rs", "crates/hyprstream-rpc-std/src/vfs_mount.rs",
-    ]
+        ".github/license-boundary.toml",
+    ] + [str(Path(directory).parent / "Cargo.toml") for directory in OWNER_DIRECTORIES]
     required(subprocess.run(["git", "-C", str(repo), "diff", "--quiet", commit, "--", *audited_paths]).returncode == 0,
              f"{label} source_commit does not match audited input state")
 
@@ -256,6 +259,7 @@ def cgr_inventory(build_file: str, source: str) -> list[dict[str, Any]]:
     def binding(value: str) -> str:
         name = value.strip().lstrip("&").strip()
         required(name in bindings and len(bindings[name]) == 1, f"{build_file} has unresolved or shadowed binding {name}")
+        required(len(re.findall(rf"\b{re.escape(name)}(?:\s*:[^=;]+)?\s*=", source)) == 1, f"{build_file} mutates binding {name}")
         return bindings[name][0]
     def path(value: str) -> str:
         expr = binding(value)
@@ -278,17 +282,18 @@ def cgr_inventory(build_file: str, source: str) -> list[dict[str, Any]]:
             required(found is not None, f"{build_file} has non-literal schema input")
             result.append(found.group(1))
         return result
-    calls, needle, start = [], "hyprstream_rpc_build::compile_schemas(", 0
-    while (found := source.find(needle, start)) >= 0:
-        index, depth = found + len(needle), 1
+    calls, start = [], 0
+    pattern = re.compile(r"\bhyprstream_rpc_build\s*::\s*compile_schemas\s*\(")
+    while (match := pattern.search(source, start)) is not None:
+        found, index, depth = match.start(), match.end(), 1
         while index < len(source) and depth:
             depth += (source[index] == "(") - (source[index] == ")"); index += 1
         required(depth == 0, f"{build_file} has unterminated persisted-CGR call")
-        args = split_top_level(source[found + len(needle):index - 1])
+        args = split_top_level(source[match.end():index - 1])
         required(len(args) == 4, f"{build_file} persisted-CGR call has unexpected arguments")
         calls.append({"source_root": path(args[0]), "import_roots": paths(args[2]), "schemas": schemas(args[3])})
         start = index
-    required(calls, f"{build_file} is not a persisted-CGR producer")
+    required(calls or "compile_schemas" not in source, f"{build_file} uses an unrecognized persisted-CGR alias")
     return calls
 
 
@@ -296,6 +301,8 @@ def check_cgr(catalog: dict[str, Any], repo: Path, schemas: list[dict[str, Any]]
               mutations: dict[str, str] | None) -> None:
     roots = catalog.get("cgr_build_roots", {})
     required(roots == CGR_ROOTS, "persisted-CGR import roots drift")
+    producers = [path for path in tracked(repo, "build.rs", "**/build.rs") if "compile_schemas" in strip_rust_comments(text(repo, path, mutations))]
+    required(set(roots) == set(producers), "persisted-CGR producer inventory drift")
     for build_file, import_roots in roots.items():
         source = text(repo, build_file, mutations)
         required(isinstance(import_roots, list) and import_roots, f"{build_file} lacks import roots")
@@ -537,10 +544,10 @@ def self_test(repo: Path) -> None:
     expect_failure("public license", repo, catalog, bad, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["package_contract"]["requirements"] = []
     expect_failure("package requirements", repo, catalog, bad, schemas, consumers)
-    validate(repo, catalog, corpus, schemas, consumers, event="push", revision=catalog["source_commit"])
+    validate(repo, catalog, corpus, schemas, consumers, event="push", revision=git(repo, "rev-parse", "HEAD~1"))
     bad = copy.deepcopy(catalog); bad["source_commit"] = stale; bad["source_tree"] = git(repo, "rev-parse", f"{stale}^{{tree}}")
     try:
-        validate(repo, bad, corpus, schemas, consumers, event="push", revision=catalog["source_commit"])
+        validate(repo, bad, corpus, schemas, consumers, event="push", revision=git(repo, "rev-parse", "HEAD~1"))
     except CatalogError:
         pass
     else:
