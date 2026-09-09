@@ -73,7 +73,7 @@ pub use worker_handlers::{
     handle_worker_stop, handle_worker_terminal,
 };
 pub use service_handlers::{
-    handle_service_install,
+    handle_service_install, handle_service_provision_policy_templates,
     handle_service_uninstall, handle_service_start, handle_service_stop, handle_service_status,
 };
 pub use sign_challenge::handle_sign_challenge;

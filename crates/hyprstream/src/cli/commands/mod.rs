@@ -299,4 +299,14 @@ pub enum ServiceAction {
         /// Service name (e.g. registry, discovery, policy)
         name: String,
     },
+
+    /// Persist built-in policy templates directly into the configured policy store
+    ///
+    /// This offline provisioning command is intended for boot orchestration before
+    /// Policy or Registry starts. It does not contact a service or load credentials.
+    ProvisionPolicyTemplates {
+        /// Built-in template name; repeat for each template to provision
+        #[arg(long, required = true, action = clap::ArgAction::Append)]
+        template: Vec<String>,
+    },
 }

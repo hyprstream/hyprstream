@@ -1034,12 +1034,15 @@ impl PolicyManager {
         let mut enforcer = self.enforcer.write().await;
 
         // Add policy rules
+        let existing_policies = enforcer.get_policy();
         let policy_vecs: Vec<Vec<String>> = policies
             .iter()
             .map(ServicePolicyRule::to_vec)
+            .filter(|rule| !existing_policies.contains(rule))
             .collect();
         if !policy_vecs.is_empty() {
-            enforcer.add_policies(policy_vecs)
+            enforcer
+                .add_policies(policy_vecs)
                 .await
                 .map_err(PolicyError::CasbinError)?;
         }
@@ -1050,25 +1053,34 @@ impl PolicyManager {
         // the verified request domain itself is `*`.
         if let Some(groupings) = template.groupings {
             if let Some(domain) = tenant_domains.first() {
+                let existing_groupings = enforcer.get_named_grouping_policy("g2");
                 for grouping in groupings {
+                    let grouping = vec![
+                        grouping.user.to_owned(),
+                        grouping.role.to_owned(),
+                        (*domain).to_owned(),
+                    ];
+                    if existing_groupings.contains(&grouping) {
+                        continue;
+                    }
                     enforcer
-                        .add_named_grouping_policy(
-                            "g2",
-                            vec![
-                                grouping.user.to_owned(),
-                                grouping.role.to_owned(),
-                                (*domain).to_owned(),
-                            ],
-                        )
+                        .add_named_grouping_policy("g2", grouping)
                         .await
                         .map_err(PolicyError::CasbinError)?;
                 }
             } else {
-                let grouping_vecs: Vec<Vec<String>> = groupings.iter().map(ServiceGrouping::to_vec).collect();
-                enforcer
-                    .add_grouping_policies(grouping_vecs)
-                    .await
-                    .map_err(PolicyError::CasbinError)?;
+                let existing_groupings = enforcer.get_grouping_policy();
+                let grouping_vecs: Vec<Vec<String>> = groupings
+                    .iter()
+                    .map(ServiceGrouping::to_vec)
+                    .filter(|grouping| !existing_groupings.contains(grouping))
+                    .collect();
+                if !grouping_vecs.is_empty() {
+                    enforcer
+                        .add_grouping_policies(grouping_vecs)
+                        .await
+                        .map_err(PolicyError::CasbinError)?;
+                }
             }
         }
 

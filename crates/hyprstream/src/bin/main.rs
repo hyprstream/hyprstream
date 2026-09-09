@@ -35,7 +35,7 @@ use hyprstream_core::cli::{
     handle_worker_run, handle_worker_start, handle_worker_stats, handle_worker_status,
     handle_worker_terminal, handle_worker_stop,
     // Service handlers
-    handle_service_install,
+    handle_service_install, handle_service_provision_policy_templates,
     handle_service_start, handle_service_status,
     handle_service_stop, handle_service_uninstall,
 };
@@ -2813,6 +2813,30 @@ fn main() -> Result<()> {
         }
     }
 
+    // ── `service provision-policy-templates` early dispatch ─────────────────
+    // The OS-owned bootstrap writes the configured policy store before either
+    // Policy or Registry starts. It must never construct a resolver or borrow
+    // a runtime service credential.
+    if let Some(("service", sub_m)) = matches.subcommand() {
+        if let Some(("provision-policy-templates", provision_m)) = sub_m.subcommand() {
+            let templates = provision_m
+                .get_many::<String>("template")
+                .context("at least one policy template is required")?
+                .cloned()
+                .collect::<Vec<_>>();
+            let models_dir = config.models_dir().clone();
+            return with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    handle_service_provision_policy_templates(&models_dir, &templates).await
+                },
+            );
+        }
+    }
+
     // ── `service ensure-key` early dispatch ─────────────────────────────────
     // Key materialization for provisioning/keygen units: it must work on a
     // fresh install (before any bootstrap-pubkeys exist) and must not start
@@ -3776,6 +3800,18 @@ fn main() -> Result<()> {
                         &name,
                     )?;
                 }
+                ServiceAction::ProvisionPolicyTemplates { template } => {
+                    let models_dir = config_for_service.models_dir().clone();
+                    with_runtime(
+                        RuntimeConfig {
+                            device: DeviceConfig::request_cpu(),
+                            multi_threaded: true,
+                        },
+                        || async move {
+                            handle_service_provision_policy_templates(&models_dir, &template).await
+                        },
+                    )?;
+                }
             }
         }
 
@@ -4031,6 +4067,35 @@ fn main() -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod resolver_startup_controls {
+    use clap::FromArgMatches as _;
+
+    #[test]
+    fn offline_policy_provision_cli_requires_and_preserves_templates() {
+        let matches = super::build_cli()
+            .try_get_matches_from([
+                "hyprstream",
+                "service",
+                "provision-policy-templates",
+                "--template",
+                "public-inference",
+                "--template",
+                "public-read",
+            ])
+            .expect("offline policy CLI");
+        let service = matches.subcommand_matches("service").expect("service");
+        let action = hyprstream_core::cli::commands::ServiceAction::from_arg_matches(service)
+            .expect("service action");
+        let hyprstream_core::cli::commands::ServiceAction::ProvisionPolicyTemplates { template } =
+            action
+        else {
+            panic!("wrong service action");
+        };
+        assert_eq!(template, ["public-inference", "public-read"]);
+        assert!(super::build_cli()
+            .try_get_matches_from(["hyprstream", "service", "provision-policy-templates",])
+            .is_err());
+    }
+
     #[test]
     fn deployment_bootstrap_cli_requires_roster_and_parses_lifetime() {
         let matches = super::build_cli().try_get_matches_from([
