@@ -29,13 +29,18 @@ use tokio::sync::Mutex;
 use super::{ProcessConfig, ProcessKind, ProcessReadiness, SpawnedProcess, SpawnerBackend};
 use hyprstream_rpc::error::{Result, RpcError};
 
-/// One per-child sd_notify endpoint beneath the protected runtime directory.
+/// One per-child sd_notify endpoint in the Linux/Android abstract namespace.
 ///
-/// The launcher binds a unique datagram socket, hands its path to the child as
+/// The launcher binds a compact random datagram address, hands it to the child as
 /// `NOTIFY_SOCKET`, and accepts `READY=1` only from the spawned child's PID
 /// (via `SO_PASSCRED` sender credentials). This is local lifecycle
 /// supervision, not a service RPC endpoint — nothing dials it and no service
 /// traffic flows through it.
+///
+/// Abstract addresses have no filesystem inode or mode and may be visible in
+/// `/proc/net/unix`. The random name limits collisions; it is not an access
+/// control or authentication mechanism. Kernel-attested sender credentials
+/// and exact child-PID matching provide the authentication boundary.
 ///
 /// Platform support: the credential combination this receiver is built on —
 /// `SO_PASSCRED` plus `SCM_CREDENTIALS` for kernel-attested sender-PID
@@ -46,116 +51,63 @@ use hyprstream_rpc::error::{Result, RpcError};
 /// platforms refuse supervised Notify launches pre-spawn (see
 /// `spawn_notified`) instead of weakening the sender-PID check.
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Debug)]
 struct ChildNotifySocket {
     fd: OwnedFd,
-    path: std::path::PathBuf,
+    endpoint: String,
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 impl ChildNotifySocket {
-    fn bind(name: &str) -> Result<Self> {
-        // Per-attempt private directory, created EXCLUSIVELY (no
-        // exists-ok): each attempt owns its directory outright, so
-        // concurrent attempts of the same service can never share an
-        // endpoint (a fixed name+launcher-PID path collided across
-        // attempts). The nanos suffix keeps attempts collision-free; the
-        // suffix is NOT a secret — sender-PID credentials are the identity
-        // check.
-        let runtime = hyprstream_rpc::paths::runtime_dir();
-        let mut dir = None;
-        for _ in 0..8 {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default();
-            let candidate =
-                runtime.join(format!("notify-{name}-{}-{nanos}", nix::unistd::getpid()));
-            match std::fs::create_dir(&candidate) {
-                Ok(()) => {
-                    dir = Some(candidate);
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => {
-                    return Err(RpcError::SpawnFailed(format!(
-                        "failed to create notify runtime dir {}: {e}",
-                        candidate.display()
-                    )))
-                }
-            }
-        }
-        let Some(dir) = dir else {
-            return Err(RpcError::SpawnFailed(format!(
-                "could not create a unique notify runtime dir for {name}"
-            )));
-        };
-        // This attempt owns `dir` from here: any failure between creation
-        // and a fully bound socket must remove the directory before
-        // returning, so a partial bind never leaks an endpoint directory.
-        let result = Self::bind_in(&dir);
-        if result.is_err() {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-        result
+    fn bind(_name: &str) -> Result<Self> {
+        Self::bind_with_name_source(|| format!("hypr-n-{}", uuid::Uuid::new_v4().simple()))
     }
 
-    fn bind_in(dir: &std::path::Path) -> Result<Self> {
+    fn bind_with_name_source(mut next_name: impl FnMut() -> String) -> Result<Self> {
         use nix::sys::socket::{
             bind, setsockopt, sockopt::PassCred, socket, AddressFamily, SockFlag, SockType,
             UnixAddr,
         };
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(
-                |e| {
-                    RpcError::SpawnFailed(format!(
-                        "failed to restrict notify runtime dir {}: {e}",
-                        dir.display()
-                    ))
-                },
-            )?;
-        }
-        let path = dir.join("notify.sock");
-
-        let fd = socket(
-            AddressFamily::Unix,
-            SockType::Datagram,
-            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
-            None,
-        )
-        .map_err(|e| RpcError::SpawnFailed(format!("notify socket creation failed: {e}")))?;
-        setsockopt(&fd, PassCred, &true)
-            .map_err(|e| RpcError::SpawnFailed(format!("SO_PASSCRED setup failed: {e}")))?;
-        bind(fd.as_raw_fd(), &UnixAddr::new(&path).map_err(|e| {
-            RpcError::SpawnFailed(format!("notify socket path invalid: {e}"))
-        })?)
-        .map_err(|e| RpcError::SpawnFailed(format!("notify socket bind failed: {e}")))?;
-        // Owner-only permissions on the bound socket's filesystem pathname —
-        // fchmod on the fd does NOT change the pathname mode (root-verified on
-        // this host), so chmod the path itself, checked. Hardening against
-        // nuisance datagrams; sender-PID credentials remain the identity check.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                &path,
-                std::fs::Permissions::from_mode(0o600),
-            )
-            .map_err(|e| {
-                RpcError::SpawnFailed(format!(
-                    "failed to restrict notify socket {}: {e}",
-                    path.display()
-                ))
+        // A new fd and random abstract address are created for each bounded
+        // attempt. EADDRINUSE is the only retryable outcome; every other
+        // setup error fails closed before a child is spawned.
+        for _ in 0..8 {
+            let name = next_name();
+            let address = UnixAddr::new_abstract(name.as_bytes()).map_err(|e| {
+                RpcError::SpawnFailed(format!("notification endpoint name invalid: {e}"))
             })?;
+            let fd = socket(
+                AddressFamily::Unix,
+                SockType::Datagram,
+                SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+                None,
+            )
+            .map_err(|e| RpcError::SpawnFailed(format!("notify socket creation failed: {e}")))?;
+            setsockopt(&fd, PassCred, &true)
+                .map_err(|e| RpcError::SpawnFailed(format!("SO_PASSCRED setup failed: {e}")))?;
+            match bind(fd.as_raw_fd(), &address) {
+                Ok(()) => {
+                    return Ok(Self {
+                        fd,
+                        endpoint: format!("@{name}"),
+                    })
+                }
+                Err(nix::errno::Errno::EADDRINUSE) => continue,
+                Err(e) => {
+                    return Err(RpcError::SpawnFailed(format!(
+                        "notification endpoint bind failed: {e}"
+                    )))
+                }
+            }
         }
-
-        Ok(Self { fd, path })
+        Err(RpcError::SpawnFailed(
+            "could not bind a unique notification endpoint after 8 attempts".to_owned(),
+        ))
     }
 
-    fn socket_path(&self) -> &std::path::Path {
-        &self.path
+    fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     /// Non-blocking poll for a `READY=1` datagram from exactly `child_pid`.
@@ -204,19 +156,6 @@ impl ChildNotifySocket {
             return Ok(false);
         }
         Ok(bytes > 0 && buffer[..bytes] == *b"READY=1")
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-impl Drop for ChildNotifySocket {
-    fn drop(&mut self) {
-        // OwnedFd closes the descriptor itself; remove the socket inode and
-        // this launch's private runtime directory.
-        let _ = std::fs::remove_file(&self.path);
-        if let Some(parent) = self.path.parent() {
-            // Only ever removes the per-launch `notify-<name>-<pid>` dir.
-            let _ = std::fs::remove_dir(parent);
-        }
     }
 }
 
@@ -535,13 +474,15 @@ impl StandaloneBackend {
     /// Notify-supervised path (#1585): the spawn reports success only after
     /// the child's own `READY=1` datagram arrives from the child's PID; a
     /// child exit or the hard timeout fails the spawn, the child is
-    /// terminated/reaped, and no PID/notify artifact survives.
+    /// terminated/reaped, and no PID artifact or live abstract notification
+    /// endpoint survives.
     ///
     /// Platform support: the credential-authenticated receiver
     /// (`SO_PASSCRED`/`SCM_CREDENTIALS`, exact child-PID matching) exists on
     /// Linux/Android only. On any other target this request fails closed
-    /// BEFORE spawning the child or creating the notification directory, PID
-    /// artifact, or any other launch side effect — there is no fallback to
+    /// BEFORE spawning the child or binding a notification endpoint, creating
+    /// a PID artifact, or causing any other launch side effect — there is no
+    /// fallback to
     /// `Immediate` readiness and no unauthenticated receiver.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     async fn spawn_notified(
@@ -603,7 +544,7 @@ impl StandaloneBackend {
         }
         // The child learns its notification endpoint only through its own
         // environment; the launcher's environment is untouched.
-        cmd.env("NOTIFY_SOCKET", notify.socket_path());
+        cmd.env("NOTIFY_SOCKET", notify.endpoint());
         cmd.kill_on_drop(false);
 
         let child = cmd.spawn().map_err(|e| {
@@ -797,14 +738,14 @@ impl StandaloneBackend {
             "Daemon spawned successfully (notification readiness satisfied)"
         );
 
-        // ChildNotifySocket::drop closes the endpoint and removes the socket.
+        // ChildNotifySocket::drop closes the abstract endpoint.
         Ok(SpawnedProcess::new(id, ProcessKind::Direct(pid))
             .with_pid_file(pid_file))
     }
 
     /// Non-Linux arm of the Notify-supervised path: an explicit pre-spawn
     /// refusal (see the Linux/Android arm's contract above). Nothing is
-    /// spawned and no notification directory, child guard, or PID artifact is
+    /// spawned and no notification endpoint, child guard, or PID artifact is
     /// created; there is deliberately no fallback to `Immediate` readiness,
     /// because a supervised launch whose sender cannot be kernel-attested
     /// must not report success from an unauthenticated payload.
@@ -854,7 +795,7 @@ impl StandaloneBackend {
                 return Err(format!(
                     "no READY=1 within {}s (notification endpoint {})",
                     timeout.as_secs(),
-                    notify.socket_path().display()
+                    notify.endpoint()
                 ));
             }
             let wait = poll.tick();
@@ -1514,6 +1455,30 @@ mod notify_readiness_tests {
     const PENDING_RELEASE: &str = "HYPRSTREAM_LAUNCHER_PENDING_RELEASE";
     const OBSTACLE_HELPER: &str = "HYPRSTREAM_LAUNCHER_OBSTACLE_HELPER";
     const OBSTACLE_PATH: &str = "HYPRSTREAM_LAUNCHER_OBSTACLE_PATH";
+    const LONG_RUNTIME_HELPER: &str = "HYPRSTREAM_LONG_NOTIFY_RUNTIME_HELPER";
+
+    fn send_ready_to(endpoint: &str) -> anyhow::Result<()> {
+        use nix::sys::socket::{
+            sendto, socket, AddressFamily, MsgFlags, SockFlag, SockType, UnixAddr,
+        };
+
+        let name = endpoint
+            .strip_prefix('@')
+            .expect("launcher notification endpoint must be abstract");
+        let fd = socket(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )?;
+        sendto(
+            fd.as_raw_fd(),
+            b"READY=1",
+            &UnixAddr::new_abstract(name.as_bytes())?,
+            MsgFlags::empty(),
+        )?;
+        Ok(())
+    }
 
     /// Helper child: reports readiness through the real sd_notify send path,
     /// then stays alive so the supervisor observes a genuinely RUNNING ready
@@ -1572,8 +1537,9 @@ mod notify_readiness_tests {
         assert!(gone, "child pid {pid} must be reaped after cleanup");
     }
 
-    /// Assert no notification endpoint (private dir or socket) for `name`
-    /// remains under the runtime dir.
+    /// Assert that lifecycle supervision created no legacy pathname endpoint.
+    /// Abstract endpoints have no filesystem inode and disappear when their
+    /// owned descriptor closes.
     fn assert_no_notify_inode(name: &str) {
         let dir = hyprstream_rpc::paths::runtime_dir();
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
@@ -1781,6 +1747,59 @@ mod notify_readiness_tests {
         );
         assert_pid_gone(pid);
         assert_no_notify_inode("notify-ready-control");
+        Ok(())
+    }
+
+    /// A valid long instance/runtime namespace must not influence the compact
+    /// abstract notification address. Run this scenario in a subprocess so
+    /// its process-global path environment cannot race other libtest cases.
+    #[test]
+    fn notified_spawn_with_long_runtime_reaches_ready_stops_and_reaps() -> Result<()> {
+        if std::env::var_os(LONG_RUNTIME_HELPER).is_some() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            return runtime.block_on(async {
+                let name = "notify-long-runtime";
+                let backend = StandaloneBackend::new();
+                let config = ProcessConfig::new(name, test_binary())
+                    .args([
+                        "--exact",
+                        "service::spawner::standalone::notify_readiness_tests::notify_ready_helper_child",
+                        "--nocapture",
+                    ])
+                    .env(READY_HELPER, "1")
+                    .with_notify_ready(Duration::from_secs(30));
+                let process = backend.spawn(config).await?;
+                let pid = process.pid().expect("direct child pid");
+                assert!(backend.is_running(&process).await?);
+                backend.stop(&process).await?;
+                assert!(!backend.is_running(&process).await?);
+                assert_pid_gone(pid);
+                assert!(
+                    !hyprstream_rpc::paths::service_pid_file(name).exists(),
+                    "stopped child must leave no PID artifact"
+                );
+                assert_no_notify_inode(name);
+                Ok(())
+            });
+        }
+
+        let runtime = tempfile::tempdir()?;
+        let status = std::process::Command::new(test_binary())
+            .args([
+                "--exact",
+                "service::spawner::standalone::notify_readiness_tests::notified_spawn_with_long_runtime_reaches_ready_stops_and_reaps",
+                "--nocapture",
+            ])
+            .env(LONG_RUNTIME_HELPER, "1")
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env(
+                "HYPRSTREAM_INSTANCE",
+                "production-west-instance-0000000000000000",
+            )
+            .status()?;
+        assert!(status.success(), "isolated long-runtime scenario failed: {status}");
         Ok(())
     }
 
@@ -2231,16 +2250,91 @@ mod notify_readiness_tests {
         Ok(())
     }
 
+    #[test]
+    fn notification_endpoint_is_compact_unique_and_abstract() -> Result<()> {
+        let first = ChildNotifySocket::bind("a-service-name-that-is-deliberately-ignored")?;
+        let second = ChildNotifySocket::bind("a-service-name-that-is-deliberately-ignored")?;
+        assert!(first.endpoint().starts_with('@'));
+        assert!(second.endpoint().starts_with('@'));
+        assert_ne!(first.endpoint(), second.endpoint());
+        assert!(first.endpoint().len() <= 48);
+        Ok(())
+    }
+
+    #[test]
+    fn notification_endpoint_collision_retries_are_bounded() -> anyhow::Result<()> {
+        use nix::sys::socket::{
+            bind, socket, AddressFamily, SockFlag, SockType, UnixAddr,
+        };
+
+        let occupied_name = format!("hypr-n-collision-{}", std::process::id());
+        let occupied = socket(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )?;
+        bind(
+            occupied.as_raw_fd(),
+            &UnixAddr::new_abstract(occupied_name.as_bytes())?,
+        )?;
+
+        let mut attempts = 0usize;
+        let error = ChildNotifySocket::bind_with_name_source(|| {
+            attempts += 1;
+            occupied_name.clone()
+        })
+        .expect_err("eight collisions must fail closed");
+        assert_eq!(attempts, 8);
+        assert!(error.to_string().contains("after 8 attempts"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn foreign_datagram_flood_cannot_extend_readiness_deadline() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let backend = StandaloneBackend::new();
+        let notify = ChildNotifySocket::bind("flood-deadline")?;
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()?;
+        let endpoint = notify.endpoint().to_owned();
+        let flooding = Arc::new(AtomicBool::new(true));
+        let sender = std::thread::spawn({
+            let flooding = Arc::clone(&flooding);
+            move || {
+                while flooding.load(Ordering::Relaxed) {
+                    let _ = send_ready_to(&endpoint);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let outcome = backend
+            .await_child_readiness(&mut child, &notify, Duration::from_millis(200))
+            .await;
+        flooding.store(false, Ordering::Relaxed);
+        sender.join().expect("flood sender thread");
+        child.kill().await?;
+        child.wait().await?;
+
+        let error = outcome.expect_err("foreign datagrams must not satisfy readiness");
+        assert!(error.contains("no READY=1"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        Ok(())
+    }
+
     /// Sender-PID matching: a READY datagram from any process other than the
     /// expected child is ignored, not honored.
     #[tokio::test]
-    async fn notify_socket_rejects_spoofed_sender() -> Result<()> {
+    async fn notify_socket_rejects_spoofed_sender() -> anyhow::Result<()> {
         let notify = ChildNotifySocket::bind("spoof-probe")?;
-        let sender = std::os::unix::net::UnixDatagram::unbound()?;
         // First datagram: sent by THIS test process but checked against a
         // different expected PID — the refusal must consume it without
         // satisfying readiness.
-        sender.send_to(b"READY=1", notify.socket_path())?;
+        send_ready_to(notify.endpoint())?;
         let this_pid = std::process::id() as i32;
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -2248,7 +2342,7 @@ mod notify_readiness_tests {
             "a foreign sender must not satisfy readiness"
         );
         // Second datagram, checked against the actual sender PID: accepted.
-        sender.send_to(b"READY=1", notify.socket_path())?;
+        send_ready_to(notify.endpoint())?;
         std::thread::sleep(Duration::from_millis(50));
         assert!(
             notify.try_recv_ready(this_pid)?,
