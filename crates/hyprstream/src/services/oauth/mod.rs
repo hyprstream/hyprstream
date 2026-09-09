@@ -82,7 +82,7 @@ use hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge;
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_service::Spawnable;
 use tokio::sync::Notify;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::config::{CredentialsBackend, OAuthConfig};
 use crate::services::PolicyClient;
@@ -1236,8 +1236,13 @@ impl Spawnable for OAuthService {
                                 }
                                 substrate_owned = Some(substrate);
                             }
-                            Err(error) if iroh_required => return Err(error),
-                            Err(error) => warn!("OAuth iroh substrate bind failed; continuing quinn-only: {error:#}"),
+                            Err(error) => {
+                                // An enabled OAuth Iroh endpoint is advertised in the DID
+                                // document before the HTTP server becomes reachable. A bind
+                                // failure must therefore abort every profile; continuing would
+                                // publish a node id with no live endpoint behind it.
+                                return Err(error);
+                            }
                         }
                     }
                     let control_transport = self.control_transport.clone();

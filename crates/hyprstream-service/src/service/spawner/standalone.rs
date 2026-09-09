@@ -20,6 +20,8 @@ use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
 use std::process::Stdio;
+#[cfg(unix)]
+use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -36,19 +38,21 @@ use hyprstream_rpc::error::{Result, RpcError};
 /// them in the launcher. PGlite registers stdout with epoll, so `/dev/null`
 /// is not a safe sink on Linux; a pipe preserves pollability and prevents the
 /// launcher's stdout/stderr or SSH channel from being held open by the child.
-fn detached_stdio() -> std::io::Result<Stdio> {
+fn detached_output_stdio() -> std::io::Result<Stdio> {
     #[cfg(unix)]
     {
-        let (reader, writer) = nix::unistd::pipe()?;
+        use nix::fcntl::OFlag;
+        // CLOEXEC keeps the sink reader out of the adopted daemon. The sink
+        // process itself owns the reader and survives launcher exit, so a
+        // daemon can write indefinitely without filling an undrained pipe.
+        let (reader, writer) = nix::unistd::pipe2(OFlag::O_CLOEXEC)?;
         let reader = unsafe { std::fs::File::from_raw_fd(reader) };
         let writer = unsafe { std::fs::File::from_raw_fd(writer) };
-        std::thread::Builder::new()
-            .name("hyprstream-daemon-stdio-drain".to_owned())
-            .spawn(move || {
-                let mut reader = reader;
-                let mut sink = std::io::sink();
-                let _ = std::io::copy(&mut reader, &mut sink);
-            })?;
+        StdCommand::new("cat")
+            .stdin(Stdio::from(reader))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
         Ok(Stdio::from(writer))
     }
     #[cfg(not(unix))]
@@ -58,9 +62,9 @@ fn detached_stdio() -> std::io::Result<Stdio> {
 }
 
 fn configure_detached_stdio(cmd: &mut Command) -> std::io::Result<()> {
-    cmd.stdin(detached_stdio()?)
-        .stdout(detached_stdio()?)
-        .stderr(detached_stdio()?);
+    cmd.stdin(Stdio::null())
+        .stdout(detached_output_stdio()?)
+        .stderr(detached_output_stdio()?);
     Ok(())
 }
 
@@ -1552,6 +1556,22 @@ mod notify_readiness_tests {
     const OBSTACLE_HELPER: &str = "HYPRSTREAM_LAUNCHER_OBSTACLE_HELPER";
     const OBSTACLE_PATH: &str = "HYPRSTREAM_LAUNCHER_OBSTACLE_PATH";
     const LONG_RUNTIME_HELPER: &str = "HYPRSTREAM_LONG_NOTIFY_RUNTIME_HELPER";
+    const SPOOF_HELPER: &str = "HYPRSTREAM_NOTIFY_SPOOF_HELPER";
+
+    /// Helper child: sends READY datagrams from a distinct process PID so the
+    /// receiver regression test exercises kernel credential filtering rather
+    /// than a same-process sender.
+    #[test]
+    fn notify_spoof_helper_child() {
+        if std::env::var_os(SPOOF_HELPER).is_none() {
+            return;
+        }
+        let endpoint = std::env::var("HYPRSTREAM_NOTIFY_SPOOF_ENDPOINT").expect("endpoint");
+        for _ in 0..128 {
+            let _ = send_ready_to(&endpoint);
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
 
     fn send_ready_to(endpoint: &str) -> anyhow::Result<()> {
         use nix::sys::socket::{
@@ -2387,6 +2407,16 @@ mod notify_readiness_tests {
     }
 
     #[tokio::test]
+    async fn detached_stdio_drains_large_post_launch_output() -> anyhow::Result<()> {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 0.05; yes x | head -c 1048576"]);
+        configure_detached_stdio(&mut cmd)?;
+        let status = cmd.status().await?;
+        assert!(status.success(), "post-launch output child must exit cleanly");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn foreign_datagram_flood_cannot_extend_readiness_deadline() -> Result<()> {
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -2428,21 +2458,26 @@ mod notify_readiness_tests {
     async fn notify_socket_rejects_spoofed_sender() -> anyhow::Result<()> {
         let notify = ChildNotifySocket::bind("spoof-probe")?;
         let this_pid = std::process::id() as i32;
-        // A sustained foreign queue must be drained in one poll so it cannot
-        // hide the genuine sender's datagram behind the 20ms readiness tick.
-        let endpoint = notify.endpoint().to_owned();
-        let flooding = std::thread::spawn(move || {
-            for _ in 0..128 {
-                let _ = send_ready_to(&endpoint);
-            }
-        });
-        flooding.join().expect("spoof flood sender thread");
+        // Flood from a distinct helper process, whose kernel-attested PID is
+        // foreign to this receiver. The genuine datagram follows the flood.
+        let mut foreign = std::process::Command::new(test_binary())
+            .args([
+                "--exact",
+                "service::spawner::standalone::notify_readiness_tests::notify_spoof_helper_child",
+                "--nocapture",
+            ])
+            .env(SPOOF_HELPER, "1")
+            .env("HYPRSTREAM_NOTIFY_SPOOF_ENDPOINT", notify.endpoint())
+            .spawn()?;
+        std::thread::sleep(Duration::from_millis(50));
         send_ready_to(notify.endpoint())?;
         std::thread::sleep(Duration::from_millis(50));
         assert!(
             notify.try_recv_ready(this_pid)?,
-            "the matching sender satisfies readiness"
+            "the matching sender satisfies readiness after foreign flood"
         );
+        foreign.kill()?;
+        let _ = foreign.wait();
         Ok(())
     }
 }
