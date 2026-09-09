@@ -238,15 +238,13 @@ def check_provenance(record: dict[str, Any], repo: Path, label: str, corpus: dic
     required(isinstance(declared_digest, str) and re.fullmatch(r"[0-9a-f]{64}", declared_digest) is not None,
              f"{label} has invalid source_input_digest")
     topology, boundary = audited_input(repo, event, revision)
-    # PR validation attests the recorded revision/tree pair while its object is
-    # available.  A squash push may not retain PR objects, so push validation is
-    # deliberately content-addressed: its durable input digest is checked below.
-    if topology == "pull_request":
-        git(repo, "cat-file", "-e", f"{commit}^{{commit}}")
-        required(git(repo, "rev-parse", f"{commit}^{{tree}}") == tree,
-                 f"{label} source_tree does not match source_commit")
-        required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", boundary, commit]).returncode == 0,
-                 f"{label} source_commit is not bound to the pull-request input")
+    # The Git pair is the durable event-boundary attestation.  Unlike a PR
+    # intermediate, the base/push-before commit is present after merge, squash,
+    # and rebase; the separately stored digest attests the selected source input.
+    git(repo, "cat-file", "-e", f"{commit}^{{commit}}")
+    required(git(repo, "rev-parse", f"{commit}^{{tree}}") == tree,
+             f"{label} source_tree does not match source_commit")
+    required(commit == boundary, f"{label} source_commit is not the trusted {topology} boundary")
     staged_catalog = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--quiet", "--",
                                      "docs/schema-catalog.json", "docs/corpus-sources.json"]).returncode != 0
     required(commit != git(repo, "rev-parse", "HEAD") or staged_catalog,
@@ -256,9 +254,6 @@ def check_provenance(record: dict[str, Any], repo: Path, label: str, corpus: dic
     paths = provenance_paths(repo, corpus)
     required(input_digest(repo, paths, mutations) == declared_digest,
              f"{label} current audited inputs differ from source_input_digest")
-    if topology == "pull_request":
-        required(input_digest(repo, paths, tree=tree) == declared_digest,
-                 f"{label} source_tree does not contain the audited input state")
 
 
 def owner_manifest(repo: Path, schema_path: str, owner_directories: list[str]) -> tuple[str, str, str]:
@@ -282,49 +277,45 @@ def check_owner_directories(catalog: dict[str, Any], repo: Path) -> list[str]:
     return owner_directories
 
 
-def strip_rust_comments(source: str) -> str:
-    """Blank comments while preserving literals and source offsets."""
-    out, index, quote, block = [], 0, None, 0
+def rust_lex(source: str, mask_literals: bool) -> str:
+    """Offset-preserving Rust comment/literal lexer for the limited build.rs grammar."""
+    out, index, block = [], 0, 0
+    def blank(value: str) -> str:
+        return "".join("\n" if char == "\n" else " " for char in value)
     while index < len(source):
         pair = source[index:index + 2]
-        if quote:
-            out.append(source[index])
-            if source[index] == "\\" and index + 1 < len(source):
-                out.append(source[index + 1]); index += 2; continue
-            if source[index] == quote: quote = None
-            index += 1; continue
         if pair == "//":
-            end = source.find("\n", index)
-            if end < 0: end = len(source)
-            out.extend(" " * (end - index)); index = end; continue
-        if pair == "/*": block += 1; out.extend("  "); index += 2; continue
-        if pair == "*/" and block: block -= 1; out.extend("  "); index += 2; continue
-        if block: out.append("\n" if source[index] == "\n" else " "); index += 1; continue
-        if source[index] == "\"" or (source[index] == "'" and not (index + 1 < len(source) and (source[index + 1].isalpha() or source[index + 1] == "_"))): quote = source[index]
-        out.append(source[index]); index += 1
+            end = source.find("\n", index); end = len(source) if end < 0 else end
+            out.append(blank(source[index:end])); index = end; continue
+        if pair == "/*": block += 1; out.append("  "); index += 2; continue
+        if pair == "*/" and block: block -= 1; out.append("  "); index += 2; continue
+        if block:
+            out.append("\n" if source[index] == "\n" else " "); index += 1; continue
+        raw = re.match(r"(?:br|r)(?P<hashes>#{0,32})\"", source[index:])
+        if raw:
+            close = '"' + raw.group("hashes")
+            end = source.find(close, index + len(raw.group(0)))
+            end = len(source) if end < 0 else end + len(close)
+            value = source[index:end]; out.append(blank(value) if mask_literals else value); index = end; continue
+        char = source[index]
+        is_char = char == "'" and (index + 2 < len(source)) and (source[index + 1] == "\\" or source[index + 2] == "'")
+        if char == '"' or is_char:
+            quote, end = char, index + 1
+            while end < len(source):
+                if source[end] == "\\": end += 2; continue
+                end += 1
+                if source[end - 1] == quote: break
+            value = source[index:end]; out.append(blank(value) if mask_literals else value); index = end; continue
+        out.append(char); index += 1
     return "".join(out)
+
+
+def strip_rust_comments(source: str) -> str:
+    return rust_lex(source, False)
 
 
 def strip_rust_noncode(source: str) -> str:
-    """Blank comments and literals while retaining offsets and token boundaries."""
-    out, index, quote, block = [], 0, None, 0
-    while index < len(source):
-        pair = source[index:index + 2]
-        if quote:
-            out.append("\n" if source[index] == "\n" else " ")
-            if source[index] == "\\" and index + 1 < len(source): out.append(" "); index += 2; continue
-            if source[index] == quote: quote = None
-            index += 1; continue
-        if pair == "//":
-            index = source.find("\n", index)
-            if index < 0: break
-            out.append("\n"); index += 1; continue
-        if pair == "/*": block += 1; out.extend("  "); index += 2; continue
-        if pair == "*/" and block: block -= 1; out.extend("  "); index += 2; continue
-        if block: out.append("\n" if source[index] == "\n" else " "); index += 1; continue
-        if source[index] == "\"" or (source[index] == "'" and not (index + 1 < len(source) and (source[index + 1].isalpha() or source[index + 1] == "_"))): quote = source[index]
-        out.append(source[index]); index += 1
-    return "".join(out)
+    return rust_lex(source, True)
 
 
 def split_top_level(value: str) -> list[str]:
@@ -376,8 +367,9 @@ def cgr_inventory(build_file: str, source: str) -> list[dict[str, Any]]:
         module_aliases.add(match.group(1))
     for match in re.finditer(r"\buse\s+hyprstream_rpc_build\s*::\s*compile_schemas(?:\s+as\s+([A-Za-z_]\w*))?\s*;", tokens):
         function_aliases.add(match.group(1) or "compile_schemas")
-    for match in re.finditer(r"\buse\s+hyprstream_rpc_build\s*::\s*\{\s*compile_schemas(?:\s+as\s+([A-Za-z_]\w*))?\s*\}\s*;", tokens):
-        function_aliases.add(match.group(1) or "compile_schemas")
+    for group in re.finditer(r"\buse\s+hyprstream_rpc_build\s*::\s*\{(?P<items>[^}]*)\}\s*;", tokens):
+        for match in re.finditer(r"(?:^|,)\s*compile_schemas(?:\s+as\s+([A-Za-z_]\w*))?\s*(?=,|$)", group.group("items")):
+            function_aliases.add(match.group(1) or "compile_schemas")
     for alias in module_aliases | function_aliases:
         if alias == "hyprstream_rpc_build":
             continue
@@ -600,7 +592,7 @@ def self_test(repo: Path) -> None:
     expect_failure("schema provenance", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(catalog); bad["source_commit"] = "f" * 40
     expect_failure("fabricated provenance commit", repo, bad, corpus, schemas, consumers)
-    bad = copy.deepcopy(catalog); bad["source_commit"] = git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
+    bad = copy.deepcopy(catalog); bad["source_commit"] = git(repo, "rev-parse", "HEAD~1")
     expect_failure("stale base provenance commit", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["source_tree"] = "0" * 40
     expect_failure("corpus provenance", repo, catalog, bad, schemas, consumers)
@@ -698,15 +690,12 @@ def self_test(repo: Path) -> None:
     top_level = "docs/KV-CACHE-ARCHITECTURE.md"
     changed_top_level = text(repo, top_level, None) + "\nprovenance mutation\n"
     expect_failure("top-level corpus provenance", repo, catalog, corpus, schemas, consumers, {top_level: changed_top_level})
-    # A squash/rebase changes the source revision identity, but preserves the
-    # audited tree.  Main-push validation must therefore rely on tree+digest.
-    merged = copy.deepcopy(catalog); merged["source_commit"] = "f" * 40
-    validate(repo, merged, corpus, schemas, consumers, event="push", revision=git(repo, "rev-parse", "HEAD~1"))
-    merged_corpus = copy.deepcopy(corpus); merged_corpus["source_commit"] = "e" * 40
-    validate(repo, catalog, merged_corpus, schemas, consumers, event="push", revision=git(repo, "rev-parse", "HEAD~1"))
+    # Merge/squash/rebase all retain the trusted push-before boundary; the
+    # current selected-input digest supplies the durable source attestation.
+    validate(repo, catalog, corpus, schemas, consumers, event="push", revision=catalog["source_commit"])
     bad = copy.deepcopy(catalog); bad["source_commit"] = stale; bad["source_tree"] = git(repo, "rev-parse", f"{stale}^{{tree}}")
     try:
-        validate(repo, bad, corpus, schemas, consumers, event="push", revision=git(repo, "rev-parse", "HEAD~1"))
+        validate(repo, bad, corpus, schemas, consumers, event="push", revision=catalog["source_commit"])
     except CatalogError:
         pass
     else:
