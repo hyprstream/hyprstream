@@ -2863,8 +2863,12 @@ impl PolicyHandler for PolicyService {
         // that path tenantless while using the explicit global domain for the
         // workload-session policy checks below. Tenant-bearing callers retain
         // their verified tenant binding.
-        let tenant = ctx.verified_tenant().map(str::to_owned);
-        let policy_domain = tenant.as_deref().unwrap_or("*");
+        let policy_domain = self.request_domain(ctx)?;
+        let tenant = if ctx.verified_tenant().is_some() {
+            Some(ctx.domain()?)
+        } else {
+            None
+        };
         let mut claims =
             renewed_service_claims(subject.clone(), now, expires_at, &issuer, tenant.as_deref(), &ctx.cnf);
 
@@ -2919,7 +2923,7 @@ impl PolicyHandler for PolicyService {
             .resolve_renewal_workload_session(
                 &issuer,
                 &subject,
-                policy_domain,
+                &policy_domain,
                 now,
                 family_policy,
                 old_wsid.as_deref(),
