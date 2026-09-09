@@ -82,7 +82,7 @@ use hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge;
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_service::Spawnable;
 use tokio::sync::Notify;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{CredentialsBackend, OAuthConfig};
 use crate::services::PolicyClient;
@@ -409,6 +409,8 @@ fn self_resource_scopes() -> Vec<String> {
 /// handler is never installed behind `AnySigner`, and anonymous MoQ peers never
 /// receive the process-global origin. The endpoint remains usable as the shared
 /// outbound dialer. Native-only.
+#[cfg(test)]
+#[cfg(test)]
 async fn build_oauth_iroh_substrate(
     transport_secret: [u8; 32],
 ) -> anyhow::Result<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate> {
@@ -428,6 +430,8 @@ async fn build_oauth_iroh_substrate(
 /// production substrate builder. See [`bind_oauth_substrate_profile`] — the
 /// builder is a parameter only so causal tests can inject a bind failure at
 /// this exact production boundary.
+#[cfg(test)]
+#[cfg(test)]
 async fn build_oauth_substrate_profile(
     signing_key: &ed25519_dalek::SigningKey,
     iroh_required: bool,
@@ -453,6 +457,8 @@ async fn build_oauth_substrate_profile(
 /// separate from the install disposition ([`classify_oauth_endpoint_install`])
 /// so "mandatory local bind" cannot regress into "must replace the global
 /// dialer".
+#[cfg(test)]
+#[cfg(test)]
 async fn bind_oauth_substrate_profile<F, Fut>(
     iroh_required: bool,
     build: F,
@@ -1043,12 +1049,22 @@ impl Spawnable for OAuthService {
                         }
                     }
 
-                    // OAuth's iroh inbound ALPNs are deliberately refused until
-                    // fresh application/session proof exists (#1027/#726), so do
-                    // not advertise them as an available DID service.
+                    // The Iroh transport entry is populated before state is
+                    // shared; its RPC plane is bound after bridge readiness.
                 }
             }
 
+            if self
+                .quic_config
+                .as_ref()
+                .is_some_and(|q| q.enabled && q.iroh)
+            {
+                let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
+                    &self.signing_key,
+                    "hyprstream-iroh-transport-v1",
+                );
+                oauth_state.iroh_node_id = Some(transport_key.verifying_key().to_bytes());
+            }
             let state = Arc::new(oauth_state);
             state.spawn_code_sweeper();
 
@@ -1058,12 +1074,6 @@ impl Spawnable for OAuthService {
             // here, while the supervised launcher still owns the launch.
             let bound = crate::server::tls::bind_listener(addr, rustls_config, "OAuthService")?;
 
-            // Mandatory inbound reach-only carrier: bound + endpoint-install
-            // classified BEFORE any spawned OAuth task can dial and BEFORE any
-            // readiness signal. Bind policy is profile-aware (Required fatal /
-            // Compatibility warn-continue) and separate from install
-            // classification — both install outcomes are valid and the
-            // substrate is retained either way (see the helper docs).
             let iroh_required = self
                 .quic_config
                 .as_ref()
@@ -1072,45 +1082,13 @@ impl Spawnable for OAuthService {
                 .quic_config
                 .as_ref()
                 .is_some_and(|q| q.enabled && q.iroh);
-            // Defense in depth: `validate_native_network_profile` already
-            // rejects this at config validation before factory creation, but
-            // Required must never silently run without its mandatory carrier.
             if iroh_required && !iroh_enabled {
                 return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
                     "network-iroh-required OAuth service requires [quic] enabled with iroh"
                         .to_owned(),
                 ));
             }
-            let mut substrate_owned = if iroh_enabled {
-                build_oauth_substrate_profile(&self.signing_key, iroh_required).await?
-            } else {
-                // Compatibility with Iroh disabled: skip the OAuth substrate
-                // entirely — no bind, no install, no global-slot interaction.
-                None
-            };
-            if let Some(substrate) = &substrate_owned {
-                match classify_oauth_endpoint_install(substrate) {
-                    OAuthEndpointInstall::InstalledHere => {
-                        info!(
-                            "OAuth iroh endpoint installed as the process-global outbound dialer"
-                        );
-                    }
-                    OAuthEndpointInstall::ExistingGlobalRetained => {
-                        // Production Required order: the authenticated OS-owned
-                        // bootstrap installed a DISTINCT outbound carrier
-                        // (PROCESS_BOOTSTRAP_CARRIER) before this service
-                        // started. Both carriers are correct and retained —
-                        // OAuth's substrate owns the inbound reach lifecycle;
-                        // the bootstrap global endpoint stays untouched for
-                        // outbound dials. The deliberately different endpoint
-                        // IDs are never compared.
-                        info!(
-                            "OAuth iroh substrate retained as the independent inbound carrier; \
-                             the already-installed process-global outbound endpoint is untouched"
-                        );
-                    }
-                }
-            }
+            let mut substrate_owned: Option<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate> = None;
 
             // Federation publisher: a DIALING task — spawned only after the
             // final endpoint decision so its discovery dials use the installed
@@ -1225,7 +1203,43 @@ impl Spawnable for OAuthService {
             // serve result propagates (no log-and-swallow).
             let primary: anyhow::Result<()> = match bridge_init {
                 Err(e) => Err(anyhow::anyhow!("OAuthService startup failed: {e}")),
-                Ok(bridge) => {
+                Ok(bridge) => async {
+                    if iroh_enabled {
+                        let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
+                            &self.signing_key,
+                            "hyprstream-iroh-transport-v1",
+                        );
+                        let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> = bridge.clone();
+                        let rpc_handler = hyprstream_rpc::transport::iroh_rpc::IrohRpcProtocolHandler::with_stream_limit(
+                            processor,
+                            self.signing_key.clone(),
+                            hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
+                        );
+                        let substrate_result = hyprstream_rpc::transport::iroh_substrate::IrohSubstrate::new(
+                            transport_key.to_bytes(),
+                            hyprstream_rpc::transport::iroh_substrate::RefuseHandler::new(
+                                "OAuth MoQ disabled pending verified session proof (#1027/#726)",
+                            ),
+                            rpc_handler,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("OAuth iroh substrate bind failed: {e}"));
+                        match substrate_result {
+                            Ok(substrate) => {
+                                match classify_oauth_endpoint_install(&substrate) {
+                                    OAuthEndpointInstall::InstalledHere => {
+                                        info!("OAuth iroh endpoint installed as the process-global outbound dialer");
+                                    }
+                                    OAuthEndpointInstall::ExistingGlobalRetained => {
+                                        info!("OAuth iroh substrate retained; existing global outbound endpoint is untouched");
+                                    }
+                                }
+                                substrate_owned = Some(substrate);
+                            }
+                            Err(error) if iroh_required => return Err(error),
+                            Err(error) => warn!("OAuth iroh substrate bind failed; continuing quinn-only: {error:#}"),
+                        }
+                    }
                     let control_transport = self.control_transport.clone();
                     let rpc_signing_key = self.signing_key.clone();
                     let processor: Arc<
@@ -1267,7 +1281,7 @@ impl Spawnable for OAuthService {
                     };
                     rpc_owner = Some((rpc_loop, rpc_consumed));
                     outcome
-                }
+                }.await
             };
 
             // ── Single common bounded teardown (the one startup owner): runs

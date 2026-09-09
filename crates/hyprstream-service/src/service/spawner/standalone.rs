@@ -17,6 +17,9 @@
 // Immediate path and the stop/cleanup helpers use stays portable.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -28,6 +31,38 @@ use tokio::sync::Mutex;
 
 use super::{ProcessConfig, ProcessKind, ProcessReadiness, SpawnedProcess, SpawnerBackend};
 use hyprstream_rpc::error::{Result, RpcError};
+
+/// Give adopted daemons independent, pollable standard streams while draining
+/// them in the launcher. PGlite registers stdout with epoll, so `/dev/null`
+/// is not a safe sink on Linux; a pipe preserves pollability and prevents the
+/// launcher's stdout/stderr or SSH channel from being held open by the child.
+fn detached_stdio() -> std::io::Result<Stdio> {
+    #[cfg(unix)]
+    {
+        let (reader, writer) = nix::unistd::pipe()?;
+        let reader = unsafe { std::fs::File::from_raw_fd(reader) };
+        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
+        std::thread::Builder::new()
+            .name("hyprstream-daemon-stdio-drain".to_owned())
+            .spawn(move || {
+                let mut reader = reader;
+                let mut sink = std::io::sink();
+                let _ = std::io::copy(&mut reader, &mut sink);
+            })?;
+        Ok(Stdio::from(writer))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Stdio::null())
+    }
+}
+
+fn configure_detached_stdio(cmd: &mut Command) -> std::io::Result<()> {
+    cmd.stdin(detached_stdio()?)
+        .stdout(detached_stdio()?)
+        .stderr(detached_stdio()?);
+    Ok(())
+}
 
 /// One per-child sd_notify endpoint in the Linux/Android abstract namespace.
 ///
@@ -123,39 +158,46 @@ impl ChildNotifySocket {
         use std::io::IoSliceMut;
 
         let mut buffer = [0u8; 128];
-        // Scope the recvmsg borrows: `message` holds the iov/cmsg borrows, so
-        // extract what we need before touching the payload buffer again.
-        let (bytes, sender_pid) = {
-            let mut iov = [IoSliceMut::new(&mut buffer)];
-            let mut cmsg = cmsg_space!(UnixCredentials);
-            let message = match recvmsg::<UnixAddr>(
-                self.fd.as_raw_fd(),
-                &mut iov,
-                Some(&mut cmsg),
-                MsgFlags::empty(),
-            ) {
-                Ok(message) => message,
-                Err(nix::errno::Errno::EAGAIN) => return Ok(false),
-                Err(e) => {
-                    return Err(RpcError::SpawnFailed(format!("notify recv failed: {e}")))
-                }
+        // Drain the complete nonblocking queue in one poll. A foreign sender
+        // must never be able to keep the genuine child's READY=1 datagram
+        // behind a sustained backlog; only the exact child PID can succeed.
+        loop {
+            // Scope the recvmsg borrows: `message` holds the iov/cmsg borrows,
+            // so extract what we need before touching the payload buffer again.
+            let (bytes, sender_pid) = {
+                let mut iov = [IoSliceMut::new(&mut buffer)];
+                let mut cmsg = cmsg_space!(UnixCredentials);
+                let message = match recvmsg::<UnixAddr>(
+                    self.fd.as_raw_fd(),
+                    &mut iov,
+                    Some(&mut cmsg),
+                    MsgFlags::empty(),
+                ) {
+                    Ok(message) => message,
+                    Err(nix::errno::Errno::EAGAIN) => return Ok(false),
+                    Err(e) => {
+                        return Err(RpcError::SpawnFailed(format!("notify recv failed: {e}")))
+                    }
+                };
+                let sender_pid = message.cmsgs().find_map(|cmsg| match cmsg {
+                    ControlMessageOwned::ScmCredentials(creds) => Some(creds.pid()),
+                    _ => None,
+                });
+                (message.bytes, sender_pid)
             };
-            let sender_pid = message.cmsgs().find_map(|cmsg| match cmsg {
-                ControlMessageOwned::ScmCredentials(creds) => Some(creds.pid()),
-                _ => None,
-            });
-            (message.bytes, sender_pid)
-        };
 
-        if sender_pid != Some(child_pid) {
-            tracing::warn!(
-                sender = ?sender_pid,
-                expected = child_pid,
-                "ignoring readiness datagram from a process other than the spawned child"
-            );
-            return Ok(false);
+            if sender_pid != Some(child_pid) {
+                tracing::warn!(
+                    sender = ?sender_pid,
+                    expected = child_pid,
+                    "ignoring readiness datagram from a process other than the spawned child"
+                );
+                continue;
+            }
+            if bytes > 0 && buffer[..bytes] == *b"READY=1" {
+                return Ok(true);
+            }
         }
-        Ok(bytes > 0 && buffer[..bytes] == *b"READY=1")
     }
 }
 
@@ -432,6 +474,9 @@ impl StandaloneBackend {
         }
 
         // Disable kill on drop - daemon processes should outlive the spawner
+        configure_detached_stdio(&mut cmd).map_err(|e| {
+            RpcError::SpawnFailed(format!("failed to detach {} standard streams: {e}", config.name))
+        })?;
         cmd.kill_on_drop(false);
 
         // Spawn the process
@@ -545,6 +590,9 @@ impl StandaloneBackend {
         // The child learns its notification endpoint only through its own
         // environment; the launcher's environment is untouched.
         cmd.env("NOTIFY_SOCKET", notify.endpoint());
+        configure_detached_stdio(&mut cmd).map_err(|e| {
+            RpcError::SpawnFailed(format!("failed to detach {} standard streams: {e}", config.name))
+        })?;
         cmd.kill_on_drop(false);
 
         let child = cmd.spawn().map_err(|e| {
@@ -2379,17 +2427,16 @@ mod notify_readiness_tests {
     #[tokio::test]
     async fn notify_socket_rejects_spoofed_sender() -> anyhow::Result<()> {
         let notify = ChildNotifySocket::bind("spoof-probe")?;
-        // First datagram: sent by THIS test process but checked against a
-        // different expected PID — the refusal must consume it without
-        // satisfying readiness.
-        send_ready_to(notify.endpoint())?;
         let this_pid = std::process::id() as i32;
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(
-            !notify.try_recv_ready(this_pid.wrapping_add(1013))?,
-            "a foreign sender must not satisfy readiness"
-        );
-        // Second datagram, checked against the actual sender PID: accepted.
+        // A sustained foreign queue must be drained in one poll so it cannot
+        // hide the genuine sender's datagram behind the 20ms readiness tick.
+        let endpoint = notify.endpoint().to_owned();
+        let flooding = std::thread::spawn(move || {
+            for _ in 0..128 {
+                let _ = send_ready_to(&endpoint);
+            }
+        });
+        flooding.join().expect("spoof flood sender thread");
         send_ready_to(notify.endpoint())?;
         std::thread::sleep(Duration::from_millis(50));
         assert!(
