@@ -97,6 +97,13 @@ run_phase "browser WASM real execution" bash .github/scripts/browser-wasm-test-c
 # aarch64 wheel at /opt/libtorch, so NO download-libtorch feature here.
 run_phase "native release build" cargo build --release
 
+# Metrics is a supported standalone profile with the encrypted-account admission
+# marker and without PGlite. Exercise both its production binary and typed
+# handler tests in the required merge/preflight path; the default build above
+# cannot compile this mutually exclusive profile.
+run_phase "Metrics release build" cargo build --locked --release --no-default-features --features metrics
+run_phase "Metrics typed handler tests" cargo test -p hyprstream --locked --lib --no-default-features --features metrics services::metrics::tests::
+
 # wasm guest artifacts for the sandbox/mount tests (deny-on-missing-guest guard).
 # cd INTO each guest crate so cargo reads its .cargo/config.toml (the python guest
 # needs getrandom_backend="custom" for wasm32-unknown-unknown; see #1013).
