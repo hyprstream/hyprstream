@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Extension, RawQuery, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -95,6 +95,17 @@ pub fn xrpc_routes() -> axum::Router<Arc<OAuthState>> {
         .route("/xrpc/com.atproto.repo.describeRepo", get(describe_repo))
         .route("/xrpc/com.atproto.repo.getRecord", get(get_record))
         .route("/xrpc/com.atproto.sync.getRepo", get(get_repo))
+}
+
+/// Protected standard repository write routes. These are mounted only when a
+/// public writer is explicitly installed in OAuthState; the default remains
+/// read-only until account/session authorization is configured.
+pub fn xrpc_write_routes() -> axum::Router<Arc<OAuthState>> {
+    use axum::routing::post;
+    axum::Router::new().route(
+        "/xrpc/com.atproto.repo.createRecord",
+        post(create_record),
+    )
 }
 
 /// An in-memory snapshot of one repo's signed state — enough to answer the
@@ -901,6 +912,100 @@ pub async fn get_repo(State(state): State<Arc<OAuthState>>, RawQuery(raw): RawQu
     // Reject since by PRESENCE (not just non-empty) — ?since= and ?since=x both 400.
     let since_present = params.contains_key("since");
     get_repo_core(&state.xrpc_repos, did, since_present).await
+}
+
+/// `com.atproto.repo.createRecord` for the first native-authorized public
+/// posting slice. The route is deliberately opt-in: OAuthState must carry a
+/// PublicRepoWriter, and the normal bearer/DPoP middleware must have inserted
+/// AuthenticatedUser before this handler runs.
+pub async fn create_record(
+    State(state): State<Arc<OAuthState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    const MAX_BODY_BYTES: usize = 1_048_576;
+    if body.len() > MAX_BODY_BYTES {
+        return xrpc_error(StatusCode::PAYLOAD_TOO_LARGE, errors::INVALID_REQUEST, "record body exceeds 1 MiB");
+    }
+    let Some(writer) = state.public_repo_writer.as_ref() else {
+        return xrpc_error(StatusCode::SERVICE_UNAVAILABLE, errors::INTERNAL_SERVER_ERROR, "public repository writer is not configured");
+    };
+    let Some(token) = user.token.as_deref() else {
+        return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "verified OAuth access token is required");
+    };
+    let claims = match auth::validate_oauth_access_token(&state, token).await {
+        Ok(claims) => claims,
+        Err(_) => return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "OAuth access token is invalid or expired"),
+    };
+    if !claims.has_scope("atproto") {
+        return xrpc_error(StatusCode::FORBIDDEN, "InsufficientScope", "the atproto scope is required");
+    }
+    if claims.sub != user.user || claims.tenant != user.verified_tenant {
+        return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "OAuth identity binding is invalid");
+    }
+    let input: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "request body must be valid JSON"),
+    };
+    let object = match input.as_object() {
+        Some(object) => object,
+        None => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "request body must be an object"),
+    };
+    let repo = match object.get("repo").and_then(Value::as_str) {
+        Some(repo) if !repo.is_empty() => repo,
+        _ => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "repo is required"),
+    };
+    if repo != writer.did() {
+        return xrpc_error(StatusCode::FORBIDDEN, "AuthRequired", "the request repo is not owned by this writer");
+    }
+    let collection = match object.get("collection").and_then(Value::as_str) {
+        Some(collection) if matches!(collection, "app.bsky.feed.post" | "app.bsky.actor.profile") => collection,
+        Some(_) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "collection is outside the enabled posting slice"),
+        None => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "collection is required"),
+    };
+    let rkey = match object.get("rkey").and_then(Value::as_str).and_then(|value| Tid::parse(value).ok()) {
+        Some(rkey) => rkey,
+        None => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "a valid TID rkey is required"),
+    };
+    let record_value = match object.get("record") {
+        Some(record) => record,
+        None => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "record is required"),
+    };
+    let record = match crate::services::public_repo::json_to_dag_cbor(record_value) {
+        Ok(record) => record,
+        Err(_) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "record contains unsupported data"),
+    };
+    let request_id = headers
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("create-{}-{}", collection.replace('.', "_"), rkey.encode()));
+    let expected_prev = object.get("swapCommit").and_then(Value::as_str);
+    let result = writer.create_record_with_expected_prev_text(
+        crate::services::public_repo::PublicCreateRequest {
+            request_id,
+            principal: user.user,
+            did: repo.to_owned(),
+            collection: collection.to_owned(),
+            rkey,
+            value: record,
+            expected_prev: None,
+        },
+        expected_prev,
+    );
+    let result = match result {
+        Ok(result) => result,
+        Err(error) if error.to_string().contains("authorization") || error.to_string().contains("denied") => return xrpc_error(StatusCode::FORBIDDEN, "AuthRequired", error.to_string()),
+        Err(error) if error.to_string().contains("CAS conflict") || error.to_string().contains("already exists") => return xrpc_error(StatusCode::CONFLICT, "InvalidSwap", error.to_string()),
+        Err(error) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, error.to_string()),
+    };
+    let mut response = json!({"uri": result.uri, "cid": result.cid.to_string()});
+    if object.get("returnRecord").and_then(Value::as_bool).unwrap_or(false) {
+        response["value"] = record_value.clone();
+    }
+    (StatusCode::OK, axum::Json(response)).into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
