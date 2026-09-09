@@ -237,11 +237,16 @@ def check_provenance(record: dict[str, Any], repo: Path, label: str, corpus: dic
     required(isinstance(tree, str) and re.fullmatch(r"[0-9a-f]{40}", tree) is not None, f"{label} has invalid source_tree")
     required(isinstance(declared_digest, str) and re.fullmatch(r"[0-9a-f]{64}", declared_digest) is not None,
              f"{label} has invalid source_input_digest")
-    # A revision is retained for audit traceability, but only the immutable tree and
-    # its selected-input digest are authoritative.  A squash/rebase legitimately
-    # rewrites commits while preserving this tree.
-    git(repo, "cat-file", "-e", f"{tree}^{{tree}}")
-    _, boundary = audited_input(repo, event, revision)
+    topology, boundary = audited_input(repo, event, revision)
+    # PR validation attests the recorded revision/tree pair while its object is
+    # available.  A squash push may not retain PR objects, so push validation is
+    # deliberately content-addressed: its durable input digest is checked below.
+    if topology == "pull_request":
+        git(repo, "cat-file", "-e", f"{commit}^{{commit}}")
+        required(git(repo, "rev-parse", f"{commit}^{{tree}}") == tree,
+                 f"{label} source_tree does not match source_commit")
+        required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", boundary, commit]).returncode == 0,
+                 f"{label} source_commit is not bound to the pull-request input")
     staged_catalog = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--quiet", "--",
                                      "docs/schema-catalog.json", "docs/corpus-sources.json"]).returncode != 0
     required(commit != git(repo, "rev-parse", "HEAD") or staged_catalog,
@@ -251,8 +256,9 @@ def check_provenance(record: dict[str, Any], repo: Path, label: str, corpus: dic
     paths = provenance_paths(repo, corpus)
     required(input_digest(repo, paths, mutations) == declared_digest,
              f"{label} current audited inputs differ from source_input_digest")
-    required(input_digest(repo, paths, tree=tree) == declared_digest,
-             f"{label} source_tree does not contain the audited input state")
+    if topology == "pull_request":
+        required(input_digest(repo, paths, tree=tree) == declared_digest,
+                 f"{label} source_tree does not contain the audited input state")
 
 
 def owner_manifest(repo: Path, schema_path: str, owner_directories: list[str]) -> tuple[str, str, str]:
@@ -294,7 +300,7 @@ def strip_rust_comments(source: str) -> str:
         if pair == "/*": block += 1; out.extend("  "); index += 2; continue
         if pair == "*/" and block: block -= 1; out.extend("  "); index += 2; continue
         if block: out.append("\n" if source[index] == "\n" else " "); index += 1; continue
-        if source[index] in "\"'": quote = source[index]
+        if source[index] == "\"" or (source[index] == "'" and not (index + 1 < len(source) and (source[index + 1].isalpha() or source[index + 1] == "_"))): quote = source[index]
         out.append(source[index]); index += 1
     return "".join(out)
 
@@ -316,7 +322,7 @@ def strip_rust_noncode(source: str) -> str:
         if pair == "/*": block += 1; out.extend("  "); index += 2; continue
         if pair == "*/" and block: block -= 1; out.extend("  "); index += 2; continue
         if block: out.append("\n" if source[index] == "\n" else " "); index += 1; continue
-        if source[index] in "\"'": quote = source[index]
+        if source[index] == "\"" or (source[index] == "'" and not (index + 1 < len(source) and (source[index + 1].isalpha() or source[index + 1] == "_"))): quote = source[index]
         out.append(source[index]); index += 1
     return "".join(out)
 
@@ -369,6 +375,8 @@ def cgr_inventory(build_file: str, source: str) -> list[dict[str, Any]]:
     for match in re.finditer(r"\buse\s+hyprstream_rpc_build\s+as\s+([A-Za-z_]\w*)\s*;", tokens):
         module_aliases.add(match.group(1))
     for match in re.finditer(r"\buse\s+hyprstream_rpc_build\s*::\s*compile_schemas(?:\s+as\s+([A-Za-z_]\w*))?\s*;", tokens):
+        function_aliases.add(match.group(1) or "compile_schemas")
+    for match in re.finditer(r"\buse\s+hyprstream_rpc_build\s*::\s*\{\s*compile_schemas(?:\s+as\s+([A-Za-z_]\w*))?\s*\}\s*;", tokens):
         function_aliases.add(match.group(1) or "compile_schemas")
     for alias in module_aliases | function_aliases:
         if alias == "hyprstream_rpc_build":
@@ -590,6 +598,10 @@ def self_test(repo: Path) -> None:
     expect_failure("stale schema", repo, copy.deepcopy(catalog), corpus, schemas[1:], consumers)
     bad = copy.deepcopy(catalog); bad["source_commit"] = "not-a-git-revision"
     expect_failure("schema provenance", repo, bad, corpus, schemas, consumers)
+    bad = copy.deepcopy(catalog); bad["source_commit"] = "f" * 40
+    expect_failure("fabricated provenance commit", repo, bad, corpus, schemas, consumers)
+    bad = copy.deepcopy(catalog); bad["source_commit"] = git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
+    expect_failure("stale base provenance commit", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["source_tree"] = "0" * 40
     expect_failure("corpus provenance", repo, catalog, bad, schemas, consumers)
     stale = git(repo, "rev-parse", "HEAD")
@@ -637,6 +649,13 @@ def self_test(repo: Path) -> None:
                       .replace("hyprstream_rpc_build::compile_schemas(", "rpc_build::compile_schemas(", 1))
     required(cgr_inventory(discovery_build, module_aliased) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
              "CGR module-alias normalization drift")
+    grouped_aliased = ("use hyprstream_rpc_build::{compile_schemas as compile};\n" + discovery_source
+                       .replace("hyprstream_rpc_build::compile_schemas(", "compile(", 1))
+    required(cgr_inventory(discovery_build, grouped_aliased) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
+             "CGR grouped function-alias normalization drift")
+    lifetime_extra = discovery_source + "\nfn marker<'a>() {}\n" + discovery_source[discovery_source.find("hyprstream_rpc_build::compile_schemas("):]
+    required(len(cgr_inventory(discovery_build, lifetime_extra)) == 2,
+             "CGR lifetime tokenization hid an invocation")
     expect_cgr_failure("CGR unresolved alias", discovery_build,
                        discovery_source.replace("hyprstream_rpc_build::compile_schemas(", "unknown::compile_schemas(", 1))
     expect_cgr_failure("CGR alias reassignment", discovery_build,
