@@ -62,10 +62,23 @@ fn detached_output_stdio() -> std::io::Result<Stdio> {
                 // never inherits the writer, so EOF is well-defined.
                 unsafe {
                     nix::libc::close(writer);
+                    // This child does not exec, so O_CLOEXEC alone cannot
+                    // shed the launcher's SSH/session and service sockets.
+                    // Move the reader to stdin, close every other inherited
+                    // descriptor (including stdout/stderr), then drain only
+                    // through fd 0. The bounded sweep is portable across the
+                    // Unix targets supported by this crate and avoids relying
+                    // on an external close-range utility.
+                    if nix::libc::dup2(reader, 0) < 0 {
+                        nix::libc::_exit(1);
+                    }
+                    for fd in 1..=65_535 {
+                        nix::libc::close(fd);
+                    }
                     let mut buffer = [0u8; 8192];
                     loop {
                         let read = nix::libc::read(
-                            reader,
+                            0,
                             buffer.as_mut_ptr().cast(),
                             buffer.len(),
                         );
@@ -73,7 +86,7 @@ fn detached_output_stdio() -> std::io::Result<Stdio> {
                             break;
                         }
                     }
-                    nix::libc::close(reader);
+                    nix::libc::close(0);
                     nix::libc::_exit(0);
                 }
             }
