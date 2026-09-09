@@ -1,0 +1,37 @@
+name: Docs catalog
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'tools/check-docs-catalog.py'
+      - '.github/workflows/docs-catalog.yml'
+      - 'crates/**/schema/**'
+      - 'crates/**/build.rs'
+      - 'crates/hyprstream/src/cli/schema_cli.rs'
+      - 'crates/hyprstream/src/services/factories.rs'
+      - 'crates/hyprstream/src/services/mcp_service.rs'
+      - 'crates/hyprstream-rpc-std/src/vfs_mount.rs'
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'tools/check-docs-catalog.py'
+      - '.github/workflows/docs-catalog.yml'
+      - 'crates/**/schema/**'
+      - 'crates/**/build.rs'
+      - 'crates/hyprstream/src/cli/schema_cli.rs'
+      - 'crates/hyprstream/src/services/factories.rs'
+      - 'crates/hyprstream/src/services/mcp_service.rs'
+      - 'crates/hyprstream-rpc-std/src/vfs_mount.rs'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 tools/check-docs-catalog.py
+      - run: python3 tools/check-docs-catalog.py --self-test
