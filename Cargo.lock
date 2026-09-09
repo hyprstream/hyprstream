@@ -7098,6 +7098,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
+ "bytes",
  "capnp",
  "capnpc",
  "chrono",
@@ -7115,6 +7116,7 @@ dependencies = [
  "hyprstream-util",
  "iroh",
  "libc",
+ "moq-net",
  "p256",
  "parking_lot 0.12.4",
  "proptest",
@@ -7128,6 +7130,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "web-transport-iroh",
 ]
 
 [[package]]
