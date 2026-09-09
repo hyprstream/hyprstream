@@ -112,6 +112,20 @@ impl NodeData {
         Cid::from_dag_cbor(&self.encode())
     }
 
+    /// Public AT Protocol serialization. The existing native format remains
+    /// the default for already-signed artifacts.
+    pub fn encode_atproto(&self) -> Result<Vec<u8>> {
+        crate::atproto_cbor::encode(&self.to_value())
+    }
+
+    pub fn cid_atproto(&self) -> Result<Cid> {
+        Ok(Cid::from_dag_cbor(&self.encode_atproto()?))
+    }
+
+    pub fn from_atproto_dag_cbor(bytes: &[u8]) -> Result<Self> {
+        Self::from_value(&crate::atproto_cbor::decode(bytes)?)
+    }
+
     pub fn to_value(&self) -> DagCbor {
         // atproto node shape: { l: Option<Link>, e: [{p,k,v,t}, ...] }
         let entries: Vec<DagCbor> = self
@@ -374,6 +388,97 @@ impl Node {
         blocks
     }
 
+    /// Serialize this tree with public AT Protocol node ordering and CIDs.
+    pub fn to_node_data_with_blocks_atproto(&self) -> Result<(NodeData, Vec<(Cid, NodeData)>)> {
+        let mut blocks = Vec::new();
+        let data = self.to_node_data_atproto_rec(&mut blocks)?;
+        let cid = data.cid_atproto()?;
+        blocks.push((cid, data.clone()));
+        Ok((data, blocks))
+    }
+
+    fn to_node_data_atproto_rec(&self, blocks: &mut Vec<(Cid, NodeData)>) -> Result<NodeData> {
+        let l = self
+            .l
+            .as_ref()
+            .map(|child| -> Result<Cid> {
+                let child_data = child.to_node_data_atproto_rec(blocks)?;
+                let cid = child_data.cid_atproto()?;
+                blocks.push((cid, child_data));
+                Ok(cid)
+            })
+            .transpose()?;
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for (idx, entry) in self.entries.iter().enumerate() {
+            let p = shared_prefix_len(
+                self.entries
+                    .get(idx.wrapping_sub(1))
+                    .map(|e| e.key.as_str()),
+                &entry.key,
+            );
+            let k = entry.key.as_bytes()[p..].to_vec();
+            let t = entry
+                .right
+                .as_ref()
+                .map(|child| -> Result<Cid> {
+                    let child_data = child.to_node_data_atproto_rec(blocks)?;
+                    let cid = child_data.cid_atproto()?;
+                    blocks.push((cid, child_data));
+                    Ok(cid)
+                })
+                .transpose()?;
+            entries.push(TreeEntry {
+                p,
+                k,
+                v: entry.value,
+                t,
+            });
+        }
+        Ok(NodeData { l, e: entries })
+    }
+
+    /// Build an inclusion proof whose node CIDs use public AT serialization.
+    pub fn proof_atproto(&self, collection: &str, rkey: &Tid) -> Option<Proof> {
+        let target = record_key(collection, *rkey);
+        let mut path = Vec::new();
+        self.proof_rec_atproto(&target, &mut path).ok()?;
+        Some(Proof { path })
+    }
+
+    fn proof_rec_atproto(&self, target: &str, path: &mut Vec<ProofStep>) -> Result<()> {
+        let node_data = self.to_node_data_atproto_rec(&mut Vec::new())?;
+        if let Some(left) = &self.l {
+            let below_first = self
+                .entries
+                .first()
+                .map(|e| target < e.key.as_str())
+                .unwrap_or(true);
+            if below_first {
+                path.push(ProofStep::LeftSubtree(node_data));
+                return left.proof_rec_atproto(target, path);
+            }
+        }
+        for (i, entry) in self.entries.iter().enumerate() {
+            if entry.key == target {
+                path.push(ProofStep::FoundAt(node_data, i));
+                return Ok(());
+            }
+            let next_key = self.entries.get(i + 1).map(|e| e.key.as_str());
+            let in_range = match next_key {
+                Some(nk) => entry.key.as_str() < target && target < nk,
+                None => entry.key.as_str() < target,
+            };
+            if in_range {
+                if let Some(right) = &entry.right {
+                    path.push(ProofStep::ThroughEntry(node_data, i));
+                    return right.proof_rec_atproto(target, path);
+                }
+                return Err(anyhow::anyhow!("target is not present"));
+            }
+        }
+        Err(anyhow::anyhow!("target is not present"))
+    }
+
     /// Compute the MST path (inclusion proof) for `rkey`: the chain of
     /// `(NodeData, entry_index)` pairs from the root down to the entry whose
     /// key matches, plus the sibling-subtree CIDs needed to verify the chain.
@@ -459,6 +564,18 @@ impl Proof {
     /// (they asked for it), so we don't reconstruct it from prefix-compression —
     /// the value-CID check plus the CID chain is the load-bearing guarantee.
     pub fn verify(&self, root_cid: &Cid, record_cid: &Cid) -> Result<()> {
+        self.verify_with(root_cid, record_cid, |data| Ok(data.cid()))
+    }
+
+    /// Verify an inclusion proof using public AT Protocol node serialization.
+    pub fn verify_atproto(&self, root_cid: &Cid, record_cid: &Cid) -> Result<()> {
+        self.verify_with(root_cid, record_cid, NodeData::cid_atproto)
+    }
+
+    fn verify_with<F>(&self, root_cid: &Cid, record_cid: &Cid, cid_for: F) -> Result<()>
+    where
+        F: Fn(&NodeData) -> Result<Cid>,
+    {
         ensure!(!self.path.is_empty(), "empty MST proof");
         let mut expected_cid: Option<Cid> = None; // CID the *current* node must have
         let mut found_value: Option<Cid> = None;
@@ -470,7 +587,7 @@ impl Proof {
                 ProofStep::LeftSubtree(d) => (d, ProofKind::Left),
             };
             // Recompute this node's CID and verify against the expectation.
-            let node_cid = data.cid();
+            let node_cid = cid_for(data)?;
             if let Some(ref want) = expected_cid {
                 ensure!(
                     node_cid == *want,
@@ -694,7 +811,10 @@ mod tests {
             }
         }
         walk(tree.root_cid(), &block_map, &mut found);
-        assert_eq!(found, keyed, "walked entries must match the input key set exactly");
+        assert_eq!(
+            found, keyed,
+            "walked entries must match the input key set exactly"
+        );
     }
 
     #[test]

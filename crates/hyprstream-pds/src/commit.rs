@@ -39,9 +39,10 @@ pub const COMMIT_VERSION: u64 = 3;
 /// An unsigned commit — the form that gets DAG-CBOR-encoded and signed.
 ///
 /// Field order matches atproto (`did`, `version`, `data`, `rev`, `prev`); the
-/// encoder re-sorts canonically (**pure lexicographic byte order**, RFC 7049
-/// §4.2.1 "core determinism" — not length-first) so the order here is only for
-/// readability. `version` is always [`COMMIT_VERSION`] = 3.
+/// existing native encoder re-sorts in its historical lexical text-key order.
+/// Public AT serialization is available through `to_atproto_dag_cbor` and uses
+/// encoded-key ordering without changing existing native bytes. `version` is
+/// always [`COMMIT_VERSION`] = 3.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnsignedCommit {
     pub did: String,
@@ -65,6 +66,12 @@ impl UnsignedCommit {
     /// DAG-CBOR encode the unsigned commit (no `sig` field). This is what gets signed.
     pub fn to_dag_cbor(&self) -> Vec<u8> {
         self.to_value().encode()
+    }
+
+    /// Encode this commit's unsigned body using public AT Protocol ordering.
+    /// The native `to_dag_cbor` format is retained for existing artifacts.
+    pub fn to_atproto_dag_cbor(&self) -> Result<Vec<u8>> {
+        crate::atproto_cbor::encode(&self.to_value())
     }
 
     pub fn to_value(&self) -> DagCbor {
@@ -118,9 +125,28 @@ impl Commit {
         }
     }
 
+    /// Sign a commit using public AT Protocol canonical bytes.
+    pub fn sign_atproto(unsigned: &UnsignedCommit, key: &SigningKey) -> Result<Self> {
+        use p256::ecdsa::signature::Signer;
+        let sig: Signature = key.sign(&unsigned.to_atproto_dag_cbor()?);
+        Ok(Commit {
+            did: unsigned.did.clone(),
+            version: unsigned.version,
+            data: unsigned.data,
+            rev: unsigned.rev,
+            prev: unsigned.prev,
+            sig: sig.to_vec(),
+        })
+    }
+
     /// DAG-CBOR encode the (signed) commit. The `sig` field is a byte string.
     pub fn to_dag_cbor(&self) -> Vec<u8> {
         self.to_value().encode()
+    }
+
+    /// Encode the signed commit using public AT Protocol canonical bytes.
+    pub fn to_atproto_dag_cbor(&self) -> Result<Vec<u8>> {
+        crate::atproto_cbor::encode(&self.to_value())
     }
 
     pub fn to_value(&self) -> DagCbor {
@@ -166,6 +192,10 @@ impl Commit {
     pub fn from_dag_cbor(bytes: &[u8]) -> Result<Self> {
         let value = DagCbor::decode(bytes)?;
         Self::from_value(&value)
+    }
+
+    pub fn from_atproto_dag_cbor(bytes: &[u8]) -> Result<Self> {
+        Self::from_value(&crate::atproto_cbor::decode(bytes)?)
     }
 
     pub fn from_value(value: &DagCbor) -> Result<Self> {
@@ -219,6 +249,10 @@ impl Commit {
         Cid::from_dag_cbor(&self.to_dag_cbor())
     }
 
+    pub fn cid_atproto(&self) -> Result<Cid> {
+        Ok(Cid::from_dag_cbor(&self.to_atproto_dag_cbor()?))
+    }
+
     /// Verify the commit's signature against a `#atproto` P-256 verifying key.
     ///
     /// Re-encodes the unsigned commit, hashes with SHA-256, and verifies the
@@ -241,6 +275,14 @@ impl Commit {
             .map_err(|e| anyhow::anyhow!("invalid ES256 signature bytes: {e}"))?;
         vk.verify(&unsigned_bytes, &signature)
             .map_err(|e| anyhow::anyhow!("ES256 signature verification failed: {e}"))
+    }
+
+    pub fn verify_atproto(&self, vk: &VerifyingKey) -> Result<()> {
+        use p256::ecdsa::signature::Verifier;
+        let signature = Signature::from_slice(&self.sig)
+            .map_err(|e| anyhow::anyhow!("invalid ES256 signature bytes: {e}"))?;
+        vk.verify(&self.unsigned().to_atproto_dag_cbor()?, &signature)
+            .map_err(|e| anyhow::anyhow!("public ATProto ES256 signature verification failed: {e}"))
     }
 
     /// Verify against the bounded `#atproto` slot set currently published by a

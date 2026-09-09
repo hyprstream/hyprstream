@@ -26,6 +26,7 @@
 use anyhow::{anyhow, bail, ensure, Result};
 use p256::ecdsa::VerifyingKey;
 
+use crate::atproto_cbor::AtprotoRecord;
 use crate::cid::{read_uvarint, write_uvarint, Cid};
 use crate::commit::Commit;
 use crate::dag_cbor::DagCbor;
@@ -115,6 +116,56 @@ pub fn build_car_v1(roots: &[Cid], blocks: &[(Cid, Vec<u8>)]) -> Vec<u8> {
     out
 }
 
+/// Build a public AT Protocol CAR proof without changing the native CAR
+/// builder. Every block CID and byte payload is derived from the public
+/// canonical codec, including the CAR header.
+pub fn build_public_record_proof_car(
+    commit: &Commit,
+    path: &Proof,
+    node_blocks: &[(Cid, NodeData)],
+    record: &AtprotoRecord,
+) -> Result<Vec<u8>> {
+    let commit_cid = commit.cid_atproto()?;
+    let mut blocks = vec![(commit_cid, commit.to_atproto_dag_cbor()?)];
+    let path_cids: std::collections::BTreeSet<Cid> = path
+        .path
+        .iter()
+        .map(|step| match step {
+            crate::mst::ProofStep::FoundAt(d, _)
+            | crate::mst::ProofStep::ThroughEntry(d, _)
+            | crate::mst::ProofStep::LeftSubtree(d) => d.cid_atproto(),
+        })
+        .collect::<Result<_>>()?;
+    for (cid, data) in node_blocks {
+        if path_cids.contains(cid) {
+            blocks.push((*cid, data.encode_atproto()?));
+        }
+    }
+    blocks.push((record.cid(), record.bytes().to_vec()));
+    build_car_v1_atproto(&[commit_cid], &blocks)
+}
+
+/// Public AT Protocol CARv1 builder. The native builder remains unchanged.
+pub fn build_car_v1_atproto(roots: &[Cid], blocks: &[(Cid, Vec<u8>)]) -> Result<Vec<u8>> {
+    let header_value = DagCbor::str_map([
+        ("version", DagCbor::Unsigned(1)),
+        (
+            "roots",
+            DagCbor::List(roots.iter().copied().map(DagCbor::Link).collect()),
+        ),
+    ]);
+    let header_bytes = crate::atproto_cbor::encode(&header_value)?;
+    let mut out = Vec::new();
+    write_section(&mut out, &header_bytes);
+    for (cid, bytes) in blocks {
+        let mut section = Vec::with_capacity(cid.as_bytes().len() + bytes.len());
+        section.extend_from_slice(cid.as_bytes());
+        section.extend_from_slice(bytes);
+        write_section(&mut out, &section);
+    }
+    Ok(out)
+}
+
 fn write_section(out: &mut Vec<u8>, body: &[u8]) {
     write_uvarint(body.len() as u64, out);
     out.extend_from_slice(body);
@@ -153,6 +204,40 @@ pub fn parse_car_v1(input: &[u8]) -> Result<(Vec<Cid>, Vec<(Cid, Vec<u8>)>)> {
         let (cid, consumed) = parse_cid_prefix(body)?;
         let raw = body[consumed..].to_vec();
         blocks.push((cid, raw));
+    }
+    Ok((roots, blocks))
+}
+
+/// Parse a CAR whose header uses public AT canonical DAG-CBOR. Block framing is
+/// identical to [`parse_car_v1`]; callers decide how to decode each block.
+pub fn parse_car_v1_atproto(input: &[u8]) -> Result<(Vec<Cid>, Vec<(Cid, Vec<u8>)>)> {
+    let (header_body, mut cursor) = read_section(input, 0)?;
+    let header_val = crate::atproto_cbor::decode(header_body)?;
+    let version = header_val
+        .get("version")
+        .ok_or_else(|| anyhow!("CAR header missing 'version'"))?
+        .as_unsigned()?;
+    ensure!(
+        version == 1,
+        "only CARv1 is supported (got version {version})"
+    );
+    let roots_val = header_val
+        .get("roots")
+        .ok_or_else(|| anyhow!("CAR header missing 'roots'"))?
+        .as_list()?;
+    let roots = roots_val
+        .iter()
+        .map(|r| r.as_link())
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .copied()
+        .collect();
+    let mut blocks = Vec::new();
+    while cursor < input.len() {
+        let (body, after) = read_section(input, cursor)?;
+        cursor = after;
+        let (cid, consumed) = parse_cid_prefix(body)?;
+        blocks.push((cid, body[consumed..].to_vec()));
     }
     Ok((roots, blocks))
 }
