@@ -4359,6 +4359,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn required_iroh_carrier_watcher_detects_endpoint_close() -> anyhow::Result<()> {
+        use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, NoopHandler};
+
+        let signing_key = hyprstream_rpc::prelude::SigningKey::generate(&mut rand::rngs::OsRng);
+        let server = IrohSubstrate::new(
+            signing_key.to_bytes(),
+            NoopHandler::new("oauth watcher moq"),
+            NoopHandler::new("oauth watcher rpc"),
+        )
+        .await?;
+        let shutdown = Notify::new();
+
+        // Endpoint::close is the same observable carrier failure that the
+        // watcher must convert into a terminal service outcome.
+        server.endpoint().close().await;
+        let lost = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_for_required_iroh_carrier(&server, &shutdown),
+        )
+        .await?;
+        assert!(lost, "closed required carrier must be reported as lost");
+        server.shutdown().await?;
+        Ok(())
+    }
+
     #[test]
     fn test_validate_redirect_uri_exact_match() {
         let registered = vec!["http://127.0.0.1:3000/callback".to_owned()];
