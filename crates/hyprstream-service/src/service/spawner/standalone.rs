@@ -162,10 +162,13 @@ impl ChildNotifySocket {
         use std::io::IoSliceMut;
 
         let mut buffer = [0u8; 128];
-        // Drain the complete nonblocking queue in one poll. A foreign sender
-        // must never be able to keep the genuine child's READY=1 datagram
-        // behind a sustained backlog; only the exact child PID can succeed.
-        loop {
+        // Drain a bounded batch of the nonblocking queue in one poll. A
+        // foreign sender must not be able to keep the readiness loop from
+        // returning to its child-exit/deadline checks by keeping the queue
+        // perpetually nonempty. Subsequent polls continue draining, so a
+        // genuine READY behind a finite spoof backlog is still observed.
+        const MAX_DATAGRAMS_PER_POLL: usize = 256;
+        for _ in 0..MAX_DATAGRAMS_PER_POLL {
             // Scope the recvmsg borrows: `message` holds the iov/cmsg borrows,
             // so extract what we need before touching the payload buffer again.
             let (bytes, sender_pid) = {
@@ -202,6 +205,7 @@ impl ChildNotifySocket {
                 return Ok(true);
             }
         }
+        Ok(false)
     }
 }
 
