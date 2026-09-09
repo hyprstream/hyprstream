@@ -7,7 +7,6 @@ import argparse
 import copy
 import fnmatch
 import json
-import os
 import re
 import subprocess
 import sys
@@ -15,15 +14,15 @@ from pathlib import Path
 from typing import Any
 
 SURFACES = ("cli", "mcp", "factory", "vfs", "typescript")
-OWNER_MANIFESTS = {
-    "hyprstream": "crates/hyprstream/Cargo.toml",
-    "hyprstream-discovery": "crates/hyprstream-discovery/Cargo.toml",
-    "hyprstream-pay": "crates/hyprstream-pay/Cargo.toml",
-    "hyprstream-rpc": "crates/hyprstream-rpc/Cargo.toml",
-    "hyprstream-rpc-build": "crates/hyprstream-rpc-build/Cargo.toml",
-    "hyprstream-rpc-std": "crates/hyprstream-rpc-std/Cargo.toml",
-    "hyprstream-workers": "crates/hyprstream-workers/Cargo.toml",
-}
+OWNER_DIRECTORIES = (
+    "crates/hyprstream/schema",
+    "crates/hyprstream-discovery/schema",
+    "crates/hyprstream-pay/schema",
+    "crates/hyprstream-rpc/schema",
+    "crates/hyprstream-rpc-build/tests",
+    "crates/hyprstream-rpc-std/schema",
+    "crates/hyprstream-workers/schema",
+)
 PUBLIC_GLOBS = {
     "docs/*.md", "docs/adr/**/*.md", "docs/contracts/**/*.md",
     "docs/deployment/**/*.md", "docs/network/**/*.md", "docs/security/**/*.md",
@@ -45,6 +44,58 @@ CGR_ROOTS = {
     "crates/hyprstream-rpc/build.rs": ["crates/hyprstream-rpc/schema"],
     "crates/hyprstream-rpc-std/build.rs": ["crates/hyprstream-rpc-std/schema", "crates/hyprstream-rpc/schema"],
     "crates/hyprstream-workers/build.rs": ["crates/hyprstream-workers/schema", "crates/hyprstream-rpc/schema"],
+}
+CGR_SOURCE_CONTRACTS = {
+    "crates/hyprstream/build.rs": (
+        'letschema_dir=Path::new("schema");',
+        'letrpc_schema_dir=Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
+        "letimport_paths:&[&Path]=&[&rpc_schema_dir,schema_dir];",
+        'letschemas=["tui","compositor_ipc"];',
+        'letrpc_schemas=["streaming","nine"];',
+        "hyprstream_rpc_build::compile_schemas(schema_dir,out_path,import_paths,&schemas);",
+        "hyprstream_rpc_build::compile_schemas(&rpc_schema_dir,out_path,import_paths,&rpc_schemas);",
+    ),
+    "crates/hyprstream-discovery/build.rs": (
+        'letschema_dir=Path::new("schema");',
+        'letrpc_schema_dir=Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
+        'hyprstream_rpc_build::compile_schemas(schema_dir,Path::new(&out_dir),&[&rpc_schema_dir],&["discovery"],);',
+    ),
+    "crates/hyprstream-rpc/build.rs": (
+        'letschema_dir=Path::new("schema");',
+        'hyprstream_rpc_build::compile_schemas(schema_dir,Path::new(&out_dir),&[],&["common","streaming","events","annotations","optional","nine"],);',
+    ),
+    "crates/hyprstream-rpc-std/build.rs": (
+        'letschema_dir=Path::new("schema");',
+        'letrpc_schema_dir=Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
+        "letimport_paths:&[&Path]=&[&rpc_schema_dir,schema_dir];",
+        'letschemas=["inference","model","registry","policy","mcp","metrics","service_events","chat_core","oauth",];',
+        "hyprstream_rpc_build::compile_schemas(schema_dir,out_path,import_paths,&schemas);",
+    ),
+    "crates/hyprstream-workers/build.rs": (
+        'letschema_dir=Path::new("schema");',
+        'letrpc_schema_dir=Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
+        'hyprstream_rpc_build::compile_schemas(schema_dir,Path::new(&out_dir),&[&rpc_schema_dir],&["worker","workflow"],);',
+    ),
+}
+CGR_SCHEMA_INPUTS = {
+    "crates/hyprstream/build.rs": {
+        "crates/hyprstream/schema": ["tui", "compositor_ipc"],
+        "crates/hyprstream-rpc/schema": ["streaming", "nine"],
+    },
+    "crates/hyprstream-discovery/build.rs": {
+        "crates/hyprstream-discovery/schema": ["discovery"],
+    },
+    "crates/hyprstream-rpc/build.rs": {
+        "crates/hyprstream-rpc/schema": ["common", "streaming", "events", "annotations", "optional", "nine"],
+    },
+    "crates/hyprstream-rpc-std/build.rs": {
+        "crates/hyprstream-rpc-std/schema": [
+            "inference", "model", "registry", "policy", "mcp", "metrics", "service_events", "chat_core", "oauth",
+        ],
+    },
+    "crates/hyprstream-workers/build.rs": {
+        "crates/hyprstream-workers/schema": ["worker", "workflow"],
+    },
 }
 PACKAGE_REQUIREMENTS = [
     "Publish only validated manifest entries.",
@@ -95,7 +146,21 @@ def source_services(
     factories = text(repo, "crates/hyprstream/src/services/factories.rs", mutations)
     vfs = text(repo, "crates/hyprstream-rpc-std/src/vfs_mount.rs", mutations)
 
-    cli_services = re.findall(r'build_service_command\(\s*"([a-z0-9-]+)"', cli)
+    registrations: list[tuple[int, str, list[str] | None]] = [
+        (match.start(), match.group(1), None)
+        for match in re.finditer(r'build_service_command\(\s*"([a-z0-9-]+)"', cli)
+    ]
+    for match in re.finditer(
+        r'let\s+(?P<binding>[a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*Command::new\("(?P<service>[a-z0-9-]+)"\)'
+        r'(?P<body>.*?)\btool\s*=\s*tool\.subcommand\((?P=binding)\);',
+        cli,
+        re.DOTALL,
+    ):
+        methods = re.findall(r'Command::new\("([a-z0-9-]+)"\)', match.group("body"))
+        registrations.append((match.start(), match.group("service"), methods))
+    registrations.sort()
+    cli_services = [service for _, service, _ in registrations]
+    manual_services = {service: methods for _, service, methods in registrations if methods is not None}
     mcp_modules = re.findall(r"register_top_level!\(\s*reg,\s*([a-zA-Z0-9_:]+)::schema_metadata\(\)\s*\)", mcp)
     mcp_services = [module.rsplit("::", 1)[-1].removesuffix("_client") for module in mcp_modules]
     factory_matches = re.finditer(
@@ -115,6 +180,7 @@ def source_services(
     return {
         "cli": {
             "services": cli_services,
+            "manual_services": manual_services,
             "method_policy": {
                 "hidden": "excluded" if "if method.cli_hidden || method.is_streaming" in cli else "unknown",
                 "streaming": "excluded" if "if method.cli_hidden || method.is_streaming" in cli else "unknown",
@@ -133,6 +199,10 @@ def source_services(
     }
 
 
+def audited_base(repo: Path) -> str:
+    return git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
+
+
 def check_provenance(record: dict[str, Any], repo: Path, label: str) -> None:
     commit = record.get("source_commit")
     tree = record.get("source_tree")
@@ -140,43 +210,91 @@ def check_provenance(record: dict[str, Any], repo: Path, label: str) -> None:
     required(isinstance(tree, str) and re.fullmatch(r"[0-9a-f]{40}", tree) is not None, f"{label} has invalid source_tree")
     git(repo, "cat-file", "-e", f"{commit}^{{commit}}")
     required(git(repo, "rev-parse", f"{commit}^{{tree}}") == tree, f"{label} source_tree does not match source_commit")
+    base = audited_base(repo)
+    required(commit == base, f"{label} source_commit does not match audited merge base")
+    required(tree == git(repo, "rev-parse", f"{base}^{{tree}}"), f"{label} source_tree does not match audited merge base")
 
 
-def manifest_license(repo: Path, owner: str) -> str:
-    manifest = OWNER_MANIFESTS.get(owner)
-    required(manifest is not None, f"unknown schema owner {owner}")
-    found = re.search(r'^license\s*=\s*"([^"]+)"', text(repo, manifest, None), re.MULTILINE)
-    required(found is not None, f"{manifest} lacks package license")
-    return found.group(1)
+def owner_manifest(repo: Path, schema_path: str, owner_directories: list[str]) -> tuple[str, str, str]:
+    matches = [directory for directory in owner_directories if schema_path.startswith(f"{directory}/")]
+    required(len(matches) == 1, f"{schema_path} does not map to exactly one owner directory")
+    manifest = str(Path(matches[0]).parent / "Cargo.toml")
+    source = text(repo, manifest, None)
+    package = re.search(r'^name\s*=\s*"([^"]+)"', source, re.MULTILINE)
+    license_match = re.search(r'^license\s*=\s*"([^"]+)"', source, re.MULTILINE)
+    required(package is not None, f"{manifest} lacks package name")
+    required(license_match is not None, f"{manifest} lacks package license")
+    return matches[0], package.group(1), license_match.group(1)
 
 
-def check_cgr(catalog: dict[str, Any], repo: Path, schemas: list[dict[str, Any]]) -> None:
+def check_owner_directories(catalog: dict[str, Any], repo: Path) -> list[str]:
+    owner_directories = catalog.get("owner_directories")
+    required(owner_directories == list(OWNER_DIRECTORIES), "owner directory inventory drift")
+    for directory in owner_directories:
+        required((repo / directory).is_dir(), f"owner directory does not exist: {directory}")
+        required((repo / directory).parent.joinpath("Cargo.toml").is_file(), f"owner manifest missing for {directory}")
+    return owner_directories
+
+
+def compact(source: str) -> str:
+    return re.sub(r"\s+", "", source)
+
+
+def check_cgr(catalog: dict[str, Any], repo: Path, schemas: list[dict[str, Any]],
+              mutations: dict[str, str] | None) -> None:
     roots = catalog.get("cgr_build_roots", {})
     required(roots == CGR_ROOTS, "persisted-CGR import roots drift")
     for build_file, import_roots in roots.items():
-        source = text(repo, build_file, None)
+        source = text(repo, build_file, mutations)
+        source_compact = compact(source)
         required("hyprstream_rpc_build::compile_schemas" in source, f"{build_file} is not a persisted-CGR producer")
         required(isinstance(import_roots, list) and import_roots, f"{build_file} lacks import roots")
-        for root in import_roots:
-            relative = os.path.relpath(root, str(Path(build_file).parent)).replace("\\", "/")
-            required(relative in source or f'"{Path(root).name}"' in source, f"{build_file} does not reference declared import root {root}")
+        for contract in CGR_SOURCE_CONTRACTS[build_file]:
+            required(contract in source_compact, f"{build_file} persisted-CGR source/import arguments drift")
     for entry in schemas:
         producer = entry.get("cgr_producer")
         if producer is None:
             mode = entry.get("compiled_by")
             required(mode in {"capnp_only", "not_compiled"}, f"{entry['path']} must distinguish non-CGR compilation")
             if mode == "capnp_only":
-                source = text(repo, "crates/hyprstream-rpc-build/build.rs", None)
+                source = text(repo, "crates/hyprstream-rpc-build/build.rs", mutations)
                 required("capnpc::CompilerCommand" in source and Path(entry["path"]).stem in source, f"{entry['path']} capnp-only claim drift")
             continue
-        source = text(repo, producer, None)
+        source = text(repo, producer, mutations)
         required(producer in roots, f"{entry['path']} producer is not an audited persisted-CGR root")
         required("hyprstream_rpc_build::compile_schemas" in source, f"{entry['path']} producer does not emit persisted CGR")
-        required(re.search(rf'["\']{re.escape(Path(entry["path"]).stem)}["\']', source) is not None,
-                 f"{entry['path']} is absent from declared persisted-CGR inputs")
+        input_roots = CGR_SCHEMA_INPUTS[producer]
+        matched_roots = [root for root in input_roots if entry["path"].startswith(f"{root}/")]
+        required(len(matched_roots) == 1, f"{entry['path']} does not map to an exact {producer} input root")
+        required(Path(entry["path"]).stem in input_roots[matched_roots[0]],
+                 f"{entry['path']} is absent from exact persisted-CGR inputs")
 
 
-def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list[str], consumers: dict[str, dict[str, Any]]) -> None:
+def schema_method_metadata(repo: Path, schemas: list[dict[str, Any]],
+                           mutations: dict[str, str] | None) -> dict[str, list[str]]:
+    hidden, streaming = [], []
+    for entry in schemas:
+        service = entry.get("service")
+        if not service:
+            continue
+        source = text(repo, entry["path"], mutations)
+        hidden.extend(
+            f"{service}.{method}"
+            for method in re.findall(
+                r"(?ms)^\s*([A-Za-z][A-Za-z0-9_]*)\s+@\d+\s*:[^;]*?\$cliHidden\b[^;]*;", source
+            )
+        )
+        streaming.extend(
+            f"{service}.{method.removesuffix('Result')}"
+            for method in re.findall(
+                r"(?m)^\s*([A-Za-z][A-Za-z0-9_]*)Result\s+@\d+\s*:\s*StreamInfo\s*;", source
+            )
+        )
+    return {"cli_hidden": sorted(hidden), "streaming": sorted(streaming)}
+
+
+def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list[str],
+                         consumers: dict[str, dict[str, Any]], mutations: dict[str, str] | None) -> None:
     required(catalog.get("schema_version") == 1, "schema catalog must use schema_version 1")
     required(catalog.get("authority") == "docs/system-ontology.md", "system ontology must remain authoritative")
     check_provenance(catalog, repo, "schema catalog")
@@ -190,18 +308,23 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
     service_ids = [entry["service"] for entry in schemas if entry.get("service")]
     required(len(service_ids) == len(set(service_ids)), "duplicate schema service identity")
     by_service = {entry["service"]: entry for entry in schemas if entry.get("service")}
+    owner_directories = check_owner_directories(catalog, repo)
     for entry in schemas:
         for key in ("owner", "license", "kind", "exclusions"):
             required(bool(entry.get(key)), f"{entry['path']} lacks {key}")
-        required(entry["license"] == manifest_license(repo, entry["owner"]), f"{entry['path']} license differs from owner manifest")
-        source = text(repo, entry["path"], None)
+        _, owner, license_id = owner_manifest(repo, entry["path"], owner_directories)
+        required(entry["owner"] == owner, f"{entry['path']} owner differs from path-derived package")
+        required(entry["license"] == license_id, f"{entry['path']} license differs from owner manifest")
+        source = text(repo, entry["path"], mutations)
         found = re.search(r"^@(0x[0-9a-f]+);", source, re.MULTILINE)
         required(found is not None and found.group(1) == entry["source_id"], f"{entry['path']} source ID drift")
         active = set(entry.get("surfaces", []))
         required(active <= set(SURFACES) | {"docs"}, f"{entry['path']} has unknown surface")
         for surface in SURFACES:
             required(surface in active or bool(entry["exclusions"].get(surface)), f"{entry['path']} lacks {surface} disposition")
-    check_cgr(catalog, repo, schemas)
+    check_cgr(catalog, repo, schemas, mutations)
+    required(catalog.get("method_metadata") == schema_method_metadata(repo, schemas, mutations),
+             "schema hidden/streaming method metadata drift")
 
     declared = catalog.get("consumer_sets", {})
     required(set(declared) == set(SURFACES), "consumer sets must enumerate every surface")
@@ -212,6 +335,8 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
         required(record.get(key) == actual.get(key), f"{surface} source registration drift")
         if surface in {"cli", "mcp"}:
             required(record.get("method_policy") == actual.get("method_policy"), f"{surface} hidden/streaming policy drift")
+        if surface == "cli":
+            required(record.get("manual_services") == actual.get("manual_services"), "CLI manual registration drift")
         if surface == "factory":
             required(record.get("feature_conditions") == actual.get("feature_conditions"), "factory feature condition drift")
         if surface == "typescript":
@@ -250,18 +375,23 @@ def check_corpus(corpus: dict[str, Any], repo: Path) -> None:
 
 
 def validate(repo: Path, catalog: dict[str, Any] | None = None, corpus: dict[str, Any] | None = None,
-             schema_paths: list[str] | None = None, consumers: dict[str, dict[str, Any]] | None = None) -> None:
+             schema_paths: list[str] | None = None, consumers: dict[str, dict[str, Any]] | None = None,
+             mutations: dict[str, str] | None = None) -> None:
     catalog = catalog or read_json(repo / "docs/schema-catalog.json")
     corpus = corpus or read_json(repo / "docs/corpus-sources.json")
-    check_schema_catalog(catalog, repo, schema_paths or tracked(repo, "*.capnp"), consumers or source_services(repo))
+    check_schema_catalog(
+        catalog, repo, schema_paths or tracked(repo, "*.capnp"),
+        consumers or source_services(repo, mutations), mutations,
+    )
     check_corpus(corpus, repo)
     required("docs/system-ontology.md" in text(repo, "docs/contracts/docs-pipeline.md", None), "pipeline contract omits ontology authority")
 
 
 def expect_failure(name: str, repo: Path, catalog: dict[str, Any], corpus: dict[str, Any],
-                   schemas: list[str], consumers: dict[str, dict[str, Any]]) -> None:
+                   schemas: list[str], consumers: dict[str, dict[str, Any]],
+                   mutations: dict[str, str] | None = None) -> None:
     try:
-        validate(repo, catalog, corpus, schemas, consumers)
+        validate(repo, catalog, corpus, schemas, consumers, mutations)
     except CatalogError:
         return
     raise AssertionError(f"mutation probe {name} unexpectedly passed")
@@ -277,6 +407,17 @@ def self_test(repo: Path) -> None:
     expect_failure("schema provenance", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["source_tree"] = "0" * 40
     expect_failure("corpus provenance", repo, catalog, bad, schemas, consumers)
+    stale = git(repo, "rev-parse", "HEAD")
+    if stale == catalog["source_commit"]:
+        stale = git(repo, "rev-parse", "HEAD~1")
+    bad = copy.deepcopy(catalog)
+    bad["source_commit"] = stale
+    bad["source_tree"] = git(repo, "rev-parse", f"{stale}^{{tree}}")
+    expect_failure("stale valid provenance", repo, bad, corpus, schemas, consumers)
+    bad = copy.deepcopy(corpus)
+    bad["source_commit"] = stale
+    bad["source_tree"] = git(repo, "rev-parse", f"{stale}^{{tree}}")
+    expect_failure("stale valid corpus provenance", repo, catalog, bad, schemas, consumers)
     bad = copy.deepcopy(catalog); bad["schemas"][0]["license"] = "MIT"
     expect_failure("manifest license", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(catalog); bad["cgr_build_roots"]["crates/hyprstream/build.rs"][0] = "made/up/schema"
@@ -290,7 +431,22 @@ def self_test(repo: Path) -> None:
     ]:
         mutated = text(repo, path, None).replace(before, after)
         expect_failure(name, repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, {path: mutated}))
+    cli_path = "crates/hyprstream/src/cli/schema_cli.rs"
+    renamed = text(repo, cli_path, None).replace('Command::new("discovery")', 'Command::new("settlement")', 1)
+    expect_failure("manual CLI rename", repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, {cli_path: renamed}))
+    removed = text(repo, cli_path, None).replace("tool = tool.subcommand(discovery);", "// manual discovery registration removed", 1)
+    expect_failure("manual CLI removal", repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, {cli_path: removed}))
+    worker_path = "crates/hyprstream-workers/schema/worker.capnp"
+    hidden_removed = text(repo, worker_path, None).replace("$cliHidden ", "", 1)
+    expect_failure("schema hidden annotation", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: hidden_removed})
+    discovery_build = "crates/hyprstream-discovery/build.rs"
+    root_changed = text(repo, discovery_build, None).replace("../hyprstream-rpc/schema", "../unrelated/schema", 1)
+    expect_failure("CGR source import root", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {discovery_build: root_changed})
     expect_failure("TypeScript source", repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, tracked_sources=["package.json"]))
+    bad = copy.deepcopy(catalog); bad.pop("owner_directories")
+    expect_failure("owner directory inventory", repo, bad, corpus, schemas, consumers)
+    bad = copy.deepcopy(catalog); bad["schemas"][0]["owner"] = "hyprstream"
+    expect_failure("path-derived owner", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["excluded"][0]["reason"] = ""
     expect_failure("exclusion reason", repo, catalog, bad, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["public_prose"][0]["glob"] = "docs/**/*.md"
@@ -299,7 +455,7 @@ def self_test(repo: Path) -> None:
     expect_failure("public license", repo, catalog, bad, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["package_contract"]["requirements"] = []
     expect_failure("package requirements", repo, catalog, bad, schemas, consumers)
-    print("docs catalog mutation probes: passed (16 expected failures)")
+    print("docs catalog mutation probes: passed (24 expected failures)")
 
 
 def main() -> int:

@@ -9,6 +9,7 @@
     "crates/hyprstream-discovery/schema",
     "crates/hyprstream-pay/schema",
     "crates/hyprstream-rpc/schema",
+    "crates/hyprstream-rpc-build/tests",
     "crates/hyprstream-rpc-std/schema",
     "crates/hyprstream-workers/schema"
   ],
@@ -19,8 +20,12 @@
     "crates/hyprstream-rpc-std/build.rs": ["crates/hyprstream-rpc-std/schema", "crates/hyprstream-rpc/schema"],
     "crates/hyprstream-workers/build.rs": ["crates/hyprstream-workers/schema", "crates/hyprstream-rpc/schema"]
   },
+  "method_metadata": {
+    "cli_hidden": ["worker.attach", "worker.detach"],
+    "streaming": ["inference.createLoraStream", "inference.exportPeftAdapterStream", "inference.generateStream", "inference.loadLoraStream", "inference.mergeLoraStream", "inference.saveAdaptationStream", "inference.saveLoraStream", "inference.snapshotDeltaStream", "inference.trainStepStream", "metrics.queryStream", "registry.cloneStream", "registry.getBlob"]
+  },
   "schemas": [
-    {"path":"crates/hyprstream-discovery/schema/discovery.capnp","source_id":"0xe8bc708034927ef4","owner":"hyprstream-discovery","license":"AGPL-3.0-only","kind":"service","service":"discovery","cgr_producer":"crates/hyprstream-discovery/build.rs","surfaces":["factory","docs"],"exclusions":{"cli":"not composed by schema_cli","mcp":"not registered as an MCP tool source","vfs":"not in vfs_mount dispatch","typescript":"CGR is emitted, but no tracked TypeScript package consumes it"}},
+    {"path":"crates/hyprstream-discovery/schema/discovery.capnp","source_id":"0xe8bc708034927ef4","owner":"hyprstream-discovery","license":"AGPL-3.0-only","kind":"service","service":"discovery","cgr_producer":"crates/hyprstream-discovery/build.rs","surfaces":["cli","factory","docs"],"exclusions":{"mcp":"not registered as an MCP tool source","vfs":"not in vfs_mount dispatch","typescript":"CGR is emitted, but no tracked TypeScript package consumes it"}},
     {"path":"crates/hyprstream-pay/schema/settlement.capnp","source_id":"0xbf8c3a91e5f27a09","owner":"hyprstream-pay","license":"MIT","kind":"service","service":"settlement","cgr_producer":null,"compiled_by":"not_compiled","surfaces":["docs"],"exclusions":{"cli":"payment protocol is not a CLI service","mcp":"not exposed as MCP","factory":"no application factory","vfs":"no VFS projection","typescript":"no tracked TypeScript consumer"}},
     {"path":"crates/hyprstream-rpc-build/tests/wire_roundtrip_fixture.capnp","source_id":"0xb1175a70b1175a70","owner":"hyprstream-rpc-build","license":"Apache-2.0","kind":"test-fixture","service":null,"cgr_producer":null,"compiled_by":"capnp_only","surfaces":[],"exclusions":{"cli":"test-only fixture","mcp":"test-only fixture","factory":"test-only fixture","vfs":"test-only fixture","typescript":"wire round-trip test input, not package API"}},
     {"path":"crates/hyprstream-rpc-std/schema/chat_core.capnp","source_id":"0xb8b2fdca21f1727e","owner":"hyprstream-rpc-std","license":"Apache-2.0","kind":"type-only","service":null,"cgr_producer":"crates/hyprstream-rpc-std/build.rs","surfaces":["docs"],"exclusions":{"cli":"data types only","mcp":"data types only","factory":"no generated service","vfs":"data types only","typescript":"CGR available but no tracked TypeScript consumer"}},
@@ -44,7 +49,7 @@
     {"path":"crates/hyprstream/schema/tui.capnp","source_id":"0xa159a8ac3c898085","owner":"hyprstream","license":"AGPL-3.0-only","kind":"service","service":"tui","cgr_producer":"crates/hyprstream/build.rs","surfaces":["mcp","factory","docs"],"exclusions":{"cli":"not composed by schema_cli","vfs":"not in vfs_mount dispatch","typescript":"CGR available but no tracked TypeScript consumer"}}
   ],
   "consumer_sets": {
-    "cli": {"state":"active","source":"crates/hyprstream/src/cli/schema_cli.rs","services":["registry","model","inference","policy","worker","workflow"],"method_policy":{"hidden":"excluded","streaming":"excluded"},"notes":"Runtime builder excludes hidden and streaming methods."},
+    "cli": {"state":"active","source":"crates/hyprstream/src/cli/schema_cli.rs","services":["registry","model","inference","policy","discovery","worker","workflow"],"manual_services":{"discovery":["ping"]},"method_policy":{"hidden":"excluded","streaming":"excluded"},"notes":"Runtime builder excludes hidden and streaming methods; discovery is a deliberately restricted manual ping-only command."},
     "mcp": {"state":"active","source":"crates/hyprstream/src/services/mcp_service.rs","services":["model","registry","policy","tui","workflow"],"method_policy":{"hidden":"excluded","streaming":"included"},"notes":"MCP deliberately differs from CLI; hidden methods are excluded before registration."},
     "factory": {"state":"active","source":"crates/hyprstream/src/services/factories.rs","services":["event","ledger","policy","registry","streams","model","inference","worker","workflow","oai","xet","at9p-verify","flight","oauth","mcp","tui","discovery","metrics"],"feature_conditions":{"ledger":"feature=ledger","flight":"feature=metrics","metrics":"feature=metrics"},"non_schema_services":{"event":"event-plane lifecycle factory has no Cap'n Proto schema","ledger":"feature-gated ledger factory has no Cap'n Proto schema","streams":"MoQ stream-plane factory has no Cap'n Proto schema","oai":"OpenAI adapter factory has no Cap'n Proto schema","xet":"storage substrate factory has no Cap'n Proto schema","at9p-verify":"verification factory has no Cap'n Proto schema","flight":"feature-gated Arrow Flight factory has no Cap'n Proto schema"}},
     "vfs": {"state":"active","source":"crates/hyprstream-rpc-std/src/vfs_mount.rs","services":["registry","model","policy","mcp","inference"],"notes":"Generated dispatch is not a runtime mount assertion; browser/runtime mounting remains separately configured."},
