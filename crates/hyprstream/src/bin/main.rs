@@ -3724,6 +3724,37 @@ fn main() -> Result<()> {
                                     &service_names, ctx.iroh_required(),
                                 );
 
+                                // In a split required-native launch each child
+                                // sees only its own `service_names` entry, while
+                                // the parent stages the configured roster. If
+                                // this child is one of the services scheduled
+                                // before Policy (currently event, discovery,
+                                // or streams), defer its startup probe so the
+                                // parent can reach the Policy stage. A
+                                // standalone policy-dependent child retains
+                                // the eager probe and cannot report ready with
+                                // an unavailable authority.
+                                let defer_policy_probe = if ctx.iroh_required()
+                                    && service_names.len() == 1
+                                {
+                                    let configured_stages =
+                                        hyprstream_service::service::ordering::startup_stages_for_profile(
+                                            &services,
+                                            true,
+                                        );
+                                    let policy_stage = configured_stages
+                                        .iter()
+                                        .position(|stage| stage.iter().any(|name| name == "policy"));
+                                    policy_stage.is_some_and(|policy_index| {
+                                        configured_stages[..policy_index]
+                                            .iter()
+                                            .flatten()
+                                            .any(|name| service_names[0] == *name)
+                                    })
+                                } else {
+                                    false
+                                };
+
                                 // Publish the process-global authority stores
                                 // (credential revocation + session registry)
                                 // BEFORE any factory runs. The policy process
@@ -3737,9 +3768,7 @@ fn main() -> Result<()> {
                                     &ctx,
                                     ctx.signing_key(),
                                     service_names.iter().any(|n| n == "policy"),
-                                    ctx.iroh_required()
-                                        && service_names.len() == 1
-                                        && service_names.first().is_some_and(|n| n == "discovery"),
+                                    defer_policy_probe,
                                 )
                                 .await
                                 .context("revocation/session authority initialization failed")?;
