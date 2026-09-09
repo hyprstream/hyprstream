@@ -13,6 +13,7 @@
 //! | GET    | `com.atproto.repo.describeRepo`     | DID/handle + commit head + didDoc |
 //! | GET    | `com.atproto.repo.getRecord`        | record JSON (optional `cid` pinning) |
 //! | GET    | `com.atproto.sync.getRepo`          | full-repo CARv1 export (lazy stream) |
+//! | GET    | `com.atproto.server.describeServer` | server DID and account-domain policy |
 //! | GET    | `com.atproto.server.getServiceAuth` | protected hosted-account service JWT |
 //!
 //! **Session endpoints (`createSession`/`getSession`) are deliberately NOT in
@@ -91,6 +92,10 @@ pub fn xrpc_routes() -> axum::Router<Arc<OAuthState>> {
         .route(
             "/xrpc/com.atproto.identity.resolveHandle",
             get(resolve_handle),
+        )
+        .route(
+            "/xrpc/com.atproto.server.describeServer",
+            get(describe_server),
         )
         .route("/xrpc/com.atproto.repo.describeRepo", get(describe_repo))
         .route("/xrpc/com.atproto.repo.getRecord", get(get_record))
@@ -836,6 +841,40 @@ async fn lookup_public_snapshot(store: &XrpcRepoStore, key: &str) -> Option<Arc<
 // ─────────────────────────────────────────────────────────────────────────────
 // Axum handler wrappers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Return the standard server capability and account-domain description.
+///
+/// The service DID is derived from the configured issuer origin. Account
+/// domains are advertised only when an authority-owned [`AccountZone`] is
+/// installed; an unconfigured zone yields an empty list rather than a guessed
+/// or operator-wide wildcard. Account creation remains unavailable until its
+/// provisioning contract is installed, so invite-code requirement is kept
+/// fail-closed.
+pub async fn describe_server(State(state): State<Arc<OAuthState>>) -> Response {
+    let Some(did) = state.atproto_service_did() else {
+        return xrpc_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            errors::INTERNAL_SERVER_ERROR,
+            "server DID is unavailable",
+        );
+    };
+    let available_user_domains = state
+        .hosted_account_zone
+        .as_ref()
+        .map(|zone| format!(".{}", zone.apex()))
+        .into_iter()
+        .collect::<Vec<_>>();
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "did": did,
+            "availableUserDomains": available_user_domains,
+            "inviteCodeRequired": true,
+            "phoneVerificationRequired": false,
+        })),
+    )
+        .into_response()
+}
 
 pub async fn resolve_handle(
     State(state): State<Arc<OAuthState>>,
@@ -1680,6 +1719,31 @@ mod tests {
         let body = resp_json(resp).await;
         assert_eq!(body["did"], "did:web:pub.example.com");
         assert_eq!(body["handleIsCorrect"], true);
+    }
+
+    #[tokio::test]
+    async fn router_describe_server_reports_service_did_and_safe_defaults() {
+        let app = build_xrpc_router().await;
+        let resp = app
+            .oneshot(req("/xrpc/com.atproto.server.describeServer"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp_json(resp).await;
+        assert_eq!(body["did"], "did:web:h.example.com");
+        assert_eq!(body["availableUserDomains"], json!([]));
+        assert_eq!(body["inviteCodeRequired"], true);
+        assert_eq!(body["phoneVerificationRequired"], false);
+    }
+
+    #[tokio::test]
+    async fn describe_server_advertises_only_configured_account_zone() {
+        let mut state = build_test_state(false).await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .hosted_account_zone = Some(crate::account::AccountZone::new("acct.example.com").unwrap());
+        let body = resp_json(describe_server(State(state)).await).await;
+        assert_eq!(body["availableUserDomains"], json!([".acct.example.com"]));
     }
 
     #[tokio::test]
