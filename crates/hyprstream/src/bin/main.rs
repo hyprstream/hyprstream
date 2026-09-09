@@ -3737,6 +3737,9 @@ fn main() -> Result<()> {
                                     &ctx,
                                     ctx.signing_key(),
                                     service_names.iter().any(|n| n == "policy"),
+                                    ctx.iroh_required()
+                                        && service_names.len() == 1
+                                        && service_names.first().is_some_and(|n| n == "discovery"),
                                 )
                                 .await
                                 .context("revocation/session authority initialization failed")?;

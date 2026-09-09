@@ -306,23 +306,28 @@ impl CredentialRevocationStore for PolicyAuthorityRevocationStore {
 /// (`credential-revocations.jsonl`, `sessions.jsonl`). Every compatibility-mode
 /// process PROBES the authority (a freshly generated random credential ID,
 /// expected not revoked; and a random session key, expected not active) before
-/// publishing the RPC client stores. In the required-native profile, Discovery
-/// starts before Policy so its resolver can publish the bootstrap announcement;
-/// non-Policy processes therefore publish lazy RPC client stores without a
-/// startup probe. Their first operation still fails closed until Policy is
-/// reachable. Both stores resolve a fresh
+/// publishing the RPC client stores. In the required-native profile, the
+/// standalone Discovery process starts before Policy so its resolver can
+/// publish the bootstrap announcement; that bootstrap process publishes lazy
+/// RPC client stores without a startup probe. Other service processes retain
+/// the startup probe and therefore do not report ready when Policy is
+/// unavailable. Lazy stores still fail closed on every operation. Both stores
+/// resolve a fresh
 /// [`PolicyClient`] per operation through the production resolver, so a
 /// renewed trust-store service JWT is consumed without a process restart.
 ///
 /// Fail-closed: any error in compatibility-mode probing — an unreadable/corrupt
 /// durable file, or an authority unreachable after [`PROBE_ATTEMPTS`] attempts
-/// — is propagated and MUST abort startup. Required-native clients retain the
-/// same fail-closed operation behavior while allowing the dependency-ordered
-/// Discovery → Policy bootstrap to complete.
+/// — is propagated and MUST abort startup. Required-native Discovery clients
+/// retain the same fail-closed operation behavior while allowing the
+/// dependency-ordered Discovery → Policy bootstrap to complete. Policy-
+/// dependent services keep the probe so a standalone service cannot become
+/// ready without its authority.
 pub async fn init_process_authority_stores(
     ctx: &ServiceContext,
     signing_key: &SigningKey,
     hosts_policy: bool,
+    defer_policy_probe: bool,
 ) -> anyhow::Result<()> {
     if hosts_policy {
         let data_dir = ctx.deployment_data_dir()?;
@@ -351,13 +356,11 @@ pub async fn init_process_authority_stores(
 
     let store = PolicyAuthorityRevocationStore::for_service(signing_key.clone());
     let sessions = PolicyAuthoritySessionRegistry::for_service(signing_key.clone());
-    // Required-native startup deliberately launches Discovery before Policy so
-    // the native resolver can publish the bootstrap announcement. A cold
-    // single-service child cannot synchronously probe Policy here without
-    // deadlocking that ordering. Publish the lazy clients; each operation
-    // continues to resolve Policy over authenticated Iroh and fails closed on
-    // an unavailable authority.
-    if ctx.iroh_required() {
+    // Required-native standalone Discovery launches before Policy so the native
+    // resolver can publish the bootstrap announcement. Only that bootstrap
+    // process may defer the probe; policy-dependent services must remain
+    // blocked until their authority is reachable.
+    if ctx.iroh_required() && defer_policy_probe {
         hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(store))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         hyprstream_rpc::auth::set_global_session_registry(Arc::new(sessions))
