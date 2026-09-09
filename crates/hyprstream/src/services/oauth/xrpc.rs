@@ -985,7 +985,14 @@ pub async fn create_record(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("create-{}-{}", collection.replace('.', "_"), rkey.encode()));
-    let expected_prev = object.get("swapCommit").and_then(Value::as_str);
+    let expected_prev = match parse_swap_commit(object.get("swapCommit")) {
+        Ok(value) => value,
+        Err(message) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message),
+    };
+    let return_record = match parse_return_record(object.get("returnRecord")) {
+        Ok(value) => value,
+        Err(message) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message),
+    };
     let result = writer.create_record_with_expected_prev_text(
         crate::services::public_repo::PublicCreateRequest {
             request_id,
@@ -1005,7 +1012,7 @@ pub async fn create_record(
         Err(error) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, error.to_string()),
     };
     let mut response = json!({"uri": result.uri, "cid": result.cid.to_string()});
-    if object.get("returnRecord").and_then(Value::as_bool).unwrap_or(false) {
+    if return_record {
         response["value"] = record_value.clone();
     }
     (StatusCode::OK, axum::Json(response)).into_response()
@@ -1016,6 +1023,23 @@ fn validate_flag(value: Option<&Value>) -> Result<(), &'static str> {
         Some(Value::Bool(true)) => Err("Lexicon validation is not configured for this repository"),
         Some(Value::Bool(false)) | None => Ok(()),
         Some(_) => Err("validate must be a boolean"),
+    }
+}
+
+fn parse_swap_commit(value: Option<&Value>) -> Result<Option<&str>, &'static str> {
+    match value {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.as_str())),
+        Some(Value::String(_)) => Err("swapCommit must be a non-empty CID"),
+        Some(_) => Err("swapCommit must be a string"),
+    }
+}
+
+fn parse_return_record(value: Option<&Value>) -> Result<bool, &'static str> {
+    match value {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err("returnRecord must be a boolean"),
     }
 }
 
@@ -1082,6 +1106,26 @@ mod tests {
         assert_eq!(
             validate_flag(Some(&json!("yes"))).unwrap_err(),
             "validate must be a boolean"
+        );
+    }
+
+    #[test]
+    fn create_record_optional_fields_reject_wrong_types() {
+        assert_eq!(parse_swap_commit(None).unwrap(), None);
+        assert_eq!(parse_swap_commit(Some(&json!("bafyhead"))).unwrap(), Some("bafyhead"));
+        assert_eq!(
+            parse_swap_commit(Some(&json!(""))).unwrap_err(),
+            "swapCommit must be a non-empty CID"
+        );
+        assert_eq!(
+            parse_swap_commit(Some(&json!(42))).unwrap_err(),
+            "swapCommit must be a string"
+        );
+        assert!(!parse_return_record(None).unwrap());
+        assert!(parse_return_record(Some(&Value::Bool(true))).unwrap());
+        assert_eq!(
+            parse_return_record(Some(&json!("yes"))).unwrap_err(),
+            "returnRecord must be a boolean"
         );
     }
 
