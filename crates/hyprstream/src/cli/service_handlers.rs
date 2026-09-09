@@ -919,6 +919,48 @@ async fn launch_planned_children(
         }
         return Err(error);
     }
+    // A child may exit after its readiness notification while a later stage
+    // is still starting. Recheck every adopted child immediately before the
+    // transaction commits so we never report success for a deployment whose
+    // earlier service has already died.
+    if iroh_required {
+        let liveness_error = {
+            let mut failure = None;
+            for (service, process) in &guard.started {
+                match spawner.is_running(process).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        failure = Some(anyhow::anyhow!(
+                            "required-native child '{service}' exited before launch commit"
+                        ));
+                        break;
+                    }
+                    Err(e) => {
+                        failure = Some(anyhow::anyhow!(
+                            "could not verify required-native child '{service}' before launch commit: {e}"
+                        ));
+                        break;
+                    }
+                }
+            }
+            failure
+        };
+        if let Some(error) = liveness_error {
+            guard
+                .rollback_owned_children(|process| async move {
+                    spawner.stop(&process).await.map_err(anyhow::Error::from)
+                })
+                .await;
+            let residuals = guard.stop_all_sync_and_disarm();
+            if !residuals.is_empty() {
+                return Err(error.context(format!(
+                    "launch rollback left residual state: {}",
+                    residuals.join("; ")
+                )));
+            }
+            return Err(error);
+        }
+    }
     guard.commit();
     Ok(())
 }

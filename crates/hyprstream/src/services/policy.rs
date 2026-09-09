@@ -586,12 +586,14 @@ fn renewed_service_claims(
     now: i64,
     expires_at: i64,
     issuer: &str,
-    tenant: String,
+    tenant: Option<&str>,
     cnf_key: &[u8; 32],
 ) -> hyprstream_rpc::auth::Claims {
     let mut claims = hyprstream_rpc::auth::Claims::new(subject, now, expires_at)
-        .with_tenant(tenant)
         .with_cnf_jwk(cnf_key);
+    if let Some(tenant) = tenant {
+        claims = claims.with_tenant(tenant.to_owned());
+    }
     if !issuer.is_empty() {
         claims = claims
             .with_issuer(issuer.to_owned())
@@ -2856,9 +2858,15 @@ impl PolicyHandler for PolicyService {
         }
 
         let issuer = self.default_audience.clone().unwrap_or_default();
-        let tenant = ctx.domain()?;
+        // Provisioned native service credentials are authenticated against the
+        // global Policy domain and intentionally carry no tenant claim. Keep
+        // that path tenantless while using the explicit global domain for the
+        // workload-session policy checks below. Tenant-bearing callers retain
+        // their verified tenant binding.
+        let tenant = ctx.verified_tenant().map(str::to_owned);
+        let policy_domain = tenant.as_deref().unwrap_or("*");
         let mut claims =
-            renewed_service_claims(subject.clone(), now, expires_at, &issuer, tenant.clone(), &ctx.cnf);
+            renewed_service_claims(subject.clone(), now, expires_at, &issuer, tenant.as_deref(), &ctx.cnf);
 
         // ServiceEnrollmentManifest (v16 §11): renewal re-derives clearance
         // from the manifest — authority removed from enrollment never
@@ -2911,7 +2919,7 @@ impl PolicyHandler for PolicyService {
             .resolve_renewal_workload_session(
                 &issuer,
                 &subject,
-                &tenant,
+                policy_domain,
                 now,
                 family_policy,
                 old_wsid.as_deref(),
@@ -4102,7 +4110,7 @@ mod tests {
             100,
             200,
             "http://localhost:9080",
-            "tenant-a.example".to_owned(),
+            Some("tenant-a.example"),
             &cnf,
         );
         assert_eq!(claims.iss, "http://localhost:9080");
@@ -4114,7 +4122,7 @@ mod tests {
             100,
             200,
             "",
-            "tenant-a.example".to_owned(),
+            Some("tenant-a.example"),
             &cnf,
         );
         assert!(bare.iss.is_empty());
