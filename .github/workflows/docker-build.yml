@@ -323,6 +323,8 @@ jobs:
         TAGS: ${{ steps.meta.outputs.tags }}
       run: |
         set -euo pipefail
+        revision=$(git rev-parse HEAD)
+        test "$revision" = "$GITHUB_SHA"
         mkdir -p "$PODMAN_ROOT" "$PODMAN_RUNROOT"
         # Turn the newline-separated tag list into repeated `-t` args.
         tag_args=()
@@ -340,9 +342,16 @@ jobs:
         podman --root "$PODMAN_ROOT" --runroot "$PODMAN_RUNROOT" build \
           --target runtime \
           --build-arg VARIANT=cpu-arm64 \
+          --label "org.opencontainers.image.revision=$revision" \
           "${tag_args[@]}" \
           -f Dockerfile \
           .
+        # Staging pins the arm64 child digest only after checking this label.
+        # Refuse publication if the built image does not identify our source.
+        built_revision=$(podman --root "$PODMAN_ROOT" --runroot "$PODMAN_RUNROOT" \
+          image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+          "${tag_args[1]}")
+        test "$built_revision" = "$revision"
 
     - name: Push image tags
       if: github.event_name != 'pull_request'
