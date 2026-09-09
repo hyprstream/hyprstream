@@ -20,8 +20,6 @@ use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
 use std::process::Stdio;
-#[cfg(unix)]
-use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -42,18 +40,56 @@ fn detached_output_stdio() -> std::io::Result<Stdio> {
     #[cfg(unix)]
     {
         use nix::fcntl::OFlag;
-        // CLOEXEC keeps the sink reader out of the adopted daemon. The sink
-        // process itself owns the reader and survives launcher exit, so a
-        // daemon can write indefinitely without filling an undrained pipe.
+        use std::os::fd::RawFd;
+
+        // CLOEXEC keeps the drain reader out of the adopted daemon. Fork a
+        // tiny in-process reader instead of invoking an external `cat`: the
+        // official runtime image contains only `/hyprstream`, and the drain
+        // must continue after this launcher exits.
         let (reader, writer) = nix::unistd::pipe2(OFlag::O_CLOEXEC)?;
-        let reader = unsafe { std::fs::File::from_raw_fd(reader) };
-        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
-        StdCommand::new("cat")
-            .stdin(Stdio::from(reader))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        Ok(Stdio::from(writer))
+        let drain_pid = unsafe { nix::libc::fork() };
+        match drain_pid {
+            -1 => {
+                unsafe {
+                    nix::libc::close(reader);
+                    nix::libc::close(writer);
+                }
+                Err(std::io::Error::last_os_error())
+            }
+            0 => {
+                // After fork, use only async-signal-safe libc calls. The
+                // child owns the reader and discards bytes until EOF; it
+                // never inherits the writer, so EOF is well-defined.
+                unsafe {
+                    nix::libc::close(writer);
+                    let mut buffer = [0u8; 8192];
+                    loop {
+                        let read = nix::libc::read(
+                            reader,
+                            buffer.as_mut_ptr().cast(),
+                            buffer.len(),
+                        );
+                        if read <= 0 {
+                            break;
+                        }
+                    }
+                    nix::libc::close(reader);
+                    nix::libc::_exit(0);
+                }
+            }
+            pid => {
+                unsafe { nix::libc::close(reader) };
+                // Reap the helper while this launcher remains alive. If the
+                // launcher exits first, init adopts and reaps the helper.
+                let _ = std::thread::Builder::new()
+                    .name("hyprstream-daemon-stdio-reaper".to_owned())
+                    .spawn(move || unsafe {
+                        nix::libc::waitpid(pid, std::ptr::null_mut(), 0);
+                    });
+                let writer = unsafe { std::fs::File::from_raw_fd(writer as RawFd) };
+                Ok(Stdio::from(writer))
+            }
+        }
     }
     #[cfg(not(unix))]
     {
