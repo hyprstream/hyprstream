@@ -146,6 +146,12 @@ pub use namespace_builder::{build_standard_namespace, StandardNamespaceConfig};
 pub use hyprstream_workers::runtime::WorkerClient;
 pub use oauth::OAuthService;
 pub use oai::OAIService;
+#[cfg(test)]
+pub(crate) use oai::{
+    await_required_native_dependencies as oai_await_required_native_dependencies,
+    healthy_registry as oai_healthy_registry,
+    prove_model_reachability_denial as oai_prove_model_reachability_denial,
+};
 pub use xet::{XetService, XetState};
 pub use at9p_verify::{At9pVerifyService, VerifyFaceState, credential_free_router};
 #[cfg(feature = "oci-image")]

@@ -1776,7 +1776,8 @@ fn build_workflow_namespace() -> Namespace {
 /// Factory for OAIService (OpenAI-compatible HTTP API)
 ///
 /// This service provides the HTTP API for inference requests.
-/// It communicates with ModelService and PolicyService via ZMQ.
+/// It communicates with ModelService, PolicyService, and RegistryService over
+/// the configured authenticated RPC resolver.
 #[service_factory("oai", depends_on = ["policy", "model", "registry", "discovery"])]
 fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating OAIService");
@@ -1792,7 +1793,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     // Register this service's verifying key with PolicyService
     register_service_key(ctx, "oai", &sk)?;
 
-    // Create ZMQ clients for Model and Policy services
+    // Create authenticated clients for Model and Policy services.
     let model_client = ModelClient::from_resolver(sk.clone(), service_token(&sk))?;
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
@@ -1854,8 +1855,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         config.tls.clone(),
         config.account.clone(),
         server_state,
-        ctx.transport("oai", SocketKind::Rep),
-        ctx.verifying_key(),
+        ctx.iroh_required(),
     );
 
     Ok(Box::new(oai_service))
