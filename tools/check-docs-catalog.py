@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed contract check for the schema and documentation catalog."""
+"""Fail-closed checks for schema coverage and publication contracts."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 import copy
 import fnmatch
 import json
+import os
 import re
 import subprocess
 import sys
@@ -14,184 +15,251 @@ from pathlib import Path
 from typing import Any
 
 SURFACES = ("cli", "mcp", "factory", "vfs", "typescript")
+OWNER_MANIFESTS = {
+    "hyprstream": "crates/hyprstream/Cargo.toml",
+    "hyprstream-discovery": "crates/hyprstream-discovery/Cargo.toml",
+    "hyprstream-pay": "crates/hyprstream-pay/Cargo.toml",
+    "hyprstream-rpc": "crates/hyprstream-rpc/Cargo.toml",
+    "hyprstream-rpc-build": "crates/hyprstream-rpc-build/Cargo.toml",
+    "hyprstream-rpc-std": "crates/hyprstream-rpc-std/Cargo.toml",
+    "hyprstream-workers": "crates/hyprstream-workers/Cargo.toml",
+}
+PUBLIC_GLOBS = {
+    "docs/*.md", "docs/adr/**/*.md", "docs/contracts/**/*.md",
+    "docs/deployment/**/*.md", "docs/network/**/*.md", "docs/security/**/*.md",
+    "docs/standards/adr/**/*.md", "docs/standards/analysis/**/*.md",
+    "docs/standards/runbooks/**/*.md", "docs/standards/v16/**/*.md",
+}
+EXCLUSIONS = {
+    ".fleet-coord/**": "local coordination and handoff state is not publication input",
+    "docs/plans/**": "unpublished planning artifacts are not corpus material",
+    "docs/standards/rfc/**": "third-party or separately licensed RFC renderings require their own release review",
+    "docs/.obsidian/**": "editor-local state",
+    "**/.env*": "secrets and local credentials are never publication input",
+    "codegen-out/**": "ignored generated artifacts are not source corpus",
+    "dist/**": "release output is not source corpus",
+}
+CGR_ROOTS = {
+    "crates/hyprstream/build.rs": ["crates/hyprstream/schema", "crates/hyprstream-rpc/schema"],
+    "crates/hyprstream-discovery/build.rs": ["crates/hyprstream-discovery/schema", "crates/hyprstream-rpc/schema"],
+    "crates/hyprstream-rpc/build.rs": ["crates/hyprstream-rpc/schema"],
+    "crates/hyprstream-rpc-std/build.rs": ["crates/hyprstream-rpc-std/schema", "crates/hyprstream-rpc/schema"],
+    "crates/hyprstream-workers/build.rs": ["crates/hyprstream-workers/schema", "crates/hyprstream-rpc/schema"],
+}
+PACKAGE_REQUIREMENTS = [
+    "Publish only validated manifest entries.",
+    "Preserve source license and provenance per document.",
+    "Do not package excluded paths or generated output without a separate license review.",
+    "Keep docs/system-ontology.md authoritative; projections may link to it but may not redefine canonical terms.",
+]
 
 
 class CatalogError(Exception):
     pass
 
 
-def fail(message: str) -> None:
-    raise CatalogError(message)
+def required(condition: bool, message: str) -> None:
+    if not condition:
+        raise CatalogError(message)
+
+
+def git(repo: Path, *args: str) -> str:
+    result = subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, check=False)
+    required(result.returncode == 0, f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
 
 
 def read_json(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        fail(f"{path}: {error}")
+        raise CatalogError(f"{path}: {error}") from error
 
 
 def tracked(repo: Path, *patterns: str) -> list[str]:
-    result = subprocess.run(
-        ["git", "-C", str(repo), "ls-files", "--", *patterns],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if result.returncode:
-        fail(f"git ls-files failed: {result.stderr.strip()}")
-    return [line for line in result.stdout.splitlines() if line]
+    output = git(repo, "ls-files", "--", *patterns)
+    return [path for path in output.splitlines() if path]
 
 
-def source_services(repo: Path) -> dict[str, list[str]]:
-    cli = (repo / "crates/hyprstream/src/cli/schema_cli.rs").read_text(encoding="utf-8")
-    mcp = (repo / "crates/hyprstream/src/services/mcp_service.rs").read_text(encoding="utf-8")
-    factories = (repo / "crates/hyprstream/src/services/factories.rs").read_text(encoding="utf-8")
-    vfs = (repo / "crates/hyprstream-rpc-std/src/vfs_mount.rs").read_text(encoding="utf-8")
+def text(repo: Path, path: str, mutations: dict[str, str] | None) -> str:
+    if mutations and path in mutations:
+        return mutations[path]
+    return (repo / path).read_text(encoding="utf-8")
+
+
+def source_services(
+    repo: Path, mutations: dict[str, str] | None = None, tracked_sources: list[str] | None = None
+) -> dict[str, dict[str, Any]]:
+    cli = text(repo, "crates/hyprstream/src/cli/schema_cli.rs", mutations)
+    mcp = text(repo, "crates/hyprstream/src/services/mcp_service.rs", mutations)
+    factories = text(repo, "crates/hyprstream/src/services/factories.rs", mutations)
+    vfs = text(repo, "crates/hyprstream-rpc-std/src/vfs_mount.rs", mutations)
 
     cli_services = re.findall(r'build_service_command\(\s*"([a-z0-9-]+)"', cli)
-    mcp_modules = re.findall(
-        r"register_top_level!\(\s*reg,\s*([a-zA-Z0-9_:]+)::schema_metadata\(\)\s*\)", mcp
-    )
+    mcp_modules = re.findall(r"register_top_level!\(\s*reg,\s*([a-zA-Z0-9_:]+)::schema_metadata\(\)\s*\)", mcp)
     mcp_services = [module.rsplit("::", 1)[-1].removesuffix("_client") for module in mcp_modules]
-    factory_services = re.findall(r'#\[service_factory\(\s*"([a-z0-9-]+)"', factories)
-    vfs_services = re.findall(
-        r'impl_service_dispatch!\([^,]+,\s*"([a-z0-9-]+)"', vfs
+    factory_matches = re.finditer(
+        r'(?P<cfg>#\[cfg\(feature = "([^"]+)"\)\]\s*)?#\[service_factory\(\s*"(?P<name>[a-z0-9-]+)"',
+        factories,
     )
-    ts_sources = tracked(repo, "*.ts", "*.tsx", "*.js", "*.jsx", "package.json")
+    factory_services, features = [], {}
+    for match in factory_matches:
+        name = match.group("name")
+        factory_services.append(name)
+        if match.group(2):
+            features[name] = f"feature={match.group(2)}"
+    vfs_services = re.findall(r'impl_service_dispatch!\([^,]+,\s*"([a-z0-9-]+)"', vfs)
+    ts_sources = tracked_sources if tracked_sources is not None else tracked(
+        repo, "*.ts", "*.tsx", "*.js", "*.jsx", "package.json"
+    )
     return {
-        "cli": cli_services,
-        "mcp": mcp_services,
-        "factory": factory_services,
-        "vfs": vfs_services,
-        "typescript": ts_sources,
+        "cli": {
+            "services": cli_services,
+            "method_policy": {
+                "hidden": "excluded" if "if method.cli_hidden || method.is_streaming" in cli else "unknown",
+                "streaming": "excluded" if "if method.cli_hidden || method.is_streaming" in cli else "unknown",
+            },
+        },
+        "mcp": {
+            "services": mcp_services,
+            "method_policy": {
+                "hidden": "excluded" if "if method.hidden {" in mcp else "unknown",
+                "streaming": "included" if "if method.is_streaming {" in mcp else "unknown",
+            },
+        },
+        "factory": {"services": factory_services, "feature_conditions": features},
+        "vfs": {"services": vfs_services},
+        "typescript": {"tracked_sources": ts_sources},
     }
 
 
-def required(condition: bool, message: str) -> None:
-    if not condition:
-        fail(message)
+def check_provenance(record: dict[str, Any], repo: Path, label: str) -> None:
+    commit = record.get("source_commit")
+    tree = record.get("source_tree")
+    required(isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) is not None, f"{label} has invalid source_commit")
+    required(isinstance(tree, str) and re.fullmatch(r"[0-9a-f]{40}", tree) is not None, f"{label} has invalid source_tree")
+    git(repo, "cat-file", "-e", f"{commit}^{{commit}}")
+    required(git(repo, "rev-parse", f"{commit}^{{tree}}") == tree, f"{label} source_tree does not match source_commit")
 
 
-def check_schema_catalog(
-    catalog: dict[str, Any], repo: Path, tracked_schemas: list[str], consumers: dict[str, list[str]]
-) -> None:
+def manifest_license(repo: Path, owner: str) -> str:
+    manifest = OWNER_MANIFESTS.get(owner)
+    required(manifest is not None, f"unknown schema owner {owner}")
+    found = re.search(r'^license\s*=\s*"([^"]+)"', text(repo, manifest, None), re.MULTILINE)
+    required(found is not None, f"{manifest} lacks package license")
+    return found.group(1)
+
+
+def check_cgr(catalog: dict[str, Any], repo: Path, schemas: list[dict[str, Any]]) -> None:
+    roots = catalog.get("cgr_build_roots", {})
+    required(roots == CGR_ROOTS, "persisted-CGR import roots drift")
+    for build_file, import_roots in roots.items():
+        source = text(repo, build_file, None)
+        required("hyprstream_rpc_build::compile_schemas" in source, f"{build_file} is not a persisted-CGR producer")
+        required(isinstance(import_roots, list) and import_roots, f"{build_file} lacks import roots")
+        for root in import_roots:
+            relative = os.path.relpath(root, str(Path(build_file).parent)).replace("\\", "/")
+            required(relative in source or f'"{Path(root).name}"' in source, f"{build_file} does not reference declared import root {root}")
+    for entry in schemas:
+        producer = entry.get("cgr_producer")
+        if producer is None:
+            mode = entry.get("compiled_by")
+            required(mode in {"capnp_only", "not_compiled"}, f"{entry['path']} must distinguish non-CGR compilation")
+            if mode == "capnp_only":
+                source = text(repo, "crates/hyprstream-rpc-build/build.rs", None)
+                required("capnpc::CompilerCommand" in source and Path(entry["path"]).stem in source, f"{entry['path']} capnp-only claim drift")
+            continue
+        source = text(repo, producer, None)
+        required(producer in roots, f"{entry['path']} producer is not an audited persisted-CGR root")
+        required("hyprstream_rpc_build::compile_schemas" in source, f"{entry['path']} producer does not emit persisted CGR")
+        required(re.search(rf'["\']{re.escape(Path(entry["path"]).stem)}["\']', source) is not None,
+                 f"{entry['path']} is absent from declared persisted-CGR inputs")
+
+
+def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list[str], consumers: dict[str, dict[str, Any]]) -> None:
     required(catalog.get("schema_version") == 1, "schema catalog must use schema_version 1")
     required(catalog.get("authority") == "docs/system-ontology.md", "system ontology must remain authoritative")
-    required(
-        catalog.get("owner_directories") == [
-            "crates/hyprstream/schema",
-            "crates/hyprstream-discovery/schema",
-            "crates/hyprstream-pay/schema",
-            "crates/hyprstream-rpc/schema",
-            "crates/hyprstream-rpc-std/schema",
-            "crates/hyprstream-workers/schema",
-        ],
-        "catalog must name all six production schema-owner directories",
-    )
+    check_provenance(catalog, repo, "schema catalog")
     schemas = catalog.get("schemas")
     required(isinstance(schemas, list), "catalog.schemas must be a list")
     paths = [entry.get("path") for entry in schemas]
-    required(len(paths) == len(set(paths)), "duplicate schema path in catalog")
-    required(set(paths) == set(tracked_schemas), "catalog schema paths must exactly equal git-tracked .capnp files")
-    source_ids = [entry.get("source_id") for entry in schemas]
-    required(all(isinstance(value, str) and value.startswith("0x") for value in source_ids), "each schema needs a source ID")
-    required(len(source_ids) == len(set(source_ids)), "duplicate schema source identity")
-    service_ids = [entry["service"] for entry in schemas if entry.get("service") is not None]
+    required(len(paths) == len(set(paths)) and set(paths) == set(schema_paths), "catalog must exactly cover git-tracked .capnp files")
+    ids = [entry.get("source_id") for entry in schemas]
+    required(all(isinstance(value, str) and re.fullmatch(r"0x[0-9a-f]+", value) for value in ids), "each schema needs a source ID")
+    required(len(ids) == len(set(ids)), "duplicate schema source identity")
+    service_ids = [entry["service"] for entry in schemas if entry.get("service")]
     required(len(service_ids) == len(set(service_ids)), "duplicate schema service identity")
-
     by_service = {entry["service"]: entry for entry in schemas if entry.get("service")}
-    roots = catalog.get("cgr_build_roots", {})
-    required(isinstance(roots, dict) and roots, "catalog must record CGR build/import roots")
-    for build_file, import_roots in roots.items():
-        required((repo / build_file).is_file(), f"missing CGR build root source {build_file}")
-        required(isinstance(import_roots, list) and import_roots, f"{build_file} needs import roots")
-        source = (repo / build_file).read_text(encoding="utf-8")
-        for import_root in import_roots:
-            required(Path(import_root).name in source, f"{build_file} no longer references import root {import_root}")
     for entry in schemas:
         for key in ("owner", "license", "kind", "exclusions"):
             required(bool(entry.get(key)), f"{entry['path']} lacks {key}")
-        source = (repo / entry["path"]).read_text(encoding="utf-8")
+        required(entry["license"] == manifest_license(repo, entry["owner"]), f"{entry['path']} license differs from owner manifest")
+        source = text(repo, entry["path"], None)
         found = re.search(r"^@(0x[0-9a-f]+);", source, re.MULTILINE)
         required(found is not None and found.group(1) == entry["source_id"], f"{entry['path']} source ID drift")
-        producer = entry.get("cgr_producer")
-        if producer is not None:
-            required((repo / producer).is_file(), f"{entry['path']} names missing CGR producer {producer}")
-            producer_source = (repo / producer).read_text(encoding="utf-8")
-            required(Path(entry["path"]).stem in producer_source, f"{entry['path']} is not represented by declared CGR producer")
         active = set(entry.get("surfaces", []))
         required(active <= set(SURFACES) | {"docs"}, f"{entry['path']} has unknown surface")
-        exclusions = entry["exclusions"]
         for surface in SURFACES:
-            required(
-                surface in active or bool(exclusions.get(surface)),
-                f"{entry['path']} lacks an active {surface} surface or an exclusion reason",
-            )
+            required(surface in active or bool(entry["exclusions"].get(surface)), f"{entry['path']} lacks {surface} disposition")
+    check_cgr(catalog, repo, schemas)
 
     declared = catalog.get("consumer_sets", {})
-    required(set(declared) == set(SURFACES), "consumer sets must enumerate CLI, MCP, factory, VFS, and TypeScript")
+    required(set(declared) == set(SURFACES), "consumer sets must enumerate every surface")
     for surface in SURFACES:
-        record = declared[surface]
+        record, actual = declared[surface], consumers[surface]
         required(record.get("state") in {"active", "declared", "absent"}, f"invalid {surface} state")
-        expected = record.get("services", record.get("tracked_sources", []))
-        required(expected == consumers[surface], f"{surface} consumer list drift: expected {expected}, source has {consumers[surface]}")
+        key = "tracked_sources" if surface == "typescript" else "services"
+        required(record.get(key) == actual.get(key), f"{surface} source registration drift")
+        if surface in {"cli", "mcp"}:
+            required(record.get("method_policy") == actual.get("method_policy"), f"{surface} hidden/streaming policy drift")
+        if surface == "factory":
+            required(record.get("feature_conditions") == actual.get("feature_conditions"), "factory feature condition drift")
         if surface == "typescript":
-            required(record.get("state") == "absent" and expected == [], "TypeScript state must describe the actual empty tracked set")
+            required(record.get("state") == "absent" and record[key] == [], "TypeScript state must reflect tracked sources")
             continue
-        for service in expected:
+        for service in record[key]:
             if service not in by_service:
-                reason = record.get("non_schema_services", {}).get(service)
-                required(bool(reason), f"{surface} registers unclassified service {service}")
-                continue
-            required(surface in by_service[service].get("surfaces", []), f"{service} is active on {surface} but catalog omits it")
+                required(bool(record.get("non_schema_services", {}).get(service)), f"{surface} registers unclassified service {service}")
+            else:
+                required(surface in by_service[service].get("surfaces", []), f"{service} active on {surface} but omitted")
         for service, entry in by_service.items():
             if surface in entry.get("surfaces", []):
-                required(service in expected, f"{service} is marked active on {surface} but source does not register it")
+                required(service in record[key], f"{service} claims {surface} activity without source registration")
 
 
 def check_corpus(corpus: dict[str, Any], repo: Path) -> None:
-    required(corpus.get("schema_version") == 1, "corpus manifest must use schema_version 1")
-    required(corpus.get("authority") == "docs/system-ontology.md", "corpus must retain ontology authority")
-    for manifest in ("api_manifest", "corpus_manifest"):
-        record = corpus.get(manifest, {})
-        for key in ("version", "path", "id", "integrity", "limit_bytes"):
-            required(key in record, f"{manifest} lacks {key}")
-        required(record["version"] == 1 and record["limit_bytes"] > 0, f"invalid {manifest}")
-    public = corpus.get("public_prose", [])
-    excluded = corpus.get("excluded", [])
-    required(public and excluded, "corpus needs explicit public and excluded source policies")
-    for record in public:
-        required(all(record.get(key) for key in ("glob", "license", "provenance")), "public source needs glob/license/provenance")
-    excluded_globs = {record.get("glob") for record in excluded}
-    required(".fleet-coord/**" in excluded_globs and "**/.env*" in excluded_globs, "corpus must exclude coordination and secrets")
+    required(corpus.get("schema_version") == 1 and corpus.get("authority") == "docs/system-ontology.md", "invalid corpus authority/version")
+    check_provenance(corpus, repo, "corpus catalog")
+    for name in ("api_manifest", "corpus_manifest"):
+        record = corpus.get(name, {})
+        required(record.get("version") == 1 and isinstance(record.get("limit_bytes"), int) and record["limit_bytes"] > 0, f"invalid {name}")
+        required(all(record.get(key) for key in ("path", "id", "integrity")), f"{name} lacks stable contract fields")
+    public, excluded = corpus.get("public_prose", []), corpus.get("excluded", [])
+    required({item.get("glob") for item in public} == PUBLIC_GLOBS, "public prose allowlist widened or incomplete")
+    for item in public:
+        required(item.get("license") == "AGPL-3.0-only", f"{item.get('glob')} lacks exact SPDX license")
+        required(isinstance(item.get("provenance"), str) and item["provenance"].startswith("tracked first-party repository"), "public prose provenance drift")
+    required({item.get("glob"): item.get("reason") for item in excluded} == EXCLUSIONS, "corpus exclusions or reasons drift")
     package = corpus.get("package_contract", {})
-    required(package.get("name") == "@hyprstream/docs", "package contract must name @hyprstream/docs")
-    required(package.get("state") == "declared-not-yet-published", "package contract must not claim publication")
-
-    allow = [record["glob"] for record in public]
-    deny = [record["glob"] for record in excluded]
+    required(package.get("name") == "@hyprstream/docs" and package.get("state") == "declared-not-yet-published", "invalid docs package contract")
+    required(package.get("requirements") == PACKAGE_REQUIREMENTS, "docs package requirements drift")
+    allow, deny = [item["glob"] for item in public], [item["glob"] for item in excluded]
     for path in tracked(repo, "docs/**/*.md"):
-        if any(fnmatch.fnmatch(path, pattern) for pattern in deny):
-            continue
-        required(any(fnmatch.fnmatch(path, pattern) for pattern in allow), f"unallowlisted public prose: {path}")
+        if not any(fnmatch.fnmatch(path, pattern) for pattern in deny):
+            required(any(fnmatch.fnmatch(path, pattern) for pattern in allow), f"unallowlisted public prose: {path}")
 
 
 def validate(repo: Path, catalog: dict[str, Any] | None = None, corpus: dict[str, Any] | None = None,
-             tracked_schemas: list[str] | None = None, consumers: dict[str, list[str]] | None = None) -> None:
+             schema_paths: list[str] | None = None, consumers: dict[str, dict[str, Any]] | None = None) -> None:
     catalog = catalog or read_json(repo / "docs/schema-catalog.json")
     corpus = corpus or read_json(repo / "docs/corpus-sources.json")
-    tracked_schemas = tracked_schemas if tracked_schemas is not None else tracked(repo, "*.capnp")
-    consumers = consumers or source_services(repo)
-    check_schema_catalog(catalog, repo, tracked_schemas, consumers)
+    check_schema_catalog(catalog, repo, schema_paths or tracked(repo, "*.capnp"), consumers or source_services(repo))
     check_corpus(corpus, repo)
-    contract = (repo / "docs/contracts/docs-pipeline.md").read_text(encoding="utf-8")
-    required("docs/system-ontology.md" in contract, "pipeline contract must name ontology authority")
+    required("docs/system-ontology.md" in text(repo, "docs/contracts/docs-pipeline.md", None), "pipeline contract omits ontology authority")
 
 
-def expect_mutation_failure(name: str, repo: Path, catalog: dict[str, Any], corpus: dict[str, Any],
-                            schemas: list[str], consumers: dict[str, list[str]]) -> None:
+def expect_failure(name: str, repo: Path, catalog: dict[str, Any], corpus: dict[str, Any],
+                   schemas: list[str], consumers: dict[str, dict[str, Any]]) -> None:
     try:
         validate(repo, catalog, corpus, schemas, consumers)
     except CatalogError:
@@ -200,38 +268,48 @@ def expect_mutation_failure(name: str, repo: Path, catalog: dict[str, Any], corp
 
 
 def self_test(repo: Path) -> None:
-    catalog = read_json(repo / "docs/schema-catalog.json")
-    corpus = read_json(repo / "docs/corpus-sources.json")
-    schemas = tracked(repo, "*.capnp")
-    consumers = source_services(repo)
+    catalog, corpus = read_json(repo / "docs/schema-catalog.json"), read_json(repo / "docs/corpus-sources.json")
+    schemas, consumers = tracked(repo, "*.capnp"), source_services(repo)
     validate(repo, catalog, corpus, schemas, consumers)
-
-    unlisted = schemas + ["crates/example/schema/new.capnp"]
-    expect_mutation_failure("unlisted schema", repo, copy.deepcopy(catalog), corpus, unlisted, consumers)
-    stale = schemas[1:]
-    expect_mutation_failure("stale removed schema", repo, copy.deepcopy(catalog), corpus, stale, consumers)
-    changed = copy.deepcopy(consumers)
-    changed["cli"] = changed["cli"] + ["settlement"]
-    expect_mutation_failure("changed CLI consumer list", repo, copy.deepcopy(catalog), corpus, schemas, changed)
-    duplicate = copy.deepcopy(catalog)
-    duplicate["schemas"][1]["source_id"] = duplicate["schemas"][0]["source_id"]
-    expect_mutation_failure("duplicate identity", repo, duplicate, corpus, schemas, consumers)
-    unexplained = copy.deepcopy(catalog)
-    unexplained["schemas"][0]["exclusions"].pop("cli")
-    expect_mutation_failure("unexplained exclusion", repo, unexplained, corpus, schemas, consumers)
-    print("docs catalog mutation probes: passed (5 expected failures)")
+    expect_failure("unlisted schema", repo, copy.deepcopy(catalog), corpus, schemas + ["new.capnp"], consumers)
+    expect_failure("stale schema", repo, copy.deepcopy(catalog), corpus, schemas[1:], consumers)
+    bad = copy.deepcopy(catalog); bad["source_commit"] = "0" * 40
+    expect_failure("schema provenance", repo, bad, corpus, schemas, consumers)
+    bad = copy.deepcopy(corpus); bad["source_tree"] = "0" * 40
+    expect_failure("corpus provenance", repo, catalog, bad, schemas, consumers)
+    bad = copy.deepcopy(catalog); bad["schemas"][0]["license"] = "MIT"
+    expect_failure("manifest license", repo, bad, corpus, schemas, consumers)
+    bad = copy.deepcopy(catalog); bad["cgr_build_roots"]["crates/hyprstream/build.rs"][0] = "made/up/schema"
+    expect_failure("CGR import root", repo, bad, corpus, schemas, consumers)
+    for name, path, before, after in [
+        ("CLI registration", "crates/hyprstream/src/cli/schema_cli.rs", '"workflow",\n        &workflow_methods', '"settlement",\n        &workflow_methods'),
+        ("MCP registration", "crates/hyprstream/src/services/mcp_service.rs", "tui_client::schema_metadata()", "mcp_client::schema_metadata()"),
+        ("factory feature", "crates/hyprstream/src/services/factories.rs", '#[cfg(feature = "metrics")]', '#[cfg(feature = "other")]'),
+        ("VFS registration", "crates/hyprstream-rpc-std/src/vfs_mount.rs", 'McpDispatch, "mcp"', 'McpDispatch, "oauth"'),
+        ("CLI hidden policy", "crates/hyprstream/src/cli/schema_cli.rs", "if method.cli_hidden || method.is_streaming", "if method.cli_hidden"),
+    ]:
+        mutated = text(repo, path, None).replace(before, after)
+        expect_failure(name, repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, {path: mutated}))
+    expect_failure("TypeScript source", repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, tracked_sources=["package.json"]))
+    bad = copy.deepcopy(corpus); bad["excluded"][0]["reason"] = ""
+    expect_failure("exclusion reason", repo, catalog, bad, schemas, consumers)
+    bad = copy.deepcopy(corpus); bad["public_prose"][0]["glob"] = "docs/**/*.md"
+    expect_failure("allowlist widening", repo, catalog, bad, schemas, consumers)
+    bad = copy.deepcopy(corpus); bad["public_prose"][0]["license"] = "MIT"
+    expect_failure("public license", repo, catalog, bad, schemas, consumers)
+    bad = copy.deepcopy(corpus); bad["package_contract"]["requirements"] = []
+    expect_failure("package requirements", repo, catalog, bad, schemas, consumers)
+    print("docs catalog mutation probes: passed (16 expected failures)")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--self-test", action="store_true", help="run mutation probes after normal validation")
+    parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args()
     try:
-        if args.self_test:
-            self_test(args.repo.resolve())
-        else:
-            validate(args.repo.resolve())
+        (self_test if args.self_test else validate)(args.repo.resolve())
+        if not args.self_test:
             print("docs catalog: OK")
     except (CatalogError, AssertionError) as error:
         print(f"docs catalog: FAILED: {error}", file=sys.stderr)

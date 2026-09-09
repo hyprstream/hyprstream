@@ -1,20 +1,21 @@
 {
   "schema_version": 1,
-  "source_commit": "655d73a28fca109f1cdb04e1b849eb7c6623c0c4",
+  "source_commit": "210e4e0a278d7fac231ad6d5f58a88951fd33ae6",
+  "source_tree": "fc65a8807ac73e0742eb1603951a3f1b8901c63a",
   "authority": "docs/system-ontology.md",
   "api_manifest": {"version": 1, "path": "api/v1/{service}/{method}.json", "id": "api:{service}:{method}", "integrity": "sha256 of canonical UTF-8 JSON", "limit_bytes": 1048576},
   "corpus_manifest": {"version": 1, "path": "corpus/v1/{document_id}.md", "id": "doc:{repository-relative-path}", "integrity": "sha256 of source bytes", "limit_bytes": 2097152},
   "public_prose": [
-    {"glob":"docs/*.md","license":"repository source license","provenance":"tracked first-party prose"},
-    {"glob":"docs/adr/**/*.md","license":"repository source license","provenance":"tracked first-party ADR"},
-    {"glob":"docs/contracts/**/*.md","license":"repository source license","provenance":"tracked first-party contract"},
-    {"glob":"docs/deployment/**/*.md","license":"repository source license","provenance":"tracked first-party deployment guide"},
-    {"glob":"docs/network/**/*.md","license":"repository source license","provenance":"tracked first-party network guide"},
-    {"glob":"docs/security/**/*.md","license":"repository source license","provenance":"tracked first-party security guide"},
-    {"glob":"docs/standards/adr/**/*.md","license":"repository source license","provenance":"tracked first-party standards ADR"},
-    {"glob":"docs/standards/analysis/**/*.md","license":"repository source license","provenance":"tracked first-party analysis"},
-    {"glob":"docs/standards/runbooks/**/*.md","license":"repository source license","provenance":"tracked first-party runbook"},
-    {"glob":"docs/standards/v16/**/*.md","license":"repository source license","provenance":"tracked first-party v16 specification"}
+    {"glob":"docs/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository prose"},
+    {"glob":"docs/adr/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository ADR"},
+    {"glob":"docs/contracts/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository contract"},
+    {"glob":"docs/deployment/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository deployment guide"},
+    {"glob":"docs/network/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository network guide"},
+    {"glob":"docs/security/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository security guide"},
+    {"glob":"docs/standards/adr/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository standards ADR"},
+    {"glob":"docs/standards/analysis/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository analysis"},
+    {"glob":"docs/standards/runbooks/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository runbook"},
+    {"glob":"docs/standards/v16/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository v16 specification"}
   ],
   "excluded": [
     {"glob":".fleet-coord/**","reason":"local coordination and handoff state is not publication input"},
