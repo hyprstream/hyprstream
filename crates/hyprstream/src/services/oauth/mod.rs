@@ -617,6 +617,25 @@ fn runtime_clients(
     ))
 }
 
+/// Wait until the required native carrier closes or the service receives its
+/// normal shutdown signal. A required-native OAuth process must not continue
+/// serving HTTP after its advertised Iroh endpoint has died; that would leave
+/// discovery pointing at a dead transport while readiness remains green.
+async fn wait_for_required_iroh_carrier(
+    substrate: &hyprstream_rpc::transport::iroh_substrate::IrohSubstrate,
+    shutdown: &Notify,
+) -> bool {
+    loop {
+        if substrate.router().is_shutdown() || substrate.endpoint().is_closed() {
+            return true;
+        }
+        tokio::select! {
+            _ = shutdown.notified() => return false,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod required_consumer_tests;
 
@@ -1281,6 +1300,25 @@ impl Spawnable for OAuthService {
                                 Err(join) => Err(anyhow::anyhow!(
                                     "OAuthService RPC task join error: {join}"
                                 )),
+                            }
+                        }
+                        carrier_lost = async {
+                            match substrate_owned.as_ref() {
+                                Some(substrate) => {
+                                    wait_for_required_iroh_carrier(substrate, shutdown.as_ref()).await
+                                }
+                                None => std::future::pending::<bool>().await,
+                            }
+                        }, if iroh_required => {
+                            if carrier_lost {
+                                Err(anyhow::anyhow!(
+                                    "OAuth required Iroh carrier terminated unexpectedly"
+                                ))
+                            } else {
+                                // Normal shutdown was consumed by the watcher;
+                                // the common teardown below still owns every
+                                // bridge, publisher, and carrier resource.
+                                Ok(())
                             }
                         }
                     };
