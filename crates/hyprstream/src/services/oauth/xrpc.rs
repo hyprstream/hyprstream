@@ -3711,17 +3711,18 @@ mod tests {
         assert!(!bytes.is_empty());
     }
 
-    // ── Finding 1: feature-gate matrix — all 4 routes, enabled AND disabled ────
+    // ── Finding 1: feature-gate matrix — all 5 routes, enabled AND disabled ────
 
     #[tokio::test]
-    async fn router_feature_gate_disabled_all_four_routes_404() {
+    async fn router_feature_gate_disabled_all_five_routes_404() {
         let app = build_production_app(false).await;
-        // All four XRPC routes must 404 when the gate is disabled.
+        // All five XRPC routes must 404 when the gate is disabled.
         let routes = [
             "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com",
             "/xrpc/com.atproto.repo.describeRepo?repo=did:web:pub.example.com",
             "/xrpc/com.atproto.repo.getRecord?repo=did:web:pub.example.com&collection=ai.hyprstream.model&rkey=abc",
             "/xrpc/com.atproto.identity.resolveHandle?handle=pub.example.com",
+            "/xrpc/com.atproto.server.describeServer",
         ];
         for uri in &routes {
             let resp = app.clone().oneshot(req(uri)).await.unwrap();
@@ -3734,8 +3735,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_feature_gate_enabled_all_four_routes_reachable() {
-        // Smoke-test: all four routes reach XRPC handlers (not 404) when enabled.
+    async fn router_feature_gate_enabled_all_five_routes_reachable() {
+        // Smoke-test: all five routes reach XRPC handlers (not 404) when enabled.
         // Detailed assertions are in the individual endpoint tests above.
         let app = build_production_app(true).await;
         let routes = [
@@ -3743,6 +3744,7 @@ mod tests {
             ("/xrpc/com.atproto.identity.resolveHandle?handle=pub.example.com", StatusCode::OK),
             ("/xrpc/com.atproto.repo.getRecord?repo=did:web:pub.example.com&collection=ai.hyprstream.model&rkey=abc", StatusCode::BAD_REQUEST), // RecordNotFound
             ("/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com", StatusCode::OK),
+            ("/xrpc/com.atproto.server.describeServer", StatusCode::OK),
         ];
         for (uri, expected) in &routes {
             let resp = app.clone().oneshot(req(uri)).await.unwrap();
