@@ -22,7 +22,7 @@
   },
   "method_metadata": {
     "cli_hidden": ["worker.attach", "worker.detach"],
-    "streaming": ["inference.createLoraStream", "inference.exportPeftAdapterStream", "inference.generateStream", "inference.loadLoraStream", "inference.mergeLoraStream", "inference.saveAdaptationStream", "inference.saveLoraStream", "inference.snapshotDeltaStream", "inference.trainStepStream", "metrics.queryStream", "registry.cloneStream", "registry.getBlob"]
+    "streaming": ["inference.createLoraStream", "inference.exportPeftAdapterStream", "inference.generateStream", "inference.loadLoraStream", "inference.mergeLoraStream", "inference.saveAdaptationStream", "inference.saveLoraStream", "inference.snapshotDeltaStream", "inference.trainStepStream", "metrics.queryStream", "model.generateStream", "model.trainStream", "registry.cloneStream", "registry.getBlob", "worker.attach"]
   },
   "schemas": [
     {"path":"crates/hyprstream-discovery/schema/discovery.capnp","source_id":"0xe8bc708034927ef4","owner":"hyprstream-discovery","license":"AGPL-3.0-only","kind":"service","service":"discovery","cgr_producer":"crates/hyprstream-discovery/build.rs","surfaces":["cli","factory","docs"],"exclusions":{"mcp":"not registered as an MCP tool source","vfs":"not in vfs_mount dispatch","typescript":"CGR is emitted, but no tracked TypeScript package consumes it"}},

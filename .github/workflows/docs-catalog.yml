@@ -19,5 +19,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Bind audited input revision
+        shell: bash
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            pull_request) printf 'DOCS_CATALOG_EVENT=pull_request\nDOCS_CATALOG_AUDITED_COMMIT=%s\n' "${{ github.event.pull_request.base.sha }}" >> "$GITHUB_ENV" ;;
+            push) printf 'DOCS_CATALOG_EVENT=push\nDOCS_CATALOG_AUDITED_COMMIT=%s\n' "${{ github.event.before }}" >> "$GITHUB_ENV" ;;
+            *) exit 1 ;;
+          esac
       - run: python3 tools/check-docs-catalog.py
       - run: python3 tools/check-docs-catalog.py --self-test

@@ -7,6 +7,7 @@ import argparse
 import copy
 import fnmatch
 import json
+import os
 import re
 import subprocess
 import sys
@@ -45,57 +46,17 @@ CGR_ROOTS = {
     "crates/hyprstream-rpc-std/build.rs": ["crates/hyprstream-rpc-std/schema", "crates/hyprstream-rpc/schema"],
     "crates/hyprstream-workers/build.rs": ["crates/hyprstream-workers/schema", "crates/hyprstream-rpc/schema"],
 }
-CGR_SOURCE_CONTRACTS = {
-    "crates/hyprstream/build.rs": (
-        'letschema_dir=Path::new("schema");',
-        'letrpc_schema_dir=Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
-        "letimport_paths:&[&Path]=&[&rpc_schema_dir,schema_dir];",
-        'letschemas=["tui","compositor_ipc"];',
-        'letrpc_schemas=["streaming","nine"];',
-        "hyprstream_rpc_build::compile_schemas(schema_dir,out_path,import_paths,&schemas);",
-        "hyprstream_rpc_build::compile_schemas(&rpc_schema_dir,out_path,import_paths,&rpc_schemas);",
-    ),
-    "crates/hyprstream-discovery/build.rs": (
-        'letschema_dir=Path::new("schema");',
-        'letrpc_schema_dir=Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
-        'hyprstream_rpc_build::compile_schemas(schema_dir,Path::new(&out_dir),&[&rpc_schema_dir],&["discovery"],);',
-    ),
-    "crates/hyprstream-rpc/build.rs": (
-        'letschema_dir=Path::new("schema");',
-        'hyprstream_rpc_build::compile_schemas(schema_dir,Path::new(&out_dir),&[],&["common","streaming","events","annotations","optional","nine"],);',
-    ),
-    "crates/hyprstream-rpc-std/build.rs": (
-        'letschema_dir=Path::new("schema");',
-        'letrpc_schema_dir=Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
-        "letimport_paths:&[&Path]=&[&rpc_schema_dir,schema_dir];",
-        'letschemas=["inference","model","registry","policy","mcp","metrics","service_events","chat_core","oauth",];',
-        "hyprstream_rpc_build::compile_schemas(schema_dir,out_path,import_paths,&schemas);",
-    ),
-    "crates/hyprstream-workers/build.rs": (
-        'letschema_dir=Path::new("schema");',
-        'letrpc_schema_dir=Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
-        'hyprstream_rpc_build::compile_schemas(schema_dir,Path::new(&out_dir),&[&rpc_schema_dir],&["worker","workflow"],);',
-    ),
-}
-CGR_SCHEMA_INPUTS = {
+EXPECTED_CGR_INVOCATIONS = {
     "crates/hyprstream/build.rs": {
-        "crates/hyprstream/schema": ["tui", "compositor_ipc"],
-        "crates/hyprstream-rpc/schema": ["streaming", "nine"],
-    },
-    "crates/hyprstream-discovery/build.rs": {
-        "crates/hyprstream-discovery/schema": ["discovery"],
-    },
-    "crates/hyprstream-rpc/build.rs": {
-        "crates/hyprstream-rpc/schema": ["common", "streaming", "events", "annotations", "optional", "nine"],
-    },
-    "crates/hyprstream-rpc-std/build.rs": {
-        "crates/hyprstream-rpc-std/schema": [
-            "inference", "model", "registry", "policy", "mcp", "metrics", "service_events", "chat_core", "oauth",
+        "invocations": [
+            {"source_root": "crates/hyprstream/schema", "import_roots": ["crates/hyprstream-rpc/schema", "crates/hyprstream/schema"], "schemas": ["tui", "compositor_ipc"]},
+            {"source_root": "crates/hyprstream-rpc/schema", "import_roots": ["crates/hyprstream-rpc/schema", "crates/hyprstream/schema"], "schemas": ["streaming", "nine"]},
         ],
     },
-    "crates/hyprstream-workers/build.rs": {
-        "crates/hyprstream-workers/schema": ["worker", "workflow"],
-    },
+    "crates/hyprstream-discovery/build.rs": {"invocations": [{"source_root":"crates/hyprstream-discovery/schema","import_roots":["crates/hyprstream-rpc/schema"],"schemas":["discovery"]}]},
+    "crates/hyprstream-rpc/build.rs": {"invocations": [{"source_root":"crates/hyprstream-rpc/schema","import_roots":[],"schemas":["common","streaming","events","annotations","optional","nine"]}]},
+    "crates/hyprstream-rpc-std/build.rs": {"invocations": [{"source_root":"crates/hyprstream-rpc-std/schema","import_roots":["crates/hyprstream-rpc/schema","crates/hyprstream-rpc-std/schema"],"schemas":["inference","model","registry","policy","mcp","metrics","service_events","chat_core","oauth"]}]},
+    "crates/hyprstream-workers/build.rs": {"invocations": [{"source_root":"crates/hyprstream-workers/schema","import_roots":["crates/hyprstream-rpc/schema"],"schemas":["worker","workflow"]}]},
 }
 PACKAGE_REQUIREMENTS = [
     "Publish only validated manifest entries.",
@@ -199,20 +160,40 @@ def source_services(
     }
 
 
-def audited_base(repo: Path) -> str:
-    return git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
+def audited_input(repo: Path, event: str | None = None, revision: str | None = None) -> tuple[str, str]:
+    event = event or os.environ.get("DOCS_CATALOG_EVENT", "pull_request")
+    revision = revision or os.environ.get("DOCS_CATALOG_AUDITED_COMMIT")
+    if event == "pull_request":
+        base = git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
+        required(revision in {None, base}, "pull-request audited input differs from merge base")
+        return event, base
+    if event == "push":
+        boundary = revision or git(repo, "rev-parse", "HEAD^")
+        required(boundary != git(repo, "rev-parse", "HEAD"), "push audited input must precede pushed HEAD")
+        return event, boundary
+    raise CatalogError(f"unsupported docs-catalog event {event}")
 
 
-def check_provenance(record: dict[str, Any], repo: Path, label: str) -> None:
+def check_provenance(record: dict[str, Any], repo: Path, label: str, event: str | None = None,
+                     revision: str | None = None) -> None:
     commit = record.get("source_commit")
     tree = record.get("source_tree")
     required(isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) is not None, f"{label} has invalid source_commit")
     required(isinstance(tree, str) and re.fullmatch(r"[0-9a-f]{40}", tree) is not None, f"{label} has invalid source_tree")
     git(repo, "cat-file", "-e", f"{commit}^{{commit}}")
     required(git(repo, "rev-parse", f"{commit}^{{tree}}") == tree, f"{label} source_tree does not match source_commit")
-    base = audited_base(repo)
-    required(commit == base, f"{label} source_commit does not match audited merge base")
-    required(tree == git(repo, "rev-parse", f"{base}^{{tree}}"), f"{label} source_tree does not match audited merge base")
+    topology, boundary = audited_input(repo, event, revision)
+    if topology == "pull_request":
+        required(commit == boundary, f"{label} source_commit does not match audited merge base")
+    else:
+        required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", commit, boundary]).returncode == 0,
+                 f"{label} source_commit is not reachable from push input")
+    audited_paths = tracked(repo, "*.capnp") + list(CGR_ROOTS) + [
+        "crates/hyprstream/src/cli/schema_cli.rs", "crates/hyprstream/src/services/mcp_service.rs",
+        "crates/hyprstream/src/services/factories.rs", "crates/hyprstream-rpc-std/src/vfs_mount.rs",
+    ]
+    required(subprocess.run(["git", "-C", str(repo), "diff", "--quiet", commit, "--", *audited_paths]).returncode == 0,
+             f"{label} source_commit does not match audited input state")
 
 
 def owner_manifest(repo: Path, schema_path: str, owner_directories: list[str]) -> tuple[str, str, str]:
@@ -236,8 +217,79 @@ def check_owner_directories(catalog: dict[str, Any], repo: Path) -> list[str]:
     return owner_directories
 
 
-def compact(source: str) -> str:
-    return re.sub(r"\s+", "", source)
+def strip_rust_comments(source: str) -> str:
+    out, index, quote, block = [], 0, None, 0
+    while index < len(source):
+        pair = source[index:index + 2]
+        if quote:
+            out.append(source[index])
+            if source[index] == "\\" and index + 1 < len(source): out.append(source[index + 1]); index += 2; continue
+            if source[index] == quote: quote = None
+            index += 1; continue
+        if pair == "//":
+            index = source.find("\n", index)
+            if index < 0: break
+            out.append("\n"); index += 1; continue
+        if pair == "/*": block += 1; index += 2; continue
+        if pair == "*/" and block: block -= 1; index += 2; continue
+        if block: index += 1; continue
+        if source[index] in "\"'": quote = source[index]
+        out.append(source[index]); index += 1
+    return "".join(out)
+
+
+def split_top_level(value: str) -> list[str]:
+    items, start, depth = [], 0, 0
+    for index, char in enumerate(value):
+        if char in "([": depth += 1
+        elif char in ")]": depth -= 1
+        elif char == "," and depth == 0: items.append(value[start:index].strip()); start = index + 1
+    items.append(value[start:].strip())
+    return [item for item in items if item]
+
+
+def cgr_inventory(build_file: str, source: str) -> list[dict[str, Any]]:
+    source = strip_rust_comments(source)
+    bindings: dict[str, list[str]] = {}
+    for match in re.finditer(r"\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=;]+)?=\s*([^;]+);", source):
+        bindings.setdefault(match.group(1), []).append(match.group(2).strip())
+    def binding(value: str) -> str:
+        name = value.strip().lstrip("&").strip()
+        required(name in bindings and len(bindings[name]) == 1, f"{build_file} has unresolved or shadowed binding {name}")
+        return bindings[name][0]
+    def path(value: str) -> str:
+        expr = binding(value)
+        direct = re.fullmatch(r'Path::new\("([^"]+)"\)', expr)
+        joined = re.fullmatch(r'Path::new\(&manifest_dir\)\.join\("([^"]+)"\)', expr)
+        required(direct is not None or joined is not None, f"{build_file} has non-literal schema path binding")
+        raw = (direct or joined).group(1)
+        return os.path.normpath(str(Path(build_file).parent / raw)).replace("\\", "/")
+    def paths(value: str) -> list[str]:
+        expr = binding(value) if re.fullmatch(r"&?[A-Za-z_]\w*", value.strip()) else value.strip()
+        required(expr.startswith("&[") and expr.endswith("]"), f"{build_file} has non-literal import roots")
+        return [path(item) for item in split_top_level(expr[2:-1])]
+    def schemas(value: str) -> list[str]:
+        expr = binding(value) if re.fullmatch(r"&?[A-Za-z_]\w*", value.strip()) else value.strip()
+        if expr.startswith("&"): expr = expr[1:]
+        required(expr.startswith("[") and expr.endswith("]"), f"{build_file} has non-literal schema list")
+        result = []
+        for item in split_top_level(expr[1:-1]):
+            found = re.fullmatch(r'"([^"]+)"', item.strip())
+            required(found is not None, f"{build_file} has non-literal schema input")
+            result.append(found.group(1))
+        return result
+    calls, needle, start = [], "hyprstream_rpc_build::compile_schemas(", 0
+    while (found := source.find(needle, start)) >= 0:
+        index, depth = found + len(needle), 1
+        while index < len(source) and depth:
+            depth += (source[index] == "(") - (source[index] == ")"); index += 1
+        required(depth == 0, f"{build_file} has unterminated persisted-CGR call")
+        args = split_top_level(source[found + len(needle):index - 1])
+        required(len(args) == 4, f"{build_file} persisted-CGR call has unexpected arguments")
+        calls.append({"source_root": path(args[0]), "import_roots": paths(args[2]), "schemas": schemas(args[3])})
+        start = index
+    required(calls, f"{build_file} is not a persisted-CGR producer")
+    return calls
 
 
 def check_cgr(catalog: dict[str, Any], repo: Path, schemas: list[dict[str, Any]],
@@ -246,11 +298,9 @@ def check_cgr(catalog: dict[str, Any], repo: Path, schemas: list[dict[str, Any]]
     required(roots == CGR_ROOTS, "persisted-CGR import roots drift")
     for build_file, import_roots in roots.items():
         source = text(repo, build_file, mutations)
-        source_compact = compact(source)
-        required("hyprstream_rpc_build::compile_schemas" in source, f"{build_file} is not a persisted-CGR producer")
         required(isinstance(import_roots, list) and import_roots, f"{build_file} lacks import roots")
-        for contract in CGR_SOURCE_CONTRACTS[build_file]:
-            required(contract in source_compact, f"{build_file} persisted-CGR source/import arguments drift")
+        required(cgr_inventory(build_file, source) == EXPECTED_CGR_INVOCATIONS[build_file]["invocations"],
+                 f"{build_file} persisted-CGR invocation inventory drift")
     for entry in schemas:
         producer = entry.get("cgr_producer")
         if producer is None:
@@ -263,15 +313,25 @@ def check_cgr(catalog: dict[str, Any], repo: Path, schemas: list[dict[str, Any]]
         source = text(repo, producer, mutations)
         required(producer in roots, f"{entry['path']} producer is not an audited persisted-CGR root")
         required("hyprstream_rpc_build::compile_schemas" in source, f"{entry['path']} producer does not emit persisted CGR")
-        input_roots = CGR_SCHEMA_INPUTS[producer]
-        matched_roots = [root for root in input_roots if entry["path"].startswith(f"{root}/")]
-        required(len(matched_roots) == 1, f"{entry['path']} does not map to an exact {producer} input root")
-        required(Path(entry["path"]).stem in input_roots[matched_roots[0]],
+        matched = [call for call in cgr_inventory(producer, source) if entry["path"].startswith(f"{call['source_root']}/") and Path(entry["path"]).stem in call["schemas"]]
+        required(len(matched) == 1,
                  f"{entry['path']} is absent from exact persisted-CGR inputs")
 
 
 def schema_method_metadata(repo: Path, schemas: list[dict[str, Any]],
                            mutations: dict[str, str] | None) -> dict[str, list[str]]:
+    def block(source: str, marker: str) -> str:
+        start = source.find(marker)
+        required(start >= 0, f"missing {marker}")
+        start = source.find("{", start); depth = 1; index = start + 1
+        while index < len(source) and depth:
+            depth += (source[index] == "{") - (source[index] == "}"); index += 1
+        required(depth == 0, f"unterminated {marker}")
+        return source[start + 1:index - 1]
+    def fields(source: str, struct: str) -> dict[str, str]:
+        body = block(source, f"struct {struct}")
+        union = block(body, "union")
+        return {name: type_name for name, type_name in re.findall(r"(?m)^\s*(\w+)\s+@\d+\s*:\s*(\w+)", union)}
     hidden, streaming = [], []
     for entry in schemas:
         service = entry.get("service")
@@ -284,20 +344,28 @@ def schema_method_metadata(repo: Path, schemas: list[dict[str, Any]],
                 r"(?ms)^\s*([A-Za-z][A-Za-z0-9_]*)\s+@\d+\s*:[^;]*?\$cliHidden\b[^;]*;", source
             )
         )
-        streaming.extend(
-            f"{service}.{method.removesuffix('Result')}"
-            for method in re.findall(
-                r"(?m)^\s*([A-Za-z][A-Za-z0-9_]*)Result\s+@\d+\s*:\s*StreamInfo\s*;", source
-            )
-        )
+        pascal = "".join(part.capitalize() for part in service.split("-"))
+        if f"struct {pascal}Request" not in source:
+            continue
+        request, response = fields(source, f"{pascal}Request"), fields(source, f"{pascal}Response")
+        streaming.extend(f"{service}.{method}" for method in request if response.get(f"{method}Result") == "StreamInfo")
+        for scope, request_type in request.items():
+            response_type = response.get(f"{scope}Result")
+            if request_type.endswith("Request") and response_type and response_type.endswith("Response"):
+                try:
+                    scoped_request, scoped_response = fields(source, request_type), fields(source, response_type)
+                except CatalogError:
+                    continue
+                streaming.extend(f"{service}.{method}" for method in scoped_request if scoped_response.get(method) == "StreamInfo")
     return {"cli_hidden": sorted(hidden), "streaming": sorted(streaming)}
 
 
 def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list[str],
-                         consumers: dict[str, dict[str, Any]], mutations: dict[str, str] | None) -> None:
+                         consumers: dict[str, dict[str, Any]], mutations: dict[str, str] | None,
+                         event: str | None = None, revision: str | None = None) -> None:
     required(catalog.get("schema_version") == 1, "schema catalog must use schema_version 1")
     required(catalog.get("authority") == "docs/system-ontology.md", "system ontology must remain authoritative")
-    check_provenance(catalog, repo, "schema catalog")
+    check_provenance(catalog, repo, "schema catalog", event, revision)
     schemas = catalog.get("schemas")
     required(isinstance(schemas, list), "catalog.schemas must be a list")
     paths = [entry.get("path") for entry in schemas]
@@ -352,9 +420,9 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
                 required(service in record[key], f"{service} claims {surface} activity without source registration")
 
 
-def check_corpus(corpus: dict[str, Any], repo: Path) -> None:
+def check_corpus(corpus: dict[str, Any], repo: Path, event: str | None = None, revision: str | None = None) -> None:
     required(corpus.get("schema_version") == 1 and corpus.get("authority") == "docs/system-ontology.md", "invalid corpus authority/version")
-    check_provenance(corpus, repo, "corpus catalog")
+    check_provenance(corpus, repo, "corpus catalog", event, revision)
     for name in ("api_manifest", "corpus_manifest"):
         record = corpus.get(name, {})
         required(record.get("version") == 1 and isinstance(record.get("limit_bytes"), int) and record["limit_bytes"] > 0, f"invalid {name}")
@@ -376,14 +444,14 @@ def check_corpus(corpus: dict[str, Any], repo: Path) -> None:
 
 def validate(repo: Path, catalog: dict[str, Any] | None = None, corpus: dict[str, Any] | None = None,
              schema_paths: list[str] | None = None, consumers: dict[str, dict[str, Any]] | None = None,
-             mutations: dict[str, str] | None = None) -> None:
+             mutations: dict[str, str] | None = None, event: str | None = None, revision: str | None = None) -> None:
     catalog = catalog or read_json(repo / "docs/schema-catalog.json")
     corpus = corpus or read_json(repo / "docs/corpus-sources.json")
     check_schema_catalog(
         catalog, repo, schema_paths or tracked(repo, "*.capnp"),
-        consumers or source_services(repo, mutations), mutations,
+        consumers or source_services(repo, mutations), mutations, event, revision,
     )
-    check_corpus(corpus, repo)
+    check_corpus(corpus, repo, event, revision)
     required("docs/system-ontology.md" in text(repo, "docs/contracts/docs-pipeline.md", None), "pipeline contract omits ontology authority")
 
 
@@ -442,6 +510,20 @@ def self_test(repo: Path) -> None:
     discovery_build = "crates/hyprstream-discovery/build.rs"
     root_changed = text(repo, discovery_build, None).replace("../hyprstream-rpc/schema", "../unrelated/schema", 1)
     expect_failure("CGR source import root", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {discovery_build: root_changed})
+    shadowed = text(repo, discovery_build, None).replace(
+        'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
+        'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");\n    let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-workers/schema");',
+    )
+    expect_failure("CGR shadowed binding", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {discovery_build: shadowed})
+    commented = text(repo, discovery_build, None).replace("../hyprstream-rpc/schema", "../hyprstream-workers/schema", 1) + '\n// let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");\n'
+    expect_failure("CGR commented declaration", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {discovery_build: commented})
+    extra = text(repo, discovery_build, None).replace("\n}", '\n    hyprstream_rpc_build::compile_schemas(schema_dir, Path::new(&out_dir), &[], &["extra"]);\n}', 1)
+    expect_failure("CGR additional invocation", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {discovery_build: extra})
+    model_path = "crates/hyprstream-rpc-std/schema/model.capnp"
+    model_drift = text(repo, model_path, None).replace("generateStream @1 :StreamInfo", "generateStream @1 :Text", 1)
+    expect_failure("scoped model streaming response", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {model_path: model_drift})
+    worker_drift = text(repo, worker_path, None).replace("attach @10 :StreamInfo", "attach @10 :Text", 1)
+    expect_failure("scoped worker streaming response", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: worker_drift})
     expect_failure("TypeScript source", repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, tracked_sources=["package.json"]))
     bad = copy.deepcopy(catalog); bad.pop("owner_directories")
     expect_failure("owner directory inventory", repo, bad, corpus, schemas, consumers)
@@ -455,7 +537,15 @@ def self_test(repo: Path) -> None:
     expect_failure("public license", repo, catalog, bad, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["package_contract"]["requirements"] = []
     expect_failure("package requirements", repo, catalog, bad, schemas, consumers)
-    print("docs catalog mutation probes: passed (24 expected failures)")
+    validate(repo, catalog, corpus, schemas, consumers, event="push", revision=catalog["source_commit"])
+    bad = copy.deepcopy(catalog); bad["source_commit"] = stale; bad["source_tree"] = git(repo, "rev-parse", f"{stale}^{{tree}}")
+    try:
+        validate(repo, bad, corpus, schemas, consumers, event="push", revision=catalog["source_commit"])
+    except CatalogError:
+        pass
+    else:
+        raise AssertionError("mutation probe modeled main push provenance unexpectedly passed")
+    print("docs catalog mutation probes: passed (30 expected failures plus modeled main push)")
 
 
 def main() -> int:
