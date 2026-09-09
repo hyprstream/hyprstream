@@ -11,6 +11,351 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tracing::info;
 
+/// Persist requested built-in templates into the same policy store loaded by
+/// PolicyService, without starting a resolver or loading service credentials.
+pub async fn handle_service_provision_policy_templates(
+    models_dir: &Path,
+    template_names: &[String],
+) -> Result<()> {
+    provision_policy_templates(
+        models_dir,
+        template_names,
+        |_| Ok(()),
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .await
+}
+
+async fn provision_policy_templates(
+    models_dir: &Path,
+    template_names: &[String],
+    after_staged_save: impl FnOnce(&Path) -> Result<()>,
+    after_snapshot: impl FnOnce(&Path) -> Result<()>,
+    mut after_publication_write: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    use crate::auth::{get_template, PolicyManager, PolicyTemplate};
+    use anyhow::{bail, ensure};
+    use std::collections::BTreeSet;
+
+    ensure!(
+        !template_names.is_empty(),
+        "at least one policy template is required"
+    );
+
+    // Resolve and validate the complete request before PolicyManager::new can
+    // create or migrate anything on disk.
+    let mut unique = BTreeSet::new();
+    let mut templates: Vec<&'static PolicyTemplate> = Vec::with_capacity(template_names.len());
+    for name in template_names {
+        ensure!(
+            unique.insert(name.as_str()),
+            "duplicate policy template: {name}"
+        );
+        let Some(template) = get_template(name) else {
+            bail!("unknown policy template: {name}");
+        };
+        templates.push(template);
+    }
+
+    let registry_dir = models_dir.join(".registry");
+    tokio::fs::create_dir_all(&registry_dir)
+        .await
+        .context("create registry directory for policy provisioning")?;
+    let staging = tempfile::Builder::new()
+        .prefix(".policy-provision-")
+        .tempdir_in(&registry_dir)
+        .context("create policy staging directory")?;
+    let policies_dir = registry_dir.join("policies");
+    let staged_policies_dir = staging.path().join("policies");
+    tokio::fs::create_dir(&staged_policies_dir)
+        .await
+        .context("create staged policy directory")?;
+    for name in ["model.conf", "policy.csv"] {
+        let source = policies_dir.join(name);
+        match tokio::fs::read(&source).await {
+            Ok(content) => {
+                crate::auth::write_policy_file(&staged_policies_dir.join(name), content)
+                    .await
+                    .with_context(|| format!("stage retained policy file {name}"))?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read retained policy file {}", source.display()));
+            }
+        }
+    }
+
+    // PolicyManager's FileAdapter truncates files when it saves. Keep every
+    // constructor migration and template save in this disposable directory.
+    let manager = PolicyManager::new(&staged_policies_dir)
+        .await
+        .context("open staged policy store")?;
+    for template in &templates {
+        manager
+            .apply_template(template)
+            .await
+            .with_context(|| format!("apply policy template '{}'", template.name))?;
+    }
+
+    let requested: BTreeSet<&str> = templates.iter().map(|template| template.name).collect();
+    let public_staging: BTreeSet<&str> = ["public-inference", "public-read"].into_iter().collect();
+    verify_requested_templates(&manager, &templates).await?;
+    if requested == public_staging {
+        verify_public_staging_policy(&manager).await?;
+    }
+    let intended_state = complete_policy_state(&manager).await;
+    drop(manager);
+
+    let staged_policy_path = staged_policies_dir.join("policy.csv");
+    after_staged_save(&staged_policy_path)?;
+
+    // Capture once, validate these immutable bytes, and publish these same
+    // buffers. A late write to staging cannot change the selected replacement.
+    let staged_model = tokio::fs::read(staged_policies_dir.join("model.conf"))
+        .await
+        .context("capture staged policy model")?;
+    let staged_policy = tokio::fs::read(&staged_policy_path)
+        .await
+        .context("capture staged policy")?;
+    anyhow::ensure!(
+        parse_complete_policy_state(&staged_model, &staged_policy).await? == intended_state,
+        "captured staged policy does not match the complete intended policy state"
+    );
+    after_snapshot(&staged_policy_path)?;
+    tokio::fs::create_dir_all(&policies_dir)
+        .await
+        .context("create live policy directory")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tokio::fs::set_permissions(&policies_dir, std::fs::Permissions::from_mode(0o750))
+            .await
+            .context("set live policy directory permissions")?;
+    }
+
+    // The model is compatible with both the retained and replacement policy.
+    // Publish policy.csv last: its rename is the authority commit point.
+    atomic_publish_policy_file(
+        &policies_dir.join("model.conf"),
+        &staged_model,
+        &mut after_publication_write,
+    )
+        .context("publish verified policy model")?;
+    atomic_publish_policy_file(
+        &policies_dir.join("policy.csv"),
+        &staged_policy,
+        &mut after_publication_write,
+    )
+        .context("publish verified policy")?;
+
+    let published = PolicyManager::new(&policies_dir)
+        .await
+        .context("reopen published policy store")?;
+    verify_requested_templates(&published, &templates).await?;
+    if requested == public_staging {
+        verify_public_staging_policy(&published).await?;
+    }
+
+    println!(
+        "verified {} policy template(s): {}",
+        templates.len(),
+        template_names.join(",")
+    );
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CompletePolicyState {
+    policies: std::collections::BTreeSet<Vec<String>>,
+    groupings: std::collections::BTreeSet<Vec<String>>,
+    domain_groupings: std::collections::BTreeSet<Vec<String>>,
+}
+
+async fn complete_policy_state(manager: &crate::auth::PolicyManager) -> CompletePolicyState {
+    CompletePolicyState {
+        policies: manager.get_policy().await.into_iter().collect(),
+        groupings: manager.get_grouping_policy().await.into_iter().collect(),
+        domain_groupings: manager
+            .get_domain_grouping_policy()
+            .await
+            .into_iter()
+            .collect(),
+    }
+}
+
+async fn parse_complete_policy_state(
+    model: &[u8],
+    policy: &[u8],
+) -> Result<CompletePolicyState> {
+    use casbin::{CoreApi as _, DefaultModel, Enforcer, MgmtApi as _, StringAdapter};
+
+    let model = std::str::from_utf8(model).context("captured policy model is not UTF-8")?;
+    let policy = std::str::from_utf8(policy).context("captured policy is not UTF-8")?;
+    let model = DefaultModel::from_str(model)
+        .await
+        .context("parse captured policy model")?;
+    let enforcer = Enforcer::new(model, StringAdapter::new(policy))
+        .await
+        .context("parse captured policy")?;
+    Ok(CompletePolicyState {
+        policies: enforcer.get_policy().into_iter().collect(),
+        groupings: enforcer.get_grouping_policy().into_iter().collect(),
+        domain_groupings: enforcer
+            .get_named_grouping_policy("g2")
+            .into_iter()
+            .collect(),
+    })
+}
+
+fn atomic_publish_policy_file(
+    path: &Path,
+    content: &[u8],
+    after_write: &mut impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("policy publication path has no parent")?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create publication file for {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o640))
+            .with_context(|| format!("set publication permissions for {}", path.display()))?;
+    }
+    staged
+        .write_all(content)
+        .with_context(|| format!("write publication file for {}", path.display()))?;
+    after_write(path)?;
+    staged
+        .as_file_mut()
+        .flush()
+        .with_context(|| format!("flush publication file for {}", path.display()))?;
+    staged
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("sync publication file for {}", path.display()))?;
+    staged
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish policy file {}", path.display()))?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("sync policy directory {}", parent.display()))?;
+    Ok(())
+}
+
+async fn verify_requested_templates(
+    manager: &crate::auth::PolicyManager,
+    templates: &[&crate::auth::PolicyTemplate],
+) -> Result<()> {
+    use anyhow::ensure;
+    use std::collections::BTreeSet;
+
+    let policies = manager.get_policy().await;
+    let groupings = manager.get_grouping_policy().await;
+    let domain_groupings = manager.get_domain_grouping_policy().await;
+    for template in templates {
+        let expanded = template.expanded_policies();
+        let tenant_domains: BTreeSet<&str> = expanded
+            .iter()
+            .map(|policy| policy.domain)
+            .filter(|domain| *domain != "*")
+            .collect();
+        for expected in expanded {
+            ensure!(
+                policies.contains(&expected.to_vec()),
+                "policy template '{}' did not persist its canonical rule",
+                template.name
+            );
+        }
+        if let Some(expected_groupings) = template.groupings {
+            for expected in expected_groupings {
+                if let Some(domain) = tenant_domains.first() {
+                    ensure!(
+                        domain_groupings.contains(&vec![
+                            expected.user.to_owned(),
+                            expected.role.to_owned(),
+                            (*domain).to_owned(),
+                        ]),
+                        "policy template '{}' did not persist its canonical domain grouping",
+                        template.name
+                    );
+                } else {
+                    ensure!(
+                        groupings.contains(&expected.to_vec()),
+                        "policy template '{}' did not persist its canonical grouping",
+                        template.name
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn verify_public_staging_policy(manager: &crate::auth::PolicyManager) -> Result<()> {
+    use anyhow::ensure;
+
+    let policies = manager.get_policy().await;
+    let mut expected = Vec::new();
+    for name in ["public-inference", "public-read"] {
+        let template = crate::auth::get_template(name)
+            .with_context(|| format!("compiled-in public staging template missing: {name}"))?;
+        expected.extend(
+            template
+                .expanded_policies()
+                .into_iter()
+                .map(|rule| rule.to_vec()),
+        );
+    }
+    ensure!(
+        expected.len() == 3,
+        "public staging templates must define exactly three rules"
+    );
+    for rule in &expected {
+        ensure!(
+            policies
+                .iter()
+                .filter(|candidate| candidate.as_slice() == rule.as_slice())
+                .count()
+                == 1,
+            "public staging policy must persist each of its three canonical rules exactly once"
+        );
+    }
+
+    let checks = [
+        ("model:policy-bootstrap-probe", "infer.generate"),
+        ("model:policy-bootstrap-probe", "query.status"),
+        ("registry:policy-bootstrap-probe", "query.status"),
+    ];
+    for (resource, action) in checks {
+        ensure!(
+            manager
+                .check_with_domain("anonymous", "*", resource, action)
+                .await,
+            "public staging policy is not effective for {action} on {resource}"
+        );
+    }
+    ensure!(
+        !manager
+            .check_with_domain(
+                "anonymous",
+                "*",
+                "model:policy-bootstrap-probe",
+                "ttt.writeback",
+            )
+            .await,
+        "public staging policy must not grant anonymous ttt.writeback"
+    );
+    Ok(())
+}
+
 /// Handle `service install` - Idempotent setup and optional restart
 ///
 /// 1. Run repair checks (dirs, registry, policy, signing key, git identity)
@@ -1244,4 +1589,500 @@ fn update_shell_profiles(home: &Path, bin_dir: &Path) -> Result<Vec<String>> {
     }
 
     Ok(updated)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod offline_policy_provision_tests {
+    use super::*;
+    use crate::auth::{get_template, PolicyManager};
+
+    fn public_templates() -> Vec<String> {
+        vec!["public-inference".to_owned(), "public-read".to_owned()]
+    }
+
+    #[tokio::test]
+    async fn fresh_and_repeat_public_staging_policy_is_canonical() {
+        let root = tempfile::tempdir().expect("temporary models root");
+        handle_service_provision_policy_templates(root.path(), &public_templates())
+            .await
+            .expect("fresh provision");
+        let policy_path = root.path().join(".registry/policies/policy.csv");
+        let first = tokio::fs::read(&policy_path).await.expect("first policy");
+
+        handle_service_provision_policy_templates(root.path(), &public_templates())
+            .await
+            .expect("repeat provision");
+        let second = tokio::fs::read(&policy_path)
+            .await
+            .expect("repeated policy");
+        assert_eq!(first, second, "repeat must leave serialized policy stable");
+
+        let manager = PolicyManager::new(root.path().join(".registry/policies"))
+            .await
+            .expect("reopen policy store");
+        let policies = manager.get_policy().await;
+        let expected = public_templates()
+            .iter()
+            .flat_map(|name| get_template(name).expect("template").expanded_policies())
+            .map(|rule| rule.to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(expected.len(), 3);
+        for rule in expected {
+            assert_eq!(
+                policies
+                    .iter()
+                    .filter(|candidate| candidate.as_slice() == rule.as_slice())
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            !manager
+                .check_with_domain(
+                    "anonymous",
+                    "*",
+                    "model:policy-bootstrap-probe",
+                    "ttt.writeback",
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_partial_template_converges() {
+        let root = tempfile::tempdir().expect("temporary models root");
+        let policies_dir = root.path().join(".registry/policies");
+        let manager = PolicyManager::new(&policies_dir)
+            .await
+            .expect("policy manager");
+        manager
+            .add_policy_with_domain("anonymous", "*", "model:*", "infer.generate", "allow")
+            .await
+            .expect("partial rule");
+        manager.save().await.expect("save partial state");
+        drop(manager);
+
+        handle_service_provision_policy_templates(root.path(), &public_templates())
+            .await
+            .expect("partial state must converge");
+        let verified = PolicyManager::new(&policies_dir)
+            .await
+            .expect("reopen converged policy");
+        assert!(
+            verified
+                .check_with_domain(
+                    "anonymous",
+                    "*",
+                    "model:policy-bootstrap-probe",
+                    "query.status",
+                )
+                .await
+        );
+        assert!(
+            verified
+                .check_with_domain(
+                    "anonymous",
+                    "*",
+                    "registry:policy-bootstrap-probe",
+                    "query.status",
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_partial_domain_grouping_converges() {
+        let root = tempfile::tempdir().expect("temporary models root");
+        let policies_dir = root.path().join(".registry/policies");
+        let manager = PolicyManager::new(&policies_dir)
+            .await
+            .expect("policy manager");
+        manager
+            .add_role_for_user_in_domain("service:inference:host-1", "mesh-readers", "acme")
+            .await
+            .expect("partial domain grouping");
+        manager.save().await.expect("save partial grouping");
+        drop(manager);
+
+        handle_service_provision_policy_templates(root.path(), &["mesh-host-group".to_owned()])
+            .await
+            .expect("partial grouping must converge");
+        let verified = PolicyManager::new(&policies_dir)
+            .await
+            .expect("reopen grouping policy");
+        let groupings = verified.get_domain_grouping_policy().await;
+        for host in ["service:inference:host-1", "service:inference:host-2"] {
+            assert!(groupings.contains(&vec![
+                host.to_owned(),
+                "mesh-readers".to_owned(),
+                "acme".to_owned(),
+            ]));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_requests_fail_before_storage_mutation() {
+        for templates in [
+            vec!["not-a-template".to_owned()],
+            vec!["public-read".to_owned(), "public-read".to_owned()],
+        ] {
+            let root = tempfile::tempdir().expect("temporary models root");
+            assert!(
+                handle_service_provision_policy_templates(root.path(), &templates)
+                    .await
+                    .is_err()
+            );
+            assert!(!root.path().join(".registry").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_or_explicitly_denied_policy_fails_closed() {
+        let malformed_root = tempfile::tempdir().expect("malformed models root");
+        let malformed_dir = malformed_root.path().join(".registry/policies");
+        PolicyManager::new(&malformed_dir)
+            .await
+            .expect("initialize policy");
+        let malformed_path = malformed_dir.join("policy.csv");
+        let malformed = b"p, malformed\n";
+        tokio::fs::write(&malformed_path, malformed)
+            .await
+            .expect("write malformed policy");
+        assert!(handle_service_provision_policy_templates(
+            malformed_root.path(),
+            &public_templates(),
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            tokio::fs::read(&malformed_path)
+                .await
+                .expect("read malformed"),
+            malformed
+        );
+
+        let denied_root = tempfile::tempdir().expect("denied models root");
+        let denied_dir = denied_root.path().join(".registry/policies");
+        let denied = PolicyManager::new(&denied_dir)
+            .await
+            .expect("initialize denied policy");
+        denied
+            .add_policy_with_domain("anonymous", "*", "model:*", "infer.generate", "deny")
+            .await
+            .expect("add explicit deny");
+        denied.save().await.expect("persist explicit deny");
+        drop(denied);
+        let denied_path = denied_dir.join("policy.csv");
+        let denied_original = tokio::fs::read(&denied_path)
+            .await
+            .expect("retained anonymous deny");
+        assert!(
+            handle_service_provision_policy_templates(denied_root.path(), &public_templates(),)
+                .await
+                .is_err(),
+            "explicit deny must block verified staging readiness"
+        );
+        assert_eq!(
+            tokio::fs::read(&denied_path)
+                .await
+                .expect("anonymous deny after refused retry"),
+            denied_original
+        );
+        let reopened = PolicyManager::new(&denied_dir)
+            .await
+            .expect("reopen denied policy");
+        assert!(
+            !reopened
+                .check_with_domain(
+                    "anonymous",
+                    "*",
+                    "model:policy-bootstrap-probe",
+                    "infer.generate",
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn prepublication_failure_and_retry_preserve_retained_deny() {
+        let root = tempfile::tempdir().expect("retained-policy models root");
+        let policies_dir = root.path().join(".registry/policies");
+        let denied = PolicyManager::new(&policies_dir)
+            .await
+            .expect("initialize policy");
+        let deny = vec![
+            "service:retained".to_owned(),
+            "*".to_owned(),
+            "model:*".to_owned(),
+            "ttt.writeback".to_owned(),
+            "deny".to_owned(),
+        ];
+        denied
+            .add_policy_with_domain(
+                "service:retained",
+                "*",
+                "model:*",
+                "ttt.writeback",
+                "deny",
+            )
+            .await
+            .expect("add retained deny");
+        denied.save().await.expect("persist retained deny");
+        drop(denied);
+        let policy_path = policies_dir.join("policy.csv");
+        let original = tokio::fs::read(&policy_path)
+            .await
+            .expect("retained policy");
+        assert!(!original.is_empty());
+
+        let mut fault_reached = false;
+        assert!(provision_policy_templates(
+                root.path(),
+                &public_templates(),
+                |_| {
+                    fault_reached = true;
+                    anyhow::bail!("injected failure after staged write before publication")
+                },
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .await
+            .is_err());
+        assert!(fault_reached, "prepublication fault seam must be reached");
+        assert_eq!(
+            tokio::fs::read(&policy_path)
+                .await
+                .expect("policy after injected failure"),
+            original
+        );
+
+        let retained = PolicyManager::new(&policies_dir)
+            .await
+            .expect("reopen retained policy");
+        assert!(retained.get_policy().await.contains(&deny));
+        drop(retained);
+
+        handle_service_provision_policy_templates(root.path(), &public_templates())
+            .await
+            .expect("retry must converge");
+        let after_retry = PolicyManager::new(&policies_dir)
+            .await
+            .expect("reopen retry policy");
+        assert!(after_retry.get_policy().await.contains(&deny));
+    }
+
+    #[tokio::test]
+    async fn atomic_policy_publication_failure_preserves_retained_deny_and_retry() {
+        let root = tempfile::tempdir().expect("retained-policy models root");
+        let policies_dir = root.path().join(".registry/policies");
+        let retained = PolicyManager::new(&policies_dir)
+            .await
+            .expect("initialize policy");
+        let deny = vec![
+            "service:retained".to_owned(),
+            "*".to_owned(),
+            "model:*".to_owned(),
+            "ttt.writeback".to_owned(),
+            "deny".to_owned(),
+        ];
+        retained
+            .add_policy_with_domain(
+                "service:retained",
+                "*",
+                "model:*",
+                "ttt.writeback",
+                "deny",
+            )
+            .await
+            .expect("add retained deny");
+        retained.save().await.expect("persist retained deny");
+        drop(retained);
+        let policy_path = policies_dir.join("policy.csv");
+        let original = tokio::fs::read(&policy_path)
+            .await
+            .expect("retained policy bytes");
+
+        let mut wrote_model_temp = false;
+        let mut failed_policy_write = false;
+        let result = provision_policy_templates(
+            root.path(),
+            &public_templates(),
+            |_| Ok(()),
+            |_| Ok(()),
+            |destination| {
+                if destination.file_name().is_some_and(|name| name == "model.conf") {
+                    wrote_model_temp = true;
+                } else if destination.file_name().is_some_and(|name| name == "policy.csv") {
+                    failed_policy_write = true;
+                    anyhow::bail!("injected failure after policy temp-file write")
+                }
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(wrote_model_temp, "model publication must precede policy");
+        assert!(failed_policy_write, "fault must reach policy publication");
+        assert_eq!(
+            tokio::fs::read(&policy_path)
+                .await
+                .expect("policy after publication failure"),
+            original
+        );
+        let after_failure = PolicyManager::new(&policies_dir)
+            .await
+            .expect("reopen policy after failure");
+        assert!(after_failure.get_policy().await.contains(&deny));
+        drop(after_failure);
+
+        handle_service_provision_policy_templates(root.path(), &public_templates())
+            .await
+            .expect("retry converges without losing retained deny");
+        let after_retry = PolicyManager::new(&policies_dir)
+            .await
+            .expect("reopen policy after retry");
+        assert!(after_retry.get_policy().await.contains(&deny));
+        assert!(
+            !after_retry
+                .check_with_domain(
+                    "service:retained",
+                    "*",
+                    "model:policy-bootstrap-probe",
+                    "ttt.writeback",
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_staged_snapshot_cannot_drop_retained_deny() {
+        let root = tempfile::tempdir().expect("incomplete-snapshot models root");
+        let policies_dir = root.path().join(".registry/policies");
+        let retained = PolicyManager::new(&policies_dir)
+            .await
+            .expect("initialize policy");
+        retained
+            .add_policy_with_domain(
+                "service:retained",
+                "*",
+                "model:*",
+                "ttt.writeback",
+                "deny",
+            )
+            .await
+            .expect("add retained deny");
+        retained.save().await.expect("persist retained deny");
+        drop(retained);
+        let policy_path = policies_dir.join("policy.csv");
+        let original = tokio::fs::read(&policy_path)
+            .await
+            .expect("retained policy bytes");
+
+        let result = provision_policy_templates(
+            root.path(),
+            &public_templates(),
+            |staged_path| {
+                let staged = std::fs::read_to_string(staged_path)?;
+                for name in public_templates() {
+                    let template = get_template(&name).expect("public template");
+                    for rule in template.expanded_policies() {
+                        assert!(staged.contains(&format!("p, {}", rule.to_vec().join(", "))));
+                    }
+                }
+                let mut removed = 0;
+                let incomplete = staged
+                    .lines()
+                    .filter(|line| {
+                        let keep = !line.contains("service:retained")
+                            || !line.contains("ttt.writeback")
+                            || !line.ends_with("deny");
+                        if !keep {
+                            removed += 1;
+                        }
+                        keep
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n";
+                assert_eq!(removed, 1, "fault must omit exactly the retained DENY");
+                std::fs::write(staged_path, incomplete)?;
+                Ok(())
+            },
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .await;
+        assert!(
+            result
+                .expect_err("incomplete snapshot must be rejected")
+                .to_string()
+                .contains("complete intended policy state")
+        );
+        assert_eq!(
+            tokio::fs::read(&policy_path)
+                .await
+                .expect("live policy after rejected snapshot"),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_after_snapshot_cannot_change_published_policy() {
+        let root = tempfile::tempdir().expect("post-snapshot-mutation models root");
+        let mut captured = None;
+        provision_policy_templates(
+            root.path(),
+            &public_templates(),
+            |_| Ok(()),
+            |staged_path| {
+                captured = Some(std::fs::read(staged_path)?);
+                std::fs::write(staged_path, b"p, malformed\n")?;
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .await
+        .expect("immutable captured policy must publish successfully");
+        assert_eq!(
+            tokio::fs::read(root.path().join(".registry/policies/policy.csv"))
+                .await
+                .expect("published policy"),
+            captured.expect("snapshot callback captured bytes")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_retained_policy_is_not_replaced_with_defaults() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("unreadable-policy models root");
+        let policies_dir = root.path().join(".registry/policies");
+        PolicyManager::new(&policies_dir)
+            .await
+            .expect("initialize policy");
+        let policy_path = policies_dir.join("policy.csv");
+        let original = tokio::fs::read(&policy_path)
+            .await
+            .expect("retained policy bytes");
+        tokio::fs::set_permissions(&policy_path, std::fs::Permissions::from_mode(0o000))
+            .await
+            .expect("make retained policy unreadable");
+
+        assert!(
+            handle_service_provision_policy_templates(root.path(), &public_templates())
+                .await
+                .is_err()
+        );
+        tokio::fs::set_permissions(&policy_path, std::fs::Permissions::from_mode(0o640))
+            .await
+            .expect("restore retained policy permissions");
+        assert_eq!(
+            tokio::fs::read(&policy_path)
+                .await
+                .expect("policy after read failure"),
+            original
+        );
+    }
 }
