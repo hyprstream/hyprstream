@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Verify pinned schema bytes and reference closure without fetching
         run: python3 scripts/check_atproto_lexicons.py
       - name: Exercise missing, modified and unresolved schema failures
