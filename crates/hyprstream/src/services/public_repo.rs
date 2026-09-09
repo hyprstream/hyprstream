@@ -256,6 +256,10 @@ impl std::fmt::Debug for PublicRepoWriter {
 }
 
 impl PublicRepoWriter {
+    pub fn did(&self) -> &str {
+        &self.did
+    }
+
     pub fn new(
         store: Arc<PublicRepoStore>,
         did: impl Into<String>,
@@ -368,6 +372,65 @@ impl PublicRepoWriter {
             commit_cid,
         })
     }
+
+    /// Variant used by JSON/XRPC adapters, which receive the standard base32
+    /// CID text form. The string is compared with the durable public head
+    /// before delegating to the typed transaction; no unvalidated CID parser
+    /// or native-format fallback is introduced.
+    pub fn create_record_with_expected_prev_text(
+        &self,
+        mut request: PublicCreateRequest,
+        expected_prev: Option<&str>,
+    ) -> Result<PublicCommitResult> {
+        request.expected_prev = match expected_prev {
+            None => None,
+            Some(expected) if !expected.is_empty() => {
+                let snapshot = self
+                    .store
+                    .snapshot(&self.did)?
+                    .ok_or_else(|| anyhow!("public repo head is absent"))?;
+                let actual = snapshot.commit.cid_atproto()?;
+                ensure!(actual.to_string() == expected, "public repo head CAS conflict");
+                Some(actual)
+            }
+            Some(_) => return Err(anyhow!("swapCommit must be a non-empty CID")),
+        };
+        self.create_record(request)
+    }
+}
+
+/// Convert the JSON data model accepted by AT records into the bounded native
+/// value type used by the public codec. Floats, non-string object keys and
+/// integers outside signed 64-bit range are rejected before serialization.
+pub fn json_to_dag_cbor(value: &serde_json::Value) -> Result<DagCbor> {
+    Ok(match value {
+        serde_json::Value::Null => DagCbor::Null,
+        serde_json::Value::Bool(value) => DagCbor::Bool(*value),
+        serde_json::Value::Number(number) => {
+            if let Some(value) = number.as_i64() {
+                if value >= 0 {
+                    DagCbor::Unsigned(value as u64)
+                } else {
+                    DagCbor::Negative(value as i128)
+                }
+            } else {
+                return Err(anyhow!("AT record numbers must be signed integers"));
+            }
+        }
+        serde_json::Value::String(value) => DagCbor::Text(value.clone()),
+        serde_json::Value::Array(values) => DagCbor::List(
+            values
+                .iter()
+                .map(json_to_dag_cbor)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        serde_json::Value::Object(values) => DagCbor::Map(
+            values
+                .iter()
+                .map(|(key, value)| Ok((DagCbor::Text(key.clone()), json_to_dag_cbor(value)?)))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    })
 }
 
 fn next_revision(previous: Option<Tid>) -> Tid {
