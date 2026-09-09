@@ -82,8 +82,9 @@ pub enum DagCbor {
     Text(String),
     /// Array (major 4), in given order.
     List(Vec<DagCbor>),
-    /// Map (major 5). Keys are stored in canonical (pure lexicographic byte)
-    /// sorted order at construction; encoding emits them as-is.
+    /// Map (major 5). Keys are stored in the existing native lexical text-byte
+    /// order at construction; public AT ordering is applied by
+    /// [`crate::atproto_cbor`] at its explicit boundary.
     Map(Vec<(DagCbor, DagCbor)>),
     /// CID link — encoded as CBOR tag 42.
     Link(Cid),
@@ -448,11 +449,11 @@ fn take<'a>(input: &'a [u8], cursor: &mut usize, n: usize) -> Result<&'a [u8]> {
     Ok(slice)
 }
 
-// ── canonical key ordering ──────────────────────────────────────────────────
+// ── native key ordering ──────────────────────────────────────────────────────
 
 /// Canonical comparison for a map key: returns the "canonical key" byte
 /// representation used both for sorting at construction and for verifying order
-/// at decode. DAG-CBOR map keys are text strings, so this is always UTF-8 bytes.
+/// at decode. Native map keys are text strings, so this is always UTF-8 bytes.
 fn canonical_key_of(key: &DagCbor) -> Vec<u8> {
     match key {
         DagCbor::Text(s) => s.as_bytes().to_vec(),
