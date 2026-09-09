@@ -592,7 +592,7 @@ def self_test(repo: Path) -> None:
     expect_failure("schema provenance", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(catalog); bad["source_commit"] = "f" * 40
     expect_failure("fabricated provenance commit", repo, bad, corpus, schemas, consumers)
-    bad = copy.deepcopy(catalog); bad["source_commit"] = git(repo, "rev-parse", "HEAD~1")
+    bad = copy.deepcopy(catalog); bad["source_commit"] = git(repo, "rev-parse", "HEAD"); bad["source_tree"] = git(repo, "rev-parse", "HEAD^{tree}")
     expect_failure("stale base provenance commit", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["source_tree"] = "0" * 40
     expect_failure("corpus provenance", repo, catalog, bad, schemas, consumers)
@@ -641,7 +641,7 @@ def self_test(repo: Path) -> None:
                       .replace("hyprstream_rpc_build::compile_schemas(", "rpc_build::compile_schemas(", 1))
     required(cgr_inventory(discovery_build, module_aliased) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
              "CGR module-alias normalization drift")
-    grouped_aliased = ("use hyprstream_rpc_build::{compile_schemas as compile};\n" + discovery_source
+    grouped_aliased = ("use hyprstream_rpc_build::{compile_schemas as compile, SchemaMetadata};\n" + discovery_source
                        .replace("hyprstream_rpc_build::compile_schemas(", "compile(", 1))
     required(cgr_inventory(discovery_build, grouped_aliased) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
              "CGR grouped function-alias normalization drift")
