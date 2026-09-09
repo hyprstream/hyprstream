@@ -1468,14 +1468,14 @@ mod notify_readiness_tests {
         let fd = socket(
             AddressFamily::Unix,
             SockType::Datagram,
-            SockFlag::SOCK_CLOEXEC,
+            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
             None,
         )?;
         sendto(
             fd.as_raw_fd(),
             b"READY=1",
             &UnixAddr::new_abstract(name.as_bytes())?,
-            MsgFlags::empty(),
+            MsgFlags::MSG_DONTWAIT,
         )?;
         Ok(())
     }
