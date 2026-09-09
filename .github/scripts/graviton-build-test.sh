@@ -17,6 +17,34 @@ export RUSTUP_HOME=/root/.rustup
 export SCCACHE_DIR="${PWD}/.sccache"
 mkdir -p "${SCCACHE_DIR}"
 
+# These are standalone workspaces, so Cargo's default target directory is
+# relative to each guest crate.  When the CI workflow supplies a shared target
+# directory, Cargo resolves a relative value from the crate's working
+# directory and an absolute value verbatim.  Keep that resolution in one
+# place so the artifacts we hand to the guest tests are the artifacts the
+# preceding Cargo commands actually produced.
+guest_target_dir() {
+  local crate_dir="$1"
+  if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    if [[ "${CARGO_TARGET_DIR}" = /* ]]; then
+      printf '%s\n' "${CARGO_TARGET_DIR}"
+    else
+      printf '%s/%s\n' "${crate_dir}" "${CARGO_TARGET_DIR}"
+    fi
+  else
+    printf '%s/target\n' "${crate_dir}"
+  fi
+}
+
+require_guest_artifact() {
+  local label="$1"
+  local artifact="$2"
+  if [[ ! -r "${artifact}" || ! -s "${artifact}" ]]; then
+    echo "${label} guest artifact is missing, unreadable, or empty: ${artifact}" >&2
+    return 1
+  fi
+}
+
 # Same-filesystem TMPDIR: the overlay_fsmount tests rename across layers, which
 # fails EXDEV (cross-device link) when temp dirs land on /tmp (tmpfs) while the
 # workspace is on another filesystem. Keep temp on the workspace fs.
@@ -83,8 +111,12 @@ run_phase "Python guest WASM build" bash -c \
   'cd crates/hyprstream-workers-python-guest && cargo build --release --target wasm32-unknown-unknown'
 run_phase "Wasmtime guest WASM build" bash -c \
   'cd crates/hyprstream-workers-wasmtime-fsguest && cargo build --release --target wasm32-wasip1'
-export HYPRSTREAM_PYGUEST_WASM="${PWD}/crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm"
-export HYPRSTREAM_FSGUEST_WASM="${PWD}/crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm"
+PYTHON_GUEST_DIR="${PWD}/crates/hyprstream-workers-python-guest"
+FSGUEST_DIR="${PWD}/crates/hyprstream-workers-wasmtime-fsguest"
+export HYPRSTREAM_PYGUEST_WASM="$(guest_target_dir "${PYTHON_GUEST_DIR}")/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm"
+export HYPRSTREAM_FSGUEST_WASM="$(guest_target_dir "${FSGUEST_DIR}")/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm"
+require_guest_artifact "Python" "${HYPRSTREAM_PYGUEST_WASM}"
+require_guest_artifact "Wasmtime" "${HYPRSTREAM_FSGUEST_WASM}"
 
 # nextest ci profile enforces the per-test slow-timeout from .config/nextest.toml;
 # fail-fast (the default) is what the merge gate wants.
