@@ -964,6 +964,9 @@ pub async fn create_record(
         Some(_) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "collection is outside the enabled posting slice"),
         None => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "collection is required"),
     };
+    if let Err(message) = validate_flag(object.get("validate")) {
+        return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message);
+    }
     let rkey = match object.get("rkey").and_then(Value::as_str).and_then(|value| Tid::parse(value).ok()) {
         Some(rkey) => rkey,
         None => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "a valid TID rkey is required"),
@@ -1006,6 +1009,14 @@ pub async fn create_record(
         response["value"] = record_value.clone();
     }
     (StatusCode::OK, axum::Json(response)).into_response()
+}
+
+fn validate_flag(value: Option<&Value>) -> Result<(), &'static str> {
+    match value {
+        Some(Value::Bool(true)) => Err("Lexicon validation is not configured for this repository"),
+        Some(Value::Bool(false)) | None => Ok(()),
+        Some(_) => Err("validate must be a boolean"),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1058,6 +1069,20 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn create_record_validate_flag_fails_closed_without_lexicon_validator() {
+        assert!(validate_flag(None).is_ok());
+        assert!(validate_flag(Some(&Value::Bool(false))).is_ok());
+        assert_eq!(
+            validate_flag(Some(&Value::Bool(true))).unwrap_err(),
+            "Lexicon validation is not configured for this repository"
+        );
+        assert_eq!(
+            validate_flag(Some(&json!("yes"))).unwrap_err(),
+            "validate must be a boolean"
+        );
     }
 
     // ── Finding 1: lazy CAR + owned permit held until EOF ───────────────────
