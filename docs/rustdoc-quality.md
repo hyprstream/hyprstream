@@ -27,18 +27,35 @@ Two invariants hold for the whole lane:
 The pilot crate is `hyprstream-util` — a dependency-light leaf (Apache-2.0,
 `parking_lot` only) whose public API is small enough to document to completion.
 
-The lint is enabled **crate-scoped**, not workspace-wide:
+The lint is enabled **crate-scoped**, not workspace-wide, and **isolated from
+Clippy**:
 
 ```rust
 // crates/hyprstream-util/src/lib.rs
-#![warn(missing_docs)]
+#![cfg_attr(not(clippy), warn(missing_docs))]
 ```
 
-It is deliberately *not* added to `[workspace.lints]` in the root `Cargo.toml`:
-the workspace lints table applies to every crate that sets
+Two deliberate choices here:
+
+It is *not* added to `[workspace.lints]` in the root `Cargo.toml`: the
+workspace lints table applies to every crate that sets
 `[lints] workspace = true`, which would be a workspace-wide rollout — out of
 scope for the pilot. Each crate opts in individually after measuring its own
 baseline.
+
+The `cfg_attr(not(clippy), …)` guard is what makes the non-blocking invariant
+true in practice. Clippy runs rustc's lint passes, so a plain
+`warn(missing_docs)` would be promoted to a hard error by the
+repository-wide `cargo clippy --workspace --all-targets -- -D warnings` (the
+PR Clippy job and the pre-commit hook) the moment any public item is
+undocumented — `-D warnings` implies `-D missing-docs` at the command line.
+That would silently turn every documented-but-incomplete crate into a blocking
+PR lint and strand the expansion policy. With the guard, the attribute is
+inert under clippy and active under plain rustc/rustdoc: `cargo doc` emits the
+warnings, the scoped strict-evidence run (`RUSTDOCFLAGS="-D warnings"`) still
+escalates them, and `cargo clippy … -D warnings` stays clean regardless of
+documentation debt. The guard must accompany every future opt-in (step 3
+below); dropping it re-introduces the blocking behavior.
 
 ## Measuring locally
 
@@ -91,7 +108,10 @@ For each additional crate, in this order:
    public items. Avoid broad `allow(missing_docs)`; a targeted attribute on a
    generated or foreign-shaped item is acceptable when there is no better
    owner for the doc.
-3. **Opt in** — add `#![warn(missing_docs)]` to that crate's lib root only.
+3. **Opt in** — add `#![cfg_attr(not(clippy), warn(missing_docs))]` to that
+   crate's lib root only. Keep the `not(clippy)` guard: without it, the
+   workspace-wide Clippy `-D warnings` promotes every missing-doc warning to a
+   hard error and the lane stops being non-blocking.
 4. **Extend the evidence job** — add the crate to
    `.github/workflows/rustdoc.yml`'s scoped `cargo doc` invocation (keep
    `--no-deps`; one scoped invocation per crate keeps failures attributable).
