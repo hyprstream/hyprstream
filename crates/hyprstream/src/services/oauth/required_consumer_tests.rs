@@ -281,6 +281,7 @@ fn service_announcement(
     }
 }
 
+#[cfg(test)]
 #[test]
 fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Result<()> {
     const CHILD: &str = "HYPRSTREAM_REQUIRED_OAUTH_CLIENT_TEST";
