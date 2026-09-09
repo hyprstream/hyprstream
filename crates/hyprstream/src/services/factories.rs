@@ -399,6 +399,19 @@ fn register_service_key(
     }
 
     if service_name == "policy" {
+        if ctx.iroh_required() {
+            // Policy is the native authority itself: it does not register its
+            // own key through RPC, but its provisioned service JWT still needs
+            // the same renewal task as every other native child.
+            spawn_jwt_renewal_task(
+                service_name,
+                signing_key.clone(),
+                creds_dir,
+                secrets_profile,
+                true,
+                ctx.transport("policy", SocketKind::Rep),
+            );
+        }
         return Ok(());
     }
 
@@ -534,7 +547,14 @@ fn spawn_jwt_renewal_task(
     policy_transport: hyprstream_rpc::transport::TransportConfig,
 ) {
     let service_name = service_name.to_owned();
-    tokio::spawn(async move {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // Factory unit tests exercise registration without a running executor;
+        // production startup always has one. Avoid panicking in the former
+        // while keeping renewal attached to the service runtime in the latter.
+        tracing::debug!(service = service_name, "JWT renewal deferred: no Tokio runtime");
+        return;
+    };
+    runtime.spawn(async move {
         const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3_600);
         const RENEW_THRESHOLD: i64 = 7 * 24 * 3_600; // 7 days remaining
 
