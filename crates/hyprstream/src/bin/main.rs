@@ -5079,6 +5079,37 @@ mod native_launcher {
     const SERVICE: &str = "model";
     const KEY_SEED: u8 = 0x5A;
 
+    #[cfg(unix)]
+    #[test]
+    fn cli_parser_loads_non_utf8_config_path_without_changing_bytes() -> anyhow::Result<()> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let root = tempfile::tempdir()?;
+        let config_path = root
+            .path()
+            .join(std::ffi::OsString::from_vec(b"parent-\xff.toml".to_vec()));
+        HyprConfig::default().to_file(&config_path)?;
+        let canonical = std::fs::canonicalize(&config_path)?;
+        assert!(canonical.to_str().is_none(), "fixture path must be non-UTF-8");
+
+        let matches = build_cli().try_get_matches_from([
+            std::ffi::OsString::from("hyprstream"),
+            std::ffi::OsString::from("--config"),
+            canonical.as_os_str().to_owned(),
+        ])?;
+        let parsed = matches
+            .get_one::<std::path::PathBuf>("config")
+            .context("config PathBuf parsed by clap")?;
+        assert_eq!(
+            parsed.as_os_str().as_bytes(),
+            canonical.as_os_str().as_bytes(),
+            "clap must preserve the explicit selector byte for byte"
+        );
+        let config = load_config(Some(parsed))?;
+        config.validate()?;
+        Ok(())
+    }
+
     fn provision_custom_config(
         root: &tempfile::TempDir,
         seed: u8,
@@ -5156,7 +5187,7 @@ mod native_launcher {
 
     async fn spawn_causal_child(
         supervisor: &hyprstream_service::ProcessSpawner,
-        launch_args: &[String],
+        launch_args: &[std::ffi::OsString],
         mode: &str,
         proof: &Path,
         stop_file: &Path,
@@ -5168,6 +5199,13 @@ mod native_launcher {
         let exe = std::env::current_exe()?;
         // Unique supervisor name: PID artifacts land under a test-owned
         // namespace, never the shared `model.pid` of a real deployment.
+        let serialized_args: Vec<&str> = launch_args
+            .iter()
+            .map(|arg| {
+                arg.to_str()
+                    .context("UTF-8 fixture argument for launcher causal-test envelope")
+            })
+            .collect::<anyhow::Result<_>>()?;
         let mut child = hyprstream_service::ProcessConfig::new(child_instance, &exe)
             .args([
                 "--exact",
@@ -5176,7 +5214,7 @@ mod native_launcher {
             ])
             .env(CAUSAL_CHILD, "1")
             .env(CAUSAL_MODE, mode)
-            .env(CAUSAL_ARGV, serde_json::to_string(launch_args)?)
+            .env(CAUSAL_ARGV, serde_json::to_string(&serialized_args)?)
             .env(CAUSAL_PROOF, proof.display().to_string())
             .env(CAUSAL_STOP, stop_file.display().to_string())
             // Deterministic identity layout, isolated runtime namespace.

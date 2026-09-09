@@ -54,6 +54,7 @@ pub use service::{
 };
 pub use systemd::SystemdBackend;
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use hyprstream_rpc::error::{Result, RpcError};
@@ -96,7 +97,7 @@ pub struct ProcessConfig {
     pub executable: PathBuf,
 
     /// Command-line arguments.
-    pub args: Vec<String>,
+    pub args: Vec<OsString>,
 
     /// Working directory.
     pub working_dir: Option<PathBuf>,
@@ -148,7 +149,7 @@ impl ProcessConfig {
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: Into<OsString>,
     {
         self.args = args.into_iter().map(Into::into).collect();
         self

@@ -1427,6 +1427,54 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn standalone_spawn_preserves_non_utf8_argument_bytes() -> anyhow::Result<()> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let root = tempfile::tempdir()?;
+        let script = root.path().join("record-argument.sh");
+        let observed = root.path().join("observed.bin");
+        std::fs::write(
+            &script,
+            b"printf '%s' \"$1\" > \"$2\"\nexec sleep 30\n",
+        )?;
+        let expected = std::ffi::OsString::from_vec(b"config-\xff.toml".to_vec());
+        let name = format!("non-utf8-argv-{}", uuid::Uuid::new_v4().simple());
+        let backend = StandaloneBackend::new();
+        let config = ProcessConfig::new(&name, "/bin/sh").args([
+            script.as_os_str().to_owned(),
+            expected.clone(),
+            observed.as_os_str().to_owned(),
+        ]);
+        let process = backend.spawn(config).await?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let observation = loop {
+            match std::fs::read(&observed) {
+                Ok(bytes) if bytes == expected.as_os_str().as_bytes() => break Ok(()),
+                Ok(_) | Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok(bytes) => break Err(anyhow::anyhow!(
+                    "child changed argument bytes: observed {bytes:?}"
+                )),
+                Err(error) => break Err(anyhow::anyhow!(
+                    "child did not record its argument before the deadline: {error}"
+                )),
+            }
+        };
+        let stop = backend.stop(&process).await;
+        observation?;
+        stop?;
+        assert!(!backend.is_running(&process).await?);
+        assert!(
+            !hyprstream_rpc::paths::service_pid_file(&name).exists(),
+            "stopped child must leave no PID artifact"
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_backend_type() {
         let backend = StandaloneBackend::new();

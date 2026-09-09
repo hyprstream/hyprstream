@@ -1961,7 +1961,7 @@ impl Default for MetricsConfig {
 pub struct ServicesConfig {
     /// Services to start automatically at startup (ipc-systemd mode)
     ///
-    /// Default: ["registry", "policy", "worker", "event"]
+    /// Default: the factories compiled into the standard service roster.
     #[serde(default = "default_startup_services")]
     pub startup: Vec<String>,
 }
@@ -1976,22 +1976,30 @@ impl Default for ServicesConfig {
 
 /// Default list of services to start at startup
 fn default_startup_services() -> Vec<String> {
-    vec![
+    let mut services = vec![
         "event".to_owned(),     // Must start first (message bus)
         "registry".to_owned(),  // Model registry
         "policy".to_owned(),    // Authorization
-        "streams".to_owned(),       // Streaming proxy with JWT validation
-        "notification".to_owned(),  // Encrypted notification relay (uses streams)
-        "worker".to_owned(),        // Container workloads
-        "model".to_owned(),         // Model management (publishes to notification)
+        "streams".to_owned(),   // Streaming proxy with JWT validation
+        "worker".to_owned(),    // Container workloads
+        "model".to_owned(),     // Model management
         "oauth".to_owned(),     // OAuth 2.1 authorization server
         "oai".to_owned(),       // OpenAI-compatible HTTP API
-        "flight".to_owned(),    // Arrow Flight SQL server
+    ];
+    #[cfg(feature = "metrics")]
+    {
+        services.push("flight".to_owned()); // Arrow Flight SQL server
+    }
+    services.extend([
         "discovery".to_owned(), // Endpoint discovery (RFC 9728 metadata)
         "mcp".to_owned(),       // Model Context Protocol service
         "tui".to_owned(),       // Terminal multiplexer display server
-        "metrics".to_owned(),   // Metrics ingest and query (DuckDB/DataFusion)
-    ]
+    ]);
+    #[cfg(feature = "metrics")]
+    {
+        services.push("metrics".to_owned()); // Metrics ingest and query
+    }
+    services
 }
 
 /// Model loading and identification
@@ -3246,6 +3254,32 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_startup_services_are_available_in_this_build() {
+        let startup = super::default_startup_services();
+        assert!(
+            !startup.iter().any(|name| name == "notification"),
+            "the removed notification service must not remain in the default roster"
+        );
+        for name in &startup {
+            assert!(
+                hyprstream_service::get_factory(name).is_some(),
+                "default service {name} must have a factory in this build"
+            );
+        }
+
+        #[cfg(feature = "metrics")]
+        {
+            assert!(startup.iter().any(|name| name == "flight"));
+            assert!(startup.iter().any(|name| name == "metrics"));
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            assert!(!startup.iter().any(|name| name == "flight"));
+            assert!(!startup.iter().any(|name| name == "metrics"));
+        }
+    }
+
     #[tokio::test]
     async fn oauth_cors_origin_list_from_environment_preserves_scalars() -> anyhow::Result<()> {
         use axum::{body::Body, http::{header, Request}, routing::get, Router};

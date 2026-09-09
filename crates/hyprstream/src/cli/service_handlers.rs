@@ -5,6 +5,7 @@
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -598,26 +599,17 @@ pub fn direct_child_process_config(
     explicit_config: Option<&Path>,
     exe: &Path,
 ) -> Result<hyprstream_service::ProcessConfig> {
-    let mut args: Vec<String> = Vec::new();
+    let mut args: Vec<OsString> = Vec::new();
     if let Some(config_path) = explicit_config {
-        let rendered = config_path
-            .to_str()
-            .with_context(|| {
-                format!(
-                    "explicit config path {} is not valid UTF-8 and cannot be forwarded",
-                    config_path.display()
-                )
-            })?
-            .to_owned();
-        args.push("--config".to_owned());
-        args.push(rendered);
+        args.push(OsString::from("--config"));
+        args.push(config_path.as_os_str().to_owned());
     }
-    args.push("service".to_owned());
-    args.push("start".to_owned());
-    args.push(service.to_owned());
-    args.push("--foreground".to_owned());
+    args.push(OsString::from("service"));
+    args.push(OsString::from("start"));
+    args.push(OsString::from(service));
+    args.push(OsString::from("--foreground"));
     if !iroh_required {
-        args.push("--ipc".to_owned());
+        args.push(OsString::from("--ipc"));
     }
 
     let mut config = hyprstream_service::ProcessConfig::new(service, exe);
@@ -651,6 +643,14 @@ pub async fn launch_direct_children(
     exe: &Path,
     spawner: &hyprstream_service::ProcessSpawner,
 ) -> Result<()> {
+    if iroh_required {
+        for service in targets {
+            anyhow::ensure!(
+                hyprstream_service::get_factory(service).is_some(),
+                "unknown native service: {service}"
+            );
+        }
+    }
     let stages = hyprstream_service::startup_stages_for_profile(targets, iroh_required);
     // Flatten the ordered stages into the serial launch plan (same order the
     // loop below would spawn in), so the launch core is injectably testable
@@ -2019,7 +2019,6 @@ fn update_shell_profiles(home: &Path, bin_dir: &Path) -> Result<Vec<String>> {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
 #[allow(clippy::expect_used)]
 mod offline_policy_provision_tests {
     use super::*;
@@ -2146,158 +2145,10 @@ mod offline_policy_provision_tests {
                 "mesh-readers".to_owned(),
                 "acme".to_owned(),
             ]));
-=======
-mod launcher_tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
-
-    use super::*;
-    use hyprstream_service::ProcessReadiness;
-
-    #[test]
-    fn direct_child_process_config_builds_profile_specific_invocation() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        // A relative-looking config directory containing spaces: the launcher
-        // hands the child one canonical absolute argv element that keeps the
-        // spaces (no shell splitting, no quoting).
-        let config_path = root.path().join("my configs/custom.toml");
-        std::fs::create_dir_all(config_path.parent().expect("parent"))?;
-        std::fs::write(&config_path, "[secrets]\n")?;
-        let canonical = std::fs::canonicalize(&config_path)?;
-
-        // Required-native: no --ipc, config forwarded, notification readiness.
-        let required = direct_child_process_config(
-            "model",
-            true,
-            Some(&canonical),
-            Path::new("/usr/local/bin/hyprstream"),
-        )?;
-        let expected_tail = [
-            "service".to_owned(),
-            "start".to_owned(),
-            "model".to_owned(),
-            "--foreground".to_owned(),
-        ];
-        assert_eq!(&required.args[required.args.len() - 4..], &expected_tail);
-        assert!(
-            !required.args.iter().any(|arg| arg == "--ipc"),
-            "required-native child must not be forced onto the local IPC endpoint"
-        );
-        assert!(
-            required
-                .args
-                .windows(2)
-                .any(|pair| pair[0] == "--config" && pair[1] == canonical.to_str().expect("utf-8")),
-            "canonical config path (spaces intact) must be forwarded as one argv element"
-        );
-        assert!(matches!(
-            required.readiness,
-            ProcessReadiness::Notify { .. }
-        ));
-
-        // Compatibility keeps the historical shape and immediate reporting.
-        let compat_with_config = direct_child_process_config(
-            "registry",
-            false,
-            Some(&canonical),
-            Path::new("/usr/local/bin/hyprstream"),
-        )?;
-        assert_eq!(
-            &compat_with_config.args[compat_with_config.args.len() - 5..],
-            &[
-                "service".to_owned(),
-                "start".to_owned(),
-                "registry".to_owned(),
-                "--foreground".to_owned(),
-                "--ipc".to_owned(),
-            ]
-        );
-        assert_eq!(compat_with_config.readiness, ProcessReadiness::Immediate);
-
-        // No explicit selector: argv identical to the legacy launcher.
-        let compat_default =
-            direct_child_process_config("policy", false, None, Path::new("/bin/hyprstream"))?;
-        assert_eq!(
-            compat_default.args,
-            [
-                "service".to_owned(),
-                "start".to_owned(),
-                "policy".to_owned(),
-                "--foreground".to_owned(),
-                "--ipc".to_owned(),
-            ]
-        );
-        Ok(())
-    }
-
-    /// Mock manager: scripted start/is_active behavior for the permitted
-    /// Compatibility unit-start lifecycle contract.
-    struct MockManager {
-        start_error: Option<&'static str>,
-        active_after: std::sync::atomic::AtomicU32,
-    }
-
-    impl MockManager {
-        fn failing() -> Self {
-            Self {
-                start_error: Some("unit is masked"),
-                active_after: std::sync::atomic::AtomicU32::new(0),
-            }
-        }
-        fn never_active() -> Self {
-            Self {
-                start_error: None,
-                active_after: std::sync::atomic::AtomicU32::new(u32::MAX),
-            }
-        }
-        fn immediate() -> Self {
-            Self {
-                start_error: None,
-                active_after: std::sync::atomic::AtomicU32::new(0),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl hyprstream_service::ServiceManager for MockManager {
-        async fn install(&self, _service: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn uninstall(&self, _service: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn start(&self, _service: &str) -> anyhow::Result<()> {
-            match self.start_error {
-                Some(reason) => anyhow::bail!("{reason}"),
-                None => Ok(()),
-            }
-        }
-        async fn stop(&self, _service: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn is_active(&self, _service: &str) -> anyhow::Result<bool> {
-            use std::sync::atomic::Ordering;
-            let remaining = self.active_after.load(Ordering::SeqCst);
-            if remaining > 0 && remaining != u32::MAX {
-                self.active_after.store(remaining - 1, Ordering::SeqCst);
-                return Ok(false);
-            }
-            Ok(remaining == 0)
-        }
-        async fn reload(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        async fn spawn(
-            &self,
-            _spawnable: Box<dyn hyprstream_rpc::Spawnable>,
-        ) -> anyhow::Result<hyprstream_service::SpawnedService> {
-            anyhow::bail!("mock manager does not host services")
->>>>>>> 37dc8ac74 (fix(launcher): carry config provenance and enforce verified startup ownership)
         }
     }
 
     #[tokio::test]
-<<<<<<< HEAD
     async fn invalid_requests_fail_before_storage_mutation() {
         for templates in [
             vec!["not-a-template".to_owned()],
@@ -2377,25 +2228,10 @@ mod launcher_tests {
                     "infer.generate",
                 )
                 .await
-=======
-    async fn unit_start_mutation_failure_propagates_without_active_poll() {
-        let manager = MockManager::failing();
-        let error = start_units_to_active(
-            &manager,
-            &["model".to_owned()],
-            std::time::Duration::from_secs(1),
-        )
-        .await
-        .expect_err("start mutation failure must propagate");
-        assert!(
-            error.to_string().contains("unit is masked"),
-            "real failure expected, got: {error}"
->>>>>>> 37dc8ac74 (fix(launcher): carry config provenance and enforce verified startup ownership)
         );
     }
 
     #[tokio::test]
-<<<<<<< HEAD
     async fn prepublication_failure_and_retry_preserve_retained_deny() {
         let root = tempfile::tempdir().expect("retained-policy models root");
         let policies_dir = root.path().join(".registry/policies");
@@ -2674,7 +2510,272 @@ mod launcher_tests {
                 .await
                 .expect("policy after read failure"),
             original
-=======
+        );
+    }
+}
+
+#[cfg(test)]
+mod launcher_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use hyprstream_service::ProcessReadiness;
+
+    #[test]
+    fn direct_child_process_config_builds_profile_specific_invocation() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        // A relative-looking config directory containing spaces: the launcher
+        // hands the child one canonical absolute argv element that keeps the
+        // spaces (no shell splitting, no quoting).
+        let config_path = root.path().join("my configs/custom.toml");
+        std::fs::create_dir_all(config_path.parent().expect("parent"))?;
+        std::fs::write(&config_path, "[secrets]\n")?;
+        let canonical = std::fs::canonicalize(&config_path)?;
+
+        // Required-native: no --ipc, config forwarded, notification readiness.
+        let required = direct_child_process_config(
+            "model",
+            true,
+            Some(&canonical),
+            Path::new("/usr/local/bin/hyprstream"),
+        )?;
+        let expected_tail = [
+            OsString::from("service"),
+            OsString::from("start"),
+            OsString::from("model"),
+            OsString::from("--foreground"),
+        ];
+        assert_eq!(&required.args[required.args.len() - 4..], &expected_tail);
+        assert!(
+            !required.args.iter().any(|arg| arg == "--ipc"),
+            "required-native child must not be forced onto the local IPC endpoint"
+        );
+        assert!(
+            required
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--config" && pair[1] == canonical.to_str().expect("utf-8")),
+            "canonical config path (spaces intact) must be forwarded as one argv element"
+        );
+        assert!(matches!(
+            required.readiness,
+            ProcessReadiness::Notify { .. }
+        ));
+
+        // Compatibility keeps the historical shape and immediate reporting.
+        let compat_with_config = direct_child_process_config(
+            "registry",
+            false,
+            Some(&canonical),
+            Path::new("/usr/local/bin/hyprstream"),
+        )?;
+        assert_eq!(
+            &compat_with_config.args[compat_with_config.args.len() - 5..],
+            &[
+                OsString::from("service"),
+                OsString::from("start"),
+                OsString::from("registry"),
+                OsString::from("--foreground"),
+                OsString::from("--ipc"),
+            ]
+        );
+        assert_eq!(compat_with_config.readiness, ProcessReadiness::Immediate);
+
+        // No explicit selector: argv identical to the legacy launcher.
+        let compat_default =
+            direct_child_process_config("policy", false, None, Path::new("/bin/hyprstream"))?;
+        assert_eq!(
+            compat_default.args,
+            [
+                OsString::from("service"),
+                OsString::from("start"),
+                OsString::from("policy"),
+                OsString::from("--foreground"),
+                OsString::from("--ipc"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_child_preserves_non_utf8_explicit_config_path() -> anyhow::Result<()> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let root = tempfile::tempdir()?;
+        let config_path = root
+            .path()
+            .join(OsString::from_vec(b"custom-\xff.toml".to_vec()));
+        std::fs::write(&config_path, "[secrets]\n")?;
+        let canonical = std::fs::canonicalize(&config_path)?;
+        assert!(canonical.to_str().is_none(), "fixture path must be non-UTF-8");
+
+        let loaded = crate::config::HyprConfig::from_file(&canonical)?;
+        loaded.validate()?;
+
+        for (iroh_required, expects_ipc) in [(true, false), (false, true)] {
+            let plan = direct_child_process_config(
+                "model",
+                iroh_required,
+                Some(&canonical),
+                Path::new("/usr/local/bin/hyprstream"),
+            )?;
+            let selectors: Vec<_> = plan
+                .args
+                .windows(2)
+                .filter(|pair| pair[0] == "--config")
+                .collect();
+            assert_eq!(selectors.len(), 1, "one explicit selector must be forwarded");
+            assert_eq!(
+                selectors[0][1].as_os_str().as_bytes(),
+                canonical.as_os_str().as_bytes(),
+                "the canonical selector must be preserved byte for byte"
+            );
+            assert_eq!(
+                plan.args.iter().any(|arg| arg == "--ipc"),
+                expects_ipc,
+                "Required and Compatibility invocation shapes must remain distinct"
+            );
+            assert_eq!(
+                matches!(plan.readiness, ProcessReadiness::Notify { .. }),
+                iroh_required,
+                "Required and Compatibility readiness policies must remain distinct"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn known_required_roster_retains_dependency_order() {
+        let targets = ["model", "registry", "policy", "discovery"];
+        for service in targets {
+            assert!(
+                hyprstream_service::get_factory(service).is_some(),
+                "test roster service {service} must be compiled"
+            );
+        }
+        assert_eq!(
+            hyprstream_service::startup_stages_for_profile(&targets, true),
+            vec![
+                vec!["discovery".to_owned()],
+                vec!["policy".to_owned()],
+                vec!["registry".to_owned()],
+                vec!["model".to_owned()],
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unknown_required_roster_is_rejected_before_any_child_spawns()
+    -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir()?;
+        let executable = root.path().join("spawn-sentinel.sh");
+        let marker = root.path().join("spawn-sentinel.sh.spawned");
+        std::fs::write(&executable, b"#!/bin/sh\ntouch \"$0.spawned\"\n")?;
+        let mut permissions = std::fs::metadata(&executable)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions)?;
+
+        let unknown = "not-a-compiled-native-service";
+        let targets = vec!["policy".to_owned(), unknown.to_owned()];
+        let spawner = hyprstream_service::ProcessSpawner::standalone();
+        let error = launch_direct_children(&targets, true, None, &executable, &spawner)
+            .await
+            .expect_err("an unknown Required target must reject the whole plan");
+        assert_eq!(error.to_string(), format!("unknown native service: {unknown}"));
+        assert!(
+            !marker.exists(),
+            "validation must finish before any configured executable runs"
+        );
+        Ok(())
+    }
+
+    /// Mock manager: scripted start/is_active behavior for the permitted
+    /// Compatibility unit-start lifecycle contract.
+    struct MockManager {
+        start_error: Option<&'static str>,
+        active_after: std::sync::atomic::AtomicU32,
+    }
+
+    impl MockManager {
+        fn failing() -> Self {
+            Self {
+                start_error: Some("unit is masked"),
+                active_after: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+        fn never_active() -> Self {
+            Self {
+                start_error: None,
+                active_after: std::sync::atomic::AtomicU32::new(u32::MAX),
+            }
+        }
+        fn immediate() -> Self {
+            Self {
+                start_error: None,
+                active_after: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl hyprstream_service::ServiceManager for MockManager {
+        async fn install(&self, _service: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn uninstall(&self, _service: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn start(&self, _service: &str) -> anyhow::Result<()> {
+            match self.start_error {
+                Some(reason) => anyhow::bail!("{reason}"),
+                None => Ok(()),
+            }
+        }
+        async fn stop(&self, _service: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn is_active(&self, _service: &str) -> anyhow::Result<bool> {
+            use std::sync::atomic::Ordering;
+            let remaining = self.active_after.load(Ordering::SeqCst);
+            if remaining > 0 && remaining != u32::MAX {
+                self.active_after.store(remaining - 1, Ordering::SeqCst);
+                return Ok(false);
+            }
+            Ok(remaining == 0)
+        }
+        async fn reload(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn spawn(
+            &self,
+            _spawnable: Box<dyn hyprstream_rpc::Spawnable>,
+        ) -> anyhow::Result<hyprstream_service::SpawnedService> {
+            anyhow::bail!("mock manager does not host services")
+        }
+    }
+
+    #[tokio::test]
+    async fn unit_start_mutation_failure_propagates_without_active_poll() {
+        let manager = MockManager::failing();
+        let error = start_units_to_active(
+            &manager,
+            &["model".to_owned()],
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("start mutation failure must propagate");
+        assert!(
+            error.to_string().contains("unit is masked"),
+            "real failure expected, got: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn unit_start_requires_bounded_active_state() {
         let manager = MockManager::never_active();
         let error = start_units_to_active(
@@ -3435,7 +3536,6 @@ mod launcher_tests {
         assert!(
             required_error.to_string().contains("--daemon"),
             "rejection must direct the operator to the direct launch path"
->>>>>>> 37dc8ac74 (fix(launcher): carry config provenance and enforce verified startup ownership)
         );
     }
 }
