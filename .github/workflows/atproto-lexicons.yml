@@ -1,0 +1,29 @@
+name: ATProto Lexicon contract
+
+on:
+  pull_request:
+    paths:
+      - 'lexicons/**'
+      - 'scripts/check_atproto_lexicons.py'
+      - 'scripts/tests/test_check_atproto_lexicons.py'
+      - '.github/workflows/atproto-lexicons.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'lexicons/**'
+      - 'scripts/check_atproto_lexicons.py'
+      - 'scripts/tests/test_check_atproto_lexicons.py'
+      - '.github/workflows/atproto-lexicons.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify pinned schema bytes and reference closure without fetching
+        run: python3 scripts/check_atproto_lexicons.py
+      - name: Exercise missing, modified and unresolved schema failures
+        run: python3 -m unittest discover -s scripts/tests -p test_check_atproto_lexicons.py -v
