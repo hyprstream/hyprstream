@@ -1649,6 +1649,39 @@ mod notify_readiness_tests {
         Ok(())
     }
 
+    /// Enqueue the genuine sender's datagram even when the foreign helper has
+    /// filled the receiver queue. The test sender is intentionally
+    /// nonblocking, so a full queue is a transient condition rather than a
+    /// failed readiness send. Drain only datagrams that cannot authenticate as
+    /// this process, then retry; the receiver still requires the kernel PID
+    /// credential before accepting READY=1.
+    fn send_ready_to_until_accepted(
+        notify: &ChildNotifySocket,
+        expected_pid: i32,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match send_ready_to(notify.endpoint()) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if error
+                        .downcast_ref::<nix::errno::Errno>()
+                        .is_some_and(|errno| *errno == nix::errno::Errno::EAGAIN) =>
+                {
+                    // Make room for the authenticated sender while retaining
+                    // the same receiver path and sender-PID check exercised by
+                    // the assertion below.
+                    while notify.try_recv_ready(expected_pid)? {}
+                    if Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    std::thread::yield_now();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Helper child: reports readiness through the real sd_notify send path,
     /// then stays alive so the supervisor observes a genuinely RUNNING ready
     /// child; the supervisor's stop is the controlled shutdown.
@@ -2523,8 +2556,16 @@ mod notify_readiness_tests {
             .env("HYPRSTREAM_NOTIFY_SPOOF_ENDPOINT", notify.endpoint())
             .spawn()?;
         std::thread::sleep(Duration::from_millis(50));
-        send_ready_to(notify.endpoint())?;
-        std::thread::sleep(Duration::from_millis(50));
+        // The helper deliberately fills the receiver queue with foreign
+        // datagrams.  Drain that finite backlog before sending the genuine
+        // datagram: send_ready_to uses a nonblocking sender, so attempting to
+        // enqueue while the abstract socket queue is full would fail with
+        // EAGAIN before the receiver has a chance to exercise PID matching.
+        assert!(
+            !notify.try_recv_ready(this_pid)?,
+            "foreign sender must not satisfy readiness"
+        );
+        send_ready_to_until_accepted(&notify, this_pid)?;
         assert!(
             notify.try_recv_ready(this_pid)?,
             "the matching sender satisfies readiness after foreign flood"
