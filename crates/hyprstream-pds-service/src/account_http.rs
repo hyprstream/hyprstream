@@ -375,7 +375,9 @@ async fn serve_artifact(
             return StatusCode::BAD_REQUEST.into_response();
         }
         let host = match (uri_authority, host_header) {
-            (Some(authority), Some(host)) if authority != host => {
+            (Some(authority), Some(host))
+                if !equivalent_authorities(authority, host, &state.zone) =>
+            {
                 return StatusCode::BAD_REQUEST.into_response();
             }
             (Some(authority), _) => authority,
@@ -468,6 +470,26 @@ fn host_label(host: &str, zone: &str) -> Option<String> {
         return None;
     }
     AccountLabel::parse(label).ok().map(|_| label.to_owned())
+}
+
+fn equivalent_authorities(left: &str, right: &str, zone: &str) -> bool {
+    let Some(left_label) = host_label(left, zone) else {
+        return false;
+    };
+    let Some(right_label) = host_label(right, zone) else {
+        return false;
+    };
+    if left_label != right_label {
+        return false;
+    }
+    let Ok(left_authority) = left.parse::<Authority>() else {
+        return false;
+    };
+    let Ok(right_authority) = right.parse::<Authority>() else {
+        return false;
+    };
+    left_authority.port().map(|port| port.as_str().to_owned())
+        == right_authority.port().map(|port| port.as_str().to_owned())
 }
 
 #[cfg(test)]
@@ -681,6 +703,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn equivalent_http2_authority_and_host_ignore_dns_case() {
+        let app = router("tormentnexus.social", directory()).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("https://alice.tormentnexus.social/.well-known/did.json")
+                    .header(header::HOST, "ALICE.TORMENTNEXUS.SOCIAL")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn authority_only_requests_still_reject_credentials() {
         let app = router("tormentnexus.social", directory()).unwrap();
         for name in [header::AUTHORIZATION, header::COOKIE] {
@@ -869,6 +907,29 @@ mod tests {
                 .as_ref(),
             log
         );
+    }
+
+    #[tokio::test]
+    async fn mounted_directory_unallocated_404_is_not_cached() {
+        let (directory, _document, _log, _record) = mounted_directory();
+        directory
+            .store
+            .refresh_hosted_did_index(&directory.authority)
+            .await
+            .unwrap();
+        let response = router(DEFAULT_ACCOUNT_ZONE, directory)
+            .unwrap()
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/did.json")
+                    .header(header::HOST, "bob.tormentnexus.social")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[tokio::test]
