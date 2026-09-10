@@ -12,6 +12,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, ensure, Context as _, Result};
+use base64::{
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+    Engine as _,
+};
 use hyprstream_pds::atproto_cbor::{AtprotoRecord, AtprotoRecordKey};
 use hyprstream_pds::commit::{Commit, UnsignedCommit};
 use hyprstream_pds::dag_cbor::DagCbor;
@@ -541,7 +545,10 @@ impl PublicRepoWriter {
                     .snapshot(&self.did)?
                     .ok_or_else(|| anyhow!("public repo head is absent"))?;
                 let actual = snapshot.commit.cid_atproto()?;
-                ensure!(actual.to_string() == expected, "public repo head CAS conflict");
+                ensure!(
+                    actual.to_string() == expected,
+                    "public repo head CAS conflict"
+                );
                 Some(actual)
             }
             Some(_) => return Err(anyhow!("swapCommit must be a non-empty CID")),
@@ -550,9 +557,45 @@ impl PublicRepoWriter {
     }
 }
 
-/// Convert the JSON data model accepted by AT records into the bounded native
-/// value type used by the public codec. Floats, non-string object keys and
-/// integers outside signed 64-bit range are rejected before serialization.
+/// Decode a canonical AT JSON CID link without accepting other codecs,
+/// hashes, overlong varints, or noncanonical base32 spellings.
+fn parse_atproto_json_cid(text: &str) -> Result<Cid> {
+    // CIDv1, one-byte raw/DAG-CBOR codec, sha2-256, and 32 digest bytes.
+    // These 36 bytes occupy 58 base32 digits plus the multibase prefix.
+    ensure!(
+        text.len() == 59 && text.starts_with('b'),
+        "invalid AT CID text"
+    );
+    let mut raw = Vec::with_capacity(36);
+    let mut pending = 0u16;
+    let mut bits = 0u32;
+    for digit in text.bytes().skip(1) {
+        let digit = match digit {
+            b'a'..=b'z' => digit - b'a',
+            b'2'..=b'7' => digit - b'2' + 26,
+            _ => return Err(anyhow!("AT CID must use lowercase base32")),
+        };
+        pending = (pending << 5) | u16::from(digit);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            raw.push((pending >> bits) as u8);
+            pending &= (1 << bits) - 1;
+        }
+    }
+    ensure!(
+        pending == 0
+            && raw.len() == 36
+            && matches!(raw.as_slice(), [1, 0x55 | 0x71, 0x12, 0x20, ..]),
+        "AT CID requires canonical raw or DAG-CBOR SHA-256 bytes"
+    );
+    Cid::from_bytes(&raw)
+}
+
+/// Convert AT JSON into the value type used by the public codec. Reserved
+/// single-key `$link` and `$bytes` objects become links and byte strings,
+/// never ordinary maps. Invalid wrappers, floats and integers outside signed
+/// 64-bit range are rejected before serialization.
 pub fn json_to_dag_cbor(value: &serde_json::Value) -> Result<DagCbor> {
     Ok(match value {
         serde_json::Value::Null => DagCbor::Null,
@@ -575,6 +618,26 @@ pub fn json_to_dag_cbor(value: &serde_json::Value) -> Result<DagCbor> {
                 .map(json_to_dag_cbor)
                 .collect::<Result<Vec<_>>>()?,
         ),
+        serde_json::Value::Object(values) if values.contains_key("$link") => {
+            ensure!(values.len() == 1, "AT JSON link must contain only $link");
+            let text = values
+                .get("$link")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("AT JSON $link must be a CID string"))?;
+            DagCbor::Link(parse_atproto_json_cid(text)?)
+        }
+        serde_json::Value::Object(values) if values.contains_key("$bytes") => {
+            ensure!(values.len() == 1, "AT JSON bytes must contain only $bytes");
+            let text = values
+                .get("$bytes")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("AT JSON $bytes must be a base64 string"))?;
+            let bytes = STANDARD
+                .decode(text)
+                .or_else(|_| STANDARD_NO_PAD.decode(text))
+                .context("invalid AT JSON base64 bytes")?;
+            DagCbor::Bytes(bytes)
+        }
         serde_json::Value::Object(values) => DagCbor::Map(
             values
                 .iter()
@@ -1074,6 +1137,106 @@ mod tests {
             )
             .unwrap();
         assert!(store.snapshot(&writer.did).is_err());
+    }
+
+    #[test]
+    fn json_links_and_bytes_match_independent_public_record_fixture() {
+        // Independently encoded using Python hashlib/base64 and a minimal
+        // RFC 8949 encoder with public map ordering and tag-42 links.
+        let json = serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "json",
+            "payload": {"$bytes": "AQI="},
+            "links": [{"$link": "bafyreifqwkmiw256ojf2zws6tzjeonw6bpd5vza4i22ccpcq4hjv2ts7cm"}],
+            "blob": {
+                "$type": "blob",
+                "ref": {"$link": "bafkreifbfby75yqq7odbski6v2qziwa4xustdzfsg5m5ejpwqbush5rsei"},
+                "mimeType": "image/png",
+                "size": 2
+            }
+        });
+        let value = json_to_dag_cbor(&json).expect("AT JSON");
+        let record = AtprotoRecord::new("app.bsky.feed.post", Tid::from_raw(7), value)
+            .expect("public record");
+        let fixture = hex::decode(concat!(
+            "a564626c6f62a463726566d82a58250001551220a12871fee210fb8619291eaea194581cbd2531e4b23759d225f6806923f63222",
+            "6473697a650265247479706564626c6f62686d696d655479706569696d6167652f706e676474657874646a736f6e",
+            "652474797065726170702e62736b792e666565642e706f7374656c696e6b7381d82a58250001711220b0b2988b6bbe724bacda5e9e524736de0bc7dae41c46b4213c50e1d35d4e5f13",
+            "677061796c6f6164420102"
+        )).expect("fixture");
+        assert_eq!(record.bytes(), fixture);
+        assert_eq!(
+            record.cid().to_string(),
+            "bafyreie3irn4tnywq3hxjm3knxuq7ovhni7cjqxa7weo7dncxsw6rj3s4m"
+        );
+        assert!(
+            AtprotoRecord::from_bytes("app.bsky.feed.post", Tid::from_raw(7), &fixture).is_ok()
+        );
+    }
+
+    #[test]
+    fn json_bytes_accept_standard_base64_with_optional_padding() {
+        for text in ["", "AQI", "AQI=", "+/8=", "+/8"] {
+            let value = json_to_dag_cbor(&serde_json::json!({"$bytes": text})).expect("bytes");
+            let expected = match text {
+                "" => vec![],
+                "AQI" | "AQI=" => vec![1, 2],
+                _ => vec![251, 255],
+            };
+            assert_eq!(value, DagCbor::Bytes(expected));
+        }
+    }
+
+    #[test]
+    fn json_rejects_malformed_reserved_wrappers_at_any_depth() {
+        let cid = Cid::from_raw(b"blob").to_string();
+        let malformed = [
+            serde_json::json!({"$link": false}),
+            serde_json::json!({"$link": "not-a-cid"}),
+            serde_json::json!({"$link": cid, "extra": 1}),
+            serde_json::json!({"$link": cid, "$bytes": "AQI="}),
+            serde_json::json!({"$bytes": 12}),
+            serde_json::json!({"$bytes": "AQI=", "extra": 1}),
+            serde_json::json!({"$bytes": "-_8="}),
+            serde_json::json!({"$bytes": "AQJ="}),
+            serde_json::json!({"$bytes": "AQI=="}),
+        ];
+        for value in malformed {
+            assert!(json_to_dag_cbor(&value).is_err(), "{value}");
+            assert!(json_to_dag_cbor(&serde_json::json!({"nested": [value]})).is_err());
+        }
+    }
+
+    #[test]
+    fn json_links_reject_noncanonical_and_unsupported_cids() {
+        let cid = Cid::from_raw(b"blob");
+        let text = cid.to_string();
+        assert_eq!(parse_atproto_json_cid(&text).expect("canonical"), cid);
+        assert!(parse_atproto_json_cid(&text.to_uppercase()).is_err());
+        assert!(parse_atproto_json_cid(&format!("{text}=")).is_err());
+        let mut noncanonical = text.into_bytes();
+        let last = noncanonical.last_mut().expect("last digit");
+        // The last base32 digit has two zero padding bits. Setting one leaves
+        // the decoded CID bytes unchanged but must not be accepted.
+        let alphabet = b"abcdefghijklmnopqrstuvwxyz234567";
+        let position = alphabet.iter().position(|c| c == last).expect("base32");
+        *last = alphabet[position + 1];
+        assert!(parse_atproto_json_cid(&String::from_utf8(noncanonical).unwrap()).is_err());
+        for (position, replacement) in [(1, 0x70), (2, 0x13), (3, 0x1f)] {
+            let mut raw = cid.as_bytes().to_vec();
+            raw[position] = replacement;
+            // Encode invalid bytes independently of the production parser.
+            let encoded = raw
+                .iter()
+                .flat_map(|byte| (0..8).rev().map(move |bit| (byte >> bit) & 1))
+                .collect::<Vec<_>>();
+            let mut text = String::from("b");
+            for chunk in encoded.chunks(5) {
+                let n = chunk.iter().fold(0u8, |n, bit| (n << 1) | bit) << (5 - chunk.len());
+                text.push(alphabet[n as usize] as char);
+            }
+            assert!(parse_atproto_json_cid(&text).is_err());
+        }
     }
 
     #[test]
