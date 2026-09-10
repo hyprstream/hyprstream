@@ -197,7 +197,16 @@ impl Commit {
     pub fn from_atproto_dag_cbor(bytes: &[u8]) -> Result<Self> {
         let value = crate::atproto_cbor::decode(bytes)?;
         Self::validate_atproto_fields(&value)?;
-        Self::from_value(&value)
+        let commit = Self::from_value(&value)?;
+        // Public verification must bind the exact canonical block bytes. In
+        // particular, Tid::parse normalizes the final base32 bit; without
+        // this round-trip check, two distinct `rev` encodings could decode to
+        // one value and share signature verification.
+        ensure!(
+            commit.to_atproto_dag_cbor()?.as_slice() == bytes,
+            "public commit bytes are not canonical"
+        );
+        Ok(commit)
     }
 
     fn validate_atproto_fields(value: &DagCbor) -> Result<()> {
@@ -651,6 +660,35 @@ mod tests {
         assert!(
             Commit::from_atproto_dag_cbor(&bytes).is_err(),
             "public commits must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn public_commit_rejects_noncanonical_tid_rev_bytes() {
+        let (commit, _vk) = make_signed_commit();
+        let canonical = commit
+            .to_atproto_dag_cbor()
+            .expect("canonical public commit");
+        let mut value = crate::atproto_cbor::decode(&canonical).expect("decode public commit");
+        let mut fields = value.as_map().expect("commit map").to_vec();
+        let rev = fields
+            .iter_mut()
+            .find(|(key, _)| matches!(key, DagCbor::Text(name) if name == "rev"))
+            .expect("rev field");
+        let mut rev_text = rev.1.as_str().expect("rev text").to_owned();
+        let last = rev_text.pop().expect("tid digit");
+        let replacement = match last {
+            '2' => '3',
+            '3' => '2',
+            _ => panic!("test TID must end in 2 or 3, got {last}"),
+        };
+        rev_text.push(replacement);
+        rev.1 = DagCbor::Text(rev_text);
+        value = DagCbor::Map(fields);
+        let tampered = crate::atproto_cbor::encode(&value).expect("encode tampered commit");
+        assert!(
+            Commit::from_atproto_dag_cbor(&tampered).is_err(),
+            "public decoder must reject a rev encoding that normalizes to a different byte form"
         );
     }
 
