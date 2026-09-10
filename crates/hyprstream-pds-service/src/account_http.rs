@@ -326,17 +326,24 @@ async fn serve_artifact(
         }
         // HTTP/1.1 supplies Host, while HTTP/2 carries the origin in the
         // :authority pseudo-header, which `http` exposes as the URI authority.
-        // Prefer an explicitly supplied Host; only an absent Host may fall back
-        // to :authority. This keeps malformed Host values fail-closed.
-        let host = match headers.get(header::HOST) {
-            Some(value) => match value.to_str() {
-                Ok(host) => host,
-                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-            },
-            None => match request.uri().authority() {
-                Some(authority) => authority.as_str(),
-                None => return StatusCode::BAD_REQUEST.into_response(),
-            },
+        // When both are present, they must be byte-identical: accepting a
+        // mismatched Host would let a proxy route one public account while the
+        // request authority names another. Only an absent URI authority may
+        // use Host as its target.
+        let uri_authority = request.uri().authority().map(Authority::as_str);
+        let host_header = headers
+            .get(header::HOST)
+            .map(|value| value.to_str().unwrap_or_default());
+        if headers.contains_key(header::HOST) && host_header == Some("") {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        let host = match (uri_authority, host_header) {
+            (Some(authority), Some(host)) if authority != host => {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            (Some(authority), _) => authority,
+            (None, Some(host)) => host,
+            (None, None) => return StatusCode::BAD_REQUEST.into_response(),
         };
         if host.is_empty() {
             return StatusCode::BAD_REQUEST.into_response();
@@ -558,6 +565,22 @@ mod tests {
             to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
             b"sealed-did-document"
         );
+    }
+
+    #[tokio::test]
+    async fn mismatched_http2_authority_and_host_fail_closed() {
+        let app = router("tormentnexus.social", directory()).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("https://bob.tormentnexus.social/.well-known/did.json")
+                    .header(header::HOST, "alice.tormentnexus.social")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
