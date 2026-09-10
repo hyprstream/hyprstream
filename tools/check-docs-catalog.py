@@ -252,7 +252,8 @@ def check_provenance(record: dict[str, Any], repo: Path, label: str, corpus: dic
     required(git(repo, "rev-parse", f"{commit}^{{tree}}") == tree,
              f"{label} source_tree does not match source_commit")
     if topology != "local":
-        required(commit == boundary, f"{label} source_commit is not the trusted {topology} boundary")
+        required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", boundary, commit]).returncode == 0,
+                 f"{label} source_commit is not descended from the trusted {topology} boundary")
     staged_catalog = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--quiet", "--",
                                      "docs/schema-catalog.json", "docs/corpus-sources.json"]).returncode != 0
     required(commit != git(repo, "rev-parse", "HEAD") or staged_catalog,
@@ -262,6 +263,9 @@ def check_provenance(record: dict[str, Any], repo: Path, label: str, corpus: dic
     paths = provenance_paths(repo, corpus)
     required(input_digest(repo, paths, mutations) == declared_digest,
              f"{label} current audited inputs differ from source_input_digest")
+    if not mutations:
+        required(input_digest(repo, paths, tree=tree) == declared_digest,
+                 f"{label} source_tree does not reproduce the audited input digest")
 
 
 def owner_manifest(repo: Path, schema_path: str, owner_directories: list[str]) -> tuple[str, str, str]:
@@ -472,14 +476,21 @@ def schema_method_metadata(repo: Path, schemas: list[dict[str, Any]],
             continue
         request, response = fields(source, f"{pascal}Request"), fields(source, f"{pascal}Response")
         streaming.extend(f"{service}.{method}" for method in request if response.get(f"{method}Result") == "StreamInfo")
-        for scope, request_type in request.items():
-            response_type = response.get(f"{scope}Result")
-            if request_type.endswith("Request") and response_type and response_type.endswith("Response"):
+        def nested_streams(request_fields: dict[str, str], response_fields: dict[str, str], seen: set[tuple[str, str]]) -> list[str]:
+            result: list[str] = []
+            for scope, request_type in request_fields.items():
+                response_type = response_fields.get(f"{scope}Result")
+                if not (request_type.endswith("Request") and response_type and response_type.endswith("Response")) or (request_type, response_type) in seen:
+                    continue
+                seen.add((request_type, response_type))
                 try:
-                    scoped_request, scoped_response = fields(source, request_type), fields(source, response_type)
+                    nested_request, nested_response = fields(source, request_type), fields(source, response_type)
                 except CatalogError:
                     continue
-                streaming.extend(f"{service}.{method}" for method in scoped_request if scoped_response.get(method) == "StreamInfo")
+                result.extend(method for method in nested_request if nested_response.get(method) == "StreamInfo")
+                result.extend(nested_streams(nested_request, nested_response, seen))
+            return result
+        streaming.extend(f"{service}.{method}" for method in nested_streams(request, response, set()))
     return {"cli_hidden": sorted(hidden), "streaming": sorted(streaming)}
 
 
@@ -652,7 +663,11 @@ def self_test(repo: Path) -> None:
     validate(repo, catalog, corpus, schemas, consumers)
     # GitHub supplies the PR's immutable base SHA, which may be behind the
     # moving remote-main tip by the time the check runs.
-    validate(repo, catalog, corpus, schemas, consumers, event="pull_request", revision=catalog["source_commit"])
+    # A PR validates against its immutable remote-main base, not the catalog's
+    # source snapshot: a source-plus-catalog PR legitimately pins a descendant
+    # of that base that is not itself on main yet.
+    validate(repo, catalog, corpus, schemas, consumers, event="pull_request",
+             revision=git(repo, "merge-base", "HEAD", "refs/remotes/origin/main"))
     previous_head = os.environ.get("DOCS_CATALOG_AUDITED_HEAD")
     previous_event = os.environ.get("DOCS_CATALOG_EVENT")
     os.environ["DOCS_CATALOG_AUDITED_HEAD"] = "0" * 40
@@ -769,6 +784,22 @@ def self_test(repo: Path) -> None:
     expect_failure("scoped model streaming response", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {model_path: model_drift})
     worker_drift = text(repo, worker_path, None).replace("attach @10 :StreamInfo", "attach @10 :Text", 1)
     expect_failure("scoped worker streaming response", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: worker_drift})
+    registry_path = "crates/hyprstream-rpc-std/schema/registry.capnp"
+    registry_source = text(repo, registry_path, None)
+    deep_stream = registry_source.replace(
+        "struct WorktreeRequest {\n  name @0 :Text;\n  union {",
+        "struct WorktreeRequest {\n  name @0 :Text;\n  union {\n    deepStream @99 :Void;",
+        1,
+    ).replace(
+        "struct WorktreeResponse {\n  union {",
+        "struct WorktreeResponse {\n  union {\n    deepStream @99 :StreamInfo;",
+        1,
+    )
+    deep_metadata = schema_method_metadata(repo, catalog["schemas"], {registry_path: deep_stream})
+    required("registry.deepStream" in deep_metadata["streaming"],
+             "deeply scoped streaming extractor drift")
+    expect_failure("deeply scoped streaming response", repo, copy.deepcopy(catalog), corpus, schemas,
+                   consumers, {registry_path: deep_stream})
     expect_failure("TypeScript source", repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, tracked_sources=["package.json"]))
     bad = copy.deepcopy(catalog); bad.pop("owner_directories")
     expect_failure("owner directory inventory", repo, bad, corpus, schemas, consumers)
