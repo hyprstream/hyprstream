@@ -27,6 +27,7 @@
 //! ```
 
 mod account_worker;
+mod account_tls;
 
 pub mod auth;
 pub mod authorize;
@@ -672,7 +673,8 @@ async fn resolve_account_http_tls(
         "account TLS private key is unavailable: {}",
         config.tls_key.display()
     );
-    let cert_pem = std::fs::read(&config.tls_cert)?;
+    let cert_pem = tokio::fs::read(&config.tls_cert).await?;
+    let key_pem = tokio::fs::read(&config.tls_key).await?;
     let cert_der = rustls_pemfile::certs(&mut &cert_pem[..])
         .next()
         .ok_or_else(|| anyhow::anyhow!("account TLS certificate contains no certificate"))??;
@@ -694,7 +696,9 @@ async fn resolve_account_http_tls(
         covers_zone,
         "account TLS certificate does not cover account zone wildcard {wildcard}"
     );
-    axum_server::tls_rustls::RustlsConfig::from_pem_file(&config.tls_cert, &config.tls_key)
+    // Validate and install the same bytes, including during rotation. Reopening
+    // the paths here could install a different certificate than the SAN check.
+    axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem)
         .await
         .map_err(|error| {
             anyhow::anyhow!(
@@ -1310,7 +1314,7 @@ impl Spawnable for OAuthService {
                     Some(account_tls),
                     "AccountHttpService",
                 )?;
-                Some((account_bound, account_app))
+                Some((account_bound, account_app, http_config.clone(), zone))
             } else {
                 None
             };
@@ -1492,7 +1496,7 @@ impl Spawnable for OAuthService {
                     }
                     // Finish all fallible account-worker creation before the RPC
                     // task can signal readiness. Keep the actual thread owner.
-                    if let Some((account_bound, account_app)) = account_endpoint {
+                    if let Some((account_bound, account_app, account_config, account_zone)) = account_endpoint {
                         let account_shutdown_task = Arc::clone(&account_shutdown);
                         let runtime = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
@@ -1503,11 +1507,13 @@ impl Spawnable for OAuthService {
                         account_owner = Some(account_worker::ContainedWorker::spawn(
                             "hyprstream-account-http",
                             move || {
-                                runtime.block_on(crate::server::tls::serve_bound(
+                                runtime.block_on(account_tls::serve_with_reload(
                                     account_bound,
                                     account_app,
                                     account_shutdown_task,
-                                    "AccountHttpService",
+                                    account_config,
+                                    account_zone,
+                                    std::time::Duration::from_secs(30),
                                 ))
                             },
                         )?);
