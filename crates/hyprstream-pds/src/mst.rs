@@ -148,7 +148,28 @@ impl NodeData {
     }
 
     pub fn from_atproto_dag_cbor(bytes: &[u8]) -> Result<Self> {
-        Self::from_value(&crate::atproto_cbor::decode(bytes)?)
+        let value = crate::atproto_cbor::decode(bytes)?;
+        Self::reject_unknown_fields(&value, &["l", "e"], "MST node")?;
+        if let Some(entries) = value.get("e") {
+            for entry in entries.as_list()? {
+                Self::reject_unknown_fields(entry, &["p", "k", "v", "t"], "MST entry")?;
+            }
+        }
+        Self::from_value(&value)
+    }
+
+    /// Public DAG-CBOR nodes are a frozen wire shape.  Dropping an unknown
+    /// field would produce a different canonical encoding and therefore a
+    /// different CID, so reject it before projecting into [`NodeData`].
+    fn reject_unknown_fields(value: &DagCbor, allowed: &[&str], what: &str) -> Result<()> {
+        for (key, _) in value.as_map()? {
+            let key = match key {
+                DagCbor::Text(key) => key.as_str(),
+                _ => return Err(anyhow::anyhow!("{what} has a non-text field key")),
+            };
+            ensure!(allowed.contains(&key), "{what} has unknown field {key:?}");
+        }
+        Ok(())
     }
 
     pub fn to_value(&self) -> DagCbor {
@@ -908,6 +929,39 @@ mod tests {
         let (serialized, _) = native.to_node_data_with_blocks_atproto().unwrap();
         let (expected, _) = public.to_node_data_with_blocks_atproto_current().unwrap();
         assert_eq!(serialized, expected);
+    }
+
+    #[test]
+    fn public_mst_rejects_unknown_node_fields() {
+        let value = DagCbor::str_map([
+            ("e", DagCbor::List(Vec::new())),
+            ("l", DagCbor::Null),
+            ("future", DagCbor::Text("must-not-be-dropped".to_owned())),
+        ]);
+        let bytes = crate::atproto_cbor::encode(&value).expect("encode public node");
+        let error = NodeData::from_atproto_dag_cbor(&bytes).expect_err("unknown node field");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn public_mst_rejects_unknown_entry_fields() {
+        let cid = Cid::from_dag_cbor(b"record");
+        let value = DagCbor::str_map([
+            ("l", DagCbor::Null),
+            (
+                "e",
+                DagCbor::List(vec![DagCbor::str_map([
+                    ("p", DagCbor::Unsigned(0)),
+                    ("k", DagCbor::Bytes(b"app.bsky.feed.post/1".to_vec())),
+                    ("v", DagCbor::Link(cid)),
+                    ("t", DagCbor::Null),
+                    ("future", DagCbor::Bool(true)),
+                ])]),
+            ),
+        ]);
+        let bytes = crate::atproto_cbor::encode(&value).expect("encode public node");
+        let error = NodeData::from_atproto_dag_cbor(&bytes).expect_err("unknown entry field");
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
