@@ -846,6 +846,32 @@ impl Spawnable for OAuthService {
             if let Some(sink) = audit_sink {
                 oauth_state = oauth_state.with_audit_sink(sink);
             }
+
+            // Warm the authority-owned hosted-DID index before exposing OAuth
+            // readiness. Request paths remain O(1) lookups and never perform
+            // tenant enumeration; a bounded startup failure keeps OAuth
+            // fail-closed instead of serving valid hosted users intermittently
+            // while the first snapshot is still absent.
+            if let Some(store) = &self.hosted_account_store {
+                let authority = hyprstream_rpc::Subject::new(
+                    hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                );
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    store.refresh_hosted_did_index(&authority),
+                )
+                .await
+                .map_err(|_| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "hosted account index warm-up timed out".to_owned(),
+                    )
+                })?
+                .map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "hosted account index warm-up failed: {error}"
+                    ))
+                })?;
+            }
             // Populate legacy JWKS nbf/exp from signing-key file mtime (used when store absent).
             let key_nbf = crate::auth::identity_store::node_signing_key_mtime(&credentials_dir);
             oauth_state = oauth_state.with_jwt_key_timestamps(key_nbf, key_nbf + 14 * 86400);
@@ -1181,6 +1207,24 @@ mod tests {
         assert!(
             !run.contains("DiscoveryClient::for_local_bootstrap("),
             "OAuth must not use the process-local Discovery registry"
+        );
+    }
+
+    #[test]
+    fn oauth_warms_hosted_did_index_before_readiness() {
+        let source = include_str!("mod.rs");
+        let warmup = source
+            .find("store.refresh_hosted_did_index(&authority)")
+            .expect("OAuth startup must warm the hosted-DID index");
+        let ready = source
+            .find("if let Some(tx) = on_ready")
+            .expect("OAuth readiness signal must remain explicit");
+        assert!(warmup < ready, "OAuth must not signal readiness before index warm-up");
+        let warmup_block = &source[warmup.saturating_sub(512)..ready];
+        assert!(
+            warmup_block.contains("tokio::time::timeout")
+                && warmup_block.contains("Duration::from_secs(30)"),
+            "hosted-DID warm-up must have a bounded timeout"
         );
     }
 
