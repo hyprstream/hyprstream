@@ -3152,47 +3152,29 @@ async fn serve_inference_bridged(
         );
     }
 
-    // Start REP before arming the QUIC drain waiter.  Register a private
-    // shutdown waiter inside the REP task before exposing readiness.  The
-    // bridged serve helper signals readiness before it registers its own
-    // waiter, so this guard forwards an early notification after the helper
-    // has started and closes that lost-notification window.
+    // Start REP before arming the QUIC drain waiter. The bridged serve helper
+    // acknowledges only after its own shutdown waiter is registered, before
+    // it signals socket readiness, so the owner can safely arm both waiters
+    // before exposing external readiness.
     let (rep_armed_tx, rep_armed_rx) = tokio::sync::oneshot::channel();
     let rep_transport = transport.clone();
     let rep_processor = Arc::clone(&processor);
     let rep_shutdown = Arc::clone(&shutdown);
     let rep_task = tokio::spawn(async move {
-        let notified = rep_shutdown.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        let _ = rep_armed_tx.send(());
-        let serve_shutdown = Arc::clone(&rep_shutdown);
-        let serve = hyprstream_rpc::service::serve::serve_bridged(
+        hyprstream_rpc::service::serve::serve_bridged_with_shutdown_armed(
             &rep_transport,
             rep_processor,
             signing_key,
-            serve_shutdown,
+            rep_shutdown,
             None,
-        );
-        tokio::pin!(serve);
-        tokio::select! {
-            result = &mut serve => result,
-            _ = &mut notified => {
-                // The helper may not have registered its own waiter yet.
-                // Re-notify after it starts so its normal shutdown path still
-                // closes admission and drains in-flight requests.
-                rep_shutdown.notify_waiters();
-                serve.await
-            }
-        }
+            Some(rep_armed_tx),
+        )
+        .await
     });
     let rep_owner = RepTaskOwner::new(rep_task);
     rep_armed_rx
         .await
         .map_err(|_| hyprstream_rpc::error::RpcError::SpawnFailed("REP waiter failed to arm".to_owned()))?;
-    if let Some(on_ready) = on_ready {
-        let _ = on_ready.send(());
-    }
     let rep_admission = Arc::clone(&processor);
     let rep = async move {
         let result = rep_owner.join().await;
@@ -3235,6 +3217,9 @@ async fn serve_inference_bridged(
     // registered. This closes the notification-lost race on an immediately
     // failing peer.
     let _ = drain_armed_rx.await;
+    if let Some(on_ready) = on_ready {
+        let _ = on_ready.send(());
+    }
     let quic = rpc_server.run();
     run_quinn_lifecycle(rep, quic, shutdown, network_ready, draining, drain_owner).await
 }
@@ -4189,12 +4174,14 @@ mod quinn_drain_tests {
     async fn draining_quic_exit_renotifies_rep_before_join() -> Result<()> {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let drain_shutdown = Arc::clone(&shutdown);
+        let (drain_armed_tx, drain_armed_rx) = tokio::sync::oneshot::channel();
         let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
         let (drain_release_tx, drain_release_rx) = tokio::sync::oneshot::channel();
         let drain_task = tokio::spawn(async move {
             let notified = drain_shutdown.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            let _ = drain_armed_tx.send(());
             notified.await;
             let _ = drain_started_tx.send(());
             let _ = drain_release_rx.await;
@@ -4214,6 +4201,9 @@ mod quinn_drain_tests {
             rep_observed_task.store(true, Ordering::Release);
             Ok::<(), anyhow::Error>(())
         };
+        tokio::time::timeout(Duration::from_secs(1), drain_armed_rx)
+            .await
+            .context("drain waiter did not arm")??;
         let quic = async { Err::<(), _>(anyhow::anyhow!("draining accept-loop sentinel")) };
         let lifecycle = tokio::spawn(run_quinn_lifecycle(
             rep,
