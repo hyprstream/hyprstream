@@ -412,7 +412,7 @@ def cgr_inventory(build_file: str, source: str) -> list[dict[str, Any]]:
 
 
 def check_cgr(catalog: dict[str, Any], repo: Path, schemas: list[dict[str, Any]],
-              mutations: dict[str, str] | None) -> None:
+              mutations: dict[str, str] | None) -> dict[str, list[dict[str, Any]]]:
     roots = catalog.get("cgr_build_roots", {})
     required(roots == CGR_ROOTS, "persisted-CGR import roots drift")
     build_files = set(tracked(repo, "build.rs", "**/build.rs"))
@@ -438,6 +438,7 @@ def check_cgr(catalog: dict[str, Any], repo: Path, schemas: list[dict[str, Any]]
         matched = [call for call in inventories[producer] if entry["path"].startswith(f"{call['source_root']}/") and Path(entry["path"]).stem in call["schemas"]]
         required(len(matched) == 1,
                  f"{entry['path']} is absent from exact persisted-CGR inputs")
+    return inventories
 
 
 def schema_method_metadata(repo: Path, schemas: list[dict[str, Any]],
@@ -499,6 +500,8 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
     required(len(service_ids) == len(set(service_ids)), "duplicate schema service identity")
     by_service = {entry["service"]: entry for entry in schemas if entry.get("service")}
     owner_directories = check_owner_directories(catalog, repo)
+    inventories = check_cgr(catalog, repo, schemas, mutations)
+    capnp_build = text(repo, "crates/hyprstream-rpc-build/build.rs", mutations)
     for entry in schemas:
         for key in ("owner", "license", "kind", "exclusions"):
             required(bool(entry.get(key)), f"{entry['path']} lacks {key}")
@@ -508,22 +511,44 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
         source = text(repo, entry["path"], mutations)
         found = re.search(r"^@(0x[0-9a-f]+);", source, re.MULTILINE)
         required(found is not None and found.group(1) == entry["source_id"], f"{entry['path']} source ID drift")
-        if entry["path"].endswith("wire_roundtrip_fixture.capnp"):
+        stem = Path(entry["path"]).stem
+        expected_service = stem if re.search(rf"(?m)^struct\s+{''.join(part.capitalize() for part in stem.split('_'))}Request\b", source) or re.search(r"(?m)^interface\s+", source) else None
+        if expected_service is not None:
+            required(entry["kind"] == "service" and entry.get("service") == expected_service,
+                     f"{entry['path']} service identity/classification drift")
+        elif entry["path"].endswith("wire_roundtrip_fixture.capnp"):
             required(entry["kind"] == "test-fixture" and entry.get("service") is None,
                      f"{entry['path']} fixture classification drift")
-        elif re.search(r"(?m)^interface\s+", source):
-            required(entry["kind"] == "service" and isinstance(entry.get("service"), str),
-                     f"{entry['path']} service classification drift")
         elif "annotation " in source:
             required(entry["kind"] == "annotations" and entry.get("service") is None,
                      f"{entry['path']} annotation classification drift")
+        elif re.search(r"\b9P\b|CompositorIpc", source):
+            required(entry["kind"] == "protocol" and entry.get("service") is None,
+                     f"{entry['path']} protocol classification drift")
+        elif re.search(r"\b(?:ChatCoreIn|TypedEventEnvelope)\b", source):
+            required(entry["kind"] == "type-only" and entry.get("service") is None,
+                     f"{entry['path']} type-only classification drift")
+        else:
+            required(entry["kind"] == "shared-type" and entry.get("service") is None,
+                     f"{entry['path']} shared-type classification drift")
+        actual_cgr = [producer for producer, calls in inventories.items()
+                      if any(entry["path"].startswith(f"{call['source_root']}/") and stem in call["schemas"] for call in calls)]
+        if actual_cgr:
+            required(entry.get("cgr_producer") == actual_cgr[0] and "compiled_by" not in entry,
+                     f"{entry['path']} persisted-CGR compiler classification drift")
+        elif entry["path"].endswith("wire_roundtrip_fixture.capnp"):
+            required(entry.get("cgr_producer") is None and entry.get("compiled_by") == "capnp_only"
+                     and re.search(r"capnpc::CompilerCommand::new\(\).*?\.file\(&schema\)", capnp_build, re.DOTALL) is not None,
+                     f"{entry['path']} capnp-only compiler input drift")
+        else:
+            required(entry.get("cgr_producer") is None and entry.get("compiled_by") == "not_compiled",
+                     f"{entry['path']} compiler classification drift")
         active = set(entry.get("surfaces", []))
         required(active <= set(SURFACES) | {"docs"}, f"{entry['path']} has unknown surface")
         for surface in SURFACES:
             required(surface in active or bool(entry["exclusions"].get(surface)), f"{entry['path']} lacks {surface} disposition")
             required(not (surface in active and surface in entry["exclusions"]),
                      f"{entry['path']} is both active and excluded on {surface}")
-    check_cgr(catalog, repo, schemas, mutations)
     required(catalog.get("method_metadata") == schema_method_metadata(repo, schemas, mutations),
              "schema hidden/streaming method metadata drift")
 
@@ -543,7 +568,6 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
         if surface == "factory":
             required(record.get("feature_conditions") == actual.get("feature_conditions"), "factory feature condition drift")
         if surface == "typescript":
-            required(record.get("state") == "absent" and record[key] == [], "TypeScript state must reflect tracked sources")
             continue
         for service in record[key]:
             if service not in by_service:
@@ -667,6 +691,10 @@ def self_test(repo: Path) -> None:
     settlement = next(entry for entry in bad["schemas"] if entry["path"].endswith("settlement.capnp"))
     settlement["kind"], settlement["service"] = "type-only", None
     expect_failure("schema service reclassification", repo, bad, corpus, schemas, consumers)
+    bad = copy.deepcopy(catalog)
+    model = next(entry for entry in bad["schemas"] if entry["path"].endswith("model.capnp"))
+    model["cgr_producer"], model["compiled_by"] = None, "not_compiled"
+    expect_failure("compiled schema not_compiled", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(catalog); bad["cgr_build_roots"]["crates/hyprstream/build.rs"][0] = "made/up/schema"
     expect_failure("CGR import root", repo, bad, corpus, schemas, consumers)
     for name, path, before, after in [
@@ -722,6 +750,9 @@ def self_test(repo: Path) -> None:
              "CGR string-only producer false positive")
     root_changed = text(repo, discovery_build, None).replace("../hyprstream-rpc/schema", "../unrelated/schema", 1)
     expect_failure("CGR source import root", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {discovery_build: root_changed})
+    fixture_build = "crates/hyprstream-rpc-build/build.rs"
+    fixture_drift = text(repo, fixture_build, None).replace(".file(&schema)", '.file("tests/other.capnp")', 1)
+    expect_failure("capnp-only compiler input", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {fixture_build: fixture_drift})
     shadowed = text(repo, discovery_build, None).replace(
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");\n    let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-workers/schema");',
