@@ -279,6 +279,14 @@ impl HostedAccountHttpDirectory for MountedHostedAccountHttpDirectory {
             genesis.cid()? == record.genesis_op(),
             "served genesis operation does not match account record"
         );
+        ensure!(
+            genesis.unsigned().did() == did,
+            "served genesis operation does not match hosted DID"
+        );
+        ensure!(
+            genesis.unsigned().doc_cid() == record.doc_cid(),
+            "served genesis operation does not match account document"
+        );
         Ok(Some(Arc::new(HostedAccountHttpArtifacts::new(
             label,
             did.clone(),
@@ -466,8 +474,9 @@ mod tests {
         RecoveryKeyEnrollment, UserRotationKey, sign_genesis,
     };
     use hyprstream_pds::{
-        AllocatedAccountName, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE, HostedAccountMint,
+        AllocatedAccountName, Cid, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE, HostedAccountMint,
     };
+    use hyprstream_pds::dag_cbor::DagCbor;
     use hyprstream_rpc::Subject;
     use hyprstream_rpc::auth::mac::{MacDecision, SecurityContext};
     use hyprstream_vfs::{SyntheticMount, SyntheticNode};
@@ -504,14 +513,25 @@ mod tests {
         )
     }
 
-    fn mounted_directory() -> (Arc<MountedHostedAccountHttpDirectory>, Vec<u8>, Vec<u8>) {
-        mounted_directory_with_files(None, None)
+    fn mounted_directory() -> (
+        Arc<MountedHostedAccountHttpDirectory>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        mounted_directory_with_files(None, None, None)
     }
 
     fn mounted_directory_with_files(
+        record_override: Option<Vec<u8>>,
         document_override: Option<Vec<u8>>,
         log_override: Option<Vec<u8>>,
-    ) -> (Arc<MountedHostedAccountHttpDirectory>, Vec<u8>, Vec<u8>) {
+    ) -> (
+        Arc<MountedHostedAccountHttpDirectory>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
         let ed = SigningKey::generate(&mut OsRng);
         let (pq, pq_vk) = ml_dsa_generate_keypair();
         let hybrid =
@@ -532,8 +552,10 @@ mod tests {
             .unwrap();
         let signature = sign_genesis(pending.unsigned_genesis(), &ed, &pq).unwrap();
         let account = pending.seal(signature).unwrap();
+        let record_bytes = account.record_bytes().to_vec();
         let document_bytes = account.did_document().as_bytes().to_vec();
         let log_bytes = account.genesis_bytes().to_vec();
+        let record_file = record_override.unwrap_or_else(|| record_bytes.clone());
         let document_file = document_override.unwrap_or_else(|| document_bytes.clone());
         let log_file = log_override.unwrap_or_else(|| log_bytes.clone());
         let root = SyntheticNode::dir().with_child(
@@ -545,7 +567,7 @@ mod tests {
                     SyntheticNode::dir()
                         .with_child(
                             PDS_ACCOUNT_RECORD_FILE,
-                            SyntheticNode::file(account.record_bytes().to_vec()),
+                            SyntheticNode::file(record_file),
                         )
                         .with_child(DID_DOCUMENT_FILE, SyntheticNode::file(document_file))
                         .with_child(GENESIS_DID_OP_FILE, SyntheticNode::file(log_file)),
@@ -564,7 +586,30 @@ mod tests {
             )
             .unwrap(),
         );
-        (directory, document_bytes, log_bytes)
+        (directory, document_bytes, log_bytes, record_bytes)
+    }
+
+    fn alternate_genesis_same_did() -> Vec<u8> {
+        let ed = SigningKey::generate(&mut OsRng);
+        let (pq, pq_vk) = ml_dsa_generate_keypair();
+        let hybrid =
+            HybridRotationKey::new(ed.verifying_key().to_bytes(), ml_dsa_vk_bytes(&pq_vk)).unwrap();
+        let rotations = GenesisRotationKeys::new(
+            UserRotationKey::new(hybrid),
+            RecoveryKeyEnrollment::Declined,
+            HostKeyEnrollment::Absent,
+        )
+        .unwrap();
+        let name =
+            AllocatedAccountName::new("alice", "did:web:alice.tormentnexus.social".to_owned())
+                .unwrap();
+        let mint = HostedAccountMint::begin(name, rotations).unwrap();
+        let document = mint.seal_did_document("https://alternate.example.com").unwrap();
+        let pending = mint
+            .prepare_genesis(document, GenesisRepoHead::EmptyRepo)
+            .unwrap();
+        let signature = sign_genesis(pending.unsigned_genesis(), &ed, &pq).unwrap();
+        pending.seal(signature).unwrap().genesis_bytes().to_vec()
     }
 
     #[tokio::test]
@@ -738,7 +783,7 @@ mod tests {
 
     #[tokio::test]
     async fn mounted_directory_reads_only_authorized_sealed_files() {
-        let (directory, document, log) = mounted_directory();
+        let (directory, document, log, _record) = mounted_directory();
         directory
             .store
             .refresh_hosted_did_index(&directory.authority)
@@ -786,14 +831,18 @@ mod tests {
 
     #[tokio::test]
     async fn mounted_directory_rejects_artifacts_rebound_from_account_record() {
-        let (_directory, document, log) = mounted_directory();
+        let (_directory, document, log, _record) = mounted_directory();
 
         let mut altered_document = String::from_utf8(document).unwrap();
         assert!(altered_document.contains("https://pds.example.com"));
         altered_document =
             altered_document.replace("https://pds.example.com", "https://other.example.com");
-        let document_directory =
-            mounted_directory_with_files(Some(altered_document.into_bytes()), Some(log.clone())).0;
+        let document_directory = mounted_directory_with_files(
+            None,
+            Some(altered_document.into_bytes()),
+            Some(log.clone()),
+        )
+        .0;
         document_directory
             .store
             .refresh_hosted_did_index(&document_directory.authority)
@@ -804,13 +853,50 @@ mod tests {
         let mut altered_log = log;
         let last = altered_log.len() - 1;
         altered_log[last] ^= 1;
-        let log_directory = mounted_directory_with_files(None, Some(altered_log)).0;
+        let log_directory = mounted_directory_with_files(None, None, Some(altered_log)).0;
         log_directory
             .store
             .refresh_hosted_did_index(&log_directory.authority)
             .await
             .unwrap();
         assert!(log_directory.lookup("alice").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mounted_directory_rejects_genesis_rebound_from_document() {
+        let (_original, document, _log, record) = mounted_directory();
+        let alternate_log = alternate_genesis_same_did();
+        let alternate_cid = Cid::from_dag_cbor(&alternate_log);
+        let mut record_value = DagCbor::decode(&record).unwrap();
+        let fields = match &mut record_value {
+            DagCbor::Map(fields) => fields,
+            other => panic!("account record must be a map, got {other:?}"),
+        };
+        let mut replaced = false;
+        for (key, value) in fields {
+            if matches!(key, DagCbor::Text(name) if name == "genesis_op") {
+                *value = DagCbor::Link(alternate_cid);
+                replaced = true;
+            }
+        }
+        assert!(replaced, "account record must contain genesis_op");
+        let rebound_record = record_value.encode();
+        let rebound = mounted_directory_with_files(
+            Some(rebound_record),
+            Some(document),
+            Some(alternate_log),
+        )
+        .0;
+        rebound
+            .store
+            .refresh_hosted_did_index(&rebound.authority)
+            .await
+            .unwrap();
+        let error = rebound
+            .lookup("alice")
+            .await
+            .expect_err("genesis for another document must be rejected");
+        assert!(error.to_string().contains("account document"));
     }
 
     #[test]
