@@ -284,14 +284,15 @@ def rust_lex(source: str, mask_literals: bool) -> str:
         return "".join("\n" if char == "\n" else " " for char in value)
     while index < len(source):
         pair = source[index:index + 2]
+        if block:
+            if pair == "/*": block += 1; out.append("  "); index += 2; continue
+            if pair == "*/": block -= 1; out.append("  "); index += 2; continue
+            out.append("\n" if source[index] == "\n" else " "); index += 1; continue
         if pair == "//":
             end = source.find("\n", index); end = len(source) if end < 0 else end
             out.append(blank(source[index:end])); index = end; continue
         if pair == "/*": block += 1; out.append("  "); index += 2; continue
-        if pair == "*/" and block: block -= 1; out.append("  "); index += 2; continue
-        if block:
-            out.append("\n" if source[index] == "\n" else " "); index += 1; continue
-        raw = re.match(r"(?:br|r)(?P<hashes>#{0,32})\"", source[index:])
+        raw = re.match(r"(?:br|r)(?P<hashes>#{0,255})\"", source[index:])
         if raw:
             close = '"' + raw.group("hashes")
             end = source.find(close, index + len(raw.group(0)))
@@ -367,8 +368,13 @@ def cgr_inventory(build_file: str, source: str) -> list[dict[str, Any]]:
         module_aliases.add(match.group(1))
     for match in re.finditer(r"\buse\s+hyprstream_rpc_build\s*::\s*compile_schemas(?:\s+as\s+([A-Za-z_]\w*))?\s*;", tokens):
         function_aliases.add(match.group(1) or "compile_schemas")
-    for group in re.finditer(r"\buse\s+hyprstream_rpc_build\s*::\s*\{(?P<items>[^}]*)\}\s*;", tokens):
-        for match in re.finditer(r"(?:^|,)\s*compile_schemas(?:\s+as\s+([A-Za-z_]\w*))?\s*(?=,|$)", group.group("items")):
+    grouped_prefix = re.compile(r"\buse\s+hyprstream_rpc_build\s*::\s*\{")
+    for group in grouped_prefix.finditer(tokens):
+        start, index, depth = group.end(), group.end(), 1
+        while index < len(tokens) and depth:
+            depth += (tokens[index] == "{") - (tokens[index] == "}"); index += 1
+        required(depth == 0, f"{build_file} has unterminated persisted-CGR grouped import")
+        for match in re.finditer(r"(?:^|,)\s*compile_schemas(?:\s+as\s+([A-Za-z_]\w*))?\s*(?=,|$)", tokens[start:index - 1]):
             function_aliases.add(match.group(1) or "compile_schemas")
     for alias in module_aliases | function_aliases:
         if alias == "hyprstream_rpc_build":
@@ -641,13 +647,19 @@ def self_test(repo: Path) -> None:
                       .replace("hyprstream_rpc_build::compile_schemas(", "rpc_build::compile_schemas(", 1))
     required(cgr_inventory(discovery_build, module_aliased) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
              "CGR module-alias normalization drift")
-    grouped_aliased = ("use hyprstream_rpc_build::{compile_schemas as compile, SchemaMetadata};\n" + discovery_source
+    grouped_aliased = ("use hyprstream_rpc_build::{nested::{SchemaMetadata}, compile_schemas as compile, SchemaMetadata};\n" + discovery_source
                        .replace("hyprstream_rpc_build::compile_schemas(", "compile(", 1))
     required(cgr_inventory(discovery_build, grouped_aliased) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
              "CGR grouped function-alias normalization drift")
     lifetime_extra = discovery_source + "\nfn marker<'a>() {}\n" + discovery_source[discovery_source.find("hyprstream_rpc_build::compile_schemas("):]
     required(len(cgr_inventory(discovery_build, lifetime_extra)) == 2,
              "CGR lifetime tokenization hid an invocation")
+    comment_extra = discovery_source + "\n/* // still block comment */\n" + discovery_source[discovery_source.find("hyprstream_rpc_build::compile_schemas("):]
+    required(len(cgr_inventory(discovery_build, comment_extra)) == 2,
+             "CGR block-comment tokenization hid an invocation")
+    raw_string = discovery_source + '\nlet marker = br###"hyprstream_rpc_build::compile_schemas("###;\n'
+    required(cgr_inventory(discovery_build, raw_string) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
+             "CGR byte-raw string tokenization drift")
     expect_cgr_failure("CGR unresolved alias", discovery_build,
                        discovery_source.replace("hyprstream_rpc_build::compile_schemas(", "unknown::compile_schemas(", 1))
     expect_cgr_failure("CGR alias reassignment", discovery_build,
