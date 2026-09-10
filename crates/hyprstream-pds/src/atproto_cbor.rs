@@ -459,6 +459,12 @@ mod tests {
             .iter()
             .any(|(cid, bytes)| *cid == commit.cid_atproto().unwrap()
                 && bytes == &commit.to_atproto_dag_cbor().unwrap()));
+        assert!(build_public_record_proof_car(&commit, &proof, &[], &record).is_err());
+        let mislabeled = node_blocks
+            .iter()
+            .map(|(_, data)| (Cid::from_dag_cbor(b"wrong label"), data.clone()))
+            .collect::<Vec<_>>();
+        assert!(build_public_record_proof_car(&commit, &proof, &mislabeled, &record).is_err());
     }
 
     #[test]

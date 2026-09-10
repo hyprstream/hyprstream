@@ -136,11 +136,24 @@ pub fn build_public_record_proof_car(
             | crate::mst::ProofStep::LeftSubtree(d) => d.cid_atproto(),
         })
         .collect::<Result<_>>()?;
+    let mut supplied_path_cids = std::collections::BTreeSet::new();
     for (cid, data) in node_blocks {
+        ensure!(
+            data.cid_atproto()? == *cid,
+            "public MST block is labeled with a CID that does not match its bytes"
+        );
         if path_cids.contains(cid) {
+            ensure!(
+                supplied_path_cids.insert(*cid),
+                "duplicate public MST block for proof path"
+            );
             blocks.push((*cid, data.encode_atproto()?));
         }
     }
+    ensure!(
+        supplied_path_cids.len() == path_cids.len(),
+        "public proof CAR is missing an MST path block"
+    );
     blocks.push((record.cid(), record.bytes().to_vec()));
     build_car_v1_atproto(&[commit_cid], &blocks)
 }

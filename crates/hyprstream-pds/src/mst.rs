@@ -78,6 +78,26 @@ fn key_level(key: &str) -> u32 {
     zeros.min(31)
 }
 
+/// Compute the protocol MST layer for a public AT Protocol record key.
+///
+/// AT Protocol derives layers from the number of leading zero bits in the
+/// SHA-256 key hash, using two leading bits per layer. This is deliberately
+/// separate from the native tree's trailing-zero convention.
+fn atproto_key_level(key: &str) -> u32 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    let mut leading = 0u32;
+    for &byte in digest.iter() {
+        if byte == 0 {
+            leading += 8;
+        } else {
+            leading += byte.leading_zeros();
+            break;
+        }
+    }
+    (leading / 2).min(31)
+}
+
 // (key_level is private; tests that need it live in this module and see it directly.)
 
 // ── TreeEntry / NodeData (the on-the-wire DAG-CBOR shapes) ──────────────────
@@ -264,14 +284,28 @@ impl Node {
     /// A directory walker enumerates a collection's records by filtering
     /// entries whose key starts with `"<collection>/"`.
     pub fn from_keyed_records(records: &BTreeMap<String, Cid>) -> Self {
+        Self::from_keyed_records_with_level(records, key_level)
+    }
+
+    /// Build an MST using the public AT Protocol layer function. The native
+    /// [`Self::from_keyed_records`] constructor remains unchanged for native
+    /// artifacts; callers producing public roots should use this constructor.
+    pub fn from_keyed_records_atproto(records: &BTreeMap<String, Cid>) -> Self {
+        Self::from_keyed_records_with_level(records, atproto_key_level)
+    }
+
+    fn from_keyed_records_with_level(
+        records: &BTreeMap<String, Cid>,
+        level_fn: fn(&str) -> u32,
+    ) -> Self {
         let keys: Vec<(String, Cid)> = records.iter().map(|(k, v)| (k.clone(), *v)).collect();
         if keys.is_empty() {
             return Node::empty();
         }
         // The root level is the maximum key level (so every key is at or below
         // the root). Building top-down from here keeps subtrees well-formed.
-        let max_level = keys.iter().map(|(k, _)| key_level(k)).max().unwrap_or(0);
-        Self::build_subtree(max_level, &keys)
+        let max_level = keys.iter().map(|(k, _)| level_fn(k)).max().unwrap_or(0);
+        Self::build_subtree(max_level, &keys, level_fn)
     }
 
     /// Recursively build a subtree at `level` from the given sorted
@@ -281,7 +315,7 @@ impl Node {
     /// - Keys with `key_level == level` become direct entries of this node.
     /// - Runs of keys with `key_level < level` become left (`l`) / right (`t`)
     ///   subtrees, each built at `level - 1`.
-    fn build_subtree(level: u32, keys: &[(String, Cid)]) -> Self {
+    fn build_subtree(level: u32, keys: &[(String, Cid)], level_fn: fn(&str) -> u32) -> Self {
         let mut node = Node {
             level,
             l: None,
@@ -300,13 +334,13 @@ impl Node {
         let mut have_anchor = false;
         let mut low_start: usize = 0;
         for (i, (k, _)) in keys.iter().enumerate() {
-            if key_level(k) == level {
+            if level_fn(k) == level {
                 // Flush the low-level run [low_start, i) as a subtree.
                 let run = &keys[low_start..i];
                 let subtree = if run.is_empty() {
                     None
                 } else {
-                    Some(Box::new(Self::build_subtree(level - 1, run)))
+                    Some(Box::new(Self::build_subtree(level - 1, run, level_fn)))
                 };
                 if !have_anchor {
                     node.l = subtree; // leading run → leftmost subtree
@@ -328,7 +362,7 @@ impl Node {
         // Trailing low-level run after the last anchor → that anchor's right subtree.
         let trailing = &keys[low_start..];
         if !trailing.is_empty() {
-            let subtree = Some(Box::new(Self::build_subtree(level - 1, trailing)));
+            let subtree = Some(Box::new(Self::build_subtree(level - 1, trailing, level_fn)));
             if let Some(last) = node.entries.last_mut() {
                 last.right = subtree;
             } else {
@@ -395,11 +429,32 @@ impl Node {
 
     /// Serialize this tree with public AT Protocol node ordering and CIDs.
     pub fn to_node_data_with_blocks_atproto(&self) -> Result<(NodeData, Vec<(Cid, NodeData)>)> {
+        // A native Node may have been built with the native layer function.
+        // Rebuild from its complete key set before public serialization so the
+        // resulting topology follows the AT Protocol layer rule.
+        let mut records = BTreeMap::new();
+        self.collect_keyed_records(&mut records);
+        Self::from_keyed_records_atproto(&records).to_node_data_with_blocks_atproto_current()
+    }
+
+    fn to_node_data_with_blocks_atproto_current(&self) -> Result<(NodeData, Vec<(Cid, NodeData)>)> {
         let mut blocks = Vec::new();
         let data = self.to_node_data_atproto_rec(&mut blocks)?;
         let cid = data.cid_atproto()?;
         blocks.push((cid, data.clone()));
         Ok((data, blocks))
+    }
+
+    fn collect_keyed_records(&self, records: &mut BTreeMap<String, Cid>) {
+        if let Some(left) = &self.l {
+            left.collect_keyed_records(records);
+        }
+        for entry in &self.entries {
+            records.insert(entry.key.clone(), entry.value);
+            if let Some(right) = &entry.right {
+                right.collect_keyed_records(records);
+            }
+        }
     }
 
     fn to_node_data_atproto_rec(&self, blocks: &mut Vec<(Cid, NodeData)>) -> Result<NodeData> {
@@ -449,8 +504,11 @@ impl Node {
     {
         let rkey: AtprotoRecordKey = rkey.into();
         let target = public_record_key(collection, &rkey);
+        let mut records = BTreeMap::new();
+        self.collect_keyed_records(&mut records);
+        let tree = Self::from_keyed_records_atproto(&records);
         let mut path = Vec::new();
-        self.proof_rec_atproto(&target, &mut path).ok()?;
+        tree.proof_rec_atproto(&target, &mut path).ok()?;
         Some(Proof { path })
     }
 
@@ -824,6 +882,32 @@ mod tests {
             found, keyed,
             "walked entries must match the input key set exactly"
         );
+    }
+
+    #[test]
+    fn public_mst_uses_protocol_layer_function() {
+        let keyed: BTreeMap<String, Cid> = (1..=32)
+            .map(|i| {
+                (
+                    format!("app.bsky.feed.post/{i:013}"),
+                    Cid::from_dag_cbor(format!("record-{i}").as_bytes()),
+                )
+            })
+            .collect();
+        let native = Node::from_keyed_records(&keyed);
+        let public = Node::from_keyed_records_atproto(&keyed);
+        let expected_level = keyed
+            .keys()
+            .map(|key| atproto_key_level(key))
+            .max()
+            .unwrap_or(0);
+        assert_eq!(public.level, expected_level);
+        assert_ne!(native.level, public.level);
+
+        // Public serialization must also rebuild a native tree's topology.
+        let (serialized, _) = native.to_node_data_with_blocks_atproto().unwrap();
+        let (expected, _) = public.to_node_data_with_blocks_atproto_current().unwrap();
+        assert_eq!(serialized, expected);
     }
 
     #[test]
