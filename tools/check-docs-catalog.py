@@ -165,8 +165,9 @@ def audited_input(repo: Path, event: str | None = None, revision: str | None = N
     event = event or os.environ.get("DOCS_CATALOG_EVENT", "pull_request")
     revision = revision or os.environ.get("DOCS_CATALOG_AUDITED_COMMIT")
     if event == "pull_request":
-        base = git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
-        required(revision in {None, base}, "pull-request audited input differs from merge base")
+        base = revision or git(repo, "rev-parse", "refs/remotes/origin/main")
+        required(base == git(repo, "rev-parse", "refs/remotes/origin/main"),
+                 "pull-request audited input differs from remote main base")
         return event, base
     if event == "push":
         boundary = revision or git(repo, "rev-parse", "HEAD^")
@@ -702,12 +703,16 @@ def self_test(repo: Path) -> None:
     top_level = "docs/KV-CACHE-ARCHITECTURE.md"
     changed_top_level = text(repo, top_level, None) + "\nprovenance mutation\n"
     expect_failure("top-level corpus provenance", repo, catalog, corpus, schemas, consumers, {top_level: changed_top_level})
-    # Merge/squash/rebase all retain the trusted push-before boundary; the
-    # current selected-input digest supplies the durable source attestation.
-    validate(repo, catalog, corpus, schemas, consumers, event="push", revision=catalog["source_commit"])
-    bad = copy.deepcopy(catalog); bad["source_commit"] = stale; bad["source_tree"] = git(repo, "rev-parse", f"{stale}^{{tree}}")
+    # Model a hosted push boundary with objects reachable from this checkout.
+    push_commit = git(repo, "rev-parse", "HEAD~1")
+    push_catalog, push_corpus = copy.deepcopy(catalog), copy.deepcopy(corpus)
+    for record in (push_catalog, push_corpus):
+        record["source_commit"] = push_commit
+        record["source_tree"] = git(repo, "rev-parse", f"{push_commit}^{{tree}}")
+    validate(repo, push_catalog, push_corpus, schemas, consumers, event="push", revision=push_commit)
+    bad = copy.deepcopy(push_catalog); bad["source_commit"] = stale; bad["source_tree"] = git(repo, "rev-parse", f"{stale}^{{tree}}")
     try:
-        validate(repo, bad, corpus, schemas, consumers, event="push", revision=catalog["source_commit"])
+        validate(repo, bad, push_corpus, schemas, consumers, event="push", revision=push_commit)
     except CatalogError:
         pass
     else:
