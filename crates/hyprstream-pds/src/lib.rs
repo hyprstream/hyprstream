@@ -50,6 +50,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod account_label;
 pub mod at9p;
 pub mod at9p_alias;
 pub mod at9p_chain;
@@ -76,6 +77,10 @@ pub mod record;
 pub mod repo_authority;
 pub mod tid;
 
+pub use account_label::{
+    AccountLabel, AccountLabelRegistry, ReservedAccountLabel, MAX_ACCOUNT_LABEL_LEN,
+    RESERVED_ACCOUNT_LABELS,
+};
 pub use cid::Cid;
 pub use did_op::{
     sign_genesis, DidOpSignature, GenesisDidOp, GenesisRepoHead, GenesisRotationKeys,
