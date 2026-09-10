@@ -8,20 +8,22 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use axum::{
+    Router,
     extract::{Request, State},
-    http::{header, uri::Authority, HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header, uri::Authority},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
 };
-use hyprstream_pds::{AccountLabel, SealedHostedAccount, SealedHostedDidDocument};
+use hyprstream_pds::{
+    AccountLabel, AccountRecord, GenesisDidOp, SealedHostedAccount, SealedHostedDidDocument,
+};
 
 use crate::{
     AccountRecordStore, OAUTH_ACCOUNT_RESOLVER_SUBJECT, PDS_ACCOUNT_DID_DOCUMENT_FILE,
-    PDS_ACCOUNT_DID_LOG_FILE,
+    PDS_ACCOUNT_DID_LOG_FILE, PDS_ACCOUNT_RECORD_FILE,
 };
 
 /// Canonical hosted account zone used by the default deployment.
@@ -193,7 +195,10 @@ pub struct MountedHostedAccountHttpDirectory {
     store: Arc<AccountRecordStore>,
     authority: hyprstream_rpc::Subject,
     zone: String,
+    tenant_cache: Arc<tokio::sync::Mutex<BTreeMap<String, Option<String>>>>,
 }
+
+const MAX_TENANT_CACHE_ENTRIES: usize = 1024;
 
 impl MountedHostedAccountHttpDirectory {
     pub fn new(
@@ -209,6 +214,7 @@ impl MountedHostedAccountHttpDirectory {
             store,
             authority,
             zone: canonical_zone(&zone.into())?,
+            tenant_cache: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
         })
     }
 }
@@ -218,13 +224,44 @@ impl HostedAccountHttpDirectory for MountedHostedAccountHttpDirectory {
     async fn lookup(&self, label: &str) -> Result<Option<Arc<HostedAccountHttpArtifacts>>> {
         AccountLabel::parse(label).map_err(|error| anyhow::anyhow!(error))?;
         let did = format!("did:web:{label}.{}", self.zone);
-        let Some(tenant) = self
-            .store
-            .resolve_tenant_for_hosted_did(&self.authority, &did)
-            .await?
-        else {
+        // Tenant resolution is an index miss only once per label. Hold the
+        // cache lock across the miss so concurrent requests cannot all repeat
+        // the tenant scan; cache both hits and misses to keep attacker-chosen
+        // nonexistent labels from repeatedly walking every tenant.
+        let tenant = {
+            let mut cache = self.tenant_cache.lock().await;
+            if let Some(tenant) = cache.get(label).cloned() {
+                tenant
+            } else {
+                let tenant = self
+                    .store
+                    .resolve_tenant_for_hosted_did(&self.authority, &did)
+                    .await?;
+                if cache.len() >= MAX_TENANT_CACHE_ENTRIES {
+                    cache.pop_first();
+                }
+                cache.insert(label.to_owned(), tenant.clone());
+                tenant
+            }
+        };
+        let Some(tenant) = tenant else {
             return Ok(None);
         };
+        let record_bytes = self
+            .store
+            .read_hosted_http_artifact(
+                &self.authority,
+                &tenant,
+                label,
+                PDS_ACCOUNT_RECORD_FILE,
+                16 * 1024,
+            )
+            .await?;
+        let record = AccountRecord::from_dag_cbor(&record_bytes)?;
+        ensure!(
+            record.name().label() == label && record.name().did() == did,
+            "hosted account record does not match host"
+        );
         let document = self
             .store
             .read_hosted_http_artifact(
@@ -237,8 +274,8 @@ impl HostedAccountHttpDirectory for MountedHostedAccountHttpDirectory {
             .await?;
         let parsed = SealedHostedDidDocument::from_canonical_json(&document)?;
         ensure!(
-            parsed.did() == did,
-            "served DID document does not match host"
+            parsed.did() == did && parsed.cid() == record.doc_cid(),
+            "served DID document does not match host or account record"
         );
         let log = self
             .store
@@ -250,6 +287,11 @@ impl HostedAccountHttpDirectory for MountedHostedAccountHttpDirectory {
                 64 * 1024,
             )
             .await?;
+        let genesis = GenesisDidOp::from_dag_cbor(&log)?;
+        ensure!(
+            genesis.cid()? == record.genesis_op(),
+            "served genesis operation does not match account record"
+        );
         Ok(Some(Arc::new(HostedAccountHttpArtifacts::new(
             label,
             did.clone(),
@@ -405,7 +447,16 @@ fn canonical_zone(zone: &str) -> Result<String> {
 }
 
 fn host_label(host: &str, zone: &str) -> Option<String> {
+    if host.contains('@') {
+        return None;
+    }
     let authority: Authority = host.parse().ok()?;
+    if host.contains(':') {
+        let port = authority.port()?;
+        if !port.as_str().bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+    }
     let hostname = authority.host().trim_end_matches('.');
     let suffix = format!(".{zone}");
     let label = hostname.strip_suffix(&suffix)?;
@@ -424,19 +475,19 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
     use hyprstream_pds::did_op::{
-        sign_genesis, GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
-        RecoveryKeyEnrollment, UserRotationKey,
+        GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
+        RecoveryKeyEnrollment, UserRotationKey, sign_genesis,
     };
     use hyprstream_pds::{
-        AllocatedAccountName, HostedAccountMint, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE,
+        AllocatedAccountName, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE, HostedAccountMint,
     };
-    use hyprstream_rpc::auth::mac::{MacDecision, SecurityContext};
     use hyprstream_rpc::Subject;
+    use hyprstream_rpc::auth::mac::{MacDecision, SecurityContext};
     use hyprstream_vfs::{SyntheticMount, SyntheticNode};
     use rand::rngs::OsRng;
     use tower::ServiceExt;
 
-    use crate::{PDS_ACCOUNTS_DIRECTORY, PDS_ACCOUNT_RECORD_FILE};
+    use crate::{PDS_ACCOUNT_RECORD_FILE, PDS_ACCOUNTS_DIRECTORY};
 
     struct PermitReads;
 
@@ -467,6 +518,13 @@ mod tests {
     }
 
     fn mounted_directory() -> (Arc<MountedHostedAccountHttpDirectory>, Vec<u8>, Vec<u8>) {
+        mounted_directory_with_files(None, None)
+    }
+
+    fn mounted_directory_with_files(
+        document_override: Option<Vec<u8>>,
+        log_override: Option<Vec<u8>>,
+    ) -> (Arc<MountedHostedAccountHttpDirectory>, Vec<u8>, Vec<u8>) {
         let ed = SigningKey::generate(&mut OsRng);
         let (pq, pq_vk) = ml_dsa_generate_keypair();
         let hybrid =
@@ -489,6 +547,8 @@ mod tests {
         let account = pending.seal(signature).unwrap();
         let document_bytes = account.did_document().as_bytes().to_vec();
         let log_bytes = account.genesis_bytes().to_vec();
+        let document_file = document_override.unwrap_or_else(|| document_bytes.clone());
+        let log_file = log_override.unwrap_or_else(|| log_bytes.clone());
         let root = SyntheticNode::dir().with_child(
             "tenant",
             SyntheticNode::dir().with_child(
@@ -500,11 +560,8 @@ mod tests {
                             PDS_ACCOUNT_RECORD_FILE,
                             SyntheticNode::file(account.record_bytes().to_vec()),
                         )
-                        .with_child(
-                            DID_DOCUMENT_FILE,
-                            SyntheticNode::file(document_bytes.clone()),
-                        )
-                        .with_child(GENESIS_DID_OP_FILE, SyntheticNode::file(log_bytes.clone())),
+                        .with_child(DID_DOCUMENT_FILE, SyntheticNode::file(document_file))
+                        .with_child(GENESIS_DID_OP_FILE, SyntheticNode::file(log_file)),
                 ),
             ),
         );
@@ -644,6 +701,8 @@ mod tests {
             "alice.other.example",
             "nested.alice.tormentnexus.social",
             "-alice.tormentnexus.social",
+            "attacker@alice.tormentnexus.social",
+            "alice.tormentnexus.social:bad",
         ] {
             let response = app
                 .clone()
@@ -731,6 +790,25 @@ mod tests {
                 .as_ref(),
             log
         );
+    }
+
+    #[tokio::test]
+    async fn mounted_directory_rejects_artifacts_rebound_from_account_record() {
+        let (_directory, document, log) = mounted_directory();
+
+        let mut altered_document = String::from_utf8(document).unwrap();
+        assert!(altered_document.contains("https://pds.example.com"));
+        altered_document =
+            altered_document.replace("https://pds.example.com", "https://other.example.com");
+        let document_directory =
+            mounted_directory_with_files(Some(altered_document.into_bytes()), Some(log.clone())).0;
+        assert!(document_directory.lookup("alice").await.is_err());
+
+        let mut altered_log = log;
+        let last = altered_log.len() - 1;
+        altered_log[last] ^= 1;
+        let log_directory = mounted_directory_with_files(None, Some(altered_log)).0;
+        assert!(log_directory.lookup("alice").await.is_err());
     }
 
     #[test]
