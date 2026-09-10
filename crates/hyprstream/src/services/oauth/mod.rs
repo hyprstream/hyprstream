@@ -1526,21 +1526,37 @@ mod tests {
     #[test]
     fn oauth_warms_hosted_did_index_before_readiness() {
         let source = include_str!("mod.rs");
-        let warmup = source
-            .find("store.refresh_hosted_did_index(&authority)")
+        let production = source
+            .get(..source
+                .find("\n#[cfg(test)]\n#[allow(clippy::unwrap_used")
+                .expect("test module must remain explicit"))
+            .expect("production source must precede tests");
+        let run_start = production
+            .find("impl Spawnable for OAuthService")
+            .expect("OAuthService must implement Spawnable");
+        let run = &production[run_start..];
+        let warmup = run
+            .find("warm_hosted_did_index(")
             .expect("OAuth startup must warm the hosted-DID index");
-        let ready = source
-            .find("if let Some(tx) = on_ready")
-            .expect("OAuth readiness signal must remain explicit");
+        let ready = run
+            .find("serve_bridged(")
+            .expect("OAuth readiness boundary must remain explicit");
         assert!(warmup < ready, "OAuth must not signal readiness before index warm-up");
-        let warmup_block = &source[warmup.saturating_sub(512)..ready];
+        let warmup_block = &run[warmup..ready];
         assert!(
-            warmup_block.contains("tokio::time::timeout")
+            warmup_block.contains("warm_hosted_did_index(")
                 && warmup_block.contains("Duration::from_secs(30)"),
             "hosted-DID warm-up must have a bounded timeout"
         );
+        let helper_start = production
+            .find("async fn warm_hosted_did_index(")
+            .expect("warm-up helper must remain explicit");
+        let helper_end = production
+            .find("/// Profile-aware bind of OAuth's inbound reach-only substrate")
+            .expect("warm-up helper must be bounded by the next helper");
+        let helper = &production[helper_start..helper_end];
         assert!(
-            !warmup_block.contains("spawn_blocking"),
+            !helper.contains("spawn_blocking"),
             "hosted-DID warm-up timeout must not leave an uncancellable blocking task"
         );
     }
