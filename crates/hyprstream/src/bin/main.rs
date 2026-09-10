@@ -1557,12 +1557,9 @@ fn resolve_moq_relay_reach(
         .ok_or_else(|| anyhow::anyhow!("relay URI is not a network-routable transport"))
 }
 
-/// Select the process identity before constructing any resolver/client. Transport
-/// flags do not decide whose identity a required-native split service uses.
-fn native_service_process_name(matches: &clap::ArgMatches, config: &HyprConfig) -> Result<Option<String>> {
-    if !config.quic.iroh_required() {
-        return Ok(None);
-    }
+/// Resolve the services hosted by this foreground process independently of
+/// transport profile. Background start commands do not host their children.
+fn foreground_service_process_names(matches: &clap::ArgMatches, config: &HyprConfig) -> Result<Option<Vec<String>>> {
     let Some(("service", service_matches)) = matches.subcommand() else {
         return Ok(None);
     };
@@ -1578,6 +1575,29 @@ fn native_service_process_name(matches: &clap::ArgMatches, config: &HyprConfig) 
         config.services.startup.clone()
     } else {
         services.unwrap_or_else(|| name.into_iter().collect())
+    };
+    Ok(Some(names))
+}
+
+/// Process termination is safe only when this process hosts one known service.
+fn dedicated_service_process_name(matches: &clap::ArgMatches, config: &HyprConfig) -> Result<Option<String>> {
+    let Some(names) = foreground_service_process_names(matches, config)? else {
+        return Ok(None);
+    };
+    match names.as_slice() {
+        [service] if get_factory(service).is_some() => Ok(Some(service.clone())),
+        _ => Ok(None),
+    }
+}
+
+/// Select the process identity before constructing any resolver/client. Transport
+/// flags do not decide whose identity a required-native split service uses.
+fn native_service_process_name(matches: &clap::ArgMatches, config: &HyprConfig) -> Result<Option<String>> {
+    if !config.quic.iroh_required() {
+        return Ok(None);
+    }
+    let Some(names) = foreground_service_process_names(matches, config)? else {
+        return Ok(None);
     };
     anyhow::ensure!(names.len() == 1,
         "network-iroh-required requires exactly one service per foreground process; launch each provisioned service separately");
@@ -2963,6 +2983,7 @@ fn main() -> Result<()> {
     }
 
     let native_service_name = native_service_process_name(&matches, &config)?;
+    let dedicated_service_name = dedicated_service_process_name(&matches, &config)?;
 
     // Start registry service ONCE at CLI level
     let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -3166,9 +3187,9 @@ fn main() -> Result<()> {
                                     )?,
                                 );
 
-                                // native_service_process_name already enforces one service
-                                // per foreground process; IPC flags are not containment proof.
-                                if let Some(service) = &native_service_name {
+                                // Containment follows the actual single-service launch,
+                                // independently of native/compatibility transport selection.
+                                if let Some(service) = &dedicated_service_name {
                                     ctx = ctx.with_dedicated_process_service(service.clone());
                                 }
 
@@ -4315,6 +4336,54 @@ mod resolver_startup_controls {
             std::fs::write(&key_path, [seed; 31])?;
             assert!(runtime.block_on(super::load_process_signing_key(&config, selected.as_deref())).is_err());
             assert_eq!(std::fs::read(&key_path)?, vec![seed; 31], "malformed key must not be repaired during startup");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dedicated_service_containment_is_independent_of_network_profile() -> anyhow::Result<()> {
+        use hyprstream_core::config::NativeNetworkProfile;
+        let mut config = super::HyprConfig::default();
+        config.account.http = Some(hyprstream_core::account::AccountHttpConfig {
+            host: "::1".to_owned(),
+            port: 8443,
+            tls_cert: "unused.pem".into(),
+            tls_key: "unused.key".into(),
+        });
+        for profile in [NativeNetworkProfile::Compatibility, NativeNetworkProfile::NetworkIrohRequired] {
+            config.quic.native_network_profile = profile;
+            for argv in [
+                vec!["hyprstream", "service", "start", "oauth", "--foreground"],
+                vec!["hyprstream", "service", "start", "--foreground", "--services", "oauth"],
+                vec!["hyprstream", "service", "start", "--standalone"],
+            ] {
+                config.services.startup = vec!["oauth".into()];
+                let matches = super::build_cli().try_get_matches_from(argv)?;
+                let service = super::dedicated_service_process_name(&matches, &config)?
+                    .expect("a single OAuth foreground service has process containment");
+                assert_eq!(service, "oauth");
+                let key = super::SigningKey::from_bytes(&[9; 32]);
+                let context = super::ServiceContext::new(
+                    key.clone(), key.verifying_key(), false, "/unused".into(),
+                ).with_dedicated_process_service(service);
+                assert!(context.is_dedicated_process_for("oauth"));
+                assert!(!context.is_dedicated_process_for("registry"));
+                assert_eq!(
+                    super::native_service_process_name(&matches, &config)?.is_some(),
+                    config.quic.iroh_required(),
+                    "containment must not change compatibility signing-key selection",
+                );
+            }
+            config.services.startup = vec!["oauth".into(), "registry".into()];
+            for argv in [
+                vec!["hyprstream", "service", "start", "oauth"],
+                vec!["hyprstream", "service", "start", "--standalone"],
+                vec!["hyprstream", "service", "start", "--foreground", "--services", "oauth,registry"],
+                vec!["hyprstream", "service", "status"],
+            ] {
+                let matches = super::build_cli().try_get_matches_from(argv)?;
+                assert_eq!(super::dedicated_service_process_name(&matches, &config)?, None);
+            }
         }
         Ok(())
     }

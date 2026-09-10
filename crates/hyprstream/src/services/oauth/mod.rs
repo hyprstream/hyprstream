@@ -643,6 +643,16 @@ impl OAuthService {
     }
 }
 
+fn account_http_socket_addr(config: &crate::account::AccountHttpConfig) -> Result<SocketAddr> {
+    // Preserve bracketed IPv6 configurations while accepting bare IP literals.
+    let host = config.host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(&config.host);
+    let ip = host.parse::<std::net::IpAddr>()
+        .map_err(|error| anyhow::anyhow!("invalid account HTTP bind IP: {error}"))?;
+    Ok(SocketAddr::new(ip, config.port))
+}
+
 /// Resolve explicitly provisioned TLS material for the public account
 /// listener. Account hosts must never fall back to the node/self-signed
 /// certificate, so enabling the listener requires both PEM paths and a valid
@@ -749,7 +759,7 @@ impl Spawnable for OAuthService {
         let contains_account_workers = self.account_config.http.is_some();
         if contains_account_workers && !self.dedicated_process {
             return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                "hosted account workers require a dedicated native OAuth process".to_owned(),
+                "hosted account workers require a dedicated foreground OAuth process".to_owned(),
             ));
         }
         // Timed-out synchronous I/O cannot be cancelled safely. This service
@@ -1281,11 +1291,11 @@ impl Spawnable for OAuthService {
                                 "compose account HTTP router: {error}"
                             ))
                         })?;
-                let account_addr: SocketAddr = format!("{}:{}", http_config.host, http_config.port)
-                    .parse()
+                let account_addr = account_http_socket_addr(http_config)
                     .map_err(|error| {
                         hyprstream_rpc::error::RpcError::SpawnFailed(format!(
-                            "invalid account HTTP address: {error}"
+                            "invalid account HTTP bind host '{}': {error}",
+                            http_config.host
                         ))
                     })?;
                 let account_tls = resolve_account_http_tls(http_config, &zone)
@@ -1741,6 +1751,30 @@ mod tests {
     }
 
     #[test]
+    fn account_http_socket_address_preserves_ipv4_and_ipv6_literals() {
+        let mut config = crate::account::AccountHttpConfig {
+            host: String::new(),
+            port: 8443,
+            tls_cert: "unused.pem".into(),
+            tls_key: "unused.key".into(),
+        };
+        for (host, expected) in [
+            ("127.0.0.1", "127.0.0.1:8443"),
+            ("0.0.0.0", "0.0.0.0:8443"),
+            ("::1", "[::1]:8443"),
+            ("::", "[::]:8443"),
+            ("[::1]", "[::1]:8443"),
+        ] {
+            config.host = host.to_owned();
+            assert_eq!(account_http_socket_addr(&config).unwrap().to_string(), expected);
+        }
+        for invalid in ["localhost", "[::1", "::1]", "127.0.0.1:8443"] {
+            config.host = invalid.to_owned();
+            assert!(account_http_socket_addr(&config).is_err());
+        }
+    }
+
+    #[test]
     fn account_worker_requires_launcher_process_containment() {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
         let account = crate::account::AccountZoneConfig {
@@ -1761,7 +1795,7 @@ mod tests {
         let result = Box::new(service).run(Arc::new(Notify::new()), None);
         assert!(matches!(result,
             Err(hyprstream_rpc::error::RpcError::SpawnFailed(message))
-                if message.contains("dedicated native OAuth process")
+                if message.contains("dedicated foreground OAuth process")
         ));
     }
 
