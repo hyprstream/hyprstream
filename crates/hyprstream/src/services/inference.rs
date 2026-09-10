@@ -4049,8 +4049,7 @@ mod quinn_drain_tests {
         let drain_shutdown = Arc::clone(&shutdown);
         let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
         let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
-        let drain_release = Arc::new(tokio::sync::Notify::new());
-        let drain_release_task = Arc::clone(&drain_release);
+        let (drain_release_tx, drain_release_rx) = tokio::sync::oneshot::channel();
         let drain_finished = Arc::new(AtomicBool::new(false));
         let drain_finished_task = Arc::clone(&drain_finished);
         let drain_task = tokio::spawn(async move {
@@ -4060,19 +4059,19 @@ mod quinn_drain_tests {
             let _ = armed_tx.send(());
             notified.await;
             let _ = drain_started_tx.send(());
-            drain_release_task.notified().await;
+            let _ = drain_release_rx.await;
             drain_finished_task.store(true, Ordering::Release);
         });
         tokio::time::timeout(Duration::from_secs(1), armed_rx)
             .await
             .context("test drain waiter did not arm")??;
 
-        let rep_started = Arc::new(AtomicBool::new(false));
-        let rep_started_task = Arc::clone(&rep_started);
+        let rep_shutdown_observed = Arc::new(AtomicBool::new(false));
+        let rep_shutdown_observed_task = Arc::clone(&rep_shutdown_observed);
         let rep_shutdown = Arc::clone(&shutdown);
         let rep = async move {
-            rep_started_task.store(true, Ordering::Release);
             rep_shutdown.notified().await;
+            rep_shutdown_observed_task.store(true, Ordering::Release);
             Ok::<(), anyhow::Error>(())
         };
         let quic = async { Err::<(), _>(anyhow::anyhow!("accept-loop sentinel")) };
@@ -4088,19 +4087,19 @@ mod quinn_drain_tests {
             .await
             .context("test drain did not start")??;
         tokio::time::timeout(Duration::from_millis(200), async {
-            while !rep_started.load(Ordering::Acquire) {
+            while !rep_shutdown_observed.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .context("REP shutdown was not polled while QUIC drain was blocked")?;
-        drain_release.notify_waiters();
+        drain_release_tx.send(()).expect("drain waiter remains live");
         let result = tokio::time::timeout(Duration::from_secs(1), lifecycle)
             .await
             .context("unexpected QUIC lifecycle cleanup timed out")??;
         let error = result.expect_err("unexpected QUIC exit must remain the primary error");
         assert!(error.to_string().contains("accept-loop sentinel"));
-        assert!(rep_started.load(Ordering::Acquire));
+        assert!(rep_shutdown_observed.load(Ordering::Acquire));
         assert!(drain_finished.load(Ordering::Acquire));
         Ok(())
     }
