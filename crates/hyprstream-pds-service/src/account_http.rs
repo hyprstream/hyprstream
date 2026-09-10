@@ -11,7 +11,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use anyhow::{ensure, Result};
 use async_trait::async_trait;
 use axum::{
-    extract::State,
+    extract::{Request, State},
     http::{header, uri::Authority, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -287,20 +287,20 @@ pub fn router(
 
 async fn serve_did_document(
     State(state): State<Arc<AccountHttpState>>,
-    headers: HeaderMap,
+    request: Request,
 ) -> Response {
-    serve_artifact(&state, &headers, ArtifactKind::DidDocument).await
+    serve_artifact(&state, request, ArtifactKind::DidDocument).await
 }
 
 async fn serve_atproto_did(
     State(state): State<Arc<AccountHttpState>>,
-    headers: HeaderMap,
+    request: Request,
 ) -> Response {
-    serve_artifact(&state, &headers, ArtifactKind::AtprotoDid).await
+    serve_artifact(&state, request, ArtifactKind::AtprotoDid).await
 }
 
-async fn serve_did_log(State(state): State<Arc<AccountHttpState>>, headers: HeaderMap) -> Response {
-    serve_artifact(&state, &headers, ArtifactKind::DidLog).await
+async fn serve_did_log(State(state): State<Arc<AccountHttpState>>, request: Request) -> Response {
+    serve_artifact(&state, request, ArtifactKind::DidLog).await
 }
 
 #[derive(Clone, Copy)]
@@ -312,25 +312,41 @@ enum ArtifactKind {
 
 async fn serve_artifact(
     state: &AccountHttpState,
-    headers: &HeaderMap,
+    request: Request,
     kind: ArtifactKind,
 ) -> Response {
     // A credential-bearing request must never reach an artifact lookup. This
     // explicit rejection is the testable security boundary for the separate
     // origin; there is no cookie/session/bearer middleware to accidentally
     // inherit from the authenticated service.
-    if headers.contains_key(header::AUTHORIZATION) || headers.contains_key(header::COOKIE) {
-        return (StatusCode::BAD_REQUEST, "credentials are not accepted").into_response();
-    }
-    let Some(host) = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return StatusCode::BAD_REQUEST.into_response();
+    let label = {
+        let headers: &HeaderMap = request.headers();
+        if headers.contains_key(header::AUTHORIZATION) || headers.contains_key(header::COOKIE) {
+            return (StatusCode::BAD_REQUEST, "credentials are not accepted").into_response();
+        }
+        // HTTP/1.1 supplies Host, while HTTP/2 carries the origin in the
+        // :authority pseudo-header, which `http` exposes as the URI authority.
+        // Prefer an explicitly supplied Host; only an absent Host may fall back
+        // to :authority. This keeps malformed Host values fail-closed.
+        let host = match headers.get(header::HOST) {
+            Some(value) => match value.to_str() {
+                Ok(host) => host,
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            },
+            None => match request.uri().authority() {
+                Some(authority) => authority.as_str(),
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            },
+        };
+        if host.is_empty() {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        let Some(label) = host_label(host, &state.zone) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        label
     };
-    let Some(label) = host_label(host, &state.zone) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    drop(request);
     let artifact = match state.directory.lookup(&label).await {
         Ok(Some(artifact)) => artifact,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -523,6 +539,44 @@ mod tests {
             to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
             b"sealed-did-document"
         );
+    }
+
+    #[tokio::test]
+    async fn authority_only_requests_use_http2_uri_authority() {
+        let app = router("tormentnexus.social", directory()).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("https://alice.tormentnexus.social/.well-known/did.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+            b"sealed-did-document"
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_only_requests_still_reject_credentials() {
+        let app = router("tormentnexus.social", directory()).unwrap();
+        for name in [header::AUTHORIZATION, header::COOKIE] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("https://alice.tormentnexus.social/.well-known/did.json")
+                        .header(name, "present")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
     }
 
     #[tokio::test]
