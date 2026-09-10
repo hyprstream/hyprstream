@@ -679,6 +679,28 @@ async fn resolve_account_http_tls(
         "account TLS private key is unavailable: {}",
         config.tls_key.display()
     );
+    let cert_pem = std::fs::read(&config.tls_cert)?;
+    let cert_der = rustls_pemfile::certs(&mut &cert_pem[..])
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("account TLS certificate contains no certificate"))??;
+    let (_, certificate) = x509_parser::parse_x509_certificate(cert_der.as_ref())
+        .map_err(|error| anyhow::anyhow!("invalid account TLS certificate: {error}"))?;
+    let wildcard = zone.wildcard_domain();
+    let covers_zone = certificate.extensions().iter().any(|extension| {
+        matches!(
+            extension.parsed_extension(),
+            x509_parser::extensions::ParsedExtension::SubjectAlternativeName(names)
+                if names.general_names.iter().any(|name| matches!(
+                    name,
+                    x509_parser::extensions::GeneralName::DNSName(dns)
+                        if dns.eq_ignore_ascii_case(wildcard)
+                ))
+        )
+    });
+    anyhow::ensure!(
+        covers_zone,
+        "account TLS certificate does not cover account zone wildcard {wildcard}"
+    );
     axum_server::tls_rustls::RustlsConfig::from_pem_file(&config.tls_cert, &config.tls_key)
         .await
         .map_err(|error| {
@@ -1241,7 +1263,7 @@ impl Spawnable for OAuthService {
                     )
                 })?;
                 let directory = Arc::new(
-                    hyprstream_pds_service::account_http::MountedHostedAccountHttpDirectory::new(
+                    hyprstream_pds_service::account_http::MountedHostedAccountHttpDirectory::new_without_refresh(
                         store,
                         hyprstream_rpc::Subject::new(
                             hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
@@ -1352,6 +1374,7 @@ impl Spawnable for OAuthService {
             let account_shutdown = Arc::new(Notify::new());
             let mut account_owner: Option<(
                 tokio::task::JoinHandle<Result<(), hyprstream_rpc::error::RpcError>>,
+                bool,
                 bool,
             )> = None;
             let bridge_init: Result<Arc<LocalServiceBridge>, hyprstream_rpc::error::RpcError> =
@@ -1476,15 +1499,37 @@ impl Spawnable for OAuthService {
                         )
                         .await
                     });
+                    let account_enabled = account_endpoint.is_some();
                     let mut account_loop = match account_endpoint {
-                        Some((account_bound, account_app)) => tokio::task::spawn_local(
-                            crate::server::tls::serve_bound(
-                                account_bound,
-                                account_app,
-                                Arc::clone(&account_shutdown),
-                                "AccountHttpService",
-                            ),
-                        ),
+                        Some((account_bound, account_app)) => {
+                            let account_shutdown_task = Arc::clone(&account_shutdown);
+                            tokio::task::spawn_local(
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    let runtime = tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()
+                                        .map_err(|error| {
+                                            hyprstream_rpc::error::RpcError::SpawnFailed(
+                                                format!("account HTTP runtime: {error}"),
+                                            )
+                                        })?;
+                                    runtime.block_on(crate::server::tls::serve_bound(
+                                        account_bound,
+                                        account_app,
+                                        account_shutdown_task,
+                                        "AccountHttpService",
+                                    ))
+                                })
+                                .await
+                                .map_err(|join| {
+                                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                                        "account HTTP worker join error: {join}"
+                                    ))
+                                })?
+                            },
+                            )
+                        }
                         None => tokio::task::spawn_local(async {
                             std::future::pending::<Result<(), hyprstream_rpc::error::RpcError>>().await
                         }),
@@ -1539,7 +1584,7 @@ impl Spawnable for OAuthService {
                         }
                     };
                     rpc_owner = Some((rpc_loop, rpc_consumed));
-                    account_owner = Some((account_loop, account_consumed));
+                    account_owner = Some((account_loop, account_consumed, account_enabled));
                     outcome
                 }.await
             };
@@ -1550,8 +1595,11 @@ impl Spawnable for OAuthService {
             // primary error is preserved; cleanup failures are logged as
             // context, never masked. ──
             account_shutdown.notify_waiters();
-            if let Some((mut account_loop, account_consumed)) = account_owner.take() {
-                if !account_consumed {
+            if let Some((mut account_loop, account_consumed, account_enabled)) = account_owner.take() {
+                if !account_enabled {
+                    account_loop.abort();
+                    let _ = account_loop.await;
+                } else if !account_consumed {
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(45),
                         &mut account_loop,

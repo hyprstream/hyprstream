@@ -203,6 +203,26 @@ impl MountedHostedAccountHttpDirectory {
         authority: hyprstream_rpc::Subject,
         zone: impl Into<String>,
     ) -> Result<Self> {
+        Self::new_inner(store, authority, zone, true)
+    }
+
+    /// Construct a directory without scheduling a refresh on the caller's
+    /// runtime. Production OAuth uses this after performing the bounded warm-up
+    /// on its owned runtime, avoiding detached blocking work during shutdown.
+    pub fn new_without_refresh(
+        store: Arc<AccountRecordStore>,
+        authority: hyprstream_rpc::Subject,
+        zone: impl Into<String>,
+    ) -> Result<Self> {
+        Self::new_inner(store, authority, zone, false)
+    }
+
+    fn new_inner(
+        store: Arc<AccountRecordStore>,
+        authority: hyprstream_rpc::Subject,
+        zone: impl Into<String>,
+        schedule_refresh: bool,
+    ) -> Result<Self> {
         ensure!(
             authority.name() == Some(OAUTH_ACCOUNT_RESOLVER_SUBJECT),
             "hosted HTTP directory requires the fixed OAuth resolver subject"
@@ -212,9 +232,11 @@ impl MountedHostedAccountHttpDirectory {
             authority,
             zone: canonical_zone(&zone.into())?,
         };
-        directory
-            .store
-            .schedule_hosted_did_index_refresh(directory.authority.clone());
+        if schedule_refresh {
+            directory
+                .store
+                .schedule_hosted_did_index_refresh(directory.authority.clone());
+        }
         Ok(directory)
     }
 }
