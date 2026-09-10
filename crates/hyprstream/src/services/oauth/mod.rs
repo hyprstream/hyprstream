@@ -423,6 +423,54 @@ async fn build_oauth_iroh_substrate(
     .await
 }
 
+async fn warm_hosted_did_index(
+    store: Arc<hyprstream_pds_service::AccountRecordStore>,
+    authority: hyprstream_rpc::Subject,
+    timeout: std::time::Duration,
+) -> Result<(), hyprstream_rpc::error::RpcError> {
+    // The descriptor-backed PDS mount performs synchronous file and audit I/O
+    // inside its async trait methods. Run the warm-up on an owned OS thread so
+    // the timeout can return without leaving a Tokio blocking-pool task that
+    // runtime shutdown must await.
+    let (warmup_tx, warmup_rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("hyprstream-oauth-index-warmup".to_owned())
+        .spawn(move || {
+            let result = (|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("warm-up runtime: {error}"))?;
+                runtime
+                    .block_on(store.refresh_hosted_did_index(&authority))
+                    .map_err(|error| format!("index refresh: {error}"))
+            })();
+            let _ = warmup_tx.send(result);
+        })
+        .map_err(|error| {
+            hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                "hosted account index warm-up thread failed: {error}"
+            ))
+        })?;
+    tokio::time::timeout(timeout, warmup_rx)
+        .await
+        .map_err(|_| {
+            hyprstream_rpc::error::RpcError::SpawnFailed(
+                "hosted account index warm-up timed out".to_owned(),
+            )
+        })?
+        .map_err(|error| {
+            hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                "hosted account index warm-up thread exited: {error}"
+            ))
+        })?
+        .map_err(|error| {
+            hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                "hosted account index warm-up failed: {error}"
+            ))
+        })
+}
+
 pub struct OAuthService {
     config: OAuthConfig,
     /// Global TLS configuration (passed from factory, avoids re-loading config)
@@ -856,21 +904,12 @@ impl Spawnable for OAuthService {
                 let authority = hyprstream_rpc::Subject::new(
                     hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
                 );
-                tokio::time::timeout(
+                warm_hosted_did_index(
+                    Arc::clone(store),
+                    authority,
                     std::time::Duration::from_secs(30),
-                    store.refresh_hosted_did_index(&authority),
                 )
-                .await
-                .map_err(|_| {
-                    hyprstream_rpc::error::RpcError::SpawnFailed(
-                        "hosted account index warm-up timed out".to_owned(),
-                    )
-                })?
-                .map_err(|error| {
-                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
-                        "hosted account index warm-up failed: {error}"
-                    ))
-                })?;
+                .await?;
             }
             // Populate legacy JWKS nbf/exp from signing-key file mtime (used when store absent).
             let key_nbf = crate::auth::identity_store::node_signing_key_mtime(&credentials_dir);
@@ -1229,6 +1268,48 @@ mod tests {
         assert!(
             !warmup_block.contains("spawn_blocking"),
             "hosted-DID warm-up timeout must not leave an uncancellable blocking task"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hosted_did_warmup_timeout_does_not_wait_for_blocking_scan() {
+        struct SlowReads;
+        impl hyprstream_pds_service::AccountRecordReadAuthorizer for SlowReads {
+            fn check_read(
+                &self,
+                _subject: &hyprstream_rpc::Subject,
+                _verified_tenant: Option<&str>,
+                _security_context: Option<&hyprstream_rpc::auth::mac::SecurityContext>,
+                _object_id: &str,
+            ) -> hyprstream_rpc::auth::mac::MacDecision {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                hyprstream_rpc::auth::mac::MacDecision::Permit
+            }
+        }
+
+        let store = Arc::new(hyprstream_pds_service::AccountRecordStore::new(
+            Arc::new(hyprstream_vfs::SyntheticMount::new(
+                hyprstream_vfs::SyntheticNode::dir(),
+            )),
+            Arc::new(SlowReads),
+        ));
+        let started = std::time::Instant::now();
+        let result = warm_hosted_did_index(
+            store,
+            hyprstream_rpc::Subject::new(
+                hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+            ),
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(hyprstream_rpc::error::RpcError::SpawnFailed(message))
+                if message.contains("timed out")
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "timeout must return without joining the blocking scan"
         );
     }
 
