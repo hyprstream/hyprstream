@@ -18,7 +18,58 @@ use crate::storage::paths::StoragePaths;
 use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use zeroize::{Zeroize, Zeroizing};
+
+/// Process-wide validated configuration snapshot (#1585).
+///
+/// Binary startup installs the configuration it parsed and validated (from an
+/// explicit `--config` file or the default locations) into this write-once
+/// slot BEFORE any resolver, factory, or service thread runs. Every later
+/// [`HyprConfig::load()`] — including the reloads inside service factories and
+/// network modules that used to re-read XDG defaults and silently drop an
+/// explicit `--config` deployment's settings — then observes that one pinned
+/// snapshot instead of re-deriving a divergent configuration.
+///
+/// The slot is immutable once written: there is no runtime mutation path, and
+/// the snapshot replaces an unchanged-contract reload rather than authorizing
+/// anything by itself (checkpoint, trust, Policy, and service-key validation
+/// all stay exactly where they were). Tests that need a different
+/// configuration run in isolated child processes.
+static PINNED_CONFIG: OnceLock<HyprConfig> = OnceLock::new();
+
+/// Install the process-wide validated configuration snapshot (write-once).
+///
+/// Returns `true` when this call installed the snapshot; `false` when an
+/// earlier install won (first write wins, matching the
+/// `install_envelope_verify_config` precedent). Callers at the single binary
+/// startup site may ignore the result.
+pub fn install_pinned_config(config: HyprConfig) -> bool {
+    PINNED_CONFIG.set(config).is_ok()
+}
+
+/// The installed validated configuration snapshot, if startup pinned one.
+pub fn pinned_config() -> Option<&'static HyprConfig> {
+    PINNED_CONFIG.get()
+}
+
+/// Canonical absolute provenance of the operator's explicit config selector
+/// (CLI `--config` or the `HYPRSTREAM_CONFIG` env), installed by binary
+/// startup before the first load (#1585). Library code that launches services
+/// (bootstrap, wizard) forwards exactly this value to
+/// [`crate::cli::handle_service_start`] so children load the same file;
+/// `None` means defaults-resolution. Write-once, like the snapshot.
+static EXPLICIT_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Install the canonical explicit config selector provenance (write-once).
+pub fn install_explicit_config_path(path: PathBuf) -> bool {
+    EXPLICIT_CONFIG_PATH.set(path).is_ok()
+}
+
+/// The canonical explicit selector, if the operator supplied one.
+pub fn explicit_config_path() -> Option<&'static PathBuf> {
+    EXPLICIT_CONFIG_PATH.get()
+}
 
 /// Unified configuration for the Hyprstream system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1910,7 +1961,7 @@ impl Default for MetricsConfig {
 pub struct ServicesConfig {
     /// Services to start automatically at startup (ipc-systemd mode)
     ///
-    /// Default: ["registry", "policy", "worker", "event"]
+    /// Default: the factories compiled into the standard service roster.
     #[serde(default = "default_startup_services")]
     pub startup: Vec<String>,
 }
@@ -1925,22 +1976,30 @@ impl Default for ServicesConfig {
 
 /// Default list of services to start at startup
 fn default_startup_services() -> Vec<String> {
-    vec![
+    let mut services = vec![
         "event".to_owned(),     // Must start first (message bus)
         "registry".to_owned(),  // Model registry
         "policy".to_owned(),    // Authorization
-        "streams".to_owned(),       // Streaming proxy with JWT validation
-        "notification".to_owned(),  // Encrypted notification relay (uses streams)
-        "worker".to_owned(),        // Container workloads
-        "model".to_owned(),         // Model management (publishes to notification)
+        "streams".to_owned(),   // Streaming proxy with JWT validation
+        "worker".to_owned(),    // Container workloads
+        "model".to_owned(),     // Model management
         "oauth".to_owned(),     // OAuth 2.1 authorization server
         "oai".to_owned(),       // OpenAI-compatible HTTP API
-        "flight".to_owned(),    // Arrow Flight SQL server
+    ];
+    #[cfg(feature = "metrics")]
+    {
+        services.push("flight".to_owned()); // Arrow Flight SQL server
+    }
+    services.extend([
         "discovery".to_owned(), // Endpoint discovery (RFC 9728 metadata)
         "mcp".to_owned(),       // Model Context Protocol service
         "tui".to_owned(),       // Terminal multiplexer display server
-        "metrics".to_owned(),   // Metrics ingest and query (DuckDB/DataFusion)
-    ]
+    ]);
+    #[cfg(feature = "metrics")]
+    {
+        services.push("metrics".to_owned()); // Metrics ingest and query
+    }
+    services
 }
 
 /// Model loading and identification
@@ -2663,7 +2722,15 @@ impl HyprConfig {
     }
 
     /// Load configuration using the config crate with XDG directories and environment variables
+    ///
+    /// When binary startup pinned a validated snapshot ([`install_pinned_config`]),
+    /// that snapshot IS the process configuration: the XDG/env re-derivation is
+    /// skipped so factory and service-module reloads can never diverge from the
+    /// `--config` file main already loaded and validated.
     pub fn load() -> Result<Self, ConfigError> {
+        if let Some(pinned) = PINNED_CONFIG.get() {
+            return Ok(pinned.clone());
+        }
         let storage = StoragePaths::new().map_err(|e| {
             ConfigError::Message(format!("Failed to initialize storage paths: {e}"))
         })?;
@@ -3187,6 +3254,32 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_startup_services_are_available_in_this_build() {
+        let startup = super::default_startup_services();
+        assert!(
+            !startup.iter().any(|name| name == "notification"),
+            "the removed notification service must not remain in the default roster"
+        );
+        for name in &startup {
+            assert!(
+                hyprstream_service::get_factory(name).is_some(),
+                "default service {name} must have a factory in this build"
+            );
+        }
+
+        #[cfg(feature = "metrics")]
+        {
+            assert!(startup.iter().any(|name| name == "flight"));
+            assert!(startup.iter().any(|name| name == "metrics"));
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            assert!(!startup.iter().any(|name| name == "flight"));
+            assert!(!startup.iter().any(|name| name == "metrics"));
+        }
+    }
+
     #[tokio::test]
     async fn oauth_cors_origin_list_from_environment_preserves_scalars() -> anyhow::Result<()> {
         use axum::{body::Body, http::{header, Request}, routing::get, Router};
@@ -4287,4 +4380,82 @@ fn default_training_steps_per_cycle() -> usize {
 }
 fn default_training_min_quality() -> f32 {
     0.3
+}
+
+#[cfg(test)]
+mod pinned_config_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    const PINNED_CHILD: &str = "HYPRSTREAM_PINNED_CONFIG_CHILD";
+
+    /// The write-once snapshot must be the ONE process configuration: after
+    /// startup pins the validated explicit file, factory-style
+    /// `HyprConfig::load()` calls observe the snapshot even when the XDG
+    /// default changes underneath, and never follow source-file rereads.
+    /// Runs in an isolated child because the slot is process-global.
+    #[test]
+    fn pinned_config_snapshot_observed_by_load() -> anyhow::Result<()> {
+        if std::env::var_os(PINNED_CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "config::pinned_config_tests::pinned_config_snapshot_observed_by_load",
+                    "--nocapture",
+                ])
+                .env(PINNED_CHILD, "1")
+                .status()?;
+            anyhow::ensure!(status.success(), "pinned-config regression failed");
+            return Ok(());
+        }
+
+        let root = tempfile::tempdir()?;
+        let xdg = root.path().join("xdg-config");
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        let default_config = xdg.join("hyprstream").join("config.toml");
+        std::fs::create_dir_all(default_config.parent().expect("parent"))?;
+
+        let write_config = |path: &Path, secrets: &Path| -> anyhow::Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut configured = HyprConfig::default();
+            configured.secrets.path = Some(secrets.to_path_buf());
+            configured.to_file(path)
+        };
+
+        // XDG default initially points at B; the operator's explicit file at A.
+        let secrets_b = root.path().join("secrets-B");
+        write_config(&default_config, &secrets_b)?;
+        let explicit = root.path().join("custom dir/custom.toml");
+        let secrets_a = root.path().join("secrets-A");
+        write_config(&explicit, &secrets_a)?;
+
+        // Main's path: load the explicit file, validate, pin.
+        let loaded = HyprConfig::from_file(&explicit)?;
+        loaded.validate()?;
+        let _ = install_pinned_config(loaded);
+
+        // Post-pin drift: the XDG default changes to C and the explicit source
+        // file changes to D. Factory-style reloads must stay on the snapshot.
+        let secrets_c = root.path().join("secrets-C");
+        write_config(&default_config, &secrets_c)?;
+        let reloaded = HyprConfig::load().expect("pinned reload");
+        assert_eq!(
+            reloaded.secrets.path,
+            Some(secrets_a.clone()),
+            "factory-style HyprConfig::load() must observe the pinned snapshot, not XDG defaults"
+        );
+        let secrets_d = root.path().join("secrets-D");
+        write_config(&explicit, &secrets_d)?;
+        let again = HyprConfig::load().expect("second pinned reload");
+        assert_eq!(
+            again.secrets.path,
+            Some(secrets_a),
+            "load() must not follow source-file rereads after the pin"
+        );
+        std::env::remove_var("XDG_CONFIG_HOME");
+        Ok(())
+    }
 }

@@ -1,0 +1,541 @@
+//! Explicit public AT Protocol CBOR boundary over the existing value type.
+//!
+//! Public DAG-CBOR orders text map keys by encoded bytes: UTF-8 byte length
+//! first, then lexical bytes. The existing native codec has a different order
+//! and is retained for already-signed artifacts. Neither decoder falls back to
+//! the other's order. This module does not change existing record, commit, MST
+//! or identity call sites, and does not establish public repository readiness.
+//!
+//! Integer-only AT data uses signed 64-bit integers. The public encoder checks
+//! this and validates map structure/depth before invoking the existing scalar
+//! writer. The decoder retains minimal-width, tag, UTF-8, duplicate-key and
+//! bounded-depth checks. Floats remain unsupported by the AT data model.
+
+use std::cmp::Ordering;
+
+use anyhow::{ensure, Result};
+
+use crate::cid::Cid;
+use crate::dag_cbor::DagCbor;
+use crate::tid::Tid;
+
+const MAX_DEPTH: usize = 128;
+
+/// A validated AT Protocol record key.
+///
+/// Record keys are user-controlled path segments. They may be TIDs, literal
+/// values such as `self`, NSIDs, or any other value permitted by the baseline
+/// record-key syntax; they are not limited to the TID format.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AtprotoRecordKey(String);
+
+impl AtprotoRecordKey {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        ensure!(
+            (1..=512).contains(&value.len())
+                && value.is_ascii()
+                && value != "."
+                && value != ".."
+                && value.bytes().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_' | b':' | b'~')
+                }),
+            "invalid AT record key"
+        );
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<Tid> for AtprotoRecordKey {
+    fn from(value: Tid) -> Self {
+        Self(value.encode())
+    }
+}
+
+impl From<&Tid> for AtprotoRecordKey {
+    fn from(value: &Tid) -> Self {
+        Self::from(*value)
+    }
+}
+
+impl From<&AtprotoRecordKey> for AtprotoRecordKey {
+    fn from(value: &AtprotoRecordKey) -> Self {
+        value.clone()
+    }
+}
+
+/// A generic public AT Protocol repository record.
+///
+/// The value is retained as a typed DAG-CBOR value and its exact public bytes
+/// and CID are derived once at construction. This is deliberately independent
+/// of native `ModelRecord`: any supported collection can be stored without
+/// converting through a lossy JSON DTO. Construction validates the collection,
+/// general record key, `$type` discriminator and canonical public bytes; it does
+/// not grant write authority or perform a full Lexicon validation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AtprotoRecord {
+    collection: String,
+    rkey: AtprotoRecordKey,
+    value: DagCbor,
+    bytes: Vec<u8>,
+    cid: Cid,
+}
+
+impl AtprotoRecord {
+    pub fn new(
+        collection: impl Into<String>,
+        rkey: impl Into<AtprotoRecordKey>,
+        value: DagCbor,
+    ) -> Result<Self> {
+        let collection = collection.into();
+        let rkey: AtprotoRecordKey = rkey.into();
+        validate_nsid(&collection)?;
+        let type_value = value
+            .get("$type")
+            .ok_or_else(|| anyhow::anyhow!("AT record is missing $type"))?
+            .as_str()?;
+        ensure!(
+            type_value == collection,
+            "AT record $type does not match collection"
+        );
+        let bytes = encode(&value)?;
+        let cid = Cid::from_dag_cbor(&bytes);
+        Ok(Self {
+            collection,
+            rkey,
+            value,
+            bytes,
+            cid,
+        })
+    }
+
+    /// Reconstruct a record only when bytes are already strict public
+    /// canonical encoding. This check prevents a caller from changing the CID
+    /// by normalizing at a later boundary.
+    pub fn from_bytes(
+        collection: impl Into<String>,
+        rkey: impl Into<AtprotoRecordKey>,
+        bytes: &[u8],
+    ) -> Result<Self> {
+        let value = decode(bytes)?;
+        let record = Self::new(collection, rkey, value)?;
+        ensure!(record.bytes == bytes, "AT record bytes are not canonical");
+        Ok(record)
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The validated collection NSID. Record identity fields are immutable
+    /// after construction so this always agrees with `bytes()` and `cid()`.
+    pub fn collection(&self) -> &str {
+        &self.collection
+    }
+
+    /// The validated record key.
+    pub fn rkey(&self) -> &AtprotoRecordKey {
+        &self.rkey
+    }
+
+    /// The validated record value.
+    pub fn value(&self) -> &DagCbor {
+        &self.value
+    }
+
+    pub fn cid(&self) -> Cid {
+        self.cid
+    }
+    pub fn uri(&self, did: &str) -> String {
+        format!("at://{did}/{}/{}", self.collection, self.rkey.as_str())
+    }
+}
+
+fn validate_nsid(nsid: &str) -> Result<()> {
+    ensure!(
+        !nsid.is_empty() && nsid.len() <= 317 && nsid.is_ascii(),
+        "invalid AT collection NSID"
+    );
+    let segments: Vec<&str> = nsid.split('.').collect();
+    ensure!(
+        segments.len() >= 3,
+        "invalid NSID: authority and name required"
+    );
+
+    let name = segments.last().copied().unwrap_or_default();
+    ensure!(
+        (1..=63).contains(&name.len())
+            && name.as_bytes()[0].is_ascii_alphabetic()
+            && name.bytes().all(|c| c.is_ascii_alphanumeric()),
+        "invalid NSID name"
+    );
+
+    let authority = &segments[..segments.len() - 1];
+    let authority_len = nsid.len() - name.len() - 1;
+    ensure!(
+        authority.len() >= 2 && authority_len <= 253,
+        "invalid NSID authority"
+    );
+    for (index, segment) in authority.iter().enumerate() {
+        ensure!(
+            (1..=63).contains(&segment.len())
+                && segment
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                && segment.as_bytes()[0] != b'-'
+                && segment.as_bytes()[segment.len() - 1] != b'-'
+                && (index != 0 || segment.as_bytes()[0].is_ascii_alphabetic()),
+            "invalid NSID segment"
+        );
+    }
+    Ok(())
+}
+
+fn key_order(a: &[u8], b: &[u8]) -> Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// Encode a value in the public AT Protocol format without mutating it.
+/// This is canonical serialization, not schema validation or authorization.
+pub fn encode(value: &DagCbor) -> Result<Vec<u8>> {
+    Ok(normalize(value, 0)?.encode())
+}
+
+/// Decode exactly one strictly canonical public AT Protocol value.
+/// No legacy/native ordering fallback is permitted.
+pub fn decode(bytes: &[u8]) -> Result<DagCbor> {
+    let value = DagCbor::decode_with_order(bytes, key_order)?;
+    // Enforce signed integer bounds and the same construction constraints as
+    // encode; byte-level canonicality has already been checked by the parser.
+    normalize(&value, 0)
+}
+
+fn normalize(value: &DagCbor, depth: usize) -> Result<DagCbor> {
+    ensure!(
+        depth <= MAX_DEPTH,
+        "ATProto CBOR nesting exceeds {MAX_DEPTH}"
+    );
+    Ok(match value {
+        DagCbor::Unsigned(n) => {
+            ensure!(
+                *n <= i64::MAX as u64,
+                "ATProto integer exceeds signed 64-bit range"
+            );
+            value.clone()
+        }
+        DagCbor::Negative(n) => {
+            ensure!(
+                *n >= i64::MIN as i128 && *n < 0,
+                "ATProto negative integer outside signed 64-bit range"
+            );
+            value.clone()
+        }
+        DagCbor::List(items) => DagCbor::List(
+            items
+                .iter()
+                .map(|item| normalize(item, depth + 1))
+                .collect::<Result<_>>()?,
+        ),
+        DagCbor::Map(pairs) => {
+            let mut normalized = Vec::with_capacity(pairs.len());
+            for (key, val) in pairs {
+                ensure!(depth < MAX_DEPTH, "ATProto CBOR map exceeds nesting limit");
+                let text = key.as_str()?;
+                normalized.push((text.to_owned(), normalize(val, depth + 1)?));
+            }
+            normalized.sort_by(|(a, _), (b, _)| key_order(a.as_bytes(), b.as_bytes()));
+            ensure!(
+                normalized.windows(2).all(|pair| pair[0].0 != pair[1].0),
+                "duplicate ATProto CBOR map key"
+            );
+            DagCbor::Map(
+                normalized
+                    .into_iter()
+                    .map(|(k, v)| (DagCbor::Text(k), v))
+                    .collect(),
+            )
+        }
+        _ => value.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+    use crate::car::{build_public_record_proof_car, parse_car_v1_atproto};
+    use crate::commit::{Commit, UnsignedCommit};
+    use crate::mst::Node;
+    use crate::tid::Tid;
+    use crate::Cid;
+    use p256::ecdsa::SigningKey;
+
+    fn post() -> DagCbor {
+        DagCbor::str_map([
+            ("$type", DagCbor::Text("app.bsky.feed.post".into())),
+            ("text", DagCbor::Text("Hello from Torment Nexus".into())),
+            (
+                "createdAt",
+                DagCbor::Text("2026-09-09T00:00:00.000Z".into()),
+            ),
+        ])
+    }
+
+    #[test]
+    fn public_post_matches_upstream_bytes_and_cid() {
+        // Generated independently with @atproto/lex-cbor 0.1.6 encode/cidForLex.
+        let upstream = hex::decode("a36474657874781848656c6c6f2066726f6d20546f726d656e74204e65787573652474797065726170702e62736b792e666565642e706f7374696372656174656441747818323032362d30392d30395430303a30303a30302e3030305a").unwrap();
+        let bytes = encode(&post()).unwrap();
+        assert_eq!(bytes, upstream);
+        assert_eq!(
+            Cid::from_dag_cbor(&bytes).to_string(),
+            "bafyreiaapk47b4fmdslcizkj5aj6ws6bmpmvfvjq3ryhx5qwgug6tldalm"
+        );
+        assert_eq!(encode(&decode(&bytes).unwrap()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn native_bytes_and_strict_verifier_remain_separate() {
+        let value = DagCbor::str_map([("aa", DagCbor::Unsigned(1)), ("b", DagCbor::Unsigned(2))]);
+        let native = hex::decode("a262616101616202").unwrap();
+        let public = hex::decode("a261620262616101").unwrap();
+        assert_eq!(value.encode(), native);
+        assert_eq!(DagCbor::decode(&native).unwrap(), value);
+        assert_eq!(encode(&value).unwrap(), public);
+        assert!(DagCbor::decode(&public).is_err());
+        assert!(decode(&native).is_err());
+    }
+
+    #[test]
+    fn public_order_applies_to_nested_maps_and_utf8_byte_lengths() {
+        let inner = DagCbor::str_map([("é", DagCbor::Bool(true)), ("z", DagCbor::Bool(false))]);
+        let value = DagCbor::list([inner]);
+        assert_eq!(hex::encode(encode(&value).unwrap()), "81a2617af462c3a9f5");
+        assert_eq!(
+            encode(&decode(&encode(&value).unwrap()).unwrap()).unwrap(),
+            encode(&value).unwrap()
+        );
+    }
+
+    #[test]
+    fn malformed_construction_is_rejected_without_panic() {
+        for value in [
+            DagCbor::Negative(0),
+            DagCbor::Negative(i128::MIN),
+            DagCbor::Unsigned(u64::MAX),
+            DagCbor::Map(vec![(DagCbor::Bool(true), DagCbor::Null)]),
+            DagCbor::Map(vec![(DagCbor::Text("a".into()), DagCbor::Null); 2]),
+        ] {
+            assert!(encode(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn nsid_validation_matches_at_protocol_syntax() {
+        for valid in [
+            "com.example.fooBar",
+            "net.users.bob.ping",
+            "a-0.b-1.c",
+            "a.b.c",
+            "cn.8.lex.stuff",
+        ] {
+            validate_nsid(valid).unwrap();
+        }
+        for invalid in [
+            "com.example",
+            "com.example.3",
+            "1.example.record",
+            "com.-example.record",
+            "com.example-.record",
+            "com.example.re-cord",
+            "com..example.record",
+            "com.example.",
+            "com.example.é",
+            "com.example.this_name_is_invalid",
+        ] {
+            assert!(validate_nsid(invalid).is_err(), "{invalid}");
+        }
+        assert!(validate_nsid(&format!("com.{}.record", "a".repeat(64))).is_err());
+        assert!(validate_nsid(&format!("com.example.{}", "a".repeat(64))).is_err());
+        assert!(validate_nsid(&format!(
+            "{}.{}.{}.{}.record",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63),
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn record_identity_fields_are_immutable_after_construction() {
+        let record = AtprotoRecord::new("app.bsky.feed.post", Tid::from_raw(7), post()).unwrap();
+        assert_eq!(record.collection(), "app.bsky.feed.post");
+        assert_eq!(record.rkey().as_str(), Tid::from_raw(7).encode());
+        assert_eq!(record.value(), &post());
+        assert_eq!(record.cid(), Cid::from_dag_cbor(record.bytes()));
+    }
+
+    #[test]
+    fn literal_record_key_is_preserved_in_public_proof_path() {
+        let collection = "app.bsky.actor.profile";
+        let key = AtprotoRecordKey::new("self").unwrap();
+        let value = DagCbor::str_map([("$type", DagCbor::Text(collection.to_owned()))]);
+        let record = AtprotoRecord::new(collection, &key, value).unwrap();
+        let mut records = std::collections::BTreeMap::new();
+        records.insert(format!("{collection}/self"), record.cid());
+        let tree = Node::from_keyed_records(&records);
+        let proof = tree.proof_atproto(collection, &key).unwrap();
+        let root = tree
+            .to_node_data_with_blocks_atproto()
+            .unwrap()
+            .0
+            .cid_atproto()
+            .unwrap();
+        proof.verify_atproto(&root, &record.cid()).unwrap();
+        assert_eq!(record.rkey().as_str(), "self");
+        assert!(AtprotoRecordKey::new(".").is_err());
+    }
+
+    #[test]
+    fn decoder_retains_strictness_and_integer_bounds() {
+        for wire in [
+            "a2616101616102",     // duplicate keys
+            "1817",               // nonminimal integer
+            "00ff",               // trailing data
+            "9fff",               // indefinite array
+            "c000",               // unsupported tag
+            "61ff",               // invalid UTF-8
+            "1b8000000000000000", // outside signed integer range
+            "3b8000000000000000", // below signed integer range
+        ] {
+            assert!(decode(&hex::decode(wire).unwrap()).is_err(), "{wire}");
+        }
+    }
+
+    #[test]
+    fn links_and_signed_integer_extremes_round_trip() {
+        let value = DagCbor::list([
+            DagCbor::Link(Cid::from_raw(b"public blob")),
+            DagCbor::Unsigned(i64::MAX as u64),
+            DagCbor::Negative(i64::MIN as i128),
+        ]);
+        assert_eq!(decode(&encode(&value).unwrap()).unwrap(), value);
+    }
+
+    #[test]
+    fn public_record_mst_commit_and_car_proof_round_trip() {
+        let rkey = Tid::from_raw(7);
+        let record = AtprotoRecord::new("app.bsky.feed.post", rkey, post()).unwrap();
+        let tree = Node::from_keyed_records(
+            &[(
+                format!("app.bsky.feed.post/{}", rkey.encode()),
+                record.cid(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let (root_data, node_blocks) = tree.to_node_data_with_blocks_atproto().unwrap();
+        let root = root_data.cid_atproto().unwrap();
+        let unsigned =
+            UnsignedCommit::new("did:web:tormentnexus.social", root, Tid::from_raw(8), None);
+        let signing = SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+        let commit = Commit::sign_atproto(&unsigned, &signing).unwrap();
+        commit.verify_atproto(signing.verifying_key()).unwrap();
+        let proof = tree.proof_atproto("app.bsky.feed.post", rkey).unwrap();
+        proof.verify_atproto(&root, &record.cid()).unwrap();
+        let car = build_public_record_proof_car(&commit, &proof, &node_blocks, &record).unwrap();
+        let (roots, blocks) = parse_car_v1_atproto(&car).unwrap();
+        assert_eq!(roots, vec![commit.cid_atproto().unwrap()]);
+        assert!(blocks
+            .iter()
+            .any(|(cid, bytes)| *cid == record.cid() && bytes == record.bytes()));
+        assert!(blocks
+            .iter()
+            .any(|(cid, bytes)| *cid == commit.cid_atproto().unwrap()
+                && bytes == &commit.to_atproto_dag_cbor().unwrap()));
+
+        let empty = crate::mst::Proof { path: Vec::new() };
+        assert!(build_public_record_proof_car(&commit, &empty, &node_blocks, &record).is_err());
+
+        let wrong_unsigned = UnsignedCommit::new(
+            "did:web:tormentnexus.social",
+            Cid::from_dag_cbor(b"wrong public root"),
+            Tid::from_raw(9),
+            None,
+        );
+        let wrong_commit = Commit::sign_atproto(&wrong_unsigned, &signing).unwrap();
+        assert!(
+            build_public_record_proof_car(&wrong_commit, &proof, &node_blocks, &record).is_err()
+        );
+
+        // The record bytes/CID are identical, but its record key is different.
+        // A proof must remain bound to the collection/rkey path.
+        let wrong_record =
+            AtprotoRecord::new("app.bsky.feed.post", Tid::from_raw(9), post()).unwrap();
+        assert!(
+            build_public_record_proof_car(&commit, &proof, &node_blocks, &wrong_record).is_err()
+        );
+
+        assert!(build_public_record_proof_car(&commit, &proof, &[], &record).is_err());
+        let mislabeled = node_blocks
+            .iter()
+            .map(|(_, data)| (Cid::from_dag_cbor(b"wrong label"), data.clone()))
+            .collect::<Vec<_>>();
+        assert!(build_public_record_proof_car(&commit, &proof, &mislabeled, &record).is_err());
+
+        let native_commit = Commit::sign(&unsigned, &signing);
+        assert!(
+            build_public_record_proof_car(&native_commit, &proof, &node_blocks, &record).is_err(),
+            "native-signed commits must not be emitted as public proof CARs"
+        );
+        let laundered = Commit::from_atproto_dag_cbor(
+            &native_commit
+                .to_atproto_dag_cbor()
+                .expect("native commit can be encoded for the negative test"),
+        )
+        .expect("canonical public shape must decode structurally");
+        assert!(
+            build_public_record_proof_car(&laundered, &proof, &node_blocks, &record).is_err(),
+            "decoding canonical bytes must not launder native signature provenance"
+        );
+
+        let mut unsupported_unsigned = unsigned.clone();
+        unsupported_unsigned.version = 4;
+        assert!(
+            Commit::sign_atproto(&unsupported_unsigned, &signing).is_err(),
+            "public signing must reject unsupported commit versions"
+        );
+
+        let mut mutated_public_commit = commit.clone();
+        mutated_public_commit.rev = Tid::from_raw(10);
+        assert!(
+            build_public_record_proof_car(&mutated_public_commit, &proof, &node_blocks, &record)
+                .is_err(),
+            "public CAR publication must reject a commit whose signed fields were mutated"
+        );
+
+        let mut mutated_public_signature = commit.clone();
+        mutated_public_signature.sig[0] ^= 1;
+        assert!(
+            build_public_record_proof_car(&mutated_public_signature, &proof, &node_blocks, &record)
+                .is_err(),
+            "public CAR publication must reject a mutated signature"
+        );
+    }
+
+    #[test]
+    fn excessive_nesting_is_rejected() {
+        let mut value = DagCbor::Null;
+        for _ in 0..130 {
+            value = DagCbor::list([value]);
+        }
+        assert!(encode(&value).is_err());
+        assert!(decode(&value.encode()).is_err());
+    }
+}
