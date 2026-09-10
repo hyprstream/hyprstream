@@ -56,9 +56,22 @@ impl HostedAccountHttpArtifacts {
         ensure!(
             !host.is_empty()
                 && !host.contains([':', '/'])
+                && host.split('.').count() >= 2
                 && host.split('.').next() == Some(label.as_str()),
             "hosted account HTTP artifact DID does not match its label"
         );
+        for component in host.split('.') {
+            ensure!(
+                !component.is_empty()
+                    && component.len() <= 63
+                    && component.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+                    && !component.starts_with('-')
+                    && !component.ends_with('-'),
+                "hosted account HTTP artifact DID contains an invalid DNS label"
+            );
+        }
         let did_document: Arc<[u8]> = did_document.into().into();
         let atproto_did: Arc<[u8]> = atproto_did.into().into();
         let did_log: Arc<[u8]> = did_log.into().into();
@@ -238,8 +251,10 @@ async fn serve_artifact(
     let Some(label) = host_label(host, &state.zone) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Ok(Some(artifact)) = state.directory.lookup(&label).await else {
-        return StatusCode::NOT_FOUND.into_response();
+    let artifact = match state.directory.lookup(&label).await {
+        Ok(Some(artifact)) => artifact,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     if artifact.did() != format!("did:web:{label}.{}", state.zone) {
         return StatusCode::NOT_FOUND.into_response();
