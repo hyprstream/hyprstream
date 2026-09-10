@@ -3161,7 +3161,7 @@ async fn serve_inference_bridged(
     let rep_processor = Arc::clone(&processor);
     let rep_shutdown = Arc::clone(&shutdown);
     let rep_task = tokio::spawn(async move {
-        hyprstream_rpc::service::serve::serve_bridged_with_shutdown_armed(
+        hyprstream_rpc::service::serve::serve_bridged_with_shutdown_armed_silent(
             &rep_transport,
             rep_processor,
             signing_key,

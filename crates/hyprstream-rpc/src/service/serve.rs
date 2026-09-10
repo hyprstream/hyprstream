@@ -28,11 +28,16 @@ use crate::transport::{EndpointType, TransportConfig};
 
 /// Signal startup readiness: fire the `on_ready` oneshot (spawner waits on it)
 /// and notify systemd (`Type=notify`).
-fn signal_ready(on_ready: Option<tokio::sync::oneshot::Sender<()>>) {
+fn signal_ready(
+    on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    notify_systemd: bool,
+) {
     if let Some(tx) = on_ready {
         let _ = tx.send(());
     }
-    let _ = crate::notify::ready();
+    if notify_systemd {
+        let _ = crate::notify::ready();
+    }
 }
 
 /// Serve a bridged request `processor` over its registered `transport` until
@@ -64,6 +69,50 @@ pub async fn serve_bridged_with_shutdown_armed(
     on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     shutdown_armed: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
+    serve_bridged_with_shutdown_armed_impl(
+        transport,
+        processor,
+        signing_key,
+        shutdown,
+        on_ready,
+        shutdown_armed,
+        true,
+    )
+    .await
+}
+
+/// Variant of [`serve_bridged_with_shutdown_armed`] for nested helpers whose
+/// parent owns the service readiness boundary. It acknowledges the shutdown
+/// waiter but does not emit a systemd `READY=1` notification.
+pub async fn serve_bridged_with_shutdown_armed_silent(
+    transport: &TransportConfig,
+    processor: Arc<dyn IrohRequestProcessor>,
+    signing_key: SigningKey,
+    shutdown: Arc<Notify>,
+    on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown_armed: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
+    serve_bridged_with_shutdown_armed_impl(
+        transport,
+        processor,
+        signing_key,
+        shutdown,
+        on_ready,
+        shutdown_armed,
+        false,
+    )
+    .await
+}
+
+async fn serve_bridged_with_shutdown_armed_impl(
+    transport: &TransportConfig,
+    processor: Arc<dyn IrohRequestProcessor>,
+    signing_key: SigningKey,
+    shutdown: Arc<Notify>,
+    on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown_armed: Option<tokio::sync::oneshot::Sender<()>>,
+    notify_systemd: bool,
+) -> Result<()> {
     match &transport.endpoint {
         EndpointType::Inproc { endpoint } => {
             crate::dial::register_inproc(endpoint.clone(), &processor);
@@ -73,7 +122,7 @@ pub async fn serve_bridged_with_shutdown_armed(
             if let Some(tx) = shutdown_armed {
                 let _ = tx.send(());
             }
-            signal_ready(on_ready);
+            signal_ready(on_ready, notify_systemd);
             notified.await;
             processor.close_admission();
             crate::dial::unregister_inproc(endpoint);
@@ -104,6 +153,7 @@ pub async fn serve_bridged_with_shutdown_armed(
                 shutdown,
                 on_ready,
                 shutdown_armed,
+                notify_systemd,
             )
             .await
         }
@@ -123,6 +173,7 @@ pub async fn serve_bridged_with_shutdown_armed(
                 shutdown,
                 on_ready,
                 shutdown_armed,
+                notify_systemd,
             )
             .await
         }
@@ -141,6 +192,7 @@ async fn run_uds(
     shutdown: Arc<Notify>,
     on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     shutdown_armed: Option<tokio::sync::oneshot::Sender<()>>,
+    notify_systemd: bool,
 ) -> Result<()> {
     let server = UdsRpcServer::with_capacity(
         listener,
@@ -157,7 +209,7 @@ async fn run_uds(
     if let Some(tx) = shutdown_armed {
         let _ = tx.send(());
     }
-    signal_ready(on_ready);
+    signal_ready(on_ready, notify_systemd);
     tokio::select! {
         r = server.run() => r,
         _ = notified => {
