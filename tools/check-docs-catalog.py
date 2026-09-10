@@ -16,6 +16,13 @@ from pathlib import Path
 from typing import Any
 
 SURFACES = ("cli", "mcp", "factory", "vfs", "typescript")
+CATALOG_SURFACES = (*SURFACES, "docs")
+CONSUMER_SOURCE_PATHS = {
+    "cli": "crates/hyprstream/src/cli/schema_cli.rs",
+    "mcp": "crates/hyprstream/src/services/mcp_service.rs",
+    "factory": "crates/hyprstream/src/services/factories.rs",
+    "vfs": "crates/hyprstream-rpc-std/src/vfs_mount.rs",
+}
 OWNER_DIRECTORIES = (
     "crates/hyprstream/schema",
     "crates/hyprstream-discovery/schema",
@@ -100,9 +107,7 @@ def text(repo: Path, path: str, mutations: dict[str, str] | None) -> str:
     return (repo / path).read_text(encoding="utf-8")
 
 
-def source_services(
-    repo: Path, mutations: dict[str, str] | None = None, tracked_sources: list[str] | None = None
-) -> dict[str, dict[str, Any]]:
+def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict[str, dict[str, Any]]:
     cli_source = text(repo, "crates/hyprstream/src/cli/schema_cli.rs", mutations)
     mcp_source = text(repo, "crates/hyprstream/src/services/mcp_service.rs", mutations)
     factories_source = text(repo, "crates/hyprstream/src/services/factories.rs", mutations)
@@ -157,11 +162,12 @@ def source_services(
         rust_string(vfs_source, match.end(), "VFS service registration")[0]
         for match in re.finditer(r'\bimpl_service_dispatch!\s*\(\s*[A-Za-z_]\w*\s*,\s*', vfs)
     ]
-    ts_sources = tracked_sources if tracked_sources is not None else tracked(
-        repo, "*.ts", "*.tsx", "*.js", "*.jsx", "package.json"
-    )
+    # The tracked universe is authoritative: callers must not inject arbitrary
+    # JavaScript/package paths as schema consumers through an inventory argument.
+    ts_sources = tracked(repo, "*.ts", "*.tsx", "*.js", "*.jsx", "package.json")
     return {
         "cli": {
+            "source": CONSUMER_SOURCE_PATHS["cli"],
             "services": cli_services,
             "manual_services": manual_services,
             "method_policy": {
@@ -170,14 +176,15 @@ def source_services(
             },
         },
         "mcp": {
+            "source": CONSUMER_SOURCE_PATHS["mcp"],
             "services": mcp_services,
             "method_policy": {
                 "hidden": "excluded" if "if method.hidden {" in mcp else "unknown",
                 "streaming": "included" if "if method.is_streaming {" in mcp else "unknown",
             },
         },
-        "factory": {"services": factory_services, "feature_conditions": features},
-        "vfs": {"services": vfs_services},
+        "factory": {"source": CONSUMER_SOURCE_PATHS["factory"], "services": factory_services, "feature_conditions": features},
+        "vfs": {"source": CONSUMER_SOURCE_PATHS["vfs"], "services": vfs_services},
         "typescript": {"tracked_sources": ts_sources},
     }
 
@@ -642,9 +649,12 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
         else:
             required(entry.get("cgr_producer") is None and entry.get("compiled_by") == "not_compiled",
                      f"{entry['path']} compiler classification drift")
-        active = set(entry.get("surfaces", []))
-        required(active <= set(SURFACES) | {"docs"}, f"{entry['path']} has unknown surface")
-        for surface in SURFACES:
+        declared_surfaces = entry.get("surfaces", [])
+        required(isinstance(declared_surfaces, list) and len(declared_surfaces) == len(set(declared_surfaces)),
+                 f"{entry['path']} has invalid surface inventory")
+        active = set(declared_surfaces)
+        required(active <= set(CATALOG_SURFACES), f"{entry['path']} has unknown surface")
+        for surface in CATALOG_SURFACES:
             required(surface in active or bool(entry["exclusions"].get(surface)), f"{entry['path']} lacks {surface} disposition")
             required(not (surface in active and surface in entry["exclusions"]),
                      f"{entry['path']} is both active and excluded on {surface}")
@@ -656,6 +666,9 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
     for surface in SURFACES:
         record, actual = declared[surface], consumers[surface]
         required(record.get("state") in {"active", "declared", "absent"}, f"invalid {surface} state")
+        if surface != "typescript":
+            required(record.get("source") == actual.get("source") == CONSUMER_SOURCE_PATHS[surface],
+                     f"{surface} declared source path drift")
         key = "tracked_sources" if surface == "typescript" else "services"
         required(record.get(key) == actual.get(key), f"{surface} source registration drift")
         expected_state = "active" if actual.get(key) else "absent"
@@ -712,9 +725,12 @@ def validate(repo: Path, catalog: dict[str, Any] | None = None, corpus: dict[str
              mutations: dict[str, str] | None = None, event: str | None = None, revision: str | None = None) -> None:
     catalog = catalog or read_json(repo / "docs/schema-catalog.json")
     corpus = corpus or read_json(repo / "docs/corpus-sources.json")
+    derived_consumers = source_services(repo, mutations)
+    if consumers is not None:
+        required(consumers == derived_consumers, "consumer inventory is not derived from current source state")
     check_schema_catalog(
         catalog, repo, schema_paths or tracked(repo, "*.capnp"),
-        consumers or source_services(repo, mutations), corpus, mutations, event, revision,
+        derived_consumers, corpus, mutations, event, revision,
     )
     check_corpus(corpus, repo, mutations, event, revision)
     required("docs/system-ontology.md" in text(repo, "docs/contracts/docs-pipeline.md", None), "pipeline contract omits ontology authority")
@@ -929,7 +945,17 @@ def self_test(repo: Path) -> None:
         required(source_services(repo, {path: mutated}) == consumers,
                  f"{name} altered source-derived registrations")
         expect_success(name, repo, catalog, corpus, schemas, {path: mutated})
-    expect_failure("TypeScript source", repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, tracked_sources=["package.json"]))
+    bad = copy.deepcopy(catalog)
+    fixture = next(entry for entry in bad["schemas"] if entry["path"].endswith("wire_roundtrip_fixture.capnp"))
+    fixture["exclusions"].pop("docs")
+    expect_failure("mandatory docs surface disposition", repo, bad, corpus, schemas, consumers)
+    bad = copy.deepcopy(catalog); bad["consumer_sets"]["cli"]["source"] = "crates/other/schema_cli.rs"
+    expect_failure("declared consumer source path", repo, bad, corpus, schemas, consumers)
+    bad = copy.deepcopy(catalog)
+    bad["consumer_sets"]["typescript"] = {"state": "active", "tracked_sources": ["package.json"]}
+    supplied = copy.deepcopy(consumers)
+    supplied["typescript"] = {"tracked_sources": ["package.json"]}
+    expect_failure("unrelated TypeScript schema consumer", repo, bad, corpus, schemas, supplied)
     bad = copy.deepcopy(catalog); bad.pop("owner_directories")
     expect_failure("owner directory inventory", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(catalog); bad["schemas"][0]["owner"] = "hyprstream"
