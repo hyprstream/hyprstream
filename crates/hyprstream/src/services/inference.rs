@@ -3152,6 +3152,36 @@ async fn serve_inference_bridged(
         );
     }
 
+    // Start REP before arming the QUIC drain waiter.  `serve_bridged` owns
+    // the admission-closing shutdown waiter, so its readiness handshake must
+    // complete before this function exposes readiness or allows the external
+    // shutdown race to begin.
+    let (rep_armed_tx, rep_armed_rx) = tokio::sync::oneshot::channel();
+    let rep_transport = transport.clone();
+    let rep_processor = Arc::clone(&processor);
+    let rep_shutdown = Arc::clone(&shutdown);
+    let rep_task = tokio::spawn(async move {
+        hyprstream_rpc::service::serve::serve_bridged(
+            &rep_transport,
+            rep_processor,
+            signing_key,
+            rep_shutdown,
+            Some(rep_armed_tx),
+        )
+        .await
+    });
+    rep_armed_rx
+        .await
+        .map_err(|_| hyprstream_rpc::error::RpcError::SpawnFailed("REP waiter failed to arm".to_owned()))?;
+    if let Some(on_ready) = on_ready {
+        let _ = on_ready.send(());
+    }
+    let rep = async move {
+        rep_task
+            .await
+            .map_err(|error| anyhow::anyhow!("REP task failed: {error}"))?
+    };
+
     let drain_limit = rpc_server.stream_limit();
     let drain_capacity = rpc_server.capacity();
     let drain_token = rpc_server.shutdown_token();
@@ -3178,17 +3208,10 @@ async fn serve_inference_bridged(
         .await;
     });
     let drain_owner = QuinnDrainOwner::new(drain_task);
-    // Do not enter the select until the spawned waiter has registered. This
-    // closes the notification-lost race on an immediately failing peer.
+    // Do not enter the select until both the REP and QUIC waiters have
+    // registered. This closes the notification-lost race on an immediately
+    // failing peer.
     let _ = drain_armed_rx.await;
-
-    let rep = hyprstream_rpc::service::serve::serve_bridged(
-        transport,
-        Arc::clone(&processor),
-        signing_key,
-        Arc::clone(&shutdown),
-        on_ready,
-    );
     let quic = rpc_server.run();
     run_quinn_lifecycle(rep, quic, shutdown, network_ready, draining, drain_owner).await
 }
