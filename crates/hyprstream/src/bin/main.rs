@@ -177,6 +177,12 @@ fn build_cli() -> ClapCommand {
                     .about("Initialize the checkpoint store for an explicitly provisioned fresh deployment"),
             )
             .subcommand(
+                ClapCommand::new("inspect-services")
+                    .about("Read existing checkpoint-verified service identities as public JSON without provisioning or renewal")
+                    .arg(Arg::new("service").long("service").required(true)
+                        .action(clap::ArgAction::Append).value_delimiter(',')),
+            )
+            .subcommand(
                 ClapCommand::new("provision-services")
                     .about("Admit existing local service identities before starting the registry")
                     .arg(Arg::new("service").long("service").required(true)
@@ -2584,6 +2590,24 @@ fn main() -> Result<()> {
     let explicit_config: Option<&std::path::Path> = explicit_config_path.as_deref();
     let iroh_required = config.quic.iroh_required();
 
+    // Read-only accepted-state inspection must precede tracing (which may
+    // create log files), endpoint/runtime initialization and all bootstrap/key
+    // generation paths. Buffer the complete verified roster before stdout.
+    if let Some(("pds", pds)) = matches.subcommand() {
+        if let Some(("inspect-services", inspect)) = pds.subcommand() {
+            let services = inspect.get_many::<String>("service")
+                .context("service roster is required")?.cloned().collect::<Vec<_>>();
+            // Inspection errors may include trusted-artifact or configured
+            // secrets paths. Keep those details out of the process error sink
+            // and log collectors while preserving the public JSON success
+            // document unchanged.
+            let bytes = hyprstream_core::cli::deployment_bootstrap::inspect_services(&config, &services)
+                .map_err(|_| anyhow::anyhow!("read-only service roster inspection failed"))?;
+            std::io::Write::write_all(&mut std::io::stdout().lock(), &bytes)?;
+            return Ok(());
+        }
+    }
+
     // RPC clients are used by ordinary CLI commands (`quick`, `tui`, etc.),
     // not only by service entrypoints. Install both request- and response-side
     // verification defaults before dispatch so every command uses the
@@ -4375,6 +4399,22 @@ mod resolver_startup_controls {
             Some(custom_key.verifying_key()),
         );
         Ok(())
+    }
+
+    #[test]
+    fn readonly_roster_cli_requires_services_and_has_no_mutation_options() {
+        let matches = super::build_cli().try_get_matches_from([
+            "hyprstream", "pds", "inspect-services", "--service", "model,event",
+        ]).expect("read-only roster CLI");
+        let inspect = matches.subcommand_matches("pds").expect("pds")
+            .subcommand_matches("inspect-services").expect("inspect");
+        assert_eq!(inspect.get_many::<String>("service").expect("services")
+            .map(String::as_str).collect::<Vec<_>>(), vec!["model", "event"]);
+        for args in [
+            vec!["hyprstream", "pds", "inspect-services"],
+            vec!["hyprstream", "pds", "inspect-services", "--service", "model", "--valid-for-seconds", "86400"],
+            vec!["hyprstream", "pds", "inspect-services", "--service", "model", "--roster-export", "out.json"],
+        ] { assert!(super::build_cli().try_get_matches_from(args).is_err()); }
     }
 
     #[test]
