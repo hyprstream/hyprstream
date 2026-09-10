@@ -13,10 +13,14 @@
 pub mod account_http;
 pub mod federation_intake;
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use hyprstream_pds::{
-    AccountRecord, ATPROTO_SIGNING_KEY_FILE, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE,
+    ATPROTO_SIGNING_KEY_FILE, AccountLabel, AccountRecord, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE,
 };
 use hyprstream_rpc::auth::mac::{MacDecision, MacDenyReason, SecurityContext};
 use hyprstream_rpc::{EnvelopeContext, Subject};
@@ -66,6 +70,8 @@ pub enum AccountReadError {
     InvalidHostedAccountDid(String),
     #[error("hosted account DID {0:?} is bound to more than one tenant")]
     AmbiguousHostedAccountDid(String),
+    #[error("hosted account DID index is still warming")]
+    HostedDidIndexNotReady,
     #[error("PDS account record exceeds the {limit}-byte read limit")]
     RecordTooLarge { limit: usize },
     #[error("PDS account record for {requested:?} contains label {stored:?}")]
@@ -124,7 +130,17 @@ pub struct AccountRecordStore {
     pds_mount: Arc<dyn Mount>,
     read_authorizer: Arc<dyn AccountRecordReadAuthorizer>,
     max_record_bytes: usize,
+    hosted_did_index: Arc<tokio::sync::RwLock<Option<HostedDidIndex>>>,
+    hosted_did_index_refresh: Arc<tokio::sync::Mutex<()>>,
 }
+
+struct HostedDidIndex {
+    entries: BTreeMap<(String, String), Option<String>>,
+    built_at: Instant,
+}
+
+const HOSTED_DID_INDEX_TTL: Duration = Duration::from_secs(5);
+const HOSTED_DID_NEGATIVE_TTL: Duration = Duration::from_secs(1);
 
 impl AccountRecordStore {
     /// Construct a store over the mount bound at `/pds` and a mandatory MAC
@@ -137,6 +153,8 @@ impl AccountRecordStore {
             pds_mount,
             read_authorizer,
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
+            hosted_did_index: Arc::new(tokio::sync::RwLock::new(None)),
+            hosted_did_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -188,6 +206,71 @@ impl AccountRecordStore {
             return Ok(None);
         };
 
+        let index = self.hosted_did_index.read().await;
+        let Some(snapshot) = index.as_ref() else {
+            // A request must never become the tenant enumerator. Startup
+            // refresh runs independently; callers retry after the index is
+            // ready instead of amplifying a full mount scan per miss.
+            self.schedule_hosted_did_index_refresh(authority.clone());
+            return Err(AccountReadError::HostedDidIndexNotReady);
+        };
+        let age = snapshot.built_at.elapsed();
+        if age >= HOSTED_DID_INDEX_TTL {
+            self.schedule_hosted_did_index_refresh(authority.clone());
+        }
+        let key = (label.to_owned(), did.to_owned());
+        match snapshot.entries.get(&key) {
+            Some(Some(tenant)) => Ok(Some(tenant.clone())),
+            Some(None) => Err(AccountReadError::AmbiguousHostedAccountDid(did.to_owned())),
+            None if age < HOSTED_DID_NEGATIVE_TTL => Ok(None),
+            None => {
+                // Negative entries expire independently of the positive
+                // snapshot, so a newly published account is not hidden
+                // forever while refresh remains asynchronous.
+                self.schedule_hosted_did_index_refresh(authority.clone());
+                Err(AccountReadError::HostedDidIndexNotReady)
+            }
+        }
+    }
+
+    /// Start a bounded refresh without making the caller perform tenant
+    /// enumeration. A stale snapshot remains available for O(1) lookups while
+    /// one background task refreshes it; the refresh lock prevents duplicate
+    /// scans. Before the first snapshot, lookups return
+    /// [`AccountReadError::HostedDidIndexNotReady`] while this task warms it.
+    pub fn schedule_hosted_did_index_refresh(&self, authority: Subject) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let store = self.clone();
+        handle.spawn(async move {
+            let _ = store.refresh_hosted_did_index(&authority).await;
+        });
+    }
+
+    async fn refresh_hosted_did_index(&self, authority: &Subject) -> Result<(), AccountReadError> {
+        let _refresh = self.hosted_did_index_refresh.lock().await;
+        let stale = self
+            .hosted_did_index
+            .read()
+            .await
+            .as_ref()
+            .map(|snapshot| snapshot.built_at.elapsed() >= HOSTED_DID_INDEX_TTL)
+            .unwrap_or(true);
+        if stale {
+            let entries = self.build_hosted_did_index(authority).await?;
+            self.hosted_did_index.write().await.replace(HostedDidIndex {
+                entries,
+                built_at: Instant::now(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn build_hosted_did_index(
+        &self,
+        authority: &Subject,
+    ) -> Result<BTreeMap<(String, String), Option<String>>, AccountReadError> {
         let tenants = read_directory(
             self.pds_mount.as_ref(),
             self.read_authorizer.as_ref(),
@@ -197,23 +280,17 @@ impl AccountRecordStore {
             None,
         )
         .await?;
-        let mut resolved = None;
+        let mut index = BTreeMap::new();
         for entry in tenants.into_iter().filter(|entry| entry.is_dir) {
             validate_tenant_component(&entry.name)?;
-            let components = [
-                entry.name.as_str(),
-                PDS_ACCOUNTS_DIRECTORY,
-                label,
-                PDS_ACCOUNT_RECORD_FILE,
-            ];
-            let bytes = match read_file(
+            let accounts_components = [entry.name.as_str(), PDS_ACCOUNTS_DIRECTORY];
+            let accounts = match read_directory(
                 self.pds_mount.as_ref(),
                 self.read_authorizer.as_ref(),
-                &components,
+                &accounts_components,
                 authority,
                 Some(entry.name.as_str()),
                 None,
-                self.max_record_bytes,
             )
             .await
             {
@@ -221,23 +298,51 @@ impl AccountRecordStore {
                 Err(AccountReadError::Mount(MountError::NotFound(_))) => continue,
                 Err(error) => return Err(error),
             };
-            let record =
-                AccountRecord::from_dag_cbor(&bytes).map_err(AccountReadError::InvalidRecord)?;
-            if record.name().label() != label {
-                return Err(AccountReadError::RecordLabelMismatch {
-                    requested: label.to_owned(),
-                    stored: record.name().label().to_owned(),
-                });
+            for account in accounts.into_iter().filter(|account| account.is_dir) {
+                let label = account.name;
+                AccountLabel::parse(&label)
+                    .map_err(|_| AccountReadError::InvalidAccountLabel(label.clone()))?;
+                let components = [
+                    entry.name.as_str(),
+                    PDS_ACCOUNTS_DIRECTORY,
+                    label.as_str(),
+                    PDS_ACCOUNT_RECORD_FILE,
+                ];
+                let bytes = match read_file(
+                    self.pds_mount.as_ref(),
+                    self.read_authorizer.as_ref(),
+                    &components,
+                    authority,
+                    Some(entry.name.as_str()),
+                    None,
+                    self.max_record_bytes,
+                )
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(AccountReadError::Mount(MountError::NotFound(_))) => continue,
+                    Err(error) => return Err(error),
+                };
+                let record = AccountRecord::from_dag_cbor(&bytes)
+                    .map_err(AccountReadError::InvalidRecord)?;
+                if record.name().label() != label {
+                    return Err(AccountReadError::RecordLabelMismatch {
+                        requested: label,
+                        stored: record.name().label().to_owned(),
+                    });
+                }
+                let key = (label, record.name().did().to_owned());
+                match index.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(Some(entry.name.clone()));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut slot) => {
+                        slot.insert(None);
+                    }
+                }
             }
-            if record.name().did() != did {
-                continue;
-            }
-            if resolved.is_some() {
-                return Err(AccountReadError::AmbiguousHostedAccountDid(did.to_owned()));
-            }
-            resolved = Some(entry.name);
         }
-        Ok(resolved)
+        Ok(index)
     }
 
     /// Sign bytes with the account-specific `#atproto` key for one hosted DID.
@@ -256,7 +361,17 @@ impl AccountRecordStore {
     ) -> Result<Option<Vec<u8>>, AccountReadError> {
         use p256::ecdsa::signature::Signer as _;
 
-        let Some(tenant) = self.resolve_tenant_for_hosted_did(authority, did).await? else {
+        let resolved = match self.resolve_tenant_for_hosted_did(authority, did).await {
+            Err(AccountReadError::HostedDidIndexNotReady) => {
+                // Internal signing is already an authorized operation; warm
+                // its index explicitly, while the public HTTP lookup remains
+                // strictly non-blocking.
+                self.refresh_hosted_did_index(authority).await?;
+                self.resolve_tenant_for_hosted_did(authority, did).await
+            }
+            result => result,
+        }?;
+        let Some(tenant) = resolved else {
             return Ok(None);
         };
         let Some(label) = hosted_account_label(did)? else {
@@ -587,8 +702,8 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
     use hyprstream_pds::did_op::{
-        sign_genesis, GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
-        RecoveryKeyEnrollment, UserRotationKey,
+        GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
+        RecoveryKeyEnrollment, UserRotationKey, sign_genesis,
     };
     use hyprstream_pds::{AllocatedAccountName, HostedAccountMint};
     use hyprstream_rpc::Subject;
@@ -709,6 +824,10 @@ mod tests {
     #[tokio::test]
     async fn oauth_authority_resolves_tenant_from_matching_account_record() {
         let store = store();
+        store
+            .refresh_hosted_did_index(&oauth_authority())
+            .await
+            .unwrap();
 
         assert_eq!(
             store
@@ -759,15 +878,48 @@ mod tests {
         let root = SyntheticNode::dir()
             .with_child("acme", tenant_node("alice", duplicated.clone()))
             .with_child("beta", tenant_node("alice", duplicated));
-        let ambiguous =
-            AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), permit_account_reads())
-                .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
-                .await
-                .unwrap_err();
+        let ambiguous_store =
+            AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), permit_account_reads());
+        ambiguous_store
+            .refresh_hosted_did_index(&oauth_authority())
+            .await
+            .unwrap();
+        let ambiguous = ambiguous_store
+            .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
+            .await
+            .unwrap_err();
         assert!(matches!(
             ambiguous,
             AccountReadError::AmbiguousHostedAccountDid(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn cold_hosted_did_lookup_never_enumerates_on_request_path() {
+        let store = store();
+        let error = store
+            .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AccountReadError::HostedDidIndexNotReady));
+    }
+
+    #[tokio::test]
+    async fn hosted_did_negative_lookup_expires() {
+        let store = store();
+        store
+            .hosted_did_index
+            .write()
+            .await
+            .replace(HostedDidIndex {
+                entries: BTreeMap::new(),
+                built_at: Instant::now() - HOSTED_DID_NEGATIVE_TTL - Duration::from_millis(1),
+            });
+        let error = store
+            .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:new.acme.example")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AccountReadError::HostedDidIndexNotReady));
     }
 
     #[tokio::test]

@@ -195,10 +195,7 @@ pub struct MountedHostedAccountHttpDirectory {
     store: Arc<AccountRecordStore>,
     authority: hyprstream_rpc::Subject,
     zone: String,
-    tenant_cache: Arc<tokio::sync::Mutex<BTreeMap<String, Option<String>>>>,
 }
-
-const MAX_TENANT_CACHE_ENTRIES: usize = 1024;
 
 impl MountedHostedAccountHttpDirectory {
     pub fn new(
@@ -210,12 +207,15 @@ impl MountedHostedAccountHttpDirectory {
             authority.name() == Some(OAUTH_ACCOUNT_RESOLVER_SUBJECT),
             "hosted HTTP directory requires the fixed OAuth resolver subject"
         );
-        Ok(Self {
+        let directory = Self {
             store,
             authority,
             zone: canonical_zone(&zone.into())?,
-            tenant_cache: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
-        })
+        };
+        directory
+            .store
+            .schedule_hosted_did_index_refresh(directory.authority.clone());
+        Ok(directory)
     }
 }
 
@@ -224,26 +224,13 @@ impl HostedAccountHttpDirectory for MountedHostedAccountHttpDirectory {
     async fn lookup(&self, label: &str) -> Result<Option<Arc<HostedAccountHttpArtifacts>>> {
         AccountLabel::parse(label).map_err(|error| anyhow::anyhow!(error))?;
         let did = format!("did:web:{label}.{}", self.zone);
-        // Tenant resolution is an index miss only once per label. Hold the
-        // cache lock across the miss so concurrent requests cannot all repeat
-        // the tenant scan; cache both hits and misses to keep attacker-chosen
-        // nonexistent labels from repeatedly walking every tenant.
-        let tenant = {
-            let mut cache = self.tenant_cache.lock().await;
-            if let Some(tenant) = cache.get(label).cloned() {
-                tenant
-            } else {
-                let tenant = self
-                    .store
-                    .resolve_tenant_for_hosted_did(&self.authority, &did)
-                    .await?;
-                if cache.len() >= MAX_TENANT_CACHE_ENTRIES {
-                    cache.pop_first();
-                }
-                cache.insert(label.to_owned(), tenant.clone());
-                tenant
-            }
-        };
+        // The store keeps a refreshed immutable label/DID index, so each
+        // request performs one bounded map lookup. Index refresh is serialized
+        // independently and never holds the request lookup lock.
+        let tenant = self
+            .store
+            .resolve_tenant_for_hosted_did(&self.authority, &did)
+            .await?;
         let Some(tenant) = tenant else {
             return Ok(None);
         };
@@ -752,6 +739,11 @@ mod tests {
     #[tokio::test]
     async fn mounted_directory_reads_only_authorized_sealed_files() {
         let (directory, document, log) = mounted_directory();
+        directory
+            .store
+            .refresh_hosted_did_index(&directory.authority)
+            .await
+            .unwrap();
         let app = router(DEFAULT_ACCOUNT_ZONE, directory).unwrap();
         let did_response = app
             .clone()
@@ -802,12 +794,22 @@ mod tests {
             altered_document.replace("https://pds.example.com", "https://other.example.com");
         let document_directory =
             mounted_directory_with_files(Some(altered_document.into_bytes()), Some(log.clone())).0;
+        document_directory
+            .store
+            .refresh_hosted_did_index(&document_directory.authority)
+            .await
+            .unwrap();
         assert!(document_directory.lookup("alice").await.is_err());
 
         let mut altered_log = log;
         let last = altered_log.len() - 1;
         altered_log[last] ^= 1;
         let log_directory = mounted_directory_with_files(None, Some(altered_log)).0;
+        log_directory
+            .store
+            .refresh_hosted_did_index(&log_directory.authority)
+            .await
+            .unwrap();
         assert!(log_directory.lookup("alice").await.is_err());
     }
 
