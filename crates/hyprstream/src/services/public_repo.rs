@@ -117,8 +117,9 @@ pub struct PublicCreateRequest {
     pub principal: String,
     pub did: String,
     pub collection: String,
-    /// A validated AT record key, including singleton keys such as `self`.
-    pub rkey: AtprotoRecordKey,
+    /// Explicit general AT record key, or None to allocate a fresh TID under
+    /// the transaction lock. Retries recover a generated key from the intent.
+    pub rkey: Option<AtprotoRecordKey>,
     pub value: DagCbor,
     /// Required repo-head CAS value. None means this must create the genesis
     /// record; retries use the request id and never silently fork a head.
@@ -147,6 +148,9 @@ struct PublicationIntent {
     did: String,
     collection: String,
     rkey: String,
+    /// Old intents always had an explicit key. Preserve their retry behavior.
+    #[serde(default)]
+    generated_rkey: bool,
     cid: String,
     commit_cid: String,
 }
@@ -446,12 +450,16 @@ impl PublicRepoWriter {
         let signing_key = state
             .as_ref()
             .ok_or_else(|| anyhow!("no active signing authority for repository"))?;
-        let record = AtprotoRecord::new(request.collection.clone(), &request.rkey, request.value)?;
-        ensure!(
-            record.bytes().len() <= MAX_PUBLIC_RECORD_BYTES,
-            "public record exceeds {MAX_PUBLIC_RECORD_BYTES}-byte canonical encoded limit"
-        );
         if let Some(intent) = self.store.intent(&self.did, &request.request_id)? {
+            ensure!(
+                intent.generated_rkey == request.rkey.is_none(),
+                "publication request id was reused with a different key mode"
+            );
+            let rkey = match request.rkey.as_ref() {
+                Some(rkey) => rkey.clone(),
+                None => AtprotoRecordKey::new(intent.rkey.clone())?,
+            };
+            let record = AtprotoRecord::new(request.collection.clone(), &rkey, request.value)?;
             ensure!(
                 intent.request_id == request.request_id
                     && intent.principal == request.principal
@@ -468,9 +476,9 @@ impl PublicRepoWriter {
             ensure!(
                 snapshot
                     .records
-                    .get(&(record.collection().to_owned(), request.rkey))
+                    .get(&(request.collection.clone(), rkey))
                     .is_some_and(|stored| stored.bytes() == record.bytes()),
-                "publication intent record does not match repository"
+                "publication intent does not match stored record"
             );
             let commit_bytes = self
                 .store
@@ -514,6 +522,12 @@ impl PublicRepoWriter {
                 (BTreeMap::new(), None, None)
             }
         };
+        let generated_rkey = request.rkey.is_none();
+        let rkey = match request.rkey {
+            Some(rkey) => rkey,
+            None => allocate_record_key(&request.collection, &keyed, previous_rev)?,
+        };
+        let record = AtprotoRecord::new(request.collection.clone(), rkey, request.value)?;
         let record_key = format!("{}/{}", record.collection(), record.rkey().as_str());
         ensure!(
             !keyed.contains_key(&record_key),
@@ -537,6 +551,7 @@ impl PublicRepoWriter {
             did: self.did.clone(),
             collection: record.collection().to_owned(),
             rkey: record.rkey().as_str().to_owned(),
+            generated_rkey,
             cid: record.cid().to_string(),
             commit_cid: commit_cid.to_string(),
         };
@@ -566,6 +581,29 @@ impl PublicRepoWriter {
             )),
         };
         self.create_record_with_condition(request, condition)
+    }
+}
+
+/// Allocate after authorization, retry lookup and head selection, while the
+/// writer lock is held. Advancing from the durable revision survives restarts
+/// and clock rollback; collision checks also cover explicitly supplied keys.
+fn allocate_record_key(
+    collection: &str,
+    keyed: &BTreeMap<String, Cid>,
+    previous_rev: Option<Tid>,
+) -> Result<AtprotoRecordKey> {
+    let mut candidate = next_revision(previous_rev);
+    loop {
+        let rkey = AtprotoRecordKey::from(candidate);
+        if !keyed.contains_key(&format!("{collection}/{}", rkey.as_str())) {
+            return Ok(rkey);
+        }
+        candidate = Tid::from_raw(
+            candidate
+                .to_raw()
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("public record key space exhausted"))?,
+        );
     }
 }
 
@@ -1420,7 +1458,9 @@ pub struct PublicCreateRequest {
     pub principal: String,
     pub did: String,
     pub collection: String,
-    pub rkey: Tid,
+    /// Explicit general AT record key, or None to allocate a fresh TID under
+    /// the transaction lock. Retries recover a generated key from the intent.
+    pub rkey: Option<AtprotoRecordKey>,
     pub value: DagCbor,
     /// Required repo-head CAS value. None means this must create the genesis
     /// record; retries use the request id and never silently fork a head.
@@ -1438,7 +1478,7 @@ pub struct PublicCommitResult {
 #[derive(Clone, Debug)]
 pub struct PublicRepoSnapshot {
     pub did: String,
-    pub records: BTreeMap<(String, Tid), AtprotoRecord>,
+    pub records: BTreeMap<(String, AtprotoRecordKey), AtprotoRecord>,
     pub commit: Commit,
 }
 
@@ -1449,6 +1489,9 @@ struct PublicationIntent {
     did: String,
     collection: String,
     rkey: String,
+    /// Old intents always had an explicit key. Preserve their retry behavior.
+    #[serde(default)]
+    generated_rkey: bool,
     cid: String,
     commit_cid: String,
 }
@@ -1515,8 +1558,16 @@ impl PublicHeadCondition {
             .authorize(&request.principal, &self.did, &request.collection)?;
 
         let _guard = self.store.write_lock.lock();
-        let record = AtprotoRecord::new(request.collection.clone(), request.rkey, request.value)?;
         if let Some(intent) = self.store.intent(&self.did, &request.request_id)? {
+            ensure!(
+                intent.generated_rkey == request.rkey.is_none(),
+                "publication request id was reused with a different key mode"
+            );
+            let rkey = match request.rkey.as_ref() {
+                Some(rkey) => rkey.clone(),
+                None => AtprotoRecordKey::new(intent.rkey.clone())?,
+            };
+            let record = AtprotoRecord::new(request.collection.clone(), &rkey, request.value)?;
             ensure!(
                 intent.request_id == request.request_id
                     && intent.principal == request.principal
@@ -1533,7 +1584,7 @@ impl PublicHeadCondition {
             ensure!(
                 snapshot
                     .records
-                    .get(&(request.collection.clone(), request.rkey))
+                    .get(&(request.collection.clone(), rkey))
                     .is_some_and(|stored| stored.cid() == record.cid()),
                 "publication intent does not match stored record"
             );
@@ -1566,7 +1617,7 @@ impl PublicHeadCondition {
                     .records
                     .into_iter()
                     .map(|((collection, rkey), record)| {
-                        (format!("{collection}/{}", rkey.encode()), record.cid())
+                        (format!("{collection}/{}", rkey.as_str()), record.cid())
                     })
                     .collect();
                 (keyed, Some(previous), Some(previous_rev))
@@ -1576,6 +1627,12 @@ impl PublicHeadCondition {
                 (BTreeMap::new(), None, None)
             }
         };
+        let generated_rkey = request.rkey.is_none();
+        let rkey = match request.rkey {
+            Some(rkey) => rkey,
+            None => allocate_record_key(&request.collection, &keyed, previous_rev)?,
+        };
+        let record = AtprotoRecord::new(request.collection.clone(), rkey, request.value)?;
         let record_key = format!("{}/{}", record.collection(), record.rkey().as_str());
         ensure!(
             !keyed.contains_key(&record_key),
@@ -1599,6 +1656,7 @@ impl PublicHeadCondition {
             did: self.did.clone(),
             collection: record.collection().to_owned(),
             rkey: record.rkey().as_str().to_owned(),
+            generated_rkey,
             cid: record.cid().to_string(),
             commit_cid: commit_cid.to_string(),
         };
@@ -1637,10 +1695,191 @@ impl PublicHeadCondition {
             principal: "did:at9p:agent".into(),
             did: "did:web:tormentnexus.social".into(),
             collection: "app.bsky.feed.post".into(),
-            rkey: Tid::from_raw(id),
+            rkey: Some(Tid::from_raw(id).into()),
             value: post(),
             expected_prev: None,
         }
+    }
+    #[test]
+    fn general_keys_survive_restart_and_legacy_intents_remain_retriable() {
+        let (dir, store, gate, writer) = transaction_fixture();
+        let first = writer.create_record(transaction_request(7)).unwrap();
+        // Model an intent written before generated_rkey existed.
+        let mut legacy =
+            serde_json::to_value(store.intent(writer.did(), "req-7").unwrap().unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("generated_rkey");
+        store
+            .db
+            .put(
+                intent_key(writer.did(), "req-7"),
+                serde_json::to_vec(&legacy).unwrap(),
+            )
+            .unwrap();
+        let mut profile = transaction_request(8);
+        profile.collection = "app.bsky.actor.profile".into();
+        profile.rkey = Some(AtprotoRecordKey::new("self").unwrap());
+        profile.value = DagCbor::str_map([("$type", DagCbor::Text(profile.collection.clone()))]);
+        profile.expected_prev = Some(first.commit_cid);
+        let second = writer.create_record(profile.clone()).unwrap();
+        let mut general = transaction_request(9);
+        general.collection = "com.example.record".into();
+        general.rkey = Some(AtprotoRecordKey::new("literal:key~one").unwrap());
+        general.value = DagCbor::str_map([("$type", DagCbor::Text(general.collection.clone()))]);
+        general.expected_prev = Some(second.commit_cid);
+        let third = writer.create_record(general.clone()).unwrap();
+        let signing_key = writer.signing_key.clone();
+        drop(writer);
+        drop(store);
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let writer = PublicRepoWriter::new(
+            store.clone(),
+            "did:web:tormentnexus.social",
+            signing_key,
+            gate,
+        )
+        .unwrap();
+        assert_eq!(writer.create_record(transaction_request(7)).unwrap(), first);
+        assert_eq!(writer.create_record(profile).unwrap(), second);
+        assert_eq!(writer.create_record(general).unwrap(), third);
+        let snapshot = store.snapshot(writer.did()).unwrap().unwrap();
+        assert_eq!(snapshot.records.len(), 3);
+        assert!(snapshot.records.contains_key(&(
+            "app.bsky.actor.profile".into(),
+            AtprotoRecordKey::new("self").unwrap()
+        )));
+        assert!(snapshot.records.contains_key(&(
+            "com.example.record".into(),
+            AtprotoRecordKey::new("literal:key~one").unwrap()
+        )));
+        snapshot
+            .commit
+            .verify_atproto(writer.signing_key.verifying_key())
+            .unwrap();
+    }
+    #[test]
+    fn generated_keys_recover_after_restart_and_bind_request_shape() {
+        let (dir, store, gate, writer) = transaction_fixture();
+        let mut request = transaction_request(7);
+        request.rkey = None;
+        let first = writer
+            .create_record_with_expected_prev_text(request.clone(), None)
+            .unwrap();
+        let first_key = first.uri.rsplit('/').next().unwrap();
+        assert!(Tid::parse(first_key).is_ok());
+        let mut second_request = transaction_request(8);
+        second_request.rkey = None;
+        let second = writer
+            .create_record_with_expected_prev_text(second_request, None)
+            .unwrap();
+        assert_ne!(first.uri, second.uri);
+        let signing_key = writer.signing_key.clone();
+        drop(writer);
+        drop(store);
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let writer = PublicRepoWriter::new(
+            store.clone(),
+            "did:web:tormentnexus.social",
+            signing_key,
+            gate.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            writer
+                .create_record_with_expected_prev_text(request.clone(), None)
+                .unwrap(),
+            first
+        );
+        let mut explicit_retry = request.clone();
+        explicit_retry.rkey = Some(AtprotoRecordKey::new(first_key).unwrap());
+        assert!(writer
+            .create_record_with_expected_prev_text(explicit_retry, None)
+            .unwrap_err()
+            .to_string()
+            .contains("key mode"));
+        let mut changed = request.clone();
+        changed.value = DagCbor::str_map([
+            ("$type", DagCbor::Text(changed.collection.clone())),
+            ("text", DagCbor::Text("different".into())),
+        ]);
+        assert!(writer
+            .create_record_with_expected_prev_text(changed, None)
+            .is_err());
+        let mut other_principal = request.clone();
+        other_principal.principal = "did:at9p:other".into();
+        assert!(writer
+            .create_record_with_expected_prev_text(other_principal, None)
+            .is_err());
+        let explicit = transaction_request(9);
+        writer
+            .create_record_with_expected_prev_text(explicit.clone(), None)
+            .unwrap();
+        let mut omitted = explicit;
+        omitted.rkey = None;
+        assert!(writer
+            .create_record_with_expected_prev_text(omitted, None)
+            .unwrap_err()
+            .to_string()
+            .contains("key mode"));
+        gate.allow.store(false, Ordering::Release);
+        assert!(writer
+            .create_record_with_expected_prev_text(request, None)
+            .unwrap_err()
+            .to_string()
+            .contains("publication denied"));
+        assert_eq!(
+            store.snapshot(writer.did()).unwrap().unwrap().records.len(),
+            3
+        );
+    }
+    #[test]
+    fn generated_keys_are_unique_or_recovered_under_concurrent_requests() {
+        for same_request in [false, true] {
+            let (_dir, store, _gate, writer) = transaction_fixture();
+            let writer = Arc::new(writer);
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let results = std::thread::scope(|scope| {
+                let mut workers = Vec::new();
+                for id in [7, if same_request { 7 } else { 8 }] {
+                    let writer = writer.clone();
+                    let start = start.clone();
+                    workers.push(scope.spawn(move || {
+                        let mut request = transaction_request(id);
+                        request.rkey = None;
+                        start.wait();
+                        writer
+                            .create_record_with_expected_prev_text(request, None)
+                            .unwrap()
+                    }));
+                }
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(results[0] == results[1], same_request);
+            let expected = if same_request { 1 } else { 2 };
+            assert_eq!(
+                store.snapshot(writer.did()).unwrap().unwrap().records.len(),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn generated_key_skips_collisions_after_a_durable_future_revision() {
+        let previous = Tid::from_raw(1 << 62);
+        let collection = "app.bsky.feed.post";
+        let mut keyed = BTreeMap::new();
+        for offset in [1, 2] {
+            keyed.insert(
+                format!(
+                    "{collection}/{}",
+                    Tid::from_raw(previous.to_raw() + offset).encode()
+                ),
+                Cid::from_dag_cbor(b"occupied"),
+            );
+        }
+        let key = allocate_record_key(collection, &keyed, Some(previous)).unwrap();
+        assert_eq!(key.as_str(), Tid::from_raw(previous.to_raw() + 3).encode());
     }
     #[test]
     fn xrpc_omitted_swap_allows_subsequent_creates_without_weakening_native_cas() {

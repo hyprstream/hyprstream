@@ -48,6 +48,7 @@ use rand::RngCore as _;
 use serde_json::{json, Value};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
+use hyprstream_pds::atproto_cbor::AtprotoRecordKey;
 use hyprstream_pds::car::{build_record_proof_car, car_block_bytes, car_header_bytes};
 use hyprstream_pds::commit::Commit;
 use hyprstream_pds::mst::{Node, NodeData};
@@ -1090,17 +1091,27 @@ pub async fn create_record(
             )
         }
     };
-    let rkey = match object
-        .get("rkey")
-        .and_then(Value::as_str)
-        .and_then(|value| Tid::parse(value).ok())
-    {
-        Some(rkey) => rkey,
-        None => {
+    let rkey = match (collection, object.get("rkey")) {
+        ("app.bsky.actor.profile", None) => AtprotoRecordKey::new("self").map(Some),
+        ("app.bsky.actor.profile", Some(Value::String(value))) if value == "self" => {
+            AtprotoRecordKey::new(value.clone()).map(Some)
+        }
+        ("app.bsky.actor.profile", _) => Err(anyhow::anyhow!("profile rkey must be self")),
+        (_, None) => Ok(None),
+        (_, Some(Value::String(value))) if Tid::parse(value).is_ok() => {
+            // Preserve an explicit key's bytes; parsing a TID is a syntax
+            // check, not permission to normalize the caller's record path.
+            AtprotoRecordKey::new(value.clone()).map(Some)
+        }
+        _ => Err(anyhow::anyhow!("a valid TID rkey is required when present")),
+    };
+    let rkey = match rkey {
+        Ok(rkey) => rkey,
+        Err(error) => {
             return xrpc_error(
                 StatusCode::BAD_REQUEST,
                 errors::INVALID_REQUEST,
-                "a valid TID rkey is required",
+                error.to_string(),
             )
         }
     };
@@ -1124,8 +1135,12 @@ pub async fn create_record(
             )
         }
     };
-    let request_id = request_id
-        .unwrap_or_else(|| format!("create-{}-{}", collection.replace('.', "_"), rkey.encode()));
+    let request_id = request_id.unwrap_or_else(|| match rkey.as_ref() {
+        Some(rkey) => format!("create-{}-{}", collection.replace('.', "_"), rkey.as_str()),
+        // Without a client idempotency key, distinct omitted-key requests
+        // create distinct records. Key allocation itself stays in the writer.
+        None => format!("create-{}", uuid::Uuid::new_v4()),
+    });
     let result = writer.create_record_with_expected_prev_text(
         crate::services::public_repo::PublicCreateRequest {
             request_id,
@@ -1929,6 +1944,144 @@ mod tests {
             2
         );
         assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn router_create_record_profiles_use_self_for_explicit_and_omitted_keys() {
+        for omit_key in [false, true] {
+            let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+            let mut input = json!({
+                "repo": "did:web:pub.example.com",
+                "collection": "app.bsky.actor.profile",
+                "record": {"$type": "app.bsky.actor.profile", "displayName": "Profile"},
+                "validate": false
+            });
+            for invalid in [
+                Value::Null,
+                json!(false),
+                json!(1),
+                json!(""),
+                json!("other"),
+                json!(Tid::from_raw(7).encode()),
+            ] {
+                let mut malformed = input.clone();
+                malformed["rkey"] = invalid;
+                let response = app
+                    .clone()
+                    .oneshot(write_http_request(&token, &malformed, HeaderMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+                assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+            }
+            if !omit_key {
+                input["rkey"] = json!("self");
+            }
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let created = body_json(response).await;
+            assert_eq!(
+                created["uri"],
+                "at://did:web:pub.example.com/app.bsky.actor.profile/self"
+            );
+            let response = app
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_json(response).await, created);
+            let snapshot = store.snapshot("did:web:pub.example.com").unwrap().unwrap();
+            assert_eq!(snapshot.records.len(), 1);
+            assert!(snapshot.records.contains_key(&(
+                "app.bsky.actor.profile".into(),
+                AtprotoRecordKey::new("self").unwrap()
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn router_create_record_generates_post_keys_and_recovers_idempotent_results() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        let mut input = write_input(7);
+        input.as_object_mut().unwrap().remove("rkey");
+        for invalid in [
+            Value::Null,
+            json!(false),
+            json!(1),
+            json!(""),
+            json!("self"),
+            json!("bad/key"),
+        ] {
+            let mut malformed = input.clone();
+            malformed["rkey"] = invalid;
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&token, &malformed, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+            assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("Idempotency-Key", "generated-post".parse().unwrap());
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, headers.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = body_json(response).await;
+        let generated_key = created["uri"].as_str().unwrap().rsplit('/').next().unwrap();
+        assert!(Tid::parse(generated_key).is_ok());
+        let mut uris = std::collections::BTreeSet::new();
+        uris.insert(created["uri"].as_str().unwrap().to_owned());
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let created = body_json(response).await;
+            assert!(uris.insert(created["uri"].as_str().unwrap().to_owned()));
+        }
+        let latest = store
+            .snapshot("did:web:pub.example.com")
+            .unwrap()
+            .unwrap()
+            .commit
+            .cid_atproto()
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, headers.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await, created);
+        let mut explicit_retry = input.clone();
+        explicit_retry["rkey"] = json!(generated_key);
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &explicit_retry, headers.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        input["record"]["text"] = json!("changed content");
+        let response = app
+            .oneshot(write_http_request(&token, &input, headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let snapshot = store.snapshot("did:web:pub.example.com").unwrap().unwrap();
+        assert_eq!(snapshot.records.len(), 3);
+        assert_eq!(snapshot.commit.cid_atproto().unwrap(), latest);
     }
 
     // ── Finding 1: real capacity test through the mounted router ──────────────
