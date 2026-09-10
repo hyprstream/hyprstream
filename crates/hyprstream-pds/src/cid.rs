@@ -152,7 +152,7 @@ impl Cid {
         let (code, rest) = read_uvarint(rest).ok_or_else(|| anyhow!("truncated multihash code"))?;
         let (len, rest) =
             read_uvarint(rest).ok_or_else(|| anyhow!("truncated multihash length"))?;
-        let len = len as usize;
+        let len = usize::try_from(len).map_err(|_| anyhow!("multihash length overflow"))?;
         if rest.len() != len {
             bail!(
                 "multihash length {len} does not match remaining {} bytes",
@@ -228,8 +228,18 @@ pub(crate) fn read_uvarint(input: &[u8]) -> Option<(u64, &[u8])> {
         if shift >= 64 {
             return None; // varint too long
         }
+        // The tenth byte contributes only the top bit of a u64. Reject
+        // payload bits which would overflow before shifting them in.
+        if shift == 63 && b & 0x7e != 0 {
+            return None;
+        }
         val |= ((b & 0x7f) as u64) << shift;
         if b & 0x80 == 0 {
+            // A terminating zero group after the first byte is an overlong
+            // representation (for example, `f1 00` for 0x71).
+            if i > 0 && b == 0 {
+                return None;
+            }
             return Some((val, &input[i + 1..]));
         }
         shift += 7;
@@ -324,5 +334,15 @@ mod tests {
             assert_eq!(parsed, val, "varint {val}");
             assert!(rest.is_empty(), "varint {val} had trailing bytes");
         }
+    }
+
+    #[test]
+    fn varint_rejects_overlong_and_overflow_encodings() {
+        assert!(read_uvarint(&[0xf1, 0x00]).is_none());
+        assert!(read_uvarint(&[0x80, 0x00]).is_none());
+
+        let mut overflow = vec![0xff; 9];
+        overflow.push(0x02);
+        assert!(read_uvarint(&overflow).is_none());
     }
 }

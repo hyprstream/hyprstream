@@ -38,6 +38,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{ensure, Result};
 
+use crate::atproto_cbor::AtprotoRecordKey;
 use crate::cid::Cid;
 use crate::dag_cbor::DagCbor;
 use crate::tid::Tid;
@@ -46,6 +47,10 @@ use crate::tid::Tid;
 /// `ai.hyprstream.model/3zztslq4be52u`. The MST orders by these UTF-8 bytes.
 fn record_key(collection: &str, rkey: Tid) -> String {
     format!("{collection}/{rkey}")
+}
+
+fn public_record_key(collection: &str, rkey: &AtprotoRecordKey) -> String {
+    format!("{collection}/{}", rkey.as_str())
 }
 
 /// Compute the MST level (height) of a record key: the number of trailing zero
@@ -438,8 +443,12 @@ impl Node {
     }
 
     /// Build an inclusion proof whose node CIDs use public AT serialization.
-    pub fn proof_atproto(&self, collection: &str, rkey: &Tid) -> Option<Proof> {
-        let target = record_key(collection, *rkey);
+    pub fn proof_atproto<K>(&self, collection: &str, rkey: K) -> Option<Proof>
+    where
+        K: Into<AtprotoRecordKey>,
+    {
+        let rkey: AtprotoRecordKey = rkey.into();
+        let target = public_record_key(collection, &rkey);
         let mut path = Vec::new();
         self.proof_rec_atproto(&target, &mut path).ok()?;
         Some(Proof { path })

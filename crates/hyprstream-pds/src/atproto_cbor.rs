@@ -21,26 +21,78 @@ use crate::tid::Tid;
 
 const MAX_DEPTH: usize = 128;
 
+/// A validated AT Protocol record key.
+///
+/// Record keys are user-controlled path segments. They may be TIDs, literal
+/// values such as `self`, NSIDs, or any other value permitted by the baseline
+/// record-key syntax; they are not limited to the TID format.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AtprotoRecordKey(String);
+
+impl AtprotoRecordKey {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        ensure!(
+            (1..=512).contains(&value.len())
+                && value.is_ascii()
+                && value != "."
+                && value != ".."
+                && value.bytes().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_' | b':' | b'~')
+                }),
+            "invalid AT record key"
+        );
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<Tid> for AtprotoRecordKey {
+    fn from(value: Tid) -> Self {
+        Self(value.encode())
+    }
+}
+
+impl From<&Tid> for AtprotoRecordKey {
+    fn from(value: &Tid) -> Self {
+        Self::from(*value)
+    }
+}
+
+impl From<&AtprotoRecordKey> for AtprotoRecordKey {
+    fn from(value: &AtprotoRecordKey) -> Self {
+        value.clone()
+    }
+}
+
 /// A generic public AT Protocol repository record.
 ///
 /// The value is retained as a typed DAG-CBOR value and its exact public bytes
 /// and CID are derived once at construction. This is deliberately independent
 /// of native `ModelRecord`: any supported collection can be stored without
 /// converting through a lossy JSON DTO. Construction validates the collection,
-/// TID record key, `$type` discriminator and canonical public bytes; it does
+/// general record key, `$type` discriminator and canonical public bytes; it does
 /// not grant write authority or perform a full Lexicon validation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AtprotoRecord {
     collection: String,
-    rkey: Tid,
+    rkey: AtprotoRecordKey,
     value: DagCbor,
     bytes: Vec<u8>,
     cid: Cid,
 }
 
 impl AtprotoRecord {
-    pub fn new(collection: impl Into<String>, rkey: Tid, value: DagCbor) -> Result<Self> {
+    pub fn new(
+        collection: impl Into<String>,
+        rkey: impl Into<AtprotoRecordKey>,
+        value: DagCbor,
+    ) -> Result<Self> {
         let collection = collection.into();
+        let rkey: AtprotoRecordKey = rkey.into();
         validate_nsid(&collection)?;
         let type_value = value
             .get("$type")
@@ -64,7 +116,11 @@ impl AtprotoRecord {
     /// Reconstruct a record only when bytes are already strict public
     /// canonical encoding. This check prevents a caller from changing the CID
     /// by normalizing at a later boundary.
-    pub fn from_bytes(collection: impl Into<String>, rkey: Tid, bytes: &[u8]) -> Result<Self> {
+    pub fn from_bytes(
+        collection: impl Into<String>,
+        rkey: impl Into<AtprotoRecordKey>,
+        bytes: &[u8],
+    ) -> Result<Self> {
         let value = decode(bytes)?;
         let record = Self::new(collection, rkey, value)?;
         ensure!(record.bytes == bytes, "AT record bytes are not canonical");
@@ -82,8 +138,8 @@ impl AtprotoRecord {
     }
 
     /// The validated record key.
-    pub fn rkey(&self) -> Tid {
-        self.rkey
+    pub fn rkey(&self) -> &AtprotoRecordKey {
+        &self.rkey
     }
 
     /// The validated record value.
@@ -95,7 +151,7 @@ impl AtprotoRecord {
         self.cid
     }
     pub fn uri(&self, did: &str) -> String {
-        format!("at://{did}/{}/{}", self.collection, self.rkey.encode())
+        format!("at://{did}/{}/{}", self.collection, self.rkey.as_str())
     }
 }
 
@@ -320,9 +376,30 @@ mod tests {
     fn record_identity_fields_are_immutable_after_construction() {
         let record = AtprotoRecord::new("app.bsky.feed.post", Tid::from_raw(7), post()).unwrap();
         assert_eq!(record.collection(), "app.bsky.feed.post");
-        assert_eq!(record.rkey(), Tid::from_raw(7));
+        assert_eq!(record.rkey().as_str(), Tid::from_raw(7).encode());
         assert_eq!(record.value(), &post());
         assert_eq!(record.cid(), Cid::from_dag_cbor(record.bytes()));
+    }
+
+    #[test]
+    fn literal_record_key_is_preserved_in_public_proof_path() {
+        let collection = "app.bsky.actor.profile";
+        let key = AtprotoRecordKey::new("self").unwrap();
+        let value = DagCbor::str_map([("$type", DagCbor::Text(collection.to_owned()))]);
+        let record = AtprotoRecord::new(collection, &key, value).unwrap();
+        let mut records = std::collections::BTreeMap::new();
+        records.insert(format!("{collection}/self"), record.cid());
+        let tree = Node::from_keyed_records(&records);
+        let proof = tree.proof_atproto(collection, &key).unwrap();
+        let root = tree
+            .to_node_data_with_blocks_atproto()
+            .unwrap()
+            .0
+            .cid_atproto()
+            .unwrap();
+        proof.verify_atproto(&root, &record.cid()).unwrap();
+        assert_eq!(record.rkey().as_str(), "self");
+        assert!(AtprotoRecordKey::new(".").is_err());
     }
 
     #[test]
@@ -370,7 +447,7 @@ mod tests {
         let signing = SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
         let commit = Commit::sign_atproto(&unsigned, &signing).unwrap();
         commit.verify_atproto(signing.verifying_key()).unwrap();
-        let proof = tree.proof_atproto("app.bsky.feed.post", &rkey).unwrap();
+        let proof = tree.proof_atproto("app.bsky.feed.post", rkey).unwrap();
         proof.verify_atproto(&root, &record.cid()).unwrap();
         let car = build_public_record_proof_car(&commit, &proof, &node_blocks, &record).unwrap();
         let (roots, blocks) = parse_car_v1_atproto(&car).unwrap();
