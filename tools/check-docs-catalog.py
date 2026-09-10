@@ -165,9 +165,10 @@ def audited_input(repo: Path, event: str | None = None, revision: str | None = N
     event = event or os.environ.get("DOCS_CATALOG_EVENT", "pull_request")
     revision = revision or os.environ.get("DOCS_CATALOG_AUDITED_COMMIT")
     if event == "pull_request":
-        base = revision or git(repo, "rev-parse", "refs/remotes/origin/main")
-        required(base == git(repo, "rev-parse", "refs/remotes/origin/main"),
-                 "pull-request audited input differs from remote main base")
+        base = revision or git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
+        git(repo, "cat-file", "-e", f"{base}^{{commit}}")
+        required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", base, "refs/remotes/origin/main"]).returncode == 0,
+                 "pull-request audited input is not a remote main base ancestor")
         return event, base
     if event == "push":
         boundary = revision or git(repo, "rev-parse", "HEAD^")
@@ -593,6 +594,9 @@ def self_test(repo: Path) -> None:
     catalog, corpus = read_json(repo / "docs/schema-catalog.json"), read_json(repo / "docs/corpus-sources.json")
     schemas, consumers = tracked(repo, "*.capnp"), source_services(repo)
     validate(repo, catalog, corpus, schemas, consumers)
+    # GitHub supplies the PR's immutable base SHA, which may be behind the
+    # moving remote-main tip by the time the check runs.
+    validate(repo, catalog, corpus, schemas, consumers, event="pull_request", revision=catalog["source_commit"])
     expect_failure("unlisted schema", repo, copy.deepcopy(catalog), corpus, schemas + ["new.capnp"], consumers)
     expect_failure("stale schema", repo, copy.deepcopy(catalog), corpus, schemas[1:], consumers)
     bad = copy.deepcopy(catalog); bad["source_commit"] = "not-a-git-revision"
