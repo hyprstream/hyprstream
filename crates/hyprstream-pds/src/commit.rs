@@ -25,8 +25,8 @@
 //! present-and-empty). The verifier re-encodes the unsigned form and checks the
 //! signature against the DID's published `#atproto` P-256 verifying key.
 
-use anyhow::{anyhow, bail, ensure, Result};
-use p256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
+use anyhow::{Result, anyhow, bail, ensure};
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::Signer};
 use sha2::{Digest, Sha256};
 
 use crate::cid::Cid;
@@ -104,6 +104,10 @@ pub struct Commit {
     /// AT Protocol canonical-signature boundary. Native commits are never
     /// eligible for public CAR publication without an explicit conversion.
     atproto_signature: bool,
+    /// Canonical public bytes at the provenance boundary. Public fields are
+    /// intentionally retained for compatibility, so publication must also
+    /// detect any mutation after signing or decoding.
+    atproto_canonical_bytes: Option<Vec<u8>>,
 }
 
 impl Commit {
@@ -127,6 +131,7 @@ impl Commit {
             prev: unsigned.prev,
             sig: sig.to_vec(),
             atproto_signature: false,
+            atproto_canonical_bytes: None,
         }
     }
 
@@ -134,7 +139,7 @@ impl Commit {
     pub fn sign_atproto(unsigned: &UnsignedCommit, key: &SigningKey) -> Result<Self> {
         use p256::ecdsa::signature::Signer;
         let sig: Signature = key.sign(&unsigned.to_atproto_dag_cbor()?);
-        Ok(Commit {
+        let mut commit = Commit {
             did: unsigned.did.clone(),
             version: unsigned.version,
             data: unsigned.data,
@@ -142,7 +147,10 @@ impl Commit {
             prev: unsigned.prev,
             sig: sig.to_vec(),
             atproto_signature: true,
-        })
+            atproto_canonical_bytes: None,
+        };
+        commit.atproto_canonical_bytes = Some(commit.to_atproto_dag_cbor()?);
+        Ok(commit)
     }
 
     /// DAG-CBOR encode the (signed) commit. The `sig` field is a byte string.
@@ -212,10 +220,11 @@ impl Commit {
             commit.to_atproto_dag_cbor()?.as_slice() == bytes,
             "public commit bytes are not canonical"
         );
-        Ok(Commit {
-            atproto_signature: true,
-            ..commit
-        })
+        // Decoding canonical bytes proves only their shape and byte
+        // canonicality. It cannot prove that `sig` was produced over those
+        // bytes without the account's published verifying key, so decoded
+        // values remain untrusted until `verify_atproto_and_mark` succeeds.
+        Ok(commit)
     }
 
     fn validate_atproto_fields(value: &DagCbor) -> Result<()> {
@@ -279,6 +288,7 @@ impl Commit {
             prev,
             sig,
             atproto_signature: false,
+            atproto_canonical_bytes: None,
         })
     }
 
@@ -287,7 +297,29 @@ impl Commit {
             self.atproto_signature,
             "public CAR publication requires a commit signed with AT Protocol canonical bytes"
         );
+        let canonical = self
+            .atproto_canonical_bytes
+            .as_deref()
+            .ok_or_else(|| anyhow!("public signature provenance is missing canonical bytes"))?;
+        ensure!(
+            self.to_atproto_dag_cbor()?.as_slice() == canonical,
+            "public commit was mutated after its signature provenance was established"
+        );
         Ok(())
+    }
+
+    /// Verify a decoded public commit with the account's published
+    /// `#atproto` key and mark the value eligible for public CAR publication.
+    ///
+    /// Canonical decoding alone is not signature provenance: a native commit
+    /// can be re-encoded into the public shape, and its bytes remain perfectly
+    /// canonical. This explicit key-bound verification is therefore required
+    /// before a decoded value crosses the public publication boundary.
+    pub fn verify_atproto_and_mark(mut self, vk: &VerifyingKey) -> Result<Self> {
+        self.verify_atproto(vk)?;
+        self.atproto_signature = true;
+        self.atproto_canonical_bytes = Some(self.to_atproto_dag_cbor()?);
+        Ok(self)
     }
 
     /// The CID of this (signed) commit block.
@@ -708,6 +740,32 @@ mod tests {
             Commit::from_atproto_dag_cbor(&tampered).is_err(),
             "public decoder must reject a rev encoding that normalizes to a different byte form"
         );
+    }
+
+    #[test]
+    fn decoded_public_commit_requires_explicit_signature_verification() {
+        let (native, native_vk) = make_signed_commit();
+        let public_signing = SigningKey::random(&mut rand::rngs::OsRng);
+        let public =
+            Commit::sign_atproto(&native.unsigned(), &public_signing).expect("public signature");
+        let bytes = public
+            .to_atproto_dag_cbor()
+            .expect("canonical public bytes");
+        let decoded = Commit::from_atproto_dag_cbor(&bytes).expect("canonical decode");
+        assert!(
+            decoded.ensure_atproto_signature().is_err(),
+            "canonical decoding must not establish signature provenance"
+        );
+        assert!(
+            decoded.clone().verify_atproto_and_mark(&native_vk).is_err(),
+            "verification with the wrong key must not mark the commit"
+        );
+        let verified = decoded
+            .verify_atproto_and_mark(public_signing.verifying_key())
+            .expect("published key verifies public commit");
+        verified
+            .ensure_atproto_signature()
+            .expect("verified public commit is publishable");
     }
 
     #[test]
