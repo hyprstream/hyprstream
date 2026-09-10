@@ -103,39 +103,60 @@ def text(repo: Path, path: str, mutations: dict[str, str] | None) -> str:
 def source_services(
     repo: Path, mutations: dict[str, str] | None = None, tracked_sources: list[str] | None = None
 ) -> dict[str, dict[str, Any]]:
-    cli = strip_rust_comments(text(repo, "crates/hyprstream/src/cli/schema_cli.rs", mutations))
-    mcp = strip_rust_comments(text(repo, "crates/hyprstream/src/services/mcp_service.rs", mutations))
-    factories = strip_rust_comments(text(repo, "crates/hyprstream/src/services/factories.rs", mutations))
-    vfs = strip_rust_comments(text(repo, "crates/hyprstream-rpc-std/src/vfs_mount.rs", mutations))
+    cli_source = text(repo, "crates/hyprstream/src/cli/schema_cli.rs", mutations)
+    mcp_source = text(repo, "crates/hyprstream/src/services/mcp_service.rs", mutations)
+    factories_source = text(repo, "crates/hyprstream/src/services/factories.rs", mutations)
+    vfs_source = text(repo, "crates/hyprstream-rpc-std/src/vfs_mount.rs", mutations)
+    cli, mcp = strip_rust_noncode(cli_source), strip_rust_noncode(mcp_source)
+    factories, vfs = strip_rust_noncode(factories_source), strip_rust_noncode(vfs_source)
 
-    registrations: list[tuple[int, str, list[str] | None]] = [
-        (match.start(), match.group(1), None)
-        for match in re.finditer(r'build_service_command\(\s*"([a-z0-9-]+)"', cli)
-    ]
+    registrations: list[tuple[int, str, list[str] | None]] = []
+    for match in re.finditer(r'\bbuild_service_command\s*\(\s*', cli):
+        if re.match(r'"', cli_source[match.end():]) is None:
+            continue
+        service, _ = rust_string(cli_source, match.end(), "CLI service registration")
+        registrations.append((match.start(), service, None))
     for match in re.finditer(
-        r'let\s+(?P<binding>[a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*Command::new\("(?P<service>[a-z0-9-]+)"\)'
-        r'(?P<body>.*?)\btool\s*=\s*tool\.subcommand\((?P=binding)\);',
-        cli,
-        re.DOTALL,
+        r'\blet\s+(?P<binding>[a-zA-Z_]\w*)\s*=\s*Command::new\s*\(\s*', cli
     ):
-        methods = re.findall(r'Command::new\("([a-z0-9-]+)"\)', match.group("body"))
-        registrations.append((match.start(), match.group("service"), methods))
+        if re.match(r'"', cli_source[match.end():]) is None:
+            continue
+        service, end = rust_string(cli_source, match.end(), "manual CLI registration")
+        subcommand = re.search(
+            rf'\btool\s*=\s*tool\.subcommand\(\s*{re.escape(match.group("binding"))}\s*\)\s*;', cli[end:]
+        )
+        if subcommand is None:
+            continue
+        body = cli[end:end + subcommand.start()]
+        methods = [
+            rust_string(cli_source, end + command.end(), "manual CLI method")[0]
+            for command in re.finditer(r'\bCommand::new\s*\(\s*', body)
+        ]
+        registrations.append((match.start(), service, methods))
     registrations.sort()
     cli_services = [service for _, service, _ in registrations]
     manual_services = {service: methods for _, service, methods in registrations if methods is not None}
     mcp_modules = re.findall(r"register_top_level!\(\s*reg,\s*([a-zA-Z0-9_:]+)::schema_metadata\(\)\s*\)", mcp)
     mcp_services = [module.rsplit("::", 1)[-1].removesuffix("_client") for module in mcp_modules]
-    factory_matches = re.finditer(
-        r'(?P<cfg>#\[cfg\(feature = "([^"]+)"\)\]\s*)?#\[service_factory\(\s*"(?P<name>[a-z0-9-]+)"',
-        factories,
-    )
     factory_services, features = [], {}
-    for match in factory_matches:
-        name = match.group("name")
+    cfgs: list[tuple[int, int, str]] = []
+    for match in re.finditer(r'#\s*\[\s*cfg\s*\(\s*feature\s*=\s*', factories):
+        feature, end = rust_string(factories_source, match.end(), "factory feature condition")
+        close = re.match(r'\s*\)\s*\]', factories[end:])
+        if close is not None:
+            cfgs.append((match.start(), end + close.end(), feature))
+    for match in re.finditer(r'#\s*\[\s*service_factory\s*\(\s*', factories):
+        name, _ = rust_string(factories_source, match.end(), "factory registration")
         factory_services.append(name)
-        if match.group(2):
-            features[name] = f"feature={match.group(2)}"
-    vfs_services = re.findall(r'impl_service_dispatch!\([^,]+,\s*"([a-z0-9-]+)"', vfs)
+        prior = [feature for _, end, feature in cfgs
+                 if end <= match.start() and factories[end:match.start()].strip() == ""]
+        if prior:
+            required(len(prior) == 1, f"ambiguous feature condition for factory {name}")
+            features[name] = f"feature={prior[0]}"
+    vfs_services = [
+        rust_string(vfs_source, match.end(), "VFS service registration")[0]
+        for match in re.finditer(r'\bimpl_service_dispatch!\s*\(\s*[A-Za-z_]\w*\s*,\s*', vfs)
+    ]
     ts_sources = tracked_sources if tracked_sources is not None else tracked(
         repo, "*.ts", "*.tsx", "*.js", "*.jsx", "package.json"
     )
@@ -170,8 +191,8 @@ def audited_input(repo: Path, event: str | None = None, revision: str | None = N
                  "pull-request checkout is not the workflow-supplied head")
         base = revision or git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
         git(repo, "cat-file", "-e", f"{base}^{{commit}}")
-        required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", base, "refs/remotes/origin/main"]).returncode == 0,
-                 "pull-request audited input is not a remote main base ancestor")
+        required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", base, "HEAD"]).returncode == 0,
+                 "pull-request audited input is not an ancestor of the workflow-supplied head")
         return event, base
     if event == "push":
         boundary = revision or git(repo, "rev-parse", "HEAD^")
@@ -292,8 +313,9 @@ def check_owner_directories(catalog: dict[str, Any], repo: Path) -> list[str]:
 def rust_lex(source: str, mask_literals: bool) -> str:
     """Offset-preserving Rust comment/literal lexer for the limited build.rs grammar."""
     out, index, block = [], 0, 0
-    def blank(value: str) -> str:
-        return "".join("\n" if char == "\n" else " " for char in value)
+    def blank(value: str, literal: bool = False) -> str:
+        fill = "\0" if literal else " "
+        return "".join("\n" if char == "\n" else fill for char in value)
     while index < len(source):
         pair = source[index:index + 2]
         if block:
@@ -309,7 +331,7 @@ def rust_lex(source: str, mask_literals: bool) -> str:
             close = '"' + raw.group("hashes")
             end = source.find(close, index + len(raw.group(0)))
             end = len(source) if end < 0 else end + len(close)
-            value = source[index:end]; out.append(blank(value) if mask_literals else value); index = end; continue
+            value = source[index:end]; out.append(blank(value, literal=True) if mask_literals else value); index = end; continue
         char = source[index]
         is_char = char == "'" and (index + 2 < len(source)) and (source[index + 1] == "\\" or source[index + 2] == "'")
         if char == '"' or is_char:
@@ -318,7 +340,7 @@ def rust_lex(source: str, mask_literals: bool) -> str:
                 if source[end] == "\\": end += 2; continue
                 end += 1
                 if source[end - 1] == quote: break
-            value = source[index:end]; out.append(blank(value) if mask_literals else value); index = end; continue
+            value = source[index:end]; out.append(blank(value, literal=True) if mask_literals else value); index = end; continue
         out.append(char); index += 1
     return "".join(out)
 
@@ -329,6 +351,46 @@ def strip_rust_comments(source: str) -> str:
 
 def strip_rust_noncode(source: str) -> str:
     return rust_lex(source, True)
+
+
+def rust_literal(source: str, start: int, label: str) -> tuple[str, int]:
+    """Read a normal Rust string after a token-validated prefix."""
+    match = re.match(r'\s*("(?:\\.|[^"\\])*")', source[start:])
+    required(match is not None, f"{label} must use a literal")
+    try:
+        value = json.loads(match.group(1))
+    except json.JSONDecodeError as error:
+        raise CatalogError(f"{label} has invalid literal") from error
+    return value, start + match.end()
+
+
+def rust_string(source: str, start: int, label: str) -> tuple[str, int]:
+    """Read a canonical service registration literal after a token-validated prefix."""
+    value, end = rust_literal(source, start, label)
+    required(re.fullmatch(r"[a-z0-9-]+", value) is not None,
+             f"{label} has non-canonical service name")
+    return value, end
+
+
+def strip_capnp_noncode(source: str) -> str:
+    """Offset-preserving lexer for Cap'n Proto line comments and string values."""
+    out, index = [], 0
+    def blank(value: str) -> str:
+        return "".join("\n" if char == "\n" else " " for char in value)
+    while index < len(source):
+        if source[index] == "#":
+            end = source.find("\n", index)
+            end = len(source) if end < 0 else end
+            out.append(blank(source[index:end])); index = end; continue
+        if source[index] == '"':
+            end = index + 1
+            while end < len(source):
+                if source[end] == "\\": end += 2; continue
+                end += 1
+                if source[end - 1] == '"': break
+            out.append(blank(source[index:end])); index = end; continue
+        out.append(source[index]); index += 1
+    return "".join(out)
 
 
 def split_top_level(value: str) -> list[str]:
@@ -415,6 +477,28 @@ def cgr_inventory(build_file: str, source: str) -> list[dict[str, Any]]:
     return calls
 
 
+def capnp_only_inputs(build_file: str, source: str) -> list[str]:
+    """Resolve literal capnpc::CompilerCommand inputs without trusting comments/literals."""
+    code = strip_rust_noncode(source)
+    bindings: dict[str, str] = {}
+    for match in re.finditer(r'\blet\s+([A-Za-z_]\w*)\s*=\s*format!\s*\(\s*', code):
+        template, _ = rust_literal(source, match.end(), "capnp-only compiler input")
+        bindings.setdefault(match.group(1), template)
+    inputs: list[str] = []
+    for match in re.finditer(r'\bcapnpc\s*::\s*CompilerCommand\s*::\s*new\s*\(\s*\)(?:(?!;).)*?\.file\s*\(\s*', code, re.DOTALL):
+        tail = source[match.end():]
+        binding = re.match(r'&?([A-Za-z_]\w*)', tail)
+        if binding is not None:
+            required(binding.group(1) in bindings,
+                     f"{build_file} capnp-only compiler input is unresolved")
+            raw = bindings[binding.group(1)]
+        else:
+            raw, _ = rust_literal(source, match.end(), "capnp-only compiler input")
+        raw = raw.replace("{manifest}", str(Path(build_file).parent))
+        inputs.append(os.path.normpath(raw).replace("\\", "/"))
+    return inputs
+
+
 def check_cgr(catalog: dict[str, Any], repo: Path, schemas: list[dict[str, Any]],
               mutations: dict[str, str] | None) -> dict[str, list[dict[str, Any]]]:
     roots = catalog.get("cgr_build_roots", {})
@@ -429,14 +513,18 @@ def check_cgr(catalog: dict[str, Any], repo: Path, schemas: list[dict[str, Any]]
         required(isinstance(import_roots, list) and import_roots, f"{build_file} lacks import roots")
         required(inventories[build_file] == EXPECTED_CGR_INVOCATIONS[build_file]["invocations"],
                  f"{build_file} persisted-CGR invocation inventory drift")
+    capnp_only = capnp_only_inputs("crates/hyprstream-rpc-build/build.rs",
+                                   text(repo, "crates/hyprstream-rpc-build/build.rs", mutations))
+    expected_capnp_only = sorted(entry["path"] for entry in schemas if entry.get("compiled_by") == "capnp_only")
+    required(sorted(capnp_only) == expected_capnp_only,
+             "capnp-only compiler input inventory drift")
     for entry in schemas:
         producer = entry.get("cgr_producer")
         if producer is None:
             mode = entry.get("compiled_by")
             required(mode in {"capnp_only", "not_compiled"}, f"{entry['path']} must distinguish non-CGR compilation")
             if mode == "capnp_only":
-                source = text(repo, "crates/hyprstream-rpc-build/build.rs", mutations)
-                required("capnpc::CompilerCommand" in source and Path(entry["path"]).stem in source, f"{entry['path']} capnp-only claim drift")
+                required(entry["path"] in capnp_only, f"{entry['path']} capnp-only claim drift")
             continue
         required(producer in roots, f"{entry['path']} producer is not an audited persisted-CGR root")
         matched = [call for call in inventories[producer] if entry["path"].startswith(f"{call['source_root']}/") and Path(entry["path"]).stem in call["schemas"]]
@@ -512,7 +600,6 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
     by_service = {entry["service"]: entry for entry in schemas if entry.get("service")}
     owner_directories = check_owner_directories(catalog, repo)
     inventories = check_cgr(catalog, repo, schemas, mutations)
-    capnp_build = text(repo, "crates/hyprstream-rpc-build/build.rs", mutations)
     for entry in schemas:
         for key in ("owner", "license", "kind", "exclusions"):
             required(bool(entry.get(key)), f"{entry['path']} lacks {key}")
@@ -520,23 +607,25 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
         required(entry["owner"] == owner, f"{entry['path']} owner differs from path-derived package")
         required(entry["license"] == license_id, f"{entry['path']} license differs from owner manifest")
         source = text(repo, entry["path"], mutations)
-        found = re.search(r"^@(0x[0-9a-f]+);", source, re.MULTILINE)
+        code = strip_capnp_noncode(source)
+        found = re.search(r"^@(0x[0-9a-f]+);", code, re.MULTILINE)
         required(found is not None and found.group(1) == entry["source_id"], f"{entry['path']} source ID drift")
         stem = Path(entry["path"]).stem
-        expected_service = stem if re.search(rf"(?m)^struct\s+{''.join(part.capitalize() for part in stem.split('_'))}Request\b", source) or re.search(r"(?m)^interface\s+", source) else None
+        expected_service = stem if re.search(rf"(?m)^struct\s+{''.join(part.capitalize() for part in stem.split('_'))}Request\b", code) or re.search(r"(?m)^interface\s+", code) else None
         if expected_service is not None:
             required(entry["kind"] == "service" and entry.get("service") == expected_service,
                      f"{entry['path']} service identity/classification drift")
         elif entry["path"].endswith("wire_roundtrip_fixture.capnp"):
             required(entry["kind"] == "test-fixture" and entry.get("service") is None,
                      f"{entry['path']} fixture classification drift")
-        elif "annotation " in source:
+        elif "annotation " in code:
             required(entry["kind"] == "annotations" and entry.get("service") is None,
                      f"{entry['path']} annotation classification drift")
-        elif re.search(r"\b9P\b|CompositorIpc", source):
+        elif (re.search(r"(?m)^struct\s+NpRequest\b", code)
+              and re.search(r"(?m)^struct\s+NpResponse\b", code)) or re.search(r"\bCompositorIpc", code):
             required(entry["kind"] == "protocol" and entry.get("service") is None,
                      f"{entry['path']} protocol classification drift")
-        elif re.search(r"\b(?:ChatCoreIn|TypedEventEnvelope)\b", source):
+        elif re.search(r"\b(?:ChatCoreIn|TypedEventEnvelope)\b", code):
             required(entry["kind"] == "type-only" and entry.get("service") is None,
                      f"{entry['path']} type-only classification drift")
         else:
@@ -548,8 +637,7 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
             required(entry.get("cgr_producer") == actual_cgr[0] and "compiled_by" not in entry,
                      f"{entry['path']} persisted-CGR compiler classification drift")
         elif entry["path"].endswith("wire_roundtrip_fixture.capnp"):
-            required(entry.get("cgr_producer") is None and entry.get("compiled_by") == "capnp_only"
-                     and re.search(r"capnpc::CompilerCommand::new\(\).*?\.file\(&schema\)", capnp_build, re.DOTALL) is not None,
+            required(entry.get("cgr_producer") is None and entry.get("compiled_by") == "capnp_only",
                      f"{entry['path']} capnp-only compiler input drift")
         else:
             required(entry.get("cgr_producer") is None and entry.get("compiled_by") == "not_compiled",
@@ -649,6 +737,19 @@ def expect_failure(name: str, repo: Path, catalog: dict[str, Any], corpus: dict[
     raise AssertionError(f"mutation probe {name} unexpectedly passed")
 
 
+def expect_success(name: str, repo: Path, catalog: dict[str, Any], corpus: dict[str, Any],
+                   schemas: list[str], mutations: dict[str, str]) -> None:
+    """Prove a non-code decoy does not alter the source-derived inventory."""
+    trial_catalog, trial_corpus = copy.deepcopy(catalog), copy.deepcopy(corpus)
+    digest = input_digest(repo, provenance_paths(repo, trial_corpus), mutations)
+    trial_catalog["source_input_digest"] = digest
+    trial_corpus["source_input_digest"] = digest
+    try:
+        validate(repo, trial_catalog, trial_corpus, schemas, source_services(repo, mutations), mutations)
+    except CatalogError as error:
+        raise AssertionError(f"mutation probe {name} unexpectedly failed: {error}") from error
+
+
 def expect_cgr_failure(name: str, build_file: str, source: str) -> None:
     try:
         cgr_inventory(build_file, source)
@@ -668,6 +769,11 @@ def self_test(repo: Path) -> None:
     # of that base that is not itself on main yet.
     validate(repo, catalog, corpus, schemas, consumers, event="pull_request",
              revision=git(repo, "merge-base", "HEAD", "refs/remotes/origin/main"))
+    # A PR can target a maintained release branch. Its workflow-supplied base
+    # is authoritative when it is a real ancestor of this exact PR head; it
+    # need not be an ancestor of the unrelated moving main branch.
+    validate(repo, catalog, corpus, schemas, consumers, event="pull_request",
+             revision=catalog["source_commit"])
     previous_head = os.environ.get("DOCS_CATALOG_AUDITED_HEAD")
     previous_event = os.environ.get("DOCS_CATALOG_EVENT")
     os.environ["DOCS_CATALOG_AUDITED_HEAD"] = "0" * 40
@@ -706,6 +812,10 @@ def self_test(repo: Path) -> None:
     settlement = next(entry for entry in bad["schemas"] if entry["path"].endswith("settlement.capnp"))
     settlement["kind"], settlement["service"] = "type-only", None
     expect_failure("schema service reclassification", repo, bad, corpus, schemas, consumers)
+    common_path = "crates/hyprstream-rpc/schema/common.capnp"
+    common_comment_decoy = text(repo, common_path, None) + "\n# struct CommonRequest {}\n"
+    expect_success("schema kind comment decoy", repo, catalog, corpus, schemas,
+                   {common_path: common_comment_decoy})
     bad = copy.deepcopy(catalog)
     model = next(entry for entry in bad["schemas"] if entry["path"].endswith("model.capnp"))
     model["cgr_producer"], model["compiled_by"] = None, "not_compiled"
@@ -768,6 +878,11 @@ def self_test(repo: Path) -> None:
     fixture_build = "crates/hyprstream-rpc-build/build.rs"
     fixture_drift = text(repo, fixture_build, None).replace(".file(&schema)", '.file("tests/other.capnp")', 1)
     expect_failure("capnp-only compiler input", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {fixture_build: fixture_drift})
+    fixture_binding_drift = text(repo, fixture_build, None).replace(
+        "tests/wire_roundtrip_fixture.capnp", "tests/other.capnp", 1
+    )
+    expect_failure("capnp-only resolved compiler input", repo, copy.deepcopy(catalog), corpus,
+                   schemas, consumers, {fixture_build: fixture_binding_drift})
     shadowed = text(repo, discovery_build, None).replace(
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");\n    let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-workers/schema");',
@@ -800,6 +915,20 @@ def self_test(repo: Path) -> None:
              "deeply scoped streaming extractor drift")
     expect_failure("deeply scoped streaming response", repo, copy.deepcopy(catalog), corpus, schemas,
                    consumers, {registry_path: deep_stream})
+    for name, path, decoy in [
+        ("CLI literal registration decoy", cli_path,
+         'let _ = r#"build_service_command(\"ghost\", &ghost_methods, ghost_tree)"#;'),
+        ("MCP literal registration decoy", "crates/hyprstream/src/services/mcp_service.rs",
+         'let _ = "register_top_level!(reg, ghost_client::schema_metadata())";'),
+        ("factory literal registration decoy", "crates/hyprstream/src/services/factories.rs",
+         'let _ = r#"#[service_factory(\"ghost\")]"#;'),
+        ("VFS literal registration decoy", "crates/hyprstream-rpc-std/src/vfs_mount.rs",
+         'let _ = r#"impl_service_dispatch!(GhostDispatch, \"ghost\", crate::ghost_client)"#;'),
+    ]:
+        mutated = text(repo, path, None) + "\n" + decoy + "\n"
+        required(source_services(repo, {path: mutated}) == consumers,
+                 f"{name} altered source-derived registrations")
+        expect_success(name, repo, catalog, corpus, schemas, {path: mutated})
     expect_failure("TypeScript source", repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, tracked_sources=["package.json"]))
     bad = copy.deepcopy(catalog); bad.pop("owner_directories")
     expect_failure("owner directory inventory", repo, bad, corpus, schemas, consumers)
