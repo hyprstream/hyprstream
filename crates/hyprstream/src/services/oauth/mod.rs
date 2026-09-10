@@ -856,15 +856,29 @@ impl Spawnable for OAuthService {
                 let authority = hyprstream_rpc::Subject::new(
                     hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
                 );
+                let refresh_store = Arc::clone(store);
                 tokio::time::timeout(
                     std::time::Duration::from_secs(30),
-                    store.refresh_hosted_did_index(&authority),
+                    tokio::task::spawn_blocking(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|error| format!("warm-up runtime: {error}"))?;
+                        runtime
+                            .block_on(refresh_store.refresh_hosted_did_index(&authority))
+                            .map_err(|error| format!("index refresh: {error}"))
+                    }),
                 )
                 .await
                 .map_err(|_| {
                     hyprstream_rpc::error::RpcError::SpawnFailed(
                         "hosted account index warm-up timed out".to_owned(),
                     )
+                })?
+                .map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "hosted account index warm-up task failed: {error}"
+                    ))
                 })?
                 .map_err(|error| {
                     hyprstream_rpc::error::RpcError::SpawnFailed(format!(
@@ -1214,7 +1228,7 @@ mod tests {
     fn oauth_warms_hosted_did_index_before_readiness() {
         let source = include_str!("mod.rs");
         let warmup = source
-            .find("store.refresh_hosted_did_index(&authority)")
+            .find("refresh_store.refresh_hosted_did_index(&authority)")
             .expect("OAuth startup must warm the hosted-DID index");
         let ready = source
             .find("if let Some(tx) = on_ready")

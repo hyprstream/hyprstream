@@ -416,16 +416,11 @@ impl AccountRecordStore {
     ) -> Result<Option<Vec<u8>>, AccountReadError> {
         use p256::ecdsa::signature::Signer as _;
 
-        let resolved = match self.resolve_tenant_for_hosted_did(authority, did).await {
-            Err(AccountReadError::HostedDidIndexNotReady) => {
-                // Internal signing is already an authorized operation; warm
-                // its index explicitly, while the public HTTP lookup remains
-                // strictly non-blocking.
-                self.refresh_hosted_did_index(authority).await?;
-                self.resolve_tenant_for_hosted_did(authority, did).await
-            }
-            result => result,
-        }?;
+        // Signing runs on authenticated request paths; never turn a cold or
+        // hard-stale lookup into a synchronous tenant enumeration. Startup
+        // warms the index before OAuth readiness, while this resolver remains
+        // fail-closed until a snapshot is available.
+        let resolved = self.resolve_tenant_for_hosted_did(authority, did).await?;
         let Some(tenant) = resolved else {
             return Ok(None);
         };
@@ -1027,6 +1022,20 @@ mod tests {
         let store = store();
         let error = store
             .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AccountReadError::HostedDidIndexNotReady));
+    }
+
+    #[tokio::test]
+    async fn cold_hosted_did_signing_never_refreshes_on_request_path() {
+        let store = store();
+        let error = store
+            .sign_for_hosted_did(
+                &oauth_authority(),
+                "did:web:alice.acme.example",
+                b"header.payload",
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, AccountReadError::HostedDidIndexNotReady));
