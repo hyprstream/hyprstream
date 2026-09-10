@@ -314,6 +314,13 @@ impl HostedAccountHttpDirectory for MountedHostedAccountHttpDirectory {
             genesis.unsigned().doc_cid() == record.doc_cid(),
             "served genesis operation does not match account document"
         );
+        // This immutable layout contains only the sealed genesis envelope,
+        // not a validated update chain. Match the sealed-bundle and hosted
+        // connect-time validators instead of presenting genesis as current.
+        ensure!(
+            record.current_op() == record.genesis_op(),
+            "immutable hosted account record current operation is not genesis"
+        );
         Ok(Some(Arc::new(HostedAccountHttpArtifacts::new(
             label,
             did.clone(),
@@ -1047,6 +1054,48 @@ mod tests {
             .await
             .expect_err("document key rebound must be rejected");
         assert!(error.to_string().contains("#atproto key"));
+    }
+
+    #[tokio::test]
+    async fn mounted_directory_rejects_non_genesis_current_operation_on_every_route() {
+        let (original, document, log, record) = mounted_directory();
+        original.store.refresh_hosted_did_index(&original.authority).await.unwrap();
+        assert!(original.lookup("alice").await.unwrap().is_some());
+
+        // Change only current_op: host, document, key, and sealed genesis
+        // remain valid and mutually consistent, so no other guard can mask
+        // the unsupported current-operation pointer.
+        let mut record_value = DagCbor::decode(&record).unwrap();
+        let fields = match &mut record_value {
+            DagCbor::Map(fields) => fields,
+            other => panic!("account record must be a map, got {other:?}"),
+        };
+        let mut replaced = false;
+        for (key, value) in fields {
+            if matches!(key, DagCbor::Text(name) if name == "current_op") {
+                *value = DagCbor::Link(Cid::from_dag_cbor(b"unvalidated-current-operation"));
+                replaced = true;
+            }
+        }
+        assert!(replaced, "account record must contain current_op");
+        let invalid = mounted_directory_with_files(
+            Some(record_value.encode()), Some(document), Some(log),
+        ).0;
+        invalid.store.refresh_hosted_did_index(&invalid.authority).await.unwrap();
+        let error = invalid.lookup("alice").await.expect_err("current op must be sealed genesis");
+        assert!(error.to_string().contains("current operation is not genesis"));
+        let app = router(DEFAULT_ACCOUNT_ZONE, invalid).unwrap();
+        for path in ["/.well-known/did.json", "/.well-known/atproto-did", "/.well-known/did-log.json"] {
+            let response = app.clone().oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(header::HOST, "alice.tormentnexus.social")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            ).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(to_bytes(response.into_body(), 1024).await.unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
