@@ -25,8 +25,8 @@
 //! present-and-empty). The verifier re-encodes the unsigned form and checks the
 //! signature against the DID's published `#atproto` P-256 verifying key.
 
-use anyhow::{Result, anyhow, bail, ensure};
-use p256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::Signer};
+use anyhow::{anyhow, bail, ensure, Result};
+use p256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::cid::Cid;
@@ -138,6 +138,11 @@ impl Commit {
     /// Sign a commit using public AT Protocol canonical bytes.
     pub fn sign_atproto(unsigned: &UnsignedCommit, key: &SigningKey) -> Result<Self> {
         use p256::ecdsa::signature::Signer;
+        ensure!(
+            unsigned.version == COMMIT_VERSION,
+            "unsupported public commit version {} (expected {COMMIT_VERSION})",
+            unsigned.version
+        );
         let sig: Signature = key.sign(&unsigned.to_atproto_dag_cbor()?);
         let mut commit = Commit {
             did: unsigned.did.clone(),
@@ -297,6 +302,11 @@ impl Commit {
             self.atproto_signature,
             "public CAR publication requires a commit signed with AT Protocol canonical bytes"
         );
+        ensure!(
+            self.version == COMMIT_VERSION,
+            "unsupported public commit version {} (expected {COMMIT_VERSION})",
+            self.version
+        );
         let canonical = self
             .atproto_canonical_bytes
             .as_deref()
@@ -357,6 +367,11 @@ impl Commit {
 
     pub fn verify_atproto(&self, vk: &VerifyingKey) -> Result<()> {
         use p256::ecdsa::signature::Verifier;
+        ensure!(
+            self.version == COMMIT_VERSION,
+            "unsupported public commit version {} (expected {COMMIT_VERSION})",
+            self.version
+        );
         let signature = Signature::from_slice(&self.sig)
             .map_err(|e| anyhow::anyhow!("invalid ES256 signature bytes: {e}"))?;
         vk.verify(&self.unsigned().to_atproto_dag_cbor()?, &signature)

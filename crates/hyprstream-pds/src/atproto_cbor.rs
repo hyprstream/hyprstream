@@ -13,7 +13,7 @@
 
 use std::cmp::Ordering;
 
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 
 use crate::cid::Cid;
 use crate::dag_cbor::DagCbor;
@@ -268,11 +268,11 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
     use super::*;
-    use crate::Cid;
     use crate::car::{build_public_record_proof_car, parse_car_v1_atproto};
     use crate::commit::{Commit, UnsignedCommit};
     use crate::mst::Node;
     use crate::tid::Tid;
+    use crate::Cid;
     use p256::ecdsa::SigningKey;
 
     fn post() -> DagCbor {
@@ -362,16 +362,14 @@ mod tests {
         }
         assert!(validate_nsid(&format!("com.{}.record", "a".repeat(64))).is_err());
         assert!(validate_nsid(&format!("com.example.{}", "a".repeat(64))).is_err());
-        assert!(
-            validate_nsid(&format!(
-                "{}.{}.{}.{}.record",
-                "a".repeat(63),
-                "b".repeat(63),
-                "c".repeat(63),
-                "d".repeat(63),
-            ))
-            .is_err()
-        );
+        assert!(validate_nsid(&format!(
+            "{}.{}.{}.{}.record",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63),
+        ))
+        .is_err());
     }
 
     #[test]
@@ -454,17 +452,13 @@ mod tests {
         let car = build_public_record_proof_car(&commit, &proof, &node_blocks, &record).unwrap();
         let (roots, blocks) = parse_car_v1_atproto(&car).unwrap();
         assert_eq!(roots, vec![commit.cid_atproto().unwrap()]);
-        assert!(
-            blocks
-                .iter()
-                .any(|(cid, bytes)| *cid == record.cid() && bytes == record.bytes())
-        );
-        assert!(
-            blocks
-                .iter()
-                .any(|(cid, bytes)| *cid == commit.cid_atproto().unwrap()
-                    && bytes == &commit.to_atproto_dag_cbor().unwrap())
-        );
+        assert!(blocks
+            .iter()
+            .any(|(cid, bytes)| *cid == record.cid() && bytes == record.bytes()));
+        assert!(blocks
+            .iter()
+            .any(|(cid, bytes)| *cid == commit.cid_atproto().unwrap()
+                && bytes == &commit.to_atproto_dag_cbor().unwrap()));
 
         let empty = crate::mst::Proof { path: Vec::new() };
         assert!(build_public_record_proof_car(&commit, &empty, &node_blocks, &record).is_err());
@@ -509,6 +503,13 @@ mod tests {
         assert!(
             build_public_record_proof_car(&laundered, &proof, &node_blocks, &record).is_err(),
             "decoding canonical bytes must not launder native signature provenance"
+        );
+
+        let mut unsupported_unsigned = unsigned.clone();
+        unsupported_unsigned.version = 4;
+        assert!(
+            Commit::sign_atproto(&unsupported_unsigned, &signing).is_err(),
+            "public signing must reject unsupported commit versions"
         );
 
         let mut mutated_public_commit = commit.clone();
