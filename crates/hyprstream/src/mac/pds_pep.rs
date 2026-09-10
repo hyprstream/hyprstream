@@ -63,6 +63,19 @@ impl ObjectLabelResolver for PdsAccountObjectLabelResolver {
         };
         match components {
             ["pds"] => Some(pds_account_label()),
+            ["pds", tenant] if valid_tenant_component(tenant) => Some(pds_account_label()),
+            ["pds", tenant, accounts]
+                if valid_tenant_component(tenant) && *accounts == PDS_ACCOUNTS_DIRECTORY =>
+            {
+                Some(pds_account_label())
+            }
+            ["pds", tenant, accounts, account]
+                if valid_tenant_component(tenant)
+                    && *accounts == PDS_ACCOUNTS_DIRECTORY
+                    && valid_account_component(account) =>
+            {
+                Some(pds_account_label())
+            }
             ["pds", tenant, accounts, account, file]
                 if valid_tenant_component(tenant)
                     && *accounts == PDS_ACCOUNTS_DIRECTORY
@@ -624,10 +637,12 @@ pub fn production_pds_account_record_store(
     mount: Arc<PdsDirectoryMount>,
     sink: Arc<dyn AuditSink>,
 ) -> Arc<hyprstream_pds_service::AccountRecordStore> {
-    Arc::new(hyprstream_pds_service::AccountRecordStore::new(
+    let store = Arc::new(hyprstream_pds_service::AccountRecordStore::new(
         mount,
         production_pds_account_read_authorizer(sink),
-    ))
+    ));
+    store.schedule_hosted_did_index_refresh(Subject::new(OAUTH_ACCOUNT_RESOLVER_SUBJECT));
+    store
 }
 
 #[cfg(test)]
@@ -1003,6 +1018,23 @@ mod tests {
         let resolver = PdsAccountObjectLabelResolver;
         assert_eq!(
             resolver.resolve(ObjectRef::Path(&["pds"])),
+            Some(pds_account_label())
+        );
+        assert_eq!(
+            resolver.resolve(ObjectRef::Path(&["pds", "acme"])),
+            Some(pds_account_label())
+        );
+        assert_eq!(
+            resolver.resolve(ObjectRef::Path(&["pds", "acme", PDS_ACCOUNTS_DIRECTORY,])),
+            Some(pds_account_label())
+        );
+        assert_eq!(
+            resolver.resolve(ObjectRef::Path(&[
+                "pds",
+                "acme",
+                PDS_ACCOUNTS_DIRECTORY,
+                "alice",
+            ])),
             Some(pds_account_label())
         );
         assert_eq!(
