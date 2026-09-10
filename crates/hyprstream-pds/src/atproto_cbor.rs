@@ -31,9 +31,9 @@ const MAX_DEPTH: usize = 128;
 /// not grant write authority or perform a full Lexicon validation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AtprotoRecord {
-    pub collection: String,
-    pub rkey: Tid,
-    pub value: DagCbor,
+    collection: String,
+    rkey: Tid,
+    value: DagCbor,
     bytes: Vec<u8>,
     cid: Cid,
 }
@@ -74,6 +74,23 @@ impl AtprotoRecord {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// The validated collection NSID. Record identity fields are immutable
+    /// after construction so this always agrees with `bytes()` and `cid()`.
+    pub fn collection(&self) -> &str {
+        &self.collection
+    }
+
+    /// The validated record key.
+    pub fn rkey(&self) -> Tid {
+        self.rkey
+    }
+
+    /// The validated record value.
+    pub fn value(&self) -> &DagCbor {
+        &self.value
+    }
+
     pub fn cid(&self) -> Cid {
         self.cid
     }
@@ -84,31 +101,41 @@ impl AtprotoRecord {
 
 fn validate_nsid(nsid: &str) -> Result<()> {
     ensure!(
-        !nsid.is_empty() && nsid.len() <= 317,
+        !nsid.is_empty() && nsid.len() <= 317 && nsid.is_ascii(),
         "invalid AT collection NSID"
     );
-    let mut segments = nsid.split('.');
-    let first = segments.next().unwrap_or_default();
+    let segments: Vec<&str> = nsid.split('.').collect();
     ensure!(
-        !first.is_empty()
-            && first
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+        segments.len() >= 3,
+        "invalid NSID: authority and name required"
+    );
+
+    let name = segments.last().copied().unwrap_or_default();
+    ensure!(
+        (1..=63).contains(&name.len())
+            && name.as_bytes()[0].is_ascii_alphabetic()
+            && name.bytes().all(|c| c.is_ascii_alphanumeric()),
+        "invalid NSID name"
+    );
+
+    let authority = &segments[..segments.len() - 1];
+    let authority_len = nsid.len() - name.len() - 1;
+    ensure!(
+        authority.len() >= 2 && authority_len <= 253,
         "invalid NSID authority"
     );
-    for segment in segments {
+    for (index, segment) in authority.iter().enumerate() {
         ensure!(
-            !segment.is_empty()
+            (1..=63).contains(&segment.len())
                 && segment
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                && segment.as_bytes()[0] != b'-'
+                && segment.as_bytes()[segment.len() - 1] != b'-'
+                && (index != 0 || segment.as_bytes()[0].is_ascii_alphabetic()),
             "invalid NSID segment"
         );
     }
-    ensure!(
-        nsid.contains('.'),
-        "AT collection NSID needs a domain hierarchy"
-    );
     Ok(())
 }
 
@@ -250,6 +277,52 @@ mod tests {
         ] {
             assert!(encode(&value).is_err());
         }
+    }
+
+    #[test]
+    fn nsid_validation_matches_at_protocol_syntax() {
+        for valid in [
+            "com.example.fooBar",
+            "net.users.bob.ping",
+            "a-0.b-1.c",
+            "a.b.c",
+            "cn.8.lex.stuff",
+        ] {
+            validate_nsid(valid).unwrap();
+        }
+        for invalid in [
+            "com.example",
+            "com.example.3",
+            "1.example.record",
+            "com.-example.record",
+            "com.example-.record",
+            "com.example.re-cord",
+            "com..example.record",
+            "com.example.",
+            "com.example.é",
+            "com.example.this_name_is_invalid",
+        ] {
+            assert!(validate_nsid(invalid).is_err(), "{invalid}");
+        }
+        assert!(validate_nsid(&format!("com.{}.record", "a".repeat(64))).is_err());
+        assert!(validate_nsid(&format!("com.example.{}", "a".repeat(64))).is_err());
+        assert!(validate_nsid(&format!(
+            "{}.{}.{}.{}.record",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63),
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn record_identity_fields_are_immutable_after_construction() {
+        let record = AtprotoRecord::new("app.bsky.feed.post", Tid::from_raw(7), post()).unwrap();
+        assert_eq!(record.collection(), "app.bsky.feed.post");
+        assert_eq!(record.rkey(), Tid::from_raw(7));
+        assert_eq!(record.value(), &post());
+        assert_eq!(record.cid(), Cid::from_dag_cbor(record.bytes()));
     }
 
     #[test]
