@@ -1115,6 +1115,10 @@ mod tests {
         );
         let store =
             AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), permit_account_reads());
+        store
+            .refresh_hosted_did_index(&oauth_authority())
+            .await
+            .expect("startup warm-up must complete before signing");
         let input = b"header.payload";
         let signature = store
             .sign_for_hosted_did(&oauth_authority(), did, input)
@@ -1138,7 +1142,12 @@ mod tests {
         let missing = AccountRecordStore::new(
             Arc::new(SyntheticMount::new(missing_root)),
             permit_account_reads(),
-        )
+        );
+        missing
+            .refresh_hosted_did_index(&oauth_authority())
+            .await
+            .expect("startup warm-up must complete before signing");
+        let missing = missing
         .sign_for_hosted_did(&oauth_authority(), did, input)
         .await
         .unwrap_err();
@@ -1153,7 +1162,12 @@ mod tests {
         let mismatch = AccountRecordStore::new(
             Arc::new(SyntheticMount::new(mismatch_root)),
             permit_account_reads(),
-        )
+        );
+        mismatch
+            .refresh_hosted_did_index(&oauth_authority())
+            .await
+            .expect("startup warm-up must complete before signing");
+        let mismatch = mismatch
         .sign_for_hosted_did(&oauth_authority(), did, input)
         .await
         .unwrap_err();
