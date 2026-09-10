@@ -38,6 +38,7 @@ use crate::did_op::{
     UnsignedGenesisDidOp,
 };
 use crate::hosted_did_document::SealedHostedDidDocument;
+use crate::AccountLabel;
 use hyprstream_rpc::identity::UNAUTHENTICATED_DID_SENTINEL;
 
 /// Version of the durable hosted-account record.
@@ -87,25 +88,7 @@ impl AllocatedAccountName {
             self.did != UNAUTHENTICATED_DID_SENTINEL,
             "{UNAUTHENTICATED_DID_SENTINEL} is reserved for the unauthenticated floor and cannot be registered or minted"
         );
-        ensure!(!self.label.is_empty(), "allocated account label is empty");
-        ensure!(
-            self.label.len() <= 63,
-            "allocated account label exceeds 63 octets"
-        );
-        ensure!(
-            self.label == self.label.to_ascii_lowercase(),
-            "allocated account label must already be lowercase"
-        );
-        ensure!(
-            self.label
-                .bytes()
-                .all(|byte| { byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' }),
-            "allocated account label must be a single LDH label"
-        );
-        ensure!(
-            !self.label.starts_with('-') && !self.label.ends_with('-'),
-            "allocated account label must not start or end with a hyphen"
-        );
+        AccountLabel::parse(&self.label).context("allocated account label is invalid")?;
         validate_host_form_did_web(&self.did)?;
         let host = self
             .did
