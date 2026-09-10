@@ -352,14 +352,11 @@ impl AccountRecordStore {
             };
             for account in accounts.into_iter().filter(|account| account.is_dir) {
                 let label = account.name;
-                // A failed mint can leave its private staging directory in
-                // the published `accounts` directory.  Staging names (and
-                // any other non-canonical directory entries) are not account
-                // labels and must never abort the whole index refresh; only
-                // canonical labels below are authoritative account records.
-                if AccountLabel::parse(&label).is_err() {
+                if hyprstream_pds::is_hosted_account_staging_directory(&label) {
                     continue;
                 }
+                AccountLabel::parse(&label)
+                    .map_err(|_| AccountReadError::InvalidAccountLabel(label.clone()))?;
                 let components = [
                     entry.name.as_str(),
                     PDS_ACCOUNTS_DIRECTORY,
@@ -943,19 +940,18 @@ mod tests {
     async fn hosted_did_index_ignores_mint_staging_directories() {
         let record = account_bytes("alice", "acme.example");
         let accounts = SyntheticNode::dir()
-            .with_child("alice", SyntheticNode::dir().with_child(
-                PDS_ACCOUNT_RECORD_FILE,
-                SyntheticNode::file(record),
-            ))
+            .with_child(
+                "alice",
+                SyntheticNode::dir()
+                    .with_child(PDS_ACCOUNT_RECORD_FILE, SyntheticNode::file(record)),
+            )
             .with_child(".alice.mint-123-0", SyntheticNode::dir());
         let root = SyntheticNode::dir().with_child(
             "acme",
             SyntheticNode::dir().with_child(PDS_ACCOUNTS_DIRECTORY, accounts),
         );
-        let store = AccountRecordStore::new(
-            Arc::new(SyntheticMount::new(root)),
-            permit_account_reads(),
-        );
+        let store =
+            AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), permit_account_reads());
 
         store
             .refresh_hosted_did_index(&oauth_authority())
@@ -963,12 +959,36 @@ mod tests {
             .expect("staging residue must not abort index refresh");
         assert_eq!(
             store
-                .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
+                .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example",)
                 .await
                 .unwrap()
                 .as_deref(),
             Some("acme")
         );
+    }
+
+    #[tokio::test]
+    async fn hosted_did_index_rejects_malformed_permanent_account_labels() {
+        for label in [".alice.mint-*", ".garbage", "Alice", "alice_"] {
+            let accounts = SyntheticNode::dir().with_child(label, SyntheticNode::dir());
+            let root = SyntheticNode::dir().with_child(
+                "acme",
+                SyntheticNode::dir().with_child(PDS_ACCOUNTS_DIRECTORY, accounts),
+            );
+            let store = AccountRecordStore::new(
+                Arc::new(SyntheticMount::new(root)),
+                permit_account_reads(),
+            );
+
+            let error = store
+                .refresh_hosted_did_index(&oauth_authority())
+                .await
+                .expect_err("malformed permanent labels must fail closed");
+            assert!(
+                matches!(error, AccountReadError::InvalidAccountLabel(ref actual) if actual == label),
+                "unexpected error for {label:?}: {error:?}"
+            );
+        }
     }
 
     #[tokio::test]

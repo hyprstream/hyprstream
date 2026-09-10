@@ -47,6 +47,37 @@ const COMPRESSED_P256_PUBLIC_KEY_LEN: usize = 33;
 const ACCOUNT_RECORD_FILE: &str = "account-record.cbor";
 pub const GENESIS_DID_OP_FILE: &str = "genesis.didop.cbor";
 pub const DID_DOCUMENT_FILE: &str = "did-document.json";
+const ACCOUNT_STAGING_MARKER: &str = ".mint-";
+
+/// Return whether `name` is an unpublished account-mint staging directory.
+///
+/// The writer uses this exact private name shape while assembling a complete
+/// account bundle: `.{label}.mint-{random_u128}-{attempt}`. A crash can leave
+/// one of these directories behind, so readers may ignore only names that
+/// match the complete documented shape and contain a valid permanent label.
+pub fn is_hosted_account_staging_directory(name: &str) -> bool {
+    let Some(name) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((label, suffix)) = name.split_once(ACCOUNT_STAGING_MARKER) else {
+        return false;
+    };
+    if AccountLabel::parse(label).is_err() {
+        return false;
+    }
+    let Some((random_text, attempt_text)) = suffix.rsplit_once('-') else {
+        return false;
+    };
+    let Ok(random) = random_text.parse::<u128>() else {
+        return false;
+    };
+    let Ok(attempt) = attempt_text.parse::<u32>() else {
+        return false;
+    };
+    // Keep this in lockstep with new_staging_directory's bounded retry loop.
+    random.to_string() == random_text && attempt.to_string() == attempt_text && attempt < 128
+}
+
 /// Secret account-specific P-256 key paired with the public `#atproto`
 /// verification method in the immutable account record and DID document.
 ///
