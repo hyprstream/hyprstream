@@ -493,8 +493,12 @@ fn equivalent_authorities(left: &str, right: &str, zone: &str) -> bool {
     let Ok(right_authority) = right.parse::<Authority>() else {
         return false;
     };
-    left_authority.port().map(|port| port.as_str().to_owned())
-        == right_authority.port().map(|port| port.as_str().to_owned())
+    let effective_port = |authority: &Authority| {
+        authority
+            .port()
+            .map_or(Some(443), |port| port.as_str().parse::<u16>().ok())
+    };
+    effective_port(&left_authority) == effective_port(&right_authority)
 }
 
 #[cfg(test)]
@@ -721,6 +725,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn equivalent_authorities_accept_implicit_https_port() {
+        assert!(equivalent_authorities(
+            "alice.tormentnexus.social",
+            "alice.tormentnexus.social:443",
+            "tormentnexus.social",
+        ));
+        assert!(!equivalent_authorities(
+            "alice.tormentnexus.social",
+            "alice.tormentnexus.social:8443",
+            "tormentnexus.social",
+        ));
     }
 
     #[tokio::test]
