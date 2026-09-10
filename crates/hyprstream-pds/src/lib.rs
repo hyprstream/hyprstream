@@ -7,10 +7,13 @@
 //!
 //! # What this crate provides
 //!
-//! - **DAG-CBOR** deterministic encode/decode ([`dag_cbor`]) — canonical CBOR:
-//!   map keys sorted in **pure lexicographic byte order** (RFC 7049 §4.2.1 "core
-//!   determinism", the convention atproto's `@atproto/lex-cbor` uses), minimal-
-//!   length ints, no duplicate keys. CID links use CBOR tag 42 per the
+//! - **Existing native CBOR** deterministic encode/decode ([`dag_cbor`]):
+//!   map keys sorted in lexical text-byte order, minimal-length ints and no
+//!   duplicate keys. Public AT DAG-CBOR instead requires length-first key order;
+//!   [`atproto_cbor`] provides that explicit boundary without changing existing
+//!   native signed artifacts. Public repository call-site integration is still
+//!   required; the existing commit/MST APIs retain their existing bytes.
+//!   CID links use CBOR tag 42 per the
 //!   [DAG-CBOR spec](https://github.com/ipld/specs/blob/master/block-layer/codecs/dag-cbor.md).
 //!   The same record produces identical bytes → same CID every time.
 //! - **`ai.hyprstream.model` record** ([`record`]) — the confirmed 3-field
@@ -59,6 +62,7 @@ pub mod at9p_gate;
 pub mod at9p_login;
 pub mod at9p_resolver;
 pub mod at9p_sign;
+pub mod atproto_cbor;
 pub mod car;
 pub mod cid;
 pub mod commit;
