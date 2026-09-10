@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use hyprstream_pds::ATPROTO_SIGNING_KEY_FILE;
 use hyprstream_pds_service::{
     AccountRecordReadAuthorizer, OAUTH_ACCOUNT_RESOLVER_SUBJECT, PDS_ACCOUNTS_DIRECTORY,
-    PDS_ACCOUNT_RECORD_FILE,
+    PDS_ACCOUNT_DID_DOCUMENT_FILE, PDS_ACCOUNT_DID_LOG_FILE, PDS_ACCOUNT_RECORD_FILE,
 };
 use hyprstream_rpc::auth::mac::{
     Assurance, CompartmentSet, Level, MacDecision, MacDenyReason, ObjectLabelResolver, ObjectRef,
@@ -67,7 +67,13 @@ impl ObjectLabelResolver for PdsAccountObjectLabelResolver {
                 if valid_tenant_component(tenant)
                     && *accounts == PDS_ACCOUNTS_DIRECTORY
                     && valid_account_component(account)
-                    && matches!(*file, PDS_ACCOUNT_RECORD_FILE | ATPROTO_SIGNING_KEY_FILE) =>
+                    && matches!(
+                        *file,
+                        PDS_ACCOUNT_RECORD_FILE
+                            | ATPROTO_SIGNING_KEY_FILE
+                            | PDS_ACCOUNT_DID_DOCUMENT_FILE
+                            | PDS_ACCOUNT_DID_LOG_FILE
+                    ) =>
             {
                 Some(pds_account_label())
             }
@@ -1006,6 +1012,26 @@ mod tests {
                 PDS_ACCOUNTS_DIRECTORY,
                 "alice",
                 PDS_ACCOUNT_RECORD_FILE,
+            ])),
+            Some(pds_account_label())
+        );
+        assert_eq!(
+            resolver.resolve(ObjectRef::Path(&[
+                "pds",
+                "acme",
+                PDS_ACCOUNTS_DIRECTORY,
+                "alice",
+                PDS_ACCOUNT_DID_DOCUMENT_FILE,
+            ])),
+            Some(pds_account_label())
+        );
+        assert_eq!(
+            resolver.resolve(ObjectRef::Path(&[
+                "pds",
+                "acme",
+                PDS_ACCOUNTS_DIRECTORY,
+                "alice",
+                PDS_ACCOUNT_DID_LOG_FILE,
             ])),
             Some(pds_account_label())
         );

@@ -427,7 +427,9 @@ mod tests {
         sign_genesis, GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
         RecoveryKeyEnrollment, UserRotationKey,
     };
-    use hyprstream_pds::{AllocatedAccountName, HostedAccountMint};
+    use hyprstream_pds::{
+        AllocatedAccountName, HostedAccountMint, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE,
+    };
     use hyprstream_rpc::auth::mac::{MacDecision, SecurityContext};
     use hyprstream_rpc::Subject;
     use hyprstream_vfs::{SyntheticMount, SyntheticNode};
@@ -499,13 +501,10 @@ mod tests {
                             SyntheticNode::file(account.record_bytes().to_vec()),
                         )
                         .with_child(
-                            PDS_ACCOUNT_DID_DOCUMENT_FILE,
+                            DID_DOCUMENT_FILE,
                             SyntheticNode::file(document_bytes.clone()),
                         )
-                        .with_child(
-                            PDS_ACCOUNT_DID_LOG_FILE,
-                            SyntheticNode::file(log_bytes.clone()),
-                        ),
+                        .with_child(GENESIS_DID_OP_FILE, SyntheticNode::file(log_bytes.clone())),
                 ),
             ),
         );

@@ -15,7 +15,9 @@ pub mod federation_intake;
 
 use std::sync::Arc;
 
-use hyprstream_pds::{AccountRecord, ATPROTO_SIGNING_KEY_FILE};
+use hyprstream_pds::{
+    AccountRecord, ATPROTO_SIGNING_KEY_FILE, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE,
+};
 use hyprstream_rpc::auth::mac::{MacDecision, MacDenyReason, SecurityContext};
 use hyprstream_rpc::{EnvelopeContext, Subject};
 use hyprstream_vfs::{Mount, MountError, OREAD};
@@ -29,9 +31,9 @@ pub const PDS_ACCOUNTS_DIRECTORY: &str = "accounts";
 /// Public account-record publication marker.
 pub const PDS_ACCOUNT_RECORD_FILE: &str = "account-record.cbor";
 /// Sealed account DID-document bytes published beside the account record.
-pub const PDS_ACCOUNT_DID_DOCUMENT_FILE: &str = "did.json";
+pub const PDS_ACCOUNT_DID_DOCUMENT_FILE: &str = DID_DOCUMENT_FILE;
 /// Sealed account operation-log bytes published beside the account record.
-pub const PDS_ACCOUNT_DID_LOG_FILE: &str = "did-log.json";
+pub const PDS_ACCOUNT_DID_LOG_FILE: &str = GENESIS_DID_OP_FILE;
 
 pub mod hosted_account_mint;
 

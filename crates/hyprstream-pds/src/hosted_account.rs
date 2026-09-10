@@ -45,8 +45,8 @@ use hyprstream_rpc::identity::UNAUTHENTICATED_DID_SENTINEL;
 pub const ACCOUNT_RECORD_VERSION: u16 = 1;
 const COMPRESSED_P256_PUBLIC_KEY_LEN: usize = 33;
 const ACCOUNT_RECORD_FILE: &str = "account-record.cbor";
-const GENESIS_DID_OP_FILE: &str = "genesis.didop.cbor";
-const DID_DOCUMENT_FILE: &str = "did-document.json";
+pub const GENESIS_DID_OP_FILE: &str = "genesis.didop.cbor";
+pub const DID_DOCUMENT_FILE: &str = "did-document.json";
 /// Secret account-specific P-256 key paired with the public `#atproto`
 /// verification method in the immutable account record and DID document.
 ///
