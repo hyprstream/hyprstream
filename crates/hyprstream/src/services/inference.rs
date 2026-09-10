@@ -3226,10 +3226,14 @@ where
         quic_result = &mut quic => {
             network_ready.store(false, Ordering::Release);
             if draining.load(Ordering::Acquire) {
-                let rep_result = rep.await.map_err(|error| {
+                // The drain waiter and REP shutdown must run together.  The
+                // shutdown notification has already closed admission; polling
+                // both futures here makes the grace interval shared instead
+                // of delaying REP teardown until QUIC drain completes.
+                let (rep_result, _) = tokio::join!(rep, drain_owner.join());
+                let rep_result = rep_result.map_err(|error| {
                     hyprstream_rpc::error::RpcError::SpawnFailed(error.to_string())
                 });
-                drain_owner.join().await;
                 return rep_result;
             }
             shutdown.notify_waiters();
@@ -3237,10 +3241,11 @@ where
                 Ok(()) => "QUIC server exited unexpectedly".to_owned(),
                 Err(error) => format!("QUIC server failed: {error}"),
             };
-            drain_owner.join().await;
             // Preserve the unexpected QUIC exit as the primary service error;
-            // the REP side is only driven to stop so its task is not orphaned.
-            let _ = rep.await;
+            // REP teardown and the QUIC drain share the same grace interval,
+            // so a wedged request cannot hold admission open for a second
+            // full drain period.
+            let (_rep_result, _) = tokio::join!(rep, drain_owner.join());
             Err(hyprstream_rpc::error::RpcError::SpawnFailed(detail))
         }
     }
@@ -4043,6 +4048,9 @@ mod quinn_drain_tests {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let drain_shutdown = Arc::clone(&shutdown);
         let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
+        let drain_release = Arc::new(tokio::sync::Notify::new());
+        let drain_release_task = Arc::clone(&drain_release);
         let drain_finished = Arc::new(AtomicBool::new(false));
         let drain_finished_task = Arc::clone(&drain_finished);
         let drain_task = tokio::spawn(async move {
@@ -4051,6 +4059,8 @@ mod quinn_drain_tests {
             notified.as_mut().enable();
             let _ = armed_tx.send(());
             notified.await;
+            let _ = drain_started_tx.send(());
+            drain_release_task.notified().await;
             drain_finished_task.store(true, Ordering::Release);
         });
         tokio::time::timeout(Duration::from_secs(1), armed_rx)
@@ -4066,19 +4076,28 @@ mod quinn_drain_tests {
             Ok::<(), anyhow::Error>(())
         };
         let quic = async { Err::<(), _>(anyhow::anyhow!("accept-loop sentinel")) };
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            run_quinn_lifecycle(
+        let lifecycle = tokio::spawn(run_quinn_lifecycle(
                 rep,
                 quic,
                 shutdown,
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(false)),
                 QuinnDrainOwner::new(drain_task),
-            ),
-        )
+            ));
+        tokio::time::timeout(Duration::from_secs(1), drain_started_rx)
+            .await
+            .context("test drain did not start")??;
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while !rep_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .context("unexpected QUIC lifecycle cleanup timed out")?;
+        .context("REP shutdown was not polled while QUIC drain was blocked")?;
+        drain_release.notify_waiters();
+        let result = tokio::time::timeout(Duration::from_secs(1), lifecycle)
+            .await
+            .context("unexpected QUIC lifecycle cleanup timed out")??;
         let error = result.expect_err("unexpected QUIC exit must remain the primary error");
         assert!(error.to_string().contains("accept-loop sentinel"));
         assert!(rep_started.load(Ordering::Acquire));
