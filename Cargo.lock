@@ -7004,6 +7004,7 @@ dependencies = [
  "web-transport-iroh",
  "web-transport-quinn",
  "webpki-roots 0.26.11",
+ "x509-parser",
  "xdg",
  "zeroize",
 ]
@@ -7352,6 +7353,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum 0.7.9",
  "ed25519-dalek 2.2.0",
  "hyprstream-crypto",
  "hyprstream-pds",
@@ -7364,6 +7366,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tower 0.5.2",
 ]
 
 [[package]]

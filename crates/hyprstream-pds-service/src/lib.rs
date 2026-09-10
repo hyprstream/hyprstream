@@ -10,11 +10,21 @@
 //! `verified_tenant`. The tenant is never inferred from the subject, accepted
 //! from a request payload, or supplied as a free-form method argument.
 
+pub mod account_http;
 pub mod federation_intake;
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
-use hyprstream_pds::{AccountRecord, ATPROTO_SIGNING_KEY_FILE};
+use hyprstream_pds::{
+    AccountLabel, AccountRecord, ATPROTO_SIGNING_KEY_FILE, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE,
+};
 use hyprstream_rpc::auth::mac::{MacDecision, MacDenyReason, SecurityContext};
 use hyprstream_rpc::{EnvelopeContext, Subject};
 use hyprstream_vfs::{Mount, MountError, OREAD};
@@ -27,6 +37,10 @@ pub const PDS_NAMESPACE: &str = "/pds";
 pub const PDS_ACCOUNTS_DIRECTORY: &str = "accounts";
 /// Public account-record publication marker.
 pub const PDS_ACCOUNT_RECORD_FILE: &str = "account-record.cbor";
+/// Sealed account DID-document bytes published beside the account record.
+pub const PDS_ACCOUNT_DID_DOCUMENT_FILE: &str = DID_DOCUMENT_FILE;
+/// Sealed account operation-log bytes published beside the account record.
+pub const PDS_ACCOUNT_DID_LOG_FILE: &str = GENESIS_DID_OP_FILE;
 
 pub mod hosted_account_mint;
 
@@ -59,6 +73,8 @@ pub enum AccountReadError {
     InvalidHostedAccountDid(String),
     #[error("hosted account DID {0:?} is bound to more than one tenant")]
     AmbiguousHostedAccountDid(String),
+    #[error("hosted account DID index is still warming")]
+    HostedDidIndexNotReady,
     #[error("PDS account record exceeds the {limit}-byte read limit")]
     RecordTooLarge { limit: usize },
     #[error("PDS account record for {requested:?} contains label {stored:?}")]
@@ -117,7 +133,23 @@ pub struct AccountRecordStore {
     pds_mount: Arc<dyn Mount>,
     read_authorizer: Arc<dyn AccountRecordReadAuthorizer>,
     max_record_bytes: usize,
+    hosted_did_index: Arc<tokio::sync::RwLock<Option<HostedDidIndex>>>,
+    hosted_did_index_refresh: Arc<tokio::sync::Mutex<()>>,
+    hosted_did_index_refreshing: Arc<AtomicBool>,
+    hosted_did_index_refreshed: Arc<tokio::sync::Notify>,
+    hosted_did_index_last_attempt: Arc<parking_lot::Mutex<Option<Instant>>>,
 }
+
+struct HostedDidIndex {
+    entries: BTreeMap<(String, String), Option<String>>,
+    built_at: Instant,
+}
+
+const HOSTED_DID_INDEX_TTL: Duration = Duration::from_secs(5);
+const HOSTED_DID_MAX_STALE: Duration = Duration::from_secs(30);
+const HOSTED_DID_REFRESH_RETRY_COOLDOWN: Duration = Duration::from_secs(1);
+const HOSTED_DID_REFRESH_WAIT: Duration = Duration::from_secs(1);
+const HOSTED_DID_NEGATIVE_TTL: Duration = HOSTED_DID_INDEX_TTL;
 
 impl AccountRecordStore {
     /// Construct a store over the mount bound at `/pds` and a mandatory MAC
@@ -130,6 +162,11 @@ impl AccountRecordStore {
             pds_mount,
             read_authorizer,
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
+            hosted_did_index: Arc::new(tokio::sync::RwLock::new(None)),
+            hosted_did_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            hosted_did_index_refreshing: Arc::new(AtomicBool::new(false)),
+            hosted_did_index_refreshed: Arc::new(tokio::sync::Notify::new()),
+            hosted_did_index_last_attempt: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -181,6 +218,144 @@ impl AccountRecordStore {
             return Ok(None);
         };
 
+        let mut index = self.hosted_did_index.read().await;
+        if index.as_ref().is_some_and(|snapshot| {
+            snapshot.built_at.elapsed() >= HOSTED_DID_INDEX_TTL + HOSTED_DID_MAX_STALE
+        }) {
+            // The first request after an idle period may wait for the shared
+            // isolated refresher, but must never scan tenants itself or serve
+            // an expired binding. Subscribe before releasing the read lock so
+            // a concurrent refresh cannot publish unnoticed.
+            let refreshed = self.hosted_did_index_refreshed.notified();
+            tokio::pin!(refreshed);
+            refreshed.as_mut().enable();
+            drop(index);
+            self.schedule_hosted_did_index_refresh(authority.clone());
+            let _ = tokio::time::timeout(HOSTED_DID_REFRESH_WAIT, refreshed).await;
+            index = self.hosted_did_index.read().await;
+        }
+        let Some(snapshot) = index.as_ref() else {
+            // A request must never become the tenant enumerator. Startup
+            // refresh runs independently; callers retry after the index is
+            // ready instead of amplifying a full mount scan per miss.
+            self.schedule_hosted_did_index_refresh(authority.clone());
+            return Err(AccountReadError::HostedDidIndexNotReady);
+        };
+        let age = snapshot.built_at.elapsed();
+        if age >= HOSTED_DID_INDEX_TTL {
+            self.schedule_hosted_did_index_refresh(authority.clone());
+        }
+        if age >= HOSTED_DID_INDEX_TTL + HOSTED_DID_MAX_STALE {
+            return Err(AccountReadError::HostedDidIndexNotReady);
+        }
+        let key = (label.to_owned(), did.to_owned());
+        match snapshot.entries.get(&key) {
+            Some(Some(tenant)) => Ok(Some(tenant.clone())),
+            Some(None) => Err(AccountReadError::AmbiguousHostedAccountDid(did.to_owned())),
+            None if age < HOSTED_DID_NEGATIVE_TTL => Ok(None),
+            None => {
+                // A negative entry is eligible for refresh at the normal
+                // snapshot interval, but remains a stable 404 while refresh
+                // runs. This avoids turning ordinary missing-account traffic
+                // into repeated transient OAuth/HTTP failures.
+                self.schedule_hosted_did_index_refresh(authority.clone());
+                Ok(None)
+            }
+        }
+    }
+
+    /// Start a single-flight refresh without making the caller perform tenant
+    /// enumeration. A stale snapshot remains available for O(1) lookups while
+    /// one background task refreshes it; the refresh lock prevents duplicate
+    /// scans. Before the first snapshot, lookups return
+    /// [`AccountReadError::HostedDidIndexNotReady`] while this task warms it.
+    pub fn schedule_hosted_did_index_refresh(&self, authority: Subject) {
+        if self
+            .hosted_did_index_refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        {
+            let mut last_attempt = self.hosted_did_index_last_attempt.lock();
+            if last_attempt
+                .is_some_and(|attempt| attempt.elapsed() < HOSTED_DID_REFRESH_RETRY_COOLDOWN)
+            {
+                self.hosted_did_index_refreshing
+                    .store(false, Ordering::Release);
+                return;
+            }
+            *last_attempt = Some(Instant::now());
+        }
+        let store = self.clone();
+        if std::thread::Builder::new()
+            .name("hyprstream-pds-index-refresh".to_owned())
+            .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(_) => {
+                    store
+                        .hosted_did_index_refreshing
+                        .store(false, Ordering::Release);
+                    store.hosted_did_index_refreshed.notify_waiters();
+                    return;
+                }
+            };
+            let refresh_store = store.clone();
+            runtime.block_on(async {
+                let _ = refresh_store.refresh_hosted_did_index(&authority).await;
+            });
+            store
+                .hosted_did_index_refreshing
+                .store(false, Ordering::Release);
+            store.hosted_did_index_refreshed.notify_waiters();
+            })
+            .is_err()
+        {
+            self.hosted_did_index_refreshing
+                .store(false, Ordering::Release);
+            self.hosted_did_index_refreshed.notify_waiters();
+        }
+    }
+
+    /// Check an already-published snapshot without starting filesystem work.
+    /// In-process consumers must warm their injected store before startup.
+    pub async fn hosted_did_index_ready(&self) -> bool {
+        self.hosted_did_index.read().await.as_ref().is_some_and(|snapshot| {
+            snapshot.built_at.elapsed() < HOSTED_DID_INDEX_TTL + HOSTED_DID_MAX_STALE
+        })
+    }
+
+    pub async fn refresh_hosted_did_index(
+        &self,
+        authority: &Subject,
+    ) -> Result<(), AccountReadError> {
+        let _refresh = self.hosted_did_index_refresh.lock().await;
+        let stale = self
+            .hosted_did_index
+            .read()
+            .await
+            .as_ref()
+            .map(|snapshot| snapshot.built_at.elapsed() >= HOSTED_DID_INDEX_TTL)
+            .unwrap_or(true);
+        if stale {
+            let entries = self.build_hosted_did_index(authority).await?;
+            self.hosted_did_index.write().await.replace(HostedDidIndex {
+                entries,
+                built_at: Instant::now(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn build_hosted_did_index(
+        &self,
+        authority: &Subject,
+    ) -> Result<BTreeMap<(String, String), Option<String>>, AccountReadError> {
         let tenants = read_directory(
             self.pds_mount.as_ref(),
             self.read_authorizer.as_ref(),
@@ -190,23 +365,17 @@ impl AccountRecordStore {
             None,
         )
         .await?;
-        let mut resolved = None;
+        let mut index = BTreeMap::new();
         for entry in tenants.into_iter().filter(|entry| entry.is_dir) {
             validate_tenant_component(&entry.name)?;
-            let components = [
-                entry.name.as_str(),
-                PDS_ACCOUNTS_DIRECTORY,
-                label,
-                PDS_ACCOUNT_RECORD_FILE,
-            ];
-            let bytes = match read_file(
+            let accounts_components = [entry.name.as_str(), PDS_ACCOUNTS_DIRECTORY];
+            let accounts = match read_directory(
                 self.pds_mount.as_ref(),
                 self.read_authorizer.as_ref(),
-                &components,
+                &accounts_components,
                 authority,
                 Some(entry.name.as_str()),
                 None,
-                self.max_record_bytes,
             )
             .await
             {
@@ -214,23 +383,54 @@ impl AccountRecordStore {
                 Err(AccountReadError::Mount(MountError::NotFound(_))) => continue,
                 Err(error) => return Err(error),
             };
-            let record =
-                AccountRecord::from_dag_cbor(&bytes).map_err(AccountReadError::InvalidRecord)?;
-            if record.name().label() != label {
-                return Err(AccountReadError::RecordLabelMismatch {
-                    requested: label.to_owned(),
-                    stored: record.name().label().to_owned(),
-                });
+            for account in accounts.into_iter().filter(|account| account.is_dir) {
+                let label = account.name;
+                if hyprstream_pds::is_hosted_account_staging_directory(&label) {
+                    continue;
+                }
+                AccountLabel::parse(&label)
+                    .map_err(|_| AccountReadError::InvalidAccountLabel(label.clone()))?;
+                let components = [
+                    entry.name.as_str(),
+                    PDS_ACCOUNTS_DIRECTORY,
+                    label.as_str(),
+                    PDS_ACCOUNT_RECORD_FILE,
+                ];
+                let bytes = match read_file(
+                    self.pds_mount.as_ref(),
+                    self.read_authorizer.as_ref(),
+                    &components,
+                    authority,
+                    Some(entry.name.as_str()),
+                    None,
+                    self.max_record_bytes,
+                )
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(AccountReadError::Mount(MountError::NotFound(_))) => continue,
+                    Err(error) => return Err(error),
+                };
+                let record = AccountRecord::from_dag_cbor(&bytes)
+                    .map_err(AccountReadError::InvalidRecord)?;
+                if record.name().label() != label {
+                    return Err(AccountReadError::RecordLabelMismatch {
+                        requested: label,
+                        stored: record.name().label().to_owned(),
+                    });
+                }
+                let key = (label, record.name().did().to_owned());
+                match index.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(Some(entry.name.clone()));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut slot) => {
+                        slot.insert(None);
+                    }
+                }
             }
-            if record.name().did() != did {
-                continue;
-            }
-            if resolved.is_some() {
-                return Err(AccountReadError::AmbiguousHostedAccountDid(did.to_owned()));
-            }
-            resolved = Some(entry.name);
         }
-        Ok(resolved)
+        Ok(index)
     }
 
     /// Sign bytes with the account-specific `#atproto` key for one hosted DID.
@@ -249,7 +449,12 @@ impl AccountRecordStore {
     ) -> Result<Option<Vec<u8>>, AccountReadError> {
         use p256::ecdsa::signature::Signer as _;
 
-        let Some(tenant) = self.resolve_tenant_for_hosted_did(authority, did).await? else {
+        // Signing runs on authenticated request paths; never turn a cold or
+        // hard-stale lookup into a synchronous tenant enumeration. Startup
+        // warms the index before OAuth readiness, while this resolver remains
+        // fail-closed until a snapshot is available.
+        let resolved = self.resolve_tenant_for_hosted_did(authority, did).await?;
+        let Some(tenant) = resolved else {
             return Ok(None);
         };
         let Some(label) = hosted_account_label(did)? else {
@@ -335,6 +540,31 @@ impl AccountRecordStore {
     fn with_max_record_bytes(mut self, max_record_bytes: usize) -> Self {
         self.max_record_bytes = max_record_bytes;
         self
+    }
+
+    /// Read one immutable public identity artifact after the hosted DID has
+    /// already resolved to its authority-owned tenant.
+    pub(crate) async fn read_hosted_http_artifact(
+        &self,
+        authority: &Subject,
+        tenant: &str,
+        label: &str,
+        file: &str,
+        limit: usize,
+    ) -> Result<Vec<u8>, AccountReadError> {
+        validate_tenant_component(tenant)?;
+        validate_account_label(label)?;
+        let components = [tenant, PDS_ACCOUNTS_DIRECTORY, label, file];
+        read_file(
+            self.pds_mount.as_ref(),
+            self.read_authorizer.as_ref(),
+            &components,
+            authority,
+            Some(tenant),
+            None,
+            limit,
+        )
+        .await
     }
 }
 
@@ -577,6 +807,24 @@ mod tests {
         }
     }
 
+    struct SlowPermitAccountReads;
+
+    impl AccountRecordReadAuthorizer for SlowPermitAccountReads {
+        fn check_read(
+            &self,
+            _subject: &Subject,
+            _verified_tenant: Option<&str>,
+            _security_context: Option<&SecurityContext>,
+            _object_id: &str,
+        ) -> MacDecision {
+            // This models the synchronous filesystem/audit work performed by
+            // the production authorizer and mount. A current-thread OAuth
+            // runtime must remain able to make progress while it runs.
+            std::thread::sleep(Duration::from_millis(200));
+            MacDecision::Permit
+        }
+    }
+
     fn permit_account_reads() -> Arc<dyn AccountRecordReadAuthorizer> {
         Arc::new(PermitAccountReads)
     }
@@ -677,6 +925,10 @@ mod tests {
     #[tokio::test]
     async fn oauth_authority_resolves_tenant_from_matching_account_record() {
         let store = store();
+        store
+            .refresh_hosted_did_index(&oauth_authority())
+            .await
+            .unwrap();
 
         assert_eq!(
             store
@@ -713,6 +965,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_did_index_ignores_mint_staging_directories() {
+        let record = account_bytes("alice", "acme.example");
+        let accounts = SyntheticNode::dir()
+            .with_child(
+                "alice",
+                SyntheticNode::dir()
+                    .with_child(PDS_ACCOUNT_RECORD_FILE, SyntheticNode::file(record)),
+            )
+            .with_child(".alice.mint-123-0", SyntheticNode::dir());
+        let root = SyntheticNode::dir().with_child(
+            "acme",
+            SyntheticNode::dir().with_child(PDS_ACCOUNTS_DIRECTORY, accounts),
+        );
+        let store =
+            AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), permit_account_reads());
+
+        store
+            .refresh_hosted_did_index(&oauth_authority())
+            .await
+            .expect("staging residue must not abort index refresh");
+        assert_eq!(
+            store
+                .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example",)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("acme")
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_did_index_rejects_malformed_permanent_account_labels() {
+        for label in [".alice.mint-*", ".garbage", "Alice", "alice_"] {
+            let accounts = SyntheticNode::dir().with_child(label, SyntheticNode::dir());
+            let root = SyntheticNode::dir().with_child(
+                "acme",
+                SyntheticNode::dir().with_child(PDS_ACCOUNTS_DIRECTORY, accounts),
+            );
+            let store = AccountRecordStore::new(
+                Arc::new(SyntheticMount::new(root)),
+                permit_account_reads(),
+            );
+
+            let error = store
+                .refresh_hosted_did_index(&oauth_authority())
+                .await
+                .expect_err("malformed permanent labels must fail closed");
+            assert!(
+                matches!(error, AccountReadError::InvalidAccountLabel(ref actual) if actual == label),
+                "unexpected error for {label:?}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn hosted_did_resolution_requires_oauth_authority_and_is_unambiguous() {
         let denied = store()
             .resolve_tenant_for_hosted_did(&Subject::new("alice"), "did:web:alice.acme.example")
@@ -727,15 +1034,203 @@ mod tests {
         let root = SyntheticNode::dir()
             .with_child("acme", tenant_node("alice", duplicated.clone()))
             .with_child("beta", tenant_node("alice", duplicated));
-        let ambiguous =
-            AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), permit_account_reads())
-                .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
-                .await
-                .unwrap_err();
+        let ambiguous_store =
+            AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), permit_account_reads());
+        ambiguous_store
+            .refresh_hosted_did_index(&oauth_authority())
+            .await
+            .unwrap();
+        let ambiguous = ambiguous_store
+            .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
+            .await
+            .unwrap_err();
         assert!(matches!(
             ambiguous,
             AccountReadError::AmbiguousHostedAccountDid(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn cold_hosted_did_lookup_never_enumerates_on_request_path() {
+        let store = store();
+        let error = store
+            .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AccountReadError::HostedDidIndexNotReady));
+    }
+
+    #[tokio::test]
+    async fn cold_hosted_did_signing_never_refreshes_on_request_path() {
+        let store = store();
+        let error = store
+            .sign_for_hosted_did(
+                &oauth_authority(),
+                "did:web:alice.acme.example",
+                b"header.payload",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AccountReadError::HostedDidIndexNotReady));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduled_hosted_did_refresh_does_not_block_current_thread_runtime() {
+        let root = SyntheticNode::dir().with_child(
+            "acme",
+            tenant_node("alice", account_bytes("alice", "acme.example")),
+        );
+        let store = AccountRecordStore::new(
+            Arc::new(SyntheticMount::new(root)),
+            Arc::new(SlowPermitAccountReads),
+        );
+
+        store.schedule_hosted_did_index_refresh(oauth_authority());
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(10)),
+        )
+        .await
+        .expect("index refresh must not block the HTTP runtime");
+    }
+
+    #[tokio::test]
+    async fn hosted_did_negative_lookup_expires() {
+        let store = store();
+        store
+            .hosted_did_index
+            .write()
+            .await
+            .replace(HostedDidIndex {
+                entries: BTreeMap::new(),
+                built_at: Instant::now() - HOSTED_DID_NEGATIVE_TTL - Duration::from_millis(1),
+            });
+        let result = store
+            .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:new.acme.example")
+            .await;
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn hosted_did_idle_lookup_waits_for_fresh_binding() {
+        let store = store();
+        seed_expired_hosted_did_binding(&store).await;
+        let tenant = store
+            .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
+            .await
+            .expect("first lookup after idle must recover within its refresh budget");
+        assert_eq!(tenant.as_deref(), Some("acme"));
+        assert!(store.hosted_did_index_ready().await);
+    }
+
+    async fn seed_expired_hosted_did_binding(store: &AccountRecordStore) {
+        store
+            .hosted_did_index
+            .write()
+            .await
+            .replace(HostedDidIndex {
+                entries: BTreeMap::from([(
+                    ("alice".to_owned(), "did:web:alice.acme.example".to_owned()),
+                    Some("obsolete-tenant".to_owned()),
+                )]),
+                built_at: Instant::now() - HOSTED_DID_INDEX_TTL - HOSTED_DID_MAX_STALE,
+            });
+    }
+
+    #[tokio::test]
+    async fn hosted_did_positive_binding_has_a_hard_stale_deadline() {
+        let root = SyntheticNode::dir().with_child(
+            "acme",
+            tenant_node("alice", b"corrupt account record".to_vec()),
+        );
+        let store =
+            AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), permit_account_reads());
+        seed_expired_hosted_did_binding(&store).await;
+        let error = store
+            .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AccountReadError::HostedDidIndexNotReady));
+        assert!(!store.hosted_did_index_ready().await);
+        assert!(!store.hosted_did_index_refreshing.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hosted_did_idle_wait_is_bounded_coalesced_and_off_request_executor() {
+        struct BlockRootRead {
+            release: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+            scans: std::sync::atomic::AtomicUsize,
+            request_thread: std::thread::ThreadId,
+        }
+        impl AccountRecordReadAuthorizer for BlockRootRead {
+            fn check_read(
+                &self,
+                _subject: &Subject,
+                _verified_tenant: Option<&str>,
+                _security_context: Option<&SecurityContext>,
+                object_id: &str,
+            ) -> MacDecision {
+                if object_id == PDS_NAMESPACE {
+                    assert_ne!(std::thread::current().id(), self.request_thread);
+                    self.scans.fetch_add(1, Ordering::AcqRel);
+                    self.release
+                        .lock()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                MacDecision::Permit
+            }
+        }
+        let (release, blocked) = std::sync::mpsc::channel();
+        let authorizer = Arc::new(BlockRootRead {
+            release: parking_lot::Mutex::new(blocked),
+            scans: std::sync::atomic::AtomicUsize::new(0),
+            request_thread: std::thread::current().id(),
+        });
+        let mut store = store();
+        store.read_authorizer = authorizer.clone();
+        seed_expired_hosted_did_binding(&store).await;
+        let authority = oauth_authority();
+        let started = Instant::now();
+        let (first, second, heartbeat) = tokio::join!(
+            store.resolve_tenant_for_hosted_did(&authority, "did:web:alice.acme.example"),
+            store.resolve_tenant_for_hosted_did(&authority, "did:web:alice.acme.example"),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                started.elapsed()
+            },
+        );
+        let elapsed = started.elapsed();
+        // Another timed-out caller must share the existing worker as well.
+        let third = store
+            .resolve_tenant_for_hosted_did(&authority, "did:web:alice.acme.example")
+            .await;
+        let refreshed = store.hosted_did_index_refreshed.notified();
+        tokio::pin!(refreshed);
+        refreshed.as_mut().enable();
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), refreshed)
+            .await
+            .expect("released refresh must finish");
+
+        for result in [first, second, third] {
+            assert!(matches!(
+                result,
+                Err(AccountReadError::HostedDidIndexNotReady)
+            ));
+        }
+        assert!(elapsed >= HOSTED_DID_REFRESH_WAIT);
+        assert!(elapsed < HOSTED_DID_REFRESH_WAIT + Duration::from_millis(500));
+        assert!(heartbeat < Duration::from_millis(500));
+        assert_eq!(authorizer.scans.load(Ordering::Acquire), 1);
+        assert_eq!(
+            store
+                .resolve_tenant_for_hosted_did(&authority, "did:web:alice.acme.example")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("acme")
+        );
     }
 
     #[tokio::test]
@@ -754,6 +1249,10 @@ mod tests {
         );
         let store =
             AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), permit_account_reads());
+        store
+            .refresh_hosted_did_index(&oauth_authority())
+            .await
+            .expect("startup warm-up must complete before signing");
         let input = b"header.payload";
         let signature = store
             .sign_for_hosted_did(&oauth_authority(), did, input)
@@ -777,7 +1276,12 @@ mod tests {
         let missing = AccountRecordStore::new(
             Arc::new(SyntheticMount::new(missing_root)),
             permit_account_reads(),
-        )
+        );
+        missing
+            .refresh_hosted_did_index(&oauth_authority())
+            .await
+            .expect("startup warm-up must complete before signing");
+        let missing = missing
         .sign_for_hosted_did(&oauth_authority(), did, input)
         .await
         .unwrap_err();
@@ -792,7 +1296,12 @@ mod tests {
         let mismatch = AccountRecordStore::new(
             Arc::new(SyntheticMount::new(mismatch_root)),
             permit_account_reads(),
-        )
+        );
+        mismatch
+            .refresh_hosted_did_index(&oauth_authority())
+            .await
+            .expect("startup warm-up must complete before signing");
+        let mismatch = mismatch
         .sign_for_hosted_did(&oauth_authority(), did, input)
         .await
         .unwrap_err();

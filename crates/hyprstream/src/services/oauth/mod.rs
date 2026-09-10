@@ -26,6 +26,9 @@
 //!   /oauth/device/verify                     → user verification page
 //! ```
 
+mod account_worker;
+mod account_tls;
+
 pub mod auth;
 pub mod authorize;
 pub mod browser_session;
@@ -68,7 +71,7 @@ pub mod userinfo;
 pub mod wit_bootstrap;
 pub mod xrpc;
 
-use std::sync::Arc;
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use axum::{
@@ -426,6 +429,27 @@ async fn build_oauth_iroh_substrate(
     .await
 }
 
+async fn warm_hosted_did_index(
+    store: Arc<hyprstream_pds_service::AccountRecordStore>,
+    authority: hyprstream_rpc::Subject,
+    timeout: std::time::Duration,
+) -> Result<(), hyprstream_rpc::error::RpcError> {
+    let mut worker = account_worker::ContainedWorker::spawn("hyprstream-oauth-index-warmup", move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("warm-up runtime: {error}"))?;
+        runtime
+            .block_on(store.refresh_hosted_did_index(&authority))
+            .map_err(|error| format!("index refresh: {error}"))
+    })?;
+    worker.finish(timeout).await?.map_err(|error| {
+        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+            "hosted account index warm-up failed: {error}"
+        ))
+    })
+}
+
 /// Profile-aware bind of OAuth's inbound reach-only substrate, using the
 /// production substrate builder. See [`bind_oauth_substrate_profile`] — the
 /// builder is a parameter only so causal tests can inject a bind failure at
@@ -513,7 +537,7 @@ fn classify_oauth_endpoint_install(
             drop(returned);
             OAuthEndpointInstall::ExistingGlobalRetained
         }
-    }
+}
 }
 
 pub struct OAuthService {
@@ -545,6 +569,11 @@ pub struct OAuthService {
     hosted_account_store: Option<Arc<hyprstream_pds_service::AccountRecordStore>>,
     /// Authenticated hosted-account registration and federation-intake face.
     identity_registration_api: Option<Arc<identity_registration::IdentityRegistrationApi>>,
+    /// Authoritative publication root for the hosted-account tree. Set by the
+    /// production factory so OAuth and the public account listener share one
+    /// descriptor-bound store.
+    pds_root: Option<PathBuf>,
+    dedicated_process: bool,
 }
 
 impl OAuthService {
@@ -572,6 +601,8 @@ impl OAuthService {
             jwt_verifying_key: jwt_verifying_key.to_bytes(),
             hosted_account_store: None,
             identity_registration_api: None,
+            pds_root: None,
+            dedicated_process: false,
         }
     }
 
@@ -598,6 +629,83 @@ impl OAuthService {
         self.identity_registration_api = Some(api);
         self
     }
+
+    /// Set only from the launcher's explicit single-service process context.
+    pub(crate) fn with_dedicated_process(mut self, dedicated: bool) -> Self {
+        self.dedicated_process = dedicated;
+        self
+    }
+
+    /// Attach the authoritative published-account root used by production
+    /// OAuth/account HTTP composition.
+    pub fn with_pds_root(mut self, root: PathBuf) -> Self {
+        self.pds_root = Some(root);
+        self
+    }
+}
+
+fn account_http_socket_addr(config: &crate::account::AccountHttpConfig) -> Result<SocketAddr> {
+    // Preserve bracketed IPv6 configurations while accepting bare IP literals.
+    let host = config.host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(&config.host);
+    let ip = host.parse::<std::net::IpAddr>()
+        .map_err(|error| anyhow::anyhow!("invalid account HTTP bind IP: {error}"))?;
+    Ok(SocketAddr::new(ip, config.port))
+}
+
+/// Resolve explicitly provisioned TLS material for the public account
+/// listener. Account hosts must never fall back to the node/self-signed
+/// certificate, so enabling the listener requires both PEM paths and a valid
+/// rustls keypair.
+async fn resolve_account_http_tls(
+    config: &crate::account::AccountHttpConfig,
+    zone: &crate::account::AccountZone,
+) -> anyhow::Result<axum_server::tls_rustls::RustlsConfig> {
+    anyhow::ensure!(config.port != 0, "account HTTP listener port must be non-zero");
+    anyhow::ensure!(
+        config.tls_cert.is_file(),
+        "account TLS certificate is unavailable: {}",
+        config.tls_cert.display()
+    );
+    anyhow::ensure!(
+        config.tls_key.is_file(),
+        "account TLS private key is unavailable: {}",
+        config.tls_key.display()
+    );
+    let cert_pem = tokio::fs::read(&config.tls_cert).await?;
+    let key_pem = tokio::fs::read(&config.tls_key).await?;
+    let cert_der = rustls_pemfile::certs(&mut &cert_pem[..])
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("account TLS certificate contains no certificate"))??;
+    let (_, certificate) = x509_parser::parse_x509_certificate(cert_der.as_ref())
+        .map_err(|error| anyhow::anyhow!("invalid account TLS certificate: {error}"))?;
+    let wildcard = zone.wildcard_domain();
+    let covers_zone = certificate.extensions().iter().any(|extension| {
+        matches!(
+            extension.parsed_extension(),
+            x509_parser::extensions::ParsedExtension::SubjectAlternativeName(names)
+                if names.general_names.iter().any(|name| matches!(
+                    name,
+                    x509_parser::extensions::GeneralName::DNSName(dns)
+                        if dns.eq_ignore_ascii_case(wildcard)
+                ))
+        )
+    });
+    anyhow::ensure!(
+        covers_zone,
+        "account TLS certificate does not cover account zone wildcard {wildcard}"
+    );
+    // Validate and install the same bytes, including during rotation. Reopening
+    // the paths here could install a different certificate than the SAN check.
+    axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to load account-zone TLS for {}: {error}",
+                zone.wildcard_domain()
+            )
+        })
 }
 
 #[cfg(test)]
@@ -652,6 +760,15 @@ impl Spawnable for OAuthService {
         shutdown: Arc<Notify>,
         on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<(), hyprstream_rpc::error::RpcError> {
+        let contains_account_workers = self.account_config.http.is_some();
+        if contains_account_workers && !self.dedicated_process {
+            return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                "hosted account workers require a dedicated foreground OAuth process".to_owned(),
+            ));
+        }
+        // Timed-out synchronous I/O cannot be cancelled safely. This service
+        // owns the whole process when account workers are enabled; terminal
+        // startup/shutdown therefore ends that process and all its workers.
         // Use single-threaded runtime + LocalSet because HTTP handlers make ZMQ RPC
         // calls (e.g., policy_client.issue_token()), and ZMQ clients use spawn_local.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -660,7 +777,7 @@ impl Spawnable for OAuthService {
             .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
 
         let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async move {
+        let result = local.block_on(&rt, async move {
             let addr_str = format!("{}:{}", self.config.host, self.config.port);
             let addr: std::net::SocketAddr = addr_str.parse().map_err(|e| {
                 hyprstream_rpc::error::RpcError::SpawnFailed(format!("Invalid address: {e}"))
@@ -830,6 +947,37 @@ impl Spawnable for OAuthService {
                 }
             };
 
+            // The public account face and OAuth's hosted-DID resolver must
+            // share one descriptor-bound store over the authoritative
+            // publication root. Enabling the listener therefore fails closed
+            // when the root or mandatory audit sink is unavailable.
+            let hosted_account_store = if let Some(store) = &self.hosted_account_store {
+                Some(Arc::clone(store))
+            } else if self.account_config.http.is_some() {
+                let root = self.pds_root.clone().ok_or_else(|| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "account HTTP listener enabled without a PDS publication root".to_owned(),
+                    )
+                })?;
+                let sink = audit_sink.clone().ok_or_else(|| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "account HTTP listener requires a usable MAC audit sink".to_owned(),
+                    )
+                })?;
+                let mount = crate::mac::PdsDirectoryMount::open(&root).map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "open published PDS account root {}: {error}",
+                        root.display()
+                    ))
+                })?;
+                Some(crate::mac::production_pds_account_record_store(
+                    Arc::new(mount),
+                    sink,
+                ))
+            } else {
+                None
+            };
+
             let (ca_jwt_key, signing_key_store) = match crate::auth::identity_store::load_ca_signing_key(&credentials_dir) {
                 Ok(root_key) => {
                     let key = hyprstream_rpc::node_identity::derive_purpose_key(&root_key, "hyprstream-jwt-v1");
@@ -923,7 +1071,7 @@ impl Spawnable for OAuthService {
                 discovery_client.clone(),
                 jwt_verifying_key,
             );
-            if let Some(store) = &self.hosted_account_store {
+            if let Some(store) = &hosted_account_store {
                 oauth_state = oauth_state.with_hosted_account_store(Arc::clone(store));
             }
             if let Some(api) = &self.identity_registration_api {
@@ -956,6 +1104,29 @@ impl Spawnable for OAuthService {
             }
             if let Some(sink) = audit_sink {
                 oauth_state = oauth_state.with_audit_sink(sink);
+            }
+
+            // Warm the authority-owned hosted-DID index before exposing OAuth
+            // readiness. Request paths remain O(1) lookups and never perform
+            // tenant enumeration; a bounded startup failure keeps OAuth
+            // fail-closed instead of serving valid hosted users intermittently
+            // while the first snapshot is still absent.
+            if let Some(store) = &hosted_account_store {
+                let authority = hyprstream_rpc::Subject::new(
+                    hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                );
+                if contains_account_workers {
+                    warm_hosted_did_index(
+                        Arc::clone(store),
+                        authority,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await?;
+                } else if !store.hosted_did_index_ready().await {
+                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "in-process hosted-account store must be warmed before injection".to_owned(),
+                    ));
+                }
             }
             // Populate legacy JWKS nbf/exp from signing-key file mtime (used when store absent).
             let key_nbf = crate::auth::identity_store::node_signing_key_mtime(&credentials_dir);
@@ -1089,6 +1260,65 @@ impl Spawnable for OAuthService {
             // here, while the supervised launcher still owns the launch.
             let bound = crate::server::tls::bind_listener(addr, rustls_config, "OAuthService")?;
 
+            // Optional public hosted-account face. It has its own listener,
+            // certificate, and shutdown signal; it is never mounted into the
+            // authenticated OAuth router.
+            let account_endpoint = if let Some(http_config) = self.account_config.http.as_ref() {
+                let zone = self.account_config.resolve_zone().map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "account HTTP listener requires a valid account zone: {error}"
+                    ))
+                })?;
+                let store = hosted_account_store.clone().ok_or_else(|| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "account HTTP listener has no hosted-account store".to_owned(),
+                    )
+                })?;
+                let directory = Arc::new(
+                    hyprstream_pds_service::account_http::MountedHostedAccountHttpDirectory::new_without_refresh(
+                        store,
+                        hyprstream_rpc::Subject::new(
+                            hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                        ),
+                        zone.apex(),
+                    )
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "compose account HTTP directory: {error}"
+                        ))
+                    })?,
+                );
+                let account_app =
+                    hyprstream_pds_service::account_http::router(zone.apex(), directory)
+                        .map_err(|error| {
+                            hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                                "compose account HTTP router: {error}"
+                            ))
+                        })?;
+                let account_addr = account_http_socket_addr(http_config)
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "invalid account HTTP bind host '{}': {error}",
+                            http_config.host
+                        ))
+                    })?;
+                let account_tls = resolve_account_http_tls(http_config, &zone)
+                    .await
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "account HTTP TLS: {error:#}"
+                        ))
+                    })?;
+                let account_bound = crate::server::tls::bind_listener(
+                    account_addr,
+                    Some(account_tls),
+                    "AccountHttpService",
+                )?;
+                Some((account_bound, account_app, http_config.clone(), zone))
+            } else {
+                None
+            };
+
             let iroh_required = self
                 .quic_config
                 .as_ref()
@@ -1153,6 +1383,10 @@ impl Spawnable for OAuthService {
             // (join handle, whether the select branch already consumed it).
             let mut rpc_owner: Option<(tokio::task::JoinHandle<anyhow::Result<()>>, bool)> =
                 None;
+            let account_shutdown = Arc::new(Notify::new());
+            let mut account_owner: Option<account_worker::ContainedWorker<
+                Result<(), hyprstream_rpc::error::RpcError>,
+            >> = None;
             let bridge_init: Result<Arc<LocalServiceBridge>, hyprstream_rpc::error::RpcError> =
                 async {
                     let (bridge, bridge_ready_rx) =
@@ -1216,7 +1450,7 @@ impl Spawnable for OAuthService {
             // the prebound listener concurrently with the RPC loop. Whichever
             // side finishes first decides the primary outcome; the actual
             // serve result propagates (no log-and-swallow).
-            let primary: anyhow::Result<()> = match bridge_init {
+            let mut primary: anyhow::Result<()> = match bridge_init {
                 Err(e) => Err(anyhow::anyhow!("OAuthService startup failed: {e}")),
                 Ok(bridge) => async {
                     if iroh_enabled {
@@ -1260,6 +1494,30 @@ impl Spawnable for OAuthService {
                             }
                         }
                     }
+                    // Finish all fallible account-worker creation before the RPC
+                    // task can signal readiness. Keep the actual thread owner.
+                    if let Some((account_bound, account_app, account_config, account_zone)) = account_endpoint {
+                        let account_shutdown_task = Arc::clone(&account_shutdown);
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|error| hyprstream_rpc::error::RpcError::SpawnFailed(
+                                format!("account HTTP runtime: {error}"),
+                            ))?;
+                        account_owner = Some(account_worker::ContainedWorker::spawn(
+                            "hyprstream-account-http",
+                            move || {
+                                runtime.block_on(account_tls::serve_with_reload(
+                                    account_bound,
+                                    account_app,
+                                    account_shutdown_task,
+                                    account_config,
+                                    account_zone,
+                                    std::time::Duration::from_secs(30),
+                                ))
+                            },
+                        )?);
+                    }
                     let control_transport = self.control_transport.clone();
                     let rpc_signing_key = self.signing_key.clone();
                     let processor: Arc<
@@ -1283,6 +1541,24 @@ impl Spawnable for OAuthService {
                             shutdown.clone(),
                             "OAuthService",
                         ) => http.map_err(|e| anyhow::anyhow!("OAuthService HTTP serve error: {e}")),
+                        account = async {
+                            match account_owner.as_mut() {
+                                Some(worker) => worker.result().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            match account {
+                                Ok(Ok(())) => Err(anyhow::anyhow!(
+                                    "AccountHttpService stopped unexpectedly"
+                                )),
+                                Ok(Err(e)) => Err(anyhow::anyhow!(
+                                    "AccountHttpService error: {e}"
+                                )),
+                                Err(join) => Err(anyhow::anyhow!(
+                                    "AccountHttpService task join error: {join}"
+                                )),
+                            }
+                        },
                         rpc = &mut rpc_loop => {
                             // This select branch consumed the completed
                             // JoinHandle — the teardown below must not poll it
@@ -1319,7 +1595,22 @@ impl Spawnable for OAuthService {
             // readiness failure, HTTP or RPC error, or clean shutdown. The
             // primary error is preserved; cleanup failures are logged as
             // context, never masked. ──
+            // There is exactly one account listener. `notify_one` preserves a
+            // permit when teardown races worker startup; `notify_waiters` can
+            // lose the signal before the isolated runtime begins awaiting.
+            account_shutdown.notify_one();
             serve_shutdown.notify_one();
+            if let Some(mut worker) = account_owner.take() {
+                if !worker.is_joined() {
+                    let completion = worker.finish(std::time::Duration::from_secs(45)).await;
+                    if let Err(error) = completion.and_then(|result| result) {
+                        tracing::warn!(%error, "account HTTP worker failed during shutdown");
+                        if primary.is_ok() {
+                            primary = Err(anyhow::anyhow!(error));
+                        }
+                    }
+                }
+            }
             if let Some(bridge) = &bridge_owner {
                 bridge.begin_shutdown(
                     tokio::time::Instant::now() + std::time::Duration::from_secs(5),
@@ -1365,7 +1656,14 @@ impl Spawnable for OAuthService {
                 hyprstream_rpc::error::RpcError::SpawnFailed(format!("{e:#}"))
             })?;
             Ok(())
-        })
+        });
+        if contains_account_workers {
+            if let Err(error) = &result {
+                tracing::error!(%error, "dedicated OAuth process failed");
+            }
+            std::process::exit(if result.is_ok() { 0 } else { account_worker::WORKER_FAILURE_EXIT });
+        }
+        result
     }
 }
 
@@ -1456,6 +1754,131 @@ mod tests {
             !run.contains("DiscoveryClient::for_local_bootstrap("),
             "OAuth must not use the process-local Discovery registry"
         );
+    }
+
+    #[test]
+    fn account_http_socket_address_preserves_ipv4_and_ipv6_literals() {
+        let mut config = crate::account::AccountHttpConfig {
+            host: String::new(),
+            port: 8443,
+            tls_cert: "unused.pem".into(),
+            tls_key: "unused.key".into(),
+        };
+        for (host, expected) in [
+            ("127.0.0.1", "127.0.0.1:8443"),
+            ("0.0.0.0", "0.0.0.0:8443"),
+            ("::1", "[::1]:8443"),
+            ("::", "[::]:8443"),
+            ("[::1]", "[::1]:8443"),
+        ] {
+            config.host = host.to_owned();
+            assert_eq!(account_http_socket_addr(&config).unwrap().to_string(), expected);
+        }
+        for invalid in ["localhost", "[::1", "::1]", "127.0.0.1:8443"] {
+            config.host = invalid.to_owned();
+            assert!(account_http_socket_addr(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn account_worker_requires_launcher_process_containment() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let account = crate::account::AccountZoneConfig {
+            http: Some(crate::account::AccountHttpConfig {
+                host: "127.0.0.1".to_owned(),
+                port: 443,
+                tls_cert: PathBuf::from("unused.pem"),
+                tls_key: PathBuf::from("unused.key"),
+            }),
+            ..Default::default()
+        };
+        let transport = TransportConfig::inproc("test-containment-unused");
+        let service = OAuthService::new(
+            Default::default(), Default::default(), account, sk.clone(),
+            transport.clone(), transport.clone(), transport,
+            sk.verifying_key(), sk.verifying_key(),
+        );
+        let result = Box::new(service).run(Arc::new(Notify::new()), None);
+        assert!(matches!(result,
+            Err(hyprstream_rpc::error::RpcError::SpawnFailed(message))
+                if message.contains("dedicated foreground OAuth process")
+        ));
+    }
+
+    #[test]
+    fn oauth_warms_hosted_did_index_before_readiness() {
+        let source = include_str!("mod.rs");
+        let production = source
+            .get(..source
+                .find("\n#[cfg(test)]\n#[allow(clippy::unwrap_used")
+                .expect("test module must remain explicit"))
+            .expect("production source must precede tests");
+        let run_start = production
+            .find("impl Spawnable for OAuthService")
+            .expect("OAuthService must implement Spawnable");
+        let run = &production[run_start..];
+        let warmup = run
+            .find("warm_hosted_did_index(")
+            .expect("OAuth startup must warm the hosted-DID index");
+        let ready = run
+            .find("serve_bridged(")
+            .expect("OAuth readiness boundary must remain explicit");
+        assert!(warmup < ready, "OAuth must not signal readiness before index warm-up");
+        let warmup_block = &run[warmup..ready];
+        assert!(
+            warmup_block.contains("warm_hosted_did_index(")
+                && warmup_block.contains("Duration::from_secs(30)"),
+            "hosted-DID warm-up must have a bounded timeout"
+        );
+        let helper_start = production
+            .find("async fn warm_hosted_did_index(")
+            .expect("warm-up helper must remain explicit");
+        let helper_end = production
+            .find("/// Profile-aware bind of OAuth's inbound reach-only substrate")
+            .expect("warm-up helper must be bounded by the next helper");
+        let helper = &production[helper_start..helper_end];
+        assert!(
+            !helper.contains("spawn_blocking"),
+            "hosted-DID warm-up timeout must not leave an uncancellable blocking task"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hosted_did_warmup_timeout_does_not_wait_for_blocking_scan() {
+        const TEST: &str = "services::oauth::tests::hosted_did_warmup_timeout_does_not_wait_for_blocking_scan";
+        if !account_worker::tests::is_child(TEST) {
+            account_worker::tests::expect_contained_exit(TEST, &[]);
+            return;
+        }
+        struct SlowReads;
+        impl hyprstream_pds_service::AccountRecordReadAuthorizer for SlowReads {
+            fn check_read(
+                &self,
+                _subject: &hyprstream_rpc::Subject,
+                _verified_tenant: Option<&str>,
+                _security_context: Option<&hyprstream_rpc::auth::mac::SecurityContext>,
+                _object_id: &str,
+            ) -> hyprstream_rpc::auth::mac::MacDecision {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                hyprstream_rpc::auth::mac::MacDecision::Permit
+            }
+        }
+
+        let store = Arc::new(hyprstream_pds_service::AccountRecordStore::new(
+            Arc::new(hyprstream_vfs::SyntheticMount::new(
+                hyprstream_vfs::SyntheticNode::dir(),
+            )),
+            Arc::new(SlowReads),
+        ));
+        let _ = warm_hosted_did_index(
+            store,
+            hyprstream_rpc::Subject::new(
+                hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+            ),
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        panic!("timed-out warm-up must terminate its dedicated process");
     }
 
     fn encode_form(fields: &[(&str, &str)]) -> String {
@@ -2016,6 +2439,11 @@ mod tests {
             Arc::new(SyntheticMount::new(pds_root)),
             Arc::new(PermitFixtureAccountReads),
         ));
+        hosted_account_store
+            .refresh_hosted_did_index(&hyprstream_rpc::Subject::new(
+                hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+            ))
+            .await?;
         let mut oauth_state = OAuthState::new(
             &config,
             policy_client,

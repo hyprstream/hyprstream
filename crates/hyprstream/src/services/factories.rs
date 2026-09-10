@@ -2065,13 +2065,14 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     // Register this service's verifying key with PolicyService
     register_service_key(ctx, "oauth", &sk)?;
 
+    let pds_root = ctx.deployment_data_dir()?.join("pds");
     let identity_registration_api =
         crate::services::oauth::identity_registration::production_identity_registration_api(
             &config.oauth,
             &config.account,
             &config.quic,
             sk.clone(),
-            ctx.deployment_data_dir()?.join("pds"),
+            pds_root.clone(),
         )
         .context("compose production identity registration API")?;
 
@@ -2090,7 +2091,9 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         ctx.jwt_verifying_key(),
     )
     .with_quic_config(config.quic.clone())
-    .with_identity_registration_api(identity_registration_api);
+    .with_identity_registration_api(identity_registration_api)
+    .with_pds_root(pds_root)
+    .with_dedicated_process(ctx.is_dedicated_process_for("oauth"));
 
     Ok(Box::new(oauth_service))
 }
