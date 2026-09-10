@@ -271,7 +271,7 @@ impl AccountRecordStore {
             *last_attempt = Some(Instant::now());
         }
         let store = self.clone();
-        let _ = std::thread::Builder::new()
+        if std::thread::Builder::new()
             .name("hyprstream-pds-index-refresh".to_owned())
             .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -293,7 +293,12 @@ impl AccountRecordStore {
             store
                 .hosted_did_index_refreshing
                 .store(false, Ordering::Release);
-            });
+            })
+            .is_err()
+        {
+            self.hosted_did_index_refreshing
+                .store(false, Ordering::Release);
+        }
     }
 
     pub async fn refresh_hosted_did_index(

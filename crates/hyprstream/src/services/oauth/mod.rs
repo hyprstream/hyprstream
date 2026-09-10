@@ -1503,21 +1503,39 @@ impl Spawnable for OAuthService {
                     let mut account_loop = match account_endpoint {
                         Some((account_bound, account_app)) => {
                             let account_shutdown_task = Arc::clone(&account_shutdown);
-                            tokio::task::spawn_blocking(move || {
-                                let runtime = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                    .map_err(|error| {
-                                        hyprstream_rpc::error::RpcError::SpawnFailed(
-                                            format!("account HTTP runtime: {error}"),
-                                        )
-                                    })?;
-                                runtime.block_on(crate::server::tls::serve_bound(
-                                    account_bound,
-                                    account_app,
-                                    account_shutdown_task,
-                                    "AccountHttpService",
-                                ))
+                            let (account_tx, account_rx) = tokio::sync::oneshot::channel();
+                            std::thread::Builder::new()
+                                .name("hyprstream-account-http".to_owned())
+                                .spawn(move || {
+                                    let result = (|| {
+                                        let runtime = tokio::runtime::Builder::new_current_thread()
+                                            .enable_all()
+                                            .build()
+                                            .map_err(|error| {
+                                                hyprstream_rpc::error::RpcError::SpawnFailed(
+                                                    format!("account HTTP runtime: {error}"),
+                                                )
+                                            })?;
+                                        runtime.block_on(crate::server::tls::serve_bound(
+                                            account_bound,
+                                            account_app,
+                                            account_shutdown_task,
+                                            "AccountHttpService",
+                                        ))
+                                    })();
+                                    let _ = account_tx.send(result);
+                                })
+                                .map_err(|error| {
+                                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                                        "account HTTP thread spawn failed: {error}"
+                                    ))
+                                })?;
+                            tokio::task::spawn_local(async move {
+                                account_rx.await.map_err(|_| {
+                                    hyprstream_rpc::error::RpcError::SpawnFailed(
+                                        "account HTTP thread exited without a result".to_owned(),
+                                    )
+                                })?
                             })
                         }
                         None => tokio::task::spawn_local(async {
