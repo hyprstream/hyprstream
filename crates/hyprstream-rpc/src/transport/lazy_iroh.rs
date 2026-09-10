@@ -55,9 +55,16 @@ static IROH_CLIENT_ENDPOINT: OnceLock<iroh::Endpoint> = OnceLock::new();
 /// originate outbound RPC dials. First-write-wins (mirrors
 /// `install_verify_config`); returns `Err(endpoint)` if one is already set.
 ///
-/// The daemon calls this once during bootstrap with the shared endpoint (the
-/// same one its inbound iroh substrate listens on, so outbound dials reuse the
-/// node identity). The capability can only be obtained from
+/// In production the authenticated OS-owned process bootstrap calls this
+/// FIRST, with a distinct outbound-only carrier endpoint (retained in
+/// `PROCESS_BOOTSTRAP_CARRIER`, transport purpose key
+/// `hyprstream-bootstrap-client-transport-v1`). A service that later binds
+/// its own inbound substrate therefore receives `Err(returned_capability)`;
+/// that is valid and expected — it keeps its substrate as the independent
+/// inbound owner and leaves the global endpoint untouched. The global
+/// endpoint is the outbound dialer only: it is not a DID, subject, tenant,
+/// response-signing key, or authorization authority. The capability can only
+/// be obtained from
 /// [`crate::transport::iroh_substrate::IrohSubstrate::owned_client_endpoint`],
 /// which proves the endpoint was bound with the exact hybrid-only provider.
 ///

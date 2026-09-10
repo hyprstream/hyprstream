@@ -143,6 +143,15 @@ impl ProcessSpawner {
     pub async fn is_running(&self, process: &SpawnedProcess) -> Result<bool> {
         self.backend.is_running(process).await
     }
+
+    /// Synchronous bounded stop of a TRACKED direct child, used only by the
+    /// launch-transaction guard's `Drop` for cancellation cleanup where no
+    /// async runtime work is guaranteed (#1585). Delegates to the backend,
+    /// which stops through its retained child handle — never a blind by-PID
+    /// signal; unsupported backends fail honestly.
+    pub fn stop_tracked_child_sync(&self, process: &SpawnedProcess) -> Result<()> {
+        self.backend.stop_tracked_child_sync(process)
+    }
 }
 
 impl Default for ProcessSpawner {

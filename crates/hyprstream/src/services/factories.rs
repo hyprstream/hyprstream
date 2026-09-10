@@ -353,7 +353,15 @@ fn register_service_key(
         return Ok(());
     }
 
-    let creds_dir = credentials_dir()?;
+    // The loaded config's `[secrets].path` must win: startup read the retained
+    // key and this very JWT from that directory, and the renewal task spawned
+    // below reads AND persists there every hour. A config-free fallback here
+    // made custom `--config [secrets].path` deployments work at startup and
+    // then silently skip renewal (P1, PR1585).
+    let creds_dir = match ctx.secrets_dir() {
+        Some(dir) => dir.to_path_buf(),
+        None => credentials_dir()?,
+    };
     let secrets_profile = crate::auth::identity_store::SecretsProfile::from_env()?;
 
     // The JWT may already be in the trust store (e.g. seeded by an earlier
@@ -391,6 +399,19 @@ fn register_service_key(
     }
 
     if service_name == "policy" {
+        if ctx.iroh_required() {
+            // Policy is the native authority itself: it does not register its
+            // own key through RPC, but its provisioned service JWT still needs
+            // the same renewal task as every other native child.
+            spawn_jwt_renewal_task(
+                service_name,
+                signing_key.clone(),
+                creds_dir,
+                secrets_profile,
+                true,
+                ctx.transport("policy", SocketKind::Rep),
+            );
+        }
         return Ok(());
     }
 
@@ -526,7 +547,14 @@ fn spawn_jwt_renewal_task(
     policy_transport: hyprstream_rpc::transport::TransportConfig,
 ) {
     let service_name = service_name.to_owned();
-    tokio::spawn(async move {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // Factory unit tests exercise registration without a running executor;
+        // production startup always has one. Avoid panicking in the former
+        // while keeping renewal attached to the service runtime in the latter.
+        tracing::debug!(service = service_name, "JWT renewal deferred: no Tokio runtime");
+        return;
+    };
+    runtime.spawn(async move {
         const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3_600);
         const RENEW_THRESHOLD: i64 = 7 * 24 * 3_600; // 7 days remaining
 
@@ -1768,7 +1796,8 @@ fn build_workflow_namespace() -> Namespace {
 /// Factory for OAIService (OpenAI-compatible HTTP API)
 ///
 /// This service provides the HTTP API for inference requests.
-/// It communicates with ModelService and PolicyService via ZMQ.
+/// It communicates with ModelService, PolicyService, and RegistryService over
+/// the configured authenticated RPC resolver.
 #[service_factory("oai", depends_on = ["policy", "model", "registry", "discovery"])]
 fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating OAIService");
@@ -1784,7 +1813,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     // Register this service's verifying key with PolicyService
     register_service_key(ctx, "oai", &sk)?;
 
-    // Create ZMQ clients for Model and Policy services
+    // Create authenticated clients for Model and Policy services.
     let model_client = ModelClient::from_resolver(sk.clone(), service_token(&sk))?;
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
@@ -1846,8 +1875,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         config.tls.clone(),
         config.account.clone(),
         server_state,
-        ctx.transport("oai", SocketKind::Rep),
-        ctx.verifying_key(),
+        ctx.iroh_required(),
     );
 
     Ok(Box::new(oai_service))
@@ -3303,6 +3331,120 @@ mod tests {
         register_service_key(&ctx, "policy", &signer)?;
         assert_eq!(hyprstream_service::global_trust_store().get(&signer.verifying_key())
             .and_then(|attestation| attestation.jwt), Some(jwt));
+        Ok(())
+    }
+
+    /// A required-native Policy process carries its loaded custom secrets path
+    /// into the factory through the trust store. The factory's config-free
+    /// fallback must not need the XDG default path to exist.
+    #[test]
+    fn required_policy_uses_loaded_custom_jwt_before_factory_fallback() -> anyhow::Result<()> {
+        const CHILD: &str = "HYPRSTREAM_POLICY_CUSTOM_JWT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "services::factories::tests::required_policy_uses_loaded_custom_jwt_before_factory_fallback", "--nocapture"])
+                .env(CHILD, "1")
+                .status()?;
+            anyhow::ensure!(status.success(), "isolated custom Policy JWT test failed");
+            return Ok(());
+        }
+        let root = tempfile::tempdir()?;
+        let custom = root.path().join("custom-credentials");
+        let xdg = root.path().join("xdg-config");
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        std::env::remove_var("HYPRSTREAM__SECRETS__PATH");
+        std::env::remove_var(crate::auth::identity_store::SECRETS_PROFILE_ENV);
+
+        let signer = SigningKey::from_bytes(&[0x6a; 32]);
+        let ctx = ServiceContext::new(signer.clone(), signer.verifying_key(), true, custom.clone())
+            .with_quic(hyprstream_service::QuicSharedConfig {
+                cert_chain: Vec::new(), key_der: zeroize::Zeroizing::new(Vec::new()),
+                base_ip: std::net::Ipv4Addr::LOCALHOST.into(), server_name: "policy.test".to_owned(),
+                oauth_issuer_url: None, jwt_verifying_key: None, iroh_enabled: true, iroh_required: true,
+                moq_relay: None, native_announcement_publisher: None,
+                moq_relay_server_identity: None, moq_admission: None,
+                moq_ingress_authorizer: None, moq_admission_proof: None,
+            });
+        // With the default XDG directory absent, registration fails before
+        // startup carries the loaded custom credential into the trust store.
+        assert!(register_service_key(&ctx, "policy", &signer).is_err());
+
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new("service:policy".to_owned(), now, now + 3600)
+            .with_cnf_jwk(signer.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &signer);
+        crate::auth::identity_store::write_service_jwt(&custom, "policy", &jwt)?;
+        let mut loaded_config = HyprConfig::default();
+        loaded_config.secrets.path = Some(custom.clone());
+        let loaded_secrets = HyprConfig::resolve_secrets_dir_for(Some(&loaded_config))?;
+        crate::auth::identity_store::seed_service_jwt_into_trust_store(
+            "policy",
+            &signer,
+            &loaded_secrets,
+            crate::auth::identity_store::SecretsProfile::SharedDirectory,
+        );
+        register_service_key(&ctx, "policy", &signer)?;
+        assert_eq!(
+            hyprstream_service::global_trust_store()
+                .get(&signer.verifying_key())
+                .and_then(|attestation| attestation.jwt),
+            Some(jwt),
+        );
+        Ok(())
+    }
+
+    /// The loaded custom `[secrets].path` must reach the factory itself, not
+    /// only the startup trust-store bridge: with the service JWT on disk
+    /// solely at the config-selected directory (no env override, no manual
+    /// seeding), `register_service_key` resolves it there. This is the exact
+    /// selection expression that feeds `spawn_jwt_renewal_task` — the hourly
+    /// renewal reads and persists at this directory — so a config-free
+    /// fallback here makes custom-path deployments renew against the wrong
+    /// directory and silently skip.
+    #[test]
+    fn register_service_key_resolves_custom_config_secrets_dir() -> anyhow::Result<()> {
+        const CHILD: &str = "HYPRSTREAM_POLICY_CTX_SECRETS_DIR_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "services::factories::tests::register_service_key_resolves_custom_config_secrets_dir", "--nocapture"])
+                .env(CHILD, "1")
+                .status()?;
+            anyhow::ensure!(status.success(), "isolated ctx secrets-dir registration test failed");
+            return Ok(());
+        }
+        let root = tempfile::tempdir()?;
+        let custom = root.path().join("custom-credentials");
+        let xdg = root.path().join("xdg-config");
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        std::env::remove_var("HYPRSTREAM__SECRETS__PATH");
+        std::env::remove_var(crate::auth::identity_store::SECRETS_PROFILE_ENV);
+
+        let signer = SigningKey::from_bytes(&[0x6b; 32]);
+        let ctx = ServiceContext::new(signer.clone(), signer.verifying_key(), true, custom.clone())
+            .with_quic(hyprstream_service::QuicSharedConfig {
+                cert_chain: Vec::new(), key_der: zeroize::Zeroizing::new(Vec::new()),
+                base_ip: std::net::Ipv4Addr::LOCALHOST.into(), server_name: "policy.test".to_owned(),
+                oauth_issuer_url: None, jwt_verifying_key: None, iroh_enabled: true, iroh_required: true,
+                moq_relay: None, native_announcement_publisher: None,
+                moq_relay_server_identity: None, moq_admission: None,
+                moq_ingress_authorizer: None, moq_admission_proof: None,
+            })
+            .with_secrets_dir(custom.clone());
+        // No trust-store bridge: the JWT exists only at the config-selected
+        // directory. Registration must resolve it from the context-carried
+        // directory — the same binding handed to the renewal task.
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new("service:policy".to_owned(), now, now + 3600)
+            .with_cnf_jwk(signer.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &signer);
+        crate::auth::identity_store::write_service_jwt(&custom, "policy", &jwt)?;
+        register_service_key(&ctx, "policy", &signer)?;
+        assert_eq!(
+            hyprstream_service::global_trust_store()
+                .get(&signer.verifying_key())
+                .and_then(|attestation| attestation.jwt),
+            Some(jwt),
+        );
         Ok(())
     }
 

@@ -557,6 +557,13 @@ pub struct ServiceContext {
     ///
     /// In multi-process mode, loaded from the `ca-mldsa-pubkey` credential.
     ca_ml_dsa_verifying_key: Option<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>,
+
+    /// Explicitly resolved credentials/secrets directory — the location the
+    /// loading process actually selected (honoring `--config [secrets].path`
+    /// and the `HYPRSTREAM__SECRETS__PATH` override). `None` lets factory
+    /// code fall back to the config-free resolver, preserving compatibility
+    /// for constructors that never carried a config handle.
+    secrets_dir: Option<std::path::PathBuf>,
 }
 
 /// Owned callback joining carrier binding to the signed announcement lifecycle.
@@ -623,7 +630,27 @@ impl ServiceContext {
                 std::sync::Arc::new(std::sync::RwLock::new(Vec::new()))
             },
             ca_ml_dsa_verifying_key: None,
+            secrets_dir: None,
         }
+    }
+
+    /// Carry the explicitly resolved credentials directory into factories.
+    ///
+    /// Startup resolves `[secrets].path` from the loaded config and reads the
+    /// retained signing key and service JWT from that directory; factory-time
+    /// helpers (key registration, JWT renewal) have no config handle of their
+    /// own and must not re-resolve from env/defaults, or a custom
+    /// `--config [secrets].path` deployment would work at startup and then
+    /// renew against the wrong directory.
+    pub fn with_secrets_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.secrets_dir = Some(dir);
+        self
+    }
+
+    /// The explicitly resolved credentials directory, when the constructing
+    /// process carried one.
+    pub fn secrets_dir(&self) -> Option<&std::path::Path> {
+        self.secrets_dir.as_deref()
     }
 
     /// Set the shared ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
