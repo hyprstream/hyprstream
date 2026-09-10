@@ -10,6 +10,7 @@
 //! `verified_tenant`. The tenant is never inferred from the subject, accepted
 //! from a request payload, or supplied as a free-form method argument.
 
+pub mod account_http;
 pub mod federation_intake;
 
 use std::sync::Arc;

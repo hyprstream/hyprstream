@@ -8,6 +8,7 @@ description = "Tenant-scoped PDS account record service over the Hyprstream 9P m
 
 [dependencies]
 anyhow = { workspace = true }
+axum = { workspace = true }
 async-trait = { workspace = true }
 hyprstream-pds = { path = "../hyprstream-pds" }
 hyprstream-rpc = { path = "../hyprstream-rpc" }
@@ -23,6 +24,7 @@ ed25519-dalek = { workspace = true }
 hyprstream-crypto = { path = "../hyprstream-crypto" }
 hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 rand = { workspace = true }
+"tower" = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
