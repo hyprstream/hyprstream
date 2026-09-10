@@ -136,6 +136,7 @@ pub struct AccountRecordStore {
     hosted_did_index: Arc<tokio::sync::RwLock<Option<HostedDidIndex>>>,
     hosted_did_index_refresh: Arc<tokio::sync::Mutex<()>>,
     hosted_did_index_refreshing: Arc<AtomicBool>,
+    hosted_did_index_refreshed: Arc<tokio::sync::Notify>,
     hosted_did_index_last_attempt: Arc<parking_lot::Mutex<Option<Instant>>>,
 }
 
@@ -147,6 +148,7 @@ struct HostedDidIndex {
 const HOSTED_DID_INDEX_TTL: Duration = Duration::from_secs(5);
 const HOSTED_DID_MAX_STALE: Duration = Duration::from_secs(30);
 const HOSTED_DID_REFRESH_RETRY_COOLDOWN: Duration = Duration::from_secs(1);
+const HOSTED_DID_REFRESH_WAIT: Duration = Duration::from_secs(1);
 const HOSTED_DID_NEGATIVE_TTL: Duration = HOSTED_DID_INDEX_TTL;
 
 impl AccountRecordStore {
@@ -163,6 +165,7 @@ impl AccountRecordStore {
             hosted_did_index: Arc::new(tokio::sync::RwLock::new(None)),
             hosted_did_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
             hosted_did_index_refreshing: Arc::new(AtomicBool::new(false)),
+            hosted_did_index_refreshed: Arc::new(tokio::sync::Notify::new()),
             hosted_did_index_last_attempt: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
@@ -215,7 +218,22 @@ impl AccountRecordStore {
             return Ok(None);
         };
 
-        let index = self.hosted_did_index.read().await;
+        let mut index = self.hosted_did_index.read().await;
+        if index.as_ref().is_some_and(|snapshot| {
+            snapshot.built_at.elapsed() >= HOSTED_DID_INDEX_TTL + HOSTED_DID_MAX_STALE
+        }) {
+            // The first request after an idle period may wait for the shared
+            // isolated refresher, but must never scan tenants itself or serve
+            // an expired binding. Subscribe before releasing the read lock so
+            // a concurrent refresh cannot publish unnoticed.
+            let refreshed = self.hosted_did_index_refreshed.notified();
+            tokio::pin!(refreshed);
+            refreshed.as_mut().enable();
+            drop(index);
+            self.schedule_hosted_did_index_refresh(authority.clone());
+            let _ = tokio::time::timeout(HOSTED_DID_REFRESH_WAIT, refreshed).await;
+            index = self.hosted_did_index.read().await;
+        }
         let Some(snapshot) = index.as_ref() else {
             // A request must never become the tenant enumerator. Startup
             // refresh runs independently; callers retry after the index is
@@ -246,7 +264,7 @@ impl AccountRecordStore {
         }
     }
 
-    /// Start a bounded refresh without making the caller perform tenant
+    /// Start a single-flight refresh without making the caller perform tenant
     /// enumeration. A stale snapshot remains available for O(1) lookups while
     /// one background task refreshes it; the refresh lock prevents duplicate
     /// scans. Before the first snapshot, lookups return
@@ -283,6 +301,7 @@ impl AccountRecordStore {
                     store
                         .hosted_did_index_refreshing
                         .store(false, Ordering::Release);
+                    store.hosted_did_index_refreshed.notify_waiters();
                     return;
                 }
             };
@@ -293,11 +312,13 @@ impl AccountRecordStore {
             store
                 .hosted_did_index_refreshing
                 .store(false, Ordering::Release);
+            store.hosted_did_index_refreshed.notify_waiters();
             })
             .is_err()
         {
             self.hosted_did_index_refreshing
                 .store(false, Ordering::Release);
+            self.hosted_did_index_refreshed.notify_waiters();
         }
     }
 
@@ -1091,8 +1112,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hosted_did_positive_binding_has_a_hard_stale_deadline() {
+    async fn hosted_did_idle_lookup_waits_for_fresh_binding() {
         let store = store();
+        seed_expired_hosted_did_binding(&store).await;
+        let tenant = store
+            .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
+            .await
+            .expect("first lookup after idle must recover within its refresh budget");
+        assert_eq!(tenant.as_deref(), Some("acme"));
+        assert!(store.hosted_did_index_ready().await);
+    }
+
+    async fn seed_expired_hosted_did_binding(store: &AccountRecordStore) {
         store
             .hosted_did_index
             .write()
@@ -1100,15 +1131,106 @@ mod tests {
             .replace(HostedDidIndex {
                 entries: BTreeMap::from([(
                     ("alice".to_owned(), "did:web:alice.acme.example".to_owned()),
-                    Some("acme".to_owned()),
+                    Some("obsolete-tenant".to_owned()),
                 )]),
                 built_at: Instant::now() - HOSTED_DID_INDEX_TTL - HOSTED_DID_MAX_STALE,
             });
+    }
+
+    #[tokio::test]
+    async fn hosted_did_positive_binding_has_a_hard_stale_deadline() {
+        let root = SyntheticNode::dir().with_child(
+            "acme",
+            tenant_node("alice", b"corrupt account record".to_vec()),
+        );
+        let store =
+            AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), permit_account_reads());
+        seed_expired_hosted_did_binding(&store).await;
         let error = store
             .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
             .await
             .unwrap_err();
         assert!(matches!(error, AccountReadError::HostedDidIndexNotReady));
+        assert!(!store.hosted_did_index_ready().await);
+        assert!(!store.hosted_did_index_refreshing.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hosted_did_idle_wait_is_bounded_coalesced_and_off_request_executor() {
+        struct BlockRootRead {
+            release: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+            scans: std::sync::atomic::AtomicUsize,
+            request_thread: std::thread::ThreadId,
+        }
+        impl AccountRecordReadAuthorizer for BlockRootRead {
+            fn check_read(
+                &self,
+                _subject: &Subject,
+                _verified_tenant: Option<&str>,
+                _security_context: Option<&SecurityContext>,
+                object_id: &str,
+            ) -> MacDecision {
+                if object_id == PDS_NAMESPACE {
+                    assert_ne!(std::thread::current().id(), self.request_thread);
+                    self.scans.fetch_add(1, Ordering::AcqRel);
+                    self.release
+                        .lock()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                MacDecision::Permit
+            }
+        }
+        let (release, blocked) = std::sync::mpsc::channel();
+        let authorizer = Arc::new(BlockRootRead {
+            release: parking_lot::Mutex::new(blocked),
+            scans: std::sync::atomic::AtomicUsize::new(0),
+            request_thread: std::thread::current().id(),
+        });
+        let mut store = store();
+        store.read_authorizer = authorizer.clone();
+        seed_expired_hosted_did_binding(&store).await;
+        let authority = oauth_authority();
+        let started = Instant::now();
+        let (first, second, heartbeat) = tokio::join!(
+            store.resolve_tenant_for_hosted_did(&authority, "did:web:alice.acme.example"),
+            store.resolve_tenant_for_hosted_did(&authority, "did:web:alice.acme.example"),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                started.elapsed()
+            },
+        );
+        let elapsed = started.elapsed();
+        // Another timed-out caller must share the existing worker as well.
+        let third = store
+            .resolve_tenant_for_hosted_did(&authority, "did:web:alice.acme.example")
+            .await;
+        let refreshed = store.hosted_did_index_refreshed.notified();
+        tokio::pin!(refreshed);
+        refreshed.as_mut().enable();
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), refreshed)
+            .await
+            .expect("released refresh must finish");
+
+        for result in [first, second, third] {
+            assert!(matches!(
+                result,
+                Err(AccountReadError::HostedDidIndexNotReady)
+            ));
+        }
+        assert!(elapsed >= HOSTED_DID_REFRESH_WAIT);
+        assert!(elapsed < HOSTED_DID_REFRESH_WAIT + Duration::from_millis(500));
+        assert!(heartbeat < Duration::from_millis(500));
+        assert_eq!(authorizer.scans.load(Ordering::Acquire), 1);
+        assert_eq!(
+            store
+                .resolve_tenant_for_hosted_did(&authority, "did:web:alice.acme.example")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("acme")
+        );
     }
 
     #[tokio::test]
