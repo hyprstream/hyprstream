@@ -252,9 +252,6 @@ impl AccountRecordStore {
     /// scans. Before the first snapshot, lookups return
     /// [`AccountReadError::HostedDidIndexNotReady`] while this task warms it.
     pub fn schedule_hosted_did_index_refresh(&self, authority: Subject) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
         if self
             .hosted_did_index_refreshing
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -274,7 +271,9 @@ impl AccountRecordStore {
             *last_attempt = Some(Instant::now());
         }
         let store = self.clone();
-        handle.spawn_blocking(move || {
+        let _ = std::thread::Builder::new()
+            .name("hyprstream-pds-index-refresh".to_owned())
+            .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -294,7 +293,7 @@ impl AccountRecordStore {
             store
                 .hosted_did_index_refreshing
                 .store(false, Ordering::Release);
-        });
+            });
     }
 
     pub async fn refresh_hosted_did_index(
