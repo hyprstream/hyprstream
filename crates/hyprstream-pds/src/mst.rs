@@ -149,6 +149,14 @@ impl NodeData {
 
     pub fn from_atproto_dag_cbor(bytes: &[u8]) -> Result<Self> {
         let value = crate::atproto_cbor::decode(bytes)?;
+        // Keep the wire bytes tied to the value used for projection.  The
+        // public decoder is canonical today; retaining this explicit check
+        // prevents a future normalizer change from silently changing the MST
+        // node bytes and therefore its CID.
+        ensure!(
+            crate::atproto_cbor::encode(&value)? == bytes,
+            "ATProto MST bytes are not canonical"
+        );
         Self::reject_unknown_fields(&value, &["l", "e"], "MST node")?;
         if let Some(entries) = value.get("e") {
             for entry in entries.as_list()? {
@@ -962,6 +970,21 @@ mod tests {
         let bytes = crate::atproto_cbor::encode(&value).expect("encode public node");
         let error = NodeData::from_atproto_dag_cbor(&bytes).expect_err("unknown entry field");
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn public_mst_preserves_canonical_bytes_on_decode() {
+        let value = DagCbor::str_map([
+            ("l", DagCbor::Null),
+            ("e", DagCbor::List(Vec::new())),
+        ]);
+        let bytes = crate::atproto_cbor::encode(&value).expect("encode public node");
+        let node = NodeData::from_atproto_dag_cbor(&bytes).expect("decode public node");
+        assert_eq!(
+            crate::atproto_cbor::encode(&node.to_value()).expect("re-encode public node"),
+            bytes,
+            "public MST decode must preserve canonical bytes and CID"
+        );
     }
 
     #[test]
