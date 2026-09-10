@@ -637,12 +637,10 @@ pub fn production_pds_account_record_store(
     mount: Arc<PdsDirectoryMount>,
     sink: Arc<dyn AuditSink>,
 ) -> Arc<hyprstream_pds_service::AccountRecordStore> {
-    let store = Arc::new(hyprstream_pds_service::AccountRecordStore::new(
+    Arc::new(hyprstream_pds_service::AccountRecordStore::new(
         mount,
         production_pds_account_read_authorizer(sink),
-    ));
-    store.schedule_hosted_did_index_refresh(Subject::new(OAUTH_ACCOUNT_RESOLVER_SUBJECT));
-    store
+    ))
 }
 
 #[cfg(test)]
