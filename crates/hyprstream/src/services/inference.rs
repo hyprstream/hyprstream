@@ -3225,6 +3225,10 @@ async fn serve_inference_bridged(
     // registered. This closes the notification-lost race on an immediately
     // failing peer.
     let _ = drain_armed_rx.await;
+    // The nested REP helper suppresses its own systemd readiness signal. The
+    // standalone inference owner emits the single outer READY=1 only after
+    // both REP and QUIC shutdown waiters are armed.
+    let _ = hyprstream_rpc::notify::ready();
     if let Some(on_ready) = on_ready {
         let _ = on_ready.send(());
     }
@@ -4365,6 +4369,26 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+
+    #[test]
+    fn standalone_ready_follows_quic_drain_arm() {
+        let source = include_str!("inference.rs");
+        let drain_arm = source
+            .find("let _ = drain_armed_rx.await;")
+            .expect("standalone inference must await the drain arm barrier");
+        let outer = &source[drain_arm..];
+        let ready = outer
+            .find("hyprstream_rpc::notify::ready()")
+            .expect("outer inference must emit systemd readiness");
+        let oneshot = outer
+            .find("if let Some(on_ready) = on_ready")
+            .expect("outer readiness oneshot must remain explicit");
+        assert!(ready < oneshot, "systemd READY must follow drain arming");
+        assert!(
+            source.contains("serve_bridged_with_shutdown_armed_silent"),
+            "nested REP helper must suppress its own readiness"
+        );
+    }
 
     /// Build a `GenerationStats` with only the fields the spend reads.
     fn stats(prefill: usize, generated: usize) -> GenerationStats {
