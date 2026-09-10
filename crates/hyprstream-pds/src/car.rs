@@ -271,11 +271,17 @@ fn parse_cid_prefix(body: &[u8]) -> Result<(Cid, usize)> {
         i += (body.len() - i) - rest.len();
         let (len, rest) = read_uvarint(&body[i..]).ok_or_else(|| anyhow!("truncated mh len"))?;
         i += (body.len() - i) - rest.len();
-        i += len as usize;
+        let digest_len = usize::try_from(len).map_err(|_| anyhow!("CID digest length overflow"))?;
+        let end = i
+            .checked_add(digest_len)
+            .ok_or_else(|| anyhow!("CID digest length overflow"))?;
+        ensure!(end <= body.len(), "truncated CID digest");
+        i = end;
         let cid = Cid::from_bytes(&body[..i])?;
         Ok((cid, i))
     } else if body[0] == 0x12 {
         // CIDv0 (sha2-256, 32 bytes): 34 bytes total.
+        ensure!(body.len() >= 34, "truncated CIDv0");
         let cid = Cid::from_bytes(&body[..34])?;
         Ok((cid, 34))
     } else {
@@ -501,5 +507,17 @@ mod tests {
         let (roots, blocks) = parse_car_v1(&car).expect("parse");
         assert_eq!(roots, vec![root]);
         assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn atproto_parser_rejects_truncated_cid_without_panicking() {
+        // A CIDv1 multihash advertises a 32-byte digest but the CAR section
+        // ends immediately after the length varint.
+        let malformed = hex::decode("11a265726f6f7473806776657273696f6e010401711220")
+            .expect("fixture is valid hex");
+        assert!(parse_car_v1_atproto(&malformed).is_err());
+
+        // The fixed-width CIDv0 form must receive the same bounds check.
+        assert!(parse_cid_prefix(&[0x12, 0x20]).is_err());
     }
 }
