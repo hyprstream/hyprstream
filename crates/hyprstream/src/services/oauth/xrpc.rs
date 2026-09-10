@@ -102,10 +102,7 @@ pub fn xrpc_routes() -> axum::Router<Arc<OAuthState>> {
 /// read-only until account/session authorization is configured.
 pub fn xrpc_write_routes() -> axum::Router<Arc<OAuthState>> {
     use axum::routing::post;
-    axum::Router::new().route(
-        "/xrpc/com.atproto.repo.createRecord",
-        post(create_record),
-    )
+    axum::Router::new().route("/xrpc/com.atproto.repo.createRecord", post(create_record))
 }
 
 /// An in-memory snapshot of one repo's signed state — enough to answer the
@@ -926,63 +923,209 @@ pub async fn create_record(
 ) -> Response {
     const MAX_BODY_BYTES: usize = 1_048_576;
     if body.len() > MAX_BODY_BYTES {
-        return xrpc_error(StatusCode::PAYLOAD_TOO_LARGE, errors::INVALID_REQUEST, "record body exceeds 1 MiB");
+        return xrpc_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            errors::INVALID_REQUEST,
+            "record body exceeds 1 MiB",
+        );
     }
     let Some(writer) = state.public_repo_writer.as_ref() else {
-        return xrpc_error(StatusCode::SERVICE_UNAVAILABLE, errors::INTERNAL_SERVER_ERROR, "public repository writer is not configured");
+        return xrpc_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            errors::INTERNAL_SERVER_ERROR,
+            "public repository writer is not configured",
+        );
     };
     let Some(token) = user.token.as_deref() else {
-        return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "verified OAuth access token is required");
+        return xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            errors::INVALID_REQUEST,
+            "verified OAuth access token is required",
+        );
     };
     let claims = match auth::validate_oauth_access_token(&state, token).await {
         Ok(claims) => claims,
-        Err(_) => return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "OAuth access token is invalid or expired"),
+        Err(_) => {
+            return xrpc_error(
+                StatusCode::UNAUTHORIZED,
+                errors::INVALID_REQUEST,
+                "OAuth access token is invalid or expired",
+            )
+        }
     };
     if !claims.has_scope("atproto") {
-        return xrpc_error(StatusCode::FORBIDDEN, "InsufficientScope", "the atproto scope is required");
+        return xrpc_error(
+            StatusCode::FORBIDDEN,
+            "InsufficientScope",
+            "the atproto scope is required",
+        );
     }
     if claims.sub != user.user || claims.tenant != user.verified_tenant {
-        return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "OAuth identity binding is invalid");
+        return xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            errors::INVALID_REQUEST,
+            "OAuth identity binding is invalid",
+        );
     }
     let input: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
-        Err(_) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "request body must be valid JSON"),
+        Err(_) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "request body must be valid JSON",
+            )
+        }
     };
     let object = match input.as_object() {
         Some(object) => object,
-        None => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "request body must be an object"),
+        None => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "request body must be an object",
+            )
+        }
+    };
+    let expected_prev = match object.get("swapCommit") {
+        None => None,
+        Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+        Some(_) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "swapCommit must be a non-empty CID string when present",
+            )
+        }
+    };
+    match object.get("validate") {
+        None | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                "UnsupportedValidation",
+                "Lexicon validation is not available; validate=true cannot be fulfilled",
+            )
+        }
+        Some(_) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "validate must be a boolean when present",
+            )
+        }
+    }
+    let return_record = match object.get("returnRecord") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "returnRecord must be a boolean when present",
+            )
+        }
+    };
+    let mut idempotency_keys = headers.get_all("Idempotency-Key").iter();
+    let request_id = match idempotency_keys.next() {
+        None => None,
+        Some(value) => {
+            let value = match value.to_str() {
+                Ok(value) if !value.is_empty() => value,
+                _ => {
+                    return xrpc_error(
+                        StatusCode::BAD_REQUEST,
+                        errors::INVALID_REQUEST,
+                        "Idempotency-Key must be a non-empty ASCII string",
+                    )
+                }
+            };
+            if idempotency_keys.next().is_some() {
+                return xrpc_error(
+                    StatusCode::BAD_REQUEST,
+                    errors::INVALID_REQUEST,
+                    "only one Idempotency-Key may be supplied",
+                );
+            }
+            // The native writer validates the publication request ID's length
+            // and alphabet before authorization or any repository access.
+            Some(value.to_owned())
+        }
     };
     let repo = match object.get("repo").and_then(Value::as_str) {
         Some(repo) if !repo.is_empty() => repo,
-        _ => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "repo is required"),
+        _ => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "repo is required",
+            )
+        }
     };
     if repo != writer.did() {
-        return xrpc_error(StatusCode::FORBIDDEN, "AuthRequired", "the request repo is not owned by this writer");
+        return xrpc_error(
+            StatusCode::FORBIDDEN,
+            "AuthRequired",
+            "the request repo is not owned by this writer",
+        );
     }
     let collection = match object.get("collection").and_then(Value::as_str) {
-        Some(collection) if matches!(collection, "app.bsky.feed.post" | "app.bsky.actor.profile") => collection,
-        Some(_) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "collection is outside the enabled posting slice"),
-        None => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "collection is required"),
+        Some(collection)
+            if matches!(collection, "app.bsky.feed.post" | "app.bsky.actor.profile") =>
+        {
+            collection
+        }
+        Some(_) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "collection is outside the enabled posting slice",
+            )
+        }
+        None => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "collection is required",
+            )
+        }
     };
-    let rkey = match object.get("rkey").and_then(Value::as_str).and_then(|value| Tid::parse(value).ok()) {
+    let rkey = match object
+        .get("rkey")
+        .and_then(Value::as_str)
+        .and_then(|value| Tid::parse(value).ok())
+    {
         Some(rkey) => rkey,
-        None => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "a valid TID rkey is required"),
+        None => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "a valid TID rkey is required",
+            )
+        }
     };
     let record_value = match object.get("record") {
         Some(record) => record,
-        None => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "record is required"),
+        None => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "record is required",
+            )
+        }
     };
     let record = match crate::services::public_repo::json_to_dag_cbor(record_value) {
         Ok(record) => record,
-        Err(_) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "record contains unsupported data"),
+        Err(_) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "record contains unsupported data",
+            )
+        }
     };
-    let request_id = headers
-        .get("Idempotency-Key")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+    let request_id = request_id
         .unwrap_or_else(|| format!("create-{}-{}", collection.replace('.', "_"), rkey.encode()));
-    let expected_prev = object.get("swapCommit").and_then(Value::as_str);
     let result = writer.create_record_with_expected_prev_text(
         crate::services::public_repo::PublicCreateRequest {
             request_id,
@@ -997,12 +1140,28 @@ pub async fn create_record(
     );
     let result = match result {
         Ok(result) => result,
-        Err(error) if error.to_string().contains("authorization") || error.to_string().contains("denied") => return xrpc_error(StatusCode::FORBIDDEN, "AuthRequired", error.to_string()),
-        Err(error) if error.to_string().contains("CAS conflict") || error.to_string().contains("already exists") => return xrpc_error(StatusCode::CONFLICT, "InvalidSwap", error.to_string()),
-        Err(error) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, error.to_string()),
+        Err(error)
+            if error.to_string().contains("authorization")
+                || error.to_string().contains("denied") =>
+        {
+            return xrpc_error(StatusCode::FORBIDDEN, "AuthRequired", error.to_string())
+        }
+        Err(error)
+            if error.to_string().contains("CAS conflict")
+                || error.to_string().contains("already exists") =>
+        {
+            return xrpc_error(StatusCode::CONFLICT, "InvalidSwap", error.to_string())
+        }
+        Err(error) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                error.to_string(),
+            )
+        }
     };
     let mut response = json!({"uri": result.uri, "cid": result.cid.to_string()});
-    if object.get("returnRecord").and_then(Value::as_bool).unwrap_or(false) {
+    if return_record {
         response["value"] = record_value.clone();
     }
     (StatusCode::OK, axum::Json(response)).into_response()
@@ -1571,6 +1730,205 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[derive(Default)]
+    struct WriteInputGate(std::sync::atomic::AtomicUsize);
+
+    impl crate::services::public_repo::PublicPublicationAuthorizer for WriteInputGate {
+        fn authorize(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    async fn build_write_input_fixture() -> (
+        tempfile::TempDir,
+        Arc<crate::services::public_repo::PublicRepoStore>,
+        Arc<WriteInputGate>,
+        Router,
+        String,
+    ) {
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(crate::services::public_repo::PublicRepoStore::open(dir.path()).unwrap());
+        let gate = Arc::new(WriteInputGate::default());
+        let writer = crate::services::public_repo::PublicRepoWriter::new(
+            store.clone(),
+            "did:web:pub.example.com",
+            SigningKey::random(&mut OsRng),
+            gate.clone(),
+        )
+        .unwrap();
+        let mut state = build_test_state(true).await;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x19; 32]);
+        let writable_state = Arc::get_mut(&mut state).unwrap();
+        writable_state.verifying_key_bytes = signing_key.verifying_key().to_bytes();
+        writable_state.public_repo_writer = Some(Arc::new(writer));
+        let issuer = state.atproto_issuer_url();
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new("xrpc-writer".to_owned(), now, now + 3600)
+            .with_issuer(issuer.clone())
+            .with_audience(Some(issuer))
+            .with_tenant("xrpc-input-tests".to_owned())
+            .with_client_id("xrpc-input-tests")
+            .with_scope(Some("atproto".to_owned()))
+            .with_jti();
+        let token = hyprstream_rpc::auth::jwt::encode(&claims, &signing_key);
+        let app = build_production_app_from_state(state).await;
+        (dir, store, gate, app, token)
+    }
+
+    fn write_input(id: u64) -> Value {
+        json!({
+            "repo": "did:web:pub.example.com",
+            "collection": "app.bsky.feed.post",
+            "rkey": Tid::from_raw(id).encode(),
+            "record": {
+                "$type": "app.bsky.feed.post",
+                "text": "input validation",
+                "createdAt": "2026-09-10T00:00:00Z"
+            }
+        })
+    }
+
+    fn write_http_request(token: &str, input: &Value, headers: HeaderMap) -> HttpRequest<Body> {
+        let mut request = HttpRequest::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.repo.createRecord")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(input).unwrap()))
+            .unwrap();
+        request.headers_mut().extend(headers);
+        request
+    }
+
+    #[tokio::test]
+    async fn router_create_record_rejects_malformed_optional_fields_without_writes() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        for field in ["swapCommit", "validate", "returnRecord"] {
+            let mut invalid = vec![Value::Null, json!(1), json!(""), json!([]), json!({})];
+            if field == "swapCommit" {
+                invalid.extend([json!(false), json!(true), json!("not-a-cid")]);
+            }
+            for value in invalid {
+                let mut input = write_input(7);
+                input[field] = value.clone();
+                let response = app
+                    .clone()
+                    .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{field}={value}"
+                );
+                assert_eq!(body_json(response).await["error"], errors::INVALID_REQUEST);
+                assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+                assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn router_create_record_rejects_invalid_idempotency_headers_without_writes() {
+        use axum::http::HeaderValue;
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        for value in [
+            HeaderValue::from_static(""),
+            HeaderValue::from_static(" "),
+            HeaderValue::from_static("bad/key"),
+            HeaderValue::from_static("first,second"),
+            HeaderValue::from_str(&"a".repeat(129)).unwrap(),
+            HeaderValue::from_bytes(&[0xff]).unwrap(),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("Idempotency-Key", value);
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&token, &write_input(7), headers))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(body_json(response).await["error"], errors::INVALID_REQUEST);
+            assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+            assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        let mut headers = HeaderMap::new();
+        headers.append("Idempotency-Key", HeaderValue::from_static("first"));
+        headers.append("Idempotency-Key", HeaderValue::from_static("second"));
+        let response = app
+            .oneshot(write_http_request(&token, &write_input(7), headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["error"], errors::INVALID_REQUEST);
+        assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn router_create_record_requires_supported_validation_and_preserves_basic_mode() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        let mut input = write_input(7);
+        input["validate"] = json!(true);
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = body_json(response).await;
+        assert_eq!(error["error"], "UnsupportedValidation");
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .contains("Lexicon validation"));
+        assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // Valid authenticated requests prove the negative cases reached the
+        // enabled production write path, not an auth failure or a 404 stub.
+        for (id, explicit_validate) in [(7, true), (8, false)] {
+            let mut input = write_input(id);
+            if explicit_validate {
+                input["validate"] = json!(false);
+            }
+            input["returnRecord"] = json!(explicit_validate);
+            let mut headers = HeaderMap::new();
+            if explicit_validate {
+                headers.insert("Idempotency-Key", "valid-7.key_1".parse().unwrap());
+            }
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&token, &input, headers))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let output = body_json(response).await;
+            if explicit_validate {
+                assert_eq!(output["value"], input["record"]);
+            } else {
+                assert!(output.get("value").is_none());
+            }
+        }
+        assert_eq!(
+            store
+                .snapshot("did:web:pub.example.com")
+                .unwrap()
+                .unwrap()
+                .records
+                .len(),
+            2
+        );
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     // ── Finding 1: real capacity test through the mounted router ──────────────
