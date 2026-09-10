@@ -1153,26 +1153,38 @@ pub async fn create_record(
         },
         expected_prev,
     );
+    use crate::services::public_repo::PublicRepoWriteError;
     let result = match result {
         Ok(result) => result,
-        Err(error)
-            if error.to_string().contains("authorization")
-                || error.to_string().contains("denied") =>
-        {
-            return xrpc_error(StatusCode::FORBIDDEN, "AuthRequired", error.to_string())
-        }
-        Err(error)
-            if error.to_string().contains("CAS conflict")
-                || error.to_string().contains("already exists") =>
-        {
-            return xrpc_error(StatusCode::CONFLICT, "InvalidSwap", error.to_string())
-        }
         Err(error) => {
-            return xrpc_error(
-                StatusCode::BAD_REQUEST,
-                errors::INVALID_REQUEST,
-                error.to_string(),
-            )
+            let (status, code, message) = match error {
+                PublicRepoWriteError::InvalidRequest(_) => (
+                    StatusCode::BAD_REQUEST,
+                    errors::INVALID_REQUEST,
+                    "record or request parameters are invalid",
+                ),
+                PublicRepoWriteError::Authorization(_) => (
+                    StatusCode::FORBIDDEN,
+                    "AuthRequired",
+                    "public repository publication is not authorized",
+                ),
+                PublicRepoWriteError::RecordAlreadyExists => (
+                    StatusCode::CONFLICT,
+                    "RecordAlreadyExists",
+                    "record key already exists",
+                ),
+                PublicRepoWriteError::InvalidSwap => (
+                    StatusCode::CONFLICT,
+                    "InvalidSwap",
+                    "swapCommit does not match the repository head",
+                ),
+                PublicRepoWriteError::Internal(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    "public repository operation failed",
+                ),
+            };
+            return xrpc_error(status, code, message);
         }
     };
     let mut response = json!({"uri": result.uri, "cid": result.cid.to_string()});
@@ -1748,11 +1760,17 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct WriteInputGate(std::sync::atomic::AtomicUsize);
+    struct WriteInputGate(
+        std::sync::atomic::AtomicUsize,
+        parking_lot::Mutex<Option<String>>,
+    );
 
     impl crate::services::public_repo::PublicPublicationAuthorizer for WriteInputGate {
         fn authorize(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(message) = self.1.lock().as_ref() {
+                anyhow::bail!(message.clone());
+            }
             Ok(())
         }
     }
@@ -1822,6 +1840,154 @@ mod tests {
             .unwrap();
         request.headers_mut().extend(headers);
         request
+    }
+
+    #[tokio::test]
+    async fn router_create_record_maps_input_and_conflicts_without_mutation() {
+        let (_dir, store, _gate, app, token) = build_write_input_fixture().await;
+        let mut invalid = write_input(7);
+        invalid["record"]["$type"] = json!("private.authorization.denied");
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &invalid, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await,
+            json!({
+                "error": "InvalidRequest", "message": "record or request parameters are invalid"
+            })
+        );
+        assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+
+        let response = app
+            .clone()
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let original = body_json(response).await;
+        let head = store
+            .snapshot("did:web:pub.example.com")
+            .unwrap()
+            .unwrap()
+            .commit
+            .cid_atproto()
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Idempotency-Key", "another-request".parse().unwrap());
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &write_input(7), headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(response).await,
+            json!({
+                "error": "RecordAlreadyExists", "message": "record key already exists"
+            })
+        );
+        let mut stale = write_input(8);
+        stale["swapCommit"] = json!(hyprstream_pds::Cid::from_dag_cbor(b"stale").to_string());
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &stale, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(response).await,
+            json!({
+                "error": "InvalidSwap", "message": "swapCommit does not match the repository head"
+            })
+        );
+        let snapshot = store.snapshot("did:web:pub.example.com").unwrap().unwrap();
+        assert_eq!(snapshot.commit.cid_atproto().unwrap(), head);
+        assert_eq!(snapshot.records.len(), 1);
+        let response = app
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await, original);
+    }
+
+    #[tokio::test]
+    async fn router_create_record_authorization_errors_ignore_source_text() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        // Deliberately use words that formerly selected conflict or input status.
+        for detail in [
+            "private credential: CAS conflict",
+            "private credential: already exists",
+            "private credential",
+        ] {
+            *gate.1.lock() = Some(detail.to_owned());
+            let response = app
+                .clone()
+                .oneshot(write_http_request(
+                    &token,
+                    &write_input(7),
+                    HeaderMap::new(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                body_json(response).await,
+                json!({
+                    "error": "AuthRequired", "message": "public repository publication is not authorized"
+                })
+            );
+            assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+        }
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn router_create_record_internal_errors_are_sanitized() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        let private_key = "private-authorization-denied-CAS-conflict";
+        store
+            .insert_malformed_record_for_test(
+                "did:web:pub.example.com",
+                "app.bsky.feed.post",
+                private_key,
+            )
+            .unwrap();
+        let source = store
+            .snapshot("did:web:pub.example.com")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            source.contains(private_key),
+            "fixture must exercise sensitive internal context"
+        );
+        let response = app
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body_json(response).await,
+            json!({
+                "error": "InternalServerError", "message": "public repository operation failed"
+            })
+        );
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
