@@ -103,10 +103,10 @@ def text(repo: Path, path: str, mutations: dict[str, str] | None) -> str:
 def source_services(
     repo: Path, mutations: dict[str, str] | None = None, tracked_sources: list[str] | None = None
 ) -> dict[str, dict[str, Any]]:
-    cli = text(repo, "crates/hyprstream/src/cli/schema_cli.rs", mutations)
-    mcp = text(repo, "crates/hyprstream/src/services/mcp_service.rs", mutations)
-    factories = text(repo, "crates/hyprstream/src/services/factories.rs", mutations)
-    vfs = text(repo, "crates/hyprstream-rpc-std/src/vfs_mount.rs", mutations)
+    cli = strip_rust_comments(text(repo, "crates/hyprstream/src/cli/schema_cli.rs", mutations))
+    mcp = strip_rust_comments(text(repo, "crates/hyprstream/src/services/mcp_service.rs", mutations))
+    factories = strip_rust_comments(text(repo, "crates/hyprstream/src/services/factories.rs", mutations))
+    vfs = strip_rust_comments(text(repo, "crates/hyprstream-rpc-std/src/vfs_mount.rs", mutations))
 
     registrations: list[tuple[int, str, list[str] | None]] = [
         (match.start(), match.group(1), None)
@@ -162,7 +162,7 @@ def source_services(
 
 
 def audited_input(repo: Path, event: str | None = None, revision: str | None = None) -> tuple[str, str]:
-    event = event or os.environ.get("DOCS_CATALOG_EVENT", "pull_request")
+    event = event or os.environ.get("DOCS_CATALOG_EVENT", "local")
     revision = revision or os.environ.get("DOCS_CATALOG_AUDITED_COMMIT")
     if event == "pull_request":
         expected_head = os.environ.get("DOCS_CATALOG_AUDITED_HEAD")
@@ -179,6 +179,8 @@ def audited_input(repo: Path, event: str | None = None, revision: str | None = N
         required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", boundary, "HEAD"]).returncode == 0,
                  "push audited input is not reachable from HEAD")
         return event, boundary
+    if event == "local":
+        return event, ""
     raise CatalogError(f"unsupported docs-catalog event {event}")
 
 
@@ -249,7 +251,8 @@ def check_provenance(record: dict[str, Any], repo: Path, label: str, corpus: dic
     git(repo, "cat-file", "-e", f"{commit}^{{commit}}")
     required(git(repo, "rev-parse", f"{commit}^{{tree}}") == tree,
              f"{label} source_tree does not match source_commit")
-    required(commit == boundary, f"{label} source_commit is not the trusted {topology} boundary")
+    if topology != "local":
+        required(commit == boundary, f"{label} source_commit is not the trusted {topology} boundary")
     staged_catalog = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--quiet", "--",
                                      "docs/schema-catalog.json", "docs/corpus-sources.json"]).returncode != 0
     required(commit != git(repo, "rev-parse", "HEAD") or staged_catalog,
@@ -505,10 +508,21 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
         source = text(repo, entry["path"], mutations)
         found = re.search(r"^@(0x[0-9a-f]+);", source, re.MULTILINE)
         required(found is not None and found.group(1) == entry["source_id"], f"{entry['path']} source ID drift")
+        if entry["path"].endswith("wire_roundtrip_fixture.capnp"):
+            required(entry["kind"] == "test-fixture" and entry.get("service") is None,
+                     f"{entry['path']} fixture classification drift")
+        elif re.search(r"(?m)^interface\s+", source):
+            required(entry["kind"] == "service" and isinstance(entry.get("service"), str),
+                     f"{entry['path']} service classification drift")
+        elif "annotation " in source:
+            required(entry["kind"] == "annotations" and entry.get("service") is None,
+                     f"{entry['path']} annotation classification drift")
         active = set(entry.get("surfaces", []))
         required(active <= set(SURFACES) | {"docs"}, f"{entry['path']} has unknown surface")
         for surface in SURFACES:
             required(surface in active or bool(entry["exclusions"].get(surface)), f"{entry['path']} lacks {surface} disposition")
+            required(not (surface in active and surface in entry["exclusions"]),
+                     f"{entry['path']} is both active and excluded on {surface}")
     check_cgr(catalog, repo, schemas, mutations)
     required(catalog.get("method_metadata") == schema_method_metadata(repo, schemas, mutations),
              "schema hidden/streaming method metadata drift")
@@ -520,6 +534,8 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
         required(record.get("state") in {"active", "declared", "absent"}, f"invalid {surface} state")
         key = "tracked_sources" if surface == "typescript" else "services"
         required(record.get(key) == actual.get(key), f"{surface} source registration drift")
+        expected_state = "active" if actual.get(key) else "absent"
+        required(record.get("state") == expected_state, f"{surface} state does not match source registrations")
         if surface in {"cli", "mcp"}:
             required(record.get("method_policy") == actual.get("method_policy"), f"{surface} hidden/streaming policy drift")
         if surface == "cli":
@@ -547,6 +563,10 @@ def check_corpus(corpus: dict[str, Any], repo: Path, mutations: dict[str, str] |
         record = corpus.get(name, {})
         required(record.get("version") == 1 and isinstance(record.get("limit_bytes"), int) and record["limit_bytes"] > 0, f"invalid {name}")
         required(all(record.get(key) for key in ("path", "id", "integrity")), f"{name} lacks stable contract fields")
+    required(corpus["api_manifest"] == {"version": 1, "path": "api/v1/{service}/{method}.json", "id": "api:{service}:{method}", "integrity": "sha256 of canonical UTF-8 JSON", "limit_bytes": 1048576},
+             "API manifest contract drift")
+    required(corpus["corpus_manifest"] == {"version": 1, "path": "corpus/v1/{document_id}.md", "id": "doc:{repository-relative-path}", "integrity": "sha256 of source bytes", "limit_bytes": 2097152},
+             "corpus manifest contract drift")
     public, excluded = corpus.get("public_prose", []), corpus.get("excluded", [])
     required({item.get("glob") for item in public} == PUBLIC_GLOBS, "public prose allowlist widened or incomplete")
     for item in public:
@@ -556,6 +576,8 @@ def check_corpus(corpus: dict[str, Any], repo: Path, mutations: dict[str, str] |
     package = corpus.get("package_contract", {})
     required(package.get("name") == "@hyprstream/docs" and package.get("state") == "declared-not-yet-published", "invalid docs package contract")
     required(package.get("requirements") == PACKAGE_REQUIREMENTS, "docs package requirements drift")
+    required(package.get("exports") == {"./manifest": "./manifest.json", "./api/*": "./api/v1/*", "./corpus/*": "./corpus/v1/*"},
+             "docs package exports drift")
     candidates = tracked(repo, "docs/*.md", "docs/**/*.md")
     for path in candidates:
         if not any(path_matches(path, item["glob"]) for item in excluded):
@@ -577,9 +599,16 @@ def validate(repo: Path, catalog: dict[str, Any] | None = None, corpus: dict[str
 
 def expect_failure(name: str, repo: Path, catalog: dict[str, Any], corpus: dict[str, Any],
                    schemas: list[str], consumers: dict[str, dict[str, Any]],
-                   mutations: dict[str, str] | None = None) -> None:
+                   mutations: dict[str, str] | None = None, rebind_digest: bool = True) -> None:
     try:
-        validate(repo, catalog, corpus, schemas, consumers, mutations)
+        # Rebind the digest for source mutations so the intended extractor or
+        # compiler assertion—not the outer provenance guard—must reject drift.
+        trial_catalog, trial_corpus = copy.deepcopy(catalog), copy.deepcopy(corpus)
+        if mutations and rebind_digest:
+            digest = input_digest(repo, provenance_paths(repo, trial_corpus), mutations)
+            trial_catalog["source_input_digest"] = digest
+            trial_corpus["source_input_digest"] = digest
+        validate(repo, trial_catalog, trial_corpus, schemas, consumers, mutations)
     except CatalogError:
         return
     raise AssertionError(f"mutation probe {name} unexpectedly passed")
@@ -601,12 +630,16 @@ def self_test(repo: Path) -> None:
     # moving remote-main tip by the time the check runs.
     validate(repo, catalog, corpus, schemas, consumers, event="pull_request", revision=catalog["source_commit"])
     previous_head = os.environ.get("DOCS_CATALOG_AUDITED_HEAD")
+    previous_event = os.environ.get("DOCS_CATALOG_EVENT")
     os.environ["DOCS_CATALOG_AUDITED_HEAD"] = "0" * 40
+    os.environ["DOCS_CATALOG_EVENT"] = "pull_request"
     try:
         expect_failure("synthetic pull-request merge checkout", repo, catalog, corpus, schemas, consumers)
     finally:
         if previous_head is None: os.environ.pop("DOCS_CATALOG_AUDITED_HEAD", None)
         else: os.environ["DOCS_CATALOG_AUDITED_HEAD"] = previous_head
+        if previous_event is None: os.environ.pop("DOCS_CATALOG_EVENT", None)
+        else: os.environ["DOCS_CATALOG_EVENT"] = previous_event
     expect_failure("unlisted schema", repo, copy.deepcopy(catalog), corpus, schemas + ["new.capnp"], consumers)
     expect_failure("stale schema", repo, copy.deepcopy(catalog), corpus, schemas[1:], consumers)
     bad = copy.deepcopy(catalog); bad["source_commit"] = "not-a-git-revision"
@@ -630,6 +663,10 @@ def self_test(repo: Path) -> None:
     expect_failure("stale valid corpus provenance", repo, catalog, bad, schemas, consumers)
     bad = copy.deepcopy(catalog); bad["schemas"][0]["license"] = "MIT"
     expect_failure("manifest license", repo, bad, corpus, schemas, consumers)
+    bad = copy.deepcopy(catalog)
+    settlement = next(entry for entry in bad["schemas"] if entry["path"].endswith("settlement.capnp"))
+    settlement["kind"], settlement["service"] = "type-only", None
+    expect_failure("schema service reclassification", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(catalog); bad["cgr_build_roots"]["crates/hyprstream/build.rs"][0] = "made/up/schema"
     expect_failure("CGR import root", repo, bad, corpus, schemas, consumers)
     for name, path, before, after in [
@@ -714,9 +751,15 @@ def self_test(repo: Path) -> None:
     expect_failure("public license", repo, catalog, bad, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["package_contract"]["requirements"] = []
     expect_failure("package requirements", repo, catalog, bad, schemas, consumers)
+    bad = copy.deepcopy(corpus); bad["api_manifest"]["integrity"] = "md5"
+    expect_failure("API manifest contract", repo, catalog, bad, schemas, consumers)
+    bad = copy.deepcopy(corpus); bad["package_contract"]["exports"] = {"./corpus/*": "./dist/*"}
+    expect_failure("package exports", repo, catalog, bad, schemas, consumers)
+    bad = copy.deepcopy(catalog); bad["consumer_sets"]["cli"]["state"] = "absent"
+    expect_failure("consumer state contradiction", repo, bad, corpus, schemas, consumers)
     top_level = "docs/KV-CACHE-ARCHITECTURE.md"
     changed_top_level = text(repo, top_level, None) + "\nprovenance mutation\n"
-    expect_failure("top-level corpus provenance", repo, catalog, corpus, schemas, consumers, {top_level: changed_top_level})
+    expect_failure("top-level corpus provenance", repo, catalog, corpus, schemas, consumers, {top_level: changed_top_level}, False)
     # Model a hosted push boundary with objects reachable from this checkout.
     push_commit = git(repo, "rev-parse", "HEAD~1")
     push_catalog, push_corpus = copy.deepcopy(catalog), copy.deepcopy(corpus)
