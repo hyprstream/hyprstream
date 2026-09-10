@@ -398,7 +398,34 @@ mod tests {
 
     use super::*;
     use axum::{body::to_bytes, http::Request};
+    use ed25519_dalek::SigningKey;
+    use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
+    use hyprstream_pds::did_op::{
+        sign_genesis, GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
+        RecoveryKeyEnrollment, UserRotationKey,
+    };
+    use hyprstream_pds::{AllocatedAccountName, HostedAccountMint};
+    use hyprstream_rpc::auth::mac::{MacDecision, SecurityContext};
+    use hyprstream_rpc::Subject;
+    use hyprstream_vfs::{SyntheticMount, SyntheticNode};
+    use rand::rngs::OsRng;
     use tower::ServiceExt;
+
+    use crate::{PDS_ACCOUNTS_DIRECTORY, PDS_ACCOUNT_RECORD_FILE};
+
+    struct PermitReads;
+
+    impl crate::AccountRecordReadAuthorizer for PermitReads {
+        fn check_read(
+            &self,
+            _subject: &Subject,
+            _verified_tenant: Option<&str>,
+            _security_context: Option<&SecurityContext>,
+            _object_id: &str,
+        ) -> MacDecision {
+            MacDecision::Permit
+        }
+    }
 
     fn directory() -> Arc<StaticHostedAccountHttpDirectory> {
         Arc::new(
@@ -412,6 +439,66 @@ mod tests {
             .unwrap()])
             .unwrap(),
         )
+    }
+
+    fn mounted_directory() -> (Arc<MountedHostedAccountHttpDirectory>, Vec<u8>, Vec<u8>) {
+        let ed = SigningKey::generate(&mut OsRng);
+        let (pq, pq_vk) = ml_dsa_generate_keypair();
+        let hybrid =
+            HybridRotationKey::new(ed.verifying_key().to_bytes(), ml_dsa_vk_bytes(&pq_vk)).unwrap();
+        let rotations = GenesisRotationKeys::new(
+            UserRotationKey::new(hybrid),
+            RecoveryKeyEnrollment::Declined,
+            HostKeyEnrollment::Absent,
+        )
+        .unwrap();
+        let name =
+            AllocatedAccountName::new("alice", "did:web:alice.tormentnexus.social".to_owned())
+                .unwrap();
+        let mint = HostedAccountMint::begin(name, rotations).unwrap();
+        let document = mint.seal_did_document("https://pds.example.com").unwrap();
+        let pending = mint
+            .prepare_genesis(document, GenesisRepoHead::EmptyRepo)
+            .unwrap();
+        let signature = sign_genesis(pending.unsigned_genesis(), &ed, &pq).unwrap();
+        let account = pending.seal(signature).unwrap();
+        let document_bytes = account.did_document().as_bytes().to_vec();
+        let log_bytes = account.genesis_bytes().to_vec();
+        let root = SyntheticNode::dir().with_child(
+            "tenant",
+            SyntheticNode::dir().with_child(
+                PDS_ACCOUNTS_DIRECTORY,
+                SyntheticNode::dir().with_child(
+                    "alice",
+                    SyntheticNode::dir()
+                        .with_child(
+                            PDS_ACCOUNT_RECORD_FILE,
+                            SyntheticNode::file(account.record_bytes().to_vec()),
+                        )
+                        .with_child(
+                            PDS_ACCOUNT_DID_DOCUMENT_FILE,
+                            SyntheticNode::file(document_bytes.clone()),
+                        )
+                        .with_child(
+                            PDS_ACCOUNT_DID_LOG_FILE,
+                            SyntheticNode::file(log_bytes.clone()),
+                        ),
+                ),
+            ),
+        );
+        let store = Arc::new(crate::AccountRecordStore::new(
+            Arc::new(SyntheticMount::new(root)),
+            Arc::new(PermitReads),
+        ));
+        let directory = Arc::new(
+            MountedHostedAccountHttpDirectory::new(
+                store,
+                Subject::new(crate::OAUTH_ACCOUNT_RESOLVER_SUBJECT),
+                DEFAULT_ACCOUNT_ZONE,
+            )
+            .unwrap(),
+        );
+        (directory, document_bytes, log_bytes)
     }
 
     #[tokio::test]
@@ -525,6 +612,49 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
+    }
+
+    #[tokio::test]
+    async fn mounted_directory_reads_only_authorized_sealed_files() {
+        let (directory, document, log) = mounted_directory();
+        let app = router(DEFAULT_ACCOUNT_ZONE, directory).unwrap();
+        let did_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/did.json")
+                    .header(header::HOST, "alice.tormentnexus.social")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(did_response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(did_response.into_body(), 16 * 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            document
+        );
+        let log_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/did-log.json")
+                    .header(header::HOST, "alice.tormentnexus.social")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(log_response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(log_response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            log
+        );
     }
 
     #[test]
