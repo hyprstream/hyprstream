@@ -2092,7 +2092,8 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     )
     .with_quic_config(config.quic.clone())
     .with_identity_registration_api(identity_registration_api)
-    .with_pds_root(pds_root);
+    .with_pds_root(pds_root)
+    .with_dedicated_process(ctx.is_dedicated_process_for("oauth"));
 
     Ok(Box::new(oauth_service))
 }

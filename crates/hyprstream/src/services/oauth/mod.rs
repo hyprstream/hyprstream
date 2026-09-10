@@ -26,6 +26,8 @@
 //!   /oauth/device/verify                     → user verification page
 //! ```
 
+mod account_worker;
+
 pub mod auth;
 pub mod authorize;
 pub mod browser_session;
@@ -431,47 +433,20 @@ async fn warm_hosted_did_index(
     authority: hyprstream_rpc::Subject,
     timeout: std::time::Duration,
 ) -> Result<(), hyprstream_rpc::error::RpcError> {
-    // The descriptor-backed PDS mount performs synchronous file and audit I/O
-    // inside its async trait methods. Run the warm-up on an owned OS thread so
-    // the timeout can return without leaving a Tokio blocking-pool task that
-    // runtime shutdown must await.
-    let (warmup_tx, warmup_rx) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name("hyprstream-oauth-index-warmup".to_owned())
-        .spawn(move || {
-            let result = (|| {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| format!("warm-up runtime: {error}"))?;
-                runtime
-                    .block_on(store.refresh_hosted_did_index(&authority))
-                    .map_err(|error| format!("index refresh: {error}"))
-            })();
-            let _ = warmup_tx.send(result);
-        })
-        .map_err(|error| {
-            hyprstream_rpc::error::RpcError::SpawnFailed(format!(
-                "hosted account index warm-up thread failed: {error}"
-            ))
-        })?;
-    tokio::time::timeout(timeout, warmup_rx)
-        .await
-        .map_err(|_| {
-            hyprstream_rpc::error::RpcError::SpawnFailed(
-                "hosted account index warm-up timed out".to_owned(),
-            )
-        })?
-        .map_err(|error| {
-            hyprstream_rpc::error::RpcError::SpawnFailed(format!(
-                "hosted account index warm-up thread exited: {error}"
-            ))
-        })?
-        .map_err(|error| {
-            hyprstream_rpc::error::RpcError::SpawnFailed(format!(
-                "hosted account index warm-up failed: {error}"
-            ))
-        })
+    let mut worker = account_worker::ContainedWorker::spawn("hyprstream-oauth-index-warmup", move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("warm-up runtime: {error}"))?;
+        runtime
+            .block_on(store.refresh_hosted_did_index(&authority))
+            .map_err(|error| format!("index refresh: {error}"))
+    })?;
+    worker.finish(timeout).await?.map_err(|error| {
+        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+            "hosted account index warm-up failed: {error}"
+        ))
+    })
 }
 
 /// Profile-aware bind of OAuth's inbound reach-only substrate, using the
@@ -597,6 +572,7 @@ pub struct OAuthService {
     /// production factory so OAuth and the public account listener share one
     /// descriptor-bound store.
     pds_root: Option<PathBuf>,
+    dedicated_process: bool,
 }
 
 impl OAuthService {
@@ -625,6 +601,7 @@ impl OAuthService {
             hosted_account_store: None,
             identity_registration_api: None,
             pds_root: None,
+            dedicated_process: false,
         }
     }
 
@@ -649,6 +626,12 @@ impl OAuthService {
         api: Arc<identity_registration::IdentityRegistrationApi>,
     ) -> Self {
         self.identity_registration_api = Some(api);
+        self
+    }
+
+    /// Set only from the launcher's explicit single-service process context.
+    pub(crate) fn with_dedicated_process(mut self, dedicated: bool) -> Self {
+        self.dedicated_process = dedicated;
         self
     }
 
@@ -763,6 +746,15 @@ impl Spawnable for OAuthService {
         shutdown: Arc<Notify>,
         on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<(), hyprstream_rpc::error::RpcError> {
+        let contains_account_workers = self.account_config.http.is_some();
+        if contains_account_workers && !self.dedicated_process {
+            return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                "hosted account workers require a dedicated native OAuth process".to_owned(),
+            ));
+        }
+        // Timed-out synchronous I/O cannot be cancelled safely. This service
+        // owns the whole process when account workers are enabled; terminal
+        // startup/shutdown therefore ends that process and all its workers.
         // Use single-threaded runtime + LocalSet because HTTP handlers make ZMQ RPC
         // calls (e.g., policy_client.issue_token()), and ZMQ clients use spawn_local.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -771,7 +763,7 @@ impl Spawnable for OAuthService {
             .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
 
         let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async move {
+        let result = local.block_on(&rt, async move {
             let addr_str = format!("{}:{}", self.config.host, self.config.port);
             let addr: std::net::SocketAddr = addr_str.parse().map_err(|e| {
                 hyprstream_rpc::error::RpcError::SpawnFailed(format!("Invalid address: {e}"))
@@ -1109,12 +1101,18 @@ impl Spawnable for OAuthService {
                 let authority = hyprstream_rpc::Subject::new(
                     hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
                 );
-                warm_hosted_did_index(
-                    Arc::clone(store),
-                    authority,
-                    std::time::Duration::from_secs(30),
-                )
-                .await?;
+                if contains_account_workers {
+                    warm_hosted_did_index(
+                        Arc::clone(store),
+                        authority,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await?;
+                } else if !store.hosted_did_index_ready().await {
+                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "in-process hosted-account store must be warmed before injection".to_owned(),
+                    ));
+                }
             }
             // Populate legacy JWKS nbf/exp from signing-key file mtime (used when store absent).
             let key_nbf = crate::auth::identity_store::node_signing_key_mtime(&credentials_dir);
@@ -1372,11 +1370,9 @@ impl Spawnable for OAuthService {
             let mut rpc_owner: Option<(tokio::task::JoinHandle<anyhow::Result<()>>, bool)> =
                 None;
             let account_shutdown = Arc::new(Notify::new());
-            let mut account_owner: Option<(
-                tokio::task::JoinHandle<Result<(), hyprstream_rpc::error::RpcError>>,
-                bool,
-                bool,
-            )> = None;
+            let mut account_owner: Option<account_worker::ContainedWorker<
+                Result<(), hyprstream_rpc::error::RpcError>,
+            >> = None;
             let bridge_init: Result<Arc<LocalServiceBridge>, hyprstream_rpc::error::RpcError> =
                 async {
                     let (bridge, bridge_ready_rx) =
@@ -1440,7 +1436,7 @@ impl Spawnable for OAuthService {
             // the prebound listener concurrently with the RPC loop. Whichever
             // side finishes first decides the primary outcome; the actual
             // serve result propagates (no log-and-swallow).
-            let primary: anyhow::Result<()> = match bridge_init {
+            let mut primary: anyhow::Result<()> = match bridge_init {
                 Err(e) => Err(anyhow::anyhow!("OAuthService startup failed: {e}")),
                 Ok(bridge) => async {
                     if iroh_enabled {
@@ -1484,6 +1480,28 @@ impl Spawnable for OAuthService {
                             }
                         }
                     }
+                    // Finish all fallible account-worker creation before the RPC
+                    // task can signal readiness. Keep the actual thread owner.
+                    if let Some((account_bound, account_app)) = account_endpoint {
+                        let account_shutdown_task = Arc::clone(&account_shutdown);
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|error| hyprstream_rpc::error::RpcError::SpawnFailed(
+                                format!("account HTTP runtime: {error}"),
+                            ))?;
+                        account_owner = Some(account_worker::ContainedWorker::spawn(
+                            "hyprstream-account-http",
+                            move || {
+                                runtime.block_on(crate::server::tls::serve_bound(
+                                    account_bound,
+                                    account_app,
+                                    account_shutdown_task,
+                                    "AccountHttpService",
+                                ))
+                            },
+                        )?);
+                    }
                     let control_transport = self.control_transport.clone();
                     let rpc_signing_key = self.signing_key.clone();
                     let processor: Arc<
@@ -1499,50 +1517,6 @@ impl Spawnable for OAuthService {
                         )
                         .await
                     });
-                    let account_enabled = account_endpoint.is_some();
-                    let mut account_loop = match account_endpoint {
-                        Some((account_bound, account_app)) => {
-                            let account_shutdown_task = Arc::clone(&account_shutdown);
-                            let (account_tx, account_rx) = tokio::sync::oneshot::channel();
-                            std::thread::Builder::new()
-                                .name("hyprstream-account-http".to_owned())
-                                .spawn(move || {
-                                    let result = (|| {
-                                        let runtime = tokio::runtime::Builder::new_current_thread()
-                                            .enable_all()
-                                            .build()
-                                            .map_err(|error| {
-                                                hyprstream_rpc::error::RpcError::SpawnFailed(
-                                                    format!("account HTTP runtime: {error}"),
-                                                )
-                                            })?;
-                                        runtime.block_on(crate::server::tls::serve_bound(
-                                            account_bound,
-                                            account_app,
-                                            account_shutdown_task,
-                                            "AccountHttpService",
-                                        ))
-                                    })();
-                                    let _ = account_tx.send(result);
-                                })
-                                .map_err(|error| {
-                                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
-                                        "account HTTP thread spawn failed: {error}"
-                                    ))
-                                })?;
-                            tokio::task::spawn_local(async move {
-                                account_rx.await.map_err(|_| {
-                                    hyprstream_rpc::error::RpcError::SpawnFailed(
-                                        "account HTTP thread exited without a result".to_owned(),
-                                    )
-                                })?
-                            })
-                        }
-                        None => tokio::task::spawn_local(async {
-                            std::future::pending::<Result<(), hyprstream_rpc::error::RpcError>>().await
-                        }),
-                    };
-                    let mut account_consumed = false;
                     let mut rpc_consumed = false;
                     let outcome = tokio::select! {
                         http = crate::server::tls::serve_bound(
@@ -1551,8 +1525,12 @@ impl Spawnable for OAuthService {
                             shutdown.clone(),
                             "OAuthService",
                         ) => http.map_err(|e| anyhow::anyhow!("OAuthService HTTP serve error: {e}")),
-                        account = &mut account_loop => {
-                            account_consumed = true;
+                        account = async {
+                            match account_owner.as_mut() {
+                                Some(worker) => worker.result().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
                             match account {
                                 Ok(Ok(())) => Err(anyhow::anyhow!(
                                     "AccountHttpService stopped unexpectedly"
@@ -1592,7 +1570,6 @@ impl Spawnable for OAuthService {
                         }
                     };
                     rpc_owner = Some((rpc_loop, rpc_consumed));
-                    account_owner = Some((account_loop, account_consumed, account_enabled));
                     outcome
                 }.await
             };
@@ -1606,34 +1583,18 @@ impl Spawnable for OAuthService {
             // permit when teardown races worker startup; `notify_waiters` can
             // lose the signal before the isolated runtime begins awaiting.
             account_shutdown.notify_one();
-            if let Some((mut account_loop, account_consumed, account_enabled)) = account_owner.take() {
-                if !account_enabled {
-                    account_loop.abort();
-                    let _ = account_loop.await;
-                } else if !account_consumed {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(45),
-                        &mut account_loop,
-                    )
-                    .await
-                    {
-                        Ok(Ok(Ok(()))) => {}
-                        Ok(Ok(Err(error))) => {
-                            tracing::warn!("account HTTP task error during shutdown: {error}");
-                        }
-                        Ok(Err(join)) => {
-                            tracing::warn!("account HTTP task join error during shutdown: {join}");
-                        }
-                        Err(_) => {
-                            account_loop.abort();
-                            tracing::warn!(
-                                "account HTTP task did not stop within the shutdown budget; aborted"
-                            );
+            serve_shutdown.notify_one();
+            if let Some(mut worker) = account_owner.take() {
+                if !worker.is_joined() {
+                    let completion = worker.finish(std::time::Duration::from_secs(45)).await;
+                    if let Err(error) = completion.and_then(|result| result) {
+                        tracing::warn!(%error, "account HTTP worker failed during shutdown");
+                        if primary.is_ok() {
+                            primary = Err(anyhow::anyhow!(error));
                         }
                     }
                 }
             }
-            serve_shutdown.notify_one();
             if let Some(bridge) = &bridge_owner {
                 bridge.begin_shutdown(
                     tokio::time::Instant::now() + std::time::Duration::from_secs(5),
@@ -1679,7 +1640,14 @@ impl Spawnable for OAuthService {
                 hyprstream_rpc::error::RpcError::SpawnFailed(format!("{e:#}"))
             })?;
             Ok(())
-        })
+        });
+        if contains_account_workers {
+            if let Err(error) = &result {
+                tracing::error!(%error, "dedicated OAuth process failed");
+            }
+            std::process::exit(if result.is_ok() { 0 } else { account_worker::WORKER_FAILURE_EXIT });
+        }
+        result
     }
 }
 
@@ -1773,6 +1741,31 @@ mod tests {
     }
 
     #[test]
+    fn account_worker_requires_launcher_process_containment() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let account = crate::account::AccountZoneConfig {
+            http: Some(crate::account::AccountHttpConfig {
+                host: "127.0.0.1".to_owned(),
+                port: 443,
+                tls_cert: PathBuf::from("unused.pem"),
+                tls_key: PathBuf::from("unused.key"),
+            }),
+            ..Default::default()
+        };
+        let transport = TransportConfig::inproc("test-containment-unused");
+        let service = OAuthService::new(
+            Default::default(), Default::default(), account, sk.clone(),
+            transport.clone(), transport.clone(), transport,
+            sk.verifying_key(), sk.verifying_key(),
+        );
+        let result = Box::new(service).run(Arc::new(Notify::new()), None);
+        assert!(matches!(result,
+            Err(hyprstream_rpc::error::RpcError::SpawnFailed(message))
+                if message.contains("dedicated native OAuth process")
+        ));
+    }
+
+    #[test]
     fn oauth_warms_hosted_did_index_before_readiness() {
         let source = include_str!("mod.rs");
         let production = source
@@ -1812,6 +1805,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn hosted_did_warmup_timeout_does_not_wait_for_blocking_scan() {
+        const TEST: &str = "services::oauth::tests::hosted_did_warmup_timeout_does_not_wait_for_blocking_scan";
+        if !account_worker::tests::is_child(TEST) {
+            account_worker::tests::expect_contained_exit(TEST, &[]);
+            return;
+        }
         struct SlowReads;
         impl hyprstream_pds_service::AccountRecordReadAuthorizer for SlowReads {
             fn check_read(
@@ -1832,8 +1830,7 @@ mod tests {
             )),
             Arc::new(SlowReads),
         ));
-        let started = std::time::Instant::now();
-        let result = warm_hosted_did_index(
+        let _ = warm_hosted_did_index(
             store,
             hyprstream_rpc::Subject::new(
                 hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
@@ -1841,15 +1838,7 @@ mod tests {
             std::time::Duration::from_millis(20),
         )
         .await;
-        assert!(matches!(
-            result,
-            Err(hyprstream_rpc::error::RpcError::SpawnFailed(message))
-                if message.contains("timed out")
-        ));
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(150),
-            "timeout must return without joining the blocking scan"
-        );
+        panic!("timed-out warm-up must terminate its dedicated process");
     }
 
     fn encode_form(fields: &[(&str, &str)]) -> String {

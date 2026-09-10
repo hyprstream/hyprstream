@@ -3166,6 +3166,12 @@ fn main() -> Result<()> {
                                     )?,
                                 );
 
+                                // native_service_process_name already enforces one service
+                                // per foreground process; IPC flags are not containment proof.
+                                if let Some(service) = &native_service_name {
+                                    ctx = ctx.with_dedicated_process_service(service.clone());
+                                }
+
                                 // Wire QUIC shared config from --quic-bind or [quic] config
                                 let mut quic_cfg = if let Some(ref bind_addr) = quic_bind {
                                     let mut qc = hyprstream_core::config::QuicConfig::default();

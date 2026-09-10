@@ -301,6 +301,14 @@ impl AccountRecordStore {
         }
     }
 
+    /// Check an already-published snapshot without starting filesystem work.
+    /// In-process consumers must warm their injected store before startup.
+    pub async fn hosted_did_index_ready(&self) -> bool {
+        self.hosted_did_index.read().await.as_ref().is_some_and(|snapshot| {
+            snapshot.built_at.elapsed() < HOSTED_DID_INDEX_TTL + HOSTED_DID_MAX_STALE
+        })
+    }
+
     pub async fn refresh_hosted_did_index(
         &self,
         authority: &Subject,
