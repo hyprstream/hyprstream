@@ -39,14 +39,13 @@ use hyprstream_rpc::error::{Result, RpcError};
 fn detached_output_stdio() -> std::io::Result<Stdio> {
     #[cfg(unix)]
     {
-        use nix::fcntl::OFlag;
         use std::os::fd::RawFd;
 
         // CLOEXEC keeps the drain reader out of the adopted daemon. Fork a
         // tiny in-process reader instead of invoking an external `cat`: the
         // official runtime image contains only `/hyprstream`, and the drain
         // must continue after this launcher exits.
-        let (reader, writer) = nix::unistd::pipe2(OFlag::O_CLOEXEC)?;
+        let (reader, writer) = cloexec_pipe()?;
         let drain_pid = unsafe { nix::libc::fork() };
         match drain_pid {
             -1 => {
@@ -107,6 +106,60 @@ fn detached_output_stdio() -> std::io::Result<Stdio> {
     #[cfg(not(unix))]
     {
         Ok(Stdio::null())
+    }
+}
+
+/// Create a pipe whose descriptors are excluded from an adopted daemon after
+/// exec. `nix::unistd::pipe2` is unavailable on Apple targets in nix 0.27.1,
+/// so use the POSIX pipe plus `FD_CLOEXEC` fallback there while retaining the
+/// atomic `pipe2(O_CLOEXEC)` path on platforms that provide it.
+#[cfg(unix)]
+fn cloexec_pipe() -> std::io::Result<(std::os::fd::RawFd, std::os::fd::RawFd)> {
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_os = "linux",
+        target_os = "redox",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris"
+    ))]
+    {
+        Ok(nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?)
+    }
+
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_os = "linux",
+        target_os = "redox",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris"
+    )))]
+    {
+        let (reader, writer) = nix::unistd::pipe()?;
+        for fd in [reader, writer] {
+            let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
+            if flags == -1
+                || unsafe {
+                    nix::libc::fcntl(fd, nix::libc::F_SETFD, flags | nix::libc::FD_CLOEXEC)
+                } == -1
+            {
+                unsafe {
+                    nix::libc::close(reader);
+                    nix::libc::close(writer);
+                }
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok((reader, writer))
     }
 }
 
@@ -1584,6 +1637,24 @@ mod tests {
     fn test_backend_type() {
         let backend = StandaloneBackend::new();
         assert_eq!(backend.backend_type(), "standalone");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_output_pipe_is_close_on_exec() -> anyhow::Result<()> {
+        let (reader, writer) = cloexec_pipe()?;
+        let flags = [reader, writer]
+            .into_iter()
+            .map(|fd| unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) })
+            .collect::<Vec<_>>();
+        unsafe {
+            nix::libc::close(reader);
+            nix::libc::close(writer);
+        }
+        assert!(flags.iter().all(|flags| {
+            *flags >= 0 && *flags & nix::libc::FD_CLOEXEC != 0
+        }));
+        Ok(())
     }
 }
 
