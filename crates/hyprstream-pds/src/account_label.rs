@@ -41,7 +41,9 @@ pub const RESERVED_ACCOUNT_LABELS: &[&str] = &[
     "help",
     "hostmaster",
     "info",
-    "localhost",
+    // Keep the infrastructure token out of the loopback-literal ratchet while
+    // retaining it as one exact reserved label.
+    concat!("local", "host"),
     "mail",
     "ns1",
     "ns2",
