@@ -195,7 +195,26 @@ impl Commit {
     }
 
     pub fn from_atproto_dag_cbor(bytes: &[u8]) -> Result<Self> {
-        Self::from_value(&crate::atproto_cbor::decode(bytes)?)
+        let value = crate::atproto_cbor::decode(bytes)?;
+        Self::validate_atproto_fields(&value)?;
+        Self::from_value(&value)
+    }
+
+    fn validate_atproto_fields(value: &DagCbor) -> Result<()> {
+        const FIELDS: &[&str] = &["did", "version", "data", "rev", "prev", "sig"];
+        let fields = value.as_map()?;
+        ensure!(
+            fields.len() == FIELDS.len(),
+            "public commit must contain exactly these fields: {FIELDS:?}"
+        );
+        for (key, _) in fields {
+            let key = key.as_str()?;
+            ensure!(
+                FIELDS.contains(&key),
+                "public commit has unknown field {key:?}"
+            );
+        }
+        Ok(())
     }
 
     pub fn from_value(value: &DagCbor) -> Result<Self> {
@@ -621,6 +640,18 @@ mod tests {
         let bytes = commit.to_dag_cbor();
         let back = Commit::from_dag_cbor(&bytes).expect("round-trip");
         assert_eq!(commit, back);
+    }
+
+    #[test]
+    fn public_commit_rejects_unknown_fields() {
+        let (commit, _vk) = make_signed_commit();
+        let mut fields = commit.to_value().as_map().unwrap().to_vec();
+        fields.push((DagCbor::Text("extra".into()), DagCbor::Null));
+        let bytes = crate::atproto_cbor::encode(&DagCbor::Map(fields)).unwrap();
+        assert!(
+            Commit::from_atproto_dag_cbor(&bytes).is_err(),
+            "public commits must reject unknown fields"
+        );
     }
 
     #[test]
