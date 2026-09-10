@@ -1503,32 +1503,22 @@ impl Spawnable for OAuthService {
                     let mut account_loop = match account_endpoint {
                         Some((account_bound, account_app)) => {
                             let account_shutdown_task = Arc::clone(&account_shutdown);
-                            tokio::task::spawn_local(
-                            async move {
-                                tokio::task::spawn_blocking(move || {
-                                    let runtime = tokio::runtime::Builder::new_current_thread()
-                                        .enable_all()
-                                        .build()
-                                        .map_err(|error| {
-                                            hyprstream_rpc::error::RpcError::SpawnFailed(
-                                                format!("account HTTP runtime: {error}"),
-                                            )
-                                        })?;
-                                    runtime.block_on(crate::server::tls::serve_bound(
-                                        account_bound,
-                                        account_app,
-                                        account_shutdown_task,
-                                        "AccountHttpService",
-                                    ))
-                                })
-                                .await
-                                .map_err(|join| {
-                                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
-                                        "account HTTP worker join error: {join}"
-                                    ))
-                                })?
-                            },
-                            )
+                            tokio::task::spawn_blocking(move || {
+                                let runtime = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                    .map_err(|error| {
+                                        hyprstream_rpc::error::RpcError::SpawnFailed(
+                                            format!("account HTTP runtime: {error}"),
+                                        )
+                                    })?;
+                                runtime.block_on(crate::server::tls::serve_bound(
+                                    account_bound,
+                                    account_app,
+                                    account_shutdown_task,
+                                    "AccountHttpService",
+                                ))
+                            })
                         }
                         None => tokio::task::spawn_local(async {
                             std::future::pending::<Result<(), hyprstream_rpc::error::RpcError>>().await
@@ -1594,7 +1584,10 @@ impl Spawnable for OAuthService {
             // readiness failure, HTTP or RPC error, or clean shutdown. The
             // primary error is preserved; cleanup failures are logged as
             // context, never masked. ──
-            account_shutdown.notify_waiters();
+            // There is exactly one account listener. `notify_one` preserves a
+            // permit when teardown races worker startup; `notify_waiters` can
+            // lose the signal before the isolated runtime begins awaiting.
+            account_shutdown.notify_one();
             if let Some((mut account_loop, account_consumed, account_enabled)) = account_owner.take() {
                 if !account_enabled {
                     account_loop.abort();
