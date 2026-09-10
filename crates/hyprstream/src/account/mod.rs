@@ -32,7 +32,7 @@ pub mod renewal;
 pub mod tls;
 pub mod zone;
 
-pub use config::AccountZoneConfig;
+pub use config::{AccountHttpConfig, AccountZoneConfig};
 pub use dns::{DnsError, DnsProvider, UnconfiguredDnsProvider};
 pub use renewal::{CertHealth, CertHealthMonitor, CertRenewer, AlarmThresholds};
 pub use tls::{CertHandle, IssuedCert, IssuanceError, NullWildcardCertIssuer, WildcardCertIssuer};

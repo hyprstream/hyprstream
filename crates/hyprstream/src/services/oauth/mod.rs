@@ -68,7 +68,7 @@ pub mod userinfo;
 pub mod wit_bootstrap;
 pub mod xrpc;
 
-use std::sync::Arc;
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use axum::{
@@ -593,6 +593,10 @@ pub struct OAuthService {
     hosted_account_store: Option<Arc<hyprstream_pds_service::AccountRecordStore>>,
     /// Authenticated hosted-account registration and federation-intake face.
     identity_registration_api: Option<Arc<identity_registration::IdentityRegistrationApi>>,
+    /// Authoritative publication root for the hosted-account tree. Set by the
+    /// production factory so OAuth and the public account listener share one
+    /// descriptor-bound store.
+    pds_root: Option<PathBuf>,
 }
 
 impl OAuthService {
@@ -620,6 +624,7 @@ impl OAuthService {
             jwt_verifying_key: jwt_verifying_key.to_bytes(),
             hosted_account_store: None,
             identity_registration_api: None,
+            pds_root: None,
         }
     }
 
@@ -646,6 +651,42 @@ impl OAuthService {
         self.identity_registration_api = Some(api);
         self
     }
+
+    /// Attach the authoritative published-account root used by production
+    /// OAuth/account HTTP composition.
+    pub fn with_pds_root(mut self, root: PathBuf) -> Self {
+        self.pds_root = Some(root);
+        self
+    }
+}
+
+/// Resolve explicitly provisioned TLS material for the public account
+/// listener. Account hosts must never fall back to the node/self-signed
+/// certificate, so enabling the listener requires both PEM paths and a valid
+/// rustls keypair.
+async fn resolve_account_http_tls(
+    config: &crate::account::AccountHttpConfig,
+    zone: &crate::account::AccountZone,
+) -> anyhow::Result<axum_server::tls_rustls::RustlsConfig> {
+    anyhow::ensure!(config.port != 0, "account HTTP listener port must be non-zero");
+    anyhow::ensure!(
+        config.tls_cert.is_file(),
+        "account TLS certificate is unavailable: {}",
+        config.tls_cert.display()
+    );
+    anyhow::ensure!(
+        config.tls_key.is_file(),
+        "account TLS private key is unavailable: {}",
+        config.tls_key.display()
+    );
+    axum_server::tls_rustls::RustlsConfig::from_pem_file(&config.tls_cert, &config.tls_key)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to load account-zone TLS for {}: {error}",
+                zone.wildcard_domain()
+            )
+        })
 }
 
 #[cfg(test)]
@@ -878,6 +919,37 @@ impl Spawnable for OAuthService {
                 }
             };
 
+            // The public account face and OAuth's hosted-DID resolver must
+            // share one descriptor-bound store over the authoritative
+            // publication root. Enabling the listener therefore fails closed
+            // when the root or mandatory audit sink is unavailable.
+            let hosted_account_store = if let Some(store) = &self.hosted_account_store {
+                Some(Arc::clone(store))
+            } else if self.account_config.http.is_some() {
+                let root = self.pds_root.clone().ok_or_else(|| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "account HTTP listener enabled without a PDS publication root".to_owned(),
+                    )
+                })?;
+                let sink = audit_sink.clone().ok_or_else(|| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "account HTTP listener requires a usable MAC audit sink".to_owned(),
+                    )
+                })?;
+                let mount = crate::mac::PdsDirectoryMount::open(&root).map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "open published PDS account root {}: {error}",
+                        root.display()
+                    ))
+                })?;
+                Some(crate::mac::production_pds_account_record_store(
+                    Arc::new(mount),
+                    sink,
+                ))
+            } else {
+                None
+            };
+
             let (ca_jwt_key, signing_key_store) = match crate::auth::identity_store::load_ca_signing_key(&credentials_dir) {
                 Ok(root_key) => {
                     let key = hyprstream_rpc::node_identity::derive_purpose_key(&root_key, "hyprstream-jwt-v1");
@@ -971,7 +1043,7 @@ impl Spawnable for OAuthService {
                 discovery_client.clone(),
                 jwt_verifying_key,
             );
-            if let Some(store) = &self.hosted_account_store {
+            if let Some(store) = &hosted_account_store {
                 oauth_state = oauth_state.with_hosted_account_store(Arc::clone(store));
             }
             if let Some(api) = &self.identity_registration_api {
@@ -1011,7 +1083,7 @@ impl Spawnable for OAuthService {
             // tenant enumeration; a bounded startup failure keeps OAuth
             // fail-closed instead of serving valid hosted users intermittently
             // while the first snapshot is still absent.
-            if let Some(store) = &self.hosted_account_store {
+            if let Some(store) = &hosted_account_store {
                 let authority = hyprstream_rpc::Subject::new(
                     hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
                 );
@@ -1154,6 +1226,65 @@ impl Spawnable for OAuthService {
             // here, while the supervised launcher still owns the launch.
             let bound = crate::server::tls::bind_listener(addr, rustls_config, "OAuthService")?;
 
+            // Optional public hosted-account face. It has its own listener,
+            // certificate, and shutdown signal; it is never mounted into the
+            // authenticated OAuth router.
+            let account_endpoint = if let Some(http_config) = self.account_config.http.as_ref() {
+                let zone = self.account_config.resolve_zone().map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "account HTTP listener requires a valid account zone: {error}"
+                    ))
+                })?;
+                let store = hosted_account_store.clone().ok_or_else(|| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "account HTTP listener has no hosted-account store".to_owned(),
+                    )
+                })?;
+                let directory = Arc::new(
+                    hyprstream_pds_service::account_http::MountedHostedAccountHttpDirectory::new(
+                        store,
+                        hyprstream_rpc::Subject::new(
+                            hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                        ),
+                        zone.apex(),
+                    )
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "compose account HTTP directory: {error}"
+                        ))
+                    })?,
+                );
+                let account_app =
+                    hyprstream_pds_service::account_http::router(zone.apex(), directory)
+                        .map_err(|error| {
+                            hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                                "compose account HTTP router: {error}"
+                            ))
+                        })?;
+                let account_addr: SocketAddr = format!("{}:{}", http_config.host, http_config.port)
+                    .parse()
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "invalid account HTTP address: {error}"
+                        ))
+                    })?;
+                let account_tls = resolve_account_http_tls(http_config, &zone)
+                    .await
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "account HTTP TLS: {error:#}"
+                        ))
+                    })?;
+                let account_bound = crate::server::tls::bind_listener(
+                    account_addr,
+                    Some(account_tls),
+                    "AccountHttpService",
+                )?;
+                Some((account_bound, account_app))
+            } else {
+                None
+            };
+
             let iroh_required = self
                 .quic_config
                 .as_ref()
@@ -1218,6 +1349,11 @@ impl Spawnable for OAuthService {
             // (join handle, whether the select branch already consumed it).
             let mut rpc_owner: Option<(tokio::task::JoinHandle<anyhow::Result<()>>, bool)> =
                 None;
+            let account_shutdown = Arc::new(Notify::new());
+            let mut account_owner: Option<(
+                tokio::task::JoinHandle<Result<(), hyprstream_rpc::error::RpcError>>,
+                bool,
+            )> = None;
             let bridge_init: Result<Arc<LocalServiceBridge>, hyprstream_rpc::error::RpcError> =
                 async {
                     let (bridge, bridge_ready_rx) =
@@ -1340,6 +1476,20 @@ impl Spawnable for OAuthService {
                         )
                         .await
                     });
+                    let mut account_loop = match account_endpoint {
+                        Some((account_bound, account_app)) => tokio::task::spawn_local(
+                            crate::server::tls::serve_bound(
+                                account_bound,
+                                account_app,
+                                Arc::clone(&account_shutdown),
+                                "AccountHttpService",
+                            ),
+                        ),
+                        None => tokio::task::spawn_local(async {
+                            std::future::pending::<Result<(), hyprstream_rpc::error::RpcError>>().await
+                        }),
+                    };
+                    let mut account_consumed = false;
                     let mut rpc_consumed = false;
                     let outcome = tokio::select! {
                         http = crate::server::tls::serve_bound(
@@ -1348,6 +1498,20 @@ impl Spawnable for OAuthService {
                             shutdown.clone(),
                             "OAuthService",
                         ) => http.map_err(|e| anyhow::anyhow!("OAuthService HTTP serve error: {e}")),
+                        account = &mut account_loop => {
+                            account_consumed = true;
+                            match account {
+                                Ok(Ok(())) => Err(anyhow::anyhow!(
+                                    "AccountHttpService stopped unexpectedly"
+                                )),
+                                Ok(Err(e)) => Err(anyhow::anyhow!(
+                                    "AccountHttpService error: {e}"
+                                )),
+                                Err(join) => Err(anyhow::anyhow!(
+                                    "AccountHttpService task join error: {join}"
+                                )),
+                            }
+                        },
                         rpc = &mut rpc_loop => {
                             // This select branch consumed the completed
                             // JoinHandle — the teardown below must not poll it
@@ -1375,6 +1539,7 @@ impl Spawnable for OAuthService {
                         }
                     };
                     rpc_owner = Some((rpc_loop, rpc_consumed));
+                    account_owner = Some((account_loop, account_consumed));
                     outcome
                 }.await
             };
@@ -1384,6 +1549,31 @@ impl Spawnable for OAuthService {
             // readiness failure, HTTP or RPC error, or clean shutdown. The
             // primary error is preserved; cleanup failures are logged as
             // context, never masked. ──
+            account_shutdown.notify_waiters();
+            if let Some((mut account_loop, account_consumed)) = account_owner.take() {
+                if !account_consumed {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(45),
+                        &mut account_loop,
+                    )
+                    .await
+                    {
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(Ok(Err(error))) => {
+                            tracing::warn!("account HTTP task error during shutdown: {error}");
+                        }
+                        Ok(Err(join)) => {
+                            tracing::warn!("account HTTP task join error during shutdown: {join}");
+                        }
+                        Err(_) => {
+                            account_loop.abort();
+                            tracing::warn!(
+                                "account HTTP task did not stop within the shutdown budget; aborted"
+                            );
+                        }
+                    }
+                }
+            }
             serve_shutdown.notify_one();
             if let Some(bridge) = &bridge_owner {
                 bridge.begin_shutdown(
