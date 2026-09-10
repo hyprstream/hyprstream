@@ -3172,9 +3172,17 @@ async fn serve_inference_bridged(
         .await
     });
     let rep_owner = RepTaskOwner::new(rep_task);
-    rep_armed_rx
-        .await
-        .map_err(|_| hyprstream_rpc::error::RpcError::SpawnFailed("REP waiter failed to arm".to_owned()))?;
+    if rep_armed_rx.await.is_err() {
+        network_ready.store(false, Ordering::Release);
+        let rep_error = rep_owner.join().await;
+        processor.close_admission();
+        return Err(match rep_error {
+            Err(error) => hyprstream_rpc::error::RpcError::SpawnFailed(error.to_string()),
+            Ok(()) => hyprstream_rpc::error::RpcError::SpawnFailed(
+                "REP waiter failed to arm".to_owned(),
+            ),
+        });
+    }
     let rep_admission = Arc::clone(&processor);
     let rep = async move {
         let result = rep_owner.join().await;
@@ -4113,7 +4121,7 @@ mod quinn_drain_tests {
     async fn unexpected_quic_exit_notifies_unpolled_rep_and_joins_drain() -> Result<()> {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let drain_shutdown = Arc::clone(&shutdown);
-        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
         let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
         let (drain_release_tx, drain_release_rx) = tokio::sync::oneshot::channel();
         let drain_finished = Arc::new(AtomicBool::new(false));
@@ -4315,6 +4323,23 @@ mod quinn_drain_tests {
         })
         .await
         .context("cancellation did not abort owned REP task")?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rep_startup_ack_failure_preserves_task_error() -> Result<()> {
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("REP bind sentinel"))
+        });
+        let owner = RepTaskOwner::new(task);
+        drop(armed_tx);
+        assert!(armed_rx.await.is_err(), "startup arm channel must close");
+        let error = owner
+            .join()
+            .await
+            .expect_err("REP startup failure must remain visible");
+        assert!(error.to_string().contains("REP bind sentinel"));
         Ok(())
     }
 }
