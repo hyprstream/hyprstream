@@ -14,6 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v5
@@ -23,7 +24,7 @@ jobs:
         shell: bash
         run: |
           case "$GITHUB_EVENT_NAME" in
-            pull_request) printf 'DOCS_CATALOG_EVENT=pull_request\nDOCS_CATALOG_AUDITED_COMMIT=%s\n' "${{ github.event.pull_request.base.sha }}" >> "$GITHUB_ENV" ;;
+            pull_request) printf 'DOCS_CATALOG_EVENT=pull_request\nDOCS_CATALOG_AUDITED_COMMIT=%s\nDOCS_CATALOG_AUDITED_HEAD=%s\n' "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" >> "$GITHUB_ENV" ;;
             push) printf 'DOCS_CATALOG_EVENT=push\nDOCS_CATALOG_AUDITED_COMMIT=%s\n' "${{ github.event.before }}" >> "$GITHUB_ENV" ;;
             *) exit 1 ;;
           esac

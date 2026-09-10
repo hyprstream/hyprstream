@@ -165,6 +165,9 @@ def audited_input(repo: Path, event: str | None = None, revision: str | None = N
     event = event or os.environ.get("DOCS_CATALOG_EVENT", "pull_request")
     revision = revision or os.environ.get("DOCS_CATALOG_AUDITED_COMMIT")
     if event == "pull_request":
+        expected_head = os.environ.get("DOCS_CATALOG_AUDITED_HEAD")
+        required(expected_head in {None, git(repo, "rev-parse", "HEAD")},
+                 "pull-request checkout is not the workflow-supplied head")
         base = revision or git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
         git(repo, "cat-file", "-e", f"{base}^{{commit}}")
         required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", base, "refs/remotes/origin/main"]).returncode == 0,
@@ -597,6 +600,13 @@ def self_test(repo: Path) -> None:
     # GitHub supplies the PR's immutable base SHA, which may be behind the
     # moving remote-main tip by the time the check runs.
     validate(repo, catalog, corpus, schemas, consumers, event="pull_request", revision=catalog["source_commit"])
+    previous_head = os.environ.get("DOCS_CATALOG_AUDITED_HEAD")
+    os.environ["DOCS_CATALOG_AUDITED_HEAD"] = "0" * 40
+    try:
+        expect_failure("synthetic pull-request merge checkout", repo, catalog, corpus, schemas, consumers)
+    finally:
+        if previous_head is None: os.environ.pop("DOCS_CATALOG_AUDITED_HEAD", None)
+        else: os.environ["DOCS_CATALOG_AUDITED_HEAD"] = previous_head
     expect_failure("unlisted schema", repo, copy.deepcopy(catalog), corpus, schemas + ["new.capnp"], consumers)
     expect_failure("stale schema", repo, copy.deepcopy(catalog), corpus, schemas[1:], consumers)
     bad = copy.deepcopy(catalog); bad["source_commit"] = "not-a-git-revision"
