@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 const RECORD_PREFIX: &str = "public-rk\0";
 const COMMIT_PREFIX: &str = "public-commit\0";
+const COMMIT_BLOCK_PREFIX: &str = "public-commit-block\0";
 const INTENT_PREFIX: &str = "public-intent\0";
 const MAX_REQUEST_ID: usize = 128;
 const MAX_PRINCIPAL: usize = 512;
@@ -38,6 +39,10 @@ fn record_key(did: &str, collection: &str, rkey: &str) -> Vec<u8> {
 
 fn commit_key(did: &str) -> Vec<u8> {
     format!("{COMMIT_PREFIX}{did}").into_bytes()
+}
+
+fn commit_block_key(did: &str, cid: &str) -> Vec<u8> {
+    format!("{COMMIT_BLOCK_PREFIX}{did}\0{cid}").into_bytes()
 }
 
 fn intent_key(did: &str, request_id: &str) -> Vec<u8> {
@@ -158,9 +163,15 @@ impl PublicRepoStore {
 
     pub fn snapshot(&self, did: &str) -> Result<Option<PublicRepoSnapshot>> {
         validate_did(did)?;
+        // Iteration and the head lookup must observe the same database
+        // sequence, even when a writer commits a batch during the scan.
+        let snapshot = self.db.snapshot();
         let prefix = record_prefix(did);
         let mut records = BTreeMap::new();
-        for item in self.db.prefix_iterator(&prefix) {
+        for item in snapshot.iterator(rocksdb::IteratorMode::From(
+            &prefix,
+            rocksdb::Direction::Forward,
+        )) {
             let (key, bytes) = item.context("public repo record scan failed")?;
             if !key.starts_with(&prefix) {
                 break;
@@ -178,8 +189,7 @@ impl PublicRepoStore {
         if records.is_empty() {
             return Ok(None);
         }
-        let bytes = self
-            .db
+        let bytes = snapshot
             .get(commit_key(did))
             .context("public repo commit read failed")?
             .ok_or_else(|| anyhow!("public repo has records but no signed commit"))?;
@@ -227,6 +237,12 @@ impl PublicRepoStore {
         batch.put(
             record_key(did, record.collection(), record.rkey().as_str()),
             record.bytes(),
+        );
+        // The mutable head may advance before a caller retries. Retain the
+        // exact commit block that backs each durable publication receipt.
+        batch.put(
+            commit_block_key(did, &commit.cid_atproto()?.to_string()),
+            &commit_bytes,
         );
         batch.put(commit_key(did), commit_bytes);
         batch.put(intent_key(did, &intent.request_id), intent_bytes);
@@ -286,7 +302,9 @@ impl PublicRepoWriter {
         let record = AtprotoRecord::new(request.collection.clone(), request.rkey, request.value)?;
         if let Some(intent) = self.store.intent(&self.did, &request.request_id)? {
             ensure!(
-                intent.did == self.did
+                intent.request_id == request.request_id
+                    && intent.principal == request.principal
+                    && intent.did == self.did
                     && intent.collection == record.collection()
                     && intent.rkey == record.rkey().as_str()
                     && intent.cid == record.cid().to_string(),
@@ -296,10 +314,24 @@ impl PublicRepoWriter {
                 .store
                 .snapshot(&self.did)?
                 .ok_or_else(|| anyhow!("publication intent exists without a repository"))?;
-            let commit_cid = snapshot.commit.cid_atproto()?;
             ensure!(
-                intent.commit_cid == commit_cid.to_string(),
-                "publication intent commit does not match repository head"
+                snapshot
+                    .records
+                    .get(&(record.collection().to_owned(), request.rkey))
+                    .is_some_and(|stored| stored.bytes() == record.bytes()),
+                "publication intent record does not match repository"
+            );
+            let commit_bytes = self
+                .store
+                .db
+                .get(commit_block_key(&self.did, &intent.commit_cid))?
+                .ok_or_else(|| anyhow!("publication intent commit block is missing"))?;
+            let commit = Commit::from_atproto_dag_cbor(&commit_bytes)
+                .context("publication intent commit is invalid")?;
+            let commit_cid = commit.cid_atproto()?;
+            ensure!(
+                commit.did == self.did && intent.commit_cid == commit_cid.to_string(),
+                "publication intent commit does not match stored block"
             );
             return Ok(PublicCommitResult {
                 uri: record.uri(&self.did),
@@ -403,6 +435,18 @@ mod tests {
         ])
     }
 
+    fn create_request(rkey: u64, expected_prev: Option<Cid>) -> PublicCreateRequest {
+        PublicCreateRequest {
+            request_id: format!("req-{rkey}"),
+            principal: "did:at9p:agent".into(),
+            did: "did:web:tormentnexus.social".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: Tid::from_raw(rkey),
+            value: post(),
+            expected_prev,
+        }
+    }
+
     #[test]
     fn authorized_create_is_atomic_durable_and_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -411,8 +455,13 @@ mod tests {
             allow: AtomicBool::new(true),
         });
         let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-        let writer = PublicRepoWriter::new(store.clone(), "did:web:tormentnexus.social", key, gate)
-            .expect("writer");
+        let writer = PublicRepoWriter::new(
+            store.clone(),
+            "did:web:tormentnexus.social",
+            key.clone(),
+            gate.clone(),
+        )
+        .expect("writer");
         let request = PublicCreateRequest {
             request_id: "req-1".into(),
             principal: "did:at9p:agent".into(),
@@ -423,7 +472,7 @@ mod tests {
             expected_prev: None,
         };
         let first = writer.create_record(request.clone()).expect("create");
-        let retry = writer.create_record(request).expect("retry");
+        let retry = writer.create_record(request.clone()).expect("retry");
         assert_eq!(first, retry);
         let second = writer
             .create_record(PublicCreateRequest {
@@ -437,18 +486,25 @@ mod tests {
             })
             .expect("second create");
         assert_ne!(first.commit_cid, second.commit_cid);
+        assert_eq!(
+            writer
+                .create_record(request.clone())
+                .expect("retry after head advance"),
+            first
+        );
         let snapshot = store
             .snapshot("did:web:tormentnexus.social")
             .expect("snapshot")
             .expect("repo");
         assert_eq!(snapshot.records.len(), 2);
+        assert_eq!(snapshot.commit.cid_atproto().unwrap(), second.commit_cid);
         snapshot
             .commit
             .verify_atproto(writer.signing_key.verifying_key())
             .expect("commit signature");
         drop(writer);
         drop(store);
-        let reopened = PublicRepoStore::open(dir.path()).expect("reopen");
+        let reopened = Arc::new(PublicRepoStore::open(dir.path()).expect("reopen"));
         assert_eq!(
             reopened
                 .snapshot("did:web:tormentnexus.social")
@@ -457,6 +513,162 @@ mod tests {
                 .records
                 .len(),
             2
+        );
+        let writer = PublicRepoWriter::new(
+            reopened.clone(),
+            "did:web:tormentnexus.social",
+            key,
+            gate.clone(),
+        )
+        .expect("reopened writer");
+        assert_eq!(
+            writer
+                .create_record(request.clone())
+                .expect("durable retry"),
+            first
+        );
+        assert_eq!(
+            reopened
+                .snapshot(&request.did)
+                .unwrap()
+                .unwrap()
+                .commit
+                .cid_atproto()
+                .unwrap(),
+            second.commit_cid
+        );
+        gate.allow.store(false, Ordering::Release);
+        assert!(writer
+            .create_record(request)
+            .unwrap_err()
+            .to_string()
+            .contains("publication denied"));
+    }
+
+    #[test]
+    fn retry_checks_intent_record_and_commit_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let request = create_request(1, None);
+        let writer = PublicRepoWriter::new(store.clone(), &request.did, key, gate).unwrap();
+        let first = writer.create_record(request.clone()).unwrap();
+        let mut changed = request.clone();
+        changed.value = DagCbor::str_map([
+            ("$type", DagCbor::Text(request.collection.clone())),
+            ("text", DagCbor::Text("changed".into())),
+        ]);
+        assert!(writer
+            .create_record(changed)
+            .unwrap_err()
+            .to_string()
+            .contains("different content"));
+        let mut changed = request.clone();
+        changed.principal = "another-agent".into();
+        assert!(writer
+            .create_record(changed)
+            .unwrap_err()
+            .to_string()
+            .contains("different content"));
+
+        let block_key = commit_block_key(&request.did, &first.commit_cid.to_string());
+        let original = store.db.get(&block_key).unwrap().unwrap();
+        let mut tampered = Commit::from_atproto_dag_cbor(&original).unwrap();
+        tampered.rev = Tid::from_raw(tampered.rev.to_raw() + 1);
+        store
+            .db
+            .put(&block_key, tampered.to_atproto_dag_cbor().unwrap())
+            .unwrap();
+        assert!(writer
+            .create_record(request.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("does not match stored block"));
+        store.db.delete(&block_key).unwrap();
+        assert!(writer
+            .create_record(request.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("commit block is missing"));
+        store.db.put(&block_key, original).unwrap();
+
+        // A valid repository containing another record must not satisfy an
+        // intent whose record path has disappeared.
+        let other_request = create_request(2, Some(first.commit_cid));
+        writer.create_record(other_request).unwrap();
+        let mut intent = store
+            .intent(&request.did, &request.request_id)
+            .unwrap()
+            .unwrap();
+        let missing = create_request(3, None);
+        intent.rkey = missing.rkey.encode();
+        store
+            .db
+            .put(
+                intent_key(&request.did, &request.request_id),
+                serde_json::to_vec(&intent).unwrap(),
+            )
+            .unwrap();
+        let mut missing = missing;
+        missing.request_id = request.request_id;
+        assert!(writer
+            .create_record(missing)
+            .unwrap_err()
+            .to_string()
+            .contains("record does not match repository"));
+    }
+
+    #[test]
+    fn snapshots_remain_consistent_during_concurrent_publications() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let verifying_key = *key.verifying_key();
+        let writer =
+            PublicRepoWriter::new(store.clone(), "did:web:tormentnexus.social", key, gate).unwrap();
+        let first = writer.create_record(create_request(1, None)).unwrap();
+        let start = std::sync::Barrier::new(4);
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    start.wait();
+                    let mut reads = 0;
+                    while !done.load(Ordering::Acquire) || reads == 0 {
+                        let snapshot = store
+                            .snapshot("did:web:tormentnexus.social")
+                            .unwrap()
+                            .unwrap();
+                        assert!(!snapshot.records.is_empty());
+                        snapshot.commit.verify_atproto(&verifying_key).unwrap();
+                        reads += 1;
+                    }
+                });
+            }
+            start.wait();
+            let mut head = first.commit_cid;
+            for rkey in 2..=64 {
+                head = writer
+                    .create_record(create_request(rkey, Some(head)))
+                    .unwrap()
+                    .commit_cid;
+            }
+            done.store(true, Ordering::Release);
+        });
+        assert_eq!(
+            store
+                .snapshot("did:web:tormentnexus.social")
+                .unwrap()
+                .unwrap()
+                .records
+                .len(),
+            64
         );
     }
 
