@@ -28,6 +28,10 @@ pub const PDS_NAMESPACE: &str = "/pds";
 pub const PDS_ACCOUNTS_DIRECTORY: &str = "accounts";
 /// Public account-record publication marker.
 pub const PDS_ACCOUNT_RECORD_FILE: &str = "account-record.cbor";
+/// Sealed account DID-document bytes published beside the account record.
+pub const PDS_ACCOUNT_DID_DOCUMENT_FILE: &str = "did.json";
+/// Sealed account operation-log bytes published beside the account record.
+pub const PDS_ACCOUNT_DID_LOG_FILE: &str = "did-log.json";
 
 pub mod hosted_account_mint;
 
@@ -336,6 +340,31 @@ impl AccountRecordStore {
     fn with_max_record_bytes(mut self, max_record_bytes: usize) -> Self {
         self.max_record_bytes = max_record_bytes;
         self
+    }
+
+    /// Read one immutable public identity artifact after the hosted DID has
+    /// already resolved to its authority-owned tenant.
+    pub(crate) async fn read_hosted_http_artifact(
+        &self,
+        authority: &Subject,
+        tenant: &str,
+        label: &str,
+        file: &str,
+        limit: usize,
+    ) -> Result<Vec<u8>, AccountReadError> {
+        validate_tenant_component(tenant)?;
+        validate_account_label(label)?;
+        let components = [tenant, PDS_ACCOUNTS_DIRECTORY, label, file];
+        read_file(
+            self.pds_mount.as_ref(),
+            self.read_authorizer.as_ref(),
+            &components,
+            authority,
+            Some(tenant),
+            None,
+            limit,
+        )
+        .await
     }
 }
 

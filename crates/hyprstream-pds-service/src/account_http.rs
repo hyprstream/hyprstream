@@ -17,7 +17,12 @@ use axum::{
     routing::get,
     Router,
 };
-use hyprstream_pds::{AccountLabel, SealedHostedAccount};
+use hyprstream_pds::{AccountLabel, SealedHostedAccount, SealedHostedDidDocument};
+
+use crate::{
+    AccountRecordStore, OAUTH_ACCOUNT_RESOLVER_SUBJECT, PDS_ACCOUNT_DID_DOCUMENT_FILE,
+    PDS_ACCOUNT_DID_LOG_FILE,
+};
 
 /// Canonical hosted account zone used by the default deployment.
 pub const DEFAULT_ACCOUNT_ZONE: &str = "tormentnexus.social";
@@ -177,6 +182,81 @@ impl StaticHostedAccountHttpDirectory {
 impl HostedAccountHttpDirectory for StaticHostedAccountHttpDirectory {
     async fn lookup(&self, label: &str) -> Result<Option<Arc<HostedAccountHttpArtifacts>>> {
         Ok(self.entries.get(label).cloned())
+    }
+}
+
+/// Live adapter that loads the immutable artifact bundle from the authorized
+/// PDS mount. The OAuth service identity is fixed at construction; callers
+/// cannot substitute a tenant or subject through an HTTP request.
+#[derive(Clone)]
+pub struct MountedHostedAccountHttpDirectory {
+    store: Arc<AccountRecordStore>,
+    authority: hyprstream_rpc::Subject,
+    zone: String,
+}
+
+impl MountedHostedAccountHttpDirectory {
+    pub fn new(
+        store: Arc<AccountRecordStore>,
+        authority: hyprstream_rpc::Subject,
+        zone: impl Into<String>,
+    ) -> Result<Self> {
+        ensure!(
+            authority.name() == Some(OAUTH_ACCOUNT_RESOLVER_SUBJECT),
+            "hosted HTTP directory requires the fixed OAuth resolver subject"
+        );
+        Ok(Self {
+            store,
+            authority,
+            zone: canonical_zone(&zone.into())?,
+        })
+    }
+}
+
+#[async_trait]
+impl HostedAccountHttpDirectory for MountedHostedAccountHttpDirectory {
+    async fn lookup(&self, label: &str) -> Result<Option<Arc<HostedAccountHttpArtifacts>>> {
+        AccountLabel::parse(label).map_err(|error| anyhow::anyhow!(error))?;
+        let did = format!("did:web:{label}.{}", self.zone);
+        let Some(tenant) = self
+            .store
+            .resolve_tenant_for_hosted_did(&self.authority, &did)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let document = self
+            .store
+            .read_hosted_http_artifact(
+                &self.authority,
+                &tenant,
+                label,
+                PDS_ACCOUNT_DID_DOCUMENT_FILE,
+                16 * 1024,
+            )
+            .await?;
+        let parsed = SealedHostedDidDocument::from_canonical_json(&document)?;
+        ensure!(
+            parsed.did() == did,
+            "served DID document does not match host"
+        );
+        let log = self
+            .store
+            .read_hosted_http_artifact(
+                &self.authority,
+                &tenant,
+                label,
+                PDS_ACCOUNT_DID_LOG_FILE,
+                64 * 1024,
+            )
+            .await?;
+        Ok(Some(Arc::new(HostedAccountHttpArtifacts::new(
+            label,
+            did.clone(),
+            document,
+            did.into_bytes(),
+            log,
+        )?)))
     }
 }
 
