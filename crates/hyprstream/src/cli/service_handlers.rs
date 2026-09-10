@@ -483,35 +483,7 @@ pub async fn handle_service_install(
         // within the bounded startup budget (#1585).
         if start {
             println!("  Starting services...");
-            for service in &target_services {
-                print!("    \u{25CB} {}... ", service);
-                manager
-                    .start(service)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("starting {service}: {e}"))?;
-                let deadline = std::time::Instant::now() + CHILD_READINESS_TIMEOUT;
-                loop {
-                    match manager.is_active(service).await {
-                        Ok(true) => break,
-                        Ok(false) => {
-                            if std::time::Instant::now() >= deadline {
-                                anyhow::bail!(
-                                    "service {service} unit did not reach the active state \
-                                     within {}s",
-                                    CHILD_READINESS_TIMEOUT.as_secs()
-                                );
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                        Err(e) => {
-                            return Err(anyhow::anyhow!(
-                                "active-state check for {service} failed: {e}"
-                            ));
-                        }
-                    }
-                }
-                println!("\u{2713}");
-            }
+            start_units_to_active(&*manager, &target_services, CHILD_READINESS_TIMEOUT).await?;
         }
     } else if start {
         // No systemd: the same factored direct launch path as `service start`
@@ -1045,15 +1017,25 @@ async fn start_units_to_active(
     targets: &[String],
     active_timeout: std::time::Duration,
 ) -> Result<()> {
+    // Submit every start request concurrently before waiting on any unit.
+    // Compatibility services may probe Policy during their own startup;
+    // waiting for an earlier Event unit to become active before submitting
+    // Policy would deadlock when the units were stopped. Systemd's
+    // StartUnit call waits for its job result, so concurrent requests are
+    // required to let Policy and Event make progress together. Mutation
+    // failures still propagate before any active-state success is reported.
     for service in targets {
         print!("  \u{25CB} {}... ", service);
-        // A real mutation failure must surface: continuing here would let a
-        // pre-existing active unit mask the failed start.
+    }
+    futures::future::try_join_all(targets.iter().map(|service| async move {
         manager
             .start(service)
             .await
-            .map_err(|e| anyhow::anyhow!("starting {service}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("starting {service}: {e}"))
+    }))
+    .await?;
 
+    for service in targets {
         let deadline = std::time::Instant::now() + active_timeout;
         loop {
             match manager.is_active(service).await {
@@ -2740,6 +2722,7 @@ mod launcher_tests {
     struct MockManager {
         start_error: Option<&'static str>,
         active_after: std::sync::atomic::AtomicU32,
+        calls: parking_lot::Mutex<Vec<String>>,
     }
 
     impl MockManager {
@@ -2747,18 +2730,21 @@ mod launcher_tests {
             Self {
                 start_error: Some("unit is masked"),
                 active_after: std::sync::atomic::AtomicU32::new(0),
+                calls: parking_lot::Mutex::new(Vec::new()),
             }
         }
         fn never_active() -> Self {
             Self {
                 start_error: None,
                 active_after: std::sync::atomic::AtomicU32::new(u32::MAX),
+                calls: parking_lot::Mutex::new(Vec::new()),
             }
         }
         fn immediate() -> Self {
             Self {
                 start_error: None,
                 active_after: std::sync::atomic::AtomicU32::new(0),
+                calls: parking_lot::Mutex::new(Vec::new()),
             }
         }
     }
@@ -2771,7 +2757,10 @@ mod launcher_tests {
         async fn uninstall(&self, _service: &str) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn start(&self, _service: &str) -> anyhow::Result<()> {
+        async fn start(&self, service: &str) -> anyhow::Result<()> {
+            self.calls
+                .lock()
+                .push(format!("start:{service}"));
             match self.start_error {
                 Some(reason) => anyhow::bail!("{reason}"),
                 None => Ok(()),
@@ -2780,7 +2769,10 @@ mod launcher_tests {
         async fn stop(&self, _service: &str) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn is_active(&self, _service: &str) -> anyhow::Result<bool> {
+        async fn is_active(&self, service: &str) -> anyhow::Result<bool> {
+            self.calls
+                .lock()
+                .push(format!("active:{service}"));
             use std::sync::atomic::Ordering;
             let remaining = self.active_after.load(Ordering::SeqCst);
             if remaining > 0 && remaining != u32::MAX {
@@ -2842,6 +2834,28 @@ mod launcher_tests {
         )
         .await
         .expect("immediately-active unit must complete");
+    }
+
+    #[tokio::test]
+    async fn unit_starts_are_queued_before_active_waits() {
+        let manager = MockManager::immediate();
+        start_units_to_active(
+            &manager,
+            &["event".to_owned(), "policy".to_owned()],
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("queued unit starts must complete");
+
+        assert_eq!(
+            *manager.calls.lock(),
+            [
+                "start:event".to_owned(),
+                "start:policy".to_owned(),
+                "active:event".to_owned(),
+                "active:policy".to_owned(),
+            ]
+        );
     }
 
     /// Required roster rollback: a later child failing must stop earlier
