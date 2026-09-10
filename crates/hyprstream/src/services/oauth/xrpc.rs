@@ -1552,6 +1552,27 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[tokio::test]
+    async fn router_create_record_is_absent_without_explicit_public_writer() {
+        // The production builder must not expose a write endpoint until a
+        // native-authorized PublicRepoWriter is explicitly installed.
+        let app = build_production_app(true).await;
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/xrpc/com.atproto.repo.createRecord")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"repo":"did:web:pub.example.com","collection":"app.bsky.feed.post","rkey":"3jzfcijpj2z2a","record":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     // ── Finding 1: real capacity test through the mounted router ──────────────
 
     #[tokio::test]
