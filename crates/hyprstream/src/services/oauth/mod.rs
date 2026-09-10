@@ -1742,6 +1742,11 @@ mod tests {
             Arc::new(SyntheticMount::new(pds_root)),
             Arc::new(PermitFixtureAccountReads),
         ));
+        hosted_account_store
+            .refresh_hosted_did_index(&hyprstream_rpc::Subject::new(
+                hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+            ))
+            .await?;
         let mut oauth_state = OAuthState::new(
             &config,
             policy_client,

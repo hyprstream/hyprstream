@@ -274,8 +274,23 @@ impl AccountRecordStore {
             *last_attempt = Some(Instant::now());
         }
         let store = self.clone();
-        handle.spawn(async move {
-            let _ = store.refresh_hosted_did_index(&authority).await;
+        handle.spawn_blocking(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(_) => {
+                    store
+                        .hosted_did_index_refreshing
+                        .store(false, Ordering::Release);
+                    return;
+                }
+            };
+            let refresh_store = store.clone();
+            runtime.block_on(async {
+                let _ = refresh_store.refresh_hosted_did_index(&authority).await;
+            });
             store
                 .hosted_did_index_refreshing
                 .store(false, Ordering::Release);
@@ -761,6 +776,24 @@ mod tests {
         }
     }
 
+    struct SlowPermitAccountReads;
+
+    impl AccountRecordReadAuthorizer for SlowPermitAccountReads {
+        fn check_read(
+            &self,
+            _subject: &Subject,
+            _verified_tenant: Option<&str>,
+            _security_context: Option<&SecurityContext>,
+            _object_id: &str,
+        ) -> MacDecision {
+            // This models the synchronous filesystem/audit work performed by
+            // the production authorizer and mount. A current-thread OAuth
+            // runtime must remain able to make progress while it runs.
+            std::thread::sleep(Duration::from_millis(200));
+            MacDecision::Permit
+        }
+    }
+
     fn permit_account_reads() -> Arc<dyn AccountRecordReadAuthorizer> {
         Arc::new(PermitAccountReads)
     }
@@ -939,6 +972,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, AccountReadError::HostedDidIndexNotReady));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduled_hosted_did_refresh_does_not_block_current_thread_runtime() {
+        let root = SyntheticNode::dir().with_child(
+            "acme",
+            tenant_node("alice", account_bytes("alice", "acme.example")),
+        );
+        let store = AccountRecordStore::new(
+            Arc::new(SyntheticMount::new(root)),
+            Arc::new(SlowPermitAccountReads),
+        );
+
+        store.schedule_hosted_did_index_refresh(oauth_authority());
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(10)),
+        )
+        .await
+        .expect("index refresh must not block the HTTP runtime");
     }
 
     #[tokio::test]
