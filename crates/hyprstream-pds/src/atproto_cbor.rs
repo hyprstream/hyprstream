@@ -488,6 +488,12 @@ mod tests {
             .map(|(_, data)| (Cid::from_dag_cbor(b"wrong label"), data.clone()))
             .collect::<Vec<_>>();
         assert!(build_public_record_proof_car(&commit, &proof, &mislabeled, &record).is_err());
+
+        let native_commit = Commit::sign(&unsigned, &signing);
+        assert!(
+            build_public_record_proof_car(&native_commit, &proof, &node_blocks, &record).is_err(),
+            "native-signed commits must not be emitted as public proof CARs"
+        );
     }
 
     #[test]

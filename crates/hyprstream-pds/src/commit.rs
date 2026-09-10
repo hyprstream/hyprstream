@@ -100,6 +100,10 @@ pub struct Commit {
     pub rev: Tid,
     pub prev: Option<Cid>,
     pub sig: Vec<u8>,
+    /// Whether this value was produced or decoded through the public
+    /// AT Protocol canonical-signature boundary. Native commits are never
+    /// eligible for public CAR publication without an explicit conversion.
+    atproto_signature: bool,
 }
 
 impl Commit {
@@ -122,6 +126,7 @@ impl Commit {
             rev: unsigned.rev,
             prev: unsigned.prev,
             sig: sig.to_vec(),
+            atproto_signature: false,
         }
     }
 
@@ -136,6 +141,7 @@ impl Commit {
             rev: unsigned.rev,
             prev: unsigned.prev,
             sig: sig.to_vec(),
+            atproto_signature: true,
         })
     }
 
@@ -206,7 +212,10 @@ impl Commit {
             commit.to_atproto_dag_cbor()?.as_slice() == bytes,
             "public commit bytes are not canonical"
         );
-        Ok(commit)
+        Ok(Commit {
+            atproto_signature: true,
+            ..commit
+        })
     }
 
     fn validate_atproto_fields(value: &DagCbor) -> Result<()> {
@@ -269,7 +278,16 @@ impl Commit {
             rev,
             prev,
             sig,
+            atproto_signature: false,
         })
+    }
+
+    pub(crate) fn ensure_atproto_signature(&self) -> Result<()> {
+        ensure!(
+            self.atproto_signature,
+            "public CAR publication requires a commit signed with AT Protocol canonical bytes"
+        );
+        Ok(())
     }
 
     /// The CID of this (signed) commit block.

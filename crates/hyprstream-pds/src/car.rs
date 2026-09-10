@@ -125,6 +125,7 @@ pub fn build_public_record_proof_car(
     node_blocks: &[(Cid, NodeData)],
     record: &AtprotoRecord,
 ) -> Result<Vec<u8>> {
+    commit.ensure_atproto_signature()?;
     // Bind the supplied proof to both the signed commit root and this exact
     // record before emitting any blocks. This rejects empty proofs and proofs
     // copied from a different commit or record.
