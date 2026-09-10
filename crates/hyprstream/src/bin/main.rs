@@ -2597,7 +2597,12 @@ fn main() -> Result<()> {
         if let Some(("inspect-services", inspect)) = pds.subcommand() {
             let services = inspect.get_many::<String>("service")
                 .context("service roster is required")?.cloned().collect::<Vec<_>>();
-            let bytes = hyprstream_core::cli::deployment_bootstrap::inspect_services(&config, &services)?;
+            // Inspection errors may include trusted-artifact or configured
+            // secrets paths. Keep those details out of the process error sink
+            // and log collectors while preserving the public JSON success
+            // document unchanged.
+            let bytes = hyprstream_core::cli::deployment_bootstrap::inspect_services(&config, &services)
+                .map_err(|_| anyhow::anyhow!("read-only service roster inspection failed"))?;
             std::io::Write::write_all(&mut std::io::stdout().lock(), &bytes)?;
             return Ok(());
         }
