@@ -257,7 +257,11 @@ pub fn with_checkpointed_native_announcements(
     let store = crate::services::discovery::PdsRecordStore::open_readonly(&pds_store_dir(&ctx)?)?
         .with_at9p_deployment_verifier(acceptance_identity);
     let states = store.accepted_at9p_states()?;
-    let iroh_required = ctx.iroh_required();
+    // The native-profile flag is installed during authenticated deployment
+    // bootstrap, before `ServiceContext` owns its shared QUIC config.  Read
+    // that process-wide decision here so split Discovery receives its
+    // checkpointed proof before its Event client initializer runs.
+    let iroh_required = hyprstream_discovery::native_network_required();
     for service_name in service_names
         .iter()
         .filter(|name| checkpoint_announces_service(iroh_required, name))
@@ -3154,6 +3158,10 @@ mod tests {
         assert!(
             body.contains("checkpoint_announces_service(iroh_required, name)"),
             "the checkpoint loop must route services through the compatibility decision"
+        );
+        assert!(
+            body.contains("hyprstream_discovery::native_network_required()"),
+            "required native bootstrap must gate Discovery proof installation before QUIC setup"
         );
     }
 
