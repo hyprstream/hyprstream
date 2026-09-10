@@ -383,17 +383,17 @@ async fn serve_artifact(
             (None, None) => return StatusCode::BAD_REQUEST.into_response(),
         };
         if host.is_empty() {
-            return StatusCode::BAD_REQUEST.into_response();
+            return negative_response(StatusCode::BAD_REQUEST);
         }
         let Some(label) = host_label(host, &state.zone) else {
-            return StatusCode::NOT_FOUND.into_response();
+            return negative_response(StatusCode::NOT_FOUND);
         };
         label
     };
     drop(request);
     let artifact = match state.directory.lookup(&label).await {
         Ok(Some(artifact)) => artifact,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => return negative_response(StatusCode::NOT_FOUND),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     if artifact.did() != format!("did:web:{label}.{}", state.zone) {
@@ -414,6 +414,15 @@ async fn serve_artifact(
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=300, immutable"),
+    );
+    response
+}
+
+fn negative_response(status: StatusCode) -> Response {
+    let mut response = status.into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
     );
     response
 }
@@ -452,7 +461,7 @@ fn host_label(host: &str, zone: &str) -> Option<String> {
             return None;
         }
     }
-    let hostname = authority.host().trim_end_matches('.');
+    let hostname = authority.host().trim_end_matches('.').to_ascii_lowercase();
     let suffix = format!(".{zone}");
     let label = hostname.strip_suffix(&suffix)?;
     if label.contains('.') {
@@ -688,6 +697,39 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
+    }
+
+    #[tokio::test]
+    async fn hostname_matching_is_case_insensitive() {
+        let app = router("tormentnexus.social", directory()).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/did.json")
+                    .header(header::HOST, "ALICE.TORMENTNEXUS.SOCIAL")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unallocated_label_404_is_not_cached() {
+        let app = router("tormentnexus.social", directory()).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/did.json")
+                    .header(header::HOST, "bob.tormentnexus.social")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[tokio::test]
