@@ -3152,34 +3152,57 @@ async fn serve_inference_bridged(
         );
     }
 
-    // Start REP before arming the QUIC drain waiter.  `serve_bridged` owns
-    // the admission-closing shutdown waiter, so its readiness handshake must
-    // complete before this function exposes readiness or allows the external
-    // shutdown race to begin.
+    // Start REP before arming the QUIC drain waiter.  Register a private
+    // shutdown waiter inside the REP task before exposing readiness.  The
+    // bridged serve helper signals readiness before it registers its own
+    // waiter, so this guard forwards an early notification after the helper
+    // has started and closes that lost-notification window.
     let (rep_armed_tx, rep_armed_rx) = tokio::sync::oneshot::channel();
     let rep_transport = transport.clone();
     let rep_processor = Arc::clone(&processor);
     let rep_shutdown = Arc::clone(&shutdown);
     let rep_task = tokio::spawn(async move {
-        hyprstream_rpc::service::serve::serve_bridged(
+        let notified = rep_shutdown.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let _ = rep_armed_tx.send(());
+        let serve_shutdown = Arc::clone(&rep_shutdown);
+        let serve = hyprstream_rpc::service::serve::serve_bridged(
             &rep_transport,
             rep_processor,
             signing_key,
-            rep_shutdown,
-            Some(rep_armed_tx),
-        )
-        .await
+            serve_shutdown,
+            None,
+        );
+        tokio::pin!(serve);
+        tokio::select! {
+            result = &mut serve => result,
+            _ = &mut notified => {
+                // The helper may not have registered its own waiter yet.
+                // Re-notify after it starts so its normal shutdown path still
+                // closes admission and drains in-flight requests.
+                rep_shutdown.notify_waiters();
+                serve.await
+            }
+        }
     });
+    let rep_owner = RepTaskOwner::new(rep_task);
     rep_armed_rx
         .await
         .map_err(|_| hyprstream_rpc::error::RpcError::SpawnFailed("REP waiter failed to arm".to_owned()))?;
     if let Some(on_ready) = on_ready {
         let _ = on_ready.send(());
     }
+    let rep_admission = Arc::clone(&processor);
     let rep = async move {
-        rep_task
-            .await
-            .map_err(|error| anyhow::anyhow!("REP task failed: {error}"))?
+        let result = rep_owner.join().await;
+        if result.is_err() {
+            // A bind/setup or serve failure can happen after QUIC/Iroh was
+            // advertised. Close admission before the QUIC drain waits so no
+            // new work can enter while the owner tears down.
+            rep_admission.close_admission();
+        }
+        result
     };
 
     let drain_limit = rpc_server.stream_limit();
@@ -3253,6 +3276,9 @@ where
                 // shutdown notification has already closed admission; polling
                 // both futures here makes the grace interval shared instead
                 // of delaying REP teardown until QUIC drain completes.
+                // Re-notify to cover a REP waiter that was registered after
+                // the first notification but before this branch was polled.
+                shutdown.notify_waiters();
                 let (rep_result, _) = tokio::join!(rep, drain_owner.join());
                 let rep_result = rep_result.map_err(|error| {
                     hyprstream_rpc::error::RpcError::SpawnFailed(error.to_string())
@@ -3281,6 +3307,38 @@ where
 /// it into the runtime.
 struct QuinnDrainOwner {
     task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Owns the REP task for the lifetime of the bridged service. Cancellation of
+/// the lifecycle must abort the child instead of detaching it while retaining
+/// the processor and its admission handles.
+struct RepTaskOwner {
+    task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+}
+
+impl RepTaskOwner {
+    fn new(task: tokio::task::JoinHandle<anyhow::Result<()>>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    async fn join(mut self) -> anyhow::Result<()> {
+        let Some(task) = self.task.as_mut() else {
+            return Err(anyhow::anyhow!("REP task missing"));
+        };
+        let result = task
+            .await
+            .map_err(|error| anyhow::anyhow!("REP task failed: {error}"))?;
+        self.task.take();
+        result
+    }
+}
+
+impl Drop for RepTaskOwner {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl QuinnDrainOwner {
@@ -4128,6 +4186,63 @@ mod quinn_drain_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_quic_exit_renotifies_rep_before_join() -> Result<()> {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let drain_shutdown = Arc::clone(&shutdown);
+        let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
+        let (drain_release_tx, drain_release_rx) = tokio::sync::oneshot::channel();
+        let drain_task = tokio::spawn(async move {
+            let notified = drain_shutdown.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            notified.await;
+            let _ = drain_started_tx.send(());
+            let _ = drain_release_rx.await;
+        });
+
+        let rep_shutdown = Arc::clone(&shutdown);
+        let rep_observed = Arc::new(AtomicBool::new(false));
+        let rep_observed_task = Arc::clone(&rep_observed);
+        let rep = async move {
+            // Register the REP waiter, then let the QUIC branch win. The
+            // lifecycle's re-notify keeps this waiter live through the join.
+            let notified = rep_shutdown.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            tokio::task::yield_now().await;
+            notified.await;
+            rep_observed_task.store(true, Ordering::Release);
+            Ok::<(), anyhow::Error>(())
+        };
+        let quic = async { Err::<(), _>(anyhow::anyhow!("draining accept-loop sentinel")) };
+        let lifecycle = tokio::spawn(run_quinn_lifecycle(
+            rep,
+            quic,
+            Arc::clone(&shutdown),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            QuinnDrainOwner::new(drain_task),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), drain_started_rx)
+            .await
+            .context("drain did not start")??;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !rep_observed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("draining QUIC exit did not re-notify REP")?;
+        drain_release_tx.send(()).expect("drain waiter remains live");
+        let result = tokio::time::timeout(Duration::from_secs(1), lifecycle)
+            .await
+            .context("draining lifecycle cleanup timed out")??;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelling_drain_join_aborts_owned_waiter() -> Result<()> {
         struct DropMarker(Arc<AtomicBool>);
 
@@ -4169,6 +4284,47 @@ mod quinn_drain_tests {
         })
         .await
         .context("cancellation did not abort the owned drain waiter")?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_rep_join_aborts_owned_task() -> Result<()> {
+        struct DropMarker(Arc<AtomicBool>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&dropped);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _marker = DropMarker(marker);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+            Ok::<(), anyhow::Error>(())
+        });
+        let owner = RepTaskOwner::new(task);
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .context("REP child did not start")??;
+        let mut join = Box::pin(owner.join());
+        let pending = std::future::poll_fn(|cx| match join.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(true),
+            std::task::Poll::Ready(_) => std::task::Poll::Ready(false),
+        })
+        .await;
+        assert!(pending, "REP owner join unexpectedly completed");
+        drop(join);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("cancellation did not abort owned REP task")?;
         Ok(())
     }
 }
