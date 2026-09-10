@@ -264,6 +264,11 @@ impl HostedAccountHttpDirectory for MountedHostedAccountHttpDirectory {
             parsed.did() == did && parsed.cid() == record.doc_cid(),
             "served DID document does not match host or account record"
         );
+        ensure!(
+            parsed.atproto_verifying_key()?.to_encoded_point(true)
+                == record.atproto_verifying_key()?.to_encoded_point(true),
+            "served DID document #atproto key does not match account record"
+        );
         let log = self
             .store
             .read_hosted_http_artifact(
@@ -963,6 +968,45 @@ mod tests {
             .await
             .unwrap();
         assert!(log_directory.lookup("alice").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mounted_directory_rejects_document_key_rebound_from_account_record() {
+        let (_original, document, log, record) = mounted_directory();
+        let replacement = p256::ecdsa::SigningKey::random(&mut OsRng)
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        let mut record_value = DagCbor::decode(&record).unwrap();
+        let fields = match &mut record_value {
+            DagCbor::Map(fields) => fields,
+            other => panic!("account record must be a map, got {other:?}"),
+        };
+        let mut replaced = false;
+        for (key, value) in fields {
+            if matches!(key, DagCbor::Text(name) if name == "atproto_key") {
+                *value = DagCbor::Bytes(replacement.clone());
+                replaced = true;
+            }
+        }
+        assert!(replaced, "account record must contain atproto_key");
+        let rebound = mounted_directory_with_files(
+            Some(record_value.encode()),
+            Some(document),
+            Some(log),
+        )
+        .0;
+        rebound
+            .store
+            .refresh_hosted_did_index(&rebound.authority)
+            .await
+            .unwrap();
+        let error = rebound
+            .lookup("alice")
+            .await
+            .expect_err("document key rebound must be rejected");
+        assert!(error.to_string().contains("#atproto key"));
     }
 
     #[tokio::test]
