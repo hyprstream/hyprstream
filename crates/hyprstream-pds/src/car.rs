@@ -125,6 +125,12 @@ pub fn build_public_record_proof_car(
     node_blocks: &[(Cid, NodeData)],
     record: &AtprotoRecord,
 ) -> Result<Vec<u8>> {
+    // Bind the supplied proof to both the signed commit root and this exact
+    // record before emitting any blocks. This rejects empty proofs and proofs
+    // copied from a different commit or record.
+    path.verify_atproto(&commit.data, &record.cid())?;
+    ensure_proof_record_key(path, record)?;
+
     let commit_cid = commit.cid_atproto()?;
     let mut blocks = vec![(commit_cid, commit.to_atproto_dag_cbor()?)];
     let path_cids: std::collections::BTreeSet<Cid> = path
@@ -156,6 +162,28 @@ pub fn build_public_record_proof_car(
     );
     blocks.push((record.cid(), record.bytes().to_vec()));
     build_car_v1_atproto(&[commit_cid], &blocks)
+}
+
+fn ensure_proof_record_key(path: &Proof, record: &AtprotoRecord) -> Result<()> {
+    let (data, index) = match path.path.last() {
+        Some(crate::mst::ProofStep::FoundAt(data, index)) => (data, *index),
+        _ => bail!("public MST proof has no terminal record entry"),
+    };
+    let mut key = Vec::new();
+    for entry in data.e.iter().take(index + 1) {
+        ensure!(
+            entry.p <= key.len(),
+            "public MST proof has an invalid key prefix length"
+        );
+        key.truncate(entry.p);
+        key.extend_from_slice(&entry.k);
+    }
+    let key = String::from_utf8(key).map_err(|_| anyhow!("public MST proof key is not UTF-8"))?;
+    ensure!(
+        key == format!("{}/{}", record.collection(), record.rkey().as_str()),
+        "public MST proof key does not match the supplied record"
+    );
+    Ok(())
 }
 
 /// Public AT Protocol CARv1 builder. The native builder remains unchanged.

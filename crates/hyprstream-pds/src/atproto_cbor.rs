@@ -459,6 +459,29 @@ mod tests {
             .iter()
             .any(|(cid, bytes)| *cid == commit.cid_atproto().unwrap()
                 && bytes == &commit.to_atproto_dag_cbor().unwrap()));
+
+        let empty = crate::mst::Proof { path: Vec::new() };
+        assert!(build_public_record_proof_car(&commit, &empty, &node_blocks, &record).is_err());
+
+        let wrong_unsigned = UnsignedCommit::new(
+            "did:web:tormentnexus.social",
+            Cid::from_dag_cbor(b"wrong public root"),
+            Tid::from_raw(9),
+            None,
+        );
+        let wrong_commit = Commit::sign_atproto(&wrong_unsigned, &signing).unwrap();
+        assert!(
+            build_public_record_proof_car(&wrong_commit, &proof, &node_blocks, &record).is_err()
+        );
+
+        // The record bytes/CID are identical, but its record key is different.
+        // A proof must remain bound to the collection/rkey path.
+        let wrong_record =
+            AtprotoRecord::new("app.bsky.feed.post", Tid::from_raw(9), post()).unwrap();
+        assert!(
+            build_public_record_proof_car(&commit, &proof, &node_blocks, &wrong_record).is_err()
+        );
+
         assert!(build_public_record_proof_car(&commit, &proof, &[], &record).is_err());
         let mislabeled = node_blocks
             .iter()
