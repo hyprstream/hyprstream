@@ -32,8 +32,8 @@ fn record_prefix(did: &str) -> Vec<u8> {
     format!("{RECORD_PREFIX}{did}\0").into_bytes()
 }
 
-fn record_key(did: &str, collection: &str, rkey: Tid) -> Vec<u8> {
-    format!("{RECORD_PREFIX}{did}\0{collection}\0{}", rkey.encode()).into_bytes()
+fn record_key(did: &str, collection: &str, rkey: &str) -> Vec<u8> {
+    format!("{RECORD_PREFIX}{did}\0{collection}\0{rkey}").into_bytes()
 }
 
 fn commit_key(did: &str) -> Vec<u8> {
@@ -225,7 +225,7 @@ impl PublicRepoStore {
         let intent_bytes = serde_json::to_vec(intent).context("encode publication intent")?;
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(
-            record_key(did, &record.collection, record.rkey),
+            record_key(did, record.collection(), record.rkey().as_str()),
             record.bytes(),
         );
         batch.put(commit_key(did), commit_bytes);
@@ -287,8 +287,8 @@ impl PublicRepoWriter {
         if let Some(intent) = self.store.intent(&self.did, &request.request_id)? {
             ensure!(
                 intent.did == self.did
-                    && intent.collection == record.collection
-                    && intent.rkey == record.rkey.encode()
+                    && intent.collection == record.collection()
+                    && intent.rkey == record.rkey().as_str()
                     && intent.cid == record.cid().to_string(),
                 "publication request id was reused with different content"
             );
@@ -334,7 +334,7 @@ impl PublicRepoWriter {
                 (BTreeMap::new(), None, None)
             }
         };
-        let record_key = format!("{}/{}", record.collection, record.rkey.encode());
+        let record_key = format!("{}/{}", record.collection(), record.rkey().as_str());
         ensure!(
             !keyed.contains_key(&record_key),
             "record key already exists"
@@ -355,8 +355,8 @@ impl PublicRepoWriter {
             request_id: request.request_id,
             principal: request.principal,
             did: self.did.clone(),
-            collection: record.collection.clone(),
-            rkey: record.rkey.encode(),
+            collection: record.collection().to_owned(),
+            rkey: record.rkey().as_str().to_owned(),
             cid: record.cid().to_string(),
             commit_cid: commit_cid.to_string(),
         };
