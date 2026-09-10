@@ -900,12 +900,8 @@ mod tests {
             sink.clone(),
         ));
         let store = AccountRecordStore::new(mount.clone(), authorizer);
-
         let error = store
-            .resolve_tenant_for_hosted_did(
-                &Subject::new(OAUTH_ACCOUNT_RESOLVER_SUBJECT),
-                "did:web:alice.example.test",
-            )
+            .refresh_hosted_did_index(&Subject::new(OAUTH_ACCOUNT_RESOLVER_SUBJECT))
             .await
             .unwrap_err();
         assert!(matches!(

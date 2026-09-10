@@ -15,12 +15,15 @@ pub mod federation_intake;
 
 use std::{
     collections::BTreeMap,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 use hyprstream_pds::{
-    ATPROTO_SIGNING_KEY_FILE, AccountLabel, AccountRecord, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE,
+    AccountLabel, AccountRecord, ATPROTO_SIGNING_KEY_FILE, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE,
 };
 use hyprstream_rpc::auth::mac::{MacDecision, MacDenyReason, SecurityContext};
 use hyprstream_rpc::{EnvelopeContext, Subject};
@@ -132,6 +135,8 @@ pub struct AccountRecordStore {
     max_record_bytes: usize,
     hosted_did_index: Arc<tokio::sync::RwLock<Option<HostedDidIndex>>>,
     hosted_did_index_refresh: Arc<tokio::sync::Mutex<()>>,
+    hosted_did_index_refreshing: Arc<AtomicBool>,
+    hosted_did_index_last_attempt: Arc<parking_lot::Mutex<Option<Instant>>>,
 }
 
 struct HostedDidIndex {
@@ -140,7 +145,9 @@ struct HostedDidIndex {
 }
 
 const HOSTED_DID_INDEX_TTL: Duration = Duration::from_secs(5);
-const HOSTED_DID_NEGATIVE_TTL: Duration = Duration::from_secs(1);
+const HOSTED_DID_MAX_STALE: Duration = Duration::from_secs(30);
+const HOSTED_DID_REFRESH_RETRY_COOLDOWN: Duration = Duration::from_secs(1);
+const HOSTED_DID_NEGATIVE_TTL: Duration = HOSTED_DID_INDEX_TTL;
 
 impl AccountRecordStore {
     /// Construct a store over the mount bound at `/pds` and a mandatory MAC
@@ -155,6 +162,8 @@ impl AccountRecordStore {
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
             hosted_did_index: Arc::new(tokio::sync::RwLock::new(None)),
             hosted_did_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            hosted_did_index_refreshing: Arc::new(AtomicBool::new(false)),
+            hosted_did_index_last_attempt: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -218,17 +227,21 @@ impl AccountRecordStore {
         if age >= HOSTED_DID_INDEX_TTL {
             self.schedule_hosted_did_index_refresh(authority.clone());
         }
+        if age >= HOSTED_DID_INDEX_TTL + HOSTED_DID_MAX_STALE {
+            return Err(AccountReadError::HostedDidIndexNotReady);
+        }
         let key = (label.to_owned(), did.to_owned());
         match snapshot.entries.get(&key) {
             Some(Some(tenant)) => Ok(Some(tenant.clone())),
             Some(None) => Err(AccountReadError::AmbiguousHostedAccountDid(did.to_owned())),
             None if age < HOSTED_DID_NEGATIVE_TTL => Ok(None),
             None => {
-                // Negative entries expire independently of the positive
-                // snapshot, so a newly published account is not hidden
-                // forever while refresh remains asynchronous.
+                // A negative entry is eligible for refresh at the normal
+                // snapshot interval, but remains a stable 404 while refresh
+                // runs. This avoids turning ordinary missing-account traffic
+                // into repeated transient OAuth/HTTP failures.
                 self.schedule_hosted_did_index_refresh(authority.clone());
-                Err(AccountReadError::HostedDidIndexNotReady)
+                Ok(None)
             }
         }
     }
@@ -242,13 +255,37 @@ impl AccountRecordStore {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        if self
+            .hosted_did_index_refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        {
+            let mut last_attempt = self.hosted_did_index_last_attempt.lock();
+            if last_attempt
+                .is_some_and(|attempt| attempt.elapsed() < HOSTED_DID_REFRESH_RETRY_COOLDOWN)
+            {
+                self.hosted_did_index_refreshing
+                    .store(false, Ordering::Release);
+                return;
+            }
+            *last_attempt = Some(Instant::now());
+        }
         let store = self.clone();
         handle.spawn(async move {
             let _ = store.refresh_hosted_did_index(&authority).await;
+            store
+                .hosted_did_index_refreshing
+                .store(false, Ordering::Release);
         });
     }
 
-    async fn refresh_hosted_did_index(&self, authority: &Subject) -> Result<(), AccountReadError> {
+    pub async fn refresh_hosted_did_index(
+        &self,
+        authority: &Subject,
+    ) -> Result<(), AccountReadError> {
         let _refresh = self.hosted_did_index_refresh.lock().await;
         let stale = self
             .hosted_did_index
@@ -702,8 +739,8 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
     use hyprstream_pds::did_op::{
-        GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
-        RecoveryKeyEnrollment, UserRotationKey, sign_genesis,
+        sign_genesis, GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
+        RecoveryKeyEnrollment, UserRotationKey,
     };
     use hyprstream_pds::{AllocatedAccountName, HostedAccountMint};
     use hyprstream_rpc::Subject;
@@ -915,8 +952,28 @@ mod tests {
                 entries: BTreeMap::new(),
                 built_at: Instant::now() - HOSTED_DID_NEGATIVE_TTL - Duration::from_millis(1),
             });
-        let error = store
+        let result = store
             .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:new.acme.example")
+            .await;
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn hosted_did_positive_binding_has_a_hard_stale_deadline() {
+        let store = store();
+        store
+            .hosted_did_index
+            .write()
+            .await
+            .replace(HostedDidIndex {
+                entries: BTreeMap::from([(
+                    ("alice".to_owned(), "did:web:alice.acme.example".to_owned()),
+                    Some("acme".to_owned()),
+                )]),
+                built_at: Instant::now() - HOSTED_DID_INDEX_TTL - HOSTED_DID_MAX_STALE,
+            });
+        let error = store
+            .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
             .await
             .unwrap_err();
         assert!(matches!(error, AccountReadError::HostedDidIndexNotReady));
