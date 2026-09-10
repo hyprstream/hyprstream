@@ -7004,6 +7004,7 @@ dependencies = [
  "web-transport-iroh",
  "web-transport-quinn",
  "webpki-roots 0.26.11",
+ "x509-parser",
  "xdg",
  "zeroize",
 ]
