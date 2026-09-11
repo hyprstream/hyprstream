@@ -11,7 +11,9 @@
 //!
 //! Public authorities are validated as complete repository identifiers, not
 //! DID URLs. Host-form web authorities use the hosted-account DNS rules plus
-//! atproto's public top-level-domain restrictions, and
+//! atproto's top-level-domain restrictions, with an explicit self-hosted OAuth
+//! extension for canonical encoded ports (including .test hosts). This extension
+//! does not imply interoperability with public AT Protocol services.
 //! PLC authorities require their full base32 identifier. Native at9p capsule
 //! validation remains the native resolver's responsibility. This is not a
 //! signature or ownership check (see [`crate::commit::Commit::verify`]).
@@ -78,12 +80,25 @@ pub fn accept_repo_authority(did: &str) -> Result<RepoAuthority> {
                 "path-form did:web {did:?} is not an accepted repo authority; the atproto profile requires host-form did:web"
             );
         }
-        crate::did_op::validate_host_form_did_web(did)?;
-        // AT Protocol applies handle TLD restrictions to public did:web
-        // authorities too: https://atproto.com/specs/did#didweb-in-at-protocol.
-        // This public boundary does not enable localhost/ports or .test,
-        // which the protocol permits only in development environments.
-        let tld = did.rsplit('.').next().unwrap_or_default();
+        // Repository-specific compatibility with the canonical service DID
+        // produced from configured OAuth origins. The public AT Protocol DID
+        // profile is stricter: non-localhost ports are a Hyprstream self-hosted
+        // extension, not a public interoperability guarantee.
+        let (host_did, has_port) = if let Some((host, port)) = did.split_once("%3A") {
+            let number = port.parse::<u16>()?;
+            ensure!(
+                number != 0 && number != 443 && port == number.to_string(),
+                "repo did:web port must be canonical, nonzero and non-default"
+            );
+            (host, true)
+        } else {
+            (did, false)
+        };
+        // Validating the undecoded host rejects userinfo, IPs, localhost,
+        // other percent escapes and repeated encoded ports without rewriting
+        // the accepted DID used in repository keys or signatures.
+        crate::did_op::validate_host_form_did_web(host_did)?;
+        let tld = host_did.rsplit('.').next().unwrap_or_default();
         ensure!(
             tld.as_bytes().first().is_some_and(u8::is_ascii_lowercase),
             "public did:web top-level domain must start with an ASCII letter"
@@ -99,9 +114,12 @@ pub fn accept_repo_authority(did: &str) -> Result<RepoAuthority> {
                     | "local"
                     | "localhost"
                     | "onion"
-                    | "test"
             ),
             "public did:web top-level domain is reserved or disallowed by atproto"
+        );
+        ensure!(
+            tld != "test" || has_port,
+            "repo did:web .test requires the canonical self-hosted OAuth port form"
         );
         Ok(RepoAuthority::Web)
     } else if let Some(identifier) = did.strip_prefix("did:plc:") {
@@ -226,6 +244,53 @@ mod tests {
             assert_eq!(
                 accept_repo_authority(&format!("did:web:{host}")).unwrap(),
                 RepoAuthority::Web
+            );
+        }
+    }
+    #[test]
+    fn repo_web_authority_preserves_canonical_oauth_port_extension() {
+        for did in [
+            "did:web:pds.example.test%3A8443",
+            "did:web:pds.example.com%3A8443",
+            "did:web:example.com%3A1",
+            "did:web:example.com%3A65535",
+        ] {
+            assert_eq!(accept_repo_authority(did).unwrap(), RepoAuthority::Web);
+        }
+        for host in [
+            "example.com%3A0",
+            "example.com%3A443",
+            "example.com%3A65536",
+            "example.com%3A08443",
+            "example.com%3A+8443",
+            "example.com%3A",
+            "example.com%3A8443%3A8444",
+            "example.com%3a8443",
+            "example.com%253A8443",
+            "example.com%3A8443:users",
+            "user@example.com%3A8443",
+            "user%40example.com%3A8443",
+            "127.0.0.1%3A8443",
+            "192.0.2.1%3A8443",
+            "[::1]%3A8443",
+            "localhost%3A8443",
+            "example.123%3A8443",
+            "example.1com%3A8443",
+            "example.arpa%3A8443",
+            "example.onion%3A8443",
+            "example.internal%3A8443",
+            "example.invalid%3A8443",
+            "example.local%3A8443",
+            "example.localhost%3A8443",
+            "example.alt%3A8443",
+            "example.example%3A8443",
+            "example.com%3A8443#key",
+            "example.com%3A8443?query",
+            "example.com%3A8443/path",
+        ] {
+            assert!(
+                accept_repo_authority(&format!("did:web:{host}")).is_err(),
+                "{host}"
             );
         }
     }

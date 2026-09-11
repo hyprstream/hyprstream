@@ -28,6 +28,11 @@ const COMMIT_BLOCK_PREFIX: &str = "public-commit-block\0";
 const INTENT_PREFIX: &str = "public-intent\0";
 const MAX_REQUEST_ID: usize = 128;
 const MAX_PRINCIPAL: usize = 512;
+/// Deployment ceiling on complete canonical DAG-CBOR record bytes (64 KiB).
+/// A conservative storage policy, not a universal protocol maximum; large
+/// payloads belong in linked blobs. Includes CBOR map/type/length overhead.
+/// See https://atproto.com/specs/repository#security-considerations.
+pub const MAX_PUBLIC_RECORD_BYTES: usize = 64 * 1024;
 
 fn record_prefix(did: &str) -> Vec<u8> {
     format!("{RECORD_PREFIX}{did}\0").into_bytes()
@@ -303,6 +308,10 @@ impl PublicRepoWriter {
 
         let _guard = self.store.write_lock.lock();
         let record = AtprotoRecord::new(request.collection.clone(), &request.rkey, request.value)?;
+        ensure!(
+            record.bytes().len() <= MAX_PUBLIC_RECORD_BYTES,
+            "public record exceeds {MAX_PUBLIC_RECORD_BYTES}-byte canonical encoded limit"
+        );
         if let Some(intent) = self.store.intent(&self.did, &request.request_id)? {
             ensure!(
                 intent.request_id == request.request_id
@@ -448,6 +457,113 @@ mod tests {
             value: post(),
             expected_prev,
         }
+    }
+
+    #[test]
+    fn public_repo_oauth_port_authority_survives_commit_reopen_and_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let mut request = create_request(1, None);
+        request.did = "did:web:pds.example.test%3A8443".into();
+        let writer =
+            PublicRepoWriter::new(store.clone(), &request.did, key.clone(), gate.clone()).unwrap();
+        let result = writer.create_record(request.clone()).unwrap();
+        assert!(result
+            .uri
+            .starts_with("at://did:web:pds.example.test%3A8443/"));
+        drop(writer);
+        drop(store);
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let snapshot = store.snapshot(&request.did).unwrap().unwrap();
+        assert_eq!(snapshot.commit.did, request.did);
+        snapshot.commit.verify_atproto(key.verifying_key()).unwrap();
+        let writer = PublicRepoWriter::new(store, &request.did, key, gate).unwrap();
+        assert_eq!(writer.create_record(request).unwrap(), result);
+    }
+
+    #[test]
+    fn public_repo_encoded_size_boundary_rejects_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let writer = PublicRepoWriter::new(
+            store.clone(),
+            "did:web:tormentnexus.social",
+            p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng),
+            gate,
+        )
+        .unwrap();
+        let sized_request = |rkey, prev, size| {
+            let mut request = create_request(rkey, prev);
+            let value = |payload| {
+                DagCbor::str_map([
+                    ("$type", DagCbor::Text(request.collection.clone())),
+                    ("text", DagCbor::Text("x".repeat(payload))),
+                ])
+            };
+            let overhead = AtprotoRecord::new(&request.collection, &request.rkey, value(1024))
+                .unwrap()
+                .bytes()
+                .len()
+                - 1024;
+            request.value = value(size - overhead);
+            assert_eq!(
+                AtprotoRecord::new(&request.collection, &request.rkey, request.value.clone())
+                    .unwrap()
+                    .bytes()
+                    .len(),
+                size
+            );
+            request
+        };
+        let oversized = sized_request(1, None, MAX_PUBLIC_RECORD_BYTES + 1);
+        assert!(writer
+            .create_record(oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("canonical encoded limit"));
+        assert!(store
+            .db
+            .iterator(rocksdb::IteratorMode::Start)
+            .next()
+            .is_none());
+        let at_limit = sized_request(1, None, MAX_PUBLIC_RECORD_BYTES);
+        let first = writer.create_record(at_limit.clone()).unwrap();
+        assert_eq!(writer.create_record(at_limit).unwrap(), first);
+        let all_bytes = || {
+            store
+                .db
+                .iterator(rocksdb::IteratorMode::Start)
+                .map(|item| item.unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before = all_bytes();
+        assert!(writer
+            .create_record(sized_request(
+                2,
+                Some(first.commit_cid),
+                MAX_PUBLIC_RECORD_BYTES + 1
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("canonical encoded limit"));
+        assert_eq!(
+            all_bytes(),
+            before,
+            "oversize rejection must not modify record/head/intent/block state"
+        );
+        let snapshot = store
+            .snapshot("did:web:tormentnexus.social")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.commit.cid_atproto().unwrap(), first.commit_cid);
+        assert_eq!(snapshot.records.len(), 1);
     }
 
     #[test]
