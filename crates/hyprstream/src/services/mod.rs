@@ -82,6 +82,7 @@ pub mod model;
 pub mod oauth;
 pub mod oai;
 pub mod policy;
+pub mod public_repo;
 pub mod registry;
 pub mod revocation;
 pub mod router;
