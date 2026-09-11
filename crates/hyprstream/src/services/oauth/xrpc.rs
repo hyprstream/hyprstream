@@ -925,7 +925,7 @@ pub async fn get_record(State(state): State<Arc<OAuthState>>, RawQuery(raw): Raw
     };
     let cid = params.get("cid").map(|c| c.trim());
     if let Some(writer) = owned_public_writer(&state, repo).await {
-        return durable_reads::get_record(writer, collection, rkey, cid).await;
+        return durable_reads::get_record(&state.xrpc_repos, writer, collection, rkey, cid).await;
     }
     get_record_core(&state.xrpc_repos, repo, collection, rkey, cid).await
 }
@@ -1932,6 +1932,115 @@ mod tests {
 
     fn read_request(uri: &str) -> HttpRequest<Body> {
         HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn router_durable_reads_enforce_aggregate_snapshot_budget() {
+        for (count, bytes) in [(257, 1), (18, 60_000)] {
+            let (_dir, store, _gate, app, _token) = build_write_input_fixture().await;
+            store
+                .insert_snapshot_budget_fixture_for_test("did:web:pub.example.com", count, bytes)
+                .unwrap();
+            for uri in [
+                "/xrpc/com.atproto.repo.getRecord?repo=pub.example.com&collection=app.bsky.feed.post&rkey=0000",
+                "/xrpc/com.atproto.repo.describeRepo?repo=pub.example.com",
+                "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com",
+            ] {
+                let response = app.clone().oneshot(read_request(uri)).await.unwrap();
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(body_json(response).await, json!({"error":"InternalServerError","message":"public repository read failed"}));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn router_all_durable_reads_share_export_admission() {
+        let (_dir, _store, _gate, app, token) = build_write_input_fixture().await;
+        let created = app
+            .clone()
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let mut held = Vec::new();
+        for _ in 0..GET_REPO_CONCURRENCY {
+            held.push(
+                app.clone()
+                    .oneshot(read_request(
+                        "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com",
+                    ))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut pending = Vec::new();
+        for uri in [
+            format!("/xrpc/com.atproto.repo.getRecord?repo=pub.example.com&collection=app.bsky.feed.post&rkey={}", Tid::from_raw(7).encode()),
+            "/xrpc/com.atproto.repo.describeRepo?repo=pub.example.com".to_owned(),
+        ] {
+            let app = app.clone();
+            pending.push(tokio::spawn(async move { app.oneshot(read_request(&uri)).await.unwrap() }));
+        }
+        for request in &mut pending {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), request)
+                    .await
+                    .is_err()
+            );
+        }
+        drop(held.pop());
+        for request in pending {
+            let response = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn router_describes_nonissuer_writers_without_legacy_handle_metadata() {
+        for did in [
+            "did:plc:abcdefghijklmnopqrstuvwx",
+            "did:web:account.example.com",
+        ] {
+            let (_dir, _store, _gate, app, token) =
+                build_write_input_fixture_for(did, "https://pds.example.com").await;
+            let mut input = write_input(7);
+            input["repo"] = json!(did);
+            let created = app
+                .clone()
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(created.status(), StatusCode::OK);
+            let response = app
+                .clone()
+                .oneshot(read_request(&format!(
+                    "/xrpc/com.atproto.repo.describeRepo?repo={did}"
+                )))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            assert_eq!(body["did"], did);
+            assert_eq!(body["didDoc"]["id"], did);
+            assert_eq!(body["handle"], "handle.invalid");
+            assert_eq!(body["handleIsCorrect"], false);
+            assert!(body["didDoc"].get("alsoKnownAs").is_none());
+            assert_eq!(body["collections"], json!(["app.bsky.feed.post"]));
+            // The unknown account handle must not claim the PDS issuer handle.
+            input["repo"] = json!("pds.example.com");
+            let foreign = app
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+        }
     }
 
     #[tokio::test]

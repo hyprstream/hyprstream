@@ -38,6 +38,38 @@ const MAX_PRINCIPAL: usize = 512;
 /// See https://atproto.com/specs/repository#security-considerations.
 pub const MAX_PUBLIC_RECORD_BYTES: usize = 64 * 1024;
 
+/// MVP repository capacity: bounds raw records, decoded trees and MST work for
+/// every snapshot caller. Key bytes count too; tiny records also have a limit.
+pub const MAX_PUBLIC_SNAPSHOT_BYTES: usize = 1024 * 1024;
+pub const MAX_PUBLIC_SNAPSHOT_RECORDS: usize = 256;
+
+#[derive(Default)]
+struct SnapshotBudget {
+    bytes: usize,
+    records: usize,
+}
+
+impl SnapshotBudget {
+    fn charge(&mut self, key_bytes: usize, record_bytes: usize) -> Result<()> {
+        ensure!(
+            record_bytes <= MAX_PUBLIC_RECORD_BYTES,
+            "public snapshot record exceeds byte budget"
+        );
+        let bytes = self
+            .bytes
+            .checked_add(key_bytes)
+            .and_then(|bytes| bytes.checked_add(record_bytes));
+        ensure!(
+            self.records < MAX_PUBLIC_SNAPSHOT_RECORDS
+                && bytes.is_some_and(|bytes| bytes <= MAX_PUBLIC_SNAPSHOT_BYTES),
+            "public snapshot exceeds aggregate budget"
+        );
+        self.bytes = bytes.ok_or_else(|| anyhow!("public snapshot byte count overflow"))?;
+        self.records += 1;
+        Ok(())
+    }
+}
+
 /// Blob storage is not wired to this public writer. Never accept caller-supplied
 /// blob claims as proof of account ownership, bytes, MIME type or size. Scan
 /// every object, including open unions/extensions and legacy blob objects.
@@ -236,6 +268,36 @@ impl std::fmt::Debug for PublicRepoStore {
 
 impl PublicRepoStore {
     #[cfg(test)]
+    pub(crate) fn insert_snapshot_budget_fixture_for_test(
+        &self,
+        did: &str,
+        count: usize,
+        payload_bytes: usize,
+    ) -> Result<()> {
+        let value = DagCbor::str_map([
+            ("$type", DagCbor::Text("app.bsky.feed.post".into())),
+            ("text", DagCbor::Text("x".repeat(payload_bytes))),
+        ]);
+        let record = AtprotoRecord::new(
+            "app.bsky.feed.post",
+            AtprotoRecordKey::new("fixture")?,
+            value,
+        )?;
+        let mut batch = rocksdb::WriteBatch::default();
+        for index in 0..count {
+            let key = record_key(did, "app.bsky.feed.post", &format!("{index:04}"));
+            if index + 1 == count {
+                // Same size, invalid CBOR: capacity must fail BEFORE decoding it.
+                batch.put(key, vec![0xff; record.bytes().len()]);
+            } else {
+                batch.put(key, record.bytes());
+            }
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn insert_unverified_blob_for_test(&self, did: &str) -> Result<()> {
         let account = self
             .accounts
@@ -322,14 +384,22 @@ impl PublicRepoStore {
         let snapshot = self.db.snapshot();
         let prefix = record_prefix(did);
         let mut records = BTreeMap::new();
-        for item in snapshot.iterator(rocksdb::IteratorMode::From(
-            &prefix,
-            rocksdb::Direction::Forward,
-        )) {
-            let (key, bytes) = item.context("public repo record scan failed")?;
+        let mut budget = SnapshotBudget::default();
+        // Borrow RocksDB's current key/value so oversized values are rejected
+        // before the iterator or decoder copies them into Rust-owned buffers.
+        let mut iterator = snapshot.raw_iterator();
+        iterator.seek(&prefix);
+        while iterator.valid() {
+            let key = iterator
+                .key()
+                .ok_or_else(|| anyhow!("public record key unavailable"))?;
             if !key.starts_with(&prefix) {
                 break;
             }
+            let bytes = iterator
+                .value()
+                .ok_or_else(|| anyhow!("public record bytes unavailable"))?;
+            budget.charge(key.len(), bytes.len())?;
             let suffix = std::str::from_utf8(&key[prefix.len()..])
                 .context("public repo record key is not UTF-8")?;
             let (collection, rkey) = suffix
@@ -337,19 +407,27 @@ impl PublicRepoStore {
                 .ok_or_else(|| anyhow!("public repo record key missing separator"))?;
             let rkey = AtprotoRecordKey::new(rkey)?;
             let record =
-                AtprotoRecord::from_bytes(collection, &rkey, &bytes).with_context(|| {
+                AtprotoRecord::from_bytes(collection, &rkey, bytes).with_context(|| {
                     format!("invalid public record {did}/{collection}/{}", rkey.as_str())
                 })?;
             reject_unverified_blobs(record.value())?;
             records.insert((collection.to_owned(), rkey), record);
+            iterator.next();
         }
+        iterator
+            .status()
+            .context("public repo record scan failed")?;
         if records.is_empty() {
             return Ok(None);
         }
         let bytes = snapshot
-            .get(commit_key(did))
+            .get_pinned(commit_key(did))
             .context("public repo commit read failed")?
             .ok_or_else(|| anyhow!("public repo has records but no signed commit"))?;
+        ensure!(
+            bytes.len() <= MAX_PUBLIC_RECORD_BYTES,
+            "public commit exceeds byte budget"
+        );
         let commit = Commit::from_atproto_dag_cbor(&bytes)
             .context("public repo signed commit is invalid")?;
         ensure!(commit.did == did, "public repo commit DID mismatch");
@@ -663,12 +741,19 @@ impl PublicRepoWriter {
         }
 
         let existing = self.store.snapshot(&self.did)?;
+        let mut budget = SnapshotBudget::default();
         let (mut keyed, previous, previous_rev) = match existing {
             Some(snapshot) => {
                 let previous = snapshot.commit.cid_atproto()?;
                 let previous_rev = snapshot.commit.rev;
                 if !condition.matches(Some(previous)) {
                     return Err(PublicRepoWriteError::InvalidSwap);
+                }
+                for ((collection, rkey), record) in &snapshot.records {
+                    budget.charge(
+                        record_key(&self.did, collection, rkey.as_str()).len(),
+                        record.bytes().len(),
+                    )?;
                 }
                 let keyed = snapshot
                     .records
@@ -702,6 +787,12 @@ impl PublicRepoWriter {
         if keyed.contains_key(&record_key) {
             return Err(PublicRepoWriteError::RecordAlreadyExists);
         }
+        budget
+            .charge(
+                self::record_key(&self.did, record.collection(), record.rkey().as_str()).len(),
+                record.bytes().len(),
+            )
+            .map_err(PublicRepoWriteError::InvalidRequest)?;
         keyed.insert(record_key, record.cid());
 
         let tree = Node::from_keyed_records(&keyed);
@@ -1923,6 +2014,69 @@ mod tests {
             store.snapshot(writer.did()).unwrap().unwrap().records.len(),
             3
         );
+    }
+
+    #[test]
+    fn publication_capacity_rejects_before_commit_and_keeps_existing_retries_valid() {
+        for payload_bytes in [0, 60_000] {
+            let (_dir, store, _gate, writer) = transaction_fixture();
+            let mut last = None;
+            for id in 1..=MAX_PUBLIC_SNAPSHOT_RECORDS + 1 {
+                let mut request = transaction_request(id as u64);
+                request.value = DagCbor::str_map([
+                    ("$type", DagCbor::Text(request.collection.clone())),
+                    ("text", DagCbor::Text("x".repeat(payload_bytes))),
+                ]);
+                let result = writer.create_record_with_expected_prev_text(request.clone(), None);
+                if let Ok(result) = result {
+                    last = Some((request, result));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(PublicRepoWriteError::InvalidRequest(_))
+                    ));
+                    let (request, original) = last.as_ref().unwrap();
+                    let snapshot = store.snapshot(writer.did()).unwrap().unwrap();
+                    assert_eq!(snapshot.records.len(), id - 1);
+                    assert_eq!(snapshot.commit.cid_atproto().unwrap(), original.commit_cid);
+                    assert_eq!(
+                        writer
+                            .create_record_with_expected_prev_text(request.clone(), None)
+                            .unwrap(),
+                        *original
+                    );
+                    if payload_bytes == 0 {
+                        assert_eq!(snapshot.records.len(), MAX_PUBLIC_SNAPSHOT_RECORDS);
+                    } else {
+                        assert!(snapshot.records.len() < MAX_PUBLIC_SNAPSHOT_RECORDS);
+                    }
+                    break;
+                }
+                assert!(id <= MAX_PUBLIC_SNAPSHOT_RECORDS);
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_budget_fails_before_decoding_over_limit_records() {
+        for (count, bytes) in [
+            (MAX_PUBLIC_SNAPSHOT_RECORDS + 1, 1),
+            (18, 60_000),
+            (1, MAX_PUBLIC_RECORD_BYTES + 1),
+        ] {
+            let (_dir, store, _gate, writer) = transaction_fixture();
+            store
+                .insert_snapshot_budget_fixture_for_test(writer.did(), count, bytes)
+                .unwrap();
+            // Last record is intentionally invalid; budget wins before decode.
+            let error = store.snapshot(writer.did()).unwrap_err().to_string();
+            assert!(error.contains("budget"), "{error}");
+            assert!(writer
+                .public_snapshot()
+                .unwrap_err()
+                .to_string()
+                .contains("budget"));
+        }
     }
 
     #[test]

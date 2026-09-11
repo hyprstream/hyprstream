@@ -43,6 +43,7 @@ fn record_json(value: &DagCbor) -> anyhow::Result<Value> {
 }
 
 pub(super) async fn get_record(
+    store: &XrpcRepoStore,
     writer: Arc<PublicRepoWriter>,
     collection: &str,
     rkey: &str,
@@ -55,10 +56,15 @@ pub(super) async fn get_record(
             "collection and rkey are required",
         );
     }
+    let permit = match store.acquire_get_repo_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return internal_error(),
+    };
     let collection = collection.to_owned();
     let rkey = rkey.to_owned();
     let cid = cid.map(str::to_owned);
     let result=tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Option<Value>>> {
+        let _permit = permit;
         let Some((snapshot,_))=writer.public_snapshot()? else { return Ok(None); };
         let key=match AtprotoRecordKey::new(rkey) { Ok(key)=>key, Err(_)=>return Ok(Some(None)) };
         let Some(record)=snapshot.records.get(&(collection,key)) else { return Ok(Some(None)); };
@@ -77,6 +83,25 @@ pub(super) async fn get_record(
     }
 }
 
+const MAX_PUBLIC_CAR_BYTES: usize = 2 * 1024 * 1024;
+
+fn append_car_block(car: &mut Vec<u8>, cid: Cid, bytes: &[u8]) -> anyhow::Result<()> {
+    // Conservative framing bound, checked before section allocation/copy.
+    let extra = bytes
+        .len()
+        .checked_add(cid.as_bytes().len() + 10)
+        .ok_or_else(|| anyhow::anyhow!("public CAR length overflow"))?;
+    anyhow::ensure!(
+        car.len()
+            .checked_add(extra)
+            .is_some_and(|size| size <= MAX_PUBLIC_CAR_BYTES),
+        "public CAR exceeds byte budget"
+    );
+    car.try_reserve_exact(extra)?;
+    car.extend_from_slice(&hyprstream_pds::car::car_block_bytes(cid, bytes));
+    Ok(())
+}
+
 fn repo_car(snapshot: &PublicRepoSnapshot) -> anyhow::Result<Vec<u8>> {
     let keyed = snapshot
         .records
@@ -85,17 +110,19 @@ fn repo_car(snapshot: &PublicRepoSnapshot) -> anyhow::Result<Vec<u8>> {
         .collect();
     let (_, nodes) = Node::from_keyed_records(&keyed).to_node_data_with_blocks_atproto()?;
     let commit_cid = snapshot.commit.cid_atproto()?;
-    let mut blocks = vec![(commit_cid, snapshot.commit.to_atproto_dag_cbor()?)];
+    let mut car = hyprstream_pds::car::build_car_v1_atproto(&[commit_cid], &[])?;
+    append_car_block(
+        &mut car,
+        commit_cid,
+        &snapshot.commit.to_atproto_dag_cbor()?,
+    )?;
     for (cid, node) in nodes {
-        blocks.push((cid, node.encode_atproto()?));
+        append_car_block(&mut car, cid, &node.encode_atproto()?)?;
     }
-    blocks.extend(
-        snapshot
-            .records
-            .values()
-            .map(|record| (record.cid(), record.bytes().to_vec())),
-    );
-    hyprstream_pds::car::build_car_v1_atproto(&[commit_cid], &blocks)
+    for record in snapshot.records.values() {
+        append_car_block(&mut car, record.cid(), record.bytes())?;
+    }
+    Ok(car)
 }
 
 pub(super) async fn get_repo(
@@ -147,32 +174,58 @@ pub(super) async fn describe_repo(state: &OAuthState, writer: Arc<PublicRepoWrit
         .get_public(writer.did())
         .await
         .map(|snapshot| snapshot.handle.clone());
-    let handle = match handle {
-        Some(handle) => handle,
-        None => {
-            if state.atproto_service_did().as_deref() != Some(writer.did()) {
-                return missing_repo();
-            }
-            let Some(handle) = url::Url::parse(&state.issuer_url)
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_owned))
-            else {
-                return missing_repo();
-            };
-            handle
-        }
+    // No trusted account handle exists for some PLC/non-issuer repositories.
+    // Use the protocol's invalid-handle sentinel without inventing a binding.
+    let handle = handle.or_else(|| {
+        (state.atproto_service_did().as_deref() == Some(writer.did()))
+            .then(|| {
+                url::Url::parse(&state.issuer_url)
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_owned))
+            })
+            .flatten()
+    });
+    let handle_is_correct = handle.is_some();
+    let handle = handle.unwrap_or_else(|| "handle.invalid".to_owned());
+    let permit = match state.xrpc_repos.acquire_get_repo_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return internal_error(),
     };
     let issuer = state.issuer_url.clone();
     let result=tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let _permit = permit;
         let Some((snapshot,key))=writer.public_snapshot()? else { return Ok(None); };
         let collections:std::collections::BTreeSet<_>=snapshot.records.keys().map(|(collection,_)|collection.as_str()).collect();
         let identity=AtprotoIdentity {p256_vk:&key,handle:&handle,drain:None,lead:None};
-        let did_doc=build_did_document(&snapshot.did,&issuer,&[],Some(&identity),&[],None,None);
-        Ok(Some(json!({"handle":handle,"did":snapshot.did,"didDoc":did_doc,"collections":collections,"handleIsCorrect":true})))
+        let mut did_doc=build_did_document(&snapshot.did,&issuer,&[],Some(&identity),&[],None,None);
+        if !handle_is_correct {
+            if let Some(document) = did_doc.as_object_mut() { document.remove("alsoKnownAs"); }
+        }
+        Ok(Some(json!({"handle":handle,"did":snapshot.did,"didDoc":did_doc,"collections":collections,"handleIsCorrect":handle_is_correct})))
     }).await;
     match result {
         Ok(Ok(Some(value))) => axum::Json(value).into_response(),
         Ok(Ok(None)) => missing_repo(),
         _ => internal_error(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn car_budget_rejects_before_appending_an_excess_section() {
+        let block = vec![0; 64 * 1024];
+        let cid = Cid::from_dag_cbor(&block);
+        let mut car = Vec::new();
+        loop {
+            let before = car.len();
+            if append_car_block(&mut car, cid, &block).is_err() {
+                assert_eq!(car.len(), before);
+                assert!(car.len() <= MAX_PUBLIC_CAR_BYTES);
+                break;
+            }
+        }
     }
 }
