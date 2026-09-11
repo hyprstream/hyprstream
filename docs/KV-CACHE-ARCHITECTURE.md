@@ -157,12 +157,20 @@ conversation turns:
    (`swap_session_cache`).
 2. `prefix_match_len(&prompt_tokens)` compares the new prompt against
    `cached_token_ids` from the previous turn.
-3. On a hit, `rewind_session_state` rewinds the cache: for pure-attention
-   models the cache is `truncate_to(prefix_len)` (discarding the stale
-   suffix, e.g. the previous turn's generation) and **prefill starts at
-   `prefix_len`** instead of 0 — only the new suffix is computed.
-4. On a miss, the cache is cleared and prefill starts fresh.
-5. After generation, `save_cached_tokens` records the full token sequence for
+3. On a hit with a nonempty suffix, `resolve_session_prefill_start` rewinds
+   the cache via `rewind_session_state`: for pure-attention models the cache
+   is `truncate_to(prefix_len)` (discarding the stale suffix, e.g. the
+   previous turn's generation) and **prefill starts at `prefix_len`** instead
+   of 0 — only the new suffix is computed.
+4. An **exact-prompt repeat** (`prefix_len == prompt_len` — the session
+   resending its previous prompt verbatim) is treated as a miss: no tokens
+   remain to prefill, and sampling the first new token needs logits for the
+   last prompt position, which the cache does not retain. The cache is
+   cleared and the full prompt is recomputed. Re-prefilling onto the restored
+   cache would double-advance hybrid recurrent state (see below) and re-run
+   the prompt redundantly for pure-attention models.
+5. On a miss, the cache is cleared and prefill starts fresh.
+6. After generation, `save_cached_tokens` records the full token sequence for
    the next turn's match.
 
 A typical multi-turn chat reuses the entire shared history, skipping most of
@@ -180,13 +188,21 @@ reuse for these models therefore works differently:
   snapshot captured at the **end of that turn's prefill**
   (`KVCacheManager::set_cached_tokens_with_ssm`; the snapshot is taken in
   `TextStream::sample_next_token` before decode advances the state).
-- On a prefix hit, `rewind_session_state` reuses the prefix **only when the
-  full cached sequence matched** (`prefix_len == cached_token_count()`) and a
-  snapshot is present: it truncates KV *and* restores the snapshot
+- On a prefix hit with a nonempty suffix (`prefix_len < prompt_len`),
+  `rewind_session_state` reuses the prefix **only when the full cached
+  sequence matched** (`prefix_len == cached_token_count()`) and a snapshot is
+  present: it truncates KV *and* restores the snapshot
   (`Qwen3_5Model::restore_ssm_states`). A partial match or a missing snapshot
   discards KV + SSM state and forces a full recompute — decoding from
   truncated KV with stale recurrent state would silently condition on the
   wrong context.
+- On an **exact-prompt repeat** (`prefix_len == prompt_len`, even when the
+  full cached sequence matched and a snapshot exists) the snapshot is not
+  restored: there is no suffix left to prefill, so the engine re-runs the
+  whole prompt to obtain end-of-prefill logits — and that re-run must start
+  from cleared state, or the restored GDN recurrence would advance over the
+  prompt a second time and the end-of-prefill snapshot captured afterwards
+  would be wrong for every later turn.
 - On a miss (and for stateless requests) `clear_kv_cache` resets both the KV
   cache and all conv/rec slots, so no recurrent state leaks across requests.
 

@@ -3178,6 +3178,129 @@ mod pipeline_tests {
         assert_eq!(gen, gen_ref);
         assert_logits_match(&logits, &logits_ref, "post-clear run vs fresh model");
     }
+
+    /// Bug characterization (non-vacuity guard for the exact-repeat regression
+    /// below): routing an EXACT-prompt repeat (`prefix_len == prompt_len`)
+    /// through the snapshot restore re-runs the FULL prompt with the GDN
+    /// recurrence starting from the previous turn's end-of-prefill state
+    /// instead of zero — this is what the pre-fix hit path effectively did,
+    /// because `sample_next_token` falls through to a full prefill when no
+    /// suffix remains to prefill. The first re-forwarded row is then
+    /// conditioned on turn 1's recurrent state and MUST diverge from a
+    /// fresh-cache prefill. (The divergence decays across rows as the
+    /// delta-rule recurrence forgets the restored state, so it is asserted on
+    /// the FIRST row; the last row lands near the fixture's float-reassociation
+    /// noise floor and proves nothing.)
+    #[test]
+    fn session_exact_prompt_hit_restored_reforward_diverges_from_fresh_cache() {
+        // Long enough cached history that the restored end-of-prefill state is
+        // appreciable at the first re-forwarded row.
+        let prompt: Vec<i64> = [1i64, 5, 9, 2, 7, 3, 8, 4]
+            .iter()
+            .cycle()
+            .take(24)
+            .copied()
+            .collect();
+
+        // Session model: turn 1, save tokens + end-of-prefill SSM snapshot.
+        let model = whole_model();
+        let cache = session_cache();
+        let mut m = model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, cache.clone());
+        let model = m;
+
+        let (_gen1, _logits1, ssm1) = run_turn(&model, &prompt, 0, 3);
+        cache
+            .lock()
+            .set_cached_tokens_with_ssm(prompt.clone(), Some(ssm1));
+
+        // The pre-fix exact-hit path: restore the snapshot, then re-run the
+        // whole prompt at position 0. Row-wise logits of that re-forward (row
+        // i is conditioned on the recurrence as of position i).
+        let row_logits = |m: &Qwen3_5Model| -> Tensor {
+            let _g = tch::no_grad_guard();
+            let ids = Tensor::from_slice(&prompt).reshape([1, prompt.len() as i64]);
+            let emb = m.embed_tokens(&ids).unwrap();
+            let h = m.forward_layers(&emb, 0..m.num_layers(), 0, None).unwrap();
+            let h = m.apply_final_norm(&h).unwrap();
+            m.lm_head(&h).unwrap() // [1, seq, V]
+        };
+        let prefix_len = cache.lock().prefix_match_len(&prompt);
+        assert_eq!(prefix_len, prompt.len(), "exact repeat must fully match");
+        let start = crate::runtime::torch_engine::rewind_session_state(&model, prefix_len);
+        assert_eq!(start, prompt.len(), "rewind alone still reports the full hit");
+        let broken_rows = row_logits(&model);
+
+        // Reference: fresh model + fresh cache, same row-wise prefill.
+        let ref_model = whole_model();
+        let ref_cache = session_cache();
+        let mut m = ref_model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, ref_cache);
+        let ref_model = m;
+        let fresh_rows = row_logits(&ref_model);
+
+        let first_row_diff = (&broken_rows.select(1, 0).reshape([-1i64])
+            - &fresh_rows.select(1, 0).reshape([-1i64]))
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(
+            first_row_diff > 1e-4,
+            "restore-then-reforward on an exact repeat must condition the first row on the \
+             previous turn's recurrent state and diverge from a fresh prefill \
+             (first-row max_diff={first_row_diff}); otherwise the cleared-recompute \
+             regression test proves nothing"
+        );
+    }
+
+    /// Regression test (exact-prompt repeat): when the new prompt is IDENTICAL
+    /// to the cached one, the production reuse decision must NOT route the hit
+    /// through the end-of-prefill snapshot restore — there is no suffix left
+    /// to prefill, and sampling the first token needs a fresh forward, which
+    /// would double-advance the restored GDN recurrence (see the
+    /// characterization test above). `resolve_session_prefill_start` must
+    /// clear the cache and return 0, and the recomputed turn must then match
+    /// a fresh-cache reference token-for-token and logit-for-logit.
+    #[test]
+    fn session_exact_prompt_repeat_forces_cleared_recompute() {
+        let prompt = [1i64, 5, 9, 2, 7, 3];
+
+        let model = whole_model();
+        let cache = session_cache();
+        let mut m = model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, cache.clone());
+        let model = m;
+
+        let (_gen1, _logits1, ssm1) = run_turn(&model, &prompt, 0, 3);
+        cache
+            .lock()
+            .set_cached_tokens_with_ssm(prompt.to_vec(), Some(ssm1));
+
+        let prefix_len = cache.lock().prefix_match_len(&prompt);
+        assert_eq!(prefix_len, prompt.len(), "exact repeat must fully match");
+        let start = crate::runtime::torch_engine::resolve_session_prefill_start(
+            &model,
+            prefix_len,
+            prompt.len(),
+        );
+        assert_eq!(start, 0, "exact-prompt repeat must force full recompute");
+        // Cleared state: neither the restored snapshot nor turn 1's live GDN
+        // recurrence may leak into the recomputed prefill.
+        assert!(model.conv_states.lock().iter().all(Option::is_none));
+        assert!(model.rec_states.lock().iter().all(Option::is_none));
+
+        let (gen2, logits2, _ssm2) = run_turn(&model, &prompt, start, 4);
+
+        let ref_model = whole_model();
+        let ref_cache = session_cache();
+        let mut m = ref_model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, ref_cache);
+        let ref_model = m;
+        let (gen2_ref, logits2_ref, _ssm_ref) = run_turn(&ref_model, &prompt, 0, 4);
+
+        assert_eq!(gen2, gen2_ref);
+        assert_logits_match(&logits2, &logits2_ref, "recomputed exact repeat vs fresh cache");
+    }
     /// Regression guard for the causal-mask offset in cached multi-token
     /// forwards: with `q_len > 1` and `start_pos > 0` the mask must be
     /// `tril(kv_len - q_len)`, not `tril(0)` — otherwise every cached row

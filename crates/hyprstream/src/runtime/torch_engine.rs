@@ -1621,7 +1621,9 @@ impl TorchEngine {
 /// conditioned on the wrong context.
 ///
 /// Returns the number of reusable prefix tokens (0 = cache cleared, full
-/// prefill required).
+/// prefill required). The caller must guarantee a strict partial hit
+/// (`prefix_len < prompt_len`); the exact-prompt-repeat decision lives in
+/// [`resolve_session_prefill_start`].
 pub(crate) fn rewind_session_state(model: &dyn ModelOperations, prefix_len: usize) -> usize {
     let Some(cache) = model.get_kv_cache() else {
         return 0;
@@ -1654,6 +1656,37 @@ pub(crate) fn rewind_session_state(model: &dyn ModelOperations, prefix_len: usiz
             model.clear_kv_cache();
             0
         }
+    }
+}
+
+/// Decide the prefill start position for a session-cache prefix match.
+///
+/// A strict partial hit (`0 < prefix_len < prompt_len`) is reusable: there is
+/// a nonempty suffix left to prefill, and [`rewind_session_state`] puts the
+/// cache and model into the exact end-of-prefix state.
+///
+/// An exact-prompt repeat (`prefix_len == prompt_len` — the session resending
+/// its previous prompt verbatim, `prefix_len == cached_token_count()`) is NOT
+/// reusable even though the full cached sequence matched: no tokens remain to
+/// prefill, and sampling the first new token needs logits for the last prompt
+/// position, which the cache does not retain. The engine must re-run the whole
+/// prompt, and that re-run must start from CLEARED state — prefilling onto the
+/// restored KV plus end-of-prefill GDN snapshot would advance the recurrent
+/// state over the prompt a second time, producing wrong logits (and a wrong
+/// end-of-prefill snapshot for the next turn). A miss (`prefix_len == 0`)
+/// clears and starts fresh as before.
+///
+/// Returns the prefill start position (0 = cache cleared, full prefill).
+pub(crate) fn resolve_session_prefill_start(
+    model: &dyn ModelOperations,
+    prefix_len: usize,
+    prompt_len: usize,
+) -> usize {
+    if prefix_len > 0 && prefix_len < prompt_len {
+        rewind_session_state(model, prefix_len)
+    } else {
+        model.clear_kv_cache();
+        0
     }
 }
 
@@ -3458,16 +3491,17 @@ impl<'a> TextStream<'a> {
             };
 
             if prefix_len > 0 && prefix_len <= prompt_len {
-                // Rewind session state to the matched prefix. Pure-attention
-                // models truncate the KV cache; hybrid recurrent models
-                // (Qwen3.5) additionally restore the end-of-prefill GDN
-                // conv/rec snapshot saved with the cached tokens — or fall
-                // back to a full recompute (returns 0) when the recurrent
-                // state cannot be rewound exactly (partial match / no
-                // snapshot). See `rewind_session_state`.
+                // Resolve the hit: a strict partial prefix rewinds cached
+                // state (KV truncation; hybrid recurrent models additionally
+                // restore the end-of-prefill GDN conv/rec snapshot). An
+                // exact-prompt repeat (`prefix_len == prompt_len`) must
+                // recompute from cleared state instead — there is no suffix
+                // left to prefill, and the fresh forward would double-advance
+                // restored recurrent state. Both decisions live in
+                // `resolve_session_prefill_start`.
                 if let Some(model_arc) = &engine.persistent_model {
                     let model = model_arc.lock();
-                    rewind_session_state(model.as_ref(), prefix_len)
+                    resolve_session_prefill_start(model.as_ref(), prefix_len, prompt_len)
                 } else {
                     0
                 }
