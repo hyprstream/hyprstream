@@ -61,7 +61,7 @@
 //! self-hosted `iroh-dns-server` configured through the owned endpoint builder.
 
 use anyhow::Result;
-use iroh::endpoint::{Connection, presets};
+use iroh::endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks, presets};
 use iroh::protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 
@@ -70,6 +70,43 @@ pub const ALPN_MOQ_LITE: &[u8] = b"moql";
 
 /// ALPN for the raw Cap'n Proto bidi RPC plane.
 pub const ALPN_HYPRSTREAM_RPC: &[u8] = b"hyprstream-rpc/1";
+
+/// Keep the owned HyprStream ALPNs on a PQ-hybrid carrier while allowing the
+/// endpoint's outer HTTPS clients (N0 relay and pkarr) to interoperate with
+/// classical-only public infrastructure. The provider therefore offers
+/// X25519 as a fallback, but a completed HyprStream carrier handshake that
+/// negotiated it is rejected before the protocol router sees the connection.
+#[derive(Debug, Clone, Copy, Default)]
+struct HybridCarrierHook;
+
+impl EndpointHooks for HybridCarrierHook {
+    async fn after_handshake(&self, conn: &Connection) -> AfterHandshakeOutcome {
+        if !matches!(conn.alpn(), ALPN_MOQ_LITE | ALPN_HYPRSTREAM_RPC) {
+            return AfterHandshakeOutcome::Accept;
+        }
+
+        let Some(data) = conn.handshake_data() else {
+            return AfterHandshakeOutcome::Reject {
+                error_code: 403u32.into(),
+                reason: b"missing iroh handshake data".to_vec(),
+            };
+        };
+        let Ok(data) = data.downcast::<noq::crypto::rustls::HandshakeData>() else {
+            return AfterHandshakeOutcome::Reject {
+                error_code: 403u32.into(),
+                reason: b"unsupported iroh handshake data".to_vec(),
+            };
+        };
+        if data.negotiated_key_exchange_group == Some(rustls::NamedGroup::X25519MLKEM768) {
+            AfterHandshakeOutcome::Accept
+        } else {
+            AfterHandshakeOutcome::Reject {
+                error_code: 403u32.into(),
+                reason: b"hyprstream carrier requires PQ-hybrid TLS".to_vec(),
+            }
+        }
+    }
+}
 
 /// Two-plane iroh substrate: one shared QUIC endpoint, two ALPN-dispatched
 /// protocol handlers.
@@ -82,7 +119,7 @@ pub struct IrohSubstrate {
 }
 
 /// Capability proving an outbound iroh endpoint was constructed by
-/// [`IrohSubstrate::new`] with the owned hybrid-only crypto provider.
+/// [`IrohSubstrate::new`] with the owned PQ-hybrid carrier policy.
 ///
 /// The inner endpoint is intentionally private: an already-bound iroh endpoint
 /// does not expose its effective provider, so arbitrary endpoints cannot be
@@ -103,10 +140,10 @@ impl IrohSubstrate {
     /// Build the substrate from raw 32-byte Ed25519 secret key material.
     ///
     /// Uses iroh's `presets::N0` for discovery (n0 DNS + pkarr) and relay
-    /// fallback. Alternate discovery configuration must be added through an
-    /// owned builder that also installs this same hybrid-only provider; a
-    /// prebuilt endpoint cannot safely be accepted because iroh exposes no
-    /// effective-provider introspection after bind.
+    /// fallback. The endpoint offers PQ-hybrid TLS first, with classical
+    /// X25519 needed for the public N0 HTTPS relay/pkarr services. The
+    /// [`HybridCarrierHook`] rejects classical negotiation on HyprStream's
+    /// owned ALPNs before any handler receives the connection.
     ///
     /// **pkarr here is liveness-only** — see the module-level "D3" note. The
     /// published record carries reach hints (relay + direct addrs) for this
@@ -122,16 +159,26 @@ impl IrohSubstrate {
         M: Into<Box<dyn DynProtocolHandler>>,
         R: Into<Box<dyn DynProtocolHandler>>,
     {
+        // N0 1.0.x configures native resolution through DNS TXT only, while
+        // its publisher writes relay-only reach to the HTTPS pkarr service.
+        // Install the matching HTTPS resolver as well so node-id-only native
+        // announcements can resolve the same reach that N0 publishes.
         let endpoint = Endpoint::builder(presets::N0)
+            .address_lookup(iroh::address_lookup::PkarrResolver::n0_dns())
             .secret_key(SecretKey::from_bytes(&secret_key_bytes))
-            // Owned mesh policy: require X25519MLKEM768 with no classical
-            // fallback. RFC 7250 raw-public-key identity is orthogonal to kx.
-            .crypto_provider(crate::transport::pq_provider::internal_mesh_crypto_provider())
+            // Public N0 relay/pkarr HTTPS currently requires classical
+            // X25519. The carrier hook above keeps HyprStream ALPNs hybrid-only.
+            .crypto_provider(crate::transport::pq_provider::pq_crypto_provider())
+            .hooks(HybridCarrierHook)
             .bind()
             .await
             .map_err(|e| anyhow::anyhow!("iroh endpoint bind: {e}"))?;
 
-        Ok(Self::from_owned_endpoint(endpoint, moq_handler, rpc_handler))
+        Ok(Self::from_owned_endpoint(
+            endpoint,
+            moq_handler,
+            rpc_handler,
+        ))
     }
 
     /// Build a hermetic direct-only substrate for unit tests.
@@ -159,16 +206,16 @@ impl IrohSubstrate {
             .await
             .map_err(|e| anyhow::anyhow!("test iroh endpoint bind: {e}"))?;
 
-        Ok(Self::from_owned_endpoint(endpoint, moq_handler, rpc_handler))
+        Ok(Self::from_owned_endpoint(
+            endpoint,
+            moq_handler,
+            rpc_handler,
+        ))
     }
 
     /// Attach the owned ALPNs to an endpoint constructed immediately above.
     /// Kept private because `Endpoint` does not reveal its effective provider.
-    fn from_owned_endpoint<M, R>(
-        endpoint: Endpoint,
-        moq_handler: M,
-        rpc_handler: R,
-    ) -> Self
+    fn from_owned_endpoint<M, R>(endpoint: Endpoint, moq_handler: M, rpc_handler: R) -> Self
     where
         M: Into<Box<dyn DynProtocolHandler>>,
         R: Into<Box<dyn DynProtocolHandler>>,
@@ -402,11 +449,14 @@ mod tests {
             )
             .await
             .expect("classical-only iroh mutation handshake must terminate");
-            assert!(
-                result.is_err(),
-                "internal iroh outbound endpoint reached owned ALPN {:?}",
-                String::from_utf8_lossy(alpn)
-            );
+            match result {
+                Err(_) => {}
+                Ok(conn) => {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed())
+                        .await
+                        .expect("classical-only carrier must be closed by the hybrid hook");
+                }
+            }
         }
 
         classical_client.close().await;
