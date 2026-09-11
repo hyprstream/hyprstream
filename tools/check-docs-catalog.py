@@ -819,11 +819,18 @@ def self_test(repo: Path) -> None:
     catalog, corpus = read_json(repo / "docs/schema-catalog.json"), read_json(repo / "docs/corpus-sources.json")
     schemas, consumers = tracked(repo, "*.capnp"), source_services(repo)
     validate(repo, catalog, corpus, schemas, consumers)
+    # PR-topology probes need a derivable merge-base: hosted PR runs always
+    # supply one, but source archives and non-origin remotes legitimately lack
+    # the ref, so those probes are skipped there instead of failing the self-test.
+    boundary = subprocess.run(["git", "-C", str(repo), "merge-base", "HEAD", "refs/remotes/origin/main"],
+                              capture_output=True, text=True)
+    has_pr_boundary = boundary.returncode == 0
+    pr_base = boundary.stdout.strip() if has_pr_boundary else ""
     # A hosted push validates its own topology only: it must never invent a PR
     # merge-base model after an ordinary main push.
-    if os.environ.get("DOCS_CATALOG_EVENT", "local") != "push":
+    if os.environ.get("DOCS_CATALOG_EVENT", "local") != "push" and has_pr_boundary:
         validate(repo, catalog, corpus, schemas, consumers, event="pull_request",
-                 revision=git(repo, "merge-base", "HEAD", "refs/remotes/origin/main"))
+                 revision=pr_base)
         validate(repo, catalog, corpus, schemas, consumers, event="pull_request",
                  revision=catalog["source_commit"])
         previous_head = os.environ.get("DOCS_CATALOG_AUDITED_HEAD")
@@ -839,11 +846,11 @@ def self_test(repo: Path) -> None:
             else: os.environ["DOCS_CATALOG_EVENT"] = previous_event
     expect_failure("unlisted schema", repo, copy.deepcopy(catalog), corpus, schemas + ["new.capnp"], consumers)
     expect_failure("stale schema", repo, copy.deepcopy(catalog), corpus, schemas[1:], consumers)
-    pr_base = git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
-    bad = copy.deepcopy(catalog); bad["source_commit"] = "not-a-git-revision"
-    expect_event_failure("schema provenance", repo, bad, corpus, schemas, consumers, "pull_request", pr_base)
-    bad = copy.deepcopy(catalog); bad["source_commit"] = "f" * 40
-    expect_event_failure("fabricated provenance commit", repo, bad, corpus, schemas, consumers, "pull_request", pr_base)
+    if has_pr_boundary:
+        bad = copy.deepcopy(catalog); bad["source_commit"] = "not-a-git-revision"
+        expect_event_failure("schema provenance", repo, bad, corpus, schemas, consumers, "pull_request", pr_base)
+        bad = copy.deepcopy(catalog); bad["source_commit"] = "f" * 40
+        expect_event_failure("fabricated provenance commit", repo, bad, corpus, schemas, consumers, "pull_request", pr_base)
     bad = copy.deepcopy(catalog); bad["source_commit"] = git(repo, "rev-parse", "HEAD"); bad["source_tree"] = git(repo, "rev-parse", "HEAD^{tree}")
     expect_failure("stale base provenance commit", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["source_tree"] = "0" * 40
