@@ -9,12 +9,13 @@
 //! under a classical `did:web`/`did:plc` authority that public infra will accept —
 //! so accepting did:at9p here never implies public infra must.
 //!
-//! This is a pure classification of the DID *method*; it is not a signature check
-//! (that is [`crate::commit::Commit::verify`]) and not a full DID-grammar
-//! validation (the resolver owns that). It answers exactly one question: *is this
-//! DID method one our PDS will host a repo for?*
+//! Public authorities are validated as complete repository identifiers, not
+//! DID URLs. Host-form web authorities use the hosted-account DNS rules and
+//! PLC authorities require their full base32 identifier. Native at9p capsule
+//! validation remains the native resolver's responsibility. This is not a
+//! signature or ownership check (see [`crate::commit::Commit::verify`]).
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 
 use hyprstream_rpc::identity::Did;
 
@@ -65,6 +66,10 @@ impl RepoAuthority {
 /// methods were already implicitly accepted by the commit layer, which never
 /// method-checked its `did`.
 pub fn accept_repo_authority(did: &str) -> Result<RepoAuthority> {
+    ensure!(
+        did.len() <= 2048 && !did.contains(['/', '?', '#', '\\', '\0']),
+        "repo authority must be a bare DID, not a DID URL"
+    );
     let d = Did::new(did.to_owned());
     if d.is_did_web() {
         if is_path_form_did_web(did) {
@@ -72,8 +77,16 @@ pub fn accept_repo_authority(did: &str) -> Result<RepoAuthority> {
                 "path-form did:web {did:?} is not an accepted repo authority; the atproto profile requires host-form did:web"
             );
         }
+        crate::did_op::validate_host_form_did_web(did)?;
         Ok(RepoAuthority::Web)
-    } else if did.starts_with("did:plc:") {
+    } else if let Some(identifier) = did.strip_prefix("did:plc:") {
+        ensure!(
+            identifier.len() == 24
+                && identifier
+                    .bytes()
+                    .all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')),
+            "repo did:plc requires 24 lowercase base32 characters"
+        );
         Ok(RepoAuthority::Plc)
     } else if d.is_did_at9p() {
         Ok(RepoAuthority::At9p)
@@ -91,7 +104,10 @@ mod tests {
     fn accepts_did_at9p() {
         let a = accept_repo_authority("did:at9p:bafkrei1234567890abcdefghijklmnop").unwrap();
         assert_eq!(a, RepoAuthority::At9p);
-        assert!(!a.is_publicly_publishable(), "did:at9p is bridged, not public");
+        assert!(
+            !a.is_publicly_publishable(),
+            "did:at9p is bridged, not public"
+        );
     }
 
     #[test]
@@ -100,7 +116,7 @@ mod tests {
         assert_eq!(web, RepoAuthority::Web);
         assert!(web.is_publicly_publishable());
 
-        let plc = accept_repo_authority("did:plc:abc123").unwrap();
+        let plc = accept_repo_authority("did:plc:ewvi7nxzyoun6zhxrhs64oiz").unwrap();
         assert_eq!(plc, RepoAuthority::Plc);
         assert!(plc.is_publicly_publishable());
     }
@@ -121,5 +137,30 @@ mod tests {
         assert!(accept_repo_authority("did:example:123").is_err());
         assert!(accept_repo_authority("not-a-did").is_err());
         assert!(accept_repo_authority("").is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_public_identifiers_and_did_urls() {
+        for did in [
+            "did:plc:",
+            "did:plc:abc",
+            "did:plc:ewvi7nxzyoun6zhxrhs64oi1",
+            "did:plc:EWVI7NXZYOUN6ZHX RHS64OIZ",
+            "did:web:",
+            "did:web:example..com",
+            "did:web:-example.com",
+            "did:web:example.com-",
+            "did:web:example_com",
+            "did:web:example.com%23fragment",
+            "did:web:example.com#fragment",
+            "did:web:example.com?query",
+            "did:web:example.com/path",
+            "did:web:example.com\0",
+            "did:plc:ewvi7nxzyoun6zhxrhs64oiz#key",
+            "did:plc:ewvi7nxzyoun6zhxrhs64oiz?query",
+            "did:plc:ewvi7nxzyoun6zhxrhs64oiz/path",
+        ] {
+            assert!(accept_repo_authority(did).is_err(), "{did:?}");
+        }
     }
 }

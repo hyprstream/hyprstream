@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, ensure, Context as _, Result};
-use hyprstream_pds::atproto_cbor::AtprotoRecord;
+use hyprstream_pds::atproto_cbor::{AtprotoRecord, AtprotoRecordKey};
 use hyprstream_pds::commit::{Commit, UnsignedCommit};
 use hyprstream_pds::dag_cbor::DagCbor;
 use hyprstream_pds::mst::Node;
@@ -100,7 +100,8 @@ pub struct PublicCreateRequest {
     pub principal: String,
     pub did: String,
     pub collection: String,
-    pub rkey: Tid,
+    /// A validated AT record key, including singleton keys such as `self`.
+    pub rkey: AtprotoRecordKey,
     pub value: DagCbor,
     /// Required repo-head CAS value. None means this must create the genesis
     /// record; retries use the request id and never silently fork a head.
@@ -118,7 +119,7 @@ pub struct PublicCommitResult {
 #[derive(Clone, Debug)]
 pub struct PublicRepoSnapshot {
     pub did: String,
-    pub records: BTreeMap<(String, Tid), AtprotoRecord>,
+    pub records: BTreeMap<(String, AtprotoRecordKey), AtprotoRecord>,
     pub commit: Commit,
 }
 
@@ -181,9 +182,11 @@ impl PublicRepoStore {
             let (collection, rkey) = suffix
                 .split_once('\0')
                 .ok_or_else(|| anyhow!("public repo record key missing separator"))?;
-            let rkey = Tid::parse(rkey)?;
-            let record = AtprotoRecord::from_bytes(collection, rkey, &bytes)
-                .with_context(|| format!("invalid public record {did}/{collection}/{rkey}"))?;
+            let rkey = AtprotoRecordKey::new(rkey)?;
+            let record =
+                AtprotoRecord::from_bytes(collection, &rkey, &bytes).with_context(|| {
+                    format!("invalid public record {did}/{collection}/{}", rkey.as_str())
+                })?;
             records.insert((collection.to_owned(), rkey), record);
         }
         if records.is_empty() {
@@ -199,7 +202,7 @@ impl PublicRepoStore {
         let keyed = records
             .iter()
             .map(|((collection, rkey), record)| {
-                (format!("{collection}/{}", rkey.encode()), record.cid())
+                (format!("{collection}/{}", rkey.as_str()), record.cid())
             })
             .collect();
         let tree = Node::from_keyed_records(&keyed);
@@ -299,7 +302,7 @@ impl PublicRepoWriter {
             .authorize(&request.principal, &self.did, &request.collection)?;
 
         let _guard = self.store.write_lock.lock();
-        let record = AtprotoRecord::new(request.collection.clone(), request.rkey, request.value)?;
+        let record = AtprotoRecord::new(request.collection.clone(), &request.rkey, request.value)?;
         if let Some(intent) = self.store.intent(&self.did, &request.request_id)? {
             ensure!(
                 intent.request_id == request.request_id
@@ -353,7 +356,7 @@ impl PublicRepoWriter {
                     .records
                     .into_iter()
                     .map(|((collection, rkey), record)| {
-                        (format!("{collection}/{}", rkey.encode()), record.cid())
+                        (format!("{collection}/{}", rkey.as_str()), record.cid())
                     })
                     .collect();
                 (keyed, Some(previous), Some(previous_rev))
@@ -441,10 +444,105 @@ mod tests {
             principal: "did:at9p:agent".into(),
             did: "did:web:tormentnexus.social".into(),
             collection: "app.bsky.feed.post".into(),
-            rkey: Tid::from_raw(rkey),
+            rkey: Tid::from_raw(rkey).into(),
             value: post(),
             expected_prev,
         }
+    }
+
+    #[test]
+    fn public_repo_rejects_invalid_authorities_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        for did in [
+            "did:plc:abc",
+            "did:plc:ewvi7nxzyoun6zhxrhs64oiz#key",
+            "did:web:example.com#fragment",
+            "did:web:example.com?query",
+            "did:web:example.com/path",
+            "did:web:example..com",
+            "did:web:example.com%2Fpath",
+        ] {
+            assert!(PublicRepoWriter::new(store.clone(), did, key.clone(), gate.clone()).is_err());
+            assert!(store.snapshot(did).is_err());
+        }
+        assert!(store
+            .db
+            .iterator(rocksdb::IteratorMode::Start)
+            .next()
+            .is_none());
+        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+        let writer = PublicRepoWriter::new(store.clone(), did, key, gate).unwrap();
+        let mut request = create_request(1, None);
+        request.did = did.to_owned();
+        writer.create_record(request).unwrap();
+        assert_eq!(store.snapshot(did).unwrap().unwrap().commit.did, did);
+    }
+
+    #[test]
+    fn public_repo_general_keys_preserve_profile_self_through_reopen_and_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let mut profile = create_request(1, None);
+        profile.collection = "app.bsky.actor.profile".into();
+        profile.rkey = AtprotoRecordKey::new("self").unwrap();
+        profile.value = DagCbor::str_map([
+            ("$type", DagCbor::Text(profile.collection.clone())),
+            ("displayName", DagCbor::Text("Profile".into())),
+        ]);
+        let writer =
+            PublicRepoWriter::new(store.clone(), &profile.did, key.clone(), gate.clone()).unwrap();
+        let first = writer.create_record(profile.clone()).unwrap();
+        assert_eq!(
+            first.uri,
+            format!("at://{}/app.bsky.actor.profile/self", profile.did)
+        );
+        let mut post = create_request(2, Some(first.commit_cid));
+        post.rkey = AtprotoRecordKey::new("custom-key:~").unwrap();
+        let second = writer.create_record(post.clone()).unwrap();
+        assert_eq!(writer.create_record(profile.clone()).unwrap(), first);
+        let mut duplicate = profile.clone();
+        duplicate.request_id = "duplicate-profile".into();
+        duplicate.expected_prev = Some(second.commit_cid);
+        assert!(writer
+            .create_record(duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
+        drop(writer);
+        drop(store);
+
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let snapshot = store.snapshot(&profile.did).unwrap().unwrap();
+        assert_eq!(snapshot.records.len(), 2);
+        let stored = &snapshot.records[&(profile.collection.clone(), profile.rkey.clone())];
+        assert_eq!(stored.rkey().as_str(), "self");
+        assert_eq!(stored.cid(), first.cid);
+        assert_eq!(stored.value(), &profile.value);
+        assert!(snapshot.records.contains_key(&(post.collection, post.rkey)));
+        snapshot.commit.verify_atproto(key.verifying_key()).unwrap();
+        assert_eq!(snapshot.commit.cid_atproto().unwrap(), second.commit_cid);
+        let writer = PublicRepoWriter::new(store.clone(), &profile.did, key, gate).unwrap();
+        assert_eq!(writer.create_record(profile).unwrap(), first);
+
+        // Storage reconstruction validates keys instead of treating an
+        // arbitrary path or separator as an ordinary record key.
+        store
+            .db
+            .put(
+                record_key(writer.did.as_str(), "app.bsky.actor.profile", "bad/key"),
+                stored.bytes(),
+            )
+            .unwrap();
+        assert!(store.snapshot(&writer.did).is_err());
     }
 
     #[test]
@@ -467,7 +565,7 @@ mod tests {
             principal: "did:at9p:agent".into(),
             did: "did:web:tormentnexus.social".into(),
             collection: "app.bsky.feed.post".into(),
-            rkey: Tid::from_raw(7),
+            rkey: Tid::from_raw(7).into(),
             value: post(),
             expected_prev: None,
         };
@@ -480,7 +578,7 @@ mod tests {
                 principal: "did:at9p:agent".into(),
                 did: "did:web:tormentnexus.social".into(),
                 collection: "app.bsky.feed.post".into(),
-                rkey: Tid::from_raw(8),
+                rkey: Tid::from_raw(8).into(),
                 value: post(),
                 expected_prev: Some(first.commit_cid),
             })
@@ -604,7 +702,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let missing = create_request(3, None);
-        intent.rkey = missing.rkey.encode();
+        intent.rkey = missing.rkey.as_str().to_owned();
         store
             .db
             .put(
@@ -688,7 +786,7 @@ mod tests {
                 principal: "agent".into(),
                 did: "did:web:tormentnexus.social".into(),
                 collection: "app.bsky.feed.post".into(),
-                rkey: Tid::from_raw(1),
+                rkey: Tid::from_raw(1).into(),
                 value: post(),
                 expected_prev: None,
             })
