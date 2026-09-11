@@ -466,6 +466,11 @@ mod tests {
             "did:web:example.com/path",
             "did:web:example..com",
             "did:web:example.com%2Fpath",
+            "did:web:example.arpa",
+            "did:web:example.onion",
+            "did:web:example.123",
+            "did:web:example.1com",
+            "did:web:127.0.0.1",
         ] {
             assert!(PublicRepoWriter::new(store.clone(), did, key.clone(), gate.clone()).is_err());
             assert!(store.snapshot(did).is_err());

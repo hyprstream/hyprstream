@@ -10,7 +10,8 @@
 //! so accepting did:at9p here never implies public infra must.
 //!
 //! Public authorities are validated as complete repository identifiers, not
-//! DID URLs. Host-form web authorities use the hosted-account DNS rules and
+//! DID URLs. Host-form web authorities use the hosted-account DNS rules plus
+//! atproto's public top-level-domain restrictions, and
 //! PLC authorities require their full base32 identifier. Native at9p capsule
 //! validation remains the native resolver's responsibility. This is not a
 //! signature or ownership check (see [`crate::commit::Commit::verify`]).
@@ -78,6 +79,30 @@ pub fn accept_repo_authority(did: &str) -> Result<RepoAuthority> {
             );
         }
         crate::did_op::validate_host_form_did_web(did)?;
+        // AT Protocol applies handle TLD restrictions to public did:web
+        // authorities too: https://atproto.com/specs/did#didweb-in-at-protocol.
+        // This public boundary does not enable localhost/ports or .test,
+        // which the protocol permits only in development environments.
+        let tld = did.rsplit('.').next().unwrap_or_default();
+        ensure!(
+            tld.as_bytes().first().is_some_and(u8::is_ascii_lowercase),
+            "public did:web top-level domain must start with an ASCII letter"
+        );
+        ensure!(
+            !matches!(
+                tld,
+                "alt"
+                    | "arpa"
+                    | "example"
+                    | "internal"
+                    | "invalid"
+                    | "local"
+                    | "localhost"
+                    | "onion"
+                    | "test"
+            ),
+            "public did:web top-level domain is reserved or disallowed by atproto"
+        );
         Ok(RepoAuthority::Web)
     } else if let Some(identifier) = did.strip_prefix("did:plc:") {
         ensure!(
@@ -161,6 +186,47 @@ mod tests {
             "did:plc:ewvi7nxzyoun6zhxrhs64oiz/path",
         ] {
             assert!(accept_repo_authority(did).is_err(), "{did:?}");
+        }
+    }
+
+    #[test]
+    fn public_web_authority_enforces_tld_and_production_host_rules() {
+        for host in [
+            "example.arpa",
+            "example.onion",
+            "example.123",
+            "example.1com",
+            "127.0.0.1",
+            "[::1]",
+            "%5B%3A%3A1%5D",
+            "localhost",
+            "localhost%3A6791",
+            "example.com%3A443",
+            "example.alt",
+            "example.example",
+            "example.internal",
+            "example.invalid",
+            "example.local",
+            "example.localhost",
+            "example.test",
+        ] {
+            assert!(
+                accept_repo_authority(&format!("did:web:{host}")).is_err(),
+                "{host}"
+            );
+        }
+        for host in [
+            "example.com",
+            "alice.example.com",
+            "123.example.com",
+            "arpa.example.com",
+            "onion.example.com",
+            "example.xn--fiqs8s",
+        ] {
+            assert_eq!(
+                accept_repo_authority(&format!("did:web:{host}")).unwrap(),
+                RepoAuthority::Web
+            );
         }
     }
 }
