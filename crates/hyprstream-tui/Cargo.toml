@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 avt = "0.17"
 hyprstream-compositor = { path = "../hyprstream-compositor" }
+hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }
 hyprstream-workers-tcl = { path = "../hyprstream-workers-tcl" }
 hyprstream-workers-python = { path = "../hyprstream-workers-python" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
@@ -50,9 +51,6 @@ tui-logger = { version = "0.18", default-features = false }
 ratatui-textarea = { version = "0.8", default-features = false }
 edtui = { version = "0.11" }
 crossterm = { version = "0.29", default-features = false }
-
-[build-dependencies]
-capnpc = { workspace = true }
 
 [profile.release]
 opt-level = "s"
