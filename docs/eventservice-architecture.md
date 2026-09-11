@@ -276,7 +276,7 @@ To avoid circular dependencies, event schemas are distributed:
 | Crate | Schema | Contents |
 |-------|--------|----------|
 | `hyprstream-rpc` | `schema/events.capnp` | `EventEnvelope`, `EventEnvelopeV2`, rekey announcements (`RekeyAnnouncement`, `WrappedKey`), prefix announcements |
-| `hyprstream-workers` | `schema/worker.capnp` | `SandboxStarted`/`SandboxStopped`/`ContainerStarted`/`ContainerStopped` (the `WorkerEvent` payloads) |
+| `hyprstream-rpc-std` | `schema/worker.capnp` | `SandboxStarted`/`SandboxStopped`/`ContainerStarted`/`ContainerStopped` (the `WorkerEvent` payloads) |
 | `hyprstream-rpc-std` | `schema/service_events.capnp` | `TypedEventEnvelope` + typed service event payloads (generation, metrics, …) |
 
 Consumers deserialize `payload` based on topic prefix (e.g. `worker.*` →

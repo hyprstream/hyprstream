@@ -30,7 +30,7 @@ App (ratatui)  ──→  TuiPaneBackend  ──→  TuiPane (cell buffer)
 ### Service registration and delivery
 
 `TuiService` is a registered service
-(`#[service_factory("tui", schema = "../../schema/tui.capnp", depends_on = ["policy", "discovery"])]`
+(`#[service_factory("tui", schema = "../../../hyprstream-rpc-std/schema/tui.capnp", depends_on = ["policy", "discovery"])]`
 in `crates/hyprstream/src/services/factories.rs`). The factory:
 
 - calls `init_local_moq_stream_plane("tui")` so the process has a MoQ
@@ -79,7 +79,7 @@ A 33ms frame loop diffs pane buffers (`tui/diff.rs`) and encodes once per
 distinct viewer display mode (ANSI for terminals, Cap'n Proto `TuiFrame` for
 the native compositor and WebTransport viewers).
 
-### RPC surface (`crates/hyprstream/schema/tui.capnp`)
+### RPC surface (`crates/hyprstream-rpc-std/schema/tui.capnp`)
 
 Methods on `TuiRequest`: `connect` / `disconnect` (viewer lifecycle),
 `createWindow` / `closeWindow` / `listWindows` / `focusWindow`,
