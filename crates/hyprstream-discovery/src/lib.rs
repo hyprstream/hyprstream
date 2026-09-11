@@ -168,6 +168,25 @@ pub use generated::discovery_client::{
     PingInfo, RecordCar, ServiceAnnouncement, ServiceEndpoints, ServiceList, ServiceSummary,
 };
 
+/// Production client-construction adapter for the portable `rpc-std` clients.
+///
+/// The adapter lives in this AGPL implementation crate because resolver
+/// authority/evidence is deployment policy. Third-party applications can
+/// provide their own `RpcClientProvider` without depending on Discovery.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProductionRpcClientProvider;
+
+impl hyprstream_rpc::RpcClientProvider for ProductionRpcClientProvider {
+    fn rpc_client(
+        &self,
+        service_name: &str,
+        signing_key: hyprstream_rpc::crypto::SigningKey,
+        token: Option<String>,
+    ) -> anyhow::Result<std::sync::Arc<dyn hyprstream_rpc::RpcClient>> {
+        service::production_rpc_client(service_name, signing_key, token)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod did_field_domain_type_tests {

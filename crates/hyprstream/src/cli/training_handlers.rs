@@ -25,7 +25,7 @@ use crate::services::generated::inference_client::{ChatMessage, ChatTemplateRequ
 use crate::services::generated::registry_client::{
     BranchRequest, CreateWorktreeRequest, StageFilesRequest, CommitRequest, PushRequest,
 };
-use crate::services::{InferenceServiceConfig, RegistryClient, WorktreeClient, INFERENCE_ENDPOINT};
+use crate::services::{InferenceServiceConfig, RegistryClient, WorktreeClient, WorktreeClientExt, INFERENCE_ENDPOINT};
 use crate::services::generated::inference_client::InferenceClient;
 use crate::storage::ModelRef;
 use hyprstream_rpc::{SigningKey, VerifyingKey};

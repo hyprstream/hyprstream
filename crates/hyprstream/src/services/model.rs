@@ -42,6 +42,7 @@ use crate::services::{
 use crate::services::generated::inference_client::InferenceClient;
 use crate::services::RegistryClient;
 use crate::services::generated::registry_client::{StageFilesRequest, CommitWithAuthorRequest};
+use crate::services::WorktreeClientExt;
 use crate::services::generated::policy_client::PolicyCheck;
 use crate::storage::ModelRef;
 use anyhow::{anyhow, Result};

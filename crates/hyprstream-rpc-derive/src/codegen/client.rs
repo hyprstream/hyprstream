@@ -606,6 +606,88 @@ fn generate_trait_method_impl(
 // Constructor Generation (Phase 2b)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Generate constructors that are safe to ship with the portable client.
+///
+/// Resolver authority is deliberately not linked into the contract crate.  A
+/// host may use the explicit [`Client::from_provider`] API; the
+/// `from_resolver` method below is retained only as a compatibility shim for
+/// applications that install a process provider through `hyprstream-rpc`.
+pub fn generate_portable_constructors(service_name: &str) -> TokenStream {
+    let pascal = to_pascal_case(service_name);
+    let client_name = format_ident!("{}Client", pascal);
+    let service_name_lit = service_name;
+
+    quote! {
+        #[cfg(not(target_arch = "wasm32"))]
+        impl #client_name {
+            /// Compatibility construction through the host-installed provider.
+            /// Prefer [`Self::from_provider`] for new applications.
+            pub fn from_resolver(
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                Ok(Self::new(hyprstream_rpc::rpc_client_from_provider(
+                    Self::SERVICE_NAME,
+                    signing_key,
+                    token,
+                )?))
+            }
+
+            /// Construct a client for a co-located service discovered through
+            /// the explicitly registered local endpoint.
+            pub fn for_local_bootstrap(
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                let registry = hyprstream_rpc::registry::try_global()
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "EndpointRegistry not initialized — local bootstrap requires registry::init()"
+                    ))?;
+                let transport = registry.registered_endpoint(
+                    #service_name_lit,
+                    hyprstream_rpc::registry::SocketKind::Rep,
+                ).ok_or_else(|| anyhow::anyhow!(
+                    "local bootstrap requires an explicitly registered service endpoint"
+                ))?;
+                Self::for_local_transport_bootstrap(&transport, signing_key, destination, token)
+            }
+
+            /// Construct a client from an explicit local endpoint string.
+            pub fn for_local_endpoint_bootstrap(
+                endpoint: &str,
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(endpoint);
+                Self::for_local_transport_bootstrap(&transport, signing_key, destination, token)
+            }
+
+            /// Construct a client from a typed local transport.
+            pub fn for_local_transport_bootstrap(
+                transport: &hyprstream_rpc::transport::TransportConfig,
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                anyhow::ensure!(
+                    matches!(
+                        &transport.endpoint,
+                        hyprstream_rpc::transport::EndpointType::Inproc { .. }
+                            | hyprstream_rpc::transport::EndpointType::Ipc { .. }
+                            | hyprstream_rpc::transport::EndpointType::SystemdFd { .. }
+                    ),
+                    "local bootstrap refuses network transport; use the identity-bound provider",
+                );
+                let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
+                let rpc = hyprstream_rpc::dial::dial(transport, signer, Some(destination), token)?;
+                Ok(Self::new(rpc))
+            }
+        }
+    }
+}
+
 /// Generate `new` and `with_endpoint` constructors on the client struct.
 ///
 /// Both constructors are `#[cfg(not(target_arch = "wasm32"))]` because `registry`
@@ -954,6 +1036,17 @@ pub fn generate_client(
             pub fn new(client: std::sync::Arc<dyn hyprstream_rpc::RpcClient>) -> Self {
                 Self { client, call_options: hyprstream_rpc::CallOptions::default() }
             }
+
+            /// Construct this typed client through an application-supplied
+            /// [`hyprstream_rpc::RpcClientProvider`].  Resolver authority and
+            /// endpoint policy stay outside the portable contract crate.
+            pub fn from_provider(
+                provider: &dyn hyprstream_rpc::RpcClientProvider,
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                Ok(Self::new(provider.rpc_client(Self::SERVICE_NAME, signing_key, token)?))
+            }
             #[must_use]
             pub fn with_delegated_bearer(mut self, token: impl Into<String>) -> Self {
                 self.call_options.delegated_bearer = Some(token.into());
@@ -986,7 +1079,7 @@ pub fn generate_client(
             }
 
             /// Send a generated request with its canonical schema method id.
-            async fn call_with_method(
+            pub async fn call_with_method(
                 &self,
                 method_discriminator: u16,
                 payload: Vec<u8>,
@@ -1006,7 +1099,7 @@ pub fn generate_client(
             }
 
             /// Send a generated streaming request with its schema method id.
-            async fn call_streaming_with_method(
+            pub async fn call_streaming_with_method(
                 &self,
                 method_discriminator: u16,
                 payload: Vec<u8>,

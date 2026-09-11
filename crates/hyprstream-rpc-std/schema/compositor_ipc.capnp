@@ -71,3 +71,4 @@ struct ChatAppIpcOut {
     ansiFrame @1 :Data;            # ANSI render output from ChatApp
   }
 }
+

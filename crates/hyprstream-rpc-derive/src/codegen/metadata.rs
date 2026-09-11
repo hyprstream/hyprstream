@@ -7,9 +7,28 @@ use crate::resolve::ResolvedSchema;
 use crate::schema::types::*;
 use crate::util::*;
 
-/// Generate schema metadata + render_doc only (no JSON dispatcher).
-/// Used by `generate_rpc_client!` (client-only, compiles on all targets).
+/// Generate schema metadata + render_doc only for a server-side projection.
+/// Used by `generate_rpc_server!` (the contract crate owns the client).
 pub fn generate_metadata_client_only(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+    generate_metadata_client_projection(service_name, resolved, types_crate, false)
+}
+
+/// Generate the public client metadata, including the transport-agnostic JSON
+/// dispatcher used by schema-driven SDK tooling.
+pub fn generate_metadata_client_with_dispatch(
+    service_name: &str,
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    generate_metadata_client_projection(service_name, resolved, types_crate, true)
+}
+
+fn generate_metadata_client_projection(
+    service_name: &str,
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+    include_json_dispatcher: bool,
+) -> TokenStream {
     let metadata_structs = generate_metadata_structs();
     let pascal = to_pascal_case(service_name);
     let schema_metadata = generate_schema_metadata_fn(
@@ -20,6 +39,20 @@ pub fn generate_metadata_client_only(service_name: &str, resolved: &ResolvedSche
         resolved,
         &resolved.raw.scoped_clients,
     );
+    // This dispatcher only invokes methods on the generated transport-agnostic
+    // client. Keeping it here makes schema-driven tooling available from the
+    // Apache SDK without pulling in an implementation/service crate.
+    let json_dispatcher = if include_json_dispatcher {
+        generate_json_dispatcher(
+            &pascal,
+            &resolved.raw.request_variants,
+            &resolved.raw.response_variants,
+            resolved,
+            &resolved.raw.scoped_clients,
+        )
+    } else {
+        TokenStream::new()
+    };
     let scoped_client_tree = generate_scoped_client_tree(&resolved.raw.scoped_clients, types_crate);
     let render_doc = generate_render_doc(
         service_name,
@@ -31,6 +64,7 @@ pub fn generate_metadata_client_only(service_name: &str, resolved: &ResolvedSche
     quote! {
         #metadata_structs
         #schema_metadata
+        #json_dispatcher
         #scoped_client_tree
         #render_doc
     }
@@ -1120,4 +1154,3 @@ fn doc_first_sentence(desc: &str) -> &str {
         desc
     }
 }
-

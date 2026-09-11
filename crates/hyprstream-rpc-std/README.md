@@ -6,8 +6,8 @@ Cap'n Proto service schemas and generated RPC clients for all standard hyprstrea
 
 This crate bundles:
 
-- **Cap'n Proto generated modules** for every first-party service: `inference_capnp`, `model_capnp`, `registry_capnp`, `policy_capnp`, `mcp_capnp`, `metrics_capnp`, `notification_capnp`, `discovery_capnp`, and more.
-- **Generated typed clients** (`InferenceClient`, `ModelClient`, `PolicyClient`, etc.) produced by `hyprstream-rpc-derive`'s `generate_rpc_service!` macro.
+- **Cap'n Proto generated modules** for every first-party service: `inference_capnp`, `model_capnp`, `registry_capnp`, `policy_capnp`, `mcp_capnp`, `metrics_capnp`, `notification_capnp`, `discovery_capnp`, `worker_capnp`, `workflow_capnp`, `tui_capnp`, and compositor IPC.
+- **Generated typed clients** (`InferenceClient`, `ModelClient`, `PolicyClient`, `WorkerClient`, `WorkflowClient`, `DiscoveryClient`, `TuiClient`, etc.) produced by `generate_rpc_client!`. They are Apache-2.0 and accept an application-supplied `RpcClientProvider` for deployment-specific endpoint resolution.
 - **WASM bindings** (`wasm_api.rs`): `wasm_bindgen` exports for the browser RPC client — `send_rpc`, `verify_signed_envelope`, `register_pq_trust`, `unregister_pq_trust`, `clear_pq_trust`.
 
 ## Targets
@@ -32,6 +32,10 @@ www-cyberdione-ai        (loads the WASM cdylib in a Web Worker)
 | `InferenceClient` | Typed client for the inference service |
 | `ModelClient` | Typed client for the model registry |
 | `PolicyClient` | Typed client for the policy/authz service |
+| `WorkerClient` / `WorkflowClient` | Typed workload and orchestration clients |
+| `DiscoveryClient` | Typed endpoint/evidence discovery client |
+| `TuiClient` | Typed TUI display service client |
+| `prelude` | Stable client/data/transport imports for third-party Rust consumers |
 | `wasm_api::send_rpc` | WASM: make a Cap'n Proto call over WebTransport |
 | `wasm_api::verify_signed_envelope` | WASM: verify COSE envelope signature |
 | `wasm_api::register_pq_trust` | WASM: bind an Ed25519 pubkey → ML-DSA-65 vk for hybrid enforcement |

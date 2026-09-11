@@ -1689,7 +1689,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 /// scope; the RPC surface (list/dispatch/getRun) works without it.
 #[service_factory(
     "workflow",
-    schema = "../../../hyprstream-workers/schema/workflow.capnp",
+    schema = "../../../hyprstream-rpc-std/schema/workflow.capnp",
     metadata = hyprstream_workers::generated::workflow_client::schema_metadata,
     depends_on = ["worker", "event", "policy", "registry", "discovery"]
 )]
@@ -2648,7 +2648,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 ///
 /// This service provides a terminal multiplexer with session persistence,
 /// multi-pane layouts, and remote access via ZMQ RPC and WebTransport.
-#[service_factory("tui", schema = "../../schema/tui.capnp", depends_on = ["policy", "discovery"])]
+#[service_factory("tui", schema = "../../../hyprstream-rpc-std/schema/tui.capnp", depends_on = ["policy", "discovery"])]
 fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating TuiService");
 
@@ -2755,7 +2755,7 @@ fn open_pds_store_readonly(
 ///
 /// This service exposes the EndpointRegistry so remote clients can discover
 /// registered services, their endpoints, socket kinds, and schemas.
-#[service_factory("discovery", schema = "../../../hyprstream-discovery/schema/discovery.capnp", metadata = hyprstream_discovery::generated::discovery_client::schema_metadata, depends_on = ["policy"])]
+#[service_factory("discovery", schema = "../../../hyprstream-rpc-std/schema/discovery.capnp", metadata = hyprstream_discovery::generated::discovery_client::schema_metadata, depends_on = ["policy"])]
 fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating DiscoveryService");
 

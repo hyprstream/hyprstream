@@ -1365,9 +1365,9 @@ pub fn generate_rpc_server(input: TokenStream) -> TokenStream {
 
 /// Generate client-only code from a Cap'n Proto service schema.
 ///
-/// Like `generate_rpc_service!` but emits only data structs, response enums,
-/// and metadata — no server handler traits, no ZMQ deps, no async runtime.
-/// Compiles to all targets including wasm32.
+/// Like `generate_rpc_service!` but emits only the portable data, client,
+/// client-trait, JSON-dispatch, and metadata surface — no server handlers or
+/// service implementation code. Compiles to all targets including wasm32.
 ///
 /// # Usage
 ///

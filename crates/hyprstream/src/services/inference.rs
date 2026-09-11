@@ -42,7 +42,7 @@ use crate::runtime::model_config::ModelConfig;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
 
 use crate::services::EnvelopeContext;
-use crate::services::WorktreeClient;
+use crate::services::{WorktreeClient, WorktreeClientExt};
 use crate::training::{DeltaPool, TenantDeltaConfig, TTTConfig, TestTimeTrainer};
 use hyprstream_rpc::Subject;
 use crate::training::serialize_state_dict_to_bytes;

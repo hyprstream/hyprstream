@@ -42,6 +42,8 @@ fn main() {
         "worker",
         "workflow",
         "discovery",
+        "tui",
+        "compositor_ipc",
     ];
 
     hyprstream_rpc_build::compile_schemas(schema_dir, out_path, import_paths, &schemas);

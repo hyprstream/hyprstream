@@ -15,7 +15,7 @@ use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::services::{WorktreeClient, RepositoryClient};
+use crate::services::{RepositoryClient, WorktreeClient, WorktreeClientExt};
 
 /// Checkpoint request sent to background worker
 #[derive(Debug, Clone)]

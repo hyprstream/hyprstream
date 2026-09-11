@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::services::WorktreeClient;
+use crate::services::{WorktreeClient, WorktreeClientExt};
 
 /// Information about a discovered adapter
 #[derive(Debug, Clone, Serialize, Deserialize)]

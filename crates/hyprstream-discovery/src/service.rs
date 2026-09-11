@@ -1370,7 +1370,16 @@ impl DiscoveryService {
                 accepted_state_source: source,
                 discovery_client: Some(discovery_client),
             }))
-            .map_err(|_| anyhow::anyhow!("production service resolver is already installed"))
+            .map_err(|_| anyhow::anyhow!("production service resolver is already installed"))?;
+
+        // Keep the resolver implementation and its evidence in this AGPL
+        // crate, but make the typed-client compatibility path available to
+        // the host through the Apache provider seam. Explicit consumers should
+        // continue to use `Client::from_provider` instead.
+        let _ = hyprstream_rpc::install_rpc_client_provider(Arc::new(
+            crate::ProductionRpcClientProvider,
+        ));
+        Ok(())
     }
 
     /// Attach the process-pinned source to the Discovery daemon. The source

@@ -14,8 +14,9 @@ use crate::schema::types::ParsedSchema;
 
 /// Generate client-only code from a parsed schema.
 ///
-/// Emits data structs, response enum, client struct, scoped clients, and metadata.
-/// Does NOT emit server-side handler traits, ZMQ service code, or native-only deps.
+/// Emits data structs, response enum, client struct, scoped clients, client
+/// traits, JSON dispatch, and metadata. Does NOT emit server-side handlers or
+/// service implementation code.
 /// Compiles to all targets including wasm32.
 pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_crate: Option<&syn::Path>) -> proc_macro2::TokenStream {
     let resolved = ResolvedSchema::from(schema);
@@ -49,9 +50,9 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
     // Scoped response enums + parsers (e.g., InferClientResponseVariant with parse_scoped_response)
     let scoped_response_types = scoped::generate_scoped_response_types(service_name, &resolved, types_crate);
 
-    // Schema metadata + render_doc() — needed for client-side documentation via VFS
-    // Uses client-only variant (no JSON dispatcher which requires ZmqClient types)
-    let metadata_code = metadata::generate_metadata_client_only(service_name, &resolved, types_crate);
+    // Schema metadata, JSON dispatch, and render_doc() for client-side
+    // documentation and schema-driven tooling.
+    let metadata_code = metadata::generate_metadata_client_with_dispatch(service_name, &resolved, types_crate);
 
     // Transport-agnostic dispatch function — routes method calls by name
     let portable_dispatch = dispatch::generate_portable_dispatch(service_name, &resolved, types_crate);
@@ -61,6 +62,14 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
 
     // Scoped client structs (same cfg-gated pattern)
     let scoped_clients = scoped::generate_portable_scoped_clients(service_name, &resolved, types_crate);
+
+    // Public client-side traits live with the generated clients.  Keeping these
+    // traits in the contract crate lets consumers depend on a single
+    // permissively licensed surface while service crates generate only their
+    // handlers and wire dispatch.
+    let service_traits = client::generate_service_traits(service_name, &resolved, types_crate);
+    let trait_impls = client::generate_trait_impls(service_name, &resolved, types_crate);
+    let constructors = client::generate_portable_constructors(service_name);
 
     // Generated 9P/VFS node table (#539 T2) — must compile to wasm32 too.
     let vfs_mount = vfs::generate_mount(service_name, &resolved);
@@ -76,6 +85,9 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
         #scoped_response_types
         #client_struct
         #scoped_clients
+        #service_traits
+        #trait_impls
+        #constructors
         #metadata_code
         #portable_dispatch
         #vfs_mount

@@ -16,7 +16,6 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=schema/");
     println!("cargo:rerun-if-changed=../hyprstream-rpc/schema/streaming.capnp");
     println!("cargo:rerun-if-changed=../hyprstream-rpc/schema/optional.capnp");
     println!("cargo:rerun-if-changed=.git/HEAD");
@@ -52,37 +51,24 @@ fn main() {
 }
 
 fn compile_capnp_schemas() {
-    let schema_dir = Path::new("schema");
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");
 
-    // Skip if schema directory doesn't exist
-    if !schema_dir.exists() {
-        return;
-    }
-
     let out_path = Path::new(&out_dir);
-    let import_paths: &[&Path] = &[&rpc_schema_dir, schema_dir];
-
-    // TUI-specific schemas only. Service schemas moved to hyprstream-rpc-std.
-    let schemas = ["tui", "compositor_ipc"];
 
     // Schemas from hyprstream-rpc/schema/ (need TS codegen but live in the RPC crate)
     let rpc_schemas = ["streaming", "nine"];
 
-    // Compile hyprstream schemas
-    hyprstream_rpc_build::compile_schemas(schema_dir, out_path, import_paths, &schemas);
-
     // Compile hyprstream-rpc schemas with rpc_schema_dir as src_prefix
-    hyprstream_rpc_build::compile_schemas(&rpc_schema_dir, out_path, import_paths, &rpc_schemas);
+    hyprstream_rpc_build::compile_schemas(&rpc_schema_dir, out_path, &[&rpc_schema_dir], &rpc_schemas);
 
     // Copy CGR files from hyprstream-rpc-std so the proc macro can find them.
     // DEP_HYPRSTREAM_RPC_STD_OUT_DIR is set by hyprstream-rpc-std's build.rs.
     if let Ok(std_out_dir) = env::var("DEP_HYPRSTREAM_RPC_STD_OUT_DIR") {
         let std_schemas = ["inference", "model", "registry", "policy", "mcp",
                           "metrics", "notification", "service_events", "chat_core", "oauth",
-                          "worker", "workflow", "discovery"];
+                          "worker", "workflow", "discovery", "tui", "compositor_ipc"];
         for name in &std_schemas {
             let cgr_src = Path::new(&std_out_dir).join(format!("{name}.cgr"));
             let cgr_dst = out_path.join(format!("{name}.cgr"));
@@ -101,7 +87,9 @@ fn compile_capnp_schemas() {
     // Copy CGR files to stable codegen-out/ for TypeScript codegen
     let codegen_dir = Path::new(&manifest_dir).join("../../codegen-out");
     let _ = std::fs::create_dir_all(&codegen_dir);
-    for name in schemas.iter().chain(rpc_schemas.iter()) {
+    for name in ["inference", "model", "registry", "policy", "mcp", "metrics",
+                 "service_events", "chat_core", "oauth", "worker", "workflow",
+                 "discovery", "tui", "compositor_ipc"].iter().chain(rpc_schemas.iter()) {
         let cgr_path = out_path.join(format!("{name}.cgr"));
         if cgr_path.exists() {
             let _ = std::fs::copy(&cgr_path, codegen_dir.join(format!("{name}.cgr")));

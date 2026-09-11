@@ -7498,6 +7498,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "getrandom 0.3.3",
  "hyprstream-9p",
+ "hyprstream-pay",
  "hyprstream-rpc",
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",

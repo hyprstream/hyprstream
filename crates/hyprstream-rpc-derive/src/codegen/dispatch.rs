@@ -450,15 +450,42 @@ fn generate_dispatch_arm(
                 return quote! { #method_name_str => Err(#err.to_owned()), };
             }
         }
-        _ => {
-            // Other primitives (Bool, UInt32, etc.)
+        CapnpType::Bool => {
             quote! {
+                let __value = args
+                    .get(#method_name_str)
+                    .or_else(|| args.get("value"))
+                    .cloned()
+                    .ok_or_else(|| format!("missing argument for {}", #method_name_str))?;
+                let value: bool = serde_json::from_value(__value)
+                    .map_err(|e| format!("deserialize {}: {e}", #method_name_str))?;
                 let payload = hyprstream_rpc::serialize_message(|msg| {
                     let mut req = msg.init_root::<#capnp_mod::#req_type::Builder>();
                     req.set_id(request_id);
-                    req.#set_method(());
+                    req.#set_method(value);
                 }).map_err(|e| format!("serialize: {e}"))?;
             }
+        }
+        _ if ct.is_numeric() => {
+            let rust_ty = rust_type_tokens(&ct.rust_owned_type());
+            quote! {
+                let __value = args
+                    .get(#method_name_str)
+                    .or_else(|| args.get("value"))
+                    .cloned()
+                    .ok_or_else(|| format!("missing argument for {}", #method_name_str))?;
+                let value: #rust_ty = serde_json::from_value(__value)
+                    .map_err(|e| format!("deserialize {}: {e}", #method_name_str))?;
+                let payload = hyprstream_rpc::serialize_message(|msg| {
+                    let mut req = msg.init_root::<#capnp_mod::#req_type::Builder>();
+                    req.set_id(request_id);
+                    req.#set_method(value);
+                }).map_err(|e| format!("serialize: {e}"))?;
+            }
+        }
+        _ => {
+            // Unsupported primitive shape — keep the diagnostic at runtime.
+            return quote! { #method_name_str => Err(format!("unsupported argument type for {}", #method_name_str)), };
         }
     };
 
@@ -497,6 +524,39 @@ fn generate_streaming_dispatch_arm(
                 req.#set_method(());
             }).map_err(|e| format!("serialize: {e}"))?;
         },
+        CapnpType::Bool => {
+            quote! {
+                let __value = args
+                    .get(#method_name_str)
+                    .or_else(|| args.get("value"))
+                    .cloned()
+                    .ok_or_else(|| format!("missing argument for {}", #method_name_str))?;
+                let value: bool = serde_json::from_value(__value)
+                    .map_err(|e| format!("deserialize {}: {e}", #method_name_str))?;
+                let payload = hyprstream_rpc::serialize_message(|msg| {
+                    let mut req = msg.init_root::<#capnp_mod::#req_type::Builder>();
+                    req.set_id(request_id);
+                    req.#set_method(value);
+                }).map_err(|e| format!("serialize: {e}"))?;
+            }
+        }
+        _ if ct.is_numeric() => {
+            let rust_ty = rust_type_tokens(&ct.rust_owned_type());
+            quote! {
+                let __value = args
+                    .get(#method_name_str)
+                    .or_else(|| args.get("value"))
+                    .cloned()
+                    .ok_or_else(|| format!("missing argument for {}", #method_name_str))?;
+                let value: #rust_ty = serde_json::from_value(__value)
+                    .map_err(|e| format!("deserialize {}: {e}", #method_name_str))?;
+                let payload = hyprstream_rpc::serialize_message(|msg| {
+                    let mut req = msg.init_root::<#capnp_mod::#req_type::Builder>();
+                    req.set_id(request_id);
+                    req.#set_method(value);
+                }).map_err(|e| format!("serialize: {e}"))?;
+            }
+        }
         _ => {
             if let Some(sdef) = resolved.find_struct(&v.type_name) {
                 let nuf: Vec<_> = sdef.non_union_fields().collect();
