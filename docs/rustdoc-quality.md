@@ -112,9 +112,20 @@ For each additional crate, in this order:
    crate's lib root only. Keep the `not(clippy)` guard: without it, the
    workspace-wide Clippy `-D warnings` promotes every missing-doc warning to a
    hard error and the lane stops being non-blocking.
-4. **Extend the evidence job** — add the crate to
-   `.github/workflows/rustdoc.yml`'s scoped `cargo doc` invocation (keep
-   `--no-deps`; one scoped invocation per crate keeps failures attributable).
+4. **Extend the evidence job** — for each opted-in crate, in the same PR that
+   opts the crate in, extend `.github/workflows/rustdoc.yml` three ways:
+
+   - add a scoped `cargo doc -p <crate> --no-deps` invocation (one scoped
+     invocation per crate keeps failures attributable);
+   - add a matching scoped `cargo test -p <crate> --doc` invocation. Broken
+     doctests are a generation failure (invariant 1), so the lane must run
+     each opted-in crate's documented examples — extending only the `cargo
+     doc` step would leave example rot invisible; and
+   - add the crate's source path (e.g. `crates/<crate>/**`) to
+     `on.pull_request.paths`. The opt-in PR itself runs because it edits the
+     workflow, but a later PR touching only the opted-in crate will not match
+     a filter that still names only the pilot, and the promised evidence
+     silently disappears.
 
 Crates with heavyweight build requirements (libtorch backends, feature-gated
 modules) are added last, with their applicable feature set, so the evidence job
