@@ -162,9 +162,7 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
         rust_string(vfs_source, match.end(), "VFS service registration")[0]
         for match in re.finditer(r'\bimpl_service_dispatch!\s*\(\s*[A-Za-z_]\w*\s*,\s*', vfs)
     ]
-    # The tracked universe is authoritative: callers must not inject arbitrary
-    # JavaScript/package paths as schema consumers through an inventory argument.
-    ts_sources = tracked(repo, "*.ts", "*.tsx", "*.js", "*.jsx", "package.json")
+    ts_sources = typescript_schema_sources(repo, mutations)
     return {
         "cli": {
             "source": CONSUMER_SOURCE_PATHS["cli"],
@@ -179,8 +177,8 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
             "source": CONSUMER_SOURCE_PATHS["mcp"],
             "services": mcp_services,
             "method_policy": {
-                "hidden": "excluded" if "if method.hidden {" in mcp else "unknown",
-                "streaming": "included" if "if method.is_streaming {" in mcp else "unknown",
+                "hidden": "excluded" if len(re.findall(r"if\s+method\.hidden\s*\{", mcp)) == 2 else "unknown",
+                "streaming": "included" if len(re.findall(r"if\s+method\.is_streaming\s*\{", mcp)) == 2 else "unknown",
             },
         },
         "factory": {"source": CONSUMER_SOURCE_PATHS["factory"], "services": factory_services, "feature_conditions": features},
@@ -273,13 +271,17 @@ def check_provenance(record: dict[str, Any], repo: Path, label: str, corpus: dic
     required(isinstance(declared_digest, str) and re.fullmatch(r"[0-9a-f]{64}", declared_digest) is not None,
              f"{label} has invalid source_input_digest")
     topology, boundary = audited_input(repo, event, revision)
-    # The Git pair is the durable event-boundary attestation.  Unlike a PR
-    # intermediate, the base/push-before commit is present after merge, squash,
-    # and rebase; the separately stored digest attests the selected source input.
-    git(repo, "cat-file", "-e", f"{commit}^{{commit}}")
-    required(git(repo, "rev-parse", f"{commit}^{{tree}}") == tree,
-             f"{label} source_tree does not match source_commit")
-    if topology != "local":
+    # PR checks require the recorded Git pair. Squash/rebase can discard those
+    # PR-only objects, so later push/local checks use the durable selected-input
+    # digest attestation below while still verifying a pair when it is present.
+    pair_exists = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{commit}^{{commit}}"],
+                                 capture_output=True).returncode == 0
+    if topology == "pull_request":
+        required(pair_exists, f"{label} source_commit is unavailable for pull-request attestation")
+    if pair_exists:
+        required(git(repo, "rev-parse", f"{commit}^{{tree}}") == tree,
+                 f"{label} source_tree does not match source_commit")
+    if topology == "pull_request":
         required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", boundary, commit]).returncode == 0,
                  f"{label} source_commit is not descended from the trusted {topology} boundary")
     staged_catalog = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--quiet", "--",
@@ -291,7 +293,7 @@ def check_provenance(record: dict[str, Any], repo: Path, label: str, corpus: dic
     paths = provenance_paths(repo, corpus)
     required(input_digest(repo, paths, mutations) == declared_digest,
              f"{label} current audited inputs differ from source_input_digest")
-    if not mutations:
+    if pair_exists and not mutations:
         required(input_digest(repo, paths, tree=tree) == declared_digest,
                  f"{label} source_tree does not reproduce the audited input digest")
 
@@ -400,6 +402,27 @@ def strip_capnp_noncode(source: str) -> str:
     return "".join(out)
 
 
+def typescript_schema_sources(repo: Path, mutations: dict[str, str] | None = None,
+                              candidates: list[str] | None = None) -> list[str]:
+    """Select only tracked frontend sources with an explicit schema/CGR dependency."""
+    candidates = candidates if candidates is not None else tracked(repo, "*.ts", "*.tsx", "*.js", "*.jsx", "package.json")
+    result = []
+    marker = re.compile(r"(?:@hyprstream/docs|codegen-out|\.capnp(?:[\"'`]|$))")
+    for path in candidates:
+        source = text(repo, path, mutations)
+        if path == "package.json":
+            try:
+                package = json.loads(source)
+            except json.JSONDecodeError:
+                continue
+            sections = (package.get("dependencies", {}), package.get("devDependencies", {}), package.get("peerDependencies", {}))
+            if any("@hyprstream/docs" in section for section in sections if isinstance(section, dict)):
+                result.append(path)
+        elif marker.search(source):
+            result.append(path)
+    return sorted(result)
+
+
 def split_top_level(value: str) -> list[str]:
     items, start, depth = [], 0, 0
     for index, char in enumerate(value):
@@ -414,13 +437,13 @@ def cgr_inventory(build_file: str, source: str) -> list[dict[str, Any]]:
     source = strip_rust_comments(source)
     tokens = strip_rust_noncode(source)
     bindings: dict[str, list[str]] = {}
-    for match in re.finditer(r"\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=;]+)?=\s*([^;]+);", source):
-        bindings.setdefault(match.group(1), []).append(match.group(2).strip())
+    for match in re.finditer(r"\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=;]+)?=\s*([^;]+);", tokens):
+        bindings.setdefault(match.group(1), []).append(source[match.start(2):match.end(2)].strip())
     def binding(value: str) -> str:
         name = value.strip().lstrip("&").strip()
         required(name in bindings and len(bindings[name]) == 1, f"{build_file} has unresolved or shadowed binding {name}")
-        required(not re.search(rf"\blet\s+mut\s+{re.escape(name)}\b", source), f"{build_file} has mutable persisted-CGR binding {name}")
-        required(len(re.findall(rf"\b{re.escape(name)}(?:\s*:[^=;]+)?\s*=", source)) == 1, f"{build_file} mutates binding {name}")
+        required(not re.search(rf"\blet\s+mut\s+{re.escape(name)}\b", tokens), f"{build_file} has mutable persisted-CGR binding {name}")
+        required(len(re.findall(rf"\b{re.escape(name)}(?:\s*:[^=;]+)?\s*=", tokens)) == 1, f"{build_file} mutates binding {name}")
         return bindings[name][0]
     def path(value: str) -> str:
         expr = binding(value)
@@ -487,18 +510,19 @@ def cgr_inventory(build_file: str, source: str) -> list[dict[str, Any]]:
 def capnp_only_inputs(build_file: str, source: str) -> list[str]:
     """Resolve literal capnpc::CompilerCommand inputs without trusting comments/literals."""
     code = strip_rust_noncode(source)
-    bindings: dict[str, str] = {}
+    bindings: dict[str, list[tuple[int, str]]] = {}
     for match in re.finditer(r'\blet\s+([A-Za-z_]\w*)\s*=\s*format!\s*\(\s*', code):
         template, _ = rust_literal(source, match.end(), "capnp-only compiler input")
-        bindings.setdefault(match.group(1), template)
+        bindings.setdefault(match.group(1), []).append((match.start(), template))
     inputs: list[str] = []
     for match in re.finditer(r'\bcapnpc\s*::\s*CompilerCommand\s*::\s*new\s*\(\s*\)(?:(?!;).)*?\.file\s*\(\s*', code, re.DOTALL):
         tail = source[match.end():]
         binding = re.match(r'&?([A-Za-z_]\w*)', tail)
         if binding is not None:
-            required(binding.group(1) in bindings,
+            choices = [template for position, template in bindings.get(binding.group(1), []) if position < match.start()]
+            required(choices,
                      f"{build_file} capnp-only compiler input is unresolved")
-            raw = bindings[binding.group(1)]
+            raw = choices[-1]
         else:
             raw, _ = rust_literal(source, match.end(), "capnp-only compiler input")
         raw = raw.replace("{manifest}", str(Path(build_file).parent))
@@ -559,11 +583,11 @@ def schema_method_metadata(repo: Path, schemas: list[dict[str, Any]],
         service = entry.get("service")
         if not service:
             continue
-        source = text(repo, entry["path"], mutations)
+        source = strip_capnp_noncode(text(repo, entry["path"], mutations))
         hidden.extend(
             f"{service}.{method}"
             for method in re.findall(
-                r"(?ms)^\s*([A-Za-z][A-Za-z0-9_]*)\s+@\d+\s*:[^;]*?\$cliHidden\b[^;]*;", source
+                r"(?ms)^\s*([A-Za-z][A-Za-z0-9_]*)\s+@\d+\s*:(?:(?!^\s*[A-Za-z][A-Za-z0-9_]*\s+@\d+).)*?\$cliHidden\b[^;]*;", source
             )
         )
         pascal = "".join(part.capitalize() for part in service.split("-"))
@@ -736,6 +760,14 @@ def validate(repo: Path, catalog: dict[str, Any] | None = None, corpus: dict[str
     required("docs/system-ontology.md" in text(repo, "docs/contracts/docs-pipeline.md", None), "pipeline contract omits ontology authority")
 
 
+def replace_nth(source: str, old: str, new: str, occurrence: int) -> str:
+    index = -1
+    for _ in range(occurrence):
+        index = source.find(old, index + 1)
+        required(index >= 0, f"mutation probe needle {old!r} occurrence {occurrence} is missing")
+    return source[:index] + new + source[index + len(old):]
+
+
 def expect_failure(name: str, repo: Path, catalog: dict[str, Any], corpus: dict[str, Any],
                    schemas: list[str], consumers: dict[str, dict[str, Any]],
                    mutations: dict[str, str] | None = None, rebind_digest: bool = True) -> None:
@@ -751,6 +783,15 @@ def expect_failure(name: str, repo: Path, catalog: dict[str, Any], corpus: dict[
     except CatalogError:
         return
     raise AssertionError(f"mutation probe {name} unexpectedly passed")
+
+
+def expect_event_failure(name: str, repo: Path, catalog: dict[str, Any], corpus: dict[str, Any],
+                         schemas: list[str], consumers: dict[str, dict[str, Any]], event: str, revision: str) -> None:
+    try:
+        validate(repo, catalog, corpus, schemas, consumers, event=event, revision=revision)
+    except CatalogError:
+        return
+    raise AssertionError(f"event mutation probe {name} unexpectedly passed")
 
 
 def expect_success(name: str, repo: Path, catalog: dict[str, Any], corpus: dict[str, Any],
@@ -778,35 +819,31 @@ def self_test(repo: Path) -> None:
     catalog, corpus = read_json(repo / "docs/schema-catalog.json"), read_json(repo / "docs/corpus-sources.json")
     schemas, consumers = tracked(repo, "*.capnp"), source_services(repo)
     validate(repo, catalog, corpus, schemas, consumers)
-    # GitHub supplies the PR's immutable base SHA, which may be behind the
-    # moving remote-main tip by the time the check runs.
-    # A PR validates against its immutable remote-main base, not the catalog's
-    # source snapshot: a source-plus-catalog PR legitimately pins a descendant
-    # of that base that is not itself on main yet.
-    validate(repo, catalog, corpus, schemas, consumers, event="pull_request",
-             revision=git(repo, "merge-base", "HEAD", "refs/remotes/origin/main"))
-    # A PR can target a maintained release branch. Its workflow-supplied base
-    # is authoritative when it is a real ancestor of this exact PR head; it
-    # need not be an ancestor of the unrelated moving main branch.
-    validate(repo, catalog, corpus, schemas, consumers, event="pull_request",
-             revision=catalog["source_commit"])
-    previous_head = os.environ.get("DOCS_CATALOG_AUDITED_HEAD")
-    previous_event = os.environ.get("DOCS_CATALOG_EVENT")
-    os.environ["DOCS_CATALOG_AUDITED_HEAD"] = "0" * 40
-    os.environ["DOCS_CATALOG_EVENT"] = "pull_request"
-    try:
-        expect_failure("synthetic pull-request merge checkout", repo, catalog, corpus, schemas, consumers)
-    finally:
-        if previous_head is None: os.environ.pop("DOCS_CATALOG_AUDITED_HEAD", None)
-        else: os.environ["DOCS_CATALOG_AUDITED_HEAD"] = previous_head
-        if previous_event is None: os.environ.pop("DOCS_CATALOG_EVENT", None)
-        else: os.environ["DOCS_CATALOG_EVENT"] = previous_event
+    # A hosted push validates its own topology only: it must never invent a PR
+    # merge-base model after an ordinary main push.
+    if os.environ.get("DOCS_CATALOG_EVENT", "local") != "push":
+        validate(repo, catalog, corpus, schemas, consumers, event="pull_request",
+                 revision=git(repo, "merge-base", "HEAD", "refs/remotes/origin/main"))
+        validate(repo, catalog, corpus, schemas, consumers, event="pull_request",
+                 revision=catalog["source_commit"])
+        previous_head = os.environ.get("DOCS_CATALOG_AUDITED_HEAD")
+        previous_event = os.environ.get("DOCS_CATALOG_EVENT")
+        os.environ["DOCS_CATALOG_AUDITED_HEAD"] = "0" * 40
+        os.environ["DOCS_CATALOG_EVENT"] = "pull_request"
+        try:
+            expect_failure("synthetic pull-request merge checkout", repo, catalog, corpus, schemas, consumers)
+        finally:
+            if previous_head is None: os.environ.pop("DOCS_CATALOG_AUDITED_HEAD", None)
+            else: os.environ["DOCS_CATALOG_AUDITED_HEAD"] = previous_head
+            if previous_event is None: os.environ.pop("DOCS_CATALOG_EVENT", None)
+            else: os.environ["DOCS_CATALOG_EVENT"] = previous_event
     expect_failure("unlisted schema", repo, copy.deepcopy(catalog), corpus, schemas + ["new.capnp"], consumers)
     expect_failure("stale schema", repo, copy.deepcopy(catalog), corpus, schemas[1:], consumers)
+    pr_base = git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
     bad = copy.deepcopy(catalog); bad["source_commit"] = "not-a-git-revision"
-    expect_failure("schema provenance", repo, bad, corpus, schemas, consumers)
+    expect_event_failure("schema provenance", repo, bad, corpus, schemas, consumers, "pull_request", pr_base)
     bad = copy.deepcopy(catalog); bad["source_commit"] = "f" * 40
-    expect_failure("fabricated provenance commit", repo, bad, corpus, schemas, consumers)
+    expect_event_failure("fabricated provenance commit", repo, bad, corpus, schemas, consumers, "pull_request", pr_base)
     bad = copy.deepcopy(catalog); bad["source_commit"] = git(repo, "rev-parse", "HEAD"); bad["source_tree"] = git(repo, "rev-parse", "HEAD^{tree}")
     expect_failure("stale base provenance commit", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["source_tree"] = "0" * 40
@@ -822,6 +859,11 @@ def self_test(repo: Path) -> None:
     bad["source_commit"] = stale
     bad["source_tree"] = git(repo, "rev-parse", f"{stale}^{{tree}}")
     expect_failure("stale valid corpus provenance", repo, catalog, bad, schemas, consumers)
+    stale_base = git(repo, "rev-parse", f"{catalog['source_commit']}~1")
+    bad = copy.deepcopy(catalog)
+    bad["source_commit"] = stale_base
+    bad["source_tree"] = git(repo, "rev-parse", f"{stale_base}^{{tree}}")
+    expect_failure("declared tree predates audited input", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(catalog); bad["schemas"][0]["license"] = "MIT"
     expect_failure("manifest license", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(catalog)
@@ -855,6 +897,14 @@ def self_test(repo: Path) -> None:
     worker_path = "crates/hyprstream-workers/schema/worker.capnp"
     hidden_removed = text(repo, worker_path, None).replace("$cliHidden ", "", 1)
     expect_failure("schema hidden annotation", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: hidden_removed})
+    hidden_comment = text(repo, worker_path, None).replace("$cliHidden", "# $cliHidden", 1)
+    required("worker.attach" not in schema_method_metadata(repo, catalog["schemas"], {worker_path: hidden_comment})["cli_hidden"],
+             "comment-only hidden annotation drift")
+    expect_failure("schema hidden comment decoy", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: hidden_comment})
+    hidden_literal = text(repo, worker_path, None).replace("$cliHidden", '$mutationSemantics("$cliHidden")', 1)
+    required("worker.attach" not in schema_method_metadata(repo, catalog["schemas"], {worker_path: hidden_literal})["cli_hidden"],
+             "literal-only hidden annotation drift")
+    expect_failure("schema hidden literal decoy", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: hidden_literal})
     discovery_build = "crates/hyprstream-discovery/build.rs"
     discovery_source = text(repo, discovery_build, None)
     whitespace = discovery_source.replace("hyprstream_rpc_build::compile_schemas(", "hyprstream_rpc_build :: compile_schemas (", 1)
@@ -881,6 +931,9 @@ def self_test(repo: Path) -> None:
     raw_string = discovery_source + '\nlet marker = br###"hyprstream_rpc_build::compile_schemas("###;\n'
     required(cgr_inventory(discovery_build, raw_string) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
              "CGR byte-raw string tokenization drift")
+    diagnostic_string = discovery_source + '\nlet diagnostic = r#"let schema_dir = Path::new(\\"elsewhere\\");"#;\n'
+    required(cgr_inventory(discovery_build, diagnostic_string) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
+             "CGR diagnostic literal binding drift")
     expect_cgr_failure("CGR unresolved alias", discovery_build,
                        discovery_source.replace("hyprstream_rpc_build::compile_schemas(", "unknown::compile_schemas(", 1))
     expect_cgr_failure("CGR alias reassignment", discovery_build,
@@ -899,6 +952,11 @@ def self_test(repo: Path) -> None:
     )
     expect_failure("capnp-only resolved compiler input", repo, copy.deepcopy(catalog), corpus,
                    schemas, consumers, {fixture_build: fixture_binding_drift})
+    fixture_shadow = text(repo, fixture_build, None).replace(
+        "\n\n    capnpc::CompilerCommand", '\n    let schema = format!("{manifest}/tests/unrelated.capnp");\n\n    capnpc::CompilerCommand', 1
+    )
+    expect_failure("capnp-only effective shadow binding", repo, copy.deepcopy(catalog), corpus,
+                   schemas, consumers, {fixture_build: fixture_shadow})
     shadowed = text(repo, discovery_build, None).replace(
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");\n    let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-workers/schema");',
@@ -945,6 +1003,16 @@ def self_test(repo: Path) -> None:
         required(source_services(repo, {path: mutated}) == consumers,
                  f"{name} altered source-derived registrations")
         expect_success(name, repo, catalog, corpus, schemas, {path: mutated})
+    unrelated_js = {"website/unrelated.js": "export const unrelated = true;\n"}
+    required(typescript_schema_sources(repo, unrelated_js, ["website/unrelated.js"]) == [],
+             "unrelated tracked JavaScript is a schema consumer")
+    mcp_path = "crates/hyprstream/src/services/mcp_service.rs"
+    for label, needle in [("hidden policy", "if method.hidden {"),
+                          ("streaming policy", "if method.is_streaming {")]:
+        for occurrence, path_name in [(1, "top-level"), (2, "scoped")]:
+            mutated = replace_nth(text(repo, mcp_path, None), needle, "if false {", occurrence)
+            expect_failure(f"MCP {path_name} {label}", repo, copy.deepcopy(catalog), corpus, schemas,
+                           source_services(repo, {mcp_path: mutated}), {mcp_path: mutated})
     bad = copy.deepcopy(catalog)
     fixture = next(entry for entry in bad["schemas"] if entry["path"].endswith("wire_roundtrip_fixture.capnp"))
     fixture["exclusions"].pop("docs")
@@ -970,6 +1038,8 @@ def self_test(repo: Path) -> None:
     expect_failure("package requirements", repo, catalog, bad, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["api_manifest"]["integrity"] = "md5"
     expect_failure("API manifest contract", repo, catalog, bad, schemas, consumers)
+    bad = copy.deepcopy(corpus); bad["corpus_manifest"]["limit_bytes"] = 1
+    expect_failure("corpus manifest contract", repo, catalog, bad, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["package_contract"]["exports"] = {"./corpus/*": "./dist/*"}
     expect_failure("package exports", repo, catalog, bad, schemas, consumers)
     bad = copy.deepcopy(catalog); bad["consumer_sets"]["cli"]["state"] = "absent"
@@ -991,7 +1061,7 @@ def self_test(repo: Path) -> None:
         pass
     else:
         raise AssertionError("mutation probe modeled main push provenance unexpectedly passed")
-    print("docs catalog mutation probes: passed (33 expected failures plus modeled merge/squash/rebase main push)")
+    print("docs catalog mutation probes: passed (all expected failures plus modeled merge/squash/rebase main push)")
 
 
 def main() -> int:
