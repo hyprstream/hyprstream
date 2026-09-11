@@ -82,6 +82,54 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
     }
 }
 
+/// Generate server-side dispatch code against contracts that were generated in
+/// another crate.
+///
+/// This is the counterpart to [`generate_client_only`].  It deliberately emits
+/// no data structs, response enums, client implementations, or JSON client
+/// dispatchers: those remain owned by the permissively licensed contract crate.
+/// The invocation module imports the contract crate's generated client module
+/// (for handler parameter/response types) and Cap'n Proto module, then emits
+/// only the handler traits, wire dispatch, metadata, and VFS projection needed
+/// by an implementation/service crate.
+pub fn generate_server(
+    service_name: &str,
+    schema: &ParsedSchema,
+    types_crate: &syn::Path,
+    scope_handlers: bool,
+) -> proc_macro2::TokenStream {
+    let resolved = ResolvedSchema::from(schema);
+    if resolved.raw.request_variants.is_empty() {
+        // A data-only schema has no server dispatch surface.  Its contracts
+        // are already exported by the contract crate, so there is nothing to
+        // emit here.
+        return quote::quote! {};
+    }
+
+    let client_mod = quote::format_ident!("{}_client", service_name);
+    let capnp_mod = quote::format_ident!("{}_capnp", service_name);
+    let imports = quote::quote! {
+        // Keep contract ownership in the permissively licensed crate.  These
+        // imports are intentionally private: this module exposes server
+        // traits/dispatch only, never a second public client implementation.
+        use #types_crate::#client_mod::*;
+        use #types_crate::#capnp_mod;
+    };
+    let handler = handler::generate_handler(service_name, &resolved, scope_handlers);
+    // Scoped metadata functions are emitted alongside the server surface, so
+    // the local tree must point at those functions (not at the contract crate's
+    // client-only metadata module).
+    let metadata = metadata::generate_metadata_client_only(service_name, &resolved, None);
+    let vfs_mount = vfs::generate_mount(service_name, &resolved);
+
+    quote::quote! {
+        #imports
+        #handler
+        #metadata
+        #vfs_mount
+    }
+}
+
 /// Generate all service code from a parsed schema.
 ///
 /// When `types_crate` is `Some`, generates client-only code (no handler/dispatch)
@@ -119,6 +167,16 @@ pub fn generate_service(service_name: &str, schema: &ParsedSchema, types_crate: 
     // Generated 9P/VFS node table (#539 T2).
     let vfs_mount = vfs::generate_mount(service_name, &resolved);
 
+    // Handler code resolves the Cap'n Proto module in the invocation module's
+    // scope.  Existing full-service invocations keep their capnp modules at
+    // crate root, so import that module before emitting the handler.
+    let capnp_import = if types_crate.is_none() {
+        let capnp_mod = quote::format_ident!("{}_capnp", service_name);
+        quote::quote! { use crate::#capnp_mod; }
+    } else {
+        quote::quote! {}
+    };
+
     quote::quote! {
         #data_structs
         #response_enum
@@ -128,6 +186,7 @@ pub fn generate_service(service_name: &str, schema: &ParsedSchema, types_crate: 
         #service_traits
         #trait_impls
         #constructors
+        #capnp_import
         #handler
         #metadata_code
         #vfs_mount

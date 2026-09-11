@@ -13,6 +13,8 @@ Provides four derive macros and one declarative macro:
 | `#[derive(authorize)]` | Attach scope/policy checks to RPC handler methods |
 | `#[service_factory]` | Generate service factory boilerplate (handler registration, dispatch table) |
 | `generate_rpc_service!("name", scope)` | Emit a complete typed client + handler + dispatch fn from a compiled schema |
+| `generate_rpc_client!("name")` | Emit portable client/data/metadata code only |
+| `generate_rpc_server!("name", types_crate = contract_crate)` | Emit handler/dispatch/metadata only against a contract crate's generated types |
 
 ## Usage
 
@@ -48,6 +50,7 @@ pub struct CloneResponse {
 hyprstream-rpc-derive    ← you are here (proc macros)
     ↓ (used by)
 hyprstream-rpc           (re-exports the derive macros)
-hyprstream-rpc-std       (generate_rpc_service! for each service schema)
+hyprstream-rpc-std       (generate_rpc_client! for each public service schema)
+hyprstream-{services}    (generate_rpc_server! against rpc-std contracts)
 hyprstream-{discovery,workers,...}
 ```

@@ -145,6 +145,17 @@ pub mod oauth_client {
     hyprstream_rpc_derive::generate_rpc_client!("oauth");
 }
 
+// Compile-time smoke test for the split codegen boundary.  The test module
+// deliberately generates a server surface for an existing standard schema
+// while importing its contracts from this crate; it ensures the server macro
+// cannot accidentally grow a second client/data implementation.
+#[cfg(test)]
+mod server_codegen_smoke {
+    pub mod model_server {
+        hyprstream_rpc_derive::generate_rpc_server!("model", types_crate = crate, scope_handlers);
+    }
+}
+
 // ============================================================================
 // WASM exports (browser only)
 // ============================================================================

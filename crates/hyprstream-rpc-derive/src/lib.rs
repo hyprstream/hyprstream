@@ -1307,6 +1307,62 @@ pub fn generate_rpc_service(input: TokenStream) -> TokenStream {
     codegen::generate_service(&name, &parsed, types_crate, args.scope_handlers).into()
 }
 
+/// Proc macro that generates only the server implementation surface for a
+/// schema whose contracts live in another crate.
+///
+/// The contract crate must export `{name}_client` and `{name}_capnp` modules
+/// (as `hyprstream-rpc-std` does).  The expansion imports those types privately
+/// and emits handler traits, dispatch, request decoding, schema metadata, and
+/// the VFS projection.  It does **not** emit a second client, response enum, or
+/// data-struct implementation, which keeps AGPL service crates from becoming
+/// the distribution home for public clients.
+///
+/// # Usage
+///
+/// ```ignore
+/// pub mod worker_server {
+///     hyprstream_rpc_derive::generate_rpc_server!(
+///         "worker",
+///         types_crate = hyprstream_rpc_std,
+///         scope_handlers,
+///     );
+/// }
+/// ```
+#[proc_macro]
+pub fn generate_rpc_server(input: TokenStream) -> TokenStream {
+    let args: RpcServiceArgs = match syn::parse(input) {
+        Ok(a) => a,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let service_name = &args.name;
+    let name = service_name.value();
+    let types_crate = match args.types_crate.as_ref() {
+        Some(path) => path,
+        None => {
+            return syn::Error::new_spanned(
+                service_name,
+                "generate_rpc_server! requires types_crate = <contract_crate>",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+
+    let parsed = match schema::parse_from_cgr(&name) {
+        Ok(p) => p,
+        Err(e) => {
+            return syn::Error::new(
+                service_name.span(),
+                format!("CGR parse failed for '{name}': {e}. Ensure the contract crate exports its CGR via build.rs."),
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+
+    codegen::generate_server(&name, &parsed, types_crate, args.scope_handlers).into()
+}
+
 /// Generate client-only code from a Cap'n Proto service schema.
 ///
 /// Like `generate_rpc_service!` but emits only data structs, response enums,
