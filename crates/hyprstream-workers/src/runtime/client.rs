@@ -8,7 +8,8 @@
 use std::collections::HashMap; // Only for StatusResponse.info (local-only, not serialized)
 
 // Re-export generated wire types as the canonical response/stats types.
-// These are produced by `generate_rpc_service!("worker")` in crate::generated::worker_client.
+// These are re-exported from the canonical `hyprstream-rpc-std` client module;
+// crate::generated::worker_client adds only the AGPL server dispatch.
 pub use crate::generated::worker_client::{
     // Generated client
     WorkerClient,

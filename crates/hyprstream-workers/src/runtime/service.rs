@@ -6,7 +6,7 @@
 //!
 //! This is the worker **control plane**. It is transport-agnostic: the service
 //! only implements `RequestService` (Cap'n Proto wire format via
-//! `generate_rpc_service!("worker")`) and carries a `TransportConfig`. The
+//! `generate_rpc_server!("worker")`) and carries a `TransportConfig`. The
 //! legacy ZMQ ROUTER/DEALER stack was removed workspace-wide (#138/#167 —
 //! ZMQ/ZeroMQ is gone); the blanket `Spawnable` impl bridges this service and
 //! serves it over its *registered* transport (`serve_bridged`: Inproc / IPC-UDS
