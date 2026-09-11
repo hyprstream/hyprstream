@@ -56,7 +56,7 @@ pub(super) async fn get_record(
             "collection and rkey are required",
         );
     }
-    let permit = match store.acquire_get_repo_owned().await {
+    let permit = match store.acquire_snapshot_work_owned().await {
         Ok(permit) => permit,
         Err(_) => return internal_error(),
     };
@@ -141,7 +141,12 @@ pub(super) async fn get_repo(
         Ok(permit) => permit,
         Err(_) => return internal_error(),
     };
+    let work_permit = match store.acquire_snapshot_work_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return internal_error(),
+    };
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let _work_permit = work_permit;
         let bytes = writer
             .public_snapshot()?
             .map(|(snapshot, _)| repo_car(&snapshot))
@@ -154,8 +159,8 @@ pub(super) async fn get_repo(
         Ok(Ok((None, _))) => return missing_repo(),
         _ => return internal_error(),
     };
-    // Hold the existing export permit through body EOF/drop, including slow
-    // clients. Snapshot validation and CAR encoding happen on the blocking pool.
+    // Only export admission survives through body EOF/drop. Snapshot-work
+    // admission ended with the blocking task, keeping point reads available.
     let stream = stream::unfold((Some(Bytes::from(bytes)), permit), |mut state| async move {
         let bytes = state.0.take()?;
         Some((Ok::<_, std::io::Error>(bytes), state))
@@ -187,7 +192,7 @@ pub(super) async fn describe_repo(state: &OAuthState, writer: Arc<PublicRepoWrit
     });
     let handle_is_correct = handle.is_some();
     let handle = handle.unwrap_or_else(|| "handle.invalid".to_owned());
-    let permit = match state.xrpc_repos.acquire_get_repo_owned().await {
+    let permit = match state.xrpc_repos.acquire_snapshot_work_owned().await {
         Ok(permit) => permit,
         Err(_) => return internal_error(),
     };

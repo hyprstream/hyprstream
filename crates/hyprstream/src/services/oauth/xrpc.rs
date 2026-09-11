@@ -80,6 +80,8 @@ const MAX_SERVICE_AUTH_PARAMETER_BYTES: usize = 2_048;
 /// Each request streams the entire repo; bounding concurrency prevents
 /// memory/CPU exhaustion from parallel full-repo exports.
 pub const GET_REPO_CONCURRENCY: usize = 4;
+/// Snapshot/encoding work has its own bound; slow CAR bodies cannot hold it.
+const DURABLE_SNAPSHOT_CONCURRENCY: usize = 4;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RepoSnapshot + XrpcRepoStore
@@ -180,6 +182,7 @@ impl RepoSnapshot {
 pub struct XrpcRepoStore {
     by_did: RwLock<BTreeMap<String, Arc<RepoSnapshot>>>,
     get_repo_sema: Arc<Semaphore>,
+    snapshot_work_sema: Arc<Semaphore>,
 }
 
 impl Default for XrpcRepoStore {
@@ -187,6 +190,7 @@ impl Default for XrpcRepoStore {
         Self {
             by_did: RwLock::new(BTreeMap::new()),
             get_repo_sema: Arc::new(Semaphore::new(GET_REPO_CONCURRENCY)),
+            snapshot_work_sema: Arc::new(Semaphore::new(DURABLE_SNAPSHOT_CONCURRENCY)),
         }
     }
 }
@@ -226,6 +230,15 @@ impl XrpcRepoStore {
             return None; // ambiguous — refuse
         }
         Some(Arc::clone(first))
+    }
+
+    /// Bound durable snapshot/encoding work independently of response bodies.
+    /// Move ownership into the blocking task so cancellation cannot release
+    /// admission while that work is still running.
+    async fn acquire_snapshot_work_owned(
+        &self,
+    ) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        self.snapshot_work_sema.clone().acquire_owned().await
     }
 
     /// Acquire an **owned** concurrency permit for full-CAR export. The permit
@@ -1869,6 +1882,22 @@ mod tests {
         Router,
         String,
     ) {
+        let (dir, store, gate, app, token, _) =
+            build_write_input_fixture_with_admission(did, issuer_url).await;
+        (dir, store, gate, app, token)
+    }
+
+    async fn build_write_input_fixture_with_admission(
+        did: &str,
+        issuer_url: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::services::public_repo::PublicRepoStore>,
+        Arc<WriteInputGate>,
+        Router,
+        String,
+        Arc<XrpcRepoStore>,
+    ) {
         if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
             let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
                 hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
@@ -1901,8 +1930,9 @@ mod tests {
             .with_scope(Some("atproto".to_owned()))
             .with_jti();
         let token = hyprstream_rpc::auth::jwt::encode(&claims, &signing_key);
+        let reads = state.xrpc_repos.clone();
         let app = build_production_app_from_state(state).await;
-        (dir, store, gate, app, token)
+        (dir, store, gate, app, token, reads)
     }
 
     fn write_input(id: u64) -> Value {
@@ -1954,7 +1984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_all_durable_reads_share_export_admission() {
+    async fn router_point_reads_remain_available_with_four_held_car_bodies() {
         let (_dir, _store, _gate, app, token) = build_write_input_fixture().await;
         let created = app
             .clone()
@@ -1977,10 +2007,73 @@ mod tests {
                     .unwrap(),
             );
         }
+        assert!(held
+            .iter()
+            .all(|response| response.status() == StatusCode::OK));
+        // Waiting exports must acquire body admission before snapshot work.
+        let mut queued_exports = Vec::new();
+        for _ in 0..DURABLE_SNAPSHOT_CONCURRENCY {
+            let app = app.clone();
+            queued_exports.push(tokio::spawn(async move {
+                app.oneshot(read_request(
+                    "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com",
+                ))
+                .await
+                .unwrap()
+            }));
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut queued_exports[0])
+                .await
+                .is_err()
+        );
         let mut pending = Vec::new();
         for uri in [
             format!("/xrpc/com.atproto.repo.getRecord?repo=pub.example.com&collection=app.bsky.feed.post&rkey={}", Tid::from_raw(7).encode()),
             "/xrpc/com.atproto.repo.describeRepo?repo=pub.example.com".to_owned(),
+        ] {
+            let app = app.clone();
+            pending.push(tokio::spawn(async move { app.oneshot(read_request(&uri)).await.unwrap() }));
+        }
+        for request in pending {
+            let response = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(held.len(), GET_REPO_CONCURRENCY);
+        for export in queued_exports {
+            export.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn router_snapshot_work_admission_bounds_every_durable_reader() {
+        let (_dir, _store, _gate, app, token, reads) = build_write_input_fixture_with_admission(
+            "did:web:pub.example.com",
+            "https://h.example.com",
+        )
+        .await;
+        let created = app
+            .clone()
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let mut held = Vec::new();
+        for _ in 0..DURABLE_SNAPSHOT_CONCURRENCY {
+            held.push(reads.acquire_snapshot_work_owned().await.unwrap());
+        }
+        let mut pending = Vec::new();
+        for uri in [
+            format!("/xrpc/com.atproto.repo.getRecord?repo=pub.example.com&collection=app.bsky.feed.post&rkey={}", Tid::from_raw(7).encode()),
+            "/xrpc/com.atproto.repo.describeRepo?repo=pub.example.com".to_owned(),
+            "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com".to_owned(),
         ] {
             let app = app.clone();
             pending.push(tokio::spawn(async move { app.oneshot(read_request(&uri)).await.unwrap() }));
@@ -1993,13 +2086,26 @@ mod tests {
             );
         }
         drop(held.pop());
+        let mut responses = Vec::new();
         for request in pending {
             let response = tokio::time::timeout(std::time::Duration::from_secs(2), request)
                 .await
                 .unwrap()
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            responses.push(response);
         }
+        // CAR body retains only export admission, not snapshot-work admission.
+        assert_eq!(reads.snapshot_work_sema.available_permits(), 1);
+        assert_eq!(
+            reads.get_repo_sema.available_permits(),
+            GET_REPO_CONCURRENCY - 1
+        );
+        drop(responses);
+        assert_eq!(
+            reads.get_repo_sema.available_permits(),
+            GET_REPO_CONCURRENCY
+        );
     }
 
     #[tokio::test]
