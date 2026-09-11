@@ -1023,6 +1023,16 @@ pub async fn create_record(
             "OAuth identity binding is invalid",
         );
     }
+    // The protected router has verified the matching proof, ath, nonce, and
+    // replay state for bound tokens. Unbound Bearer tokens remain valid for
+    // other OAuth routes, but cannot authorize this atproto write endpoint.
+    if claims.cnf_jkt().is_none() {
+        return xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            errors::INVALID_REQUEST,
+            "a DPoP-bound OAuth access token is required",
+        );
+    }
     let input: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
@@ -1862,12 +1872,59 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct WriteAccess {
+        token: String,
+        claims: hyprstream_rpc::auth::Claims,
+        key: SigningKey,
+        htu: String,
+        nonce: String,
+    }
+
+    impl WriteAccess {
+        fn proof_payload(&self) -> Value {
+            use sha2::{Digest as _, Sha256};
+            json!({
+                "jti": uuid::Uuid::new_v4().to_string(),
+                "htm": "POST",
+                "htu": self.htu,
+                "iat": chrono::Utc::now().timestamp(),
+                "ath": URL_SAFE_NO_PAD.encode(Sha256::digest(self.token.as_bytes())),
+                "nonce": self.nonce,
+            })
+        }
+    }
+
+    fn sign_write_proof(key: &SigningKey, payload: &Value) -> String {
+        use p256::ecdsa::signature::Signer as _;
+        let point = key.verifying_key().to_encoded_point(false);
+        let header = json!({
+            "typ": "dpop+jwt",
+            "alg": "ES256",
+            "jwk": {
+                "kty": "EC", "crv": "P-256",
+                "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+                "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+            }
+        });
+        let signing_input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap())
+        );
+        let signature: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
+    }
+
     async fn build_write_input_fixture() -> (
         tempfile::TempDir,
         Arc<crate::services::public_repo::PublicRepoStore>,
         Arc<WriteInputGate>,
         Router,
-        String,
+        WriteAccess,
     ) {
         build_write_input_fixture_for("did:web:pub.example.com", "https://h.example.com").await
     }
@@ -1880,7 +1937,7 @@ mod tests {
         Arc<crate::services::public_repo::PublicRepoStore>,
         Arc<WriteInputGate>,
         Router,
-        String,
+        WriteAccess,
     ) {
         let (dir, store, gate, app, token, _) =
             build_write_input_fixture_with_admission(did, issuer_url).await;
@@ -1895,7 +1952,7 @@ mod tests {
         Arc<crate::services::public_repo::PublicRepoStore>,
         Arc<WriteInputGate>,
         Router,
-        String,
+        WriteAccess,
         Arc<XrpcRepoStore>,
     ) {
         if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
@@ -1922,14 +1979,32 @@ mod tests {
         writable_state.public_repo_writer = Some(Arc::new(writer));
         let issuer = state.atproto_issuer_url();
         let now = chrono::Utc::now().timestamp();
+        let key = SigningKey::random(&mut OsRng);
+        let point = key.verifying_key().to_encoded_point(false);
+        let jkt = super::super::dpop::DpopKey::Es256 {
+            x: (*point.x().unwrap()).into(),
+            y: (*point.y().unwrap()).into(),
+        }
+        .jkt();
+        let nonce = state.issue_dpop_nonce().await;
+        state.mark_dpop_client_nonced(&jkt).await;
+        let htu = format!("{issuer}/xrpc/com.atproto.repo.createRecord");
         let claims = hyprstream_rpc::auth::Claims::new("xrpc-writer".to_owned(), now, now + 3600)
             .with_issuer(issuer.clone())
             .with_audience(Some(issuer))
             .with_tenant("xrpc-input-tests".to_owned())
             .with_client_id("xrpc-input-tests")
             .with_scope(Some("atproto".to_owned()))
+            .with_cnf_jkt_thumbprint(jkt)
             .with_jti();
         let token = hyprstream_rpc::auth::jwt::encode(&claims, &signing_key);
+        let token = WriteAccess {
+            token,
+            claims,
+            key,
+            htu,
+            nonce,
+        };
         let reads = state.xrpc_repos.clone();
         let app = build_production_app_from_state(state).await;
         (dir, store, gate, app, token, reads)
@@ -1948,16 +2023,187 @@ mod tests {
         })
     }
 
-    fn write_http_request(token: &str, input: &Value, headers: HeaderMap) -> HttpRequest<Body> {
+    fn write_http_request(
+        token: &WriteAccess,
+        input: &Value,
+        headers: HeaderMap,
+    ) -> HttpRequest<Body> {
         let mut request = HttpRequest::builder()
             .method("POST")
             .uri("/xrpc/com.atproto.repo.createRecord")
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::AUTHORIZATION, format!("DPoP {}", token.token))
+            .header("DPoP", sign_write_proof(&token.key, &token.proof_payload()))
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_vec(input).unwrap()))
             .unwrap();
         request.headers_mut().extend(headers);
         request
+    }
+
+    #[tokio::test]
+    async fn router_create_record_requires_bound_token_and_proof_before_native_calls() {
+        let (_dir, store, gate, app, access) = build_write_input_fixture().await;
+        let mut unbound = access.clone();
+        unbound.claims.cnf = None;
+        unbound.token = hyprstream_rpc::auth::jwt::encode(
+            &unbound.claims,
+            &ed25519_dalek::SigningKey::from_bytes(&[0x19; 32]),
+        );
+        for (token, scheme, include_proof, error) in [
+            (&unbound, "Bearer", false, errors::INVALID_REQUEST),
+            (&unbound, "DPoP", true, errors::INVALID_REQUEST),
+            (&access, "Bearer", false, "invalid_token"),
+            (&access, "Bearer", true, "invalid_token"),
+            (&access, "DPoP", false, "invalid_token"),
+        ] {
+            let mut request = write_http_request(token, &write_input(7), HeaderMap::new());
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("{scheme} {}", token.token).parse().unwrap(),
+            );
+            if !include_proof {
+                request.headers_mut().remove("DPoP");
+            }
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let body = body_json(response).await;
+            assert_eq!(body["error"], error);
+            if error == errors::INVALID_REQUEST {
+                assert_eq!(
+                    body["message"],
+                    "a DPoP-bound OAuth access token is required"
+                );
+            }
+            assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn router_create_record_rejects_wrong_dpop_proofs_before_native_calls() {
+        let (_dir, store, gate, app, access) = build_write_input_fixture().await;
+        for case in [
+            "key",
+            "method",
+            "uri",
+            "ath",
+            "missing_ath",
+            "nonce",
+            "missing_nonce",
+        ] {
+            let mut payload = access.proof_payload();
+            let wrong_key = SigningKey::random(&mut OsRng);
+            let key = if case == "key" {
+                &wrong_key
+            } else {
+                &access.key
+            };
+            let error = match case {
+                "key" => "invalid_token",
+                "method" => {
+                    payload["htm"] = json!("GET");
+                    "invalid_dpop_proof"
+                }
+                "uri" => {
+                    payload["htu"] =
+                        json!("https://other.example/xrpc/com.atproto.repo.createRecord");
+                    "invalid_dpop_proof"
+                }
+                "ath" => {
+                    payload["ath"] = json!("wrong-token-hash");
+                    "invalid_dpop_proof"
+                }
+                "missing_ath" => {
+                    payload.as_object_mut().unwrap().remove("ath");
+                    "invalid_dpop_proof"
+                }
+                "nonce" => {
+                    payload["nonce"] = json!("invalid-server-nonce");
+                    "use_dpop_nonce"
+                }
+                "missing_nonce" => {
+                    payload.as_object_mut().unwrap().remove("nonce");
+                    "use_dpop_nonce"
+                }
+                _ => unreachable!(),
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert("DPoP", sign_write_proof(key, &payload).parse().unwrap());
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&access, &write_input(7), headers))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{case}");
+            assert_eq!(body_json(response).await["error"], error, "{case}");
+            assert_eq!(
+                gate.0.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "{case}"
+            );
+            assert!(
+                store.snapshot("did:web:pub.example.com").unwrap().is_none(),
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn router_create_record_dpop_replay_rejected_but_fresh_retry_succeeds() {
+        let (_dir, store, gate, app, access) = build_write_input_fixture().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "DPoP",
+            sign_write_proof(&access.key, &access.proof_payload())
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("Idempotency-Key", "dpop-retry".parse().unwrap());
+        let response = app
+            .clone()
+            .oneshot(write_http_request(
+                &access,
+                &write_input(7),
+                headers.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = body_json(response).await;
+        let head = store
+            .snapshot("did:web:pub.example.com")
+            .unwrap()
+            .unwrap()
+            .commit
+            .cid();
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // Replay cannot reach the authorizer, even when the body/idempotency
+        // request changes. A fresh proof can retry the original operation.
+        for input in [write_input(7), write_input(8)] {
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&access, &input, headers.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(body_json(response).await["error"], "invalid_dpop_proof");
+            assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+            let snapshot = store.snapshot("did:web:pub.example.com").unwrap().unwrap();
+            assert_eq!(snapshot.commit.cid(), head);
+            assert_eq!(snapshot.records.len(), 1);
+        }
+        headers.remove("DPoP");
+        let response = app
+            .oneshot(write_http_request(&access, &write_input(7), headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await, created);
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let snapshot = store.snapshot("did:web:pub.example.com").unwrap().unwrap();
+        assert_eq!(snapshot.commit.cid(), head);
+        assert_eq!(snapshot.records.len(), 1);
     }
 
     fn read_request(uri: &str) -> HttpRequest<Body> {
