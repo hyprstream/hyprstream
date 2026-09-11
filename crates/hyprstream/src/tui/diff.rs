@@ -273,7 +273,7 @@ pub fn encode_capnp(diff: &FrameDiff, pane_id: u32) -> Vec<u8> {
 
     let mut message = Builder::new_default();
     {
-        let mut frame = message.init_root::<crate::tui_capnp::tui_frame::Builder<'_>>();
+        let mut frame = message.init_root::<hyprstream_rpc_std::tui_capnp::tui_frame::Builder<'_>>();
         frame.set_generation(diff.generation);
         frame.set_timestamp_ms(
             std::time::SystemTime::now()

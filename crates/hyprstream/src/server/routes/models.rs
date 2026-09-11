@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Resolve a ModelRef to its worktree path (locally derived, not from RPC).
 async fn resolve_model_path(
-    registry: &crate::services::RegistryClient,
+    registry: &hyprstream_rpc_std::registry_client::RegistryClient,
     model_ref: &crate::storage::ModelRef,
 ) -> anyhow::Result<String> {
     let tracked = registry.get_by_name(model_ref.name()).await?;
@@ -108,7 +108,7 @@ async fn list_models(
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    let request = crate::services::generated::policy_client::PolicyCheck {
+    let request = hyprstream_rpc_std::policy_client::PolicyCheck {
         subject: user.clone(),
         domain,
         resource: "registry:*".to_owned(),
@@ -191,7 +191,7 @@ async fn get_model_info(
         Err(response) => return response,
     };
     let resource = format!("model:{id}");
-    let request = crate::services::generated::policy_client::PolicyCheck {
+    let request = hyprstream_rpc_std::policy_client::PolicyCheck {
         subject: user.clone(),
         domain,
         resource: resource.clone(),
@@ -255,7 +255,7 @@ async fn download_model(
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    let policy_request = crate::services::generated::policy_client::PolicyCheck {
+    let policy_request = hyprstream_rpc_std::policy_client::PolicyCheck {
         subject: user.clone(),
         domain,
         resource: "registry:*".to_owned(),
@@ -342,7 +342,7 @@ async fn download_model(
     // Use registry client to clone model (no duplicate service)
     if let Err(e) = state
         .registry
-        .clone(&crate::services::generated::registry_client::CloneRequest {
+        .clone(&hyprstream_rpc_std::registry_client::CloneRequest {
             url: request.uri.clone(),
             name: model_name.clone(),
             shallow: true,
@@ -395,7 +395,7 @@ async fn load_model(
         Err(response) => return response,
     };
     let resource = format!("model:{id}");
-    let request = crate::services::generated::policy_client::PolicyCheck {
+    let request = hyprstream_rpc_std::policy_client::PolicyCheck {
         subject: user.clone(),
         domain,
         resource: resource.clone(),
@@ -467,7 +467,7 @@ async fn unload_model(
         Err(response) => return response,
     };
     let resource = format!("model:{id}");
-    let request = crate::services::generated::policy_client::PolicyCheck {
+    let request = hyprstream_rpc_std::policy_client::PolicyCheck {
         subject: user.clone(),
         domain,
         resource: resource.clone(),
@@ -507,7 +507,7 @@ async fn refresh_cache(
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    let request = crate::services::generated::policy_client::PolicyCheck {
+    let request = hyprstream_rpc_std::policy_client::PolicyCheck {
         subject: user.clone(),
         domain,
         resource: "registry:*".to_owned(),

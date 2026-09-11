@@ -17,8 +17,8 @@
 //! │  hyprstream/src/services/                                   │
 //! │  ├── core.rs      ← RequestService trait re-exports           │
 //! │  ├── types.rs     ← Shared types (FsDirEntry, ModelInfo, etc.)│
-//! │  ├── registry.rs  ← Registry service + client               │
-//! │  └── inference.rs ← Inference service + client              │
+//! │  ├── registry.rs  ← Registry server                        │
+//! │  └── inference.rs ← Inference server                       │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -62,6 +62,7 @@
 mod core;
 mod types;
 mod worktree_helpers;
+use hyprstream_rpc_std::{discovery_client::DiscoveryClient, policy_client::PolicyClient};
 pub use worktree_helpers::StatResult;
 pub(crate) use worktree_helpers::WorktreeClientExt;
 // contained_root replaced by hyprstream-containedfs crate
@@ -113,20 +114,6 @@ pub use core::{
     Continuation, EnvelopeContext, RequestService,
 };
 
-// Generated client types — the public API
-pub use generated::registry_client::{
-    RegistryClient,
-    RepositoryClient, WorktreeClient, CtlClient,
-    TrackedRepository as GenTrackedRepository,
-    WorktreeInfo as GenWorktreeInfo,
-    RepositoryStatus as GenRepositoryStatus,
-    RemoteInfo,
-    RWalk, ROpen, RRead, RWrite, RStat,
-    NpStat as NpStatData, Qid as QidData,
-    FileStatus, LogEntry, ValidationResult, FileInfo,
-    DocFormat,
-};
-
 // Remaining domain types
 pub use types::{
     MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT, MAX_FS_IO_SIZE,
@@ -137,15 +124,11 @@ pub use types::{
 // Open mode constants also re-exported from hyprstream-vfs::mount for VFS consumers.
 
 pub use inference::{InferenceService, InferenceServiceConfig, INFERENCE_ENDPOINT};
-pub use generated::inference_client::InferenceClient;
 pub use registry::RegistryService;
 pub use policy::PolicyService;
-pub use generated::policy_client::PolicyClient;
 pub use model::{ModelService, ModelServiceConfig, MODEL_ENDPOINT};
-pub use generated::model_client::ModelClient;
 pub use worker::build_authorize_fn;
 pub use namespace_builder::{build_standard_namespace, StandardNamespaceConfig};
-pub use hyprstream_workers::runtime::WorkerClient;
 pub use oauth::OAuthService;
 pub use oai::OAIService;
 #[cfg(test)]
@@ -163,7 +146,6 @@ pub use image_substrate::{
 #[cfg(feature = "metrics")]
 pub use flight::FlightService;
 pub use discovery::DiscoveryService;
-pub use generated::discovery_client::DiscoveryClient;
 
 /// Construct on the caller's runtime, using the authenticated process profile.
 pub fn policy_client_for_process(

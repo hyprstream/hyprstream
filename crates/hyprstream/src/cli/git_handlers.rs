@@ -6,19 +6,19 @@
 // encoder + grammar; the deprecation is enforced at the ModelRef type definition.
 #![allow(deprecated)]
 
-use crate::runtime::GenerationRequest;
-use crate::services::generated::inference_client::ChatMessage;
-use crate::services::generated::model_client::ChatTemplateRequest;
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::inference_client::ChatMessage;
+use hyprstream_rpc_std::model_client::ChatTemplateRequest;
 use hyprstream_rpc::events::EventSubscriber;
 use crate::services::event_network::ensure_event_origin_for_profile;
-use crate::services::generated::registry_client::{
+use hyprstream_rpc_std::registry_client::{
     BranchRequest, CheckoutRequest, CloneRequest, CreateWorktreeRequest,
     RemoveWorktreeRequest, UpdateRequest,
 };
-use crate::services::RegistryClient;
-use crate::services::generated::model_client::{ModelClient, LoadModelRequest, UnloadModelRequest, StatusRequest};
+use hyprstream_rpc_std::registry_client::RegistryClient;
+use hyprstream_rpc_std::model_client::{ModelClient, LoadModelRequest, UnloadModelRequest, StatusRequest};
 #[cfg(feature = "experimental")]
-use crate::services::generated::registry_client::FileChangeType;
+use hyprstream_rpc_std::registry_client::FileChangeType;
 use crate::storage::ModelRef;
 #[cfg(feature = "experimental")]
 use crate::storage::GitRef;
@@ -459,7 +459,7 @@ pub async fn handle_promote(
 }
 
 /// Print model status in a nice format using generated RepositoryStatus
-fn print_model_status(model_name: &str, status: &crate::services::GenRepositoryStatus, verbose: bool) {
+fn print_model_status(model_name: &str, status: &hyprstream_rpc_std::registry_client::RepositoryStatus, verbose: bool) {
     println!("Model: {model_name}");
 
     // Show current branch/commit
@@ -811,7 +811,7 @@ async fn clone_with_streaming(
     quiet: bool,
     verbose: bool,
 ) -> Result<()> {
-    use crate::services::generated::registry_client::RegistryRpc;
+    use hyprstream_rpc_std::registry_client::RegistryRpc;
     let mut stream_handle = RegistryRpc::clone_stream(registry, &CloneRequest {
             url: repo_url.to_owned(),
             name: model_name.to_owned(),
@@ -1391,7 +1391,7 @@ pub async fn handle_infer(
     // Generate via ModelService (handles model loading, adapter loading, training collection, auth)
     if !sync {
         // Start stream with E2E authenticated handle (DH key exchange)
-        use crate::services::generated::model_client::InferRpc;
+        use hyprstream_rpc_std::model_client::InferRpc;
         let mut stream_handle = InferRpc::generate_stream(&model_client.infer(model_ref_str), &request).await?;
 
         println!();
@@ -1427,7 +1427,7 @@ pub async fn handle_infer(
         println!();
     } else {
         // Non-streaming: collect stream into full response
-        use crate::services::generated::model_client::InferRpc;
+        use hyprstream_rpc_std::model_client::InferRpc;
         let mut handle = InferRpc::generate_stream(&model_client.infer(model_ref_str), &request).await?;
 
         let mut text = String::new();
@@ -1480,7 +1480,7 @@ pub async fn handle_infer(
 pub async fn handle_load(
     model_ref_str: &str,
     max_context: Option<usize>,
-    kv_quant: crate::runtime::KVQuantType,
+    kv_quant: hyprstream_rpc_std::model_client::KVQuantType,
     wait: Option<u64>,
     signing_key: SigningKey,
 ) -> Result<()> {
@@ -1489,7 +1489,7 @@ pub async fn handle_load(
     info!("Loading model: {}", model_ref_str);
     let _model_ref = ModelRef::parse(model_ref_str)?;
     let load_max_context = max_context.map(|v| v as u32);
-    let load_kv_quant = if kv_quant == crate::runtime::KVQuantType::None { None } else { Some(kv_quant) };
+    let load_kv_quant = if kv_quant == hyprstream_rpc_std::model_client::KVQuantType::None { None } else { Some(kv_quant) };
 
     // Issue the load RPC directly (returns immediately - Continuation pattern).
     let model_client = ModelClient::from_resolver(
@@ -1498,7 +1498,7 @@ pub async fn handle_load(
     match model_client.load(&LoadModelRequest {
         model_ref: model_ref_str.to_owned(),
         max_context: load_max_context,
-        kv_quant: load_kv_quant.filter(|q| *q != crate::runtime::KVQuantType::None),
+        kv_quant: load_kv_quant.filter(|q| *q != hyprstream_rpc_std::model_client::KVQuantType::None),
     }).await {
         Ok(_) => debug!("Load RPC accepted for {}", model_ref_str),
         Err(e) => warn!("Load RPC failed for {}: {}", model_ref_str, e),
@@ -1506,7 +1506,7 @@ pub async fn handle_load(
 
     println!("Load initiated for model: {}", model_ref_str);
     if let Some(max_ctx) = max_context { println!("  Max context: {}", max_ctx); }
-    if kv_quant != crate::runtime::KVQuantType::None { println!("  KV quantization: {:?}", kv_quant); }
+    if kv_quant != hyprstream_rpc_std::model_client::KVQuantType::None { println!("  KV quantization: {:?}", kv_quant); }
 
     // If --wait, block on EventService model.lifecycle events until loaded/failed.
     // EV7/#649: latched shape via `read_then_subscribe`. A `load --wait` issued

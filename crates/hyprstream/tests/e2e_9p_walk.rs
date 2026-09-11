@@ -51,10 +51,9 @@ use tokio::sync::RwLock;
 use git2db::{Git2DB, RepoId};
 use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::config::TokenConfig;
-use hyprstream_core::services::{
-    PolicyClient, PolicyService, RegistryClient, RegistryService,
-    generated::registry_client::CreateWorktreeRequest,
-};
+use hyprstream_core::services::{PolicyService, RegistryService};
+use hyprstream_rpc_std::policy_client::PolicyClient;
+use hyprstream_rpc_std::registry_client::{CreateWorktreeRequest, RegistryClient};
 use hyprstream_core::services::remote_registry_mount::RemoteRegistryMount;
 use hyprstream_core::git::promote::{PromoteAuthor, PromoteLeaseTable, promote};
 

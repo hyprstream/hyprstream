@@ -2207,7 +2207,7 @@ pub struct RuntimeConfig {
     /// KV cache quantization type (None, INT8, NF4, FP4).
     /// Reduces GPU memory by 50-75% at slight quality cost.
     #[serde(default)]
-    pub kv_quant_type: crate::runtime::KVQuantType,
+    pub kv_quant_type: hyprstream_rpc_std::model_client::KVQuantType,
     /// Batch processing size
     pub batch_size: usize,
     /// CPU threads (None = auto-detect)
@@ -2344,13 +2344,13 @@ impl Default for RuntimeConfig {
         let kv_quant_type = std::env::var("HYPRSTREAM_KV_QUANT")
             .ok()
             .and_then(|s| match s.to_lowercase().as_str() {
-                "int8" => Some(crate::runtime::KVQuantType::Int8),
-                "nf4" => Some(crate::runtime::KVQuantType::Nf4),
-                "fp4" => Some(crate::runtime::KVQuantType::Fp4),
-                "none" | "" => Some(crate::runtime::KVQuantType::None),
+                "int8" => Some(hyprstream_rpc_std::model_client::KVQuantType::Int8),
+                "nf4" => Some(hyprstream_rpc_std::model_client::KVQuantType::Nf4),
+                "fp4" => Some(hyprstream_rpc_std::model_client::KVQuantType::Fp4),
+                "none" | "" => Some(hyprstream_rpc_std::model_client::KVQuantType::None),
                 _ => None,
             })
-            .unwrap_or(crate::runtime::KVQuantType::None);
+            .unwrap_or(hyprstream_rpc_std::model_client::KVQuantType::None);
 
         Self {
             context_length: 4096,
@@ -3173,8 +3173,8 @@ impl SamplingParams {
     ///
     /// Applies `SamplingParams` fields as `Option<T>` — `None` means "not specified",
     /// letting the engine use its defaults.
-    pub fn into_generation_request(self, prompt: String) -> crate::services::generated::inference_client::GenerationRequest {
-        crate::services::generated::inference_client::GenerationRequest {
+    pub fn into_generation_request(self, prompt: String) -> hyprstream_rpc_std::inference_client::GenerationRequest {
+        hyprstream_rpc_std::inference_client::GenerationRequest {
             prompt,
             max_tokens: self.max_tokens.map(|v| v as u32),
             temperature: self.temperature,

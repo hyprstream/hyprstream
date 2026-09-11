@@ -22,7 +22,7 @@ pub use worker::{ImageCommand, WorkerAction};
 
 use clap::{Subcommand, ValueEnum};
 
-use crate::runtime::KVQuantType;
+use hyprstream_rpc_std::model_client::KVQuantType;
 
 /// KV cache quantization type for CLI argument parsing.
 ///

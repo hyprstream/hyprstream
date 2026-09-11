@@ -15,7 +15,8 @@ use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::services::{RepositoryClient, WorktreeClient, WorktreeClientExt};
+use hyprstream_rpc_std::registry_client::{RepositoryClient, WorktreeClient};
+use crate::services::WorktreeClientExt;
 
 /// Checkpoint request sent to background worker
 #[derive(Debug, Clone)]
@@ -381,12 +382,12 @@ impl CheckpointManager {
         // Determine worktree branch name
         let wt_branch = if let Some(ref branch_name) = branch {
             // create_branch may fail if it already exists — that's fine
-            let _ = repo_client.create_branch(&crate::services::generated::registry_client::BranchRequest {
+            let _ = repo_client.create_branch(&hyprstream_rpc_std::registry_client::BranchRequest {
                 branch_name: branch_name.clone(),
                 start_point: String::new(),
             }).await;
             // Checkout within the worktree
-            repo_client.worktree(branch_name).checkout(&crate::services::generated::registry_client::CheckoutRequest {
+            repo_client.worktree(branch_name).checkout(&hyprstream_rpc_std::registry_client::CheckoutRequest {
                 ref_name: branch_name.clone(),
                 create_branch: false,
             })
@@ -429,7 +430,7 @@ impl CheckpointManager {
         }
 
         let files_owned: Vec<String> = files_to_stage.iter().map(|s| (*s).to_owned()).collect();
-        wt.stage_files(&crate::services::generated::registry_client::StageFilesRequest {
+        wt.stage_files(&hyprstream_rpc_std::registry_client::StageFilesRequest {
                 files: files_owned,
             })
             .await
@@ -445,7 +446,7 @@ impl CheckpointManager {
             )
         });
 
-        let oid = wt.commit(&crate::services::generated::registry_client::CommitRequest {
+        let oid = wt.commit(&hyprstream_rpc_std::registry_client::CommitRequest {
                 message: commit_message,
                 author: String::new(),
                 email: String::new(),
@@ -725,11 +726,11 @@ impl CheckpointManager {
         // Determine worktree branch name
         let wt_branch = if let Some(branch) = branch_name {
             // create_branch may fail if it already exists — that's fine
-            let _ = repo_client.create_branch(&crate::services::generated::registry_client::BranchRequest {
+            let _ = repo_client.create_branch(&hyprstream_rpc_std::registry_client::BranchRequest {
                 branch_name: branch.clone(),
                 start_point: String::new(),
             }).await;
-            repo_client.worktree(branch).checkout(&crate::services::generated::registry_client::CheckoutRequest {
+            repo_client.worktree(branch).checkout(&hyprstream_rpc_std::registry_client::CheckoutRequest {
                 ref_name: branch.clone(),
                 create_branch: false,
             })
@@ -742,7 +743,7 @@ impl CheckpointManager {
         let wt = repo_client.worktree(&wt_branch);
 
         // Stage checkpoint files
-        wt.stage_files(&crate::services::generated::registry_client::StageFilesRequest {
+        wt.stage_files(&hyprstream_rpc_std::registry_client::StageFilesRequest {
                 files: vec![
                     ".checkpoints/checkpoint.safetensors".to_owned(),
                     ".checkpoints/checkpoint.json".to_owned(),
@@ -758,7 +759,7 @@ impl CheckpointManager {
             format!("Training checkpoint step {step}")
         };
 
-        wt.commit(&crate::services::generated::registry_client::CommitRequest {
+        wt.commit(&hyprstream_rpc_std::registry_client::CommitRequest {
                 message,
                 author: String::new(),
                 email: String::new(),
@@ -774,7 +775,7 @@ impl CheckpointManager {
                 format!("checkpoint-step-{step}")
             };
 
-            let _ = repo_client.create_tag(&crate::services::generated::registry_client::CreateTagRequest {
+            let _ = repo_client.create_tag(&hyprstream_rpc_std::registry_client::CreateTagRequest {
                 name: tag_name,
                 target: String::new(),
             }).await;

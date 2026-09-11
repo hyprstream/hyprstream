@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::services::{WorktreeClient, WorktreeClientExt};
+use hyprstream_rpc_std::registry_client::WorktreeClient;
+use crate::services::WorktreeClientExt;
 
 /// Information about a discovered adapter
 #[derive(Debug, Clone, Serialize, Deserialize)]

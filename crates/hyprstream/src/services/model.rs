@@ -29,7 +29,7 @@
 
 use async_trait::async_trait;
 // GenerationRequest import removed — was only used by deleted ModelZmqClient
-use crate::runtime::KVQuantType;
+use hyprstream_rpc_std::model_client::KVQuantType;
 use crate::runtime::RuntimeConfig;
 use crate::runtime::inference_profile::{
     InferenceCompute, InferenceDeploymentProfile, InferenceInstanceId,
@@ -39,11 +39,11 @@ use crate::services::{
     EnvelopeContext,
     PolicyClient,
 };
-use crate::services::generated::inference_client::InferenceClient;
-use crate::services::RegistryClient;
-use crate::services::generated::registry_client::{StageFilesRequest, CommitWithAuthorRequest};
+use hyprstream_rpc_std::inference_client::InferenceClient;
+use hyprstream_rpc_std::registry_client::RegistryClient;
+use hyprstream_rpc_std::registry_client::{StageFilesRequest, CommitWithAuthorRequest};
 use crate::services::WorktreeClientExt;
-use crate::services::generated::policy_client::PolicyCheck;
+use hyprstream_rpc_std::policy_client::PolicyCheck;
 use crate::storage::ModelRef;
 use anyhow::{anyhow, Result};
 use hyprstream_rpc::latch::{Terminal, TerminalStore};
@@ -197,7 +197,7 @@ pub struct ModelServiceInner {
     /// Discovery client for federated record resolution (#431). None = no
     /// federation; `resolve_model_ref`'s at:// branch then falls through to
     /// local resolution.
-    discovery_client: Option<Arc<hyprstream_discovery::DiscoveryClient>>,
+    discovery_client: Option<Arc<hyprstream_rpc_std::discovery_client::DiscoveryClient>>,
     /// Persistent 9P synthetic trees, partitioned by authority-verified tenant.
     fs_trees: dashmap::DashMap<String, Arc<crate::services::fs::SyntheticTree>>,
     /// Retained terminal for each model load attempt (EV7/#649) — the
@@ -489,7 +489,7 @@ impl ModelService {
     #[allow(clippy::expect_used)]
     pub fn with_discovery_client(
         mut self,
-        client: Arc<hyprstream_discovery::DiscoveryClient>,
+        client: Arc<hyprstream_rpc_std::discovery_client::DiscoveryClient>,
     ) -> Self {
         Arc::get_mut(&mut self.inner)
             .expect("with_discovery_client must be called before service is shared")
@@ -802,7 +802,7 @@ impl ModelService {
         };
 
         let car_resp = dc
-            .get_record(&hyprstream_discovery::GetRecordRequest {
+            .get_record(&hyprstream_rpc_std::discovery_client::GetRecordRequest {
                 uri: at_uri.to_owned(),
                 did: did.clone(),
                 collection: collection.clone(),
@@ -980,7 +980,7 @@ impl ModelService {
         };
 
         // Obtain FsOps from the registry for path-contained adapter I/O
-        let fs: Option<crate::services::WorktreeClient> = Some(repo_client.worktree(&branch_name));
+        let fs: Option<hyprstream_rpc_std::registry_client::WorktreeClient> = Some(repo_client.worktree(&branch_name));
 
         // Start InferenceService for this model via standard Spawnable infrastructure
         let spawner = hyprstream_service::ServiceSpawner::threaded();
@@ -1314,7 +1314,7 @@ impl ModelService {
         &self,
         model_ref_str: &str,
         ctx: &EnvelopeContext,
-    ) -> Result<crate::services::generated::inference_client::DeltaStatusResult> {
+    ) -> Result<hyprstream_rpc_std::inference_client::DeltaStatusResult> {
         let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.get_delta_status().await
     }
@@ -1323,7 +1323,7 @@ impl ModelService {
         &self,
         model_ref_str: &str,
         ctx: &EnvelopeContext,
-    ) -> Result<crate::services::generated::inference_client::SnapshotDeltaResult> {
+    ) -> Result<hyprstream_rpc_std::inference_client::SnapshotDeltaResult> {
         let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.snapshot_delta().await
     }
@@ -1344,9 +1344,8 @@ impl ModelService {
 // ModelHandler Implementation — generated dispatch for top-level + typed scope traits
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use crate::services::generated::model_client::{
-    ModelHandler, TttHandler, AdapterHandler, InferHandler,
-    dispatch_model, serialize_response, ModelResponseVariant,
+use hyprstream_rpc_std::model_client::{
+    ModelResponseVariant,
     LoadedModelResponse, ErrorInfo, ModelHealthStatus,
     StatusRequest,
     ModelStatusEntry as GenModelStatusEntry, OnlineTrainingConfig as GenOnlineTrainingConfig,
@@ -1364,6 +1363,9 @@ use crate::services::generated::model_client::{
     // Infer types (GenerationRequest follows inference.capnp name)
     GenerationRequest, ChatTemplateRequest, ModelStatusResponse,
     EmbedImagesRequest, EmbedImagesResponse,
+};
+use crate::services::generated::model_client::{
+    AdapterHandler, InferHandler, ModelHandler, TttHandler, dispatch_model, serialize_response,
 };
 // AdaptationStrategy is now from inference_client (canonical source via using-import).
 // model_client types reference it directly — no conversion needed.
@@ -1390,7 +1392,7 @@ impl TttHandler for ModelService {
     async fn handle_train_stream(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &TrainStepRequest,
-    ) -> Result<(crate::services::generated::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(hyprstream_rpc_std::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let client = self.get_inference_client(model_ref, ctx).await?;
         let ephemeral_pubkey = ctx.ephemeral_pubkey()
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
@@ -1617,7 +1619,7 @@ impl InferHandler for ModelService {
     async fn handle_generate_stream(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &GenerationRequest,
-    ) -> Result<(crate::services::generated::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(hyprstream_rpc_std::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let client = self.get_inference_client(model_ref, ctx).await?;
         let ephemeral_pubkey = ctx.ephemeral_pubkey()
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
@@ -1761,12 +1763,12 @@ impl ModelHandler for ModelService {
 // 9P Filesystem Handler (FsHandler trait)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use crate::services::generated::model_client::{
+use hyprstream_rpc_std::model_client::{
     NpWalk, NpOpen, NpRead, NpWrite, NpClunk, NpStatReq, NpCreate, NpRemove,
     RWalk, ROpen, RRead, RWrite, RStat,
     Qid as GenQid, NpStat as GenNpStat,
-    FsHandler,
 };
+use crate::services::generated::model_client::FsHandler;
 use crate::services::fs::{SyntheticTree, SyntheticNode, SyntheticQid};
 use hyprstream_vfs::DirEntry;
 
@@ -1958,12 +1960,12 @@ impl FsHandler for ModelService {
 struct ParsedLoadRequest {
     model_ref: String,
     max_context: u32,
-    kv_quant: crate::model_capnp::KVQuantType,
+    kv_quant: hyprstream_rpc_std::model_capnp::KVQuantType,
 }
 
 impl ParsedLoadRequest {
     fn to_load_params(&self) -> (Option<u32>, Option<KVQuantType>) {
-        use crate::model_capnp::KVQuantType as CKV;
+        use hyprstream_rpc_std::model_capnp::KVQuantType as CKV;
         let max_ctx = match self.max_context {
             0 => None,
             n => Some(n),
@@ -1987,10 +1989,10 @@ impl ModelService {
     fn try_parse_load_request(
         body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> Option<(u64, ParsedLoadRequest)> {
-        use crate::model_capnp::model_request;
-        use crate::model_capnp::KVQuantType as CKV;
-        use crate::optional_capnp::option_uint32;
-        use crate::model_capnp::option_k_v_quant_type;
+        use hyprstream_rpc_std::model_capnp::model_request;
+        use hyprstream_rpc_std::model_capnp::KVQuantType as CKV;
+        use hyprstream_rpc::optional_capnp::option_uint32;
+        use hyprstream_rpc_std::model_capnp::option_k_v_quant_type;
         let req = body.root::<model_request::Reader>().ok()?;
         let request_id = req.get_id();
         match req.which().ok()? {
@@ -2629,11 +2631,11 @@ mod tests {
                 &mut std::io::Cursor::new(&payload),
                 capnp::message::ReaderOptions::new(),
             )?;
-            let request = reader.get_root::<crate::inference_capnp::inference_request::Reader>()?;
+            let request = reader.get_root::<hyprstream_rpc_std::inference_capnp::inference_request::Reader>()?;
             anyhow::ensure!(
                 matches!(
                     request.which()?,
-                    crate::inference_capnp::inference_request::Which::IsReady(())
+                    hyprstream_rpc_std::inference_capnp::inference_request::Which::IsReady(())
                 ),
                 "selector fixture received a non-readiness request"
             );
@@ -2673,7 +2675,7 @@ mod tests {
             }
             crate::services::generated::inference_client::serialize_response(
                 request.get_id(),
-                &crate::services::generated::inference_client::InferenceResponseVariant::IsReadyResult(
+                &hyprstream_rpc_std::inference_client::InferenceResponseVariant::IsReadyResult(
                     true,
                 ),
             )

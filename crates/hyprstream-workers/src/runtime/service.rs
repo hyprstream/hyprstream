@@ -55,16 +55,13 @@ use crate::events::{
 // it, with no cfg mirror (#646).
 use crate::image::ImageStore;
 // Import generated wire types (canonical OCI-aligned names)
-use crate::generated::worker_client::{
+use hyprstream_rpc_std::worker_client::{
     // Filter + request types for handler signatures
     PodSandboxFilter, PodSandboxStatsFilter,
     ContainerFilter, ContainerStatsFilter,
     StatusRequest, PodSandboxStatusRequest, StopContainerRequest,
     ContainerStatusRequest, AttachRequest, ImageFilter, ImageStatusRequest,
-};
-use super::client::{
-    StatusResponse, KeyValue,
-    VersionInfo, RuntimeStatus, RuntimeCondition,
+    KeyValue, VersionInfo, RuntimeStatus, RuntimeCondition,
     ExecSyncResult,
     PodSandboxStats, PodSandboxAttributes, LinuxPodSandboxStats,
     ContainerStats, ContainerAttributes,
@@ -73,6 +70,14 @@ use super::client::{
     PodSandboxConfig, PodSandboxStatus,
     ContainerConfig, ContainerStatus,
     StreamInfo,
+    PodSandboxStatusResponse, ContainerStatusResponse,
+    ImageInfo, ImageStatusResult,
+    FilesystemUsage, AuthConfig,
+};
+use super::status::StatusResponse;
+use crate::generated::worker_client::{
+    WorkerHandler, dispatch_worker,
+    RuntimeHandler, SandboxHandler, ContainerHandler, ImageHandler,
 };
 // Domain entities (business logic)
 use super::container::Container;
@@ -1216,21 +1221,11 @@ impl From<&Container> for ContainerStats {
 // Generated scope handler traits (typed inner dispatch)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use crate::generated::worker_client::{
-    WorkerHandler, dispatch_worker,
-    RuntimeHandler, SandboxHandler, ContainerHandler, ImageHandler,
-};
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Typed Scope Handler Implementations
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use super::client::{
-    PodSandboxStatusResponse, ContainerStatusResponse,
-    ImageInfo, ImageStatusResult,
-    FilesystemUsage,
-};
-use crate::generated::worker_client::{
+use hyprstream_rpc_std::worker_client::{
     CreateContainerRequest,
     ExecSyncRequest, PullImageRequest,
 };
@@ -1377,7 +1372,7 @@ impl ImageHandler for WorkerService {
     async fn handle_pull(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &PullImageRequest) -> AnyhowResult<String> {
         let store = self.image_store.as_ref().ok_or_else(image_store_missing)?;
         let auth = if !data.auth.username.is_empty() {
-            Some(crate::image::AuthConfig {
+            Some(AuthConfig {
                 username: data.auth.username.clone(),
                 password: data.auth.password.clone(),
                 auth: String::new(),
@@ -1496,7 +1491,7 @@ mod tests {
     use super::*;
     use crate::config::ImageConfig;
     use crate::image::RafsStore;
-    use crate::runtime::{PodSandboxConfig, PodSandboxState, ContainerConfig};
+    use hyprstream_rpc_std::worker_client::{ContainerConfig, PodSandboxConfig, PodSandboxState};
     use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::transport::TransportConfig;

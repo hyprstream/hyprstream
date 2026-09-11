@@ -28,7 +28,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use hyprstream_workers::{WorkerService, RuntimeClient, ImageClient};
+//! use hyprstream_workers::WorkerService;
 //!
 //! // Create worker service
 //! let worker = WorkerService::new(config).await?;
@@ -100,10 +100,6 @@ pub use hyprstream_rpc::moq_event::{init_global_moq_event_origin, MoqEventOrigin
 pub use hyprstream_rpc::annotations_capnp;
 pub use hyprstream_rpc::common_capnp;
 pub use hyprstream_rpc::streaming_capnp;
-
-// Canonical wire modules are generated once by the Apache-2.0 contract crate.
-// Keep these names as compatibility re-exports for runtime/event code.
-pub use hyprstream_rpc_std::{worker_capnp, workflow_capnp};
 
 /// Generated RPC dispatch code from `generate_rpc_service!` proc macro.
 ///

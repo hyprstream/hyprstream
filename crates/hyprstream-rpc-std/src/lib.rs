@@ -232,9 +232,9 @@ pub mod pay_client {
     };
 }
 
-/// Stable, discoverable imports for third-party Rust consumers.  Service
-/// implementations may re-export data types for compatibility, but the public
-/// client implementations live only in this Apache-2.0 crate.
+/// Stable, discoverable imports for third-party Rust consumers. Service
+/// implementations intentionally do not re-export these client/data modules;
+/// this Apache-2.0 crate is the single public SDK surface.
 pub mod prelude {
     pub use crate::{
         discovery_client, inference_client, mcp_client, metrics_client, model_client,

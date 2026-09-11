@@ -1309,7 +1309,8 @@ mod tests {
     // ── Router-mounted tests (findings 1 + 2) ─────────────────────────────────
 
     use crate::config::OAuthConfig;
-    use crate::services::{DiscoveryClient, PolicyClient};
+    use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+    use hyprstream_rpc_std::policy_client::PolicyClient;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use axum::Router;

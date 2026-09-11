@@ -4,9 +4,9 @@
 //! pattern over the 9P protocol. These replace the old `read_file`/`write_file`/`mkdir`
 //! convenience methods that sent entire files in a single message.
 
-use crate::services::WorktreeClient;
+use hyprstream_rpc_std::registry_client::WorktreeClient;
 use crate::services::types::{OREAD, OWRITE, DMDIR};
-use crate::services::generated::registry_client::{
+use hyprstream_rpc_std::registry_client::{
     NpWalk, NpOpen, NpCreate, NpRead, NpWrite, NpClunk, NpRemove, NpStatReq,
 };
 use anyhow::Result;
@@ -43,7 +43,7 @@ pub struct StatResult {
 /// the AGPL daemon add ergonomics without defining an inherent impl for an
 /// external type.
 pub(crate) trait WorktreeClientExt:
-    crate::services::generated::registry_client::WorktreeRpc
+    hyprstream_rpc_std::registry_client::WorktreeRpc
 {
     /// Read an entire file via walk/open/read-loop/clunk (bounded by iounit per message).
     ///

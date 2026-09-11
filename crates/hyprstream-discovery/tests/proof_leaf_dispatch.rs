@@ -181,7 +181,7 @@ fn ping_request_bytes() -> Vec<u8> {
     let mut message = capnp::message::Builder::new_default();
     {
         let mut req = message
-            .init_root::<hyprstream_discovery::discovery_capnp::discovery_request::Builder>();
+            .init_root::<hyprstream_rpc_std::discovery_capnp::discovery_request::Builder>();
         req.set_id(7);
         req.set_ping(());
     }

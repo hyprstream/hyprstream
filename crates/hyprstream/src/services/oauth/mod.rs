@@ -88,7 +88,7 @@ use tokio::sync::Notify;
 use tracing::info;
 
 use crate::config::{CredentialsBackend, OAuthConfig};
-use crate::services::PolicyClient;
+use hyprstream_rpc_std::policy_client::PolicyClient;
 use state::OAuthState;
 
 /// Service name for registry and logging
@@ -711,7 +711,7 @@ async fn resolve_account_http_tls(
 #[cfg(test)]
 fn runtime_clients(
     signing_key: &ed25519_dalek::SigningKey,
-) -> anyhow::Result<(PolicyClient, crate::services::DiscoveryClient)> {
+) -> anyhow::Result<(PolicyClient, hyprstream_rpc_std::discovery_client::DiscoveryClient)> {
     let trust = hyprstream_service::global_trust_store();
     let policy_key = trust
         .resolve_one("policy")
@@ -835,10 +835,10 @@ impl Spawnable for OAuthService {
                 }
             };
             let discovery_client = if hyprstream_discovery::native_network_required() {
-                crate::services::DiscoveryClient::from_resolver(self.signing_key.clone(), None)
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::from_resolver(self.signing_key.clone(), None)
                     .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create DiscoveryClient: {e}")))?
             } else {
-                crate::services::DiscoveryClient::for_local_transport_bootstrap(
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_transport_bootstrap(
                     &self.discovery_transport,
                     self.signing_key.clone(),
                     discovery_vk,
@@ -1743,7 +1743,7 @@ mod tests {
             "Required profile must resolve Policy through the checkpoint resolver"
         );
         assert!(
-            run.contains("if hyprstream_discovery::native_network_required() {\n                crate::services::DiscoveryClient::from_resolver("),
+            run.contains("if hyprstream_discovery::native_network_required() {\n                hyprstream_rpc_std::discovery_client::DiscoveryClient::from_resolver("),
             "Required profile must resolve Discovery through the checkpoint resolver"
         );
         assert!(
@@ -2212,8 +2212,10 @@ mod tests {
         use super::token_store::RocksDbTokenStore;
         use crate::auth::rocksdb_store::RocksDbUserStore;
         use crate::auth::{PolicyManager, UserProfile, UserStore};
-        use crate::services::generated::policy_client::{IssueToken, IssueTokenProfile};
-        use crate::services::{DiscoveryClient, PolicyClient, PolicyService};
+        use hyprstream_rpc_std::policy_client::{IssueToken, IssueTokenProfile};
+        use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+        use hyprstream_rpc_std::policy_client::PolicyClient;
+        use crate::services::PolicyService;
 
         const ISSUER: &str = "https://pds.example.test:8443";
         const GENERIC_ISSUER: &str = "https://pds.example.test:8443/configured/path";

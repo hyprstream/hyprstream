@@ -24,8 +24,8 @@ use hyprstream_rpc::auth::{
 use hyprstream_rpc::crypto::SigningKey;
 use hyprstream_service::ServiceContext;
 
-use crate::services::PolicyClient;
-use crate::services::generated::policy_client::{
+use hyprstream_rpc_std::policy_client::PolicyClient;
+use hyprstream_rpc_std::policy_client::{
     CheckCredentialRevocation, CheckSession, CredentialIdRef, CredentialIdRefContent,
     RegisterSession, RevokeCredential, RevokeSession, SessionKeyRef, SessionKeyRefContent,
 };

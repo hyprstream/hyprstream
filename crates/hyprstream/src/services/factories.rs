@@ -37,9 +37,10 @@ use tracing::info;
 use crate::auth::identity_store::credentials_dir;
 use crate::auth::PolicyManager;
 use crate::config::HyprConfig;
-use crate::services::generated::policy_client::{RefreshServiceTokenRequest, RegisterServiceKey};
+use hyprstream_rpc_std::policy_client::{PolicyClient, RefreshServiceTokenRequest, RegisterServiceKey};
+use hyprstream_rpc_std::registry_client::RegistryClient;
 use crate::services::{
-    DiscoveryService, McpConfig, McpService, PolicyClient, PolicyService, RegistryClient,
+    DiscoveryService, McpConfig, McpService, PolicyService,
     RegistryService,
 };
 
@@ -191,7 +192,7 @@ fn accepted_state_matches_service(
 /// and the latest registered JWT. No stale authority is returned on failure.
 pub fn current_native_announcement(
     request: &mut hyprstream_service::NativeAnnouncementRequest,
-) -> anyhow::Result<hyprstream_discovery::ServiceAnnouncement> {
+) -> anyhow::Result<hyprstream_rpc_std::discovery_client::ServiceAnnouncement> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     let verifier = hyprstream_discovery::deployment_registry_verifier()?;
     let store = crate::services::discovery::PdsRecordStore::open_readonly(
@@ -218,7 +219,7 @@ pub fn current_native_announcement(
             .ok_or_else(|| anyhow::anyhow!("native announcement JWT has no bounded expiry"))?;
         anyhow::ensure!(expiry > now.timestamp_millis(), "native announcement JWT expired");
     }
-    Ok(hyprstream_discovery::ServiceAnnouncement {
+    Ok(hyprstream_rpc_std::discovery_client::ServiceAnnouncement {
         service_name: request.service_name.clone(),
         socket_kind: request.reach.socket_kind().to_owned(),
         endpoint: request.reach.endpoint(),
@@ -969,7 +970,7 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for PolicyService (Casbin policy management)
-#[service_factory("policy", schema = "../../../hyprstream-rpc-std/schema/policy.capnp", metadata = crate::services::generated::policy_client::schema_metadata)]
+#[service_factory("policy", schema = "../../../hyprstream-rpc-std/schema/policy.capnp", metadata = hyprstream_rpc_std::policy_client::schema_metadata)]
 fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating PolicyService");
     register_service_key(ctx, "policy", &ctx.service_signing_key("policy"))?;
@@ -1105,7 +1106,7 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for RegistryService (git2db model registry)
-#[service_factory("registry", schema = "../../../hyprstream-rpc-std/schema/registry.capnp", metadata = crate::services::generated::registry_client::schema_metadata, depends_on = ["policy", "discovery"])]
+#[service_factory("registry", schema = "../../../hyprstream-rpc-std/schema/registry.capnp", metadata = hyprstream_rpc_std::registry_client::schema_metadata, depends_on = ["policy", "discovery"])]
 fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating RegistryService");
 
@@ -1374,7 +1375,7 @@ impl Spawnable for MoqStreamBarrierService {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for ModelService (model lifecycle management)
-#[service_factory("model", schema = "../../../hyprstream-rpc-std/schema/model.capnp", metadata = crate::services::generated::model_client::schema_metadata, depends_on = ["policy", "registry", "discovery", ])]
+#[service_factory("model", schema = "../../../hyprstream-rpc-std/schema/model.capnp", metadata = hyprstream_rpc_std::model_client::schema_metadata, depends_on = ["policy", "registry", "discovery", ])]
 fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating ModelService");
 
@@ -1432,7 +1433,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     // key is in the trust store (depends_on includes "discovery"). Best-effort:
     // if discovery isn't resolvable, ModelService simply has no federation client
     // and at:// refs fall through to local resolution.
-    match crate::services::DiscoveryClient::from_resolver(sk.clone(), None) {
+    match hyprstream_rpc_std::discovery_client::DiscoveryClient::from_resolver(sk.clone(), None) {
         Ok(dc) => {
             model_service = model_service.with_discovery_client(std::sync::Arc::new(dc));
         }
@@ -1450,7 +1451,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 
 /// One model, one tenant, one CPU-only process. Metal starts two independent
 /// copies with replica ordinals 0 and 1; no engine or KV-cache state is shared.
-#[service_factory("inference", schema = "../../../hyprstream-rpc-std/schema/inference.capnp", metadata = crate::services::generated::inference_client::schema_metadata, depends_on = ["policy", "discovery"])]
+#[service_factory("inference", schema = "../../../hyprstream-rpc-std/schema/inference.capnp", metadata = hyprstream_rpc_std::inference_client::schema_metadata, depends_on = ["policy", "discovery"])]
 fn create_inference_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating standalone CPU InferenceService");
 
@@ -1690,7 +1691,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 #[service_factory(
     "workflow",
     schema = "../../../hyprstream-rpc-std/schema/workflow.capnp",
-    metadata = hyprstream_workers::generated::workflow_client::schema_metadata,
+    metadata = hyprstream_rpc_std::workflow_client::schema_metadata,
     depends_on = ["worker", "event", "policy", "registry", "discovery"]
 )]
 fn create_workflow_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
@@ -1807,7 +1808,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     info!("Creating OAIService");
 
     use crate::server::state::ServerState;
-    use crate::services::generated::model_client::ModelClient;
+    use hyprstream_rpc_std::model_client::ModelClient;
     use crate::services::OAIService;
 
     // Load full config for OAI settings
@@ -2057,7 +2058,7 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 ///
 /// This service provides OAuth 2.1 authorization for MCP and OAI services.
 /// It delegates token issuance to PolicyService over ZMQ.
-#[service_factory("oauth", schema = "../../../hyprstream-rpc-std/schema/oauth.capnp", metadata = crate::services::generated::oauth_client::schema_metadata, depends_on = ["policy", "discovery"])]
+#[service_factory("oauth", schema = "../../../hyprstream-rpc-std/schema/oauth.capnp", metadata = hyprstream_rpc_std::oauth_client::schema_metadata, depends_on = ["policy", "discovery"])]
 fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating OAuthService");
 
@@ -2114,7 +2115,7 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 /// - HTTP/SSE (for external MCP clients)
 ///
 /// Note: The HTTP/SSE server is spawned as a background task in the factory.
-#[service_factory("mcp", schema = "../../../hyprstream-rpc-std/schema/mcp.capnp", metadata = crate::services::generated::mcp_client::schema_metadata, depends_on = ["policy", "discovery"])]
+#[service_factory("mcp", schema = "../../../hyprstream-rpc-std/schema/mcp.capnp", metadata = hyprstream_rpc_std::mcp_client::schema_metadata, depends_on = ["policy", "discovery"])]
 fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating McpService");
 
@@ -2755,7 +2756,7 @@ fn open_pds_store_readonly(
 ///
 /// This service exposes the EndpointRegistry so remote clients can discover
 /// registered services, their endpoints, socket kinds, and schemas.
-#[service_factory("discovery", schema = "../../../hyprstream-rpc-std/schema/discovery.capnp", metadata = hyprstream_discovery::generated::discovery_client::schema_metadata, depends_on = ["policy"])]
+#[service_factory("discovery", schema = "../../../hyprstream-rpc-std/schema/discovery.capnp", metadata = hyprstream_rpc_std::discovery_client::schema_metadata, depends_on = ["policy"])]
 fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating DiscoveryService");
 
@@ -2934,7 +2935,7 @@ fn discovery_self_publisher(owner: hyprstream_discovery::DiscoverySelfAnnouncer)
 
 /// Factory for MetricsService (DuckDB-backed time-series ingest + DataFusion query)
 #[cfg(feature = "metrics")]
-#[service_factory("metrics", schema = "../../../hyprstream-rpc-std/schema/metrics.capnp", metadata = crate::services::generated::metrics_client::schema_metadata, depends_on = ["policy", "discovery"])]
+#[service_factory("metrics", schema = "../../../hyprstream-rpc-std/schema/metrics.capnp", metadata = hyprstream_rpc_std::metrics_client::schema_metadata, depends_on = ["policy", "discovery"])]
 fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating MetricsService");
 

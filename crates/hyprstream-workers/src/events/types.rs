@@ -30,7 +30,7 @@
 use anyhow::Result;
 use hyprstream_rpc::prelude::{FromCapnp, ToCapnp};
 
-use crate::worker_capnp;
+use hyprstream_rpc_std::worker_capnp;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Individual Event Types (with derive macros)

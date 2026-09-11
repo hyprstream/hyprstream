@@ -50,11 +50,10 @@ const MODEL_MISSING_TENANT_DENIAL: &str = "authorization denied: no verified ten
 /// decrypted and verified against the resolved Model identity. Classify the
 /// expected denial only after that verification.
 pub(crate) async fn prove_model_reachability_denial(
-    client: &crate::services::generated::model_client::ModelClient,
+    client: &hyprstream_rpc_std::model_client::ModelClient,
 ) -> Result<(), hyprstream_rpc::error::RpcError> {
-    use crate::services::generated::model_client::{
-        verified_health_check_response, ModelResponseVariant,
-    };
+    use crate::services::generated::model_client::verified_health_check_response;
+    use hyprstream_rpc_std::model_client::ModelResponseVariant;
 
     let response = verified_health_check_response(client)
         .await
@@ -83,7 +82,7 @@ pub(crate) async fn prove_model_reachability_denial(
 }
 
 pub(crate) async fn healthy_registry(
-    client: &crate::services::RegistryClient,
+    client: &hyprstream_rpc_std::registry_client::RegistryClient,
 ) -> Result<(), hyprstream_rpc::error::RpcError> {
     let health = client.health_check().await.map_err(|error| {
         hyprstream_rpc::error::RpcError::SpawnFailed(format!(
@@ -100,8 +99,8 @@ pub(crate) async fn healthy_registry(
 }
 
 pub(crate) async fn await_required_native_dependencies(
-    model: &crate::services::generated::model_client::ModelClient,
-    registry: &crate::services::RegistryClient,
+    model: &hyprstream_rpc_std::model_client::ModelClient,
+    registry: &hyprstream_rpc_std::registry_client::RegistryClient,
     shutdown: Arc<Notify>,
     timeout: Duration,
 ) -> Result<(), hyprstream_rpc::error::RpcError> {

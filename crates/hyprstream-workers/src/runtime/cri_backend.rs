@@ -69,7 +69,7 @@ use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 
 use super::backend::{NamespaceDelivery, NamespaceTransport, SandboxBackend, SandboxHandle};
-use super::client::{KeyValue, LinuxContainerResources, PodSandboxConfig};
+use hyprstream_rpc_std::worker_client::{KeyValue, LinuxContainerResources, PodSandboxConfig};
 use super::sandbox::PodSandbox;
 
 use cri::image_service_client::ImageServiceClient;
@@ -788,7 +788,7 @@ inventory::submit! {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::super::client::{KeyValue, PodSandboxConfig};
+    use super::hyprstream_rpc_std::worker_client::{KeyValue, PodSandboxConfig};
     use super::*;
     use std::path::PathBuf;
 

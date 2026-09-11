@@ -564,7 +564,9 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
     use hyprstream_core::services::oauth::state::{
         AtprotoDidDocumentResolver, OAuthState, RegisteredClient,
     };
-    use hyprstream_core::services::{DiscoveryClient, PolicyClient, PolicyService};
+    use hyprstream_core::services::PolicyService;
+    use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+    use hyprstream_rpc_std::policy_client::PolicyClient;
     use hyprstream_rpc::auth::ClusterKeySource;
     use hyprstream_rpc::crypto::CryptoPolicy;
     use hyprstream_rpc::rpc_client::RpcClientImpl;

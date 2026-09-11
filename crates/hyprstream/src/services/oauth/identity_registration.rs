@@ -1680,8 +1680,8 @@ mod tests {
         (
             Arc::new(OAuthState::new(
                 &config,
-                crate::services::PolicyClient::new(make_client()),
-                crate::services::DiscoveryClient::new(make_client()),
+                hyprstream_rpc_std::policy_client::PolicyClient::new(make_client()),
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(make_client()),
                 signing_key.verifying_key().to_bytes(),
             )),
             cors,
@@ -1787,8 +1787,8 @@ mod tests {
         let state = Arc::new(
             OAuthState::new(
                 &oauth,
-                crate::services::PolicyClient::new(make_client()),
-                crate::services::DiscoveryClient::new(make_client()),
+                hyprstream_rpc_std::policy_client::PolicyClient::new(make_client()),
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(make_client()),
                 signing_key.verifying_key().to_bytes(),
             )
             .with_identity_registration_api(api),

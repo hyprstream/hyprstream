@@ -19,15 +19,17 @@
 //! 2. Token expiration
 //! 3. Backend services enforce authorization via Casbin policies
 
-use crate::services::generated::mcp_client::{
-    dispatch_mcp, serialize_response, CallTool, ErrorInfo, McpHandler, McpResponseVariant,
+use hyprstream_rpc_std::mcp_client::{
+    CallTool, ErrorInfo, McpResponseVariant,
     ServiceMetrics, ServiceStatus, ToolDefinition, ToolList,
 };
-use crate::services::generated::model_client::ModelClient;
-use crate::services::generated::policy_client::PolicyCheck;
-use crate::services::generated::tui_client::TuiClient;
-use crate::services::{PolicyClient, RegistryClient};
-use hyprstream_workers::generated::workflow_client::WorkflowClient;
+use crate::services::generated::mcp_client::{McpHandler, dispatch_mcp, serialize_response};
+use hyprstream_rpc_std::model_client::ModelClient;
+use hyprstream_rpc_std::policy_client::PolicyCheck;
+use hyprstream_rpc_std::tui_client::TuiClient;
+use hyprstream_rpc_std::policy_client::PolicyClient;
+use hyprstream_rpc_std::registry_client::RegistryClient;
+use hyprstream_rpc_std::workflow_client::WorkflowClient;
 use async_trait::async_trait;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
@@ -276,7 +278,7 @@ fn mcp_policy_scope(scope: &str, service_name: &str, method_name: &str) -> Strin
 /// Scoped tools are discovered by recursively walking `scoped_client_tree()`.
 /// Scope and streaming flags are read from MethodSchema.
 fn register_schema_tools(reg: &mut ToolRegistry) {
-    use crate::services::generated::{model_client, policy_client, registry_client, tui_client};
+    use hyprstream_rpc_std::{model_client, policy_client, registry_client, tui_client};
     // Each service generates its own MethodSchema type, so we use a macro
     // to iterate each service's methods with the correct type.
     macro_rules! register_top_level {
@@ -335,7 +337,7 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
     register_top_level!(reg, tui_client::schema_metadata());
     register_top_level!(
         reg,
-        hyprstream_workers::generated::workflow_client::schema_metadata()
+        hyprstream_rpc_std::workflow_client::schema_metadata()
     );
     // Scoped tools: recursive tree walk for all services with nested scopes
     register_scoped_tools_recursive(
@@ -1348,7 +1350,7 @@ impl McpHandler for McpService {
             // Status check uses local identity (internal health check, no user context)
             let client = ModelClient::from_resolver(self.signing_key.clone(), None)?;
             client
-                .status(&crate::services::generated::model_client::StatusRequest {
+                .status(&hyprstream_rpc_std::model_client::StatusRequest {
                     model_ref: String::new(),
                 })
                 .await
@@ -1442,7 +1444,7 @@ impl McpHandler for McpService {
                     .collect::<Vec<_>>()
                     .join("");
                 Ok(McpResponseVariant::CallToolResult(
-                    crate::services::generated::mcp_client::ToolResult {
+                    hyprstream_rpc_std::mcp_client::ToolResult {
                         success: true,
                         result: text,
                         error_message: String::new(),
@@ -1450,7 +1452,7 @@ impl McpHandler for McpService {
                 ))
             }
             Err(e) => Ok(McpResponseVariant::CallToolResult(
-                crate::services::generated::mcp_client::ToolResult {
+                hyprstream_rpc_std::mcp_client::ToolResult {
                     success: false,
                     result: "null".to_owned(),
                     error_message: format!("{}", e),

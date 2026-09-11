@@ -55,7 +55,7 @@ use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 
 use super::backend::{SandboxBackend, SandboxHandle};
-use super::client::{LinuxContainerResources, PodSandboxConfig};
+use hyprstream_rpc_std::worker_client::{LinuxContainerResources, PodSandboxConfig};
 use super::sandbox::PodSandbox;
 #[cfg(feature = "oci-image")]
 use crate::image::RafsStore;
@@ -878,7 +878,7 @@ inventory::submit! {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::super::client::{KeyValue, PodSandboxConfig};
+    use super::hyprstream_rpc_std::worker_client::{KeyValue, PodSandboxConfig};
     use super::*;
     use std::path::PathBuf;
 

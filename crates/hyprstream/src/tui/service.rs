@@ -22,8 +22,8 @@ use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::streaming::{StreamChannel, StreamContext};
 use hyprstream_rpc::{EnvelopeContext, RequestService, Continuation};
 
-use crate::tui_capnp;
-use crate::services::PolicyClient;
+use hyprstream_rpc_std::tui_capnp;
+use hyprstream_rpc_std::policy_client::PolicyClient;
 use super::state::{TuiState, TuiEvent};
 use super::diff;
 use super::vte_parser;
@@ -248,7 +248,7 @@ impl TuiService {
         let policy_client = self.policy_client.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Authorization denied: no policy client configured")
         })?;
-        let request = crate::services::generated::policy_client::PolicyCheck {
+        let request = hyprstream_rpc_std::policy_client::PolicyCheck {
             subject: subject.clone(),
             domain,
             resource: resource.to_owned(),
@@ -844,17 +844,17 @@ impl TuiService {
         let registry_models_dir = std::path::PathBuf::from(registry_dir);
 
         let models = {
-            let registry_client: crate::services::RegistryClient =
-                crate::services::RegistryClient::from_resolver(
+            let registry_client: hyprstream_rpc_std::registry_client::RegistryClient =
+                hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(
                     self.signing_key.clone(),
                     None,
                 )?;
-            let model_client_for_status = crate::services::generated::model_client::ModelClient::from_resolver(
+            let model_client_for_status = hyprstream_rpc_std::model_client::ModelClient::from_resolver(
                 self.signing_key.clone(),
                 None,
             )?;
             let status_timeout = std::time::Duration::from_millis(500);
-            let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
+            let all_status_req = hyprstream_rpc_std::model_client::StatusRequest { model_ref: String::new() };
             let (repos_result, status_result) = tokio::join!(
                 registry_client.list(),
                 tokio::time::timeout(status_timeout, model_client_for_status.status(&all_status_req)),
@@ -900,7 +900,7 @@ impl TuiService {
                 let h   = handle_load.clone();
                 // Submit load — returns "accepted" immediately (Continuation pattern).
                 h.block_on(async {
-                    let client = match crate::services::generated::model_client::ModelClient::from_resolver(
+                    let client = match hyprstream_rpc_std::model_client::ModelClient::from_resolver(
                         sk.clone(),
                         None,
                     ) {
@@ -910,7 +910,7 @@ impl TuiService {
                             return;
                         }
                     };
-                    let _ = client.load(&crate::services::generated::model_client::LoadModelRequest {
+                    let _ = client.load(&hyprstream_rpc_std::model_client::LoadModelRequest {
                         model_ref: mr.clone(),
                         max_context: None,
                         kv_quant: None,
@@ -924,7 +924,7 @@ impl TuiService {
                     for _ in 0..60u32 {   // max ~2 minutes (60 × 2 s)
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let loaded = h_poll.block_on(async {
-                            let client = match crate::services::generated::model_client::ModelClient::from_resolver(
+                            let client = match hyprstream_rpc_std::model_client::ModelClient::from_resolver(
                                 sk_poll.clone(),
                                 None,
                             ) {
@@ -934,7 +934,7 @@ impl TuiService {
                                     return false;
                                 }
                             };
-                            client.status(&crate::services::generated::model_client::StatusRequest { model_ref: mr_poll.clone() }).await
+                            client.status(&hyprstream_rpc_std::model_client::StatusRequest { model_ref: mr_poll.clone() }).await
                                 .is_ok_and(|es| es.iter().any(|e| e.status == "loaded"))
                         });
                         if loaded {
@@ -952,7 +952,7 @@ impl TuiService {
             let sk = sk_unload.clone();
             let mr = model_ref.to_owned();
             handle_unload.block_on(async move {
-                let client = match crate::services::generated::model_client::ModelClient::from_resolver(
+                let client = match hyprstream_rpc_std::model_client::ModelClient::from_resolver(
                     sk.clone(),
                     None,
                 ) {
@@ -962,13 +962,13 @@ impl TuiService {
                         return false;
                     }
                 };
-                client.unload(&crate::services::generated::model_client::UnloadModelRequest { model_ref: mr.clone() }).await.is_ok()
+                client.unload(&hyprstream_rpc_std::model_client::UnloadModelRequest { model_ref: mr.clone() }).await.is_ok()
             })
         });
 
         let git_ops = {
             use hyprstream_tui::shell_app::{GitOps, GitOpProgress, GitProgressSender, ModelEntry as ShellModelEntry};
-            use crate::services::generated::registry_client::{CloneRequest, CreateWorktreeRequest, PushRequest, UpdateRequest, RegistryRpc};
+            use hyprstream_rpc_std::registry_client::{CloneRequest, CreateWorktreeRequest, PushRequest, UpdateRequest, RegistryRpc};
             use hyprstream_rpc::streaming::StreamPayload;
 
             let sk_clone = self.signing_key.clone();
@@ -980,7 +980,7 @@ impl TuiService {
                 let rmd = rmd_clone.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match crate::services::RegistryClient::from_resolver(sk, None) {
+                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1079,7 +1079,7 @@ impl TuiService {
                 let h = h_pull.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match crate::services::RegistryClient::from_resolver(sk, None) {
+                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1118,7 +1118,7 @@ impl TuiService {
                 let h = h_push.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match crate::services::RegistryClient::from_resolver(sk, None) {
+                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1163,7 +1163,7 @@ impl TuiService {
                 let h = h_status.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match crate::services::RegistryClient::from_resolver(sk, None) {
+                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("Failed to create RegistryClient: {e}");
@@ -1192,14 +1192,14 @@ impl TuiService {
                 let rmd = rmd_refresh.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry_client = match crate::services::RegistryClient::from_resolver(sk.clone(), None) {
+                        let registry_client = match hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(sk.clone(), None) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("model-list refresh: RegistryClient: {e}");
                                 return;
                             }
                         };
-                        let model_client = match crate::services::generated::model_client::ModelClient::from_resolver(sk, None) {
+                        let model_client = match hyprstream_rpc_std::model_client::ModelClient::from_resolver(sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("model-list refresh: ModelClient: {e}");
@@ -1207,7 +1207,7 @@ impl TuiService {
                             }
                         };
                         let status_timeout = std::time::Duration::from_millis(500);
-                        let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
+                        let all_status_req = hyprstream_rpc_std::model_client::StatusRequest { model_ref: String::new() };
                         let (repos_result, status_result) = tokio::join!(
                             registry_client.list(),
                             tokio::time::timeout(status_timeout, model_client.status(&all_status_req)),
@@ -2517,7 +2517,7 @@ mod tests {
             .get_root::<tui_capnp::stream_info::Reader<'_>>()
             .expect("root");
         let decoded =
-            crate::services::generated::tui_client::StreamInfo::read_from(si_reader).expect("decode");
+            hyprstream_rpc_std::tui_client::StreamInfo::read_from(si_reader).expect("decode");
 
         assert_eq!(
             decoded.announced_at.len(),

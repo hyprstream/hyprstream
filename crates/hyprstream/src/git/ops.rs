@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use git2::Repository;
 use std::path::Path;
 
-use crate::services::generated::registry_client::{DetailedStatusInfo, FileChangeType, FileStatusInfo};
+use hyprstream_rpc_std::registry_client::{DetailedStatusInfo, FileChangeType, FileStatusInfo};
 
 // === Commit Operations ===
 

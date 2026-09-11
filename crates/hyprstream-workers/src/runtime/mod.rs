@@ -25,7 +25,7 @@
 // substrate. Consumed by `pool::SandboxPool::acquire`.
 mod admission;
 pub mod backend;
-mod client;
+mod status;
 mod container;
 // CRI-client sandbox backend (#510) — gated behind `cri`. A tonic gRPC
 // client of an external, already-running CRI runtime service (containerd's
@@ -88,43 +88,9 @@ pub mod spawner;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod wanix_workload;
 
-// Generated wire types — canonical OCI/CRI-aligned names (no Gen*/Wire/Enum aliases)
-pub use client::{
-    // Generated client
-    WorkerClient,
-    // Response types
-    VersionInfo, RuntimeStatus, RuntimeCondition,
-    PodSandboxStatusResponse, ContainerStatusResponse,
-    ExecSyncResult,
-    // Stats types
-    PodSandboxStats, PodSandboxAttributes, LinuxPodSandboxStats,
-    ContainerStats, ContainerAttributes,
-    CpuUsage, MemoryUsage, NetworkUsage, NetworkInterfaceUsage,
-    ProcessUsage, FilesystemUsage, FilesystemIdentifier,
-    Timestamp,
-    // Info types
-    PodSandboxInfo, ContainerInfo,
-    // State enums (generated, with Hash + serde)
-    PodSandboxState, ContainerState,
-    // Config/request DTOs
-    ImageSpec, PodSandboxConfig, PodSandboxStatus, PodSandboxNetworkStatus,
-    ContainerConfig, ContainerStatus,
-    PodSandboxMetadata, ContainerMetadata,
-    DNSConfig, PortMapping, LinuxPodSandboxConfig,
-    LinuxSandboxSecurityContext,
-    Mount, Device, LinuxContainerConfig,
-    LinuxContainerSecurityContext, Capability,
-    AuthConfig, StreamInfo,
-    ImageInfo, ImageStatusResult,
-    LinuxContainerResources,
-    // Filter types (generated)
-    PodSandboxFilter, ContainerFilter,
-    PodSandboxStatsFilter, ContainerStatsFilter,
-    // Common types
-    KeyValue,
-    // Local composite
-    StatusResponse,
-};
+// Wire clients and data types are intentionally not re-exported from this
+// service crate. `StatusResponse` is the one local composite retained here.
+pub use status::StatusResponse;
 // Backend trait and implementations
 pub use backend::{SandboxBackend, SandboxHandle};
 #[cfg(feature = "cri")]

@@ -2427,14 +2427,14 @@ mod tests {
 
     fn policy_client_for_socket(
         dir: &Path,
-    ) -> anyhow::Result<crate::services::generated::policy_client::PolicyClient> {
+    ) -> anyhow::Result<hyprstream_rpc_std::policy_client::PolicyClient> {
         policy_client_for_named_socket(dir, "authority-policy.sock")
     }
 
     fn policy_client_for_named_socket(
         dir: &Path,
         socket: &str,
-    ) -> anyhow::Result<crate::services::generated::policy_client::PolicyClient> {
+    ) -> anyhow::Result<hyprstream_rpc_std::policy_client::PolicyClient> {
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
         use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
@@ -2444,7 +2444,7 @@ mod tests {
             Some(SigningKey::from_bytes(&[0x73; 32]).verifying_key()),
         )
         .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical);
-        Ok(crate::services::generated::policy_client::PolicyClient::new(Arc::new(rpc)))
+        Ok(hyprstream_rpc_std::policy_client::PolicyClient::new(Arc::new(rpc)))
     }
 
     fn authority_process_dir() -> Option<PathBuf> {
@@ -2680,7 +2680,7 @@ mod tests {
                         Ok(bytes::Bytes::new())
                     }));
                 hyprstream_rpc::dial::register_inproc("multiprocess-unused-discovery", &unused);
-                let discovery = crate::services::DiscoveryClient::for_local_endpoint_bootstrap(
+                let discovery = hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_endpoint_bootstrap(
                     "inproc://multiprocess-unused-discovery",
                     SigningKey::from_bytes(&[0x76; 32]),
                     SigningKey::from_bytes(&[0x77; 32]).verifying_key(),
@@ -2833,7 +2833,7 @@ mod tests {
                 wait_for_target_authority(&dir);
                 std::fs::write(dir.join("converged-policy"), b"1")?;
                 let token = policy_client_for_socket(&dir)?
-                    .issue_token(&crate::services::generated::policy_client::IssueToken {
+                    .issue_token(&hyprstream_rpc_std::policy_client::IssueToken {
                         requested_scopes: Some(vec!["read".to_owned()]),
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
@@ -2844,7 +2844,7 @@ mod tests {
                         tenant: None,
                         require_clearance: false,
                         session_id: None,
-                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        issuance_profile: hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
                         client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?
@@ -2969,7 +2969,7 @@ mod tests {
                 });
                 wait_path(&dir.join("stale-policy.sock"));
                 let result = policy_client_for_named_socket(&dir, "stale-policy.sock")?
-                    .issue_token(&crate::services::generated::policy_client::IssueToken {
+                    .issue_token(&hyprstream_rpc_std::policy_client::IssueToken {
                         requested_scopes: Some(vec!["read".to_owned()]),
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
@@ -2980,7 +2980,7 @@ mod tests {
                         tenant: None,
                         require_clearance: false,
                         session_id: None,
-                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        issuance_profile: hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
                         client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await;
@@ -3138,7 +3138,7 @@ mod tests {
                 });
                 wait_path(&dir.join(socket));
                 let token = policy_client_for_named_socket(&dir, socket)?
-                    .issue_token(&crate::services::generated::policy_client::IssueToken {
+                    .issue_token(&hyprstream_rpc_std::policy_client::IssueToken {
                         requested_scopes: Some(vec!["read".to_owned()]),
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
@@ -3149,7 +3149,7 @@ mod tests {
                         tenant: None,
                         require_clearance: false,
                         session_id: None,
-                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        issuance_profile: hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
                         client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?
@@ -3277,7 +3277,7 @@ mod tests {
         let oauth_url = std::fs::read_to_string(dir.path().join("oauth-http-url")).unwrap();
         let old_token = runtime.block_on(async {
                 policy_client_for_socket(dir.path())?
-                    .issue_token(&crate::services::generated::policy_client::IssueToken {
+                    .issue_token(&hyprstream_rpc_std::policy_client::IssueToken {
                         requested_scopes: Some(vec!["read".to_owned()]),
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
@@ -3288,7 +3288,7 @@ mod tests {
                         tenant: None,
                         require_clearance: false,
                         session_id: None,
-                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        issuance_profile: hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
                         client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?;
@@ -3507,7 +3507,7 @@ mod tests {
                     .ok_or_else(|| anyhow::anyhow!("pending-timeout OAuth token missing"))?
                     .to_owned();
                 let policy = policy_client_for_socket(dir.path())?
-                    .issue_token(&crate::services::generated::policy_client::IssueToken {
+                    .issue_token(&hyprstream_rpc_std::policy_client::IssueToken {
                         requested_scopes: Some(vec!["read".to_owned()]),
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
@@ -3518,7 +3518,7 @@ mod tests {
                         tenant: None,
                         require_clearance: false,
                         session_id: None,
-                        issuance_profile: crate::services::generated::policy_client::IssueTokenProfile::Rfc8693,
+                        issuance_profile: hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
                         client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?

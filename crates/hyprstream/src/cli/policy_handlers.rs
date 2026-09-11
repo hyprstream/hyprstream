@@ -13,7 +13,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::auth::{jwt, Claims};
-use crate::services::generated::policy_client::{
+use hyprstream_rpc_std::policy_client::{
     PolicyClient, GetHistory, GetDiff, ApplyDraft, RollbackPolicy, PolicyCheck, ApplyTemplate,
     AddGrouping, RemoveGrouping,
 };

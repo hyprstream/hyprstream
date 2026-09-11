@@ -1,7 +1,8 @@
 //! Server state management
 
-use crate::services::generated::model_client::{LoadModelRequest, ModelClient};
-use crate::services::{PolicyClient, RegistryClient};
+use hyprstream_rpc_std::model_client::{LoadModelRequest, ModelClient};
+use hyprstream_rpc_std::policy_client::PolicyClient;
+use hyprstream_rpc_std::registry_client::RegistryClient;
 use crate::services::oauth::replay_key::ReplayKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hyprstream_util::TtlCache;

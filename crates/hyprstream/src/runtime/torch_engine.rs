@@ -3,8 +3,8 @@
 use crate::config::{
     FinishReason, GenerationConfig, GenerationResult, RuntimeConfig,
 };
-use crate::runtime::GenerationRequest;
-use crate::runtime::ModelInfo;
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::inference_client::ModelInfo;
 use crate::runtime::tensor_sampling::TensorSampler;
 use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
 use crate::runtime::architectures::ModelOperations;
@@ -264,7 +264,7 @@ impl TorchEngine {
         &mut self,
         num_layers: usize,
         max_seq_len: usize,
-        quant_type: crate::runtime::KVQuantType,
+        quant_type: hyprstream_rpc_std::model_client::KVQuantType,
         memory_budget: Option<usize>,
     ) {
         let config = crate::runtime::kv_cache::CacheConfig::new(num_layers, max_seq_len)
@@ -953,10 +953,10 @@ impl TorchEngine {
                     WeightIdentity, KV_COMPAT_FORMAT_VERSION,
                 };
                 let kv_quant = match self.config.kv_quant_type {
-                    crate::runtime::KVQuantType::None => KvQuantMode::None,
-                    crate::runtime::KVQuantType::Int8 => KvQuantMode::Int8,
-                    crate::runtime::KVQuantType::Nf4 => KvQuantMode::Nf4,
-                    crate::runtime::KVQuantType::Fp4 => KvQuantMode::Fp4,
+                    hyprstream_rpc_std::model_client::KVQuantType::None => KvQuantMode::None,
+                    hyprstream_rpc_std::model_client::KVQuantType::Int8 => KvQuantMode::Int8,
+                    hyprstream_rpc_std::model_client::KVQuantType::Nf4 => KvQuantMode::Nf4,
+                    hyprstream_rpc_std::model_client::KVQuantType::Fp4 => KvQuantMode::Fp4,
                 };
                 // `model_name` is a display label for mismatch messages; the
                 // authoritative weight identity is the content digest above.
@@ -1945,7 +1945,7 @@ impl TorchEngine {
     /// # Example
     /// ```no_run
     /// use futures::StreamExt;
-    /// use hyprstream_core::runtime::GenerationRequest;
+    /// use hyprstream_rpc_std::inference_client::GenerationRequest;
     ///
     /// # async fn example(engine: &hyprstream_core::runtime::torch_engine::TorchEngine) -> anyhow::Result<()> {
     /// let request = GenerationRequest::default();

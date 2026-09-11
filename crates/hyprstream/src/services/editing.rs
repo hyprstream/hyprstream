@@ -22,8 +22,7 @@ use tracing::{debug, warn};
 
 /// Document format for parsing/serialization.
 ///
-/// Re-exports the generated Cap'n Proto enum — canonical OCI-aligned type.
-pub use crate::services::generated::registry_client::DocFormat;
+use hyprstream_rpc_std::registry_client::DocFormat;
 
 /// Shared CRDT document for a file, accessed by multiple clients.
 ///

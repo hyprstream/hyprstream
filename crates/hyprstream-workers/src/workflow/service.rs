@@ -17,8 +17,9 @@ use hyprstream_vfs::Namespace;
 
 use crate::error::Result;
 use crate::events::{EventSubscriber, ReceivedEvent};
-use crate::generated::workflow_client::{
-    WorkflowHandler, dispatch_workflow, WorkflowResponseVariant,
+use crate::generated::workflow_client::{WorkflowHandler, dispatch_workflow};
+use hyprstream_rpc_std::workflow_client::{
+    WorkflowResponseVariant,
     WorkflowDef as WorkflowDefWire, WorkflowInfo, WorkflowRun as WorkflowRunWire,
     JobRun as JobRunWire, StepRun as StepRunWire,
     RunStatus as WireRunStatus,

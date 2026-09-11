@@ -12,12 +12,15 @@ use ed25519_dalek::SigningKey;
 use hyprstream_service::ScopedClientTreeNode;
 use serde_json::Value;
 
-use crate::services::generated::inference_client::InferenceClient;
-use crate::services::generated::model_client::ModelClient;
-use crate::services::generated::{inference_client, model_client, policy_client, registry_client};
-use crate::services::{DiscoveryClient, RegistryClient};
-use hyprstream_workers::generated::{worker_client, workflow_client};
-use hyprstream_workers::runtime::WorkerClient;
+use hyprstream_rpc_std::inference_client::InferenceClient;
+use hyprstream_rpc_std::model_client::ModelClient;
+use hyprstream_rpc_std::{
+    inference_client, model_client, policy_client, registry_client,
+    worker_client, workflow_client,
+};
+use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+use hyprstream_rpc_std::registry_client::RegistryClient;
+use hyprstream_rpc_std::worker_client::WorkerClient;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MethodSchemaLike trait — unifies per-module MethodSchema types
@@ -926,7 +929,7 @@ mod tests {
 
         // The client bootstrap installed (authenticated: pinned discovery key)
         // — in production this is the DID-anchored remote-node network client.
-        let installed = hyprstream_discovery::DiscoveryClient::for_local_transport_bootstrap(
+        let installed = hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_transport_bootstrap(
             &reach_transport,
             caller_key.clone(),
             service_vk,

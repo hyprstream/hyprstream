@@ -25,7 +25,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use hyprstream_core::registry_capnp;
+use hyprstream_rpc_std::registry_capnp;
 use hyprstream_core::services::generated::registry_client::decode_registry_request_body;
 use hyprstream_rpc::auth::mac::{Assurance, Level};
 use hyprstream_rpc::proof::policy;

@@ -1400,7 +1400,7 @@ impl LlamaModel {
     ) -> Result<Self> {
         // Parse config from weights if possible, otherwise use defaults
         let config = Self::detect_config_from_weights(weights)?;
-        Self::from_weights_with_config(weights, config, device, dtype, crate::runtime::KVQuantType::None)
+        Self::from_weights_with_config(weights, config, device, dtype, hyprstream_rpc_std::model_client::KVQuantType::None)
     }
 
     /// Create Llama model with explicit config (allows Qwen models to override)
@@ -1411,7 +1411,7 @@ impl LlamaModel {
         mut config: LlamaConfig,
         device: &Device,
         dtype: DType,
-        kv_quant_type: crate::runtime::KVQuantType,
+        kv_quant_type: hyprstream_rpc_std::model_client::KVQuantType,
     ) -> Result<Self> {
         tracing::info!(
             "[from_weights_with_config] Received config.max_position_embeddings = {}, kv_quant = {:?}",
@@ -1608,7 +1608,7 @@ impl LlamaModel {
         devices: &LayerDeviceMap,
         layer_range: std::ops::Range<usize>,
         dtype: DType,
-        kv_quant_type: crate::runtime::KVQuantType,
+        kv_quant_type: hyprstream_rpc_std::model_client::KVQuantType,
     ) -> Result<Self> {
         let num_global = config.num_hidden_layers as usize;
         if devices.len() != num_global {
@@ -3284,7 +3284,7 @@ impl ModelOperations for LlamaModel {
 mod pipeline_tests {
     use super::*;
     use crate::runtime::device_pool::LayerDeviceMap;
-    use crate::runtime::KVQuantType;
+    use hyprstream_rpc_std::model_client::KVQuantType;
 
     const HIDDEN: i64 = 16;
     const HEADS: i64 = 2;

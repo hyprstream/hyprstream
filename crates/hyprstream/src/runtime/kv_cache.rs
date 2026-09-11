@@ -31,7 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tch::Device;
 use tch::{Kind as DType, Tensor};
 
-use super::KVQuantType;
+use hyprstream_rpc_std::model_client::KVQuantType;
 use super::kv_compat::{
     decide_cache_reuse, CacheReuseDecision, KvCompatFingerprint,
 };

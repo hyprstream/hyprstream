@@ -178,7 +178,7 @@ impl RocksDbUserStore {
 
         let mut message = Builder::new_default();
         {
-            let mut ui = message.init_root::<crate::oauth_capnp::user_info::Builder>();
+            let mut ui = message.init_root::<hyprstream_rpc_std::oauth_capnp::user_info::Builder>();
             ui.set_sub(sub);
             if let Some(ref name) = profile.name {
                 ui.set_name(name);
@@ -235,7 +235,7 @@ impl RocksDbUserStore {
         let flags = bytes[0];
         let cursor = Cursor::new(&bytes[1..]);
         let reader = capnp::serialize::read_message(cursor, ReaderOptions::new())?;
-        let ui = reader.get_root::<crate::oauth_capnp::user_info::Reader>()?;
+        let ui = reader.get_root::<hyprstream_rpc_std::oauth_capnp::user_info::Reader>()?;
 
         let sub = ui.get_sub()?.to_string()?;
         let profile = UserProfile {
@@ -1896,7 +1896,7 @@ mod tests {
         // downgrade to Ed25519).
         let mut message = Builder::new_default();
         {
-            let mut ui = message.init_root::<crate::oauth_capnp::user_info::Builder>();
+            let mut ui = message.init_root::<hyprstream_rpc_std::oauth_capnp::user_info::Builder>();
             ui.set_sub("sub");
             let mut pk_list = ui.init_pubkeys(1);
             let mut e = pk_list.reborrow().get(0);

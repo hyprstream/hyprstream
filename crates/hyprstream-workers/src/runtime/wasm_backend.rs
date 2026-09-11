@@ -56,7 +56,7 @@ use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 
 use super::backend::{SandboxBackend, SandboxHandle};
-use super::client::{LinuxContainerResources, PodSandboxConfig};
+use hyprstream_rpc_std::worker_client::{LinuxContainerResources, PodSandboxConfig};
 use super::sandbox::PodSandbox;
 
 /// Annotation key: filesystem path to the guest `.wasm`/`.wat` module.
@@ -498,7 +498,7 @@ inventory::submit! {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::super::client::KeyValue;
+    use super::hyprstream_rpc_std::worker_client::KeyValue;
     use super::*;
     use std::path::PathBuf;
 

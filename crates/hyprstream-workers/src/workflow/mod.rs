@@ -25,7 +25,6 @@
 //! ```
 
 mod service;
-mod client;
 mod parser;
 mod triggers;
 mod subscription;
@@ -42,16 +41,6 @@ pub use runner::WorkflowRunner;
 pub use scheduler::{JobScheduler, Placement};
 pub use adapter::SubscriberAdapter;
 pub use gh_adapter::GitHubActionsAdapter;
-
-// Re-export generated wire-format types for external consumers
-pub use client::{
-    GenWorkflowClient,
-    WorkflowDef, WorkflowInfo, WorkflowRun,
-    JobRun, StepRun, RunStatus,
-    KeyValue as WorkflowKeyValue,
-    EventTrigger as EventTriggerWire,
-    WorkflowResponseVariant,
-};
 
 /// Workflow ID
 pub type WorkflowId = String;

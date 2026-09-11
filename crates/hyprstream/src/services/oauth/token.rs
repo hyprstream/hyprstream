@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::state::{DeviceCodeStatus, DpopJtiAdmission, OAuthState, RefreshTokenEntry};
-use crate::services::generated::policy_client::{IssueToken, IssueTokenProfile};
+use hyprstream_rpc_std::policy_client::{IssueToken, IssueTokenProfile};
 use hyprstream_pds::repo_authority::is_path_form_did_web;
 use hyprstream_rpc::auth::{jwk_thumbprint, JwkThumbprintInput};
 // #1425: the public browser client_id routes the sender-bound exchange.
@@ -1978,7 +1978,8 @@ mod tests {
     /// /dev/null — never opened) and a recording refresh-token store.
     async fn freeze_test_state(store: Arc<RecordingTokenStore>) -> Arc<OAuthState> {
         use crate::config::OAuthConfig;
-        use crate::services::{DiscoveryClient, PolicyClient};
+        use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+        use hyprstream_rpc_std::policy_client::PolicyClient;
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
         use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;

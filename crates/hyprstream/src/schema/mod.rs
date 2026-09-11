@@ -8,10 +8,4 @@
 //! The schemas are compiled from `.capnp` files in the `schema/` directory
 //! by the build.rs script using capnpc.
 //!
-//! Note: The generated modules are included at crate root level due to
-//! capnpc path resolution. This module provides re-exports for convenience.
-
-// Re-export the crate-level modules
-pub use crate::events_capnp;
-pub use crate::inference_capnp;
-pub use crate::registry_capnp;
+//! Consumers should import the canonical modules from `hyprstream_rpc_std`.
