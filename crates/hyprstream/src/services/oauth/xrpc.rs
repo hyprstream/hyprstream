@@ -2870,10 +2870,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_explicit_tids_preserve_odd_low_bits_in_all_validation_modes() {
+        for mode in [None, Some(true), Some(false)] {
+            let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+            for rkey in ["3jzfcijpj2z2b", "2222222222223"] {
+                let mut input = write_input(7);
+                input["rkey"] = json!(rkey);
+                if let Some(mode) = mode {
+                    input["validate"] = json!(mode);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let created = body_json(response).await;
+                assert!(created["uri"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!("/{rkey}")));
+                let read = app.clone().oneshot(read_request(&format!("/xrpc/com.atproto.repo.getRecord?repo=pub.example.com&collection=app.bsky.feed.post&rkey={rkey}"))).await.unwrap();
+                assert_eq!(read.status(), StatusCode::OK);
+                assert_eq!(body_json(read).await["uri"], created["uri"]);
+            }
+            assert_eq!(
+                store
+                    .snapshot("did:web:pub.example.com")
+                    .unwrap()
+                    .unwrap()
+                    .records
+                    .len(),
+                2
+            );
+            assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+        }
+    }
+
+    #[tokio::test]
     async fn router_create_record_canonical_keys_and_unknown_collections() {
         let (_dir, store, gate, app, token) = build_write_input_fixture().await;
-        let noncanonical = "2222222222223";
-        assert_ne!(Tid::parse(noncanonical).unwrap().encode(), noncanonical);
+        let noncanonical = "kjzfcijpj2z2a";
+        assert!(Tid::parse(noncanonical).is_err());
         for mode in [None, Some(true), Some(false)] {
             let mut input = write_input(7);
             if let Some(mode) = mode {
