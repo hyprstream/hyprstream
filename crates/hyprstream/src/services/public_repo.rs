@@ -147,14 +147,21 @@ struct PublicationIntent {
     commit_cid: String,
 }
 
+#[derive(Default)]
+struct AccountSigningState {
+    // Held through snapshot/rebuild/sign/persist and through promotion. All
+    // handles for exactly one DID share this guard and its active authority.
+    active_key: Mutex<Option<p256::ecdsa::SigningKey>>,
+}
+
 /// Durable public repository storage. It uses a distinct RocksDB directory
 /// and key namespace so native signed artifacts are never re-encoded as public
 /// bytes.
 pub struct PublicRepoStore {
     db: Arc<rocksdb::DB>,
-    // Account-bound active signing keys and the repository transaction lock
-    // share one guard. Promotion cannot interleave with a stale-key commit.
-    signing_state: Mutex<BTreeMap<String, p256::ecdsa::SigningKey>>,
+    // Held only to find/insert a shared account state, never during account
+    // locking, cryptography or database access. Unrelated DIDs can progress.
+    accounts: Mutex<BTreeMap<String, Arc<AccountSigningState>>>,
 }
 
 impl std::fmt::Debug for PublicRepoStore {
@@ -173,7 +180,7 @@ impl PublicRepoStore {
             .with_context(|| format!("failed to open public repo store at {path:?}"))?;
         Ok(Self {
             db: Arc::new(db),
-            signing_state: Mutex::new(BTreeMap::new()),
+            accounts: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -277,6 +284,7 @@ impl PublicRepoStore {
 pub struct PublicRepoWriter {
     store: Arc<PublicRepoStore>,
     did: String,
+    account: Arc<AccountSigningState>,
     authorizer: Arc<dyn PublicPublicationAuthorizer>,
 }
 
@@ -299,9 +307,13 @@ impl PublicRepoWriter {
     ) -> Result<Self> {
         let did = did.into();
         validate_did(&did)?;
+        let account = {
+            let mut accounts = store.accounts.lock();
+            Arc::clone(accounts.entry(did.clone()).or_default())
+        };
         {
-            let mut state = store.signing_state.lock();
-            if let Some(active) = state.get(&did) {
+            let mut state = account.active_key.lock();
+            if let Some(active) = state.as_ref() {
                 ensure!(
                     active.verifying_key() == signing_key.verifying_key(),
                     "repo signing key differs from active authority; use explicit promotion"
@@ -314,12 +326,13 @@ impl PublicRepoWriter {
                         .verify_atproto(signing_key.verifying_key())
                         .context("repo head does not match supplied active signing authority")?;
                 }
-                state.insert(did.clone(), signing_key);
+                *state = Some(signing_key);
             }
         }
         Ok(Self {
             store,
             did,
+            account,
             authorizer,
         })
     }
@@ -327,10 +340,10 @@ impl PublicRepoWriter {
     /// Resolve this account's active public key from shared transaction state.
     /// DID-document publication must use this authority after promotion returns.
     pub fn active_verifying_key(&self) -> Result<p256::ecdsa::VerifyingKey> {
-        self.store
-            .signing_state
+        self.account
+            .active_key
             .lock()
-            .get(&self.did)
+            .as_ref()
             .map(|key| *key.verifying_key())
             .ok_or_else(|| anyhow!("no active signing authority for repository"))
     }
@@ -355,9 +368,9 @@ impl PublicRepoWriter {
         validate_principal(principal)?;
         self.authorizer
             .authorize_key_promotion(principal, &self.did)?;
-        let mut state = self.store.signing_state.lock();
+        let mut state = self.account.active_key.lock();
         let active = state
-            .get_mut(&self.did)
+            .as_mut()
             .ok_or_else(|| anyhow!("no active signing authority for repository"))?;
         ensure!(
             active.verifying_key() == expected_active,
@@ -397,9 +410,9 @@ impl PublicRepoWriter {
         self.authorizer
             .authorize(&request.principal, &self.did, &request.collection)?;
 
-        let state = self.store.signing_state.lock();
+        let state = self.account.active_key.lock();
         let signing_key = state
-            .get(&self.did)
+            .as_ref()
             .ok_or_else(|| anyhow!("no active signing authority for repository"))?;
         let record = AtprotoRecord::new(request.collection.clone(), &request.rkey, request.value)?;
         ensure!(
@@ -556,6 +569,106 @@ mod tests {
             value: post(),
             expected_prev,
         }
+    }
+
+    #[test]
+    fn public_repo_account_locks_allow_independent_dids_and_serialize_same_did() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let key_a = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let key_b = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let next_b = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let next_b_vk = *next_b.verifying_key();
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let request_a = create_request(1, None);
+        let writer_a =
+            PublicRepoWriter::new(store.clone(), &request_a.did, key_a.clone(), gate.clone())
+                .unwrap();
+        let same_did =
+            PublicRepoWriter::new(store.clone(), &request_a.did, key_a.clone(), gate.clone())
+                .unwrap();
+        assert!(Arc::ptr_eq(&writer_a.account, &same_did.account));
+        let mut request_b = create_request(1, None);
+        request_b.did = "did:web:independent.example.com".into();
+        let did_b = request_b.did.clone();
+
+        // Model a long account-A transaction/promotion without sleeping or
+        // filling a large repo. Another A handle must wait; B must finish its
+        // constructor, create and key promotion while A is still locked.
+        let held = writer_a.account.active_key.lock();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (same_tx, same_rx) = mpsc::channel();
+        let same_thread = std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            let _ = same_tx.send(same_did.create_record(request_a));
+        });
+        let other_store = store.clone();
+        let (other_tx, other_rx) = mpsc::channel();
+        let other_thread = std::thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let other = PublicRepoWriter::new(
+                    other_store.clone(),
+                    &request_b.did,
+                    key_b.clone(),
+                    gate,
+                )?;
+                let first = other.create_record(request_b.clone())?;
+                let head =
+                    other.promote_signing_key("did:at9p:agent", key_b.verifying_key(), next_b)?;
+                ensure!(
+                    head.is_some() && head != Some(first.commit_cid),
+                    "B promotion must reconcile its head"
+                );
+                ensure!(
+                    other.create_record(request_b)? == first,
+                    "B retry must retain original receipt"
+                );
+                Ok(())
+            })();
+            let _ = other_tx.send(result);
+        });
+        let started = started_rx.recv_timeout(Duration::from_secs(10));
+        let independent = other_rx.recv_timeout(Duration::from_secs(10));
+        let same_while_locked = same_rx.try_recv();
+        // Always release before assertions/joins: a regression must fail the
+        // bounded timeout rather than leave worker threads deadlocked.
+        drop(held);
+        same_thread.join().unwrap();
+        other_thread.join().unwrap();
+        started.unwrap();
+        independent
+            .expect("unrelated DID blocked behind account A")
+            .unwrap();
+        assert!(
+            matches!(same_while_locked, Err(mpsc::TryRecvError::Empty)),
+            "same-DID write bypassed its transaction lock"
+        );
+        let result_a = same_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let repo_a = store
+            .snapshot("did:web:tormentnexus.social")
+            .unwrap()
+            .unwrap();
+        assert_eq!(repo_a.commit.cid_atproto().unwrap(), result_a.commit_cid);
+        repo_a.commit.verify_atproto(key_a.verifying_key()).unwrap();
+        assert_eq!(
+            writer_a.active_verifying_key().unwrap(),
+            *key_a.verifying_key()
+        );
+        store
+            .snapshot(&did_b)
+            .unwrap()
+            .unwrap()
+            .commit
+            .verify_atproto(&next_b_vk)
+            .unwrap();
     }
 
     #[test]
