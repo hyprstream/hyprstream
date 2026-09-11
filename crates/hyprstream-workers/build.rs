@@ -12,9 +12,14 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=DEP_HYPRSTREAM_RPC_STD_OUT_DIR");
 
-    let dep_out = env::var("DEP_HYPRSTREAM_RPC_STD_OUT_DIR")
-        .expect("hyprstream-rpc-std must export its CGR OUT_DIR");
-    let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
+    let dep_out = match env::var("DEP_HYPRSTREAM_RPC_STD_OUT_DIR") {
+        Ok(value) => value,
+        Err(_) => panic!("hyprstream-rpc-std must export its CGR OUT_DIR"),
+    };
+    let out_dir = match env::var("OUT_DIR") {
+        Ok(value) => value,
+        Err(_) => panic!("OUT_DIR not set"),
+    };
     for name in ["worker", "workflow"] {
         let source = Path::new(&dep_out).join(format!("{name}.cgr"));
         let target = Path::new(&out_dir).join(format!("{name}.cgr"));

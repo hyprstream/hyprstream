@@ -64,6 +64,7 @@ pub use hyprstream_discovery::generated::discovery_client;
 pub mod tui_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
+    // TUI remains an application-local schema until P07 moves it to rpc-std.
     hyprstream_rpc_derive::generate_rpc_service!("tui", scope_handlers);
 }
 
