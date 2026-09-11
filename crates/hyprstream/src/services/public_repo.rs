@@ -195,6 +195,19 @@ impl std::fmt::Debug for PublicRepoStore {
 
 impl PublicRepoStore {
     #[cfg(test)]
+    pub(crate) fn with_account_lock_for_test(&self, did: &str, held: impl FnOnce()) -> Result<()> {
+        let account = self
+            .accounts
+            .lock()
+            .get(did)
+            .cloned()
+            .ok_or_else(|| anyhow!("test writer account missing"))?;
+        let _guard = account.active_key.lock();
+        held();
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn insert_malformed_record_for_test(
         &self,
         did: &str,
@@ -350,6 +363,22 @@ impl std::fmt::Debug for PublicRepoWriter {
 impl PublicRepoWriter {
     pub fn did(&self) -> &str {
         &self.did
+    }
+
+    /// Blocking public read boundary. The account guard keeps the snapshot and
+    /// published verifying key consistent with concurrent writes/key promotion.
+    pub(crate) fn public_snapshot(
+        &self,
+    ) -> Result<Option<(PublicRepoSnapshot, p256::ecdsa::VerifyingKey)>> {
+        let state = self.account.active_key.lock();
+        let key = state
+            .as_ref()
+            .ok_or_else(|| anyhow!("public signing authority is unavailable"))?;
+        let Some(snapshot) = self.store.snapshot(&self.did)? else {
+            return Ok(None);
+        };
+        snapshot.commit.verify_atproto(key.verifying_key())?;
+        Ok(Some((snapshot, *key.verifying_key())))
     }
 
     /// Bind a trusted account key to this store. All writer handles for the

@@ -293,7 +293,7 @@ fn valid_nsid(value: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-fn valid_handle(value: &str) -> bool {
+pub(super) fn valid_handle(value: &str) -> bool {
     valid_dns_labels(value)
         && value
             .rsplit('.')

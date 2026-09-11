@@ -32,6 +32,7 @@
 //! - Write path (`repo.createRecord` etc.) — sequenced with #910.
 //! - `createSession`/`getSession` — sequenced with #1113/#948.
 
+mod durable_reads;
 mod record_validation;
 
 use std::collections::BTreeMap;
@@ -690,17 +691,44 @@ fn hex_val(b: u8) -> Option<u8> {
 // Core handler logic (testable without OAuthState)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Resolve a handle to a DID via the store + issuer-derived self-handle.
-async fn resolve_handle_core(store: &XrpcRepoStore, issuer_url: &str, handle: &str) -> Response {
-    if let Some(snap) = store.by_handle_public(handle).await {
-        return axum::Json(json!({ "did": snap.did })).into_response();
+/// Trusted public registry/issuer resolution, shared by reads and owned writes.
+async fn resolve_handle_did(
+    store: &XrpcRepoStore,
+    issuer_url: &str,
+    handle: &str,
+) -> Option<String> {
+    let handle = handle.to_ascii_lowercase();
+    if !record_validation::valid_handle(&handle) {
+        return None;
+    }
+    if let Some(snap) = store.by_handle_public(&handle).await {
+        return Some(snap.did.clone());
     }
     if let Some(authority) = issuer_authority(issuer_url) {
         let self_handle = authority.split(':').next().unwrap_or(&authority);
         if handle == self_handle {
-            let did = format!("did:web:{authority}");
-            return axum::Json(json!({ "did": did })).into_response();
+            return Some(format!("did:web:{authority}"));
         }
+    }
+    None
+}
+
+async fn owned_public_writer(
+    state: &OAuthState,
+    repo: &str,
+) -> Option<Arc<crate::services::public_repo::PublicRepoWriter>> {
+    let writer = state.public_repo_writer.as_ref()?;
+    let did = if repo.starts_with("did:") {
+        repo.to_owned()
+    } else {
+        resolve_handle_did(&state.xrpc_repos, &state.issuer_url, repo).await?
+    };
+    (did == writer.did()).then(|| Arc::clone(writer))
+}
+
+async fn resolve_handle_core(store: &XrpcRepoStore, issuer_url: &str, handle: &str) -> Response {
+    if let Some(did) = resolve_handle_did(store, issuer_url, handle).await {
+        return axum::Json(json!({ "did": did })).into_response();
     }
     xrpc_error(
         StatusCode::BAD_REQUEST,
@@ -870,6 +898,9 @@ pub async fn describe_repo(
             );
         }
     };
+    if let Some(writer) = owned_public_writer(&state, key).await {
+        return durable_reads::describe_repo(&state, writer).await;
+    }
     describe_repo_core(&state.xrpc_repos, &state.issuer_url, key).await
 }
 
@@ -894,6 +925,9 @@ pub async fn get_record(State(state): State<Arc<OAuthState>>, RawQuery(raw): Raw
         }
     };
     let cid = params.get("cid").map(|c| c.trim());
+    if let Some(writer) = owned_public_writer(&state, repo).await {
+        return durable_reads::get_record(writer, collection, rkey, cid).await;
+    }
     get_record_core(&state.xrpc_repos, repo, collection, rkey, cid).await
 }
 
@@ -911,6 +945,13 @@ pub async fn get_repo(State(state): State<Arc<OAuthState>>, RawQuery(raw): RawQu
     };
     // Reject since by PRESENCE (not just non-empty) — ?since= and ?since=x both 400.
     let since_present = params.contains_key("since");
+    if let Some(writer) = state
+        .public_repo_writer
+        .as_ref()
+        .filter(|writer| writer.did() == did)
+    {
+        return durable_reads::get_repo(&state.xrpc_repos, Arc::clone(writer), since_present).await;
+    }
     get_repo_core(&state.xrpc_repos, did, since_present).await
 }
 
@@ -1059,7 +1100,12 @@ pub async fn create_record(
             )
         }
     };
-    if repo != writer.did() {
+    let repo = if repo.starts_with("did:") {
+        Some(repo.to_owned())
+    } else {
+        resolve_handle_did(&state.xrpc_repos, &state.issuer_url, repo).await
+    };
+    if repo.as_deref() != Some(writer.did()) {
         return xrpc_error(
             StatusCode::FORBIDDEN,
             "AuthRequired",
@@ -1155,18 +1201,26 @@ pub async fn create_record(
         // create distinct records. Key allocation itself stays in the writer.
         None => format!("create-{}", uuid::Uuid::new_v4()),
     });
-    let result = writer.create_record_with_expected_prev_text(
-        crate::services::public_repo::PublicCreateRequest {
-            request_id,
-            principal: user.user,
-            did: repo.to_owned(),
-            collection: collection.to_owned(),
-            rkey,
-            value: record,
-            expected_prev: None,
-        },
-        expected_prev,
-    );
+    let writer = Arc::clone(writer);
+    let expected_prev = expected_prev.map(str::to_owned);
+    let request = crate::services::public_repo::PublicCreateRequest {
+        request_id,
+        principal: user.user,
+        did: writer.did().to_owned(),
+        collection: collection.to_owned(),
+        rkey,
+        value: record,
+        expected_prev: None,
+    };
+    // Authorization remains inside the transaction before any store access.
+    // Native locks, RocksDB, signing and sync writes must not occupy Tokio workers.
+    let result = tokio::task::spawn_blocking(move || {
+        writer.create_record_with_expected_prev_text(request, expected_prev.as_deref())
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(crate::services::public_repo::PublicRepoWriteError::Internal(error.into()))
+    });
     use crate::services::public_repo::PublicRepoWriteError;
     let result = match result {
         Ok(result) => result,
@@ -1854,6 +1908,256 @@ mod tests {
             .unwrap();
         request.headers_mut().extend(headers);
         request
+    }
+
+    fn read_request(uri: &str) -> HttpRequest<Body> {
+        HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn router_writes_release_tokio_worker_and_serialize_same_did() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        let response = app
+            .clone()
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let head = store
+            .snapshot("did:web:pub.example.com")
+            .unwrap()
+            .unwrap()
+            .commit
+            .cid_atproto()
+            .unwrap()
+            .to_string();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let locked_store = store.clone();
+        let owner = std::thread::spawn(move || {
+            locked_store
+                .with_account_lock_for_test("did:web:pub.example.com", || {
+                    held_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+                })
+                .unwrap();
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut writes = Vec::new();
+        for id in [8, 9] {
+            let mut input = write_input(id);
+            input["swapCommit"] = json!(head);
+            let request = write_http_request(&token, &input, HeaderMap::new());
+            let app = app.clone();
+            writes.push(tokio::spawn(
+                async move { app.oneshot(request).await.unwrap() },
+            ));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while gate.0.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let response = app
+            .oneshot(read_request(
+                "/xrpc/com.atproto.identity.resolveHandle?handle=pub.example.com",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(writes.iter().all(|write| !write.is_finished()));
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+        let mut statuses = Vec::new();
+        for write in writes {
+            statuses.push(write.await.unwrap().status().as_u16());
+        }
+        statuses.sort();
+        assert_eq!(statuses, vec![200, 409]);
+        assert_eq!(
+            store
+                .snapshot("did:web:pub.example.com")
+                .unwrap()
+                .unwrap()
+                .records
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn router_create_accepts_owned_handle_and_rejects_foreign_handles() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        for repo in [
+            "priv.example.com",
+            "h.example.com",
+            "unknown.example.com",
+            "did:web:priv.example.com",
+        ] {
+            let mut input = write_input(7);
+            input["repo"] = json!(repo);
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{repo}");
+            assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+            assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        let mut input = write_input(7);
+        input["repo"] = json!("PUB.EXAMPLE.COM");
+        let mut headers = HeaderMap::new();
+        headers.insert("Idempotency-Key", "owned-handle-retry".parse().unwrap());
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, headers.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = body_json(response).await;
+        assert!(created["uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("at://did:web:pub.example.com/"));
+        let retry = app
+            .oneshot(write_http_request(&token, &write_input(7), headers))
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(body_json(retry).await, created);
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(
+            store
+                .snapshot("did:web:pub.example.com")
+                .unwrap()
+                .unwrap()
+                .records
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn router_durable_creates_are_readable_without_stale_snapshot_fallback() {
+        let (_dir, store, _gate, app, token) = build_write_input_fixture().await;
+        let repo_uri = "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com";
+        // The fixture already contains a legacy model snapshot for this DID.
+        let missing = app.clone().oneshot(read_request(repo_uri)).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(missing).await["error"], "RepoNotFound");
+        let mut input = write_input(7);
+        input["record"]["extension"] = json!({"bytes":{"$bytes":"AQI="},"link":{"$link":Cid::from_dag_cbor(b"extension").to_string()}});
+        let created = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = body_json(created).await;
+        for repo in ["did:web:pub.example.com", "pub.example.com"] {
+            let uri = format!("/xrpc/com.atproto.repo.getRecord?repo={repo}&collection=app.bsky.feed.post&rkey={}", input["rkey"].as_str().unwrap());
+            let read = app.clone().oneshot(read_request(&uri)).await.unwrap();
+            assert_eq!(read.status(), StatusCode::OK);
+            let read = body_json(read).await;
+            assert_eq!(read["uri"], created["uri"]);
+            assert_eq!(read["cid"], created["cid"]);
+            assert_eq!(read["value"], input["record"]);
+        }
+        let profile = json!({"repo":"pub.example.com","collection":"app.bsky.actor.profile","rkey":"self","record":{"$type":"app.bsky.actor.profile","displayName":"Durable"}});
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &profile, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let profile_read = app.clone().oneshot(read_request("/xrpc/com.atproto.repo.getRecord?repo=pub.example.com&collection=app.bsky.actor.profile&rkey=self")).await.unwrap();
+        assert_eq!(profile_read.status(), StatusCode::OK);
+        assert_eq!(body_json(profile_read).await["value"], profile["record"]);
+        let describe_uri = "/xrpc/com.atproto.repo.describeRepo?repo=pub.example.com";
+        let describe = app
+            .clone()
+            .oneshot(read_request(describe_uri))
+            .await
+            .unwrap();
+        assert_eq!(describe.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(describe).await["collections"],
+            json!(["app.bsky.actor.profile", "app.bsky.feed.post"])
+        );
+        let exported = app.clone().oneshot(read_request(repo_uri)).await.unwrap();
+        assert_eq!(exported.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(exported.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let (roots, blocks) = hyprstream_pds::car::parse_car_v1_atproto(&bytes).unwrap();
+        let snapshot = store.snapshot("did:web:pub.example.com").unwrap().unwrap();
+        assert_eq!(roots, vec![snapshot.commit.cid_atproto().unwrap()]);
+        for (cid, bytes) in &blocks {
+            assert_eq!(*cid, Cid::from_dag_cbor(bytes));
+        }
+        for record in snapshot.records.values() {
+            assert!(blocks
+                .iter()
+                .any(|(cid, bytes)| *cid == record.cid() && bytes == record.bytes()));
+        }
+        store
+            .insert_malformed_record_for_test(
+                "did:web:pub.example.com",
+                "app.bsky.feed.post",
+                "private-storage-context",
+            )
+            .unwrap();
+        for uri in [repo_uri, describe_uri, "/xrpc/com.atproto.repo.getRecord?repo=pub.example.com&collection=app.bsky.actor.profile&rkey=self"] {
+            let response = app.clone().oneshot(read_request(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(body_json(response).await, json!({"error":"InternalServerError","message":"public repository read failed"}));
+        }
+    }
+
+    #[tokio::test]
+    async fn router_durable_export_holds_permit_until_body_drop() {
+        let (_dir, _store, _gate, app, token) = build_write_input_fixture().await;
+        let created = app
+            .clone()
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let uri = "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com";
+        let mut responses = Vec::new();
+        for _ in 0..GET_REPO_CONCURRENCY {
+            let response = app.clone().oneshot(read_request(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            responses.push(response);
+        }
+        let mut pending =
+            tokio::spawn(async move { app.oneshot(read_request(uri)).await.unwrap() });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut pending)
+                .await
+                .is_err()
+        );
+        drop(responses.pop());
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
