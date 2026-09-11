@@ -515,20 +515,26 @@ impl PublicRepoWriter {
                 .store
                 .snapshot(&self.did)?
                 .ok_or_else(|| anyhow!("publication intent exists without a repository"))?;
-            if !snapshot.records.get(&(request.collection.clone(), rkey))
-                .is_some_and(|stored| stored.bytes() == record.bytes()) {
-                return Err(anyhow!("publication intent does not match stored record").into());
+            if !snapshot
+                .records
+                .get(&(request.collection.clone(), rkey))
+                .is_some_and(|stored| stored.bytes() == record.bytes())
+            {
+                return Err(anyhow!("publication intent record does not match repository").into());
             }
             let commit_bytes = self
                 .store
                 .db
-                .get(commit_block_key(&self.did, &intent.commit_cid))?
+                .get(commit_block_key(&self.did, &intent.commit_cid))
+                .context("publication intent commit block read failed")?
                 .ok_or_else(|| anyhow!("publication intent commit block is missing"))?;
             let commit = Commit::from_atproto_dag_cbor(&commit_bytes)
                 .context("publication intent commit is invalid")?;
             let commit_cid = commit.cid_atproto()?;
             if commit.did != self.did || intent.commit_cid != commit_cid.to_string() {
-                return Err(anyhow!("publication intent commit does not match stored block").into());
+                return Err(
+                    anyhow!("publication intent commit does not match stored block").into(),
+                );
             }
             return Ok(PublicCommitResult {
                 uri: record.uri(&self.did),
@@ -1076,17 +1082,25 @@ mod tests {
                     ("text", DagCbor::Text("x".repeat(payload))),
                 ])
             };
-            let overhead = AtprotoRecord::new(&request.collection, request.rkey.as_ref().unwrap(), value(1024))
-                .unwrap()
-                .bytes()
-                .len()
+            let overhead = AtprotoRecord::new(
+                &request.collection,
+                request.rkey.as_ref().unwrap(),
+                value(1024),
+            )
+            .unwrap()
+            .bytes()
+            .len()
                 - 1024;
             request.value = value(size - overhead);
             assert_eq!(
-                AtprotoRecord::new(&request.collection, request.rkey.as_ref().unwrap(), request.value.clone())
-                    .unwrap()
-                    .bytes()
-                    .len(),
+                AtprotoRecord::new(
+                    &request.collection,
+                    request.rkey.as_ref().unwrap(),
+                    request.value.clone()
+                )
+                .unwrap()
+                .bytes()
+                .len(),
                 size
             );
             request
@@ -1183,7 +1197,7 @@ mod tests {
         let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
         let mut profile = create_request(1, None);
         profile.collection = "app.bsky.actor.profile".into();
-        profile.rkey = AtprotoRecordKey::new("self").unwrap();
+        profile.rkey = Some(AtprotoRecordKey::new("self").unwrap());
         profile.value = DagCbor::str_map([
             ("$type", DagCbor::Text(profile.collection.clone())),
             ("displayName", DagCbor::Text("Profile".into())),
@@ -1196,7 +1210,7 @@ mod tests {
             format!("at://{}/app.bsky.actor.profile/self", profile.did)
         );
         let mut post = create_request(2, Some(first.commit_cid));
-        post.rkey = AtprotoRecordKey::new("custom-key:~").unwrap();
+        post.rkey = Some(AtprotoRecordKey::new("custom-key:~").unwrap());
         let second = writer.create_record(post.clone()).unwrap();
         assert_eq!(writer.create_record(profile.clone()).unwrap(), first);
         let mut duplicate = profile.clone();
@@ -1213,11 +1227,14 @@ mod tests {
         let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
         let snapshot = store.snapshot(&profile.did).unwrap().unwrap();
         assert_eq!(snapshot.records.len(), 2);
-        let stored = &snapshot.records[&(profile.collection.clone(), profile.rkey.clone())];
+        let stored =
+            &snapshot.records[&(profile.collection.clone(), profile.rkey.clone().unwrap())];
         assert_eq!(stored.rkey().as_str(), "self");
         assert_eq!(stored.cid(), first.cid);
         assert_eq!(stored.value(), &profile.value);
-        assert!(snapshot.records.contains_key(&(post.collection, post.rkey)));
+        assert!(snapshot
+            .records
+            .contains_key(&(post.collection, post.rkey.unwrap())));
         snapshot.commit.verify_atproto(key.verifying_key()).unwrap();
         assert_eq!(snapshot.commit.cid_atproto().unwrap(), second.commit_cid);
         let writer = PublicRepoWriter::new(store.clone(), &profile.did, key, gate).unwrap();
@@ -1392,7 +1409,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let missing = create_request(3, None);
-        intent.rkey = missing.rkey.as_str().to_owned();
+        intent.rkey = missing.rkey.as_ref().unwrap().as_str().to_owned();
         store
             .db
             .put(
@@ -1583,6 +1600,53 @@ mod tests {
         snapshot
             .commit
             .verify_atproto(&writer.active_verifying_key().unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn generated_key_retry_survives_account_key_promotion_and_reopen() {
+        let (dir, store, gate, writer) = transaction_fixture();
+        let mut request = transaction_request(7);
+        request.rkey = None;
+        let first = writer
+            .create_record_with_expected_prev_text(request.clone(), None)
+            .unwrap();
+        let candidate = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let promoted = writer
+            .promote_signing_key(
+                "did:at9p:agent",
+                &writer.active_verifying_key().unwrap(),
+                candidate.clone(),
+            )
+            .unwrap()
+            .unwrap();
+        let mut later = transaction_request(8);
+        later.rkey = None;
+        writer
+            .create_record_with_expected_prev_text(later, Some(&promoted.to_string()))
+            .unwrap();
+        assert_eq!(
+            writer
+                .create_record_with_expected_prev_text(request.clone(), None)
+                .unwrap(),
+            first
+        );
+        drop(writer);
+        drop(store);
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let writer =
+            PublicRepoWriter::new(store.clone(), &request.did, candidate.clone(), gate).unwrap();
+        assert_eq!(
+            writer
+                .create_record_with_expected_prev_text(request, None)
+                .unwrap(),
+            first
+        );
+        let snapshot = store.snapshot(writer.did()).unwrap().unwrap();
+        assert_eq!(snapshot.records.len(), 2);
+        snapshot
+            .commit
+            .verify_atproto(candidate.verifying_key())
             .unwrap();
     }
 
