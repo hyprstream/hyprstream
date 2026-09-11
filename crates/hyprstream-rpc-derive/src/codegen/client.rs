@@ -223,6 +223,11 @@ fn generate_trait_method(
     } else {
         return_type
     };
+    let stream_cfg = if is_streaming {
+        quote! { #[cfg(not(target_arch = "wasm32"))] }
+    } else {
+        TokenStream::new()
+    };
 
     // Determine params from the request variant type
     let params = match variant.type_name.as_str() {
@@ -247,6 +252,7 @@ fn generate_trait_method(
     };
 
     Some(quote! {
+        #stream_cfg
         async fn #method_name(&self #(, #params)*) -> anyhow::Result<#return_type>;
     })
 }
@@ -568,6 +574,7 @@ fn generate_trait_method_impl(
     if is_streaming {
         // Streaming trait impl: generate ephemeral keypair, call raw method, construct MoqStreamHandle
         Some(quote! {
+            #[cfg(not(target_arch = "wasm32"))]
             async fn #method_name(&self #(, #params)*) -> anyhow::Result<hyprstream_rpc::moq_stream::MoqStreamHandle> {
                 let (client_secret, client_pubkey) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
                 let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();

@@ -56,8 +56,8 @@ use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 
 use super::backend::{SandboxBackend, SandboxHandle};
-use hyprstream_rpc_std::worker_client::{LinuxContainerResources, PodSandboxConfig};
 use super::sandbox::PodSandbox;
+use hyprstream_rpc_std::worker_client::{LinuxContainerResources, PodSandboxConfig};
 
 /// Annotation key: filesystem path to the guest `.wasm`/`.wat` module.
 const ANN_WASM_PATH: &str = "hyprstream.io/wasm-module";
@@ -498,8 +498,8 @@ inventory::submit! {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::hyprstream_rpc_std::worker_client::KeyValue;
     use super::*;
+    use hyprstream_rpc_std::worker_client::KeyValue;
     use std::path::PathBuf;
 
     /// A tiny hand-written guest matching the substrate's pyguest export
