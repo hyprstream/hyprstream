@@ -61,9 +61,10 @@
 //! self-hosted `iroh-dns-server` configured through the owned endpoint builder.
 
 use anyhow::Result;
-use iroh::endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks, presets};
+use iroh::endpoint::{Accepting, AfterHandshakeOutcome, Connection, EndpointHooks, presets};
 use iroh::protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use std::{future::Future, pin::Pin};
 
 /// ALPN for moq-net (moq-lite). Must equal `moq_net::version::ALPN_LITE`.
 pub const ALPN_MOQ_LITE: &[u8] = b"moql";
@@ -215,14 +216,28 @@ impl IrohSubstrate {
 
     /// Attach the owned ALPNs to an endpoint constructed immediately above.
     /// Kept private because `Endpoint` does not reveal its effective provider.
+    ///
+    /// The wrapper completes the full TLS handshake before delegating to a
+    /// protocol handler. Iroh otherwise permits a handler's `on_accepting`
+    /// hook to consume 0-RTT data before `EndpointHooks` runs; owned ALPNs must
+    /// not expose that early-data path while carrier admission is enforced
+    /// after the handshake.
     fn from_owned_endpoint<M, R>(endpoint: Endpoint, moq_handler: M, rpc_handler: R) -> Self
     where
         M: Into<Box<dyn DynProtocolHandler>>,
         R: Into<Box<dyn DynProtocolHandler>>,
     {
         let router = Router::builder(endpoint.clone())
-            .accept(ALPN_MOQ_LITE, moq_handler.into())
-            .accept(ALPN_HYPRSTREAM_RPC, rpc_handler.into())
+            .accept(
+                ALPN_MOQ_LITE,
+                Box::new(FullHandshakeHandler::new(moq_handler.into()))
+                    as Box<dyn DynProtocolHandler>,
+            )
+            .accept(
+                ALPN_HYPRSTREAM_RPC,
+                Box::new(FullHandshakeHandler::new(rpc_handler.into()))
+                    as Box<dyn DynProtocolHandler>,
+            )
             .spawn();
         Self { endpoint, router }
     }
@@ -265,6 +280,40 @@ impl IrohSubstrate {
             .await
             .map_err(|e| anyhow::anyhow!("router shutdown: {e}"))?;
         Ok(())
+    }
+}
+
+/// Restrict owned ALPN handlers to the full-handshake `accept(Connection)`
+/// path. This prevents a custom handler from consuming 0-RTT before the
+/// post-handshake carrier policy has run.
+#[derive(Debug)]
+struct FullHandshakeHandler {
+    inner: Box<dyn DynProtocolHandler>,
+}
+
+impl FullHandshakeHandler {
+    fn new(inner: Box<dyn DynProtocolHandler>) -> Self {
+        Self { inner }
+    }
+}
+
+impl DynProtocolHandler for FullHandshakeHandler {
+    fn on_accepting(
+        &self,
+        accepting: Accepting,
+    ) -> Pin<Box<dyn Future<Output = Result<Connection, AcceptError>> + Send + '_>> {
+        Box::pin(async move { accepting.await.map_err(AcceptError::from_err) })
+    }
+
+    fn accept(
+        &self,
+        connection: Connection,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AcceptError>> + Send + '_>> {
+        self.inner.accept(connection)
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.inner.shutdown()
     }
 }
 
@@ -345,12 +394,31 @@ mod tests {
     use iroh::TransportAddr;
     use noq::crypto::rustls::HandshakeData;
     use rand::RngCore;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     fn fresh_key() -> [u8; 32] {
         let mut k = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut k);
         k
+    }
+
+    #[derive(Debug, Clone)]
+    struct EarlyDataProbe(Arc<AtomicBool>);
+
+    impl ProtocolHandler for EarlyDataProbe {
+        async fn on_accepting(&self, _accepting: Accepting) -> Result<Connection, AcceptError> {
+            self.0.store(true, Ordering::SeqCst);
+            Err(AcceptError::from_err(std::io::Error::other(
+                "early-data hook must not be delegated",
+            )))
+        }
+
+        async fn accept(&self, _connection: Connection) -> Result<(), AcceptError> {
+            Ok(())
+        }
     }
 
     /// Build an `EndpointAddr` for a server directly from its bound sockets +
@@ -425,6 +493,31 @@ mod tests {
 
         // Sanity: server id is stable.
         assert_eq!(server.endpoint_id(), server_id);
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_handlers_complete_handshake_before_delegation() -> Result<()> {
+        let called = Arc::new(AtomicBool::new(false));
+        let server = IrohSubstrate::new_test(
+            fresh_key(),
+            EarlyDataProbe(called.clone()),
+            NoopHandler::new("rpc"),
+        )
+        .await?;
+        let client = IrohSubstrate::new_test(
+            fresh_key(),
+            NoopHandler::new("moq"),
+            NoopHandler::new("rpc"),
+        )
+        .await?;
+
+        let conn = client.connect(direct_addr(&server), ALPN_MOQ_LITE).await?;
+        assert_hybrid_handshake(&conn, ALPN_MOQ_LITE);
+        assert!(!called.load(Ordering::SeqCst));
 
         client.shutdown().await?;
         server.shutdown().await?;
