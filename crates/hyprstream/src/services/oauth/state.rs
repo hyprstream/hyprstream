@@ -2260,7 +2260,7 @@ pub fn canonical_issuer_origin(issuer_url: &str) -> Option<String> {
 /// while a non-default port is retained and its domain-segment separator is
 /// encoded as `%3A`. IPv6 is rejected until client and server share one
 /// canonical DID representation for it.
-fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
+pub(super) fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
     let url = url::Url::parse(issuer_url).ok()?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()

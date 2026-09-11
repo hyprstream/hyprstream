@@ -38,6 +38,36 @@ const MAX_PRINCIPAL: usize = 512;
 /// See https://atproto.com/specs/repository#security-considerations.
 pub const MAX_PUBLIC_RECORD_BYTES: usize = 64 * 1024;
 
+/// Blob storage is not wired to this public writer. Never accept caller-supplied
+/// blob claims as proof of account ownership, bytes, MIME type or size. Scan
+/// every object, including open unions/extensions and legacy blob objects.
+pub(crate) fn reject_unverified_blobs(value: &DagCbor) -> Result<()> {
+    match value {
+        DagCbor::Map(entries) => {
+            let field = |name: &str| {
+                entries.iter().find_map(|(key, value)| {
+                    matches!(key, DagCbor::Text(key) if key == name).then_some(value)
+                })
+            };
+            ensure!(
+                !matches!(field("$type"), Some(DagCbor::Text(kind)) if kind == "blob")
+                    && !(field("cid").is_some() && field("mimeType").is_some()),
+                "blob storage verification is unavailable"
+            );
+            for (_, value) in entries {
+                reject_unverified_blobs(value)?;
+            }
+        }
+        DagCbor::List(values) => {
+            for value in values {
+                reject_unverified_blobs(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn record_prefix(did: &str) -> Vec<u8> {
     format!("{RECORD_PREFIX}{did}\0").into_bytes()
 }
@@ -153,6 +183,9 @@ struct PublicationIntent {
     generated_rkey: bool,
     cid: String,
     commit_cid: String,
+    /// Missing on older receipts: condition identity cannot safely be inferred.
+    #[serde(default)]
+    head_condition: Option<String>,
 }
 
 #[derive(Default)]
@@ -169,6 +202,14 @@ enum PublicHeadCondition {
 }
 
 impl PublicHeadCondition {
+    fn identity(&self) -> String {
+        match self {
+            Self::Unconditional => "unconditional".to_owned(),
+            Self::Exact(None) => "exact:genesis".to_owned(),
+            Self::Exact(Some(cid)) => format!("exact:{cid}"),
+        }
+    }
+
     fn matches(&self, actual: Option<Cid>) -> bool {
         match self {
             Self::Unconditional => true,
@@ -194,6 +235,48 @@ impl std::fmt::Debug for PublicRepoStore {
 }
 
 impl PublicRepoStore {
+    #[cfg(test)]
+    pub(crate) fn insert_unverified_blob_for_test(&self, did: &str) -> Result<()> {
+        let account = self
+            .accounts
+            .lock()
+            .get(did)
+            .cloned()
+            .ok_or_else(|| anyhow!("test writer account missing"))?;
+        let key = account.active_key.lock();
+        let record = AtprotoRecord::new(
+            "app.bsky.feed.post",
+            AtprotoRecordKey::new("legacy")?,
+            DagCbor::str_map([
+                ("$type", DagCbor::Text("app.bsky.feed.post".into())),
+                (
+                    "extension",
+                    DagCbor::str_map([
+                        ("$type", DagCbor::Text("blob".into())),
+                        ("ref", DagCbor::Link(Cid::from_raw(b"absent-content"))),
+                        ("mimeType", DagCbor::Text("image/png".into())),
+                        ("size", DagCbor::Unsigned(14)),
+                    ]),
+                ),
+            ]),
+        )?;
+        let keyed = BTreeMap::from([("app.bsky.feed.post/legacy".to_owned(), record.cid())]);
+        let (root, _) = Node::from_keyed_records(&keyed).to_node_data_with_blocks_atproto()?;
+        let commit = Commit::sign_atproto(
+            &UnsignedCommit::new(did.to_owned(), root.cid_atproto()?, Tid::from_raw(7), None),
+            key.as_ref()
+                .ok_or_else(|| anyhow!("test signing authority missing"))?,
+        )?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(
+            record_key(did, record.collection(), record.rkey().as_str()),
+            record.bytes(),
+        );
+        batch.put(commit_key(did), commit.to_atproto_dag_cbor()?);
+        self.db.write(batch)?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn with_account_lock_for_test(&self, did: &str, held: impl FnOnce()) -> Result<()> {
         let account = self
@@ -257,6 +340,7 @@ impl PublicRepoStore {
                 AtprotoRecord::from_bytes(collection, &rkey, &bytes).with_context(|| {
                     format!("invalid public record {did}/{collection}/{}", rkey.as_str())
                 })?;
+            reject_unverified_blobs(record.value())?;
             records.insert((collection.to_owned(), rkey), record);
         }
         if records.is_empty() {
@@ -508,11 +592,17 @@ impl PublicRepoWriter {
             .authorize(&request.principal, &self.did, &request.collection)
             .map_err(PublicRepoWriteError::Authorization)?;
 
+        reject_unverified_blobs(&request.value).map_err(PublicRepoWriteError::InvalidRequest)?;
         let state = self.account.active_key.lock();
         let signing_key = state
             .as_ref()
             .ok_or_else(|| anyhow!("no active signing authority for repository"))?;
         if let Some(intent) = self.store.intent(&self.did, &request.request_id)? {
+            if intent.head_condition.as_deref() != Some(condition.identity().as_str()) {
+                return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                    "publication request condition changed or is not bound"
+                )));
+            }
             if intent.generated_rkey != request.rkey.is_none() {
                 return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
                     "publication request id was reused with a different key mode"
@@ -633,6 +723,7 @@ impl PublicRepoWriter {
             generated_rkey,
             cid: record.cid().to_string(),
             commit_cid: commit_cid.to_string(),
+            head_condition: Some(condition.identity()),
         };
         self.store
             .write_transaction(&self.did, &record, &commit, &intent)?;
@@ -1835,6 +1926,92 @@ mod tests {
     }
 
     #[test]
+    fn retries_bind_original_condition_under_race_and_legacy_receipts_fail_closed() {
+        let (_dir, store, _gate, writer) = transaction_fixture();
+        let first = writer
+            .create_record_with_expected_prev_text(transaction_request(7), None)
+            .unwrap();
+        let previous = first.commit_cid.to_string();
+        let barrier = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let workers: Vec<_> = [None, Some(previous.as_str())]
+                .into_iter()
+                .map(|condition| {
+                    let writer = &writer;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        (
+                            condition,
+                            writer.create_record_with_expected_prev_text(
+                                transaction_request(8),
+                                condition,
+                            ),
+                        )
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        assert!(outcomes
+            .iter()
+            .any(|(_, result)| matches!(result, Err(PublicRepoWriteError::InvalidRequest(_)))));
+        let (condition, result) = outcomes.iter().find(|(_, result)| result.is_ok()).unwrap();
+        assert_eq!(
+            &writer
+                .create_record_with_expected_prev_text(transaction_request(8), *condition)
+                .unwrap(),
+            result.as_ref().unwrap()
+        );
+        assert_eq!(
+            store.snapshot(writer.did()).unwrap().unwrap().records.len(),
+            2
+        );
+        let mut legacy =
+            serde_json::to_value(store.intent(writer.did(), "req-8").unwrap().unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("head_condition");
+        store
+            .db
+            .put(
+                intent_key(writer.did(), "req-8"),
+                serde_json::to_vec(&legacy).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            writer.create_record_with_expected_prev_text(transaction_request(8), *condition),
+            Err(PublicRepoWriteError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn native_publication_rejects_unverified_blob_extensions_without_mutation() {
+        let (_dir, store, _gate, writer) = transaction_fixture();
+        let mut request = transaction_request(7);
+        request.value = DagCbor::str_map([
+            ("$type", DagCbor::Text(request.collection.clone())),
+            (
+                "extension",
+                DagCbor::List(vec![DagCbor::str_map([(
+                    "$type",
+                    DagCbor::Text("blob".into()),
+                )])]),
+            ),
+        ]);
+        assert!(matches!(
+            writer.create_record(request),
+            Err(PublicRepoWriteError::InvalidRequest(_))
+        ));
+        assert!(store.snapshot(writer.did()).unwrap().is_none());
+    }
+
+    #[test]
     fn xrpc_retries_return_original_result_after_later_commit_and_reopen() {
         let (dir, store, gate, writer) = transaction_fixture();
         let first = writer
@@ -1878,6 +2055,12 @@ mod tests {
             second,
             "durable retry returns original commit, not the latest head"
         );
+        for changed in [None, Some(third.commit_cid.to_string().as_str())] {
+            assert!(matches!(
+                writer.create_record_with_expected_prev_text(transaction_request(8), changed),
+                Err(PublicRepoWriteError::InvalidRequest(_))
+            ));
+        }
         let mut changed = transaction_request(8);
         changed.value = DagCbor::str_map([
             ("$type", DagCbor::Text("app.bsky.feed.post".into())),

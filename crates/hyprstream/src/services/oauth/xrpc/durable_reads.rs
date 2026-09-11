@@ -150,13 +150,16 @@ pub(super) async fn describe_repo(state: &OAuthState, writer: Arc<PublicRepoWrit
     let handle = match handle {
         Some(handle) => handle,
         None => {
-            let Some(authority) = issuer_authority(&state.issuer_url) else {
-                return missing_repo();
-            };
-            if writer.did() != format!("did:web:{authority}") {
+            if state.atproto_service_did().as_deref() != Some(writer.did()) {
                 return missing_repo();
             }
-            authority.split(':').next().unwrap_or(&authority).to_owned()
+            let Some(handle) = url::Url::parse(&state.issuer_url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+            else {
+                return missing_repo();
+            };
+            handle
         }
     };
     let issuer = state.issuer_url.clone();
