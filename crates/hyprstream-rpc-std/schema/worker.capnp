@@ -760,3 +760,4 @@ struct ContainerStopped {
   exitCode @2 :Int32;
   reason @3 :Text;
 }
+

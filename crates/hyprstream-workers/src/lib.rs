@@ -101,23 +101,9 @@ pub use hyprstream_rpc::annotations_capnp;
 pub use hyprstream_rpc::common_capnp;
 pub use hyprstream_rpc::streaming_capnp;
 
-/// Generated Cap'n Proto code for resource-scoped worker schema
-pub mod worker_capnp {
-    #![allow(dead_code, clippy::all, clippy::unwrap_used, clippy::expect_used)]
-    #![allow(clippy::match_same_arms, clippy::semicolon_if_nothing_returned)]
-    #![allow(clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/worker_capnp.rs"));
-}
-
-/// Generated Cap'n Proto code for workflow service schema
-pub mod workflow_capnp {
-    #![allow(dead_code, clippy::all, clippy::unwrap_used, clippy::expect_used)]
-    #![allow(clippy::match_same_arms, clippy::semicolon_if_nothing_returned)]
-    #![allow(clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/workflow_capnp.rs"));
-}
+// Canonical wire modules are generated once by the Apache-2.0 contract crate.
+// Keep these names as compatibility re-exports for runtime/event code.
+pub use hyprstream_rpc_std::{worker_capnp, workflow_capnp};
 
 /// Generated RPC dispatch code from `generate_rpc_service!` proc macro.
 ///

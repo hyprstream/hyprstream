@@ -1,27 +1,25 @@
-//! Build script for Cap'n Proto schema compilation
+//! Build script for the worker implementation crate.
 //!
-//! Compiles worker and workflow schemas with CGR + metadata extraction
-//! to support `generate_rpc_service!` proc macro in this crate.
+//! Worker/workflow schemas are canonical in `hyprstream-rpc-std`; this crate
+//! intentionally performs no local Cap'n Proto compilation. The build script
+//! stages the dependency's exported CGR files into this crate's `OUT_DIR` so
+//! proc-macro expansion can consume them (Cargo exposes dependency metadata to
+//! build scripts, not directly to proc-macros).
 
-#![allow(clippy::expect_used, clippy::print_stderr)]
-
-use std::env;
-use std::path::Path;
+use std::{env, fs, path::Path};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=schema/");
-    println!("cargo:rerun-if-changed=../hyprstream-rpc/schema/streaming.capnp");
+    println!("cargo:rerun-if-env-changed=DEP_HYPRSTREAM_RPC_STD_OUT_DIR");
 
-    let schema_dir = Path::new("schema");
+    let dep_out = env::var("DEP_HYPRSTREAM_RPC_STD_OUT_DIR")
+        .expect("hyprstream-rpc-std must export its CGR OUT_DIR");
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-    let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");
-
-    hyprstream_rpc_build::compile_schemas(
-        schema_dir,
-        Path::new(&out_dir),
-        &[&rpc_schema_dir],
-        &["worker", "workflow"],
-    );
+    for name in ["worker", "workflow"] {
+        let source = Path::new(&dep_out).join(format!("{name}.cgr"));
+        let target = Path::new(&out_dir).join(format!("{name}.cgr"));
+        fs::copy(&source, &target).unwrap_or_else(|e| {
+            panic!("failed to stage {name}.cgr from {}: {e}", source.display())
+        });
+    }
 }

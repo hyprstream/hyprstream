@@ -89,6 +89,27 @@ pub mod oauth_capnp {
     include!(concat!(env!("OUT_DIR"), "/oauth_capnp.rs"));
 }
 
+pub mod worker_capnp {
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/worker_capnp.rs"));
+}
+
+pub mod workflow_capnp {
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/workflow_capnp.rs"));
+}
+
+pub mod discovery_capnp {
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/discovery_capnp.rs"));
+}
+
 // ============================================================================
 // Generated client types (from proc macro)
 // Client-only: data structs, response enums, metadata. No server handlers.
@@ -143,6 +164,38 @@ pub mod oauth_client {
     #![allow(clippy::all)]
     extern crate self as hyprstream_rpc_std;
     hyprstream_rpc_derive::generate_rpc_client!("oauth");
+}
+
+pub mod worker_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    extern crate self as hyprstream_rpc_std;
+    hyprstream_rpc_derive::generate_rpc_client!("worker");
+}
+
+pub mod workflow_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    extern crate self as hyprstream_rpc_std;
+    hyprstream_rpc_derive::generate_rpc_client!("workflow");
+}
+
+pub mod discovery_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    extern crate self as hyprstream_rpc_std;
+    hyprstream_rpc_derive::generate_rpc_client!("discovery");
+}
+
+/// Stable, discoverable imports for third-party Rust consumers.  Service
+/// implementations may re-export data types for compatibility, but the public
+/// client implementations live only in this Apache-2.0 crate.
+pub mod prelude {
+    pub use crate::{
+        discovery_client, inference_client, mcp_client, metrics_client, model_client,
+        oauth_client, policy_client, registry_client, worker_client, workflow_client,
+    };
+    pub use hyprstream_rpc::{FromCapnp, RpcClient, ToCapnp};
 }
 
 // Compile-time smoke test for the split codegen boundary.  The test module
