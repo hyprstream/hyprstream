@@ -141,10 +141,10 @@ impl IrohSubstrate {
     /// Build the substrate from raw 32-byte Ed25519 secret key material.
     ///
     /// Uses iroh's `presets::N0` for discovery (n0 DNS + pkarr) and relay
-    /// fallback. The endpoint offers PQ-hybrid TLS first, with classical
-    /// X25519 needed for the public N0 HTTPS relay/pkarr services. The
-    /// [`HybridCarrierHook`] rejects classical negotiation on HyprStream's
-    /// owned ALPNs before any handler receives the connection.
+    /// fallback. The native carrier remains strict PQ-hybrid; the patched iroh
+    /// builder routes only external CA-validated HTTPS through its compatible
+    /// provider, so public N0 infrastructure can be reached without weakening
+    /// the owned carrier policy.
     ///
     /// **pkarr here is liveness-only** — see the module-level "D3" note. The
     /// published record carries reach hints (relay + direct addrs) for this
@@ -167,9 +167,10 @@ impl IrohSubstrate {
         let endpoint = Endpoint::builder(presets::N0)
             .address_lookup(iroh::address_lookup::PkarrResolver::n0_dns())
             .secret_key(SecretKey::from_bytes(&secret_key_bytes))
-            // Public N0 relay/pkarr HTTPS currently requires classical
-            // X25519. The carrier hook above keeps HyprStream ALPNs hybrid-only.
-            .crypto_provider(crate::transport::pq_provider::pq_crypto_provider())
+            .crypto_provider(
+                crate::transport::pq_provider::internal_mesh_crypto_provider(),
+            )
+            .ca_crypto_provider(crate::transport::pq_provider::pq_crypto_provider())
             .hooks(HybridCarrierHook)
             .bind()
             .await
