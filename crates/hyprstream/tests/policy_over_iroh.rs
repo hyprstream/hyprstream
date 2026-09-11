@@ -204,6 +204,7 @@ impl TestTokenAuthority {
         let claims = hyprstream_rpc::auth::Claims::new(subject.to_owned(), now, now + 300)
             .with_issuer(TEST_ISSUER.to_owned())
             .with_tenant(tenant.to_owned())
+            .with_client_id("hyprstream-oauth-client-1")
             .with_cnf_jwk(signer.verifying_key().as_bytes());
         hyprstream_core::auth::jwt::encode_composite_ml_dsa_65_ed25519(
             &claims,
@@ -214,10 +215,13 @@ impl TestTokenAuthority {
 
     fn service_token(&self, subject: &str, signer: &SigningKey) -> String {
         let now = chrono::Utc::now().timestamp();
+        // Service credentials are WIT (`wit+jwt`), never `at+jwt`: the
+        // type-driven client_id requirement exempts them by construction, so
+        // this helper must not normalize service:* subjects into at+jwt.
         let claims = hyprstream_rpc::auth::Claims::new(subject.to_owned(), now, now + 300)
             .with_issuer(TEST_ISSUER.to_owned())
             .with_cnf_jwk(signer.verifying_key().as_bytes());
-        hyprstream_core::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+        hyprstream_core::auth::jwt::encode_composite_service_jwt(
             &claims,
             &self.ml_dsa,
             &self.ed25519,
@@ -259,6 +263,16 @@ async fn make_policy_service_with_manager_and_authority(
         TransportConfig::inproc("policy-over-iroh-unused"),
     )
     .with_jwt_key_source(Arc::new(key_source));
+
+    // Mirror the production bootstrap: the policy process always publishes
+    // the credential-revocation store at startup. Client JWTs carry a jti
+    // (the composite encoder injects one), so `verify_claims` fails closed
+    // without it. Get-or-init: the OnceLock is per test-binary process.
+    if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+        let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+            hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+        ));
+    }
 
     Ok((service, policy_manager, signing_key, temp, authority))
 }

@@ -287,22 +287,27 @@ struct PrefixState {
 /// The caller attempting an event-plane op (`publish`/`subscribe`). Carries the
 /// verified subject identity (a DID when available). Until #446 lands, IPC
 /// callers may resolve as `anonymous` — see [`PublisherIdentity`].
+///
+/// Async because the MAC-backed adapter revalidates credential-bearing cached
+/// subject contexts against the canonical revocation authority on every check.
+#[async_trait::async_trait]
 pub trait EventAuthz: Send + Sync {
     /// May `caller` publish to the group/`prefix`? Maps to the `publish`
     /// ScopeAction.
-    fn can_publish(&self, caller: &Subject, prefix: &str) -> bool;
+    async fn can_publish(&self, caller: &Subject, prefix: &str) -> bool;
     /// May `caller` subscribe to the group/`prefix`? Maps to the `subscribe`
     /// ScopeAction.
-    fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool;
+    async fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool;
     /// May `caller` receive an encrypted epoch key and decrypt this prefix?
-    fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
-        self.can_subscribe(caller, prefix)
+    async fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
+        self.can_subscribe(caller, prefix).await
     }
 }
 
 static EVENT_AUTHZ: OnceLock<Arc<dyn EventAuthz>> = OnceLock::new();
 
-fn installed_event_authz() -> Option<Arc<dyn EventAuthz>> {
+/// Clone the process reference monitor for authenticated network Event sessions.
+pub fn installed_event_authz() -> Option<Arc<dyn EventAuthz>> {
     EVENT_AUTHZ.get().cloned()
 }
 
@@ -327,11 +332,12 @@ pub fn install_event_authz(authz: Arc<dyn EventAuthz>) -> std::result::Result<()
 /// by construction. Production wires a real UCAN/capability-backed impl (S3/S4
 /// vocab on main) via [`EventPublisher::with_authz`].
 pub struct DenyAllEventAuthz;
+#[async_trait::async_trait]
 impl EventAuthz for DenyAllEventAuthz {
-    fn can_publish(&self, _caller: &Subject, _prefix: &str) -> bool {
+    async fn can_publish(&self, _caller: &Subject, _prefix: &str) -> bool {
         false
     }
-    fn can_subscribe(&self, _caller: &Subject, _prefix: &str) -> bool {
+    async fn can_subscribe(&self, _caller: &Subject, _prefix: &str) -> bool {
         false
     }
 }
@@ -339,11 +345,12 @@ impl EventAuthz for DenyAllEventAuthz {
 /// Explicit permissive authz for callers that deliberately construct a public
 /// firehose or a test fixture. It is never an implicit fallback.
 pub struct AllowAllEventAuthz;
+#[async_trait::async_trait]
 impl EventAuthz for AllowAllEventAuthz {
-    fn can_publish(&self, _caller: &Subject, _prefix: &str) -> bool {
+    async fn can_publish(&self, _caller: &Subject, _prefix: &str) -> bool {
         true
     }
-    fn can_subscribe(&self, _caller: &Subject, _prefix: &str) -> bool {
+    async fn can_subscribe(&self, _caller: &Subject, _prefix: &str) -> bool {
         true
     }
 }
@@ -353,6 +360,12 @@ impl EventAuthz for AllowAllEventAuthz {
 /// Constructing this type installs an active PEP, so all missing clearance or
 /// object labels fail closed. Uninstalled publishers/subscribers use
 /// [`DenyAllEventAuthz`], never a dormant permit fallback.
+///
+/// Typed identity (v16 §10 / #1510): each check parses the topic-prefix
+/// grammar exactly once at this boundary. Tenant-qualified internal map keys
+/// (for example `"5:tenantworker"`) are bookkeeping keys, not identities,
+/// and must never cross this boundary. Confidential callers retain those keys
+/// only for state lookup, while presenting the underlying Event prefix here.
 pub struct MacEventAuthz {
     pep: MoqEventPep,
 }
@@ -363,24 +376,28 @@ impl MacEventAuthz {
     }
 }
 
+#[async_trait::async_trait]
 impl EventAuthz for MacEventAuthz {
-    fn can_publish(&self, caller: &Subject, prefix: &str) -> bool {
+    async fn can_publish(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
-            self.pep.check(caller, prefix, MoqEventAction::Publish),
+            self.pep
+                .check_event_prefix(caller, prefix, MoqEventAction::Publish).await,
             MacDecision::Permit
         )
     }
 
-    fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
+    async fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
-            self.pep.check(caller, prefix, MoqEventAction::Subscribe),
+            self.pep
+                .check_event_prefix(caller, prefix, MoqEventAction::Subscribe).await,
             MacDecision::Permit
         )
     }
 
-    fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
+    async fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
-            self.pep.check(caller, prefix, MoqEventAction::JoinDecrypt),
+            self.pep
+                .check_event_prefix(caller, prefix, MoqEventAction::JoinDecrypt).await,
             MacDecision::Permit
         )
     }
@@ -416,6 +433,19 @@ impl PublisherIdentity {
     pub fn is_verified(&self) -> bool {
         self.did.is_some()
     }
+}
+
+/// The local Event caller selected by checkpoint-verified process bootstrap.
+/// This supplies an identity to MAC, never a clearance or authorization grant.
+static NETWORK_EVENT_IDENTITY: OnceLock<PublisherIdentity> = OnceLock::new();
+
+/// Bind Event publishers/subscribers before construction in a single-identity
+/// native process. A later service cannot silently replace that process identity.
+pub fn install_network_event_identity(proof: &crate::transport::moql_admission::MoqlAdmissionProof) -> Result<()> {
+    anyhow::ensure!(proof.did.starts_with("did:at9p:"), "native Event identity must be checkpointed did:at9p");
+    let installed = NETWORK_EVENT_IDENTITY.get_or_init(|| PublisherIdentity::verified(proof.did.clone()));
+    anyhow::ensure!(installed.did.as_ref() == Some(&proof.did), "Event process identity already bound to another DID");
+    Ok(())
 }
 
 impl Default for PublisherIdentity {
@@ -508,7 +538,7 @@ impl EventPublisher {
             rekey_policy: RekeyPolicy::default(),
             // An omitted production installation is a hard deny at rest.
             authz: installed_event_authz().unwrap_or_else(|| Arc::new(DenyAllEventAuthz)),
-            publisher_identity: PublisherIdentity::anonymous(),
+            publisher_identity: NETWORK_EVENT_IDENTITY.get().cloned().unwrap_or_default(),
         })
     }
 
@@ -720,8 +750,7 @@ impl EventPublisher {
             Some(did) => Subject::new(did.clone()),
             None => Subject::anonymous(),
         };
-        let object = if state.confidential { &key } else { &prefix };
-        if !self.authz.can_publish(&caller, object) {
+        if !self.authz.can_publish(&caller, &prefix).await {
             return Err(anyhow!(
                 "publish denied by event-plane authz for prefix '{prefix}'"
             ));
@@ -954,7 +983,8 @@ impl EventSubscriber {
             prefixes: Arc::new(RwLock::new(HashMap::new())),
             tenant: Arc::new(RwLock::new(None)),
             authz: installed_event_authz().unwrap_or_else(|| Arc::new(DenyAllEventAuthz)),
-            caller: Subject::anonymous(),
+            caller: NETWORK_EVENT_IDENTITY.get().and_then(|identity| identity.did.clone())
+                .map(Subject::new).unwrap_or_else(Subject::anonymous),
         })
     }
 
@@ -1097,7 +1127,7 @@ impl EventSubscriber {
             );
         }
         let prefix_key = self.encrypted_prefix_key(prefix).await?;
-        if !self.authz.can_join_decrypt(&self.caller, &prefix_key) {
+        if !self.authz.can_join_decrypt(&self.caller, prefix).await {
             return Err(format!(
                 "join/decrypt denied by event-plane MAC for prefix '{prefix}'"
             ));
@@ -1275,7 +1305,11 @@ impl EventSubscriber {
     /// they are returned as an explicit error (and an installed MAC adapter
     /// audits the denial) so callers cannot confuse enforcement with an empty
     /// queue.
-    pub fn try_recv(&mut self) -> Result<Option<(String, Vec<u8>)>> {
+    ///
+    /// Async only because the authorization check may revalidate a
+    /// credential-bearing cached subject against the revocation authority; the
+    /// receive itself remains non-blocking.
+    pub async fn try_recv(&mut self) -> Result<Option<(String, Vec<u8>)>> {
         let Some((topic, raw)) = self.inner.try_recv()? else {
             return Ok(None);
         };
@@ -1288,7 +1322,7 @@ impl EventSubscriber {
                 "try_recv() does not support decoding encrypted prefixes; use recv_timeout(Duration::ZERO)"
             ));
         }
-        if !self.authz.can_subscribe(&self.caller, prefix) {
+        if !self.authz.can_subscribe(&self.caller, prefix).await {
             return Err(anyhow!(
                 "subscribe denied by event-plane MAC for prefix '{prefix}'"
             ));
@@ -1317,7 +1351,7 @@ impl EventSubscriber {
     async fn decode_frame(&self, topic: &str, raw: &[u8]) -> FrameOutcome {
         let prefix = topic.split('.').next().unwrap_or(topic);
         let Ok(key) = self.encrypted_prefix_key(prefix).await else {
-            return if self.authz.can_subscribe(&self.caller, prefix) {
+            return if self.authz.can_subscribe(&self.caller, prefix).await {
                 FrameOutcome::Passthrough
             } else {
                 FrameOutcome::Drop(
@@ -1325,9 +1359,9 @@ impl EventSubscriber {
                 )
             };
         };
-        if !self.authz.can_subscribe(&self.caller, &key) {
+        if !self.authz.can_subscribe(&self.caller, prefix).await {
             return FrameOutcome::Drop(
-                "subscribe denied by event-plane MAC for tenant-qualified prefix".to_owned(),
+                "subscribe denied by event-plane MAC for confidential prefix".to_owned(),
             );
         }
         let mut prefixes = self.prefixes.write().await;
@@ -1479,12 +1513,18 @@ enum FrameOutcome {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::auth::mac::{
+        Assurance, ClearanceSource, CompartmentSet, DeclaredTrackPolicyResolver, Level,
+        MoqEventPlane, MoqEventPolicyRow, MoqEventPolicyTable, MoqMacAuditRecord, MoqMacAuditSink,
+        SecurityContext, SecurityLabel, VerifiedKeyMaterial,
+    };
     use crate::crypto::group_key::{
         recipient_key_id, ControllerBinding, GroupKeyRegistry, GroupMembership, GroupRef,
         MembershipChange, MembershipResolver,
     };
     use crate::crypto::hybrid_kem::{generate_recipient, RecipientKeypair, SuiteId};
     use ml_dsa::Keypair;
+    use parking_lot::Mutex;
 
     const TEST_TENANT: &str = "tenant-test";
 
@@ -1499,6 +1539,94 @@ mod tests {
         let mut secret = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
         SigningKey::from_bytes(&secret)
+    }
+
+    fn public_label() -> SecurityLabel {
+        SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY)
+    }
+
+    struct PublicClearance;
+
+    #[async_trait::async_trait]
+    impl ClearanceSource for PublicClearance {
+        async fn clearance(&self, _subject: &Subject) -> Option<SecurityContext> {
+            Some(SecurityContext::from_clearance(
+                public_label(),
+                VerifiedKeyMaterial::Classical,
+            ))
+        }
+    }
+
+    struct NoopAudit;
+
+    impl MoqMacAuditSink for NoopAudit {
+        fn record_deny(&self, _record: &MoqMacAuditRecord) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A test-only wrapper around the production MAC adapter. It proves which
+    /// identity actually reaches the typed Event PEP rather than merely
+    /// asserting the internal map-key implementation detail.
+    struct RecordingMacEventAuthz {
+        inner: MacEventAuthz,
+        calls: Mutex<Vec<(MoqEventAction, String)>>,
+    }
+
+    impl RecordingMacEventAuthz {
+        fn declared_worker() -> Arc<Self> {
+            let table = MoqEventPolicyTable::build(
+                1,
+                [MoqEventPolicyRow::new(MoqEventPlane::Event, "worker", public_label())
+                    .unwrap()],
+            )
+            .unwrap();
+            Arc::new(Self {
+                inner: MacEventAuthz::new(MoqEventPep::new(
+                    Arc::new(DeclaredTrackPolicyResolver::new(table)),
+                    Arc::new(PublicClearance),
+                    Arc::new(NoopAudit),
+                )),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn empty() -> Arc<Self> {
+            Arc::new(Self {
+                inner: MacEventAuthz::new(MoqEventPep::new(
+                    Arc::new(DeclaredTrackPolicyResolver::new(MoqEventPolicyTable::empty())),
+                    Arc::new(PublicClearance),
+                    Arc::new(NoopAudit),
+                )),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<(MoqEventAction, String)> {
+            self.calls.lock().clone()
+        }
+
+        fn record(&self, action: MoqEventAction, prefix: &str) {
+            self.calls.lock().push((action, prefix.to_owned()));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventAuthz for RecordingMacEventAuthz {
+        async fn can_publish(&self, caller: &Subject, prefix: &str) -> bool {
+            self.record(MoqEventAction::Publish, prefix);
+            self.inner.can_publish(caller, prefix).await
+        }
+
+        async fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
+            self.record(MoqEventAction::Subscribe, prefix);
+            self.inner.can_subscribe(caller, prefix).await
+        }
+
+        async fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
+            self.record(MoqEventAction::JoinDecrypt, prefix);
+            self.inner.can_join_decrypt(caller, prefix).await
+        }
     }
 
     #[tokio::test]
@@ -1517,11 +1645,11 @@ mod tests {
 
         // Start the background reader, then publish until it has relayed a
         // frame into this subscriber's non-blocking queue.
-        assert!(subscriber.try_recv().unwrap().is_none());
+        assert!(subscriber.try_recv().await.unwrap().is_none());
         for _ in 0..50 {
             publisher.publish("object", "changed", b"payload").unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
-            match subscriber.try_recv() {
+            match subscriber.try_recv().await {
                 Err(error) => {
                     assert!(error
                         .to_string()
@@ -1533,6 +1661,89 @@ mod tests {
             }
         }
         panic!("subscriber did not observe the test frame");
+    }
+
+    #[tokio::test]
+    async fn declared_event_identity_authorizes_plaintext_and_confidential_paths() {
+        let authz = RecordingMacEventAuthz::declared_worker();
+
+        let origin = crate::moq_event::MoqEventOrigin::new();
+        let public = EventPublisher::from_public_prefix("worker", origin.publisher("worker").unwrap())
+            .unwrap()
+            .with_authz(authz.clone());
+        public.publish("sandbox1", "started", b"plaintext").await.unwrap();
+
+        let public_subscriber = EventSubscriber::new().unwrap().with_authz(authz.clone());
+        assert!(matches!(
+            public_subscriber
+                .decode_frame("worker.sandbox1.started", b"plaintext")
+                .await,
+            FrameOutcome::Passthrough
+        ));
+
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let (grant, key) = grant_for(&recipient, &ed, &pq).await;
+        let confidential = EventSubscriber::new()
+            .unwrap()
+            .with_authz(authz.clone())
+            .with_caller(Subject::new("did:web:member"));
+        expect_confidential(&confidential, "worker", &ed, &pq).await;
+        confidential
+            .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
+            .await
+            .unwrap();
+        let encrypted = event(&key, &ed, &pq, b"confidential", 1);
+        assert!(matches!(
+            confidential
+                .decode_frame(&encrypted.topic, &encrypted.encode_body())
+                .await,
+            FrameOutcome::Decoded(ref plaintext) if plaintext == b"confidential"
+        ));
+
+        assert_eq!(
+            authz.calls(),
+            vec![
+                (MoqEventAction::Publish, "worker".to_owned()),
+                (MoqEventAction::Subscribe, "worker".to_owned()),
+                (MoqEventAction::JoinDecrypt, "worker".to_owned()),
+                (MoqEventAction::Subscribe, "worker".to_owned()),
+            ],
+            "the MAC boundary must receive the typed Event prefix, never a tenant bookkeeping key"
+        );
+
+        let undeclared = RecordingMacEventAuthz::declared_worker();
+        let undeclared_subscriber = EventSubscriber::new()
+            .unwrap()
+            .with_authz(undeclared.clone())
+            .with_caller(Subject::new("did:web:member"));
+        expect_confidential(&undeclared_subscriber, "registry", &ed, &pq).await;
+        assert!(undeclared_subscriber
+            .install_epoch_grant("registry", &recipient, &grant, anchor(&ed, &pq), None, None)
+            .await
+            .unwrap_err()
+            .contains("join/decrypt denied by event-plane MAC"));
+        assert_eq!(
+            undeclared.calls(),
+            vec![(MoqEventAction::JoinDecrypt, "registry".to_owned())]
+        );
+
+        let empty = RecordingMacEventAuthz::empty();
+        let empty_subscriber = EventSubscriber::new()
+            .unwrap()
+            .with_authz(empty.clone())
+            .with_caller(Subject::new("did:web:member"));
+        expect_confidential(&empty_subscriber, "worker", &ed, &pq).await;
+        assert!(empty_subscriber
+            .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
+            .await
+            .unwrap_err()
+            .contains("join/decrypt denied by event-plane MAC"));
+        assert_eq!(
+            empty.calls(),
+            vec![(MoqEventAction::JoinDecrypt, "worker".to_owned())]
+        );
     }
 
     fn member(recipient: &RecipientKeypair, did: &str, blind: u8) -> GroupMembership {
@@ -2189,16 +2400,16 @@ mod tests {
         assert!(error.contains("already bound to tenant 'tenant-a'"));
     }
 
-    #[test]
-    fn rekey_policy_and_authz_are_fail_closed() {
+    #[tokio::test]
+    async fn rekey_policy_and_authz_are_fail_closed() {
         assert!(RekeyPolicy::Scheduled {
             interval: Duration::from_secs(100_000),
         }
         .validate()
         .is_err());
         let deny = DenyAllEventAuthz;
-        assert!(!deny.can_publish(&Subject::anonymous(), "worker"));
-        assert!(!deny.can_subscribe(&Subject::anonymous(), "worker"));
+        assert!(!deny.can_publish(&Subject::anonymous(), "worker").await);
+        assert!(!deny.can_subscribe(&Subject::anonymous(), "worker").await);
         assert!(EventPublisher::new_encrypted(
             signing_key(),
             EventPrivacy::Public,
@@ -2228,6 +2439,7 @@ mod tests {
         let subscriber = EventSubscriber::new().unwrap();
         assert!(!subscriber
             .authz
-            .can_subscribe(&Subject::anonymous(), &source));
+            .can_subscribe(&Subject::anonymous(), &source)
+            .await);
     }
 }

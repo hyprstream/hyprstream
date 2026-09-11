@@ -1036,6 +1036,13 @@ pub struct RefreshTokenEntry {
     /// keeps the generic OAuth 2.1 rotation path unchanged.
     #[serde(default)]
     pub ucan_grant: Option<UcanGrantRefresh>,
+    /// OIDC session ID (`sid`) of the interactive session this refresh token
+    /// belongs to. The same session spans every rotation (distinct credential
+    /// IDs, one stable sid — v16 §3.3); the refresh path checks it against
+    /// the session authority before consuming the single-use token, so a
+    /// revoked session cannot refresh. `None` only on pre-session records.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Re-evaluation context persisted alongside a UCAN-grant refresh token so the
@@ -1218,7 +1225,6 @@ pub struct OAuthState {
     /// When present, JWKS serves all slots and issuance uses the active key.
     pub signing_key_store: Option<Arc<crate::auth::SigningKeyStore>>,
     /// Shared JWT ID blocklist for access token revocation (shared with PolicyService).
-    pub jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
     /// ES256 (P-256) signing key rotation store for JWKS and DPoP/atproto interop.
     pub es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 signing key rotation store for PQ-hybrid JWT issuance.
@@ -1384,7 +1390,6 @@ impl OAuthState {
             jwt_key_nbf: chrono::Utc::now().timestamp(),
             jwt_key_exp: chrono::Utc::now().timestamp() + 14 * 86400,
             signing_key_store: None,
-            jti_blocklist: None,
             es256_key_store: None,
             ml_dsa_key_store: None,
             audit_sink: None,
@@ -1532,19 +1537,6 @@ impl OAuthState {
     pub fn with_iroh_transport(mut self, node_id: [u8; 32], relays: Vec<String>) -> Self {
         self.iroh_node_id = Some(node_id);
         self.iroh_relays = relays;
-        self
-    }
-
-    /// Attach the shared JWT ID blocklist (shared with PolicyService).
-    ///
-    /// When set, `POST /oauth/revoke` on access tokens writes the JTI into
-    /// this blocklist so the PolicyService RPC enforcement path also rejects
-    /// revoked tokens — closing the gap between HTTP revocation and RPC auth.
-    pub fn with_jti_blocklist(
-        mut self,
-        bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
-    ) -> Self {
-        self.jti_blocklist = Some(bl);
         self
     }
 

@@ -46,9 +46,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock, Weak,
+};
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, ensure};
 use bytes::Bytes;
 use moq_net::{BroadcastProducer, Group, OriginConsumer, OriginProducer, Track, TrackProducer};
 use parking_lot::{Mutex, RwLock};
@@ -67,6 +70,24 @@ use crate::streaming::{StreamContext, StreamPayloadData, StreamVerifier};
 static GLOBAL_MOQ_ORIGIN: OnceLock<MoqStreamOrigin> = OnceLock::new();
 /// The UDS socket path serving the moq plane (set by `serve_moq_uds_background`).
 static GLOBAL_MOQ_UDS_PATH: OnceLock<PathBuf> = OnceLock::new();
+/// Accepted-state-bound proof used for native Iroh `moql` client admission.
+/// Installed by the daemon's checkpointed service configuration; absent in
+/// browser, local, and test profiles.
+static GLOBAL_MOQ_ADMISSION_PROOF: OnceLock<crate::transport::moql_admission::MoqlAdmissionProof> =
+    OnceLock::new();
+
+/// Install this process's accepted-state-bound Iroh admission proof.
+pub fn init_global_moq_admission_proof(
+    proof: crate::transport::moql_admission::MoqlAdmissionProof,
+) -> bool {
+    GLOBAL_MOQ_ADMISSION_PROOF.set(proof).is_ok()
+}
+
+/// Borrow the process proof for other authenticated native MoQ planes.
+pub fn global_moq_admission_proof()
+-> Option<&'static crate::transport::moql_admission::MoqlAdmissionProof> {
+    GLOBAL_MOQ_ADMISSION_PROOF.get()
+}
 
 /// Register the process-global moq streaming origin.
 ///
@@ -112,6 +133,13 @@ pub struct NodeStreamReach {
 /// [`ProducerReachConfig::reach_with_relay`].
 #[derive(Clone, Debug, Default)]
 pub struct ProducerReachConfig {
+    /// Resolver-verified accepted-state witness for this service's signed
+    /// StreamInfo. Native Iroh subscribers require it for mutual admission.
+    pub moql_server_identity: Option<crate::stream_info::MoqlServerIdentity>,
+    /// Resolver-verified accepted-state witness for the configured relay.
+    /// This is deliberately separate from the producing service's witness:
+    /// carrier EndpointId pinning is not application identity.
+    pub relay_moql_server_identity: Option<crate::stream_info::MoqlServerIdentity>,
     /// The node's own iroh `EndpointId` (Ed25519 public key, 32 bytes) when the
     /// iroh substrate is bound (#357). `None` → no iroh-direct reach advertised.
     pub iroh_node_id: Option<[u8; 32]>,
@@ -174,6 +202,7 @@ impl ProducerReachConfig {
                         .into_owned(),
                         relay_url: String::new(),
                     }),
+                    moql_server_identity: self.moql_server_identity.clone().unwrap_or_default(),
                 });
             }
 
@@ -187,6 +216,7 @@ impl ProducerReachConfig {
                         server_name: r.server_name.clone(),
                         cert_hashes: r.cert_hashes.iter().map(|h| h.to_vec()).collect(),
                     }),
+                    moql_server_identity: self.moql_server_identity.clone().unwrap_or_default(),
                 });
             }
         }
@@ -203,14 +233,22 @@ impl ProducerReachConfig {
         //   - `Only(r)`       → a per-stream relay, direct reaches omitted,
         //   - `NoRelay`        → no relay reach (direct-only for this stream).
         let relay = match relay_choice {
-            RelayChoice::ServerDefault => self.relay.clone(),
-            RelayChoice::Override(r) | RelayChoice::Only(r) => Some(r),
+            RelayChoice::ServerDefault => self
+                .relay
+                .clone()
+                .map(|relay| (relay, self.relay_moql_server_identity.clone())),
+            // An override describes an independent remote endpoint. It must not
+            // inherit the server-default relay's accepted-state witness.
+            RelayChoice::Override(target) | RelayChoice::Only(target) => {
+                Some((target.transport, Some(target.server_identity)))
+            }
             RelayChoice::NoRelay => None,
         };
-        if let Some(relay) = relay {
+        if let Some((relay, relay_identity)) = relay {
             reach.push(Destination {
                 role: Role::Relay,
                 transport: relay,
+                moql_server_identity: relay_identity.unwrap_or_default(),
             });
         }
 
@@ -228,17 +266,39 @@ pub enum RelayChoice {
     /// case. Falls back to direct-only when the server has no relay configured.
     #[default]
     ServerDefault,
-    /// Override the server-global relay with a per-stream relay (e.g. per-tenant
-    /// isolation). Direct reaches are still advertised alongside it.
-    Override(crate::stream_info::TransportConfig),
+    /// Override the server-global relay with a separately resolver-verified
+    /// per-stream target (e.g. per-tenant isolation). Direct reaches are still
+    /// advertised alongside it. A transport alone cannot authenticate an Iroh
+    /// relay and is deliberately not representable here.
+    Override(RelayTarget),
     /// Relay-ONLY (anonymized): use this per-stream relay and OMIT all direct
     /// reaches, so the client can only route through the relay (server authority).
-    Only(crate::stream_info::TransportConfig),
+    Only(RelayTarget),
     /// No relay reach for this stream — advertise the direct reaches only.
     ///
     /// Named `NoRelay` (not `None`) to avoid shadowing [`Option::None`] under a
     /// glob import of this enum's variants.
     NoRelay,
+}
+
+/// One independently resolver-verified relay selection for a stream.
+///
+/// The accepted-state server witness belongs to the relay, not the producer
+/// advertising the reach. Keeping them together prevents an Override/Only
+/// call site from emitting an Iroh relay that cannot confirm its remote peer.
+#[derive(Clone, Debug)]
+pub struct RelayTarget {
+    pub transport: crate::stream_info::TransportConfig,
+    pub server_identity: crate::stream_info::MoqlServerIdentity,
+}
+
+impl RelayTarget {
+    pub fn new(
+        transport: crate::stream_info::TransportConfig,
+        server_identity: crate::stream_info::MoqlServerIdentity,
+    ) -> Self {
+        Self { transport, server_identity }
+    }
 }
 
 /// Build the producer-chosen relay's wire-reach [`crate::stream_info::TransportConfig`]
@@ -298,9 +358,13 @@ pub fn relay_reach_from_decoded(
 ///
 /// Idempotent: a second call is a no-op (the first path wins).
 pub fn serve_moq_uds_background(origin: MoqStreamOrigin, path: PathBuf) {
-    use crate::transport::uds_session::{accept_uds, PLANE_MOQ};
+    use crate::transport::uds_session::{PLANE_MOQ, accept_uds};
     use moq_net::Server as MoqServer;
 
+    if native_iroh_required() {
+        tracing::error!("network-iroh-required refuses a local MoQ socket server");
+        return;
+    }
     // Remove stale socket from a previous run (best-effort).
     let _ = std::fs::remove_file(&path);
 
@@ -448,9 +512,15 @@ impl MoqStreamOriginBuilder {
                 prefix: self.prefix,
                 authorize_signer: self.authorize_signer,
                 broadcasts: Mutex::new(HashMap::new()),
+                next_broadcast_generation: AtomicU64::new(0),
             }),
         }
     }
+}
+
+struct BroadcastEntry {
+    _producer: BroadcastProducer,
+    generation: u64,
 }
 
 struct OriginInner {
@@ -469,7 +539,41 @@ struct OriginInner {
     /// Keyed by broadcast path (replace semantics) so a re-announced topic
     /// drops the old `BroadcastProducer` (unannouncing it) rather than
     /// accumulating unboundedly (#164).
-    broadcasts: Mutex<HashMap<String, BroadcastProducer>>,
+    broadcasts: Mutex<HashMap<String, BroadcastEntry>>,
+    next_broadcast_generation: AtomicU64,
+}
+
+/// Removes the publisher's broadcast entry only while that exact publication
+/// is still current. A weak origin avoids making the publisher/cleanup guard
+/// retain the origin forever, and the generation prevents an old publisher
+/// from removing a newer same-path replacement.
+struct BroadcastCleanup {
+    origin: Weak<OriginInner>,
+    path: String,
+    generation: u64,
+}
+
+impl Drop for BroadcastCleanup {
+    fn drop(&mut self) {
+        let Some(origin) = self.origin.upgrade() else {
+            return;
+        };
+        let removed = {
+            let mut broadcasts = origin.broadcasts.lock();
+            let remove = broadcasts
+                .get(&self.path)
+                .is_some_and(|entry| entry.generation == self.generation);
+            if remove {
+                broadcasts.remove(&self.path)
+            } else {
+                None
+            }
+        };
+        // Drop the BroadcastProducer after releasing the origin mutex. Its
+        // close/unannounce path can notify consumers and must not re-enter the
+        // origin map while the lock is held.
+        drop(removed);
+    }
 }
 
 impl MoqStreamOrigin {
@@ -565,11 +669,25 @@ impl MoqStreamOrigin {
                 .ok_or_else(|| anyhow!("create_broadcast denied for {path}"))?;
             let track = broadcast.create_track(Track::new(STREAM_TRACK))?;
 
+            let generation = self
+                .inner
+                .next_broadcast_generation
+                .fetch_add(1, Ordering::Relaxed);
+
             // Retain the broadcast producer so it stays announced for the
             // publisher's lifetime (dropping it would unannounce the broadcast).
             // Replace-semantics: inserting the same path twice drops the old
             // BroadcastProducer rather than accumulating indefinitely (#164).
-            self.inner.broadcasts.lock().insert(path, broadcast);
+            let replaced = self.inner.broadcasts.lock().insert(
+                path.clone(),
+                BroadcastEntry {
+                    _producer: broadcast,
+                    generation,
+                },
+            );
+            // Replacement closes the old broadcast; keep that potentially
+            // notifying drop outside the origin mutex.
+            drop(replaced);
 
             Ok(MoqStreamPublisher {
                 hmac_state: StreamHmacState::new(*ctx.mac_key(), ctx.topic().to_owned()),
@@ -585,6 +703,11 @@ impl MoqStreamOrigin {
                 cancel_token: ctx.cancel_token().clone(),
                 terminated: false,
                 topic: ctx.topic().to_owned(),
+                _broadcast_cleanup: BroadcastCleanup {
+                    origin: Arc::downgrade(&self.inner),
+                    path,
+                    generation,
+                },
             })
         })
     }
@@ -621,9 +744,27 @@ pub struct MoqStreamPublisher {
     cancel_token: CancellationToken,
     terminated: bool,
     topic: String,
+    _broadcast_cleanup: BroadcastCleanup,
 }
 
 impl MoqStreamPublisher {
+    /// Wait until a subscriber has attached before publishing a short lived
+    /// response. The demand is observable on the producer track, so callers
+    /// can avoid finishing before a late subscriber has a chance to join.
+    pub async fn wait_for_consumer(&self) -> Result<()> {
+        if self.cancel_token.is_cancelled() {
+            anyhow::bail!("stream cancelled before consumer demand");
+        }
+        tokio::select! {
+            _ = self.cancel_token.cancelled() => {
+                anyhow::bail!("stream cancelled before consumer demand");
+            }
+            result = self.track.used() => {
+                result.map_err(|error| anyhow!("stream consumer demand failed: {error}"))
+            }
+        }
+    }
+
     /// Publish an opaque, authenticated control Object under the current epoch,
     /// then atomically advance the producer to the next epoch. The consumer
     /// performs the same verify-before-advance transition from the wire Object.
@@ -660,6 +801,7 @@ impl MoqStreamPublisher {
     /// Publish an error payload (terminal).
     pub async fn publish_error(&mut self, message: &str) -> Result<()> {
         self.write_block(&[StreamPayloadData::Error(message.to_owned())])?;
+        self.track.finish()?;
         self.terminated = true;
         Ok(())
     }
@@ -672,6 +814,7 @@ impl MoqStreamPublisher {
     /// Complete the stream without consuming `self`.
     pub async fn complete_ref(&mut self, metadata: &[u8]) -> Result<()> {
         self.write_block(&[StreamPayloadData::Complete(metadata.to_vec())])?;
+        self.track.finish()?;
         self.terminated = true;
         Ok(())
     }
@@ -945,7 +1088,8 @@ impl MoqStreamHandle {
         }
     }
 
-    /// Construct a handle that subscribes over the **network** (#274).
+    /// Construct a handle that subscribes over the **network** (#274), retaining
+    /// the resolver-authenticated remote server witness for every Iroh dial.
     ///
     /// Resolves the signed `StreamInfo`'s `reach` list and dials the first
     /// dialable network reach via [`crate::dial::dial_stream`] over
@@ -987,6 +1131,29 @@ impl MoqStreamHandle {
         mac_key: [u8; 32],
         enc_key: [u8; 32],
         topic: String,
+        server_identity: crate::stream_info::MoqlServerIdentity,
+    ) -> Self {
+        Self::networked_with_server_identity(
+            reach,
+            qos,
+            broadcast_path,
+            mac_key,
+            enc_key,
+            topic,
+            server_identity,
+        )
+    }
+
+    /// Native constructor that retains the server witness authenticated by the
+    /// streaming RPC response for the Iroh admission resolver.
+    pub fn networked_with_server_identity(
+        reach: Vec<crate::stream_info::Destination>,
+        qos: &crate::stream_info::StreamOpt,
+        broadcast_path: String,
+        mac_key: [u8; 32],
+        enc_key: [u8; 32],
+        topic: String,
+        server_identity: crate::stream_info::MoqlServerIdentity,
     ) -> Self {
         // QoS-aware topology selection over the SERVICE-advertised reach (server
         // authority preserved: stable reorder, never an invented/forced reach).
@@ -999,7 +1166,7 @@ impl MoqStreamHandle {
         // local moq UDS plane when the StreamInfo carries no dialable reach —
         // never the other way around (see method docs; #275).
         let has_dialable_reach = reach.iter().any(|d| reach_to_transport_config(d).is_some());
-        if has_dialable_reach {
+        if has_dialable_reach || native_iroh_required() {
             tokio::spawn(moq_stream_handle_task_networked(
                 reach,
                 broadcast_path.clone(),
@@ -1007,6 +1174,7 @@ impl MoqStreamHandle {
                 enc_key,
                 topic,
                 None,
+                server_identity,
                 tx,
                 cancel.clone(),
             ));
@@ -1041,14 +1209,16 @@ impl MoqStreamHandle {
         }
     }
 
-    /// Construct an identified-profile network consumer. A standard relay sees
-    /// ordinary opaque Objects; this receive loop consumes authenticated epoch
-    /// controls and delivers application payloads only.
+    /// Construct an identified-profile network consumer with its authenticated
+    /// remote server witness. A standard relay sees ordinary opaque Objects;
+    /// this receive loop consumes authenticated epoch controls and delivers
+    /// application payloads only.
     pub fn networked_identified(
         reach: Vec<crate::stream_info::Destination>,
         qos: &crate::stream_info::StreamOpt,
         broadcast_path: String,
         ratchet: crate::stream_epoch::StreamEpochRatchet,
+        server_identity: crate::stream_info::MoqlServerIdentity,
     ) -> Self {
         let reach = select_reach(&reach, qos);
         let keys = ratchet.current_keys();
@@ -1059,7 +1229,7 @@ impl MoqStreamHandle {
         let (tx, rx) =
             tokio::sync::mpsc::channel::<anyhow::Result<crate::streaming::StreamPayload>>(64);
         let has_dialable_reach = reach.iter().any(|d| reach_to_transport_config(d).is_some());
-        if has_dialable_reach {
+        if has_dialable_reach || native_iroh_required() {
             tokio::spawn(moq_stream_handle_task_networked(
                 reach,
                 broadcast_path.clone(),
@@ -1067,6 +1237,7 @@ impl MoqStreamHandle {
                 enc_key,
                 topic,
                 Some(ratchet),
+                server_identity,
                 tx,
                 cancel.clone(),
             ));
@@ -1149,9 +1320,13 @@ async fn moq_stream_handle_task(
     cancel: tokio_util::sync::CancellationToken,
 ) {
     use crate::streaming::StreamVerifier;
-    use crate::transport::uds_session::{connect_uds, PLANE_MOQ};
+    use crate::transport::uds_session::{PLANE_MOQ, connect_uds};
     use moq_net::{Client as MoqClient, Origin, Track};
 
+    if native_iroh_required() {
+        let _ = tx.send(Err(anyhow!("network-iroh-required refuses a local MoQ socket client"))).await;
+        return;
+    }
     let session = match connect_uds(&uds_path, PLANE_MOQ).await {
         Ok(s) => s,
         Err(e) => {
@@ -1399,12 +1574,25 @@ pub struct MoqReachConnection {
     _session: moq_net::Session,
 }
 
+/// Monotonic process transport policy installed by native deployment bootstrap.
+static NATIVE_IROH_REQUIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Require native Iroh; later compatibility callers cannot reopen fallbacks.
+pub fn require_native_iroh() {
+    NATIVE_IROH_REQUIRED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub fn native_iroh_required() -> bool {
+    NATIVE_IROH_REQUIRED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Resolve a producer's reach into a live moq subscriber connection (#356).
 ///
 /// This is the **single** reach→connection resolver shared by every networked
 /// subscriber (the inference [`MoqStreamHandle::networked`] task and the CLI
 /// model-load / `notify subscribe` consumers). It enforces one transport policy
-/// in one place:
+/// in one place. A required native process accepts only Iroh and never takes
+/// the compatibility QUIC/UDS alternatives below:
 ///
 ///   1. **Networked first** — dial the first dialable `Destination` in `reach`
 ///      (the producer's wire-advertised QUIC/`/moq` endpoint) via
@@ -1425,31 +1613,108 @@ pub struct MoqReachConnection {
 pub async fn connect_moq_reach(
     reach: &[crate::stream_info::Destination],
 ) -> Result<MoqReachConnection> {
-    use crate::transport::uds_session::{connect_uds, PLANE_MOQ};
+    connect_moq_reach_with_server_identity(
+        reach,
+        &crate::stream_info::MoqlServerIdentity::default(),
+    )
+    .await
+}
+
+/// Resolve a stream reach with the server accepted-state witness authenticated
+/// by the enclosing streaming RPC response. Iroh is fail-closed without it.
+pub async fn connect_moq_reach_with_server_identity(
+    reach: &[crate::stream_info::Destination],
+    server_identity: &crate::stream_info::MoqlServerIdentity,
+) -> Result<MoqReachConnection> {
+    connect_moq_reach_for_profile(reach, server_identity, native_iroh_required()).await
+}
+
+/// Explicit policy seam. Required mode admits only Iroh destinations.
+pub async fn connect_moq_reach_for_profile(
+    reach: &[crate::stream_info::Destination],
+    server_identity: &crate::stream_info::MoqlServerIdentity,
+    iroh_required: bool,
+) -> Result<MoqReachConnection> {
+    use crate::transport::uds_session::{PLANE_MOQ, connect_uds};
     use moq_net::{Client as MoqClient, Origin};
 
+    let iroh_required = iroh_required || native_iroh_required();
     let client_origin = Origin::random().produce();
     let consumer = client_origin.consume();
     let moq_client = MoqClient::new().with_consume(client_origin);
 
     // 1. Networked reach (source of truth): dial the first reach we can resolve.
     let mut last_err: Option<String> = None;
+    let mut had_dialable_network_reach = false;
     for dest in reach {
         let Some(cfg) = reach_to_transport_config(dest) else {
             continue;
         };
-        match crate::dial::dial_stream(&cfg).await {
+        if iroh_required && !matches!(cfg.endpoint, crate::transport::EndpointType::Iroh { .. }) {
+            continue;
+        }
+        had_dialable_network_reach = true;
+        let dial = match (&cfg.endpoint, global_moq_admission_proof()) {
+            (crate::transport::EndpointType::Iroh { .. }, Some(proof)) => {
+                // A relay is an independently operated Iroh server. It may
+                // never borrow the producer witness attached to the enclosing
+                // StreamInfo; only a direct destination retains that narrowly
+                // scoped legacy fallback. QUIC authenticates its own pinned
+                // transport path and does not require a MoQL witness.
+                let expected_server = match destination_server_identity(dest, server_identity) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        last_err = Some(error.to_string());
+                        continue;
+                    }
+                };
+                match expected_server {
+                    None => Err(anyhow!(
+                        "iroh moql reach lacks a live resolver-verified server witness"
+                    )),
+                    Some(expected_server) => {
+                    // The process-global proof is this client's local accepted
+                    // identity. The signed StreamInfo supplies the *remote*
+                    // server witness for this particular dial; never reuse the
+                    // local announcement's witness as the expected server.
+                    let mut proof = proof.clone();
+                    proof.expected_server = expected_server.clone();
+                    crate::dial::dial_stream_authenticated(&cfg, &proof).await
+                    }
+                }
+            }
+            (crate::transport::EndpointType::Iroh { .. }, None) => Err(anyhow::anyhow!(
+                "iroh moql reach requires an accepted-state admission proof"
+            )),
+            _ => crate::dial::dial_stream(&cfg).await,
+        };
+        match dial {
             Ok(stream_session) => match stream_session.connect_moq(&moq_client).await {
                 Ok(session) => {
                     return Ok(MoqReachConnection {
                         consumer,
                         _session: session,
-                    })
+                    });
                 }
                 Err(e) => last_err = Some(format!("moq handshake: {e}")),
             },
             Err(e) => last_err = Some(e.to_string()),
         }
+    }
+
+    // A producer-advertised network endpoint is authoritative. In particular,
+    // an authenticated Iroh rejection must not silently cross into this
+    // process's local plane: that could subscribe to an unrelated producer.
+    if iroh_required && !had_dialable_network_reach {
+        return Err(anyhow!("network-iroh-required: no dialable Iroh stream reach; refusing QUIC/local fallback"));
+    }
+    if had_dialable_network_reach {
+        return Err(anyhow!(
+            "all dialable network reaches failed; refusing local moq UDS fallback{}",
+            last_err
+                .map(|e| format!(" (last dial error: {e})"))
+                .unwrap_or_default()
+        ));
     }
 
     // 2. Local UDS fallback (same-host fast path, resolved from LOCAL config).
@@ -1470,8 +1735,36 @@ pub async fn connect_moq_reach(
     // 3. Fail closed.
     Err(anyhow!(
         "no dialable reach in StreamInfo and no local moq UDS plane — cannot subscribe to broadcast{}",
-        last_err.map(|e| format!(" (last dial error: {e})")).unwrap_or_default()
+        last_err
+            .map(|e| format!(" (last dial error: {e})"))
+            .unwrap_or_default()
     ))
+}
+
+/// Select the server accepted-state witness for exactly one destination.
+/// Direct legacy entries may use the authenticated enclosing producer witness;
+/// relays must carry their own current witness because their carrier endpoint
+/// is not the producer's application identity.
+fn destination_server_identity<'a>(
+    destination: &'a crate::stream_info::Destination,
+    enclosing: &'a crate::stream_info::MoqlServerIdentity,
+) -> Result<Option<&'a crate::stream_info::MoqlServerIdentity>> {
+    if destination_identity_is_live(&destination.moql_server_identity) {
+        return Ok(Some(&destination.moql_server_identity));
+    }
+    if destination.role == crate::stream_info::Role::Relay {
+        anyhow::bail!("relay moql reach lacks a live resolver-verified relay witness");
+    }
+    Ok(destination_identity_is_live(enclosing).then_some(enclosing))
+}
+
+fn destination_identity_is_live(identity: &crate::stream_info::MoqlServerIdentity) -> bool {
+    !identity.did.is_empty()
+        && identity.epoch != 0
+        && identity.head_digest.len() == 64
+        && identity.ed25519.len() == 32
+        && !identity.ml_dsa65.is_empty()
+        && identity.expires_at_unix_ms > crate::envelope::current_timestamp()
 }
 
 // ============================================================================
@@ -1632,11 +1925,20 @@ fn assert_relay_path_pinned(cfg: &crate::transport::TransportConfig) -> Result<(
 pub fn serve_origin_to_relay_background(
     producer: OriginProducer,
     relay: crate::stream_info::TransportConfig,
+    admission_proof: Option<crate::transport::moql_admission::MoqlAdmissionProof>,
+    relay_server_identity: Option<crate::stream_info::MoqlServerIdentity>,
 ) {
     tokio::spawn(async move {
         let mut failures: u32 = 0;
         loop {
-            match run_relay_announce_link(&producer, &relay).await {
+            match run_relay_announce_link(
+                &producer,
+                &relay,
+                admission_proof.as_ref(),
+                relay_server_identity.as_ref(),
+            )
+            .await
+            {
                 // A link was established and the session closed; reset the backoff.
                 Ok(()) => failures = 0,
                 Err(e) => {
@@ -1685,6 +1987,8 @@ pub fn serve_origin_to_relay_background(
 pub async fn run_relay_announce_link(
     producer: &OriginProducer,
     relay: &crate::stream_info::TransportConfig,
+    admission_proof: Option<&crate::transport::moql_admission::MoqlAdmissionProof>,
+    relay_server_identity: Option<&crate::stream_info::MoqlServerIdentity>,
 ) -> Result<()> {
     use moq_net::Client as MoqClient;
 
@@ -1693,9 +1997,14 @@ pub async fn run_relay_announce_link(
     let dest = crate::stream_info::Destination {
         role: crate::stream_info::Role::Relay,
         transport: relay.clone(),
+        moql_server_identity: relay_server_identity.cloned().unwrap_or_default(),
     };
     let cfg = reach_to_transport_config(&dest)
         .ok_or_else(|| anyhow!("relay reach is not a dialable network transport"))?;
+
+    if native_iroh_required() && !matches!(cfg.endpoint, crate::transport::EndpointType::Iroh { .. }) {
+        return Err(anyhow!("network-iroh-required rejects non-Iroh stream relay"));
+    }
 
     // #504 item 3 — relay-capability gate (fail-closed): do NOT announce this
     // node's origin (broadcast track names / `broadcastPath`, traffic patterns)
@@ -1710,7 +2019,27 @@ pub async fn run_relay_announce_link(
         return Err(e);
     }
 
-    let stream_session = crate::dial::dial_stream(&cfg).await?;
+    let stream_session = match (&cfg.endpoint, admission_proof, relay_server_identity) {
+        (crate::transport::EndpointType::Iroh { .. }, Some(proof), Some(expected_server))
+            if destination_identity_is_live(expected_server) =>
+        {
+            let mut proof = proof.clone();
+            // A relay is a distinct remote server. Confirm it with its own
+            // resolver-verified accepted state, never the producer witness.
+            proof.expected_server = expected_server.clone();
+            crate::dial::dial_stream_authenticated(&cfg, &proof).await?
+        }
+        (crate::transport::EndpointType::Iroh { .. }, Some(_), Some(_)) => anyhow::bail!(
+            "iroh moql relay lacks a live resolver-verified relay witness"
+        ),
+        (crate::transport::EndpointType::Iroh { .. }, Some(_), None) => anyhow::bail!(
+            "iroh moql relay requires a resolver-verified relay witness"
+        ),
+        (crate::transport::EndpointType::Iroh { .. }, None, _) => anyhow::bail!(
+            "iroh moql relay requires an accepted-state admission proof"
+        ),
+        _ => crate::dial::dial_stream(&cfg).await?,
+    };
     // `with_origin` makes the link bidirectional: this node's broadcasts are
     // announced UP to the relay; the relay re-serves them to its subscribers.
     let moq_client = MoqClient::new().with_origin(producer.clone());
@@ -1735,6 +2064,7 @@ async fn moq_stream_handle_task_networked(
     enc_key: [u8; 32],
     topic: String,
     epoch_ratchet: Option<crate::stream_epoch::StreamEpochRatchet>,
+    server_identity: crate::stream_info::MoqlServerIdentity,
     tx: tokio::sync::mpsc::Sender<anyhow::Result<crate::streaming::StreamPayload>>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -1743,7 +2073,7 @@ async fn moq_stream_handle_task_networked(
 
     // Resolve the producer's reach into a live moq connection via the single
     // shared resolver (networked-first, local-UDS fallback, fail-closed; #356).
-    let conn = match connect_moq_reach(&reach).await {
+    let conn = match connect_moq_reach_with_server_identity(&reach, &server_identity).await {
         Ok(c) => c,
         Err(e) => {
             let _ = tx
@@ -1944,10 +2274,10 @@ fn seal_payload(
     nonce: Option<[u8; 12]>,
     payload: &StreamPayloadData,
 ) -> Result<StreamPayloadData> {
-    use crate::crypto::event_crypto::{encrypt_event, encrypt_event_with_nonce, EventPrivacy};
+    use crate::crypto::event_crypto::{EventPrivacy, encrypt_event, encrypt_event_with_nonce};
     use crate::stream_consumer::{
-        stream_aead_aad, SEALED_KIND_COMPLETE, SEALED_KIND_DATA, SEALED_KIND_EPOCH_COMMIT,
-        SEALED_KIND_ERROR,
+        SEALED_KIND_COMPLETE, SEALED_KIND_DATA, SEALED_KIND_EPOCH_COMMIT, SEALED_KIND_ERROR,
+        stream_aead_aad,
     };
 
     let control_bytes = match payload {
@@ -2043,6 +2373,224 @@ mod tests {
         assert!(matches!(&got[0], StreamPayload::Data(d) if d == b"hello"));
         assert!(matches!(&got[1], StreamPayload::Data(d) if d == b"world"));
         assert!(matches!(&got[2], StreamPayload::Complete(_)));
+        Ok(())
+    }
+
+    /// A terminal Complete must preserve groups after the publisher is dropped
+    /// while an attached consumer is still draining, then expose clean EOF.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moq_stream_complete_finishes_track_for_attached_consumer() -> Result<()> {
+        let origin = origin();
+        let (_client_secret, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
+        let topic = ctx.topic().to_owned();
+        let mac_key = *ctx.mac_key();
+        let enc_key = *ctx.enc_key().expect("DH ctx has enc_key");
+
+        let mut publisher = origin.publisher(&ctx)?;
+        let broadcast = origin
+            .consumer()
+            .announced_broadcast(origin.broadcast_path(&topic).as_str())
+            .await
+            .ok_or_else(|| anyhow!("consumer did not see completed broadcast"))?;
+        let mut track = broadcast.subscribe_track(&Track::new(STREAM_TRACK))?;
+        publisher.publish_data(b"late-data").await?;
+        publisher.complete_ref(b"{}").await?;
+        drop(publisher);
+
+        let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let mut group = track
+                .next_group()
+                .await?
+                .ok_or_else(|| anyhow!("completed stream omitted a group"))?;
+            let frame = group
+                .read_frame()
+                .await?
+                .ok_or_else(|| anyhow!("completed stream group omitted a frame"))?;
+            got.extend(verify_moq_frame(&mut verifier, &topic, &frame)?);
+        }
+        assert!(matches!(&got[0], StreamPayload::Data(data) if data == b"late-data"));
+        assert!(matches!(&got[1], StreamPayload::Complete(_)));
+        assert!(track.next_group().await?.is_none(), "completed track must EOF cleanly");
+        Ok(())
+    }
+
+    /// An application Error is also a clean terminal track event; dropping
+    /// the publisher must not turn the authenticated error into transport Drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moq_stream_error_finishes_track_for_attached_consumer() -> Result<()> {
+        let origin = origin();
+        let (_client_secret, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
+        let topic = ctx.topic().to_owned();
+        let mac_key = *ctx.mac_key();
+        let enc_key = *ctx.enc_key().expect("DH ctx has enc_key");
+
+        let mut publisher = origin.publisher(&ctx)?;
+        let broadcast = origin
+            .consumer()
+            .announced_broadcast(origin.broadcast_path(&topic).as_str())
+            .await
+            .ok_or_else(|| anyhow!("consumer did not see errored broadcast"))?;
+        let mut track = broadcast.subscribe_track(&Track::new(STREAM_TRACK))?;
+        publisher.publish_data(b"partial").await?;
+        publisher.publish_error("expected failure").await?;
+        drop(publisher);
+
+        let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let mut group = track
+                .next_group()
+                .await?
+                .ok_or_else(|| anyhow!("errored stream omitted a group"))?;
+            let frame = group
+                .read_frame()
+                .await?
+                .ok_or_else(|| anyhow!("errored stream group omitted a frame"))?;
+            got.extend(verify_moq_frame(&mut verifier, &topic, &frame)?);
+        }
+        assert!(matches!(&got[0], StreamPayload::Data(data) if data == b"partial"));
+        assert!(matches!(&got[1], StreamPayload::Error(message) if message == "expected failure"));
+        assert!(track.next_group().await?.is_none(), "errored track must EOF cleanly");
+        Ok(())
+    }
+
+    /// A publisher owns the origin's retained broadcast entry. Removing only
+    /// the matching generation bounds finished-stream retention while an
+    /// already attached consumer keeps its track long enough to drain the
+    /// authenticated terminal group.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moq_stream_finished_broadcast_cleanup_is_exact_and_retains_attached_track()
+    -> Result<()> {
+        let origin = origin();
+
+        let (_complete_secret, complete_pub) = crate::crypto::generate_ephemeral_keypair();
+        let complete_ctx = StreamContext::from_third_party_interop_dh(&complete_pub.to_bytes())?;
+        let complete_topic = complete_ctx.topic().to_owned();
+        let complete_mac_key = *complete_ctx.mac_key();
+        let complete_enc_key = *complete_ctx.enc_key().expect("DH ctx has enc_key");
+        let mut complete_publisher = origin.publisher(&complete_ctx)?;
+        let complete_broadcast = origin
+            .consumer()
+            .announced_broadcast(origin.broadcast_path(&complete_topic).as_str())
+            .await
+            .ok_or_else(|| anyhow!("complete broadcast was not announced"))?;
+        let mut complete_track = complete_broadcast.subscribe_track(&Track::new(STREAM_TRACK))?;
+        complete_publisher
+            .publish_data(b"retained-complete")
+            .await?;
+        complete_publisher.complete_ref(b"{}").await?;
+        drop(complete_publisher);
+        assert_eq!(origin.inner.broadcasts.lock().len(), 0);
+
+        let mut complete_verifier = StreamVerifier::new(complete_mac_key, complete_topic.clone())
+            .with_enc_key(complete_enc_key);
+        let mut complete_payloads = Vec::new();
+        for _ in 0..2 {
+            let mut group = complete_track
+                .next_group()
+                .await?
+                .ok_or_else(|| anyhow!("complete group was not retained for attached consumer"))?;
+            let frame = group
+                .read_frame()
+                .await?
+                .ok_or_else(|| anyhow!("complete frame was not retained"))?;
+            complete_payloads.extend(verify_moq_frame(
+                &mut complete_verifier,
+                &complete_topic,
+                &frame,
+            )?);
+        }
+        assert!(matches!(
+            &complete_payloads[0],
+            StreamPayload::Data(data) if data == b"retained-complete"
+        ));
+        assert!(matches!(&complete_payloads[1], StreamPayload::Complete(_)));
+        assert!(complete_track.next_group().await?.is_none());
+        drop(complete_track);
+
+        let (_error_secret, error_pub) = crate::crypto::generate_ephemeral_keypair();
+        let error_ctx = StreamContext::from_third_party_interop_dh(&error_pub.to_bytes())?;
+        let error_topic = error_ctx.topic().to_owned();
+        let error_mac_key = *error_ctx.mac_key();
+        let error_enc_key = *error_ctx.enc_key().expect("DH ctx has enc_key");
+        let mut error_publisher = origin.publisher(&error_ctx)?;
+        let error_broadcast = origin
+            .consumer()
+            .announced_broadcast(origin.broadcast_path(&error_topic).as_str())
+            .await
+            .ok_or_else(|| anyhow!("error broadcast was not announced"))?;
+        let mut error_track = error_broadcast.subscribe_track(&Track::new(STREAM_TRACK))?;
+        error_publisher.publish_data(b"retained-error").await?;
+        error_publisher.publish_error("retained failure").await?;
+        drop(error_publisher);
+        assert_eq!(origin.inner.broadcasts.lock().len(), 0);
+
+        let mut error_verifier =
+            StreamVerifier::new(error_mac_key, error_topic.clone()).with_enc_key(error_enc_key);
+        let mut error_payloads = Vec::new();
+        for _ in 0..2 {
+            let mut group = error_track
+                .next_group()
+                .await?
+                .ok_or_else(|| anyhow!("error group was not retained for attached consumer"))?;
+            let frame = group
+                .read_frame()
+                .await?
+                .ok_or_else(|| anyhow!("error frame was not retained"))?;
+            error_payloads.extend(verify_moq_frame(&mut error_verifier, &error_topic, &frame)?);
+        }
+        assert!(matches!(
+            &error_payloads[0],
+            StreamPayload::Data(data) if data == b"retained-error"
+        ));
+        assert!(matches!(
+            &error_payloads[1],
+            StreamPayload::Error(message) if message == "retained failure"
+        ));
+        assert!(error_track.next_group().await?.is_none());
+        drop(error_track);
+
+        // A completed stream without a consumer also releases its origin entry.
+        let (_empty_secret, empty_pub) = crate::crypto::generate_ephemeral_keypair();
+        let empty_ctx = StreamContext::from_third_party_interop_dh(&empty_pub.to_bytes())?;
+        let mut empty_publisher = origin.publisher(&empty_ctx)?;
+        empty_publisher.complete_ref(b"{}").await?;
+        drop(empty_publisher);
+        assert_eq!(origin.inner.broadcasts.lock().len(), 0);
+
+        // The old publisher's cleanup must not remove a newer same-path entry.
+        let (_replacement_secret, replacement_pub) = crate::crypto::generate_ephemeral_keypair();
+        let replacement_ctx =
+            StreamContext::from_third_party_interop_dh(&replacement_pub.to_bytes())?;
+        let old_publisher = origin.publisher(&replacement_ctx)?;
+        let mut new_publisher = origin.publisher(&replacement_ctx)?;
+        assert_eq!(origin.inner.broadcasts.lock().len(), 1);
+        drop(old_publisher);
+        assert_eq!(origin.inner.broadcasts.lock().len(), 1);
+        new_publisher.complete_ref(b"{}").await?;
+        drop(new_publisher);
+        assert_eq!(origin.inner.broadcasts.lock().len(), 0);
+        Ok(())
+    }
+
+    /// Demand wait must release promptly when the stream is cancelled before
+    /// any consumer attaches; this covers the no-subscriber continuation path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moq_stream_consumer_wait_observes_cancellation() -> Result<()> {
+        let origin = origin();
+        let (_client_secret, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
+        let publisher = origin.publisher(&ctx)?;
+        ctx.cancel_token().cancel();
+        let error = publisher
+            .wait_for_consumer()
+            .await
+            .expect_err("cancelled stream must not wait for a consumer");
+        assert!(error.to_string().contains("cancelled"));
         Ok(())
     }
 
@@ -2202,7 +2750,7 @@ mod tests {
     /// and traffic keys, and the relay-visible Group identity remains monotonic.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn identified_epoch_rekey_keeps_stock_moq_objects_opaque_and_immutable() -> Result<()> {
-        use crate::crypto::hybrid_kem::{generate_recipient, SuiteId};
+        use crate::crypto::hybrid_kem::{SuiteId, generate_recipient};
         use crate::crypto::key_exchange::client_identified_stream_epoch;
         use crate::stream_epoch::{
             IdentifiedStreamBinding, StreamAcceptedState, StreamCarrierProfile, StreamRouteRole,
@@ -2637,6 +3185,7 @@ mod tests {
                 server_name: "localhost".to_owned(),
                 cert_hashes: vec![vec![0u8; 32]],
             }),
+            moql_server_identity: Default::default(),
         };
         assert!(
             reach_to_transport_config(&reach).is_some(),
@@ -2664,6 +3213,7 @@ mod tests {
                 alpn: "moql".to_owned(),
                 relay_url: String::new(),
             }),
+            moql_server_identity: Default::default(),
         };
         assert_eq!(
             reach.role,
@@ -2710,11 +3260,48 @@ mod tests {
                 alpn: "moql".to_owned(),
                 relay_url: String::new(),
             }),
+            moql_server_identity: Default::default(),
         }];
         assert!(
             reach.iter().any(|d| reach_to_transport_config(d).is_some()),
             "an iroh reach must resolve to a dialable TransportConfig"
         );
+    }
+
+    /// A dialable advertised Iroh destination remains authoritative even when
+    /// its admission check rejects it. Falling through to this process's UDS
+    /// plane would turn that rejection into an unauthenticated local fallback.
+    #[tokio::test]
+    async fn rejected_iroh_reach_never_falls_back_to_local_uds() -> Result<()> {
+        use crate::stream_info::{Destination, IrohReach, Role, TransportConfig as ReachTransport};
+
+        let reach = [Destination {
+            role: Role::Direct,
+            transport: ReachTransport::Iroh(IrohReach {
+                node_id: [0xCDu8; 32],
+                alpn: "moql".to_owned(),
+                relay_url: String::new(),
+            }),
+            moql_server_identity: Default::default(),
+        }];
+
+        // No process-global admission proof means this fails before any network
+        // I/O. The resolver must return that network-path rejection, even if a
+        // test or daemon has installed a local UDS path in this process.
+        let err = match connect_moq_reach(&reach).await {
+            Ok(_) => panic!("Iroh reach without admission proof must be rejected"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("all dialable network reaches failed; refusing local moq UDS fallback"),
+            "dialable Iroh rejection must not fall back to local UDS: {message}"
+        );
+        assert!(
+            message.contains("iroh moql reach"),
+            "network admission rejection must be retained: {message}"
+        );
+        Ok(())
     }
 
     /// #275: the consumer dials the producer's networked reach even when this
@@ -2749,6 +3336,7 @@ mod tests {
                 server_name: "localhost".to_owned(),
                 cert_hashes: vec![[0xABu8; 32].to_vec()],
             }),
+            moql_server_identity: Default::default(),
         }];
 
         let qos = crate::stream_info::StreamOpt::default();
@@ -2759,6 +3347,7 @@ mod tests {
             [0u8; 32],
             [0u8; 32],
             "deadbeef".repeat(8),
+            Default::default(),
         );
 
         match tokio::time::timeout(std::time::Duration::from_secs(3), handle.recv_next()).await {
@@ -2811,6 +3400,7 @@ mod tests {
                 alpn: String::new(),
                 relay_url: String::new(),
             }),
+            moql_server_identity: Default::default(),
         }
     }
     fn relay_quic(addr: &str) -> Destination {
@@ -2821,7 +3411,118 @@ mod tests {
                 server_name: "relay".to_owned(),
                 cert_hashes: vec![vec![0u8; 32]],
             }),
+            moql_server_identity: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn required_stream_reach_rejects_empty_and_browser_only_without_dial() {
+        let identity = crate::stream_info::MoqlServerIdentity::default();
+        for reach in [vec![], vec![crate::stream_info::Destination {
+            role: crate::stream_info::Role::Direct,
+            transport: crate::stream_info::TransportConfig::Quic(crate::stream_info::QuicReach {
+                addr: "127.0.0.1:9".into(), server_name: "localhost".into(), cert_hashes: vec![],
+            }), moql_server_identity: Default::default(),
+        }]] {
+            let result = tokio::time::timeout(std::time::Duration::from_millis(200),
+                connect_moq_reach_for_profile(&reach, &identity, true)).await.unwrap();
+            assert!(result.err().unwrap().to_string().contains("no dialable Iroh stream reach"));
+        }
+    }
+
+    fn accepted_server_identity(did: &str, marker: u8) -> crate::stream_info::MoqlServerIdentity {
+        crate::stream_info::MoqlServerIdentity {
+            did: did.to_owned(),
+            epoch: 1,
+            head_digest: vec![marker; 64],
+            expires_at_unix_ms: crate::envelope::current_timestamp() + 60_000,
+            ed25519: [marker; 32],
+            ml_dsa65: vec![marker; 1952],
+        }
+    }
+
+    /// A relay is a separate server, even when it is advertised beside a
+    /// producer's direct reach. The wire destination must retain the relay's
+    /// resolver witness; substituting the producer witness here would confirm
+    /// the wrong remote peer during an authenticated Iroh dial.
+    #[test]
+    fn relay_destination_uses_its_own_accepted_state_witness() {
+        let producer = accepted_server_identity("did:at9p:producer", 0x11);
+        let relay = accepted_server_identity("did:at9p:relay", 0x22);
+        let relay_transport = ReachTransport::Iroh(IrohReach {
+            node_id: [0x33; 32],
+            alpn: "moql".to_owned(),
+            relay_url: String::new(),
+        });
+        let cfg = ProducerReachConfig {
+            moql_server_identity: Some(producer.clone()),
+            relay_moql_server_identity: Some(relay.clone()),
+            iroh_node_id: Some([0x44; 32]),
+            quic_reach: None,
+            relay: Some(relay_transport.clone()),
+        };
+
+        let reach = cfg.reach();
+        let direct = reach
+            .iter()
+            .find(|destination| destination.role == Role::Direct)
+            .expect("producer direct reach");
+        let relay_destination = reach
+            .iter()
+            .find(|destination| destination.role == Role::Relay)
+            .expect("relay reach");
+        assert_eq!(direct.moql_server_identity, producer);
+        assert_eq!(relay_destination.moql_server_identity, relay);
+        assert_ne!(
+            relay_destination.moql_server_identity, direct.moql_server_identity,
+            "the relay must never inherit the producer accepted-state witness"
+        );
+
+        let independent = cfg.reach_with_relay(RelayChoice::Override(RelayTarget::new(
+            relay_transport,
+            relay.clone(),
+        )));
+        let independent_relay = independent
+            .iter()
+            .find(|destination| destination.role == Role::Relay)
+            .expect("independent relay reach");
+        assert_eq!(independent_relay.moql_server_identity, relay);
+    }
+
+    /// A live enclosing producer witness authenticates only a direct legacy
+    /// Iroh destination. An independently operated Iroh relay with no own
+    /// witness is rejected before its authenticated carrier dial.
+    #[test]
+    fn relay_without_witness_cannot_borrow_live_producer_authority() {
+        let producer = accepted_server_identity("did:at9p:producer", 0x11);
+        let relay = Destination {
+            role: Role::Relay,
+            transport: ReachTransport::Iroh(IrohReach {
+                node_id: [0x22; 32],
+                alpn: "moql".to_owned(),
+                relay_url: String::new(),
+            }),
+            moql_server_identity: Default::default(),
+        };
+        let error = destination_server_identity(&relay, &producer)
+            .expect_err("relay without its own resolver witness must reject");
+        assert!(error.to_string().contains("relay witness"));
+
+        let direct = Destination {
+            role: Role::Direct,
+            transport: ReachTransport::Quic(QuicReach {
+                addr: "127.0.0.1:4434".to_owned(),
+                server_name: "producer".to_owned(),
+                cert_hashes: vec![vec![0u8; 32]],
+            }),
+            moql_server_identity: Default::default(),
+        };
+        assert_eq!(
+            destination_server_identity(&direct, &producer)
+                .expect("direct legacy fallback remains valid")
+                .expect("live producer witness"),
+            &producer,
+        );
     }
 
     // ── #504 item 3: configured relay target/path pin gate ──────────────────
@@ -2916,6 +3617,8 @@ mod tests {
         });
         // A server with BOTH a direct (iroh) reach and a server-global relay.
         let cfg = ProducerReachConfig {
+            moql_server_identity: None,
+            relay_moql_server_identity: None,
             iroh_node_id: Some([3u8; 32]),
             quic_reach: None,
             relay: Some(relay_x.clone()),
@@ -2940,7 +3643,10 @@ mod tests {
             server_name: "relay-anon".to_owned(),
             cert_hashes: vec![vec![9u8; 32]],
         });
-        let reach_x = cfg.reach_with_relay(RelayChoice::Only(relay_only.clone()));
+        let reach_x = cfg.reach_with_relay(RelayChoice::Only(RelayTarget::new(
+            relay_only.clone(),
+            accepted_server_identity("did:at9p:relay-anon", 0x23),
+        )));
         assert_eq!(
             reach_x.len(),
             1,
@@ -2979,11 +3685,16 @@ mod tests {
             cert_hashes: vec![vec![2u8; 32]],
         });
         let cfg = ProducerReachConfig {
+            moql_server_identity: None,
+            relay_moql_server_identity: None,
             iroh_node_id: Some([4u8; 32]),
             quic_reach: None,
             relay: Some(server_relay.clone()),
         };
-        let reach = cfg.reach_with_relay(RelayChoice::Override(tenant_relay.clone()));
+        let reach = cfg.reach_with_relay(RelayChoice::Override(RelayTarget::new(
+            tenant_relay.clone(),
+            accepted_server_identity("did:at9p:tenant-relay", 0x24),
+        )));
         assert_eq!(
             reach[0].role,
             Role::Direct,
@@ -3158,50 +3869,56 @@ mod tests {
 
         // Wrong key.
         let wrong = [0x99u8; 32];
-        assert!(crate::stream_consumer::open_sealed_payload(
-            &wrong,
-            topic,
-            epoch,
-            0,
-            0,
-            tag,
-            ct,
-            nonce,
-            key_commitment
-        )
-        .is_err());
+        assert!(
+            crate::stream_consumer::open_sealed_payload(
+                &wrong,
+                topic,
+                epoch,
+                0,
+                0,
+                tag,
+                ct,
+                nonce,
+                key_commitment
+            )
+            .is_err()
+        );
 
         // Wrong epoch (AAD mismatch) — anti-replay across epochs.
-        assert!(crate::stream_consumer::open_sealed_payload(
-            &enc_key,
-            topic,
-            2,
-            0,
-            0,
-            tag,
-            ct,
-            nonce,
-            key_commitment
-        )
-        .is_err());
+        assert!(
+            crate::stream_consumer::open_sealed_payload(
+                &enc_key,
+                topic,
+                2,
+                0,
+                0,
+                tag,
+                ct,
+                nonce,
+                key_commitment
+            )
+            .is_err()
+        );
 
         // Tampered ciphertext.
         let mut bad_ct = ct.clone();
         if let Some(b) = bad_ct.first_mut() {
             *b ^= 0xFF;
         }
-        assert!(crate::stream_consumer::open_sealed_payload(
-            &enc_key,
-            topic,
-            epoch,
-            0,
-            0,
-            tag,
-            &bad_ct,
-            nonce,
-            key_commitment
-        )
-        .is_err());
+        assert!(
+            crate::stream_consumer::open_sealed_payload(
+                &enc_key,
+                topic,
+                epoch,
+                0,
+                0,
+                tag,
+                &bad_ct,
+                nonce,
+                key_commitment
+            )
+            .is_err()
+        );
     }
 
     // ── #321 provenance over a published block ─────────────────────────────
@@ -3269,14 +3986,10 @@ mod tests {
         let empty = KeyedPqTrustStore::new();
         let none_enrolled = |_: &[u8; 32]| false;
         let mut v2 = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
-        assert!(verify_moq_frame_with_provenance(
-            &mut v2,
-            &topic,
-            &frames[0],
-            &empty,
-            &none_enrolled
-        )
-        .is_err());
+        assert!(
+            verify_moq_frame_with_provenance(&mut v2, &topic, &frames[0], &empty, &none_enrolled)
+                .is_err()
+        );
         Ok(())
     }
 }

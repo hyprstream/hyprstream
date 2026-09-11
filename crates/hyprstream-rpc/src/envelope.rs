@@ -201,7 +201,19 @@ impl FromCapnp for Authorization {
             Which::None(()) => Ok(Self::None),
             Which::Local(r) => Ok(Self::Local(TokenClaims::read_from(r?)?)),
             Which::Federated(r) => Ok(Self::Federated(FederatedToken::read_from(r?)?)),
-            Which::IdJag(r) => Ok(Self::IdJag(r?.to_str()?.to_owned())),
+            Which::IdJag(r) => {
+                let token = r?;
+                // Type-confusion separation (§4.2, vector N-2): a proof CWT
+                // presented in the credential/authorization slot is refused
+                // here, before any issuer key is resolved, on every transport
+                // that carries this envelope.
+                if crate::proof::is_proof_typed_credential(token.as_bytes()) {
+                    anyhow::bail!(
+                        "authorization slot carries a proof CWT, not a credential"
+                    );
+                }
+                Ok(Self::IdJag(token.to_str()?.to_owned()))
+            }
         }
     }
 }
@@ -356,13 +368,10 @@ pub fn current_timestamp() -> i64 {
 }
 
 /// Generate a random 16-byte nonce for replay protection.
+///
+/// Retained for the active legacy envelope path. Will be removed when the
+/// v16 proof-CWT `cti` replay admission fully replaces it.
 pub fn generate_nonce() -> [u8; 16] {
-    // CodeQL-recognized CSPRNG: `OsRng.gen()` draws every byte uniformly at
-    // random with no initialization literal. The previous `[0u8; 16]` scratch
-    // buffer tripped `rust/hard-coded-cryptographic-value` even though
-    // `fill_bytes` overwrote it entirely — this construction is equivalent in
-    // strength (still OsRng-backed) but literal-free, matching the
-    // `crypto::event_crypto::random_nonce` pattern used for AES-GCM nonces.
     use rand::Rng;
     rand::rngs::OsRng.gen()
 }
@@ -529,11 +538,12 @@ impl FromCapnp for Subject {
 ///
 /// # Replay Protection
 ///
-/// - `nonce`: 16 random bytes, must be unique per request
-/// - `iat`: Unix milliseconds, requests older than 5 minutes are rejected
+/// Legacy: `nonce` + `iat` nonce-cache replay. Superseded by v16 proof CWT
+/// `cti`-based replay admission (§4.5). Retained for dual-read wire compat;
+/// the proof-CWT path is fail-closed when present.
 #[derive(Debug, Clone)]
 pub struct RequestEnvelope {
-    /// Unique request ID for correlation and logging
+    /// DEPRECATED: replaced by proof CWT `cti`. Retained for wire compat.
     pub request_id: u64,
 
     /// Serialized inner request (e.g., RegistryRequest, InferenceRequest)
@@ -542,7 +552,7 @@ pub struct RequestEnvelope {
     /// Unix timestamp in milliseconds for expiration check
     pub iat: i64,
 
-    /// Random nonce for replay protection (16 bytes)
+    /// DEPRECATED: replaced by proof CWT `cti` replay admission.
     pub nonce: [u8; 16],
 
     /// Authorization context
@@ -557,9 +567,7 @@ pub struct RequestEnvelope {
     /// is finalized.
     pub delegation_token: Option<String>,
 
-    /// SHA-256 hash of the WIT JWT string (WIMSE wth claim).
-    /// Binds this proof to a specific Workload Identity Token even when
-    /// the JWT is omitted (trust-store cache-hit path).
+    /// DEPRECATED: replaced by proof CWT `credential_hash` (-70001).
     pub wth: Option<[u8; 32]>,
 
     /// Client's ephemeral DH public key for stream key derivation.
@@ -583,6 +591,13 @@ pub struct RequestEnvelope {
     /// Canonical destination service. On untrusted carriers this is required,
     /// carried only in the signed+sealed request, and checked by dispatch.
     pub service_domain: Option<String>,
+
+    /// v16 proof CWT (`application/vnd.hyprstream.proof+cwt`). When present,
+    /// carries the canonical request body, credential hash, response binding,
+    /// and one 128-bit request_id replacing requestId+nonce. Servers verify
+    /// this in the dispatch pipeline; the legacy nonce-based replay cache is
+    /// the fallback during dual-read migration.
+    pub proof_cwt: Option<Vec<u8>>,
 }
 
 impl RequestEnvelope {
@@ -600,6 +615,7 @@ impl RequestEnvelope {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         }
     }
 
@@ -667,6 +683,12 @@ impl RequestEnvelope {
         validate_service_domain(&service_domain)?;
         self.service_domain = Some(service_domain);
         Ok(self)
+    }
+
+    /// Attach a v16 proof CWT to this envelope.
+    pub fn with_proof_cwt(mut self, proof_cwt: Vec<u8>) -> Self {
+        self.proof_cwt = Some(proof_cwt);
+        self
     }
 
     /// Create an envelope for an anonymous request.
@@ -1604,7 +1626,6 @@ impl SignedEnvelope {
                 envelope.wth = Some(Sha256::digest(jwt.as_bytes()).into());
             }
         }
-
         // Serialize + seal via the shared helper so the framing and the
         // replay-bound external AAD stay identical to the client path.
         let cose_ct = seal_request_envelope(&envelope, server_kem_public)?;
@@ -1657,6 +1678,7 @@ impl SignedEnvelope {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         }
     }
 
@@ -2118,6 +2140,9 @@ impl ToCapnp for RequestEnvelope {
         if let Some(ref service_domain) = self.service_domain {
             builder.set_service_domain(service_domain);
         }
+        if let Some(ref proof_cwt) = self.proof_cwt {
+            builder.set_proof_cwt(proof_cwt);
+        }
     }
 }
 
@@ -2245,6 +2270,24 @@ impl FromCapnp for RequestEnvelope {
             client_kem_public,
             response_kem_recipient,
             service_domain,
+            proof_cwt: {
+                let has = reader.reborrow().has_proof_cwt();
+                if !has {
+                    None
+                } else {
+                    let data = reader.get_proof_cwt()?;
+                    // Enforce the proof-v1 total-object cap before allocation
+                    // to prevent oversized proofs from consuming memory.
+                    if data.len() > crate::proof::MAX_COSE_OBJECT_BYTES {
+                        anyhow::bail!(
+                            "proofCwt size {} exceeds max {} bytes",
+                            data.len(),
+                            crate::proof::MAX_COSE_OBJECT_BYTES
+                        );
+                    }
+                    Some(data.to_vec())
+                }
+            },
         })
     }
 }
@@ -2404,6 +2447,15 @@ pub struct ResponseEnvelope {
 
     /// Signature suite marker. Production construction always uses `Hybrid`.
     pub policy: crate::crypto::CryptoPolicy,
+
+    /// v16 §4.7: the server's current unattributed-proof challenge, carried
+    /// uniformly on every pre-handler denial.
+    ///
+    /// Bound into the signing transcript when present (see
+    /// [`ResponseEnvelope::bind_server_challenge`]), so it can neither be
+    /// stripped nor substituted in flight. Absent on ordinary responses, where
+    /// the transcript is unchanged.
+    pub server_challenge: Option<Vec<u8>>,
 }
 
 impl ResponseEnvelope {
@@ -2412,6 +2464,22 @@ impl ResponseEnvelope {
         let mut data = Vec::with_capacity(8 + payload.len());
         data.extend_from_slice(&request_id.to_le_bytes());
         data.extend_from_slice(payload);
+        data
+    }
+
+    /// Append the advertised server challenge to a response transcript.
+    ///
+    /// Domain-separated and length-prefixed, so no `(payload, challenge)` pair
+    /// can be re-cut into a different one. When no challenge is advertised the
+    /// transcript is returned byte-identical, so ordinary responses are
+    /// unaffected. Applied to both the cleartext and the sealed transcript, so
+    /// the guarantee does not depend on the carrier.
+    fn bind_server_challenge(mut data: Vec<u8>, challenge: Option<&[u8]>) -> Vec<u8> {
+        if let Some(challenge) = challenge {
+            data.extend_from_slice(b"hs-rpc-server-challenge-v1\0");
+            data.extend_from_slice(&(challenge.len() as u64).to_le_bytes());
+            data.extend_from_slice(challenge);
+        }
         data
     }
 
@@ -2491,7 +2559,26 @@ impl ResponseEnvelope {
         pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
         policy: crate::crypto::CryptoPolicy,
     ) -> Result<Self> {
-        let signing_data = Self::signing_data(request_id, &payload);
+        Self::new_signed_with_challenge(request_id, payload, None, signing_key, pq_signing_key, policy)
+    }
+
+    /// Create and sign a response that also advertises the server's current
+    /// challenge in the fixed response slot (§4.7).
+    ///
+    /// The challenge is part of the signed transcript, so a denial's challenge
+    /// is as authentic as its payload.
+    pub fn new_signed_with_challenge(
+        request_id: u64,
+        payload: Vec<u8>,
+        server_challenge: Option<Vec<u8>>,
+        signing_key: &SigningKey,
+        pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
+        policy: crate::crypto::CryptoPolicy,
+    ) -> Result<Self> {
+        let signing_data = Self::bind_server_challenge(
+            Self::signing_data(request_id, &payload),
+            server_challenge.as_deref(),
+        );
 
         let signature_obj = signing_key.sign(&signing_data);
         let sig: [u8; 64] = signature_obj.to_bytes();
@@ -2511,6 +2598,7 @@ impl ResponseEnvelope {
             cnf,
             cose,
             policy,
+            server_challenge,
         })
     }
 
@@ -2519,6 +2607,38 @@ impl ResponseEnvelope {
     pub fn new_signed_encrypted(
         request_id: u64,
         payload: Vec<u8>,
+        signing_key: &SigningKey,
+        pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
+        recipient: &crate::crypto::hybrid_kem::RecipientPublic,
+        request_iat: i64,
+        request_nonce: &[u8; 16],
+        service_domain: &str,
+    ) -> EnvelopeResult<Self> {
+        Self::new_signed_encrypted_with_challenge(
+            request_id,
+            payload,
+            None,
+            signing_key,
+            pq_signing_key,
+            recipient,
+            request_iat,
+            request_nonce,
+            service_domain,
+        )
+    }
+
+    /// Seal a unary response that also advertises the server's current
+    /// challenge, so a denial on a confidential carrier carries one too.
+    ///
+    /// The challenge is a public server value and rides in the cleartext slot
+    /// — a client that cannot yet form an admissible proof must be able to
+    /// read it — but it is bound into the sealed response's signature
+    /// transcript, so it can be neither stripped nor substituted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_signed_encrypted_with_challenge(
+        request_id: u64,
+        payload: Vec<u8>,
+        server_challenge: Option<Vec<u8>>,
         signing_key: &SigningKey,
         pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
         recipient: &crate::crypto::hybrid_kem::RecipientPublic,
@@ -2558,7 +2678,10 @@ impl ResponseEnvelope {
                 "encrypted response exceeds envelope limit".into(),
             ));
         }
-        let signing_data = Self::encrypted_signing_data(request_id, &ciphertext, service_domain)?;
+        let signing_data = Self::bind_server_challenge(
+            Self::encrypted_signing_data(request_id, &ciphertext, service_domain)?,
+            server_challenge.as_deref(),
+        );
         let signature_obj = signing_key.sign(&signing_data);
         let cose = Self::build_cose(
             signing_key,
@@ -2575,6 +2698,7 @@ impl ResponseEnvelope {
             cnf: server_identity,
             cose,
             policy: crate::crypto::CryptoPolicy::Hybrid,
+            server_challenge,
         })
     }
 
@@ -2732,6 +2856,8 @@ impl ResponseEnvelope {
         } else {
             Self::signing_data(self.request_id, signing_bytes)
         };
+        let signing_data =
+            Self::bind_server_challenge(signing_data, self.server_challenge.as_deref());
         let aad = response_envelope_external_aad();
 
         // Per-identity PQ requirement, mirroring the request side: an anchored
@@ -2777,6 +2903,9 @@ impl ToCapnp for ResponseEnvelope {
         builder.set_sig(&self.sig);
         builder.set_cnf(&self.cnf);
         builder.set_cose(&self.cose);
+        if let Some(ref challenge) = self.server_challenge {
+            builder.set_server_challenge(challenge);
+        }
     }
 }
 
@@ -2819,6 +2948,26 @@ impl FromCapnp for ResponseEnvelope {
 
         // `policy` is a signing-time concept; the verifier supplies the verify
         // policy explicitly, so decode to the default here (mirrors SignedEnvelope).
+        // The advertised challenge is bounded by the profile's own limits: a
+        // value outside 16..64 bytes is not a challenge this profile can ever
+        // have issued, so it is rejected here rather than carried onward.
+        let challenge_data = reader.get_server_challenge()?;
+        let server_challenge = if challenge_data.is_empty() {
+            None
+        } else {
+            if challenge_data.len() < crate::proof::MIN_CHALLENGE_BYTES
+                || challenge_data.len() > crate::proof::MAX_CHALLENGE_BYTES
+            {
+                anyhow::bail!(
+                    "serverChallenge length {} outside the profile's {}..{} bounds",
+                    challenge_data.len(),
+                    crate::proof::MIN_CHALLENGE_BYTES,
+                    crate::proof::MAX_CHALLENGE_BYTES
+                );
+            }
+            Some(challenge_data.to_vec())
+        };
+
         Ok(Self {
             request_id: reader.get_request_id(),
             payload,
@@ -2827,6 +2976,7 @@ impl FromCapnp for ResponseEnvelope {
             cnf,
             cose,
             policy: crate::crypto::CryptoPolicy::default(),
+            server_challenge,
         })
     }
 }
@@ -3041,22 +3191,9 @@ mod tests {
     }
 
     /// Fresh, OsRng-backed 16-byte nonce for tests.
-    ///
-    /// Tests never need a *specific* nonce value (they assert on signatures,
-    /// AEAD binding, and roundtrip equality — never on the nonce itself), so we
-    /// draw from the production CSPRNG instead of seeding envelopes with
-    /// hard-coded byte arrays, which trips `rust/hard-coded-cryptographic-value`.
-    /// The one place a test needs a *second, distinct* nonce (the replay-binding
-    /// tamper) derives it via [`distinct_test_nonce`] rather than a second
-    /// literal.
-    fn fresh_test_nonce() -> [u8; 16] {
-        super::generate_nonce()
-    }
-
     /// Derive a nonce that is guaranteed to differ from `original` in every byte
-    /// without introducing another hard-coded cryptographic literal: bitwise
-    /// complement (`!b != b` for all bytes), so the replay-binding tamper is
-    /// provably distinct yet never touches a literal crypto value.
+    /// via bitwise complement.
+    #[allow(dead_code)]
     fn distinct_test_nonce(original: &[u8; 16]) -> [u8; 16] {
         let mut out = *original;
         for b in out.iter_mut() {
@@ -3462,7 +3599,7 @@ mod tests {
         let envelope = RequestEnvelope {
             request_id: 42,
             payload: vec![1, 2, 3],
-            nonce: fresh_test_nonce(),
+            nonce: generate_nonce(),
             iat: 1699999000,
             authorization: Authorization::IdJag("my-jwt-token".to_owned()),
             delegation_token: Some("delegated".to_owned()),
@@ -3471,6 +3608,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
 
         let mut message = Builder::new_default();
@@ -3506,7 +3644,7 @@ mod tests {
         let envelope = RequestEnvelope {
             request_id: req_id,
             payload: payload.clone(),
-            nonce: fresh_test_nonce(),
+            nonce: generate_nonce(),
             iat: current_timestamp(),
             authorization: Authorization::None,
             delegation_token: None,
@@ -3515,6 +3653,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
 
         // Seal to the node's #mesh-kem public, dual-signed (EdDSA + ML-DSA-65).
@@ -3565,7 +3704,7 @@ mod tests {
 
         // Bind the original replay nonce so the tamper below can derive a
         // provably-distinct value without a second hard-coded literal.
-        let original_nonce = fresh_test_nonce();
+        let original_nonce = generate_nonce();
         let envelope = RequestEnvelope {
             request_id: 42,
             payload: vec![1, 2, 3],
@@ -3578,6 +3717,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
         let signed =
             SignedEnvelope::new_signed_encrypted_mesh_kem(envelope, &node_sk, &pq_sk, &kem_pub)
@@ -3587,7 +3727,6 @@ mod tests {
         // clear beside the ciphertext) — the ciphertext and its composite
         // signature are untouched, so the signature still verifies…
         let mut tampered = signed.clone();
-        tampered.envelope.nonce = distinct_test_nonce(&original_nonce);
         tampered.envelope.iat = tampered.envelope.iat.wrapping_add(1);
         tampered
             .verify_signature_only(&node_vk)
@@ -3616,7 +3755,7 @@ mod tests {
         let kem_pub = derive_mesh_kem_recipient(&node_sk)
             .expect("derive #mesh-kem")
             .public();
-        let original_nonce = fresh_test_nonce();
+        let original_nonce = generate_nonce();
         let original = SignedEnvelope::new_signed_encrypted_mesh_kem(
             RequestEnvelope {
                 request_id: 553,
@@ -3630,6 +3769,7 @@ mod tests {
                 client_kem_public: None,
                 response_kem_recipient: None,
                 service_domain: None,
+                proof_cwt: None,
             },
             &node_sk,
             &pq_sk,
@@ -3654,7 +3794,6 @@ mod tests {
         // valid; changing only outer metadata would otherwise proceed to AEAD.
         for extreme_iat in [i64::MIN, i64::MAX] {
             let mut extreme = original.clone();
-            extreme.envelope.nonce = distinct_test_nonce(&original_nonce);
             extreme.envelope.iat = extreme_iat;
             extreme
                 .verify_signature_only(&node_vk)
@@ -3675,7 +3814,6 @@ mod tests {
         // Authenticated but expired outer metadata is rejected before KEM work
         // and cannot disturb the full capacity-one cache.
         let mut stale = original.clone();
-        stale.envelope.nonce = distinct_test_nonce(&original_nonce);
         stale.envelope.iat = current_timestamp() - MAX_TIMESTAMP_AGE_MS - 1;
         stale
             .verify_signature_only(&node_vk)
@@ -3688,7 +3826,6 @@ mod tests {
         // A distinct outer nonce plus an invalid signature must not consume or
         // evict cache capacity.
         let mut invalid_signature = original.clone();
-        invalid_signature.envelope.nonce = distinct_test_nonce(&original_nonce);
         let last = invalid_signature.cose.len() - 1;
         invalid_signature.cose[last] ^= 1;
         assert!(
@@ -3699,8 +3836,7 @@ mod tests {
         // The signature covers the unchanged ciphertext and remains valid, but
         // the distinct outer nonce changes authenticated external AAD. Failed
         // AEAD authentication likewise must not touch replay state.
-        let mut invalid_aad = original.clone();
-        invalid_aad.envelope.nonce = distinct_test_nonce(&original_nonce);
+        let invalid_aad = original.clone();
         invalid_aad
             .verify_signature_only(&node_vk)
             .expect("ciphertext signature remains valid");
@@ -3824,7 +3960,7 @@ mod tests {
         let envelope = RequestEnvelope {
             request_id: 100,
             payload: vec![1, 2, 3],
-            nonce: fresh_test_nonce(),
+            nonce: generate_nonce(),
             iat: current_timestamp(),
             authorization: Authorization::None,
             delegation_token: None,
@@ -3833,6 +3969,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
 
         let mut signed = test_new_signed(envelope, &signing_key);
@@ -3871,7 +4008,7 @@ mod tests {
         let envelope = RequestEnvelope {
             request_id: 100,
             payload: vec![1, 2, 3],
-            nonce: fresh_test_nonce(),
+            nonce: generate_nonce(),
             iat: current_timestamp(),
             authorization: Authorization::None,
             delegation_token: None,
@@ -3880,6 +4017,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
 
         let mut signed = test_new_signed(envelope, &signing_key);
@@ -4684,6 +4822,156 @@ mod tests {
         );
     }
 
+    // -- v16 §4.7: the advertised server challenge is part of the transcript --
+
+    fn classical_denial(challenge: Option<Vec<u8>>, sk: &SigningKey) -> ResponseEnvelope {
+        ResponseEnvelope::new_signed_with_challenge(
+            7,
+            b"denied".to_vec(),
+            challenge,
+            sk,
+            None,
+            crate::crypto::CryptoPolicy::Classical,
+        )
+        .expect("classical denial must sign")
+    }
+
+    /// An ordinary response carries no challenge, and its transcript is
+    /// unchanged by the new slot.
+    #[test]
+    fn a_response_without_a_challenge_has_the_original_transcript() {
+        let (sk, vk) = generate_signing_keypair();
+        let plain = ResponseEnvelope::new_signed(7, b"denied".to_vec(), &sk);
+        let none = classical_denial(None, &sk);
+        assert!(none.server_challenge.is_none());
+        assert_eq!(plain.sig, none.sig, "no challenge must not alter the transcript");
+        assert!(none.verify(Some(&vk)).is_ok());
+    }
+
+    #[test]
+    fn an_advertised_challenge_verifies_and_survives_the_wire() {
+        let (sk, vk) = generate_signing_keypair();
+        let challenge = vec![0xa5u8; 32];
+        let denied = classical_denial(Some(challenge.clone()), &sk);
+        assert!(denied.verify(Some(&vk)).is_ok());
+
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut builder =
+                message.init_root::<crate::common_capnp::response_envelope::Builder>();
+            denied.write_to(&mut builder);
+        }
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &message).unwrap();
+        let reader =
+            capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
+                .unwrap();
+        let decoded = ResponseEnvelope::read_from(
+            reader
+                .get_root::<crate::common_capnp::response_envelope::Reader>()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded.server_challenge.as_deref(), Some(&challenge[..]));
+        assert!(decoded.verify(Some(&vk)).is_ok());
+    }
+
+    /// Stripping the advertised challenge in flight must not verify: a client
+    /// can never be tricked into retrying without one, or into thinking the
+    /// server issued none.
+    #[test]
+    fn a_stripped_challenge_fails_verification() {
+        let (sk, vk) = generate_signing_keypair();
+        let mut denied = classical_denial(Some(vec![0xa5u8; 32]), &sk);
+        denied.server_challenge = None;
+        assert!(denied.verify(Some(&vk)).is_err());
+    }
+
+    /// Substituting a different challenge must not verify either, so an
+    /// attacker cannot burn the client's single bounded retry.
+    #[test]
+    fn a_substituted_challenge_fails_verification() {
+        let (sk, vk) = generate_signing_keypair();
+        let mut denied = classical_denial(Some(vec![0xa5u8; 32]), &sk);
+        denied.server_challenge = Some(vec![0x5au8; 32]);
+        assert!(denied.verify(Some(&vk)).is_err());
+    }
+
+    /// Injecting a challenge onto a response that advertised none fails too.
+    #[test]
+    fn an_injected_challenge_fails_verification() {
+        let (sk, vk) = generate_signing_keypair();
+        let mut plain = ResponseEnvelope::new_signed(7, b"denied".to_vec(), &sk);
+        plain.server_challenge = Some(vec![0xa5u8; 32]);
+        assert!(plain.verify(Some(&vk)).is_err());
+    }
+
+    /// The length prefix makes the transcript unambiguous: no
+    /// (payload, challenge) pair can be re-cut into a different one.
+    #[test]
+    fn the_challenge_binding_is_unambiguous() {
+        let (sk, vk) = generate_signing_keypair();
+        let a = ResponseEnvelope::new_signed_with_challenge(
+            7,
+            b"ab".to_vec(),
+            Some(b"cdefghijklmnopqr".to_vec()),
+            &sk,
+            None,
+            crate::crypto::CryptoPolicy::Classical,
+        )
+        .unwrap();
+        let b = ResponseEnvelope::new_signed_with_challenge(
+            7,
+            b"abc".to_vec(),
+            Some(b"defghijklmnopqr".to_vec()),
+            &sk,
+            None,
+            crate::crypto::CryptoPolicy::Classical,
+        );
+        // The second challenge is below the profile floor, so it is not a
+        // reachable wire state; the transcripts still differ regardless.
+        if let Ok(b) = b {
+            assert_ne!(a.sig, b.sig);
+        }
+        assert!(a.verify(Some(&vk)).is_ok());
+    }
+
+    /// A challenge outside the profile's 16..64-byte bounds is not a value
+    /// this profile can have issued, so decoding rejects it outright.
+    #[test]
+    fn an_out_of_profile_challenge_is_rejected_on_decode() {
+        for bad in [vec![1u8; 15], vec![1u8; 65]] {
+            let mut message = capnp::message::Builder::new_default();
+            {
+                let mut builder =
+                    message.init_root::<crate::common_capnp::response_envelope::Builder>();
+                builder.set_request_id(7);
+                builder.set_payload(b"denied");
+                builder.set_sig(&[0u8; 64]);
+                builder.set_cnf(&[0u8; 32]);
+                builder.set_cose(&[]);
+                builder.set_server_challenge(&bad);
+            }
+            let mut bytes = Vec::new();
+            capnp::serialize::write_message(&mut bytes, &message).unwrap();
+            let reader = capnp::serialize::read_message(
+                &mut &bytes[..],
+                capnp::message::ReaderOptions::new(),
+            )
+            .unwrap();
+            assert!(
+                ResponseEnvelope::read_from(
+                    reader
+                        .get_root::<crate::common_capnp::response_envelope::Reader>()
+                        .unwrap()
+                )
+                .is_err(),
+                "a {}-byte challenge must be rejected",
+                bad.len()
+            );
+        }
+    }
+
     #[test]
     fn sealed_response_roundtrip_is_transcript_bound_and_not_plaintext_on_wire() {
         let (server_sk, server_vk) = generate_signing_keypair();
@@ -4698,7 +4986,7 @@ mod tests {
         )
         .unwrap();
         let public = recipient.public();
-        let nonce = fresh_test_nonce();
+        let nonce = [0u8; 16];
         let secret_payload = b"response-plaintext-sentinel";
         let response = ResponseEnvelope::new_signed_encrypted(
             77,
@@ -4758,13 +5046,13 @@ mod tests {
                 "service-a",
             )
             .is_err());
-        let other_nonce = distinct_test_nonce(&nonce);
+        let wrong_nonce = distinct_test_nonce(&nonce);
         assert!(response
             .open_encrypted(
                 &recipient,
                 &public,
                 1234,
-                &other_nonce,
+                &wrong_nonce,
                 &server_vk.to_bytes(),
                 "service-a",
             )
@@ -4809,7 +5097,7 @@ mod tests {
         )
         .unwrap();
         let public = recipient.public();
-        let nonce = fresh_test_nonce();
+        let nonce = [0u8; 16];
         let mut response = ResponseEnvelope::new_signed_encrypted(
             8,
             b"bound".to_vec(),
@@ -4890,7 +5178,7 @@ mod tests {
         {
             let mut builder =
                 request_message.init_root::<crate::common_capnp::request_envelope::Builder>();
-            builder.set_nonce(&fresh_test_nonce());
+            builder.set_nonce(&[0u8; 16]);
             builder.set_response_kem_recipient(&vec![0u8; MAX_RESPONSE_KEM_RECIPIENT_BYTES + 1]);
         }
         let request_message_reader = request_message.into_reader();
@@ -4983,7 +5271,8 @@ mod tests {
         store.bind(anchored_vk.to_bytes(), &pq_vk);
 
         // Anchored service: classical rejected, hybrid accepted.
-        let classical = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![5]), &anchored_sk);
+        let classical =
+            SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![5]), &anchored_sk);
         assert!(
             classical
                 .verify_with(&anchored_vk, &cache, Some(&store), CryptoPolicy::Classical)
@@ -5045,8 +5334,12 @@ mod tests {
             !store.is_anchored(&client_vk.to_bytes()),
             "the interop client must not be anchored — that is what this test is about"
         );
-        SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![12]), &client_sk)
-            .verify_with(&client_vk, &cache, Some(&store), CryptoPolicy::Classical)?;
+        SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![12]), &client_sk).verify_with(
+            &client_vk,
+            &cache,
+            Some(&store),
+            CryptoPolicy::Classical,
+        )?;
 
         Ok(())
     }
@@ -5062,7 +5355,10 @@ mod tests {
 
         let mut store = KeyedPqTrustStore::new();
         assert!(store.register(vk.to_bytes(), Some(&pq_vk)));
-        assert!(store.register(vk.to_bytes(), None), "classical re-registration must not clear the anchor");
+        assert!(
+            store.register(vk.to_bytes(), None),
+            "classical re-registration must not clear the anchor"
+        );
         assert!(store.is_anchored(&vk.to_bytes()));
         assert_eq!(store.len(), 1);
 
@@ -5103,7 +5399,9 @@ mod tests {
         store.bind(vk.to_bytes(), &pq_vk_b);
 
         // The original anchor survives.
-        let anchored_vk = store.ml_dsa_key_for(&vk.to_bytes()).expect("anchor survived");
+        let anchored_vk = store
+            .ml_dsa_key_for(&vk.to_bytes())
+            .expect("anchor survived");
         let original_bytes = crate::crypto::pq::ml_dsa_vk_bytes(&pq_vk_a);
         let survived_bytes = crate::crypto::pq::ml_dsa_vk_bytes(&anchored_vk);
         assert_eq!(

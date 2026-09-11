@@ -2,7 +2,7 @@
 name = "hyprstream-service"
 version = "0.1.0"
 edition.workspace = true
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 repository.workspace = true
 description = "Pluggable service orchestration for hyprstream (spawner, factory, manager)"
 
@@ -16,6 +16,7 @@ hyprstream-pds = { path = "../hyprstream-pds" }
 
 # Async runtime
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 
@@ -66,10 +67,11 @@ zbus_systemd = { version = "0.0.11", features = ["login1", "systemd1"], optional
 
 [features]
 default = []
-systemd = ["dep:systemd", "dep:zbus_systemd"]
+systemd = ["dep:systemd", "dep:zbus_systemd", "hyprstream-rpc/systemd"]
 pq-hybrid = []  # NO-OP alias (PQ always compiled; runtime CryptoPolicy). See M3 #152.
 
 [dev-dependencies]
+rcgen = { workspace = true }
 tempfile = { workspace = true }
 hex = { workspace = true }
 

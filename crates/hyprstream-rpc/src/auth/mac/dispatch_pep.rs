@@ -109,14 +109,16 @@ pub enum MacDenyReason {
 /// default.
 ///
 /// `service_domain` is the canonical service name ("model", "registry", …).
-/// `method` is the browser method discriminator if available (a `u16`
-/// committed in the sealed transcript), else `None` for non-browser RPC.
+/// `method` is the full numeric method leaf path derived from the ONE decode
+/// of the signed request body (v16 §5.1) — the same identity the generated
+/// method policy resolved — else `None` when the dispatching service has no
+/// Cap'n Proto request schema (opaque bodies).
 ///
 /// Production implementations will map static schema nodes (S3, #569) and
 /// content-addressed manifests to labels. The default implementation
 /// ([`DenyAllObjectResolver`]) returns `None` for everything — fail-closed.
 pub trait RpcObjectLabelResolver: Send + Sync {
-    fn resolve(&self, service_domain: &str, method: Option<u16>) -> Option<SecurityLabel>;
+    fn resolve(&self, service_domain: &str, method: Option<&[u16]>) -> Option<SecurityLabel>;
 }
 
 /// Fail-closed object resolver: every object is unlabeled ⇒ deny.
@@ -129,7 +131,7 @@ pub struct DenyAllObjectResolver;
 
 impl RpcObjectLabelResolver for DenyAllObjectResolver {
     #[inline]
-    fn resolve(&self, _service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
+    fn resolve(&self, _service_domain: &str, _method: Option<&[u16]>) -> Option<SecurityLabel> {
         None
     }
 }
@@ -155,14 +157,14 @@ pub trait MacDispatchPep: Send + Sync {
     /// VerifiedKeyMaterial, S1 invariant). No schema change.
     ///
     /// `service_domain` — the canonical service name being dispatched to.
-    /// `method` — the browser method discriminator if sealed in the
-    /// transcript, else `None`.
+    /// `method` — the full numeric method leaf path derived from the single
+    /// decode of the signed request body, else `None` for opaque bodies.
     #[must_use]
     fn check(
         &self,
         ctx: &EnvelopeContext,
         service_domain: &str,
-        method: Option<u16>,
+        method: Option<&[u16]>,
     ) -> MacDecision;
 }
 
@@ -219,7 +221,7 @@ impl MacDispatchPep for DefaultMacDispatchPep {
         &self,
         ctx: &EnvelopeContext,
         service_domain: &str,
-        method: Option<u16>,
+        method: Option<&[u16]>,
     ) -> MacDecision {
         // Preserve the verified context for the direct VFS/CAS/MoQ PEPs, whose
         // low-level APIs carry Subject but not the full verified envelope.
@@ -266,7 +268,7 @@ impl MacDispatchPep for DenyAllMacPep {
         &self,
         _ctx: &EnvelopeContext,
         _service_domain: &str,
-        _method: Option<u16>,
+        _method: Option<&[u16]>,
     ) -> MacDecision {
         MacDecision::Deny(MacDenyReason::NoPepInstalled)
     }
@@ -314,7 +316,7 @@ pub fn global_mac_dispatch_pep() -> Option<Arc<dyn MacDispatchPep>> {
 pub fn check_dispatch_mac(
     ctx: &EnvelopeContext,
     service_domain: &str,
-    method: Option<u16>,
+    method: Option<&[u16]>,
 ) -> MacDecision {
     match global_mac_dispatch_pep() {
         Some(pep) => pep.check(ctx, service_domain, method),
@@ -351,7 +353,7 @@ mod tests {
     }
 
     impl RpcObjectLabelResolver for StaticResolver {
-        fn resolve(&self, service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
+        fn resolve(&self, service_domain: &str, _method: Option<&[u16]>) -> Option<SecurityLabel> {
             self.labels.get(service_domain).copied()
         }
     }
@@ -362,7 +364,7 @@ mod tests {
     fn deny_all_resolver_returns_none_for_everything() {
         let r = DenyAllObjectResolver;
         assert!(r.resolve("model", None).is_none());
-        assert!(r.resolve("anything", Some(42)).is_none());
+        assert!(r.resolve("anything", Some(&[42][..])).is_none());
     }
 
     // ── DenyAllMacPep ─────────────────────────────────────────────────

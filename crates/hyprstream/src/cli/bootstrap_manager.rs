@@ -5,7 +5,7 @@
 //! service startup. It implements WizardBackend for the TUI, using bounded channels
 //! with drain-to-latest pattern to bridge async operations to the 30fps render loop.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
@@ -50,6 +50,12 @@ pub struct BootstrapManager {
     service_rx: Option<mpsc::Receiver<OpStatus>>,
     service_handle: Option<tokio::task::JoinHandle<()>>,
 
+    /// Test-only dispatch injection for the service-start routing tests.
+    /// Production never consults an override — `new()` stores `None` and the
+    /// real `handle_service_start` path always runs (#1585).
+    #[cfg(test)]
+    start_dispatch: Option<StartDispatchFn>,
+
     // Cached environment (avoid re-detecting)
     cached_env: Option<EnvironmentInfo>,
 
@@ -86,6 +92,35 @@ fn os_username() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "anonymous".to_owned())
+}
+
+/// Test-only signature of the wizard's service-start dispatch seam: the
+/// resolved service list, explicit-config provenance, direct-launch decision,
+/// and required-native profile. Never named outside `#[cfg(test)]` code —
+/// production always runs the ordinary `dispatch_real_start` path.
+#[cfg(test)]
+type StartDispatchFn = Arc<
+    dyn Fn(
+            Vec<String>,
+            Option<PathBuf>,
+            bool,
+            bool,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+/// The actual production start: installed systemd units for the default
+/// profile, direct launch when `daemon` is set for explicit-config and
+/// required-native profiles (#1585).
+async fn dispatch_real_start(
+    services: &[String],
+    explicit_config: Option<&Path>,
+    daemon: bool,
+    iroh_required: bool,
+) -> anyhow::Result<()> {
+    crate::cli::handle_service_start(services, None, daemon, explicit_config, iroh_required).await
 }
 
 // The shared enroll routine (#438 wizard + #439 `user create`) lives in
@@ -129,9 +164,19 @@ impl BootstrapManager {
             bootstrap_cancel: None,
             service_rx: None,
             service_handle: None,
+            #[cfg(test)]
+            start_dispatch: None,
             cached_env: None,
             policy_manager: None,
         }
+    }
+
+    /// Inject the test-only service-start dispatch. Never called in
+    /// production; exists only so the routing tests can observe which launch
+    /// mode and profile provenance the wizard resolves (#1585).
+    #[cfg(test)]
+    fn set_start_dispatch(&mut self, dispatch: StartDispatchFn) {
+        self.start_dispatch = Some(dispatch);
     }
 
     fn data_dir(&self) -> PathBuf {
@@ -467,10 +512,63 @@ impl WizardBackend for BootstrapManager {
         let (tx, rx) = mpsc::sync_channel(8);
         self.service_rx = Some(rx);
         let services = self.config_services.clone();
+        // Forward this process's pinned config provenance and native profile
+        // so bootstrap-launched children load what the operator loaded (#1585).
+        let explicit_config = crate::config::explicit_config_path().cloned();
+        // Fail closed: an unloadable configuration is never silently treated
+        // as the default profile (#1585). Installed systemd units cannot carry
+        // this process's explicit --config provenance or the required-native
+        // profile, so those starts take the direct launch path via `daemon`.
+        let (daemon, iroh_required) = match crate::config::HyprConfig::load() {
+            Ok(config) => {
+                let required = config.quic.iroh_required();
+                (explicit_config.is_some() || required, required)
+            }
+            Err(error) => {
+                let message = format!("configuration load failed: {error}");
+                self.service_handle = Some(self.rt.spawn(async move {
+                    let _ = tx.send(OpStatus::InProgress);
+                    let _ = tx.send(OpStatus::Failed(message));
+                }));
+                return;
+            }
+        };
+
+        #[cfg(test)]
+        let start_override = self.start_dispatch.clone();
 
         self.service_handle = Some(self.rt.spawn(async move {
             let _ = tx.send(OpStatus::InProgress);
-            match crate::cli::handle_service_start(&services, None, false).await {
+            #[cfg(test)]
+            let outcome = match start_override {
+                Some(seam) => {
+                    seam(
+                        services.clone(),
+                        explicit_config.clone(),
+                        daemon,
+                        iroh_required,
+                    )
+                    .await
+                }
+                None => {
+                    dispatch_real_start(
+                        &services,
+                        explicit_config.as_deref(),
+                        daemon,
+                        iroh_required,
+                    )
+                    .await
+                }
+            };
+            #[cfg(not(test))]
+            let outcome = dispatch_real_start(
+                &services,
+                explicit_config.as_deref(),
+                daemon,
+                iroh_required,
+            )
+            .await;
+            match outcome {
                 Ok(()) => {
                     let _ = tx.send(OpStatus::Done);
                 }
@@ -795,12 +893,6 @@ fn provision_service_identities(
         } else {
             identity_store::load_or_generate_service_signing_key(credentials_dir, service_name)?
         };
-        let service_vk = service_key.verifying_key();
-
-        let jwt = crate::auth::service_jwt::issue_or_load_service_jwt(
-            credentials_dir, service_name, ca_jwt_key, &service_vk, local_issuer_url, now,
-        )?;
-        identity_store::write_service_jwt(credentials_dir, service_name, &jwt)?;
 
         // The hybrid entry: the Ed25519 identity plus the ML-DSA-65 key derived
         // from it. This is what `seed_bootstrap_pq_bindings` later anchors, and
@@ -809,9 +901,65 @@ fn provision_service_identities(
             service_name.to_owned(),
             identity_store::BootstrapPubkey::for_service_key(&service_key)?,
         );
+
+        // Publish the public sidecars (`signing-key.pub`, `service-pubkey.hybrid`)
+        // next to the key so the bootstrap-enrollment mint can read them without
+        // secret material (#1562 H1). For non-policy services the key loader
+        // already wrote them — an idempotent no-op here; for policy this writes
+        // them flat, alongside the node/CA seed.
+        let sidecar_dir = identity_store::service_signing_key_dir(
+            credentials_dir,
+            service_name,
+            identity_store::SecretsProfile::SharedDirectory,
+        );
+        identity_store::ensure_service_key_sidecars(&sidecar_dir, &service_key)?;
     }
 
     identity_store::write_bootstrap_pubkeys_hybrid(credentials_dir, &bootstrap_pubkeys)?;
+
+    // v16 §11: the enrollment manifest is derived BEFORE any credential is
+    // minted, so every bootstrap service JWT is clearance-bearing from first
+    // issue. The manifest is the authority for target clearance; minting
+    // consults it per service. On first provision the manifest is written
+    // with wizard defaults; on re-provision the existing manifest is
+    // authoritative — any drift (missing/extra service, changed Ed25519 or
+    // PQ half) is a hard error until the operator edits the manifest
+    // deliberately (the reviewed rotation).
+    let freshly_written;
+    let enrollment =
+        match crate::auth::service_enrollment::ServiceEnrollmentManifest::load(credentials_dir)? {
+            Some(existing) => {
+                freshly_written = false;
+                existing
+            }
+            None => {
+                let manifest =
+                    crate::auth::service_enrollment::ServiceEnrollmentManifest::from_bootstrap(
+                        &bootstrap_pubkeys,
+                    );
+                manifest.write(credentials_dir)?;
+                freshly_written = true;
+                manifest
+            }
+        };
+    if !freshly_written {
+        enrollment
+            .reconcile_with_bootstrap(&bootstrap_pubkeys)
+            .context("service enrollment manifest disagrees with bootstrap keys")?;
+    }
+
+    for (service_name, entry) in &bootstrap_pubkeys {
+        let jwt = crate::auth::service_jwt::issue_or_load_service_jwt(
+            credentials_dir,
+            service_name,
+            ca_jwt_key,
+            entry,
+            local_issuer_url,
+            now,
+            enrollment.clearance_for_service(service_name).as_ref(),
+        )?;
+        identity_store::write_service_jwt(credentials_dir, service_name, &jwt)?;
+    }
 
     Ok(bootstrap_pubkeys)
 }
@@ -822,6 +970,164 @@ mod tests {
     use crate::auth::{RocksDbUserStore, UserStore};
     use crate::cli::enroll::bind_user_signing_key;
     use tempfile::TempDir;
+
+    /// What the wizard's service-start dispatch was invoked with.
+    #[derive(Debug)]
+    struct RecordedStart {
+        services: Vec<String>,
+        explicit: Option<PathBuf>,
+        daemon: bool,
+        required: bool,
+    }
+
+    /// Gate marking a re-exec'd child that runs one service-start routing
+    /// scenario in an isolated process (the pinned/explicit config slots are
+    /// process-global and write-once).
+    const ROUTE_CHILD: &str = "HYPRSTREAM_BOOTSTRAP_ROUTE_CHILD";
+
+    /// BootstrapManager service-start routing through the real profile load:
+    /// the default profile stays on installed systemd units (daemon=false);
+    /// explicit-config and required-native route to the direct launch path
+    /// (daemon=true); an unloadable configuration fails closed with a Failed
+    /// status and never reaches the dispatch at all.
+    #[tokio::test]
+    async fn bootstrap_start_services_routes_profiles_causally() -> anyhow::Result<()> {
+        if let Ok(scenario) = std::env::var(ROUTE_CHILD) {
+            return start_services_child_scenario(&scenario).await;
+        }
+        for scenario in ["default", "explicit", "required", "invalid"] {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "cli::bootstrap_manager::tests::bootstrap_start_services_routes_profiles_causally",
+                    "--nocapture",
+                ])
+                .env(ROUTE_CHILD, scenario)
+                .status()?;
+            anyhow::ensure!(
+                status.success(),
+                "bootstrap service routing scenario '{scenario}' failed"
+            );
+        }
+        Ok(())
+    }
+
+    async fn start_services_child_scenario(scenario: &str) -> anyhow::Result<()> {
+        let recorded: Arc<parking_lot::Mutex<Vec<RecordedStart>>> = Arc::default();
+        let sink = recorded.clone();
+        let models = TempDir::new()?;
+        let mut manager = BootstrapManager::new(
+            // The test's own ambient runtime: start_services spawns onto this
+            // handle and the await-based drain below lets the task run.
+            tokio::runtime::Handle::current(),
+            models.path().to_path_buf(),
+            vec!["policy".to_owned()],
+        );
+        manager.set_start_dispatch(Arc::new(
+            move |services: Vec<String>, explicit: Option<PathBuf>, daemon: bool, required: bool| {
+                sink.lock().push(RecordedStart {
+                    services,
+                    explicit,
+                    daemon,
+                    required,
+                });
+                Box::pin(async { Ok::<(), anyhow::Error>(()) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>
+            },
+        ));
+
+        match scenario {
+            "default" => {
+                let _ = crate::config::install_pinned_config(crate::config::HyprConfig::default());
+                manager.start_services();
+                assert_eq!(drain_to_terminal(&mut manager).await, OpStatus::Done);
+                let calls = recorded.lock();
+                assert_eq!(calls.len(), 1, "the dispatch must run exactly once");
+                let call = &calls[0];
+                assert_eq!(call.services, vec!["policy".to_owned()]);
+                assert_eq!(call.explicit, None, "default profile has no explicit provenance");
+                assert!(!call.daemon, "default profile must keep the installed systemd unit route");
+                assert!(!call.required, "default profile is not required-native");
+            }
+            "explicit" => {
+                let _ = crate::config::install_pinned_config(crate::config::HyprConfig::default());
+                let explicit = TempDir::new()?;
+                let marker = explicit.path().join("operator.toml");
+                assert!(
+                    crate::config::install_explicit_config_path(marker.clone()),
+                    "explicit provenance slot must be installable in a fresh child"
+                );
+                manager.start_services();
+                assert_eq!(drain_to_terminal(&mut manager).await, OpStatus::Done);
+                let calls = recorded.lock();
+                assert_eq!(calls.len(), 1, "the dispatch must run exactly once");
+                let call = &calls[0];
+                assert_eq!(call.explicit, Some(marker), "provenance must be forwarded");
+                assert!(call.daemon, "explicit --config provenance must take the direct launch route");
+                assert!(!call.required);
+            }
+            "required" => {
+                let mut required_config = crate::config::HyprConfig::default();
+                required_config.quic.enabled = true;
+                required_config.quic.iroh = true;
+                required_config.quic.native_network_profile =
+                    crate::config::NativeNetworkProfile::NetworkIrohRequired;
+                required_config.validate()?;
+                let _ = crate::config::install_pinned_config(required_config);
+                manager.start_services();
+                assert_eq!(drain_to_terminal(&mut manager).await, OpStatus::Done);
+                let calls = recorded.lock();
+                assert_eq!(calls.len(), 1, "the dispatch must run exactly once");
+                let call = &calls[0];
+                assert!(call.required, "the required-native profile must be observed");
+                assert!(call.daemon, "required-native must take the direct launch route");
+                assert_eq!(call.explicit, None);
+            }
+            "invalid" => {
+                // No pinned snapshot: force the XDG re-derivation onto a
+                // garbage config file so HyprConfig::load() itself fails.
+                let root = TempDir::new()?;
+                let xdg = root.path().join("xdg-config");
+                std::env::set_var("XDG_CONFIG_HOME", &xdg);
+                let config_dir = xdg.join("hyprstream");
+                std::fs::create_dir_all(&config_dir)?;
+                std::fs::write(config_dir.join("config.toml"), "this is = not [valid toml")?;
+                manager.start_services();
+                let terminal = drain_to_terminal(&mut manager).await;
+                match terminal {
+                    OpStatus::Failed(message) => assert!(
+                        message.contains("configuration load failed"),
+                        "unloadable configuration must fail closed naming the cause, got: {message}"
+                    ),
+                    other => panic!("unloadable configuration must surface Failed, got {other:?}"),
+                }
+                assert!(
+                    recorded.lock().is_empty(),
+                    "an unloadable configuration must never reach the service dispatch"
+                );
+            }
+            other => anyhow::bail!("unknown bootstrap routing scenario '{other}'"),
+        }
+        Ok(())
+    }
+
+    /// Drain pending service status until a terminal one arrives (bounded,
+    /// mirroring the wizard's poll loop without the fixed sleep pacing).
+    async fn drain_to_terminal(manager: &mut BootstrapManager) -> OpStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match manager.poll_pending() {
+                OpStatus::InProgress => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "service start never reached a terminal status"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                terminal => return terminal,
+            }
+        }
+    }
 
     /// A fresh provisioning run writes a hybrid entry for EVERY service, and
     /// those entries anchor into the post-quantum trust store.

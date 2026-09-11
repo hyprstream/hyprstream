@@ -119,6 +119,7 @@ pub mod crypto;
 pub mod envelope;
 pub mod error;
 pub mod platform;
+pub mod proof;
 pub mod rpc_client;
 pub mod stream_info;
 pub mod stream_epoch;

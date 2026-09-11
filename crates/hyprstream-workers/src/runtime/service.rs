@@ -950,6 +950,7 @@ impl WorkerService {
             qos: stream_ctx.qos().clone(),
             broadcast_path,
             announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
+            moql_server_identity: stream_ctx.moql_server_identity(),
             kem_ciphertexts: Vec::new(), // #554: classical FD stream (dh_public path), no hybrid KEM
         };
 
@@ -1439,6 +1440,16 @@ impl WorkerHandler for WorkerService {
 
 #[async_trait(?Send)]
 impl RequestService for WorkerService {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        // The ONE bounded decode (v16 §5.2): the generated decoder derives
+        // the full method leaf and returns the decoded message that policy,
+        // MAC, and dispatch below all consume.
+        crate::generated::worker_client::decode_worker_request_body(signed_body)
+    }
+
     fn producer_reach_config_handle(&self) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
         Some(self.stream_channel.reach_config_handle())
     }
@@ -1447,13 +1458,13 @@ impl RequestService for WorkerService {
         Some(self.stream_channel.moq_origin_handle())
     }
 
-    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
+    async fn handle_request(&self, ctx: &EnvelopeContext, body: &hyprstream_rpc::service::DecodedRequestBody,) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
         debug!(
             "Worker request from {} (request_id={})",
             ctx.subject(),
             ctx.request_id
         );
-        dispatch_worker(self, ctx, payload).await
+        dispatch_worker(self, ctx, body).await
     }
 
     fn name(&self) -> &str {

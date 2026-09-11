@@ -50,6 +50,31 @@ impl PolicyAuthProvider {
 
 #[async_trait(?Send)]
 impl AuthorizationProvider for PolicyAuthProvider {
+    async fn check_batch(
+        &self, subject: &str, domain: &str, resources: &[String],
+        operation: &str, bearer: Option<&str>,
+    ) -> anyhow::Result<Vec<bool>> {
+        use crate::services::generated::policy_client::PolicyCheckBatch;
+        anyhow::ensure!(resources.len() <= 256, "authorization batch exceeds 256");
+        let client = match bearer {
+            Some(token) => self.client.clone().with_delegated_bearer(token.to_owned()),
+            None => {
+                let upstream = hyprstream_rpc::envelope::Subject::new(subject);
+                anyhow::ensure!(!upstream.is_federated() && upstream.name()
+                    .is_some_and(|name| name == "system" || name.starts_with("service:")),
+                    "service-mediated user policy check requires verified bearer");
+                self.client.clone()
+            }
+        };
+        let request = PolicyCheckBatch { checks: resources.iter().map(|resource| PolicyCheck {
+            subject: subject.to_owned(), domain: domain.to_owned(),
+            resource: resource.clone(), operation: operation.to_owned(),
+        }).collect() };
+        let result = client.check_batch(&request).await?;
+        anyhow::ensure!(result.allowed.len() == resources.len(), "invalid policy batch decision count");
+        Ok(result.allowed)
+    }
+
     async fn check(
         &self,
         subject: &str,
@@ -242,6 +267,12 @@ impl PdsRecordStore {
     /// (surfacing a missing/corrupt store at startup) but does not hold the
     /// handle — see the type-level docs. The resolver holds **no signing key**.
     pub fn open_readonly(path: &Path) -> AnyResult<Self> {
+        // RocksDB's read-only open can create a missing directory before it
+        // discovers that no database exists. A resolver/inspection read must
+        // not turn missing retained state into a newly initialized path.
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("PDS read-only store directory is unavailable: {path:?}"))?;
+        anyhow::ensure!(metadata.is_dir(), "PDS read-only store path is not a directory: {path:?}");
         let opts = readonly_opts();
         let _probe = rocksdb::DB::open_for_read_only(&opts, path, false)
             .with_context(|| format!("failed to open PDS record store (ro) at {path:?}"))?;
@@ -2269,6 +2300,22 @@ mod pds_store_tests {
             "the advanced commit must link the previous commit"
         );
         assert!(second.rev > first.rev, "rev must strictly advance");
+    }
+
+    #[test]
+    fn readonly_roster_store_open_never_creates_missing_directories() -> AnyResult<()> {
+        let root = tempfile::tempdir()?;
+        for path in [root.path().join("missing"), root.path().join("absent-parent/nested/store")] {
+            assert!(PdsRecordStore::open_readonly(&path).is_err());
+            assert!(!path.exists());
+            assert_eq!(std::fs::read_dir(root.path())?.count(), 0);
+        }
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, b"preserve existing bytes")?;
+        assert!(PdsRecordStore::open_readonly(&file).is_err());
+        assert_eq!(std::fs::read(&file)?, b"preserve existing bytes");
+        assert_eq!(std::fs::read_dir(root.path())?.count(), 1);
+        Ok(())
     }
 
     #[test]

@@ -151,12 +151,28 @@ pub async fn issue_mount_ticket(
             Some("source credential has no authority-stamped MAC clearance"),
         );
     };
+    // The mount ticket is itself an `at+jwt` (RFC 9068); it inherits the RFC
+    // 9068 §2.2.1 `client_id` of the OAuth client that presented the verified
+    // source credential. A source without a client_id is not a compliant
+    // `at+jwt` and cannot derive a mount ticket.
+    let Some(client_id) = source_claims
+        .client_id
+        .clone()
+        .filter(|c| !c.trim().is_empty())
+    else {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            "insufficient_scope",
+            Some("source credential has no RFC 9068 client_id to bind the mount ticket to"),
+        );
+    };
     let mut claims = hyprstream_rpc::auth::Claims::new(user.user.clone(), now, exp)
         .with_jti()
         .with_issuer(state.issuer_url.clone())
         .with_audience(Some(audience.clone()))
         .with_cap(capability.clone())
-        .with_clearance(clearance);
+        .with_client_id(client_id)
+        .with_credential_clearance(clearance);
     if domain != "*" {
         claims = claims.with_tenant(domain);
     }
@@ -256,6 +272,7 @@ mod freeze_tests {
         )
         .with_issuer(test_state().issuer_url.clone())
         .with_tenant("tenant-a.example".to_owned())
+        .with_client_id("hyprstream-oauth-client-1")
         .with_clearance(hyprstream_rpc::auth::mac::SecurityLabel::new(
             hyprstream_rpc::auth::mac::Level::Secret,
             hyprstream_rpc::auth::mac::Assurance::Classical,
