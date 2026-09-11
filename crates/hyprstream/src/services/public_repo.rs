@@ -96,6 +96,14 @@ pub trait PublicPublicationAuthorizer: Send + Sync {
     /// read or written. Implementations should apply native identity,
     /// assurance, account, collection, tenant, expiry and revocation policy.
     fn authorize(&self, principal: &str, account: &str, collection: &str) -> Result<()>;
+
+    /// Separate account-owner authority: permission to publish a record never
+    /// implicitly permits key replacement. Existing authorizers fail closed.
+    fn authorize_key_promotion(&self, _principal: &str, _account: &str) -> Result<()> {
+        Err(anyhow!(
+            "repository signing key promotion is not authorized"
+        ))
+    }
 }
 
 /// A request to create one immutable public record under an owned repo.
@@ -144,7 +152,9 @@ struct PublicationIntent {
 /// bytes.
 pub struct PublicRepoStore {
     db: Arc<rocksdb::DB>,
-    write_lock: Mutex<()>,
+    // Account-bound active signing keys and the repository transaction lock
+    // share one guard. Promotion cannot interleave with a stale-key commit.
+    signing_state: Mutex<BTreeMap<String, p256::ecdsa::SigningKey>>,
 }
 
 impl std::fmt::Debug for PublicRepoStore {
@@ -163,7 +173,7 @@ impl PublicRepoStore {
             .with_context(|| format!("failed to open public repo store at {path:?}"))?;
         Ok(Self {
             db: Arc::new(db),
-            write_lock: Mutex::new(()),
+            signing_state: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -267,7 +277,6 @@ impl PublicRepoStore {
 pub struct PublicRepoWriter {
     store: Arc<PublicRepoStore>,
     did: String,
-    signing_key: p256::ecdsa::SigningKey,
     authorizer: Arc<dyn PublicPublicationAuthorizer>,
 }
 
@@ -280,6 +289,8 @@ impl std::fmt::Debug for PublicRepoWriter {
 }
 
 impl PublicRepoWriter {
+    /// Bind a trusted account key to this store. All writer handles for the
+    /// same DID share one active authority; a different key requires promotion.
     pub fn new(
         store: Arc<PublicRepoStore>,
         did: impl Into<String>,
@@ -288,12 +299,92 @@ impl PublicRepoWriter {
     ) -> Result<Self> {
         let did = did.into();
         validate_did(&did)?;
+        {
+            let mut state = store.signing_state.lock();
+            if let Some(active) = state.get(&did) {
+                ensure!(
+                    active.verifying_key() == signing_key.verifying_key(),
+                    "repo signing key differs from active authority; use explicit promotion"
+                );
+            } else {
+                // On reopen, never silently adopt a key that disagrees with
+                // the durable head. Recover/promote through the account owner.
+                if let Some(repo) = store.snapshot(&did)? {
+                    repo.commit
+                        .verify_atproto(signing_key.verifying_key())
+                        .context("repo head does not match supplied active signing authority")?;
+                }
+                state.insert(did.clone(), signing_key);
+            }
+        }
         Ok(Self {
             store,
             did,
-            signing_key,
             authorizer,
         })
+    }
+
+    /// Resolve this account's active public key from shared transaction state.
+    /// DID-document publication must use this authority after promotion returns.
+    pub fn active_verifying_key(&self) -> Result<p256::ecdsa::VerifyingKey> {
+        self.store
+            .signing_state
+            .lock()
+            .get(&self.did)
+            .map(|key| *key.verifying_key())
+            .ok_or_else(|| anyhow!("no active signing authority for repository"))
+    }
+
+    /// Explicit account-owner promotion boundary. The trusted caller must
+    /// validate/secure the candidate and publish it in the account DID document
+    /// only after this succeeds. This is not the node-global OAuth key store.
+    ///
+    /// Serializes with all writers for this store/account. Re-signs an idle
+    /// head over identical canonical unsigned bytes, persists the new head and
+    /// immutable block synchronously, then exposes the candidate to surviving
+    /// writers and public-key readers. Errors leave the active key unchanged.
+    /// Old blocks and publication intents remain immutable for original retries.
+    /// This in-process boundary does not subscribe to external key rotations;
+    /// account lifecycle wiring must route promotion through it.
+    pub fn promote_signing_key(
+        &self,
+        principal: &str,
+        expected_active: &p256::ecdsa::VerifyingKey,
+        candidate: p256::ecdsa::SigningKey,
+    ) -> Result<Option<Cid>> {
+        validate_principal(principal)?;
+        self.authorizer
+            .authorize_key_promotion(principal, &self.did)?;
+        let mut state = self.store.signing_state.lock();
+        let active = state
+            .get_mut(&self.did)
+            .ok_or_else(|| anyhow!("no active signing authority for repository"))?;
+        ensure!(
+            active.verifying_key() == expected_active,
+            "repo signing authority CAS conflict"
+        );
+        let head = if let Some(repo) = self.store.snapshot(&self.did)? {
+            repo.commit
+                .verify_atproto(active.verifying_key())
+                .context("current repo head does not verify under active authority")?;
+            let resigned = Commit::sign_atproto(&repo.commit.unsigned(), &candidate)?;
+            let bytes = resigned.to_atproto_dag_cbor()?;
+            let cid = resigned.cid_atproto()?;
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.put(commit_block_key(&self.did, &cid.to_string()), &bytes);
+            batch.put(commit_key(&self.did), bytes);
+            let mut options = rocksdb::WriteOptions::default();
+            options.set_sync(true);
+            self.store
+                .db
+                .write_opt(batch, &options)
+                .context("public repo signing authority reconciliation failed")?;
+            Some(cid)
+        } else {
+            None
+        };
+        *active = candidate;
+        Ok(head)
     }
 
     pub fn create_record(&self, request: PublicCreateRequest) -> Result<PublicCommitResult> {
@@ -306,7 +397,10 @@ impl PublicRepoWriter {
         self.authorizer
             .authorize(&request.principal, &self.did, &request.collection)?;
 
-        let _guard = self.store.write_lock.lock();
+        let state = self.store.signing_state.lock();
+        let signing_key = state
+            .get(&self.did)
+            .ok_or_else(|| anyhow!("no active signing authority for repository"))?;
         let record = AtprotoRecord::new(request.collection.clone(), &request.rkey, request.value)?;
         ensure!(
             record.bytes().len() <= MAX_PUBLIC_RECORD_BYTES,
@@ -393,7 +487,7 @@ impl PublicRepoWriter {
             next_revision(previous_rev),
             previous,
         );
-        let commit = Commit::sign_atproto(&unsigned, &self.signing_key)?;
+        let commit = Commit::sign_atproto(&unsigned, signing_key)?;
         let commit_cid = commit.cid_atproto()?;
         let intent = PublicationIntent {
             request_id: request.request_id,
@@ -438,6 +532,11 @@ mod tests {
             ensure!(self.allow.load(Ordering::Acquire), "publication denied");
             Ok(())
         }
+
+        fn authorize_key_promotion(&self, _: &str, _: &str) -> Result<()> {
+            ensure!(self.allow.load(Ordering::Acquire), "promotion denied");
+            Ok(())
+        }
     }
 
     fn post() -> DagCbor {
@@ -457,6 +556,141 @@ mod tests {
             value: post(),
             expected_prev,
         }
+    }
+
+    #[test]
+    fn public_repo_rotation_reconciles_idle_head_and_surviving_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let old = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let candidate = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let request = create_request(1, None);
+        let writer =
+            PublicRepoWriter::new(store.clone(), &request.did, old.clone(), gate.clone()).unwrap();
+        let survivor =
+            PublicRepoWriter::new(store.clone(), &request.did, old.clone(), gate.clone()).unwrap();
+        let first = writer.create_record(request.clone()).unwrap();
+        let original = store.snapshot(&request.did).unwrap().unwrap().commit;
+        let original_block = store
+            .db
+            .get(commit_block_key(
+                &request.did,
+                &first.commit_cid.to_string(),
+            ))
+            .unwrap()
+            .unwrap();
+        let reconciled = writer
+            .promote_signing_key("did:at9p:agent", old.verifying_key(), candidate.clone())
+            .unwrap()
+            .unwrap();
+        assert_ne!(reconciled, first.commit_cid);
+        assert_eq!(
+            survivor.active_verifying_key().unwrap(),
+            *candidate.verifying_key()
+        );
+        let idle = store.snapshot(&request.did).unwrap().unwrap().commit;
+        assert_eq!(idle.unsigned(), original.unsigned());
+        idle.verify_atproto(candidate.verifying_key()).unwrap();
+        assert!(idle.verify_atproto(old.verifying_key()).is_err());
+        assert_eq!(survivor.create_record(request.clone()).unwrap(), first);
+        assert_eq!(
+            store
+                .db
+                .get(commit_block_key(
+                    &request.did,
+                    &first.commit_cid.to_string()
+                ))
+                .unwrap()
+                .unwrap(),
+            original_block
+        );
+        assert!(
+            PublicRepoWriter::new(store.clone(), &request.did, old.clone(), gate.clone()).is_err()
+        );
+        let second = survivor
+            .create_record(create_request(2, Some(reconciled)))
+            .unwrap();
+        let head = store.snapshot(&request.did).unwrap().unwrap().commit;
+        head.verify_atproto(candidate.verifying_key()).unwrap();
+        assert!(head.verify_atproto(old.verifying_key()).is_err());
+        assert_eq!(head.prev, Some(reconciled));
+        assert_eq!(head.cid_atproto().unwrap(), second.commit_cid);
+        drop(survivor);
+        drop(writer);
+        drop(store);
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        assert!(PublicRepoWriter::new(store.clone(), &request.did, old, gate.clone()).is_err());
+        let reopened = PublicRepoWriter::new(store, &request.did, candidate, gate).unwrap();
+        assert_eq!(reopened.create_record(request).unwrap(), first);
+    }
+
+    #[test]
+    fn public_repo_rotation_failure_keeps_active_authority_and_durable_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let old = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let candidate = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let request = create_request(1, None);
+        let writer = PublicRepoWriter::new(store.clone(), &request.did, old.clone(), gate).unwrap();
+        writer.create_record(request.clone()).unwrap();
+        let all_bytes = || {
+            store
+                .db
+                .iterator(rocksdb::IteratorMode::Start)
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before = all_bytes();
+        struct RecordOnly;
+        impl PublicPublicationAuthorizer for RecordOnly {
+            fn authorize(&self, _: &str, _: &str, _: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        let unprivileged = PublicRepoWriter::new(
+            store.clone(),
+            &request.did,
+            old.clone(),
+            Arc::new(RecordOnly),
+        )
+        .unwrap();
+        assert!(unprivileged
+            .promote_signing_key("did:at9p:agent", old.verifying_key(), candidate.clone())
+            .is_err());
+        assert_eq!(writer.active_verifying_key().unwrap(), *old.verifying_key());
+        assert_eq!(all_bytes(), before);
+        assert!(writer
+            .promote_signing_key(
+                "did:at9p:agent",
+                candidate.verifying_key(),
+                candidate.clone()
+            )
+            .is_err());
+        assert_eq!(writer.active_verifying_key().unwrap(), *old.verifying_key());
+        assert_eq!(all_bytes(), before);
+        // A validly encoded head signed by the wrong key must not be blessed
+        // by rotation. Reconciliation fails without exposing the candidate.
+        let head = store.snapshot(&request.did).unwrap().unwrap().commit;
+        let substituted = Commit::sign_atproto(&head.unsigned(), &candidate).unwrap();
+        store
+            .db
+            .put(
+                commit_key(&request.did),
+                substituted.to_atproto_dag_cbor().unwrap(),
+            )
+            .unwrap();
+        let before = all_bytes();
+        assert!(writer
+            .promote_signing_key("did:at9p:agent", old.verifying_key(), candidate)
+            .is_err());
+        assert_eq!(writer.active_verifying_key().unwrap(), *old.verifying_key());
+        assert_eq!(all_bytes(), before);
     }
 
     #[test]
@@ -719,7 +953,7 @@ mod tests {
         assert_eq!(snapshot.commit.cid_atproto().unwrap(), second.commit_cid);
         snapshot
             .commit
-            .verify_atproto(writer.signing_key.verifying_key())
+            .verify_atproto(&writer.active_verifying_key().unwrap())
             .expect("commit signature");
         drop(writer);
         drop(store);
