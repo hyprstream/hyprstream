@@ -27,6 +27,11 @@ on:
       - 'crates/hyprstream-util/**'
       - '.github/workflows/rustdoc.yml'
       - 'docs/rustdoc-quality.md'
+      # Shared build inputs: workspace dependencies, the lockfile, and the
+      # toolchain pin all influence rustdoc behavior for the pilot crate.
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
   workflow_dispatch:
 
 permissions:
