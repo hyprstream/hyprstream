@@ -32,6 +32,8 @@
 //! - Write path (`repo.createRecord` etc.) — sequenced with #910.
 //! - `createSession`/`getSession` — sequenced with #1113/#948.
 
+mod record_validation;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -999,15 +1001,9 @@ pub async fn create_record(
             )
         }
     };
-    match object.get("validate") {
-        None | Some(Value::Bool(false)) => {}
-        Some(Value::Bool(true)) => {
-            return xrpc_error(
-                StatusCode::BAD_REQUEST,
-                "UnsupportedValidation",
-                "Lexicon validation is not available; validate=true cannot be fulfilled",
-            )
-        }
+    let validate = match object.get("validate") {
+        None => true, // Both collections in this posting slice have known schemas.
+        Some(Value::Bool(value)) => *value,
         Some(_) => {
             return xrpc_error(
                 StatusCode::BAD_REQUEST,
@@ -1015,7 +1011,7 @@ pub async fn create_record(
                 "validate must be a boolean when present",
             )
         }
-    }
+    };
     let return_record = match object.get("returnRecord") {
         None => false,
         Some(Value::Bool(value)) => *value,
@@ -1098,9 +1094,10 @@ pub async fn create_record(
         }
         ("app.bsky.actor.profile", _) => Err(anyhow::anyhow!("profile rkey must be self")),
         (_, None) => Ok(None),
-        (_, Some(Value::String(value))) if Tid::parse(value).is_ok() => {
-            // Preserve an explicit key's bytes; parsing a TID is a syntax
-            // check, not permission to normalize the caller's record path.
+        (_, Some(Value::String(value)))
+            if Tid::parse(value).is_ok_and(|tid| tid.encode() == *value) =>
+        {
+            // Reject alternate encodings instead of changing the record path.
             AtprotoRecordKey::new(value.clone()).map(Some)
         }
         _ => Err(anyhow::anyhow!("a valid TID rkey is required when present")),
@@ -1125,6 +1122,23 @@ pub async fn create_record(
             )
         }
     };
+    if validate {
+        if let Err(error) = record_validation::validate(collection, record_value) {
+            let (status, code, message) = match error {
+                record_validation::Error::Invalid => (
+                    StatusCode::BAD_REQUEST,
+                    errors::INVALID_REQUEST,
+                    "record does not match its known schema",
+                ),
+                record_validation::Error::SchemaUnavailable => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    errors::INTERNAL_SERVER_ERROR,
+                    "record schema validation is unavailable",
+                ),
+            };
+            return xrpc_error(status, code, message);
+        }
+    }
     let record = match crate::services::public_repo::json_to_dag_cbor(record_value) {
         Ok(record) => record,
         Err(_) => {
@@ -1847,6 +1861,7 @@ mod tests {
         let (_dir, store, _gate, app, token) = build_write_input_fixture().await;
         let mut invalid = write_input(7);
         invalid["record"]["$type"] = json!("private.authorization.denied");
+        invalid["validate"] = json!(false); // Exercise the writer's typed input failure.
         let response = app
             .clone()
             .oneshot(write_http_request(&token, &invalid, HeaderMap::new()))
@@ -2056,60 +2071,194 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_create_record_requires_supported_validation_and_preserves_basic_mode() {
-        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+    async fn router_create_record_false_skips_schema_but_not_structural_checks() {
+        let (_dir, store, _gate, app, token) = build_write_input_fixture().await;
         let mut input = write_input(7);
-        input["validate"] = json!(true);
+        input["validate"] = json!(false);
+        input["returnRecord"] = json!(true);
+        input["record"].as_object_mut().unwrap().remove("text");
+        input["record"].as_object_mut().unwrap().remove("createdAt");
         let response = app
             .clone()
             .oneshot(write_http_request(&token, &input, HeaderMap::new()))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let error = body_json(response).await;
-        assert_eq!(error["error"], "UnsupportedValidation");
-        assert!(error["message"]
-            .as_str()
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["value"], input["record"]);
+        let head = store
+            .snapshot("did:web:pub.example.com")
             .unwrap()
-            .contains("Lexicon validation"));
-        assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
-        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+            .unwrap()
+            .commit
+            .cid_atproto()
+            .unwrap();
+        input["record"]["unsupported"] = json!(1.5);
+        let response = app
+            .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let snapshot = store.snapshot("did:web:pub.example.com").unwrap().unwrap();
+        assert_eq!(snapshot.records.len(), 1);
+        assert_eq!(snapshot.commit.cid_atproto().unwrap(), head);
+    }
 
-        // Valid authenticated requests prove the negative cases reached the
-        // enabled production write path, not an auth failure or a 404 stub.
-        for (id, explicit_validate) in [(7, true), (8, false)] {
-            let mut input = write_input(id);
-            if explicit_validate {
-                input["validate"] = json!(false);
+    #[tokio::test]
+    async fn router_create_record_known_schemas_validate_omitted_and_true() {
+        for mode in [None, Some(true)] {
+            let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+            let blob = json!({"$type":"blob", "ref":{"$link":hyprstream_pds::Cid::from_raw(b"image").to_string()}, "mimeType":"image/png", "size":5});
+            let strong = json!({"uri":"at://did:plc:abc/app.bsky.feed.post/custom-key", "cid":hyprstream_pds::Cid::from_dag_cbor(b"record").to_string()});
+            let mut post = write_input(7);
+            post["record"]["text"] = json!("e\u{301}".repeat(300)); // 300 graphemes, 600 code points.
+            post["record"]["langs"] = json!(["en", "i-klingon", "qaa-Zzzz-419"]);
+            post["record"]["reply"] = json!({"root":strong.clone(), "parent":strong.clone()});
+            post["record"]["facets"] = json!([{"index":{"byteStart":0,"byteEnd":1}, "features":[
+                {"$type":"app.bsky.richtext.facet#mention", "did":"did:key:zExample"},
+                {"$type":"app.bsky.richtext.facet#link", "uri":"https://example.com/path"}
+            ]}]);
+            post["record"]["embed"] = json!({"$type":"app.bsky.embed.images","images":[{"image":blob.clone(),"alt":"image","aspectRatio":{"width":1,"height":1}}]});
+            let profile = json!({"repo":"did:web:pub.example.com", "collection":"app.bsky.actor.profile", "record":{
+                "$type":"app.bsky.actor.profile", "displayName":"Profile", "pronouns":"they/them", "website":"https://example.com", "avatar":blob, "pinnedPost":strong,
+                "createdAt":"1985-04-12T23:20:50.12345678912345Z"
+            }});
+            let mut invalid = Vec::new();
+            for field in ["text", "createdAt"] {
+                let mut missing = post.clone();
+                missing["record"].as_object_mut().unwrap().remove(field);
+                invalid.push(missing);
+                for bad in [Value::Null, json!(5), json!([])] {
+                    let mut bad_type = post.clone();
+                    bad_type["record"][field] = bad;
+                    invalid.push(bad_type);
+                }
             }
-            input["returnRecord"] = json!(explicit_validate);
-            let mut headers = HeaderMap::new();
-            if explicit_validate {
-                headers.insert("Idempotency-Key", "valid-7.key_1".parse().unwrap());
+            for (pointer, bad) in [
+                ("/record/text", json!("x".repeat(301))),
+                (
+                    "/record/text",
+                    json!(format!("x{}", "\u{301}".repeat(1600))),
+                ),
+                ("/record/createdAt", json!("2026-02-30T00:00:00Z")),
+                ("/record/createdAt", json!("2026-01-01t00:00:00z")),
+                ("/record/createdAt", json!("2026-01-01T00:00:00-00:00")),
+                ("/record/langs", json!(["en_US"])),
+                ("/record/langs", json!(["en", "en", "en", "en"])),
+                ("/record/reply/root/cid", json!("private-not-a-cid")),
+                (
+                    "/record/reply/root/uri",
+                    json!("at://invalid/app.bsky.feed.post/key"),
+                ),
+                ("/record/facets/0/index/byteStart", json!(-1)),
+                ("/record/facets/0/features/0/did", json!("did::private")),
+                (
+                    "/record/facets/0/features/1/uri",
+                    json!("https://example.com/invalid space"),
+                ),
+                ("/record/embed/images/0/image/mimeType", json!("text/plain")),
+                ("/record/embed/images/0/image/size", json!(2000001)),
+                ("/record/embed/images/0/aspectRatio/width", json!(0)),
+            ] {
+                let mut bad_input = post.clone();
+                *bad_input.pointer_mut(pointer).unwrap() = bad;
+                invalid.push(bad_input);
             }
-            let response = app
-                .clone()
-                .oneshot(write_http_request(&token, &input, headers))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let output = body_json(response).await;
-            if explicit_validate {
-                assert_eq!(output["value"], input["record"]);
-            } else {
-                assert!(output.get("value").is_none());
+            for (field, bad) in [
+                ("displayName", json!("x".repeat(65))),
+                ("description", json!("x".repeat(257))),
+                ("pronouns", json!("x".repeat(21))),
+                ("avatar", Value::Null),
+                ("website", json!("relative/path")),
+                ("displayName", json!(false)),
+                ("pinnedPost", json!({})),
+                (
+                    "labels",
+                    json!({"$type":"com.atproto.label.defs#selfLabels","values":[{}]}),
+                ),
+            ] {
+                let mut bad_input = profile.clone();
+                bad_input["record"][field] = bad;
+                invalid.push(bad_input);
+            }
+            for mut input in invalid {
+                if let Some(mode) = mode {
+                    input["validate"] = json!(mode);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{input}");
+                assert_eq!(
+                    body_json(response).await,
+                    json!({"error":"InvalidRequest","message":"record does not match its known schema"})
+                );
+                assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+                assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+            }
+            for mut input in [post, profile] {
+                if let Some(mode) = mode {
+                    input["validate"] = json!(mode);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{}",
+                    body_json(response).await
+                );
+            }
+            assert_eq!(
+                store
+                    .snapshot("did:web:pub.example.com")
+                    .unwrap()
+                    .unwrap()
+                    .records
+                    .len(),
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn router_create_record_canonical_keys_and_unknown_collections() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        let noncanonical = "2222222222223";
+        assert_ne!(Tid::parse(noncanonical).unwrap().encode(), noncanonical);
+        for mode in [None, Some(true), Some(false)] {
+            let mut input = write_input(7);
+            if let Some(mode) = mode {
+                input["validate"] = json!(mode);
+            }
+            let mut unknown = input.clone();
+            unknown["collection"] = json!("com.example.unknown");
+            unknown["record"]["$type"] = unknown["collection"].clone();
+            input["rkey"] = json!(noncanonical);
+            for invalid in [input, unknown] {
+                let response = app
+                    .clone()
+                    .oneshot(write_http_request(&token, &invalid, HeaderMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(body_json(response).await["error"], errors::INVALID_REQUEST);
+                assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+                assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
             }
         }
-        assert_eq!(
-            store
-                .snapshot("did:web:pub.example.com")
-                .unwrap()
-                .unwrap()
-                .records
-                .len(),
-            2
-        );
-        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let mut input = write_input(7);
+        input["record"]["embed"] = json!({"$type":"com.example.futureEmbed","extension":true});
+        input["record"]["extension"] = json!({"value":true});
+        let response = app
+            .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK); // Open unions and extra properties stay extensible.
     }
 
     #[tokio::test]
