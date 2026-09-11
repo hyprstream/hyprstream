@@ -2,7 +2,7 @@
 name = "hyprstream-9p"
 version = "0.1.0"
 edition.workspace = true
-license = "MIT"
+license = "Apache-2.0"
 description = "9P2000.L codec and server-side translator bridging 9P to hyprstream RPC (capnp)"
 
 [lib]

@@ -15,6 +15,7 @@ pub mod gpu_detect;
 pub mod handlers;
 pub mod policy_handlers;
 pub mod pds_handlers;
+pub mod deployment_bootstrap;
 pub mod quick;
 pub mod bootstrap_manager;
 pub mod remote_handlers;
@@ -25,6 +26,7 @@ pub mod sign_challenge;
 pub mod systemd_setup;
 pub mod training_handlers;
 pub mod trust;
+pub mod trust_ceremony;
 pub mod tui_handlers;
 pub mod update_handlers;
 pub mod user_handlers;
@@ -71,11 +73,11 @@ pub use worker_handlers::{
     handle_worker_stop, handle_worker_terminal,
 };
 pub use service_handlers::{
-    handle_service_install,
+    handle_service_install, handle_service_provision_policy_templates,
     handle_service_uninstall, handle_service_start, handle_service_stop, handle_service_status,
 };
 pub use sign_challenge::handle_sign_challenge;
-pub use wizard_handlers::{handle_wizard, handle_wizard_tui};
+pub use wizard_handlers::{handle_wizard, handle_wizard_tui, WizardOptions};
 
 /// Device preference strategy
 #[derive(Debug, Clone, Copy)]

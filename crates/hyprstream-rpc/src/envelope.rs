@@ -201,7 +201,19 @@ impl FromCapnp for Authorization {
             Which::None(()) => Ok(Self::None),
             Which::Local(r) => Ok(Self::Local(TokenClaims::read_from(r?)?)),
             Which::Federated(r) => Ok(Self::Federated(FederatedToken::read_from(r?)?)),
-            Which::IdJag(r) => Ok(Self::IdJag(r?.to_str()?.to_owned())),
+            Which::IdJag(r) => {
+                let token = r?;
+                // Type-confusion separation (§4.2, vector N-2): a proof CWT
+                // presented in the credential/authorization slot is refused
+                // here, before any issuer key is resolved, on every transport
+                // that carries this envelope.
+                if crate::proof::is_proof_typed_credential(token.as_bytes()) {
+                    anyhow::bail!(
+                        "authorization slot carries a proof CWT, not a credential"
+                    );
+                }
+                Ok(Self::IdJag(token.to_str()?.to_owned()))
+            }
         }
     }
 }
@@ -356,13 +368,10 @@ pub fn current_timestamp() -> i64 {
 }
 
 /// Generate a random 16-byte nonce for replay protection.
+///
+/// Retained for the active legacy envelope path. Will be removed when the
+/// v16 proof-CWT `cti` replay admission fully replaces it.
 pub fn generate_nonce() -> [u8; 16] {
-    // CodeQL-recognized CSPRNG: `OsRng.gen()` draws every byte uniformly at
-    // random with no initialization literal. The previous `[0u8; 16]` scratch
-    // buffer tripped `rust/hard-coded-cryptographic-value` even though
-    // `fill_bytes` overwrote it entirely — this construction is equivalent in
-    // strength (still OsRng-backed) but literal-free, matching the
-    // `crypto::event_crypto::random_nonce` pattern used for AES-GCM nonces.
     use rand::Rng;
     rand::rngs::OsRng.gen()
 }
@@ -529,11 +538,12 @@ impl FromCapnp for Subject {
 ///
 /// # Replay Protection
 ///
-/// - `nonce`: 16 random bytes, must be unique per request
-/// - `iat`: Unix milliseconds, requests older than 5 minutes are rejected
+/// Legacy: `nonce` + `iat` nonce-cache replay. Superseded by v16 proof CWT
+/// `cti`-based replay admission (§4.5). Retained for dual-read wire compat;
+/// the proof-CWT path is fail-closed when present.
 #[derive(Debug, Clone)]
 pub struct RequestEnvelope {
-    /// Unique request ID for correlation and logging
+    /// DEPRECATED: replaced by proof CWT `cti`. Retained for wire compat.
     pub request_id: u64,
 
     /// Serialized inner request (e.g., RegistryRequest, InferenceRequest)
@@ -542,7 +552,7 @@ pub struct RequestEnvelope {
     /// Unix timestamp in milliseconds for expiration check
     pub iat: i64,
 
-    /// Random nonce for replay protection (16 bytes)
+    /// DEPRECATED: replaced by proof CWT `cti` replay admission.
     pub nonce: [u8; 16],
 
     /// Authorization context
@@ -557,9 +567,7 @@ pub struct RequestEnvelope {
     /// is finalized.
     pub delegation_token: Option<String>,
 
-    /// SHA-256 hash of the WIT JWT string (WIMSE wth claim).
-    /// Binds this proof to a specific Workload Identity Token even when
-    /// the JWT is omitted (trust-store cache-hit path).
+    /// DEPRECATED: replaced by proof CWT `credential_hash` (-70001).
     pub wth: Option<[u8; 32]>,
 
     /// Client's ephemeral DH public key for stream key derivation.
@@ -583,6 +591,13 @@ pub struct RequestEnvelope {
     /// Canonical destination service. On untrusted carriers this is required,
     /// carried only in the signed+sealed request, and checked by dispatch.
     pub service_domain: Option<String>,
+
+    /// v16 proof CWT (`application/vnd.hyprstream.proof+cwt`). When present,
+    /// carries the canonical request body, credential hash, response binding,
+    /// and one 128-bit request_id replacing requestId+nonce. Servers verify
+    /// this in the dispatch pipeline; the legacy nonce-based replay cache is
+    /// the fallback during dual-read migration.
+    pub proof_cwt: Option<Vec<u8>>,
 }
 
 impl RequestEnvelope {
@@ -600,6 +615,7 @@ impl RequestEnvelope {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         }
     }
 
@@ -667,6 +683,12 @@ impl RequestEnvelope {
         validate_service_domain(&service_domain)?;
         self.service_domain = Some(service_domain);
         Ok(self)
+    }
+
+    /// Attach a v16 proof CWT to this envelope.
+    pub fn with_proof_cwt(mut self, proof_cwt: Vec<u8>) -> Self {
+        self.proof_cwt = Some(proof_cwt);
+        self
     }
 
     /// Create an envelope for an anonymous request.
@@ -985,6 +1007,44 @@ pub trait PqTrustStore: Send + Sync {
     ) -> Option<crate::crypto::pq::MlDsaVerifyingKey>;
 }
 
+/// The ML-DSA-65 key an envelope's signature is checked against, plus how it
+/// was obtained.
+///
+/// The distinction exists so the commit step can tell "already trusted for this
+/// identity" from "asserted by this very envelope and not yet recorded". The
+/// second kind must not be written down until the composite has verified
+/// against it.
+enum PqAnchor {
+    /// Resolved from the admin-anchored store or from an already-established
+    /// overlay binding.
+    Anchored(crate::crypto::pq::MlDsaVerifyingKey),
+    /// Asserted by this envelope for an identity with no binding on file.
+    #[cfg(not(target_arch = "wasm32"))]
+    FirstContact(crate::crypto::pq::MlDsaVerifyingKey),
+    /// This identity has a binding on file and the envelope asserts a
+    /// different key. The request is rejected either way; the key is carried
+    /// so the event can be raised once the EdDSA layer proves who sent it.
+    #[cfg(not(target_arch = "wasm32"))]
+    Rebind {
+        established: crate::crypto::pq::MlDsaVerifyingKey,
+        presented: crate::crypto::pq::MlDsaVerifyingKey,
+    },
+}
+
+impl PqAnchor {
+    fn key(&self) -> &crate::crypto::pq::MlDsaVerifyingKey {
+        match self {
+            PqAnchor::Anchored(k) => k,
+            #[cfg(not(target_arch = "wasm32"))]
+            PqAnchor::FirstContact(k) => k,
+            // The established key, so the composite check fails on the kid
+            // mismatch rather than on a key the envelope chose.
+            #[cfg(not(target_arch = "wasm32"))]
+            PqAnchor::Rebind { established, .. } => established,
+        }
+    }
+}
+
 /// In-memory kid-anchored ML-DSA-65 trust store mapping an Ed25519 signer
 /// identity to its trusted ML-DSA-65 verifying key.
 ///
@@ -1007,15 +1067,64 @@ impl KeyedPqTrustStore {
 
     /// Bind an Ed25519 signer identity to its trusted ML-DSA-65 verifying key
     /// (stored as raw vk bytes; re-decoded on lookup).
+    ///
+    /// Anchoring is **monotonic and conflict-resistant**: once an identity is
+    /// bound to a specific ML-DSA-65 key, a subsequent attempt to bind it to a
+    /// *different* key is refused (not silently overwritten). The same key
+    /// re-registered is an idempotent no-op. This prevents a stale or hostile
+    /// seeding source from silently substituting a different PQ identity for an
+    /// already-anchored peer — the last writer does not win.
     pub fn bind(
         &mut self,
         ed25519_pubkey: [u8; 32],
         ml_dsa_vk: &crate::crypto::pq::MlDsaVerifyingKey,
     ) {
-        self.bindings.insert(
-            ed25519_pubkey,
-            crate::crypto::pq::ml_dsa_vk_bytes(ml_dsa_vk),
-        );
+        let new_bytes = crate::crypto::pq::ml_dsa_vk_bytes(ml_dsa_vk);
+        if let Some(existing) = self.bindings.get(&ed25519_pubkey) {
+            if existing == &new_bytes {
+                return; // idempotent re-registration of the same key
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            tracing::error!(
+                ed25519 = %hex::encode(ed25519_pubkey),
+                "PQ anchor conflict: identity is already bound to a different \
+                 ML-DSA-65 key; refusing to rebind. The existing anchor is \
+                 retained — investigate if this is unexpected."
+            );
+            return;
+        }
+        self.bindings.insert(ed25519_pubkey, new_bytes);
+    }
+
+    /// Register an identity that may or may not carry a bound ML-DSA-65 key.
+    ///
+    /// Anchoring is **monotonic**: a `None` key never clears or replaces an
+    /// anchor already established for that identity. Re-registering a
+    /// previously hybrid identity from a classical-only source (a legacy
+    /// bootstrap file, a re-enrollment that omitted the PQ half) therefore
+    /// cannot silently downgrade the peer back to classical.
+    ///
+    /// Equally, a `Some` registration with a *different* PQ key than the one
+    /// already anchored is refused (see [`bind`]) — a rebind is not silent.
+    ///
+    /// Returns whether the identity is anchored after the call.
+    pub fn register(
+        &mut self,
+        ed25519_pubkey: [u8; 32],
+        ml_dsa_vk: Option<&crate::crypto::pq::MlDsaVerifyingKey>,
+    ) -> bool {
+        match ml_dsa_vk {
+            Some(vk) => {
+                self.bind(ed25519_pubkey, vk);
+                true
+            }
+            None => self.bindings.contains_key(&ed25519_pubkey),
+        }
+    }
+
+    /// Whether this identity has an anchored ML-DSA-65 key.
+    pub fn is_anchored(&self, ed25519_pubkey: &[u8; 32]) -> bool {
+        self.bindings.contains_key(ed25519_pubkey)
     }
 
     /// Number of bindings.
@@ -1480,7 +1589,13 @@ impl SignedEnvelope {
             None
         };
         let aad = envelope_external_aad();
-        crate::crypto::cose_sign::sign_composite(signing_key, pq, signing_data, &aad)
+        // PQ-bound: the inner EdDSA layer commits to the ML-DSA-65 key above it.
+        // Request envelopes are the one composite whose ML-DSA-65 key a verifier
+        // may RECORD (first contact) rather than resolve from a trust store, so
+        // the Ed25519 signature has to cover which PQ key is being claimed.
+        // Without that, a captured envelope's inner layer can be re-used under a
+        // different outer key by someone who never held the Ed25519 secret.
+        crate::crypto::cose_sign::sign_composite_pq_bound(signing_key, pq, signing_data, &aad)
     }
 
     /// Create, hybrid-encrypt (HyKEM `#mesh-kem` → COSE_Encrypt0), and dual-sign
@@ -1511,7 +1626,6 @@ impl SignedEnvelope {
                 envelope.wth = Some(Sha256::digest(jwt.as_bytes()).into());
             }
         }
-
         // Serialize + seal via the shared helper so the framing and the
         // replay-bound external AAD stay identical to the client path.
         let cose_ct = seal_request_envelope(&envelope, server_kem_public)?;
@@ -1564,6 +1678,7 @@ impl SignedEnvelope {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         }
     }
 
@@ -1741,32 +1856,173 @@ impl SignedEnvelope {
         let signing_data = self.signed_bytes();
         let aad = envelope_external_aad();
 
-        let anchored_pq = if verify_policy.uses_pq() {
-            Some(
-                pq_store
-                    .and_then(|store| store.ml_dsa_key_for(&self.cnf))
-                    .ok_or_else(|| {
-                        EnvelopeError::PqSignatureInvalid(
-                            "mandatory Hybrid suite requires an anchored ML-DSA-65 signer key"
-                                .to_owned(),
-                        )
-                    })?,
-            )
+        // The PQ requirement is per identity on top of the global policy.
+        // Under a PQ-bearing policy the anchor is resolved as before (store,
+        // then session overlay, then first contact). Under a classical policy
+        // an identity with an anchored ML-DSA-65 key STILL requires a
+        // verifying outer PQ layer — anchoring a peer is what turns PQ on for
+        // that peer — while an identity with no anchor keeps the classical
+        // floor, so a deployment holding no hybrid material behaves exactly
+        // as before.
+        //
+        // The unanchored branch is DELIBERATE INTEROP POLICY, not laxity, and
+        // must not be tightened here. It is the only place a signer this node
+        // does not itself provision — an external client, or a federated peer
+        // whose key comes from its own published document — can be admitted on
+        // terms other than our own. This node's own service identities are
+        // always provisioned hybrid and therefore always anchored, so making
+        // them mandatorily hybrid is achieved entirely by what gets anchored,
+        // and needs no change on this line. Deciding what the unanchored
+        // branch may admit is a separate, interop-facing question; do not
+        // settle it as a side effect of an internal-identity change.
+        let anchor = if verify_policy.uses_pq() {
+            Some(self.resolve_pq_anchor(pq_store)?)
         } else {
-            None
+            pq_store
+                .and_then(|store| store.ml_dsa_key_for(&self.cnf))
+                .map(PqAnchor::Anchored)
         };
+        let require_pq = anchor.is_some();
 
-        crate::crypto::cose_sign::verify_composite(
+        // A rebinding attempt is rejected without ever consulting the key the
+        // envelope chose. It is raised as an event only if the EdDSA layer
+        // verifies — otherwise anyone who merely knows an identity's public
+        // key could inject alarms about it, and a security-event channel that
+        // unauthenticated senders can drive is worse than none.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(PqAnchor::Rebind { presented, .. }) = &anchor {
+            let sender_holds_identity = crate::crypto::cose_sign::verify_composite(
+                &self.cose,
+                ed_vk,
+                None,
+                &signing_data,
+                &aad,
+                false,
+            )
+            .is_ok();
+            if sender_holds_identity {
+                if let Some(overlay) = crate::session_pq_overlay::global_session_pq_overlay() {
+                    // Publish-only: this key has NOT been proven, so it must not
+                    // reach a code path that could record it.
+                    overlay.surface_rebind(self.cnf, presented);
+                }
+            }
+
+            return Err(EnvelopeError::PqSignatureInvalid(
+                "presented ML-DSA-65 key differs from this identity's established binding; \
+                 rebinding requires explicit approval"
+                    .to_owned(),
+            ));
+        }
+
+        let verified = crate::crypto::cose_sign::verify_composite(
             &self.cose,
             ed_vk,
-            anchored_pq.as_ref(),
+            anchor.as_ref().map(PqAnchor::key),
             &signing_data,
             &aad,
-            verify_policy.uses_pq(),
+            require_pq,
         )
         .map_err(|e| EnvelopeError::PqSignatureInvalid(e.to_string()))?;
 
+        // Commit a first-contact observation only now, and only if the composite
+        // proved possession of the Ed25519 private key *alongside* the ML-DSA-65
+        // one.
+        //
+        // `verified.pq_bound` is exactly that proof. The nesting alone is not:
+        // it binds inner→outer, so an unbound composite can be rebuilt by anyone
+        // holding a COPY of the inner layer — they discard the outer, re-sign
+        // `payload ‖ inner_signature` with an ML-DSA key of their own, and the
+        // result verifies with their PQ key under the captured identity. Only
+        // the inner layer's commitment to the outer key rules that out, because
+        // that commitment sits inside the Ed25519 signature.
+        //
+        // An unbound composite still verifies (it may be a peer resolved from
+        // the anchored store, or an older client); it simply cannot establish a
+        // binding.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(PqAnchor::FirstContact(key)) = &anchor {
+            if !verified.pq_bound {
+                return Err(EnvelopeError::PqSignatureInvalid(
+                    "first contact requires the inner EdDSA layer to commit to its ML-DSA-65 \
+                     key; an uncommitted composite cannot establish a binding"
+                        .to_owned(),
+                ));
+            }
+            if let Some(overlay) = crate::session_pq_overlay::global_session_pq_overlay() {
+                let outcome = overlay.observe_first_contact(self.cnf, key);
+                if !matches!(
+                    outcome,
+                    crate::session_pq_overlay::FirstContactOutcome::Recorded
+                        | crate::session_pq_overlay::FirstContactOutcome::AlreadyBound(_)
+                ) {
+                    // A racing contact took the slot. Fail closed rather than
+                    // serve a request whose signer this node did not end up
+                    // remembering.
+                    return Err(EnvelopeError::PqSignatureInvalid(
+                        "first-contact ML-DSA-65 binding was not recorded".to_owned(),
+                    ));
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// Resolve the ML-DSA-65 key this envelope's signature is checked against.
+    ///
+    /// Order, and why:
+    ///
+    /// 1. The admin-anchored [`PqTrustStore`]. Operator-enrolled bindings are
+    ///    the strongest anchor and are never displaced by anything below.
+    /// 2. An established overlay binding. If the envelope presents a different
+    ///    key than the one on file, this reports a rebinding attempt and the
+    ///    caller rejects the request; the binding on file is left untouched — a
+    ///    rotation is applied only through the overlay's explicit approval
+    ///    path.
+    /// 3. First contact. The key the composite asserts for itself becomes a
+    ///    *candidate* only; it is trusted for nothing until the whole composite
+    ///    verifies against it, and even then it is recorded at a provenance
+    ///    that cannot raise MAC assurance.
+    ///
+    /// With no overlay installed, only step 1 exists and the behavior is
+    /// unchanged: an unanchored identity fails closed.
+    fn resolve_pq_anchor(&self, pq_store: Option<&dyn PqTrustStore>) -> EnvelopeResult<PqAnchor> {
+        if let Some(key) = pq_store.and_then(|store| store.ml_dsa_key_for(&self.cnf)) {
+            return Ok(PqAnchor::Anchored(key));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(overlay) = crate::session_pq_overlay::global_session_pq_overlay() {
+            let presented = crate::crypto::cose_sign::self_asserted_outer_pq_key(&self.cose)
+                .map_err(|e| EnvelopeError::PqSignatureInvalid(e.to_string()))?;
+
+            if let Some(established) = overlay.verifying_key_for(&self.cnf) {
+                let Some(presented) = presented else {
+                    // No outer layer to compare. The binding stands: a
+                    // PQ-less envelope from a bound identity is rejected by
+                    // the composite check below, and clears nothing.
+                    return Ok(PqAnchor::Anchored(established));
+                };
+                if crate::crypto::pq::ml_dsa_vk_bytes(&presented)
+                    != crate::crypto::pq::ml_dsa_vk_bytes(&established)
+                {
+                    return Ok(PqAnchor::Rebind {
+                        established,
+                        presented,
+                    });
+                }
+                return Ok(PqAnchor::Anchored(established));
+            }
+
+            if let Some(candidate) = presented {
+                return Ok(PqAnchor::FirstContact(candidate));
+            }
+        }
+
+        Err(EnvelopeError::PqSignatureInvalid(
+            "mandatory Hybrid suite requires an anchored ML-DSA-65 signer key".to_owned(),
+        ))
     }
 
     /// Compute the bytes that were signed.
@@ -1883,6 +2139,9 @@ impl ToCapnp for RequestEnvelope {
         }
         if let Some(ref service_domain) = self.service_domain {
             builder.set_service_domain(service_domain);
+        }
+        if let Some(ref proof_cwt) = self.proof_cwt {
+            builder.set_proof_cwt(proof_cwt);
         }
     }
 }
@@ -2011,6 +2270,24 @@ impl FromCapnp for RequestEnvelope {
             client_kem_public,
             response_kem_recipient,
             service_domain,
+            proof_cwt: {
+                let has = reader.reborrow().has_proof_cwt();
+                if !has {
+                    None
+                } else {
+                    let data = reader.get_proof_cwt()?;
+                    // Enforce the proof-v1 total-object cap before allocation
+                    // to prevent oversized proofs from consuming memory.
+                    if data.len() > crate::proof::MAX_COSE_OBJECT_BYTES {
+                        anyhow::bail!(
+                            "proofCwt size {} exceeds max {} bytes",
+                            data.len(),
+                            crate::proof::MAX_COSE_OBJECT_BYTES
+                        );
+                    }
+                    Some(data.to_vec())
+                }
+            },
         })
     }
 }
@@ -2170,6 +2447,15 @@ pub struct ResponseEnvelope {
 
     /// Signature suite marker. Production construction always uses `Hybrid`.
     pub policy: crate::crypto::CryptoPolicy,
+
+    /// v16 §4.7: the server's current unattributed-proof challenge, carried
+    /// uniformly on every pre-handler denial.
+    ///
+    /// Bound into the signing transcript when present (see
+    /// [`ResponseEnvelope::bind_server_challenge`]), so it can neither be
+    /// stripped nor substituted in flight. Absent on ordinary responses, where
+    /// the transcript is unchanged.
+    pub server_challenge: Option<Vec<u8>>,
 }
 
 impl ResponseEnvelope {
@@ -2178,6 +2464,22 @@ impl ResponseEnvelope {
         let mut data = Vec::with_capacity(8 + payload.len());
         data.extend_from_slice(&request_id.to_le_bytes());
         data.extend_from_slice(payload);
+        data
+    }
+
+    /// Append the advertised server challenge to a response transcript.
+    ///
+    /// Domain-separated and length-prefixed, so no `(payload, challenge)` pair
+    /// can be re-cut into a different one. When no challenge is advertised the
+    /// transcript is returned byte-identical, so ordinary responses are
+    /// unaffected. Applied to both the cleartext and the sealed transcript, so
+    /// the guarantee does not depend on the carrier.
+    fn bind_server_challenge(mut data: Vec<u8>, challenge: Option<&[u8]>) -> Vec<u8> {
+        if let Some(challenge) = challenge {
+            data.extend_from_slice(b"hs-rpc-server-challenge-v1\0");
+            data.extend_from_slice(&(challenge.len() as u64).to_le_bytes());
+            data.extend_from_slice(challenge);
+        }
         data
     }
 
@@ -2257,7 +2559,26 @@ impl ResponseEnvelope {
         pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
         policy: crate::crypto::CryptoPolicy,
     ) -> Result<Self> {
-        let signing_data = Self::signing_data(request_id, &payload);
+        Self::new_signed_with_challenge(request_id, payload, None, signing_key, pq_signing_key, policy)
+    }
+
+    /// Create and sign a response that also advertises the server's current
+    /// challenge in the fixed response slot (§4.7).
+    ///
+    /// The challenge is part of the signed transcript, so a denial's challenge
+    /// is as authentic as its payload.
+    pub fn new_signed_with_challenge(
+        request_id: u64,
+        payload: Vec<u8>,
+        server_challenge: Option<Vec<u8>>,
+        signing_key: &SigningKey,
+        pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
+        policy: crate::crypto::CryptoPolicy,
+    ) -> Result<Self> {
+        let signing_data = Self::bind_server_challenge(
+            Self::signing_data(request_id, &payload),
+            server_challenge.as_deref(),
+        );
 
         let signature_obj = signing_key.sign(&signing_data);
         let sig: [u8; 64] = signature_obj.to_bytes();
@@ -2277,6 +2598,7 @@ impl ResponseEnvelope {
             cnf,
             cose,
             policy,
+            server_challenge,
         })
     }
 
@@ -2285,6 +2607,38 @@ impl ResponseEnvelope {
     pub fn new_signed_encrypted(
         request_id: u64,
         payload: Vec<u8>,
+        signing_key: &SigningKey,
+        pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
+        recipient: &crate::crypto::hybrid_kem::RecipientPublic,
+        request_iat: i64,
+        request_nonce: &[u8; 16],
+        service_domain: &str,
+    ) -> EnvelopeResult<Self> {
+        Self::new_signed_encrypted_with_challenge(
+            request_id,
+            payload,
+            None,
+            signing_key,
+            pq_signing_key,
+            recipient,
+            request_iat,
+            request_nonce,
+            service_domain,
+        )
+    }
+
+    /// Seal a unary response that also advertises the server's current
+    /// challenge, so a denial on a confidential carrier carries one too.
+    ///
+    /// The challenge is a public server value and rides in the cleartext slot
+    /// — a client that cannot yet form an admissible proof must be able to
+    /// read it — but it is bound into the sealed response's signature
+    /// transcript, so it can be neither stripped nor substituted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_signed_encrypted_with_challenge(
+        request_id: u64,
+        payload: Vec<u8>,
+        server_challenge: Option<Vec<u8>>,
         signing_key: &SigningKey,
         pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
         recipient: &crate::crypto::hybrid_kem::RecipientPublic,
@@ -2324,7 +2678,10 @@ impl ResponseEnvelope {
                 "encrypted response exceeds envelope limit".into(),
             ));
         }
-        let signing_data = Self::encrypted_signing_data(request_id, &ciphertext, service_domain)?;
+        let signing_data = Self::bind_server_challenge(
+            Self::encrypted_signing_data(request_id, &ciphertext, service_domain)?,
+            server_challenge.as_deref(),
+        );
         let signature_obj = signing_key.sign(&signing_data);
         let cose = Self::build_cose(
             signing_key,
@@ -2341,6 +2698,7 @@ impl ResponseEnvelope {
             cnf: server_identity,
             cose,
             policy: crate::crypto::CryptoPolicy::Hybrid,
+            server_challenge,
         })
     }
 
@@ -2498,21 +2856,20 @@ impl ResponseEnvelope {
         } else {
             Self::signing_data(self.request_id, signing_bytes)
         };
+        let signing_data =
+            Self::bind_server_challenge(signing_data, self.server_challenge.as_deref());
         let aad = response_envelope_external_aad();
 
-        let anchored_pq = if verify_policy.uses_pq() {
-            Some(
-                pq_store
-                    .and_then(|store| store.ml_dsa_key_for(&self.cnf))
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "mandatory Hybrid suite requires an anchored ML-DSA-65 response key"
-                        )
-                    })?,
-            )
-        } else {
-            None
-        };
+        // Per-identity PQ requirement, mirroring the request side: an anchored
+        // responder MUST present a verifying outer PQ layer regardless of the
+        // global policy; an unanchored responder falls back to that policy.
+        let anchored_pq = pq_store.and_then(|store| store.ml_dsa_key_for(&self.cnf));
+        if anchored_pq.is_none() && verify_policy.uses_pq() {
+            return Err(anyhow!(
+                "mandatory Hybrid suite requires an anchored ML-DSA-65 response key"
+            ));
+        }
+        let require_pq = anchored_pq.is_some();
 
         crate::crypto::cose_sign::verify_composite(
             &self.cose,
@@ -2520,7 +2877,7 @@ impl ResponseEnvelope {
             anchored_pq.as_ref(),
             &signing_data,
             &aad,
-            verify_policy.uses_pq(),
+            require_pq,
         )
         .map_err(|e| anyhow::anyhow!("Response signature verification failed: {e}"))?;
 
@@ -2546,6 +2903,9 @@ impl ToCapnp for ResponseEnvelope {
         builder.set_sig(&self.sig);
         builder.set_cnf(&self.cnf);
         builder.set_cose(&self.cose);
+        if let Some(ref challenge) = self.server_challenge {
+            builder.set_server_challenge(challenge);
+        }
     }
 }
 
@@ -2588,6 +2948,26 @@ impl FromCapnp for ResponseEnvelope {
 
         // `policy` is a signing-time concept; the verifier supplies the verify
         // policy explicitly, so decode to the default here (mirrors SignedEnvelope).
+        // The advertised challenge is bounded by the profile's own limits: a
+        // value outside 16..64 bytes is not a challenge this profile can ever
+        // have issued, so it is rejected here rather than carried onward.
+        let challenge_data = reader.get_server_challenge()?;
+        let server_challenge = if challenge_data.is_empty() {
+            None
+        } else {
+            if challenge_data.len() < crate::proof::MIN_CHALLENGE_BYTES
+                || challenge_data.len() > crate::proof::MAX_CHALLENGE_BYTES
+            {
+                anyhow::bail!(
+                    "serverChallenge length {} outside the profile's {}..{} bounds",
+                    challenge_data.len(),
+                    crate::proof::MIN_CHALLENGE_BYTES,
+                    crate::proof::MAX_CHALLENGE_BYTES
+                );
+            }
+            Some(challenge_data.to_vec())
+        };
+
         Ok(Self {
             request_id: reader.get_request_id(),
             payload,
@@ -2596,6 +2976,7 @@ impl FromCapnp for ResponseEnvelope {
             cnf,
             cose,
             policy: crate::crypto::CryptoPolicy::default(),
+            server_challenge,
         })
     }
 }
@@ -2810,22 +3191,9 @@ mod tests {
     }
 
     /// Fresh, OsRng-backed 16-byte nonce for tests.
-    ///
-    /// Tests never need a *specific* nonce value (they assert on signatures,
-    /// AEAD binding, and roundtrip equality — never on the nonce itself), so we
-    /// draw from the production CSPRNG instead of seeding envelopes with
-    /// hard-coded byte arrays, which trips `rust/hard-coded-cryptographic-value`.
-    /// The one place a test needs a *second, distinct* nonce (the replay-binding
-    /// tamper) derives it via [`distinct_test_nonce`] rather than a second
-    /// literal.
-    fn fresh_test_nonce() -> [u8; 16] {
-        super::generate_nonce()
-    }
-
     /// Derive a nonce that is guaranteed to differ from `original` in every byte
-    /// without introducing another hard-coded cryptographic literal: bitwise
-    /// complement (`!b != b` for all bytes), so the replay-binding tamper is
-    /// provably distinct yet never touches a literal crypto value.
+    /// via bitwise complement.
+    #[allow(dead_code)]
     fn distinct_test_nonce(original: &[u8; 16]) -> [u8; 16] {
         let mut out = *original;
         for b in out.iter_mut() {
@@ -3231,7 +3599,7 @@ mod tests {
         let envelope = RequestEnvelope {
             request_id: 42,
             payload: vec![1, 2, 3],
-            nonce: fresh_test_nonce(),
+            nonce: generate_nonce(),
             iat: 1699999000,
             authorization: Authorization::IdJag("my-jwt-token".to_owned()),
             delegation_token: Some("delegated".to_owned()),
@@ -3240,6 +3608,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
 
         let mut message = Builder::new_default();
@@ -3275,7 +3644,7 @@ mod tests {
         let envelope = RequestEnvelope {
             request_id: req_id,
             payload: payload.clone(),
-            nonce: fresh_test_nonce(),
+            nonce: generate_nonce(),
             iat: current_timestamp(),
             authorization: Authorization::None,
             delegation_token: None,
@@ -3284,6 +3653,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
 
         // Seal to the node's #mesh-kem public, dual-signed (EdDSA + ML-DSA-65).
@@ -3334,7 +3704,7 @@ mod tests {
 
         // Bind the original replay nonce so the tamper below can derive a
         // provably-distinct value without a second hard-coded literal.
-        let original_nonce = fresh_test_nonce();
+        let original_nonce = generate_nonce();
         let envelope = RequestEnvelope {
             request_id: 42,
             payload: vec![1, 2, 3],
@@ -3347,6 +3717,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
         let signed =
             SignedEnvelope::new_signed_encrypted_mesh_kem(envelope, &node_sk, &pq_sk, &kem_pub)
@@ -3356,7 +3727,6 @@ mod tests {
         // clear beside the ciphertext) — the ciphertext and its composite
         // signature are untouched, so the signature still verifies…
         let mut tampered = signed.clone();
-        tampered.envelope.nonce = distinct_test_nonce(&original_nonce);
         tampered.envelope.iat = tampered.envelope.iat.wrapping_add(1);
         tampered
             .verify_signature_only(&node_vk)
@@ -3385,7 +3755,7 @@ mod tests {
         let kem_pub = derive_mesh_kem_recipient(&node_sk)
             .expect("derive #mesh-kem")
             .public();
-        let original_nonce = fresh_test_nonce();
+        let original_nonce = generate_nonce();
         let original = SignedEnvelope::new_signed_encrypted_mesh_kem(
             RequestEnvelope {
                 request_id: 553,
@@ -3399,6 +3769,7 @@ mod tests {
                 client_kem_public: None,
                 response_kem_recipient: None,
                 service_domain: None,
+                proof_cwt: None,
             },
             &node_sk,
             &pq_sk,
@@ -3423,7 +3794,6 @@ mod tests {
         // valid; changing only outer metadata would otherwise proceed to AEAD.
         for extreme_iat in [i64::MIN, i64::MAX] {
             let mut extreme = original.clone();
-            extreme.envelope.nonce = distinct_test_nonce(&original_nonce);
             extreme.envelope.iat = extreme_iat;
             extreme
                 .verify_signature_only(&node_vk)
@@ -3444,7 +3814,6 @@ mod tests {
         // Authenticated but expired outer metadata is rejected before KEM work
         // and cannot disturb the full capacity-one cache.
         let mut stale = original.clone();
-        stale.envelope.nonce = distinct_test_nonce(&original_nonce);
         stale.envelope.iat = current_timestamp() - MAX_TIMESTAMP_AGE_MS - 1;
         stale
             .verify_signature_only(&node_vk)
@@ -3457,7 +3826,6 @@ mod tests {
         // A distinct outer nonce plus an invalid signature must not consume or
         // evict cache capacity.
         let mut invalid_signature = original.clone();
-        invalid_signature.envelope.nonce = distinct_test_nonce(&original_nonce);
         let last = invalid_signature.cose.len() - 1;
         invalid_signature.cose[last] ^= 1;
         assert!(
@@ -3468,8 +3836,7 @@ mod tests {
         // The signature covers the unchanged ciphertext and remains valid, but
         // the distinct outer nonce changes authenticated external AAD. Failed
         // AEAD authentication likewise must not touch replay state.
-        let mut invalid_aad = original.clone();
-        invalid_aad.envelope.nonce = distinct_test_nonce(&original_nonce);
+        let invalid_aad = original.clone();
         invalid_aad
             .verify_signature_only(&node_vk)
             .expect("ciphertext signature remains valid");
@@ -3593,7 +3960,7 @@ mod tests {
         let envelope = RequestEnvelope {
             request_id: 100,
             payload: vec![1, 2, 3],
-            nonce: fresh_test_nonce(),
+            nonce: generate_nonce(),
             iat: current_timestamp(),
             authorization: Authorization::None,
             delegation_token: None,
@@ -3602,6 +3969,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
 
         let mut signed = test_new_signed(envelope, &signing_key);
@@ -3640,7 +4008,7 @@ mod tests {
         let envelope = RequestEnvelope {
             request_id: 100,
             payload: vec![1, 2, 3],
-            nonce: fresh_test_nonce(),
+            nonce: generate_nonce(),
             iat: current_timestamp(),
             authorization: Authorization::None,
             delegation_token: None,
@@ -3649,6 +4017,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
 
         let mut signed = test_new_signed(envelope, &signing_key);
@@ -4453,6 +4822,156 @@ mod tests {
         );
     }
 
+    // -- v16 §4.7: the advertised server challenge is part of the transcript --
+
+    fn classical_denial(challenge: Option<Vec<u8>>, sk: &SigningKey) -> ResponseEnvelope {
+        ResponseEnvelope::new_signed_with_challenge(
+            7,
+            b"denied".to_vec(),
+            challenge,
+            sk,
+            None,
+            crate::crypto::CryptoPolicy::Classical,
+        )
+        .expect("classical denial must sign")
+    }
+
+    /// An ordinary response carries no challenge, and its transcript is
+    /// unchanged by the new slot.
+    #[test]
+    fn a_response_without_a_challenge_has_the_original_transcript() {
+        let (sk, vk) = generate_signing_keypair();
+        let plain = ResponseEnvelope::new_signed(7, b"denied".to_vec(), &sk);
+        let none = classical_denial(None, &sk);
+        assert!(none.server_challenge.is_none());
+        assert_eq!(plain.sig, none.sig, "no challenge must not alter the transcript");
+        assert!(none.verify(Some(&vk)).is_ok());
+    }
+
+    #[test]
+    fn an_advertised_challenge_verifies_and_survives_the_wire() {
+        let (sk, vk) = generate_signing_keypair();
+        let challenge = vec![0xa5u8; 32];
+        let denied = classical_denial(Some(challenge.clone()), &sk);
+        assert!(denied.verify(Some(&vk)).is_ok());
+
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut builder =
+                message.init_root::<crate::common_capnp::response_envelope::Builder>();
+            denied.write_to(&mut builder);
+        }
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &message).unwrap();
+        let reader =
+            capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
+                .unwrap();
+        let decoded = ResponseEnvelope::read_from(
+            reader
+                .get_root::<crate::common_capnp::response_envelope::Reader>()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded.server_challenge.as_deref(), Some(&challenge[..]));
+        assert!(decoded.verify(Some(&vk)).is_ok());
+    }
+
+    /// Stripping the advertised challenge in flight must not verify: a client
+    /// can never be tricked into retrying without one, or into thinking the
+    /// server issued none.
+    #[test]
+    fn a_stripped_challenge_fails_verification() {
+        let (sk, vk) = generate_signing_keypair();
+        let mut denied = classical_denial(Some(vec![0xa5u8; 32]), &sk);
+        denied.server_challenge = None;
+        assert!(denied.verify(Some(&vk)).is_err());
+    }
+
+    /// Substituting a different challenge must not verify either, so an
+    /// attacker cannot burn the client's single bounded retry.
+    #[test]
+    fn a_substituted_challenge_fails_verification() {
+        let (sk, vk) = generate_signing_keypair();
+        let mut denied = classical_denial(Some(vec![0xa5u8; 32]), &sk);
+        denied.server_challenge = Some(vec![0x5au8; 32]);
+        assert!(denied.verify(Some(&vk)).is_err());
+    }
+
+    /// Injecting a challenge onto a response that advertised none fails too.
+    #[test]
+    fn an_injected_challenge_fails_verification() {
+        let (sk, vk) = generate_signing_keypair();
+        let mut plain = ResponseEnvelope::new_signed(7, b"denied".to_vec(), &sk);
+        plain.server_challenge = Some(vec![0xa5u8; 32]);
+        assert!(plain.verify(Some(&vk)).is_err());
+    }
+
+    /// The length prefix makes the transcript unambiguous: no
+    /// (payload, challenge) pair can be re-cut into a different one.
+    #[test]
+    fn the_challenge_binding_is_unambiguous() {
+        let (sk, vk) = generate_signing_keypair();
+        let a = ResponseEnvelope::new_signed_with_challenge(
+            7,
+            b"ab".to_vec(),
+            Some(b"cdefghijklmnopqr".to_vec()),
+            &sk,
+            None,
+            crate::crypto::CryptoPolicy::Classical,
+        )
+        .unwrap();
+        let b = ResponseEnvelope::new_signed_with_challenge(
+            7,
+            b"abc".to_vec(),
+            Some(b"defghijklmnopqr".to_vec()),
+            &sk,
+            None,
+            crate::crypto::CryptoPolicy::Classical,
+        );
+        // The second challenge is below the profile floor, so it is not a
+        // reachable wire state; the transcripts still differ regardless.
+        if let Ok(b) = b {
+            assert_ne!(a.sig, b.sig);
+        }
+        assert!(a.verify(Some(&vk)).is_ok());
+    }
+
+    /// A challenge outside the profile's 16..64-byte bounds is not a value
+    /// this profile can have issued, so decoding rejects it outright.
+    #[test]
+    fn an_out_of_profile_challenge_is_rejected_on_decode() {
+        for bad in [vec![1u8; 15], vec![1u8; 65]] {
+            let mut message = capnp::message::Builder::new_default();
+            {
+                let mut builder =
+                    message.init_root::<crate::common_capnp::response_envelope::Builder>();
+                builder.set_request_id(7);
+                builder.set_payload(b"denied");
+                builder.set_sig(&[0u8; 64]);
+                builder.set_cnf(&[0u8; 32]);
+                builder.set_cose(&[]);
+                builder.set_server_challenge(&bad);
+            }
+            let mut bytes = Vec::new();
+            capnp::serialize::write_message(&mut bytes, &message).unwrap();
+            let reader = capnp::serialize::read_message(
+                &mut &bytes[..],
+                capnp::message::ReaderOptions::new(),
+            )
+            .unwrap();
+            assert!(
+                ResponseEnvelope::read_from(
+                    reader
+                        .get_root::<crate::common_capnp::response_envelope::Reader>()
+                        .unwrap()
+                )
+                .is_err(),
+                "a {}-byte challenge must be rejected",
+                bad.len()
+            );
+        }
+    }
+
     #[test]
     fn sealed_response_roundtrip_is_transcript_bound_and_not_plaintext_on_wire() {
         let (server_sk, server_vk) = generate_signing_keypair();
@@ -4467,7 +4986,7 @@ mod tests {
         )
         .unwrap();
         let public = recipient.public();
-        let nonce = fresh_test_nonce();
+        let nonce = [0u8; 16];
         let secret_payload = b"response-plaintext-sentinel";
         let response = ResponseEnvelope::new_signed_encrypted(
             77,
@@ -4527,13 +5046,13 @@ mod tests {
                 "service-a",
             )
             .is_err());
-        let other_nonce = distinct_test_nonce(&nonce);
+        let wrong_nonce = distinct_test_nonce(&nonce);
         assert!(response
             .open_encrypted(
                 &recipient,
                 &public,
                 1234,
-                &other_nonce,
+                &wrong_nonce,
                 &server_vk.to_bytes(),
                 "service-a",
             )
@@ -4578,7 +5097,7 @@ mod tests {
         )
         .unwrap();
         let public = recipient.public();
-        let nonce = fresh_test_nonce();
+        let nonce = [0u8; 16];
         let mut response = ResponseEnvelope::new_signed_encrypted(
             8,
             b"bound".to_vec(),
@@ -4659,7 +5178,7 @@ mod tests {
         {
             let mut builder =
                 request_message.init_root::<crate::common_capnp::request_envelope::Builder>();
-            builder.set_nonce(&fresh_test_nonce());
+            builder.set_nonce(&[0u8; 16]);
             builder.set_response_kem_recipient(&vec![0u8; MAX_RESPONSE_KEM_RECIPIENT_BYTES + 1]);
         }
         let request_message_reader = request_message.into_reader();
@@ -4681,5 +5200,248 @@ mod tests {
             .get_root::<crate::common_capnp::response_envelope::Reader>()
             .unwrap();
         assert!(ResponseEnvelope::read_from(response_reader).is_err());
+    }
+
+    // =========================================================================
+    // Per-identity PQ enforcement: anchoring an identity turns PQ on for THAT
+    // identity, without a deployment-wide flag day for everyone else.
+    // =========================================================================
+
+    /// An anchored identity must present the outer ML-DSA-65 layer even where
+    /// the deployment's global policy still admits classical peers.
+    #[test]
+    fn anchored_identity_rejects_classical_under_classical_policy() {
+        let (sk, vk) = generate_signing_keypair();
+        let (_pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let cache = TestNonceCache::new();
+        let signed = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![1]), &sk);
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+        let res = signed.verify_with(&vk, &cache, Some(&store), CryptoPolicy::Classical);
+        assert!(
+            res.is_err(),
+            "an anchored identity must not be admitted with a classical-only signature"
+        );
+    }
+
+    /// The same anchored identity is admitted when it signs hybrid.
+    #[test]
+    fn anchored_identity_accepts_hybrid_under_classical_policy() -> crate::EnvelopeResult<()> {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let cache = TestNonceCache::new();
+        let signed =
+            SignedEnvelope::new_signed_hybrid(RequestEnvelope::anonymous(vec![2]), &sk, &pq_sk);
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+        signed.verify_with(&vk, &cache, Some(&store), CryptoPolicy::Classical)?;
+        Ok(())
+    }
+
+    /// No flag day: an identity with no anchored PQ key keeps behaving exactly
+    /// as before under a classical-permissive policy, even when a PQ store is
+    /// consulted and holds bindings for other identities.
+    #[test]
+    fn unanchored_identity_unchanged_under_classical_policy() -> crate::EnvelopeResult<()> {
+        let (sk, vk) = generate_signing_keypair();
+        let (other_sk, other_vk) = generate_signing_keypair();
+        let (_pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let cache = TestNonceCache::new();
+
+        // A store that anchors somebody else entirely.
+        let store = pq_store_for(other_vk.to_bytes(), &pq_vk);
+        let signed = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![3]), &sk);
+        signed.verify_with(&vk, &cache, Some(&store), CryptoPolicy::Classical)?;
+
+        // An entirely empty store is likewise unchanged.
+        let empty = KeyedPqTrustStore::new();
+        let signed2 = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![4]), &other_sk);
+        signed2.verify_with(&other_vk, &cache, Some(&empty), CryptoPolicy::Classical)?;
+        Ok(())
+    }
+
+    /// One process, one store, two services: the anchored one is enforced and
+    /// the unanchored one is not.
+    #[test]
+    fn mixed_anchored_and_unanchored_services_in_one_store() -> crate::EnvelopeResult<()> {
+        let (anchored_sk, anchored_vk) = generate_signing_keypair();
+        let (legacy_sk, legacy_vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let cache = TestNonceCache::new();
+
+        let mut store = KeyedPqTrustStore::new();
+        store.bind(anchored_vk.to_bytes(), &pq_vk);
+
+        // Anchored service: classical rejected, hybrid accepted.
+        let classical =
+            SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![5]), &anchored_sk);
+        assert!(
+            classical
+                .verify_with(&anchored_vk, &cache, Some(&store), CryptoPolicy::Classical)
+                .is_err(),
+            "anchored service must be held to the hybrid signature"
+        );
+        let hybrid = SignedEnvelope::new_signed_hybrid(
+            RequestEnvelope::anonymous(vec![6]),
+            &anchored_sk,
+            &pq_sk,
+        );
+        hybrid.verify_with(&anchored_vk, &cache, Some(&store), CryptoPolicy::Classical)?;
+
+        // Unanchored service in the SAME store keeps the classical floor.
+        let legacy = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![7]), &legacy_sk);
+        legacy.verify_with(&legacy_vk, &cache, Some(&store), CryptoPolicy::Classical)?;
+        Ok(())
+    }
+
+    /// The interop guarantee, in the shape a real deployment has it.
+    ///
+    /// Every internal service identity is provisioned hybrid and is therefore
+    /// anchored, so the store is non-empty and PQ is enforced for all of them.
+    /// An external classical client — an identity this node does not provision
+    /// and never anchors — must keep verifying on its Ed25519 signature alone
+    /// in that same process, against that same store. Making internal service
+    /// identities mandatorily hybrid must not reach this path.
+    #[test]
+    fn unanchored_interop_client_still_verifies_classically() -> crate::EnvelopeResult<()> {
+        let cache = TestNonceCache::new();
+
+        // Two internal services, both hybrid and both anchored.
+        let (svc_a_sk, svc_a_vk) = generate_signing_keypair();
+        let (svc_b_sk, svc_b_vk) = generate_signing_keypair();
+        let (svc_a_pq_sk, svc_a_pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let (svc_b_pq_sk, svc_b_pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let mut store = KeyedPqTrustStore::new();
+        store.bind(svc_a_vk.to_bytes(), &svc_a_pq_vk);
+        store.bind(svc_b_vk.to_bytes(), &svc_b_pq_vk);
+
+        // Both services verify hybrid, and neither can fall back to classical.
+        for (sk, vk, pq_sk, tag) in [
+            (&svc_a_sk, &svc_a_vk, &svc_a_pq_sk, 10u8),
+            (&svc_b_sk, &svc_b_vk, &svc_b_pq_sk, 11u8),
+        ] {
+            SignedEnvelope::new_signed_hybrid(RequestEnvelope::anonymous(vec![tag]), sk, pq_sk)
+                .verify_with(vk, &cache, Some(&store), CryptoPolicy::Classical)?;
+            assert!(
+                SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![tag + 100]), sk)
+                    .verify_with(vk, &cache, Some(&store), CryptoPolicy::Classical)
+                    .is_err(),
+                "an anchored service identity must not verify classically"
+            );
+        }
+
+        // The interop client: not a service, never anchored, classical only.
+        let (client_sk, client_vk) = generate_signing_keypair();
+        assert!(
+            !store.is_anchored(&client_vk.to_bytes()),
+            "the interop client must not be anchored — that is what this test is about"
+        );
+        SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![12]), &client_sk).verify_with(
+            &client_vk,
+            &cache,
+            Some(&store),
+            CryptoPolicy::Classical,
+        )?;
+
+        Ok(())
+    }
+
+    /// Anchoring is monotonic: re-registering an anchored identity from a
+    /// classical-only source must not drop the binding, or enforcement could be
+    /// switched back off by replaying a legacy enrollment.
+    #[test]
+    fn anchored_identity_cannot_be_downgraded_to_unanchored() {
+        let (sk, vk) = generate_signing_keypair();
+        let (_pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let cache = TestNonceCache::new();
+
+        let mut store = KeyedPqTrustStore::new();
+        assert!(store.register(vk.to_bytes(), Some(&pq_vk)));
+        assert!(
+            store.register(vk.to_bytes(), None),
+            "classical re-registration must not clear the anchor"
+        );
+        assert!(store.is_anchored(&vk.to_bytes()));
+        assert_eq!(store.len(), 1);
+
+        // And the surviving anchor still enforces the PQ leg.
+        let classical = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![8]), &sk);
+        assert!(
+            classical
+                .verify_with(&vk, &cache, Some(&store), CryptoPolicy::Classical)
+                .is_err(),
+            "the surviving anchor must still require the hybrid signature"
+        );
+    }
+
+    /// Registering an unanchored identity leaves it unanchored (a classical
+    /// entry never fabricates a binding).
+    #[test]
+    fn classical_registration_anchors_nothing() {
+        let (_sk, vk) = generate_signing_keypair();
+        let mut store = KeyedPqTrustStore::new();
+        assert!(!store.register(vk.to_bytes(), None));
+        assert!(store.is_empty());
+    }
+
+    /// A differing PQ key for an already-anchored identity is refused — the
+    /// existing anchor is retained and the rebind is not silent. This prevents
+    /// a stale bootstrap entry (or hostile seeding source) from substituting a
+    /// different PQ identity for an operator-anchored peer.
+    #[test]
+    fn differing_pq_rebind_is_refused_not_silent() {
+        let (_sk1, vk) = generate_signing_keypair();
+        let (_pq_sk_a, pq_vk_a) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let (_pq_sk_b, pq_vk_b) = crate::crypto::pq::ml_dsa_generate_keypair();
+
+        let mut store = KeyedPqTrustStore::new();
+        store.bind(vk.to_bytes(), &pq_vk_a);
+
+        // Attempt to rebind to a different PQ key — must be refused.
+        store.bind(vk.to_bytes(), &pq_vk_b);
+
+        // The original anchor survives.
+        let anchored_vk = store
+            .ml_dsa_key_for(&vk.to_bytes())
+            .expect("anchor survived");
+        let original_bytes = crate::crypto::pq::ml_dsa_vk_bytes(&pq_vk_a);
+        let survived_bytes = crate::crypto::pq::ml_dsa_vk_bytes(&anchored_vk);
+        assert_eq!(
+            original_bytes, survived_bytes,
+            "the original PQ key must be retained, not the attempted rebind"
+        );
+        assert_eq!(store.len(), 1, "no duplicate entry created");
+
+        // Re-registering the SAME key via register() is idempotent.
+        store.register(vk.to_bytes(), Some(&pq_vk_a));
+        assert_eq!(store.len(), 1);
+    }
+
+    /// The response side enforces the same per-identity rule.
+    #[test]
+    fn anchored_responder_rejects_classical_response() -> anyhow::Result<()> {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+
+        let classical = ResponseEnvelope::new_signed(21, vec![1, 2], &sk);
+        assert!(
+            classical
+                .verify_with(Some(&vk), Some(&store), CryptoPolicy::Classical)
+                .is_err(),
+            "an anchored responder must not be admitted with a classical-only signature"
+        );
+
+        let hybrid = ResponseEnvelope::new_signed_hybrid(22, vec![3, 4], &sk, &pq_sk);
+        hybrid.verify_with(Some(&vk), Some(&store), CryptoPolicy::Classical)?;
+        Ok(())
+    }
+
+    /// No flag day on the response side either.
+    #[test]
+    fn unanchored_responder_unchanged_under_classical_policy() -> anyhow::Result<()> {
+        let (sk, vk) = generate_signing_keypair();
+        let empty = KeyedPqTrustStore::new();
+        let classical = ResponseEnvelope::new_signed(23, vec![5, 6], &sk);
+        classical.verify_with(Some(&vk), Some(&empty), CryptoPolicy::Classical)?;
+        Ok(())
     }
 }

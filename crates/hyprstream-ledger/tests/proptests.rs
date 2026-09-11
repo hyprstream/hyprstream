@@ -26,10 +26,45 @@ fn unit() -> UnitId {
     }
 }
 
+/// The signing key backing the test ledger's issuance authority.
+///
+/// Minting is sealed against fixed key material, so a test has to hold the key
+/// and produce a real signature — the same thing the production issuer does.
+/// There is deliberately no permissive verifier to inject instead.
+fn mint_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+}
+
+/// Authorize and issue in one step, the way the settlement issuer does.
+fn mint(l: &mut MemLedger, t: IssueTransfer) -> hyprstream_ledger::Outcome {
+    let seq = l.head().seq;
+    let fail = |e| hyprstream_ledger::Outcome {
+        result: Err(e),
+        seq,
+    };
+    let input = match hyprstream_ledger::mint_signing_input(&t) {
+        Ok(i) => i,
+        Err(e) => return fail(e),
+    };
+    let sig = match hyprstream_crypto::cose_sign::sign_composite(&mint_key(), None, &input, &[]) {
+        Ok(s) => s,
+        Err(e) => return fail(LedgerError::Internal(e.to_string())),
+    };
+    match l.authorize_mint(&t, &sig) {
+        Ok(cap) => l.credit(cap),
+        Err(e) => fail(e),
+    }
+}
+
 /// Build a ledger with an issuer-liability account (index 0) and `K_SPENDABLE`
 /// spendable accounts. Returns their account ids indexed 0..=K.
 fn fresh() -> (MemLedger, Vec<hyprstream_ledger::AccountId>) {
-    let mut l = MemLedger::new(ledger_id());
+    let mut l = MemLedger::new(
+        ledger_id(),
+        Some(hyprstream_ledger::MintAuthority::classical(
+            mint_key().verifying_key(),
+        )),
+    );
     let mut ids = Vec::new();
     let liability = l
         .open_account(AccountSpec::new(
@@ -181,10 +216,10 @@ proptest! {
                         grant_cid: None,
                         user_data: ud(),
                     };
-                    let out1 = l.credit(t.clone());
+                    let out1 = mint(&mut l, t.clone());
                     // Inline idempotency: replay is transparent, no state change.
                     let before = snapshot(&l);
-                    let out2 = l.credit(t);
+                    let out2 = mint(&mut l, t);
                     prop_assert_eq!(&out1, &out2);
                     prop_assert_eq!(before, snapshot(&l));
                 }
@@ -258,7 +293,7 @@ proptest! {
 
         // Fund the debit account generously so the reserve always succeeds.
         let fund = next_id(&mut counter);
-        l.credit(IssueTransfer {
+        mint(&mut l, IssueTransfer {
             id: fund,
             issuer_liability: ids[0],
             destination: ids[1],
@@ -378,7 +413,12 @@ fn timeout_bounds_are_plan_values() {
 
 #[test]
 fn issuance_rejects_available_account_even_with_empty_flags() {
-    let mut l = MemLedger::new(ledger_id());
+    let mut l = MemLedger::new(
+        ledger_id(),
+        Some(hyprstream_ledger::MintAuthority::classical(
+            mint_key().verifying_key(),
+        )),
+    );
     let source = l
         .open_account(AccountSpec {
             ledger_id: ledger_id(),
@@ -397,15 +437,18 @@ fn issuance_rejects_available_account_even_with_empty_flags() {
         ))
         .unwrap();
 
-    let out = l.credit(IssueTransfer {
-        id: TransferId(1),
-        issuer_liability: source.id,
-        destination: dest.id,
-        unit: unit(),
-        amount: 10,
-        grant_cid: None,
-        user_data: ud(),
-    });
+    let out = mint(
+        &mut l,
+        IssueTransfer {
+            id: TransferId(1),
+            issuer_liability: source.id,
+            destination: dest.id,
+            unit: unit(),
+            amount: 10,
+            grant_cid: None,
+            user_data: ud(),
+        },
+    );
 
     assert_eq!(out.result, Err(LedgerError::NotIssuerLiability(source.id)));
 }

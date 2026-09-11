@@ -39,7 +39,18 @@ fn base_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_js
         "require_pushed_authorization_requests": require_par,
         "jwks_uri": format!("{endpoint_base}/oauth/jwks"),
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"],
+        // #1425: the RFC 8693 token-exchange grant is advertised truthfully —
+        // the AS implements it at POST /oauth/token (generic bearer exchange,
+        // UCAN grant, and the sender-bound browser contract). Advertising a
+        // grant type the AS does not implement would be an RFC 8414 violation;
+        // omitting one it does implement hides the browser contract from
+        // RFC 8414 metadata discovery.
+        "grant_types_supported": [
+            "authorization_code",
+            "refresh_token",
+            "urn:ietf:params:oauth:grant-type:device_code",
+            "urn:ietf:params:oauth:grant-type:token-exchange"
+        ],
         "code_challenge_methods_supported": ["S256"],
         // #1113 rev2 finding 5: atproto profile metadata. The AS accepts both
         // public clients (PKCE) and `private_key_jwt` (RFC 7523), signs token
@@ -47,7 +58,12 @@ fn base_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_js
         // emits `authorization_endpoint` `iss` query parameter on redirects.
         "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
         "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
-        "dpop_signing_alg_values_supported": ["ES256"],
+        // RFC 9449 §9: the AS issues DPoP-bound access tokens (cnf.jkt) and
+        // accepts DPoP proofs at the token endpoint. ES256 is the
+        // browser-classical DPoP algorithm the sender-bound contract (#1425)
+        // uses; it is the value advertised, and it is supported.
+        "dpop_signing_alg_values_supported": ["ES256", "EdDSA"],
+        "dpop_bound_access_tokens_supported": true,
         "authorization_response_iss_parameter_supported": true,
         "scopes_supported": scopes_supported,
         "client_id_metadata_document_supported": true,
@@ -187,6 +203,25 @@ mod tests {
         assert_eq!(
             meta["authorization_response_iss_parameter_supported"].as_bool(),
             Some(true)
+        );
+
+        // #1425: RFC 8414 truthfulness — the token-exchange grant the AS
+        // implements is advertised, and DPoP-bound access tokens are signalled
+        // (RFC 9449 §9) so the browser sender-bound contract is discoverable.
+        let grants: Vec<&str> = meta["grant_types_supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            grants.contains(&"urn:ietf:params:oauth:grant-type:token-exchange"),
+            "RFC 8414 must advertise the implemented token-exchange grant: {grants:?}"
+        );
+        assert_eq!(
+            meta["dpop_bound_access_tokens_supported"].as_bool(),
+            Some(true),
+            "RFC 9449 §9 dpop_bound_access_tokens_supported must be true"
         );
     }
 

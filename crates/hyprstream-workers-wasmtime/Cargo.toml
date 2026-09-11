@@ -2,7 +2,7 @@
 name = "hyprstream-workers-wasmtime"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 description = "Embedded wasmtime host for sandboxing untrusted wasm guests behind capability profiles (bespoke-Linker Profile A + WASI Profile B)"
 
 # Workspace member (host target). It does NOT depend on tch/libtorch, so it builds

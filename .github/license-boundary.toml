@@ -1,0 +1,89 @@
+# Exhaustive owner-approved license map for every local Cargo package.
+# The guard requires exact manifest parity and fails closed on new packages.
+[license_gate]
+mit_packages = [
+  "bitsandbytes-sys",
+  "hyprstream-pay",
+  "cas-serve",
+  "git-xet-filter",
+]
+
+agpl_packages = [
+  "hyprstream",
+  "hyprstream-appview",
+  "hyprstream-discovery",
+  "hyprstream-flight",
+  "hyprstream-k8s-pds",
+  "hyprstream-ledger",
+  "hyprstream-metrics",
+  "hyprstream-pds",
+  "hyprstream-pds-service",
+  "hyprstream-service",
+  "hyprstream-vfs-server",
+  "hyprstream-workers",
+]
+
+apache_packages = [
+  "chat-core",
+  "git2db",
+  "hyprstream-9p",
+  "hyprstream-compositor",
+  "hyprstream-containedfs",
+  "hyprstream-crypto",
+  "hyprstream-k8s",
+  "hyprstream-p2p",
+  "hyprstream-resource",
+  "hyprstream-rpc",
+  "hyprstream-rpc-build",
+  "hyprstream-rpc-derive",
+  "hyprstream-rpc-std",
+  "hyprstream-tui",
+  "hyprstream-util",
+  "hyprstream-vfs",
+  "hyprstream-workers-python",
+  "hyprstream-workers-python-guest",
+  "hyprstream-workers-tcl",
+  "hyprstream-workers-wasmtime",
+  "hyprstream-workers-wasmtime-fsguest",
+  "waxterm",
+]
+
+# Cargo metadata is authoritative for workspace membership. These packages are
+# intentionally excluded from the root workspace and are therefore the only
+# additional standalone manifests included in the owner package universe.
+standalone_manifests = [
+  "crates/bitsandbytes-sys/Cargo.toml",
+  "crates/hyprstream-workers-python-guest/Cargo.toml",
+  "crates/hyprstream-workers-wasmtime-fsguest/Cargo.toml",
+]
+
+# Reusable permissive-only roots retain a strict complete resolved-graph
+# guarantee: none may reach a local AGPL package through any dependency source.
+permissive_roots = [
+  "bitsandbytes-sys",
+  "hyprstream-pay",
+  "cas-serve",
+  "chat-core",
+  "git-xet-filter",
+  "git2db",
+  "hyprstream-9p",
+  "hyprstream-compositor",
+  "hyprstream-containedfs",
+  "hyprstream-crypto",
+  "hyprstream-k8s",
+  "hyprstream-p2p",
+  "hyprstream-resource",
+  "hyprstream-rpc",
+  "hyprstream-rpc-build",
+  "hyprstream-rpc-derive",
+  "hyprstream-rpc-std",
+  "hyprstream-tui",
+  "hyprstream-util",
+  "hyprstream-vfs",
+  "hyprstream-workers-python",
+  "hyprstream-workers-python-guest",
+  "hyprstream-workers-tcl",
+  "hyprstream-workers-wasmtime",
+  "hyprstream-workers-wasmtime-fsguest",
+  "waxterm",
+]

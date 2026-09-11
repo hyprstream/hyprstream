@@ -267,6 +267,35 @@ def check_rust_text(text: str) -> None:
         f"(if={build_if!r})",
     )
 
+    # The merge-gate runners provision a dedicated cache EBS volume at this
+    # path. Every Rust container must bind it and direct Cargo's target there;
+    # otherwise a full link writes into the 80 GiB runner root and can exhaust
+    # it despite the 200 GiB cache volume being available.
+    required_cache_args = (
+        "-v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache",
+        "-e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream",
+    )
+    job_blocks = _job_blocks(text)
+    for name in ("clippy", "wasm", "build"):
+        block = job_blocks[name]
+        for argument in required_cache_args:
+            _assert(
+                argument in block,
+                f"rust.yml: job {name!r} must pass {argument!r} to Podman",
+            )
+        _assert(
+            "-v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache:Z" not in block,
+            f"rust.yml: job {name!r} must not SELinux-relabel the cache EBS mount",
+        )
+        _assert(
+            "--security-opt label=disable" not in block,
+            f"rust.yml: job {name!r} must keep the builder container SELinux-confined",
+        )
+        _assert(
+            re.search(r"\\\n[ \t]*#", block) is None,
+            f"rust.yml: job {name!r} must not put comments inside continued shell commands",
+        )
+
 
 def check_appimage_text(text: str) -> None:
     """Pin AppImage to one nightly cron, v* tags, and manual dispatch only."""
@@ -379,6 +408,42 @@ def _rust_mutations(rust_text: str) -> list[tuple[str, str]]:
         (
             "rename build job (removing the required gate)",
             rust_text.replace("  build:\n", "  build_renamed:\n", 1),
+        ),
+        (
+            "drop merge-gate cache mount",
+            rust_text.replace(
+                "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \\\n",
+                "",
+                1,
+            ),
+        ),
+        (
+            "drop merge-gate target directory",
+            rust_text.replace(
+                "          -e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream \\\n",
+                "",
+                1,
+            ),
+        ),
+        (
+            "SELinux-relabel cache mount (the EBS cache rejects xattrs)",
+            rust_text.replace(
+                "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \\\n",
+                "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache:Z \\\n",
+                1,
+            ),
+        ),
+        (
+            "disable container SELinux confinement",
+            rust_text.replace("podman run --rm \\\n", "podman run --rm --security-opt label=disable \\\n", 1),
+        ),
+        (
+            "comment inside continued Podman command",
+            rust_text.replace(
+                "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \\\n",
+                "          # unsafe inline comment \\\n          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \\\n",
+                1,
+            ),
         ),
     ]
 

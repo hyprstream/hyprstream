@@ -18,7 +18,58 @@ use crate::storage::paths::StoragePaths;
 use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use zeroize::{Zeroize, Zeroizing};
+
+/// Process-wide validated configuration snapshot (#1585).
+///
+/// Binary startup installs the configuration it parsed and validated (from an
+/// explicit `--config` file or the default locations) into this write-once
+/// slot BEFORE any resolver, factory, or service thread runs. Every later
+/// [`HyprConfig::load()`] — including the reloads inside service factories and
+/// network modules that used to re-read XDG defaults and silently drop an
+/// explicit `--config` deployment's settings — then observes that one pinned
+/// snapshot instead of re-deriving a divergent configuration.
+///
+/// The slot is immutable once written: there is no runtime mutation path, and
+/// the snapshot replaces an unchanged-contract reload rather than authorizing
+/// anything by itself (checkpoint, trust, Policy, and service-key validation
+/// all stay exactly where they were). Tests that need a different
+/// configuration run in isolated child processes.
+static PINNED_CONFIG: OnceLock<HyprConfig> = OnceLock::new();
+
+/// Install the process-wide validated configuration snapshot (write-once).
+///
+/// Returns `true` when this call installed the snapshot; `false` when an
+/// earlier install won (first write wins, matching the
+/// `install_envelope_verify_config` precedent). Callers at the single binary
+/// startup site may ignore the result.
+pub fn install_pinned_config(config: HyprConfig) -> bool {
+    PINNED_CONFIG.set(config).is_ok()
+}
+
+/// The installed validated configuration snapshot, if startup pinned one.
+pub fn pinned_config() -> Option<&'static HyprConfig> {
+    PINNED_CONFIG.get()
+}
+
+/// Canonical absolute provenance of the operator's explicit config selector
+/// (CLI `--config` or the `HYPRSTREAM_CONFIG` env), installed by binary
+/// startup before the first load (#1585). Library code that launches services
+/// (bootstrap, wizard) forwards exactly this value to
+/// [`crate::cli::handle_service_start`] so children load the same file;
+/// `None` means defaults-resolution. Write-once, like the snapshot.
+static EXPLICIT_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Install the canonical explicit config selector provenance (write-once).
+pub fn install_explicit_config_path(path: PathBuf) -> bool {
+    EXPLICIT_CONFIG_PATH.set(path).is_ok()
+}
+
+/// The canonical explicit selector, if the operator supplied one.
+pub fn explicit_config_path() -> Option<&'static PathBuf> {
+    EXPLICIT_CONFIG_PATH.get()
+}
 
 /// Unified configuration for the Hyprstream system
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -227,15 +278,32 @@ pub struct HyprConfig {
     /// exact signed bytes, never a normalization of them.
     #[serde(default)]
     pub rds: RdsConfig,
+
+    /// Postgres URL for the durable ledger backend (PAY-01 #1389).
+    /// When set and the `postgres-ledger` feature is compiled, the factory
+    /// constructs PostgresLedger. When empty/unset, MemLedger is used (dev/test).
+    #[cfg(feature = "postgres-ledger")]
+    #[serde(default)]
+    pub ledger_postgres_url: Option<String>,
+
+    /// Connection pool size for the PostgresLedger backend. Default 4.
+    #[cfg(feature = "postgres-ledger")]
+    #[serde(default)]
+    pub ledger_postgres_pool_size: Option<usize>,
 }
 
 /// Records/repository RDS (Multi-AZ Postgres) configuration.
 ///
-/// Deployment renders the records role's two root-owned, service-readable
-/// files into this TOML section: `url_file` (normally
-/// `/credentials/records-url`) and `root_cert_file` (the role's CA file).
-/// There is deliberately no environment fallback, generic credential path, or
-/// directory-scanning interface.
+/// The effective binding is resolved by [`RdsConfig::resolved_from_env`]:
+/// explicit TOML values win; otherwise the records role's scoped environment
+/// variables carry the paths (`HYPRSTREAM_RECORDS_URL_FILE`,
+/// `HYPRSTREAM_RECORDS_SSLROOTCERT_FILE` — metal RDS runtime contract v1.1);
+/// as a last resort the shared credentials directory is consulted
+/// (`$HYPRSTREAM_POSTGRES_CREDENTIALS_PATH/records-url` and `rds-ca.pem`),
+/// but only when the `records-url` file actually exists there, so a
+/// credentials-role-only deployment never silently activates the records
+/// backend. An env var carries only the *path* to a secret file — the
+/// password-bearing URL itself never transits the process environment.
 ///
 /// The URL file contains one newline-terminated libpq URL. It is file-backed
 /// so rotation/repointing is a deployment-side file swap, not a secret-bearing
@@ -247,13 +315,13 @@ pub struct HyprConfig {
 /// the one provider/region cell; it becomes the placement key at Stage 2.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RdsConfig {
-    /// TOML path to the records role's Postgres URL file. When `None`, the
-    /// local backend (RocksDB) is used; deployed records services set this to
-    /// `/credentials/records-url`.
+    /// Path to the records role's Postgres URL file. When `None` (and no
+    /// env binding resolves), the local backend (RocksDB) is used; deployed
+    /// records services resolve this to the records role's URL file.
     #[serde(default)]
     pub url_file: Option<PathBuf>,
 
-    /// TOML path to the records role's PEM CA file. Mandatory whenever
+    /// Path to the records role's PEM CA file. Mandatory whenever
     /// `url_file` is configured; the connector pins this trust store for the
     /// RDS connection.
     #[serde(default)]
@@ -298,9 +366,58 @@ fn default_rds_cell_id() -> String {
 }
 
 impl RdsConfig {
+    /// Records-role env var carrying the PATH to the Postgres URL file
+    /// (metal RDS runtime contract v1.1). Never the URL itself.
+    pub const RECORDS_URL_FILE_ENV: &'static str = "HYPRSTREAM_RECORDS_URL_FILE";
+    /// Records-role env var carrying the PATH to the pinned RDS CA PEM.
+    pub const RECORDS_SSLROOTCERT_FILE_ENV: &'static str =
+        "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE";
+    /// Shared Postgres credentials directory env var (metal renders the
+    /// per-role URL files and `rds-ca.pem` under it).
+    pub const POSTGRES_CREDENTIALS_PATH_ENV: &'static str = "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH";
+    /// File names metal renders under the shared credentials directory.
+    const RECORDS_URL_FILE_NAME: &'static str = "records-url";
+    const RDS_CA_FILE_NAME: &'static str = "rds-ca.pem";
+
     /// True when a Postgres URL is configured (the deployed posture).
     pub fn is_configured(&self) -> bool {
         self.url_file.is_some()
+    }
+
+    /// Resolve the effective records-role binding. Explicit TOML values win;
+    /// otherwise the records role's scoped env vars; otherwise the shared
+    /// credentials directory — consulted only when `records-url` actually
+    /// exists there, so a credentials-role-only deployment does not activate
+    /// the records backend. The `cell_id` is preserved as configured.
+    pub fn resolved_from_env(&self) -> Self {
+        self.resolve_with(|key| std::env::var_os(key))
+    }
+
+    /// The testable core of [`Self::resolved_from_env`]: the environment is
+    /// injected so resolution is exercised without mutating process state.
+    fn resolve_with(&self, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
+        let credentials_dir = || env(Self::POSTGRES_CREDENTIALS_PATH_ENV).map(PathBuf::from);
+        let url_file = self
+            .url_file
+            .clone()
+            .or_else(|| env(Self::RECORDS_URL_FILE_ENV).map(PathBuf::from))
+            .or_else(|| {
+                // Directory fallback is opt-in by file presence: a shared
+                // credentials dir that holds no records role must not turn
+                // the records store Postgres-bound.
+                let candidate = credentials_dir()?.join(Self::RECORDS_URL_FILE_NAME);
+                candidate.is_file().then_some(candidate)
+            });
+        let root_cert_file = self
+            .root_cert_file
+            .clone()
+            .or_else(|| env(Self::RECORDS_SSLROOTCERT_FILE_ENV).map(PathBuf::from))
+            .or_else(|| credentials_dir().map(|dir| dir.join(Self::RDS_CA_FILE_NAME)));
+        Self {
+            url_file,
+            root_cert_file,
+            cell_id: self.cell_id.clone(),
+        }
     }
 
     /// Read and validate the records role's URL and CA-file bindings.
@@ -599,6 +716,14 @@ fn default_tls_server_name() -> String {
 /// cert_path = ""
 /// key_path = ""
 /// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeNetworkProfile {
+    #[default]
+    Compatibility,
+    NetworkIrohRequired,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicConfig {
     /// Whether QUIC/WebTransport is enabled (defaults to true)
@@ -630,6 +755,24 @@ pub struct QuicConfig {
     #[serde(default = "default_iroh_enabled")]
     pub iroh: bool,
 
+    /// Explicit native deployment profile. `network-iroh-required` forbids a
+    /// native QUIC/local fallback but does not disable the browser edge.
+    #[serde(default)]
+    pub native_network_profile: NativeNetworkProfile,
+
+    /// Explicit admitted DID to tenant bindings. Carrier IDs never select a tenant.
+    #[serde(default)]
+    pub moql_subject_tenants: std::collections::BTreeMap<String, String>,
+
+    /// Separate Event producer grants. Tenant membership alone grants no ingress.
+    #[serde(default)]
+    pub event_publishers: std::collections::BTreeSet<String>,
+
+    /// Explicit remote Streams ingress, separate from Event permissions.
+    /// Empty leaves admitted peers read-only.
+    #[serde(default)]
+    pub stream_publishers: std::collections::BTreeSet<String>,
+
     /// #358: the producer-chosen moq RELAY this node rendezvouses through, as a
     /// dialable URI (`https://host:port` for the relay's WebTransport `/moq`
     /// endpoint, or an iroh node URI). Empty = direct-only (the baseline). When
@@ -650,12 +793,34 @@ impl Default for QuicConfig {
             cert_path: String::new(),
             key_path: String::new(),
             iroh: default_iroh_enabled(),
+            native_network_profile: NativeNetworkProfile::Compatibility,
+            moql_subject_tenants: Default::default(),
+            event_publishers: Default::default(),
+            stream_publishers: Default::default(),
             relay: String::new(),
         }
     }
 }
 
 impl QuicConfig {
+    pub fn iroh_required(&self) -> bool {
+        self.native_network_profile == NativeNetworkProfile::NetworkIrohRequired
+    }
+
+    pub fn validate_native_network_profile(&self) -> anyhow::Result<()> {
+        if self.iroh_required() {
+            anyhow::ensure!(
+                self.enabled,
+                "network-iroh-required requires [quic] enabled = true so native Iroh can bind"
+            );
+            anyhow::ensure!(
+                self.iroh,
+                "network-iroh-required rejects [quic] iroh = false"
+            );
+        }
+        Ok(())
+    }
+
     /// Parse bind_addr into a SocketAddr.
     pub fn socket_addr(&self) -> anyhow::Result<std::net::SocketAddr> {
         self.bind_addr
@@ -769,6 +934,7 @@ impl QuicConfig {
             serde_json::to_vec(&meta).unwrap_or_default()
         });
         Ok(hyprstream_rpc::service::QuicLoopConfig {
+            announcement_cancellation: tokio_util::sync::CancellationToken::new(),
             cert_chain,
             key_der,
             bind_addr: addr,
@@ -778,11 +944,18 @@ impl QuicConfig {
             // #410: iroh is the primary production transport (on by default).
             // This minimal builder mirrors the daemon bootstrap default; the
             // full `QuicSharedConfig` path in `main.rs` honours `[quic] iroh`.
-            iroh_enabled: default_iroh_enabled(),
+            iroh_enabled: self.iroh,
+            iroh_required: self.iroh_required(),
             on_iroh_bound: None,
             // #358: relay rendezvous is provisioned by the daemon bootstrap
             // (`QuicSharedConfig`), not this minimal builder. Direct-only here.
             moq_relay: None,
+            moq_relay_server_identity: None,
+            // #1027: admission material is provisioned by the daemon bootstrap
+            // (`QuicSharedConfig`), not this minimal builder.
+            moq_admission: None,
+            moq_ingress_authorizer: None,
+            moq_admission_proof: None,
         })
     }
 }
@@ -1738,14 +1911,29 @@ fn default_oauth_port() -> u16 {
 /// `Pglite` selects the shared embedded PGlite/Postgres relational store for
 /// the **account system of record** (UserStore). Token and device stores
 /// remain on RocksDB/Valkey — a pglite TokenStore does not exist.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CredentialsBackend {
-    #[default]
     Rocksdb,
     Valkey,
     /// Relational UserStore on the shared #1351 PGlite substrate.
     Pglite,
+}
+
+fn default_credentials_backend() -> CredentialsBackend {
+    CredentialsBackend::Pglite
+}
+
+impl CredentialsBackend {
+    /// Production must never select a backend that can persist protected
+    /// UserStore columns as plaintext.
+    pub fn ensure_allowed_for_build(self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self == Self::Pglite,
+            "encrypted credential storage requires credentials.backend = \"pglite\""
+        );
+        Ok(())
+    }
 }
 
 /// Valkey connection settings (used when `backend = "valkey"`).
@@ -1778,12 +1966,21 @@ impl Default for ValkeyCredentialsConfig {
 /// [credentials.valkey]
 /// url = "redis://127.0.0.1:6379"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialsConfig {
-    #[serde(default)]
+    #[serde(default = "default_credentials_backend")]
     pub backend: CredentialsBackend,
     #[serde(default)]
     pub valkey: ValkeyCredentialsConfig,
+}
+
+impl Default for CredentialsConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_credentials_backend(),
+            valkey: ValkeyCredentialsConfig::default(),
+        }
+    }
 }
 fn default_oauth_scopes() -> Vec<String> {
     // The DEFAULT GRANT set when a client omits `scope`. atproto transition
@@ -2054,6 +2251,10 @@ pub struct DiscoveryServiceConfig {
     /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
     #[serde(default)]
     pub quic_port: Option<u16>,
+    /// Volatile Discovery state. Memory is the single-process/WASM default;
+    /// active-active deployments must select Valkey or tiered memory+Valkey.
+    #[serde(default)]
+    pub state: hyprstream_discovery::DiscoveryStateConfig,
 }
 
 /// TUI display server configuration.
@@ -2136,7 +2337,7 @@ impl Default for MetricsConfig {
 pub struct ServicesConfig {
     /// Services to start automatically at startup (ipc-systemd mode)
     ///
-    /// Default: ["registry", "policy", "worker", "event"]
+    /// Default: the factories compiled into the standard service roster.
     #[serde(default = "default_startup_services")]
     pub startup: Vec<String>,
 }
@@ -2151,22 +2352,30 @@ impl Default for ServicesConfig {
 
 /// Default list of services to start at startup
 fn default_startup_services() -> Vec<String> {
-    vec![
-        "event".to_owned(),        // Must start first (message bus)
-        "registry".to_owned(),     // Model registry
-        "policy".to_owned(),       // Authorization
-        "streams".to_owned(),      // Streaming proxy with JWT validation
-        "notification".to_owned(), // Encrypted notification relay (uses streams)
-        "worker".to_owned(),       // Container workloads
-        "model".to_owned(),        // Model management (publishes to notification)
-        "oauth".to_owned(),        // OAuth 2.1 authorization server
-        "oai".to_owned(),          // OpenAI-compatible HTTP API
-        "flight".to_owned(),       // Arrow Flight SQL server
-        "discovery".to_owned(),    // Endpoint discovery (RFC 9728 metadata)
-        "mcp".to_owned(),          // Model Context Protocol service
-        "tui".to_owned(),          // Terminal multiplexer display server
-        "metrics".to_owned(),      // Metrics ingest and query (DuckDB/DataFusion)
-    ]
+    let mut services = vec![
+        "event".to_owned(),     // Must start first (message bus)
+        "registry".to_owned(),  // Model registry
+        "policy".to_owned(),    // Authorization
+        "streams".to_owned(),   // Streaming proxy with JWT validation
+        "worker".to_owned(),    // Container workloads
+        "model".to_owned(),     // Model management
+        "oauth".to_owned(),     // OAuth 2.1 authorization server
+        "oai".to_owned(),       // OpenAI-compatible HTTP API
+    ];
+    #[cfg(feature = "metrics")]
+    {
+        services.push("flight".to_owned()); // Arrow Flight SQL server
+    }
+    services.extend([
+        "discovery".to_owned(), // Endpoint discovery (RFC 9728 metadata)
+        "mcp".to_owned(),       // Model Context Protocol service
+        "tui".to_owned(),       // Terminal multiplexer display server
+    ]);
+    #[cfg(feature = "metrics")]
+    {
+        services.push("metrics".to_owned()); // Metrics ingest and query
+    }
+    services
 }
 
 /// Model loading and identification
@@ -2440,6 +2649,17 @@ pub struct RuntimeConfig {
     /// `HYPRSTREAM_CONTINUOUS_BATCH_MAX`.
     #[serde(default = "default_continuous_batch_max")]
     pub continuous_batch_max: usize,
+    /// Materialize FP8 weights as BF16 once at load time (applying the
+    /// block-wise `_scale_inv` scales during load) and drop the FP8+scale
+    /// tensors, instead of dequantizing inside every matmul on the hot path.
+    /// Trades ~2x weight VRAM for zero per-matmul dequant work. Tunable via
+    /// `HYPRSTREAM_FP8_DEQUANT_LOAD` (truthy = on). Off by default — off keeps
+    /// the FP8-in-VRAM behavior, which is required when the BF16 equivalent
+    /// would exceed VRAM. Ignored (with a warning) for multi-device pipelines:
+    /// weights are loaded onto the pool's primary device before layers are
+    /// distributed, so full-model BF16 materialization there could OOM.
+    #[serde(default = "default_fp8_dequant_load")]
+    pub fp8_dequant_load: bool,
 }
 
 /// Default for [`RuntimeConfig::continuous_batching`]: off unless
@@ -2464,6 +2684,15 @@ fn default_continuous_batch_max() -> usize {
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(16)
+}
+
+/// Default for [`RuntimeConfig::fp8_dequant_load`]: off unless
+/// `HYPRSTREAM_FP8_DEQUANT_LOAD` is set truthy. Off is the safe default — it
+/// keeps FP8 weights at FP8 size in VRAM with lazy per-matmul dequantization.
+fn default_fp8_dequant_load() -> bool {
+    std::env::var("HYPRSTREAM_FP8_DEQUANT_LOAD")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 /// Default for [`RuntimeConfig::strict_device`]: strict (fail-fast) unless
@@ -2533,6 +2762,7 @@ impl Default for RuntimeConfig {
             default_model_load_timeout_ms: 300000, // 5 minutes
             continuous_batching: default_continuous_batching(),
             continuous_batch_max: default_continuous_batch_max(),
+            fp8_dequant_load: default_fp8_dequant_load(),
         }
     }
 }
@@ -2845,6 +3075,10 @@ impl HyprConfigBuilder {
             #[cfg(feature = "ledger")]
             ledger: Default::default(),
             rds: Default::default(),
+            #[cfg(feature = "postgres-ledger")]
+            ledger_postgres_url: None,
+            #[cfg(feature = "postgres-ledger")]
+            ledger_postgres_pool_size: None,
         }
     }
 
@@ -2867,8 +3101,26 @@ impl HyprConfig {
         HyprConfigBuilder::new()
     }
 
+    // Keep list parsing restricted to fields that are actually lists. In particular,
+    // issuer URLs and other scalar strings must retain their existing parsing.
+    fn environment_source() -> Environment {
+        Environment::with_prefix("HYPRSTREAM")
+            .separator("__")
+            .try_parsing(true)
+            .list_separator(",")
+            .with_list_parse_key("oauth.cors.allowed_origins")
+    }
+
     /// Load configuration using the config crate with XDG directories and environment variables
+    ///
+    /// When binary startup pinned a validated snapshot ([`install_pinned_config`]),
+    /// that snapshot IS the process configuration: the XDG/env re-derivation is
+    /// skipped so factory and service-module reloads can never diverge from the
+    /// `--config` file main already loaded and validated.
     pub fn load() -> Result<Self, ConfigError> {
+        if let Some(pinned) = PINNED_CONFIG.get() {
+            return Ok(pinned.clone());
+        }
         let storage = StoragePaths::new().map_err(|e| {
             ConfigError::Message(format!("Failed to initialize storage paths: {e}"))
         })?;
@@ -2886,11 +3138,7 @@ impl HyprConfig {
             .add_source(File::from(config_dir.join("config.json")).required(false))
             .add_source(File::from(config_dir.join("config.yaml")).required(false))
             // Load from environment variables with HYPRSTREAM__ prefix (double underscore for nesting)
-            .add_source(
-                Environment::with_prefix("HYPRSTREAM")
-                    .separator("__")
-                    .try_parsing(true),
-            );
+            .add_source(Self::environment_source());
 
         // Build and deserialize configuration
         let mut hypr_config: HyprConfig = settings.build()?.try_deserialize()?;
@@ -2944,6 +3192,25 @@ impl HyprConfig {
 
     /// Validate the entire configuration
     pub fn validate(&self) -> anyhow::Result<()> {
+        // Ledger production mode (PAY-01): turns the deliberately-inert
+        // development defaults into startup failures, so a production node
+        // cannot come up with credit enforcement silently disabled or with a
+        // volatile accounting backend.
+        //
+        // Both the ledger config and its DSN are feature-gated, and they are
+        // gated independently: a build with `ledger` but not `postgres-ledger`
+        // has nowhere to configure a durable backend, so it reports no DSN and
+        // production validation fails — which is the correct answer, since such
+        // a build cannot serve a durable ledger at all.
+        #[cfg(feature = "ledger")]
+        {
+            #[cfg(feature = "postgres-ledger")]
+            let postgres_url = self.ledger_postgres_url.as_deref();
+            #[cfg(not(feature = "postgres-ledger"))]
+            let postgres_url: Option<&str> = None;
+            self.ledger.validate_for_production(postgres_url)?;
+        }
+
         // Validate model config
         if !self.model.path.as_os_str().is_empty() && !self.model.path.exists() {
             anyhow::bail!(
@@ -3440,6 +3707,109 @@ mod tests {
         (dir, config)
     }
 
+    /// Empty env lookup for `resolve_with` tests.
+    fn no_env(_: &str) -> Option<std::ffi::OsString> {
+        None
+    }
+
+    #[test]
+    fn rds_resolution_leaves_local_backend_when_unbound() {
+        let config = RdsConfig::default();
+        let resolved = config.resolve_with(no_env);
+        assert!(!resolved.is_configured());
+        assert_eq!(resolved.root_cert_file, None);
+    }
+
+    #[test]
+    fn rds_resolution_binds_role_scoped_env_files() {
+        let config = RdsConfig::default();
+        let resolved = config.resolve_with(|key| match key {
+            "HYPRSTREAM_RECORDS_URL_FILE" => Some("/run/cred/records-url".into()),
+            "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE" => Some("/run/cred/rds-ca.pem".into()),
+            _ => None,
+        });
+        assert!(resolved.is_configured());
+        assert_eq!(resolved.url_file.as_deref(), Some(Path::new("/run/cred/records-url")));
+        assert_eq!(
+            resolved.root_cert_file.as_deref(),
+            Some(Path::new("/run/cred/rds-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn rds_resolution_toml_overrides_env() {
+        let config = RdsConfig {
+            url_file: Some(PathBuf::from("/toml/records-url")),
+            root_cert_file: Some(PathBuf::from("/toml/rds-ca.pem")),
+            cell_id: "toml-cell".to_owned(),
+        };
+        let resolved = config.resolve_with(|key| match key {
+            "HYPRSTREAM_RECORDS_URL_FILE" => Some("/env/records-url".into()),
+            "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE" => Some("/env/rds-ca.pem".into()),
+            "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some("/env".into()),
+            _ => None,
+        });
+        assert_eq!(resolved.url_file.as_deref(), Some(Path::new("/toml/records-url")));
+        assert_eq!(
+            resolved.root_cert_file.as_deref(),
+            Some(Path::new("/toml/rds-ca.pem"))
+        );
+        assert_eq!(resolved.cell_id, "toml-cell");
+    }
+
+    #[test]
+    fn rds_resolution_uses_credentials_dir_only_when_records_url_exists() {
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        let env = |key: &str| match key {
+            "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some(dir.path().as_os_str().to_owned()),
+            _ => None,
+        };
+
+        // A credentials-role-only directory (no records-url) must NOT
+        // activate the records backend.
+        let config = RdsConfig::default();
+        let resolved = config.resolve_with(env);
+        assert!(
+            !resolved.is_configured(),
+            "a shared credentials dir without records-url stays on the local backend"
+        );
+
+        // Once metal renders the records role into the directory, the binding
+        // resolves — including the CA file at its rendered location.
+        std::fs::write(dir.path().join("records-url"), b"postgresql://x\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let resolved = config.resolve_with(env);
+        assert!(resolved.is_configured());
+        assert_eq!(resolved.url_file.as_deref(), Some(dir.path().join("records-url").as_path()));
+        assert_eq!(
+            resolved.root_cert_file.as_deref(),
+            Some(dir.path().join("rds-ca.pem").as_path())
+        );
+    }
+
+    #[test]
+    fn rds_resolution_role_env_wins_over_credentials_dir() {
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(dir.path().join("records-url"), b"postgresql://x\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let config = RdsConfig::default();
+        let resolved = config.resolve_with(|key| match key {
+            "HYPRSTREAM_RECORDS_URL_FILE" => Some("/scoped/records-url".into()),
+            "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some(dir.path().as_os_str().to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            resolved.url_file.as_deref(),
+            Some(Path::new("/scoped/records-url")),
+            "the role-scoped env binding takes precedence over the shared directory"
+        );
+        // The CA still falls through to the rendered directory default.
+        assert_eq!(
+            resolved.root_cert_file.as_deref(),
+            Some(dir.path().join("rds-ca.pem").as_path())
+        );
+    }
+
     #[cfg(feature = "pds-postgres")]
     #[test]
     fn rds_contract_accepts_exact_verify_full_and_translates_for_driver() {
@@ -3564,6 +3934,259 @@ mod tests {
         config.root_cert_file = Some(std::path::PathBuf::from("/missing/records-rds-ca.pem"));
         assert!(config.read_url().is_err());
     }
+    #[test]
+    fn default_startup_services_are_available_in_this_build() {
+        let startup = super::default_startup_services();
+        assert!(
+            !startup.iter().any(|name| name == "notification"),
+            "the removed notification service must not remain in the default roster"
+        );
+        for name in &startup {
+            assert!(
+                hyprstream_service::get_factory(name).is_some(),
+                "default service {name} must have a factory in this build"
+            );
+        }
+
+        #[cfg(feature = "metrics")]
+        {
+            assert!(startup.iter().any(|name| name == "flight"));
+            assert!(startup.iter().any(|name| name == "metrics"));
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            assert!(!startup.iter().any(|name| name == "flight"));
+            assert!(!startup.iter().any(|name| name == "metrics"));
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_cors_origin_list_from_environment_preserves_scalars() -> anyhow::Result<()> {
+        use axum::{body::Body, http::{header, Request}, routing::get, Router};
+        use tower::ServiceExt;
+
+        for origins in [
+            "https://staging-amp.hyprstream.com",
+            "https://staging-amp.hyprstream.com,https://second.example",
+            " https://staging-amp.hyprstream.com , https://second.example\t",
+        ] {
+            // Use a private source map, never mutate the test process environment.
+            let source = [
+                ("HYPRSTREAM__OAUTH__CORS__ALLOWED_ORIGINS", origins),
+                ("HYPRSTREAM__OAUTH__CORS__ENABLED", "true"),
+                ("HYPRSTREAM__OAUTH__CORS__ALLOW_CREDENTIALS", "true"),
+                ("HYPRSTREAM__OAUTH__CORS__PERMISSIVE_HEADERS", "false"),
+                ("HYPRSTREAM__OAUTH__EXTERNAL_URL", "https://discovery.staging.lab.hyprstream.com"),
+                ("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30"),
+            ].into_iter().map(|(key, value)| (key.to_owned(), value.to_owned())).collect();
+            let cfg: HyprConfig = config::Config::builder()
+                .add_source(config::Config::try_from(&HyprConfig::default())?)
+                .add_source(HyprConfig::environment_source().source(Some(source)))
+                .build()?
+                .try_deserialize()?;
+            assert_eq!(cfg.oauth.cors.allowed_origins, origins.split(',').map(str::trim).collect::<Vec<_>>());
+            assert!(cfg.oauth.cors.enabled);
+            assert!(cfg.oauth.cors.allow_credentials);
+            assert!(!cfg.oauth.cors.permissive_headers);
+            assert_eq!(cfg.oauth.external_url.as_deref(), Some("https://discovery.staging.lab.hyprstream.com"));
+            assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30));
+
+            let app = Router::new()
+                .route("/probe", get(|| async { "ok" }))
+                .layer(crate::server::middleware::cors_layer(&cfg.oauth.cors));
+            for origin in cfg.oauth.cors.allowed_origins.iter().map(String::as_str)
+                .chain(["https://not-allowed.example"])
+            {
+                let response = app.clone().oneshot(Request::builder()
+                    .uri("/probe")
+                    .header(header::ORIGIN, origin)
+                    .body(Body::empty())?).await?;
+                let allowed = cfg.oauth.cors.allowed_origins.iter().any(|value| value == origin);
+                assert_eq!(response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .and_then(|value| value.to_str().ok()), allowed.then_some(origin));
+                if allowed {
+                    assert_eq!(response.headers().get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                        .and_then(|value| value.to_str().ok()), Some("true"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Build a `HyprConfig` from a private env-source map with the OAuth CORS
+    /// list at `origins`, never mutating the test process environment.
+    fn cors_cfg_from_env(origins: &str) -> anyhow::Result<HyprConfig> {
+        let source = [
+            ("HYPRSTREAM__OAUTH__CORS__ALLOWED_ORIGINS", origins),
+            ("HYPRSTREAM__OAUTH__CORS__ENABLED", "true"),
+            ("HYPRSTREAM__OAUTH__CORS__ALLOW_CREDENTIALS", "true"),
+            ("HYPRSTREAM__OAUTH__CORS__PERMISSIVE_HEADERS", "false"),
+            ("HYPRSTREAM__OAUTH__EXTERNAL_URL", "https://discovery.staging.lab.hyprstream.com"),
+            ("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        Ok(config::Config::builder()
+            .add_source(config::Config::try_from(&HyprConfig::default())?)
+            .add_source(HyprConfig::environment_source().source(Some(source)))
+            .build()?
+            .try_deserialize()?)
+    }
+
+    /// Drive the real `cors_layer` middleware with an `Origin` request and
+    /// return the `(access-control-allow-origin, access-control-allow-credentials)`
+    /// header values it emits.
+    async fn cors_probe(cfg: &HyprConfig, origin: &str) -> anyhow::Result<(Option<String>, Option<String>)> {
+        use axum::{body::Body, http::{header, Request}, routing::get, Router};
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .layer(crate::server::middleware::cors_layer(&cfg.oauth.cors));
+        let response = app
+            .oneshot(Request::builder()
+                .uri("/probe")
+                .header(header::ORIGIN, origin)
+                .body(Body::empty())?)
+            .await?;
+        let header_str = |name: header::HeaderName| {
+            response.headers().get(name).and_then(|value| value.to_str().ok()).map(str::to_owned)
+        };
+        Ok((
+            header_str(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            header_str(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+        ))
+    }
+
+    #[tokio::test]
+    async fn oauth_cors_env_empty_whitespace_or_separator_only_falls_back_to_localhost() -> anyhow::Result<()> {
+        // An empty, whitespace-only, or separators-only value must trim+filter
+        // to an empty vector so the middleware's localhost fallback applies —
+        // the same posture as the legacy `HYPRSTREAM_CORS_ORIGINS` parser.
+        for origins in ["", "   ", ",", " ,\t, "] {
+            let cfg = cors_cfg_from_env(origins)?;
+            assert!(cfg.oauth.cors.allowed_origins.is_empty(), "{origins:?}");
+            assert!(cfg.oauth.cors.enabled);
+            assert!(cfg.oauth.cors.allow_credentials);
+            assert_eq!(cfg.oauth.external_url.as_deref(), Some("https://discovery.staging.lab.hyprstream.com"));
+            assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30));
+
+            // The exact four-origin localhost fallback set is allowed and echoes
+            // credentials; a nearby unlisted port bounds the membership.
+            for origin in [
+                "http://localhost:3000",
+                "http://localhost:3001",
+                "http://127.0.0.1:3000",
+                "http://127.0.0.1:3001",
+            ] {
+                let (acao, credentials) = cors_probe(&cfg, origin).await?;
+                assert_eq!(acao, Some(origin.to_owned()), "{origins:?}");
+                assert_eq!(credentials, Some("true".to_owned()), "{origins:?}");
+            }
+            for denied in ["http://localhost:3002", "https://not-allowed.example"] {
+                // Denial is the absent ACAO; tower-http extends the configured
+                // credentials header independently of the origin match.
+                let (acao, _credentials) = cors_probe(&cfg, denied).await?;
+                assert_eq!(acao, None, "{origins:?} {denied}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oauth_cors_env_mixed_valid_and_empty_entries_drops_empties() -> anyhow::Result<()> {
+        // Empty entries interleaved with real origins are dropped after trimming;
+        // the surviving exact list both serves itself and disables the fallback.
+        let cfg = cors_cfg_from_env(" , https://staging-amp.hyprstream.com ,, https://second.example\t,")?;
+        assert_eq!(
+            cfg.oauth.cors.allowed_origins,
+            vec!["https://staging-amp.hyprstream.com".to_owned(), "https://second.example".to_owned()]
+        );
+        assert!(cfg.oauth.cors.allow_credentials);
+        for origin in ["https://staging-amp.hyprstream.com", "https://second.example"] {
+            let (acao, credentials) = cors_probe(&cfg, origin).await?;
+            assert_eq!(acao, Some(origin.to_owned()));
+            assert_eq!(credentials, Some("true".to_owned()));
+        }
+        // Dropped empties match nothing, the nonempty exact list suppresses the
+        // localhost fallback, and unrelated origins stay denied. Denial is the
+        // absent ACAO; the configured credentials header may still be emitted.
+        for origin in ["", "http://localhost:3000", "https://not-allowed.example"] {
+            let (acao, _credentials) = cors_probe(&cfg, origin).await?;
+            assert_eq!(acao, None, "{origin:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oauth_cors_env_padded_wildcard_selects_wildcard_with_credentials_off() -> anyhow::Result<()> {
+        // Trimming a whitespace-padded star intentionally selects the explicit
+        // wildcard operator, which always disables ambient credentials.
+        let cfg = cors_cfg_from_env(" * ")?;
+        assert_eq!(cfg.oauth.cors.allowed_origins, vec!["*".to_owned()]);
+        assert!(cfg.oauth.cors.allow_credentials);
+        for origin in ["https://anything.example", "http://localhost:3000"] {
+            let (acao, credentials) = cors_probe(&cfg, origin).await?;
+            assert_eq!(acao, Some("*".to_owned()), "{origin}");
+            assert_eq!(credentials, None, "{origin}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn network_iroh_required_is_serialized_and_rejects_iroh_disabled() -> anyhow::Result<()> {
+        let mut config = QuicConfig::default();
+        config.native_network_profile = NativeNetworkProfile::NetworkIrohRequired;
+        config.iroh = false;
+        assert!(config.validate_native_network_profile().is_err());
+
+        config.iroh = true;
+        config.validate_native_network_profile()?;
+        let serialized = toml::to_string(&config)?;
+        assert!(serialized.contains("native_network_profile = \"network-iroh-required\""));
+        let decoded: QuicConfig = toml::from_str(&serialized)?;
+        assert!(decoded.iroh_required());
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_state_documentation_configures_root_backend() {
+        let doc = include_str!("../../../../docs/discovery-state.md");
+        let example = doc
+            .split_once("```toml\n")
+            .unwrap_or_else(|| panic!("TOML example"))
+            .1
+            .split_once("```")
+            .unwrap_or_else(|| panic!("closed TOML example"))
+            .0;
+        let config: HyprConfig = toml::from_str(example).unwrap_or_else(|e| panic!("{e}"));
+        let state = config.discovery.state;
+        assert_eq!(
+            state.backend,
+            hyprstream_discovery::DiscoveryStateBackend::Tiered
+        );
+        assert!(state.active_active);
+        assert_eq!(state.memory.announcement_capacity, 16_384);
+        assert_eq!(state.valkey.announcement_capacity, 65_536);
+        assert_eq!(state.valkey.key_prefix, "production");
+        assert_eq!(state.valkey.url, "rediss://discovery-state.example:6379");
+        assert_eq!(state.tiered.l1_max_ttl_ms, 1_000);
+    }
+
+    #[test]
+    fn credentials_backend_default_matches_build_profile() {
+        let config: CredentialsConfig =
+            toml::from_str("").unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(config.backend, CredentialsBackend::Pglite);
+    }
+
+    #[test]
+    fn credential_pds_rejects_plaintext_capable_backends() {
+        assert!(CredentialsBackend::Pglite.ensure_allowed_for_build().is_ok());
+        assert!(CredentialsBackend::Rocksdb.ensure_allowed_for_build().is_err());
+        assert!(CredentialsBackend::Valkey.ensure_allowed_for_build().is_err());
+    }
+
     #[test]
     fn standalone_inference_config_rejects_partial_stage_without_subset_loader() {
         let model = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
@@ -4451,4 +5074,82 @@ fn default_training_steps_per_cycle() -> usize {
 }
 fn default_training_min_quality() -> f32 {
     0.3
+}
+
+#[cfg(test)]
+mod pinned_config_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    const PINNED_CHILD: &str = "HYPRSTREAM_PINNED_CONFIG_CHILD";
+
+    /// The write-once snapshot must be the ONE process configuration: after
+    /// startup pins the validated explicit file, factory-style
+    /// `HyprConfig::load()` calls observe the snapshot even when the XDG
+    /// default changes underneath, and never follow source-file rereads.
+    /// Runs in an isolated child because the slot is process-global.
+    #[test]
+    fn pinned_config_snapshot_observed_by_load() -> anyhow::Result<()> {
+        if std::env::var_os(PINNED_CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "config::pinned_config_tests::pinned_config_snapshot_observed_by_load",
+                    "--nocapture",
+                ])
+                .env(PINNED_CHILD, "1")
+                .status()?;
+            anyhow::ensure!(status.success(), "pinned-config regression failed");
+            return Ok(());
+        }
+
+        let root = tempfile::tempdir()?;
+        let xdg = root.path().join("xdg-config");
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        let default_config = xdg.join("hyprstream").join("config.toml");
+        std::fs::create_dir_all(default_config.parent().expect("parent"))?;
+
+        let write_config = |path: &Path, secrets: &Path| -> anyhow::Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut configured = HyprConfig::default();
+            configured.secrets.path = Some(secrets.to_path_buf());
+            configured.to_file(path)
+        };
+
+        // XDG default initially points at B; the operator's explicit file at A.
+        let secrets_b = root.path().join("secrets-B");
+        write_config(&default_config, &secrets_b)?;
+        let explicit = root.path().join("custom dir/custom.toml");
+        let secrets_a = root.path().join("secrets-A");
+        write_config(&explicit, &secrets_a)?;
+
+        // Main's path: load the explicit file, validate, pin.
+        let loaded = HyprConfig::from_file(&explicit)?;
+        loaded.validate()?;
+        let _ = install_pinned_config(loaded);
+
+        // Post-pin drift: the XDG default changes to C and the explicit source
+        // file changes to D. Factory-style reloads must stay on the snapshot.
+        let secrets_c = root.path().join("secrets-C");
+        write_config(&default_config, &secrets_c)?;
+        let reloaded = HyprConfig::load().expect("pinned reload");
+        assert_eq!(
+            reloaded.secrets.path,
+            Some(secrets_a.clone()),
+            "factory-style HyprConfig::load() must observe the pinned snapshot, not XDG defaults"
+        );
+        let secrets_d = root.path().join("secrets-D");
+        write_config(&explicit, &secrets_d)?;
+        let again = HyprConfig::load().expect("second pinned reload");
+        assert_eq!(
+            again.secrets.path,
+            Some(secrets_a),
+            "load() must not follow source-file rereads after the pin"
+        );
+        std::env::remove_var("XDG_CONFIG_HOME");
+        Ok(())
+    }
 }

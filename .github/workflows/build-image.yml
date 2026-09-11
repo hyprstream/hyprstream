@@ -68,9 +68,10 @@ jobs:
           echo "digest=$(cat /tmp/img.digest)" >> "$GITHUB_OUTPUT"
 
       # -------------------------------------------------------------------------
-      # Auto-bump the digest CI pins (env.BUILDER_IMAGE in rust.yml). CI pins by
-      # digest for reproducibility; this opens a PR to move that pin whenever a new
-      # image is published, so the reproducibility costs no manual re-pinning. The
+      # Auto-bump the canonical builder-image pin. Every consumer loads this
+      # tracked value after checkout, so one update moves rust.yml, preflight, and
+      # AppImage packaging together. CI pins by digest for reproducibility; this
+      # opens a PR to move that pin whenever a new image is published. The
       # PR self-validates: the merge gate runs against the new image, so a broken
       # image simply never merges and the old digest stays live.
       #
@@ -81,18 +82,18 @@ jobs:
       # BUILDER_IMAGE_BUMP_TOKEN), scoped to THIS repo with only Contents + Pull
       # requests write. (Actions OIDC cannot be used here — it federates to EXTERNAL
       # providers like AWS, not to GitHub's own API.) If the secret is unset the bump
-      # step is skipped with a warning (image still published; bump rust.yml
-      # manually until the PAT is provisioned).
+      # step is skipped with a warning (image still published; bump the canonical
+      # .github/builder-image.env manually until the PAT is provisioned).
       # -------------------------------------------------------------------------
-      - name: Rewrite the rust.yml pin if the digest changed
+      - name: Rewrite the canonical builder-image pin if the digest changed
         id: pin
         run: |
           new="$IMAGE@${{ steps.push.outputs.digest }}"
-          cur=$(grep -oE 'ghcr\.io/hyprstream/rust-builder-arm64@sha256:[0-9a-f]+' .github/workflows/rust.yml | head -1)
+          cur=$(cat .github/builder-image.env)
           echo "current=$cur"
           echo "new=$new"
           if [ "$cur" = "$new" ]; then echo "changed=false" >> "$GITHUB_OUTPUT"; exit 0; fi
-          sed -i "s|ghcr\.io/hyprstream/rust-builder-arm64@sha256:[0-9a-f]*|$new|g" .github/workflows/rust.yml
+          printf '%s\n' "$new" > .github/builder-image.env
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Check for the bump PAT
@@ -103,7 +104,7 @@ jobs:
           if [ -n "$BOT" ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::BUILDER_IMAGE_BUMP_TOKEN not set — skipping the auto digest-bump PR (image is published; bump rust.yml manually until the PAT is provisioned)."
+            echo "::warning::BUILDER_IMAGE_BUMP_TOKEN not set — skipping the auto digest-bump PR (image is published; bump .github/builder-image.env manually until the PAT is provisioned)."
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -117,14 +118,15 @@ jobs:
           token: ${{ secrets.BUILDER_IMAGE_BUMP_TOKEN }}
           branch: automation/bump-builder-image
           base: main
-          add-paths: .github/workflows/rust.yml
-          commit-message: "ci: bump BUILDER_IMAGE to newly published rust-builder digest"
-          title: "ci: bump BUILDER_IMAGE digest (automated)"
+          add-paths: .github/builder-image.env
+          commit-message: "ci: bump canonical rust-builder image digest"
+          title: "ci: bump canonical rust-builder image digest (automated)"
           labels: automation, ci
           delete-branch: true
           body: |
-            Automated bump of the `BUILDER_IMAGE` pin in `.github/workflows/rust.yml`
-            to the digest just published by `build-image.yml`.
+            Automated bump of the shared builder-image pin in
+            `.github/builder-image.env` to the digest just published by
+            `build-image.yml`.
 
             - digest: `${{ steps.push.outputs.digest }}`
             - tag: `${{ steps.tag.outputs.date }}-${{ steps.tag.outputs.sha }}`

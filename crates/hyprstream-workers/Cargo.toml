@@ -2,7 +2,7 @@
 name = "hyprstream-workers"
 version = "0.1.0"
 edition.workspace = true
-license.workspace = true
+license = "AGPL-3.0-only"
 repository.workspace = true
 description = "Isolated workload execution using Kata Containers with CRI-aligned APIs"
 
@@ -82,6 +82,8 @@ dashmap = { workspace = true }
 walkdir = { workspace = true }
 parking_lot = { workspace = true }
 glob = { workspace = true }
+# Candidate worktree overlays allocate a per-job upper/work scratch directory.
+tempfile = { workspace = true }
 
 # System utilities (also used by runtime/pool.rs, virtiofs.rs, events/endpoints.rs)
 nix = { workspace = true }
@@ -323,7 +325,6 @@ hyprstream-rpc-build = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
-tempfile = { workspace = true }
 # F3 (#761) admission-config TOML round-trip regression test.
 toml = "0.8"
 # FS-B0 RAFS bootstrap builder tests: synthesize small OCI layer tarballs.

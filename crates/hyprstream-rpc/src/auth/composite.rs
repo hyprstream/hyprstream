@@ -181,6 +181,14 @@ impl CompositeKeySet {
         self.snapshot.read().clone()
     }
 
+    /// Whether an on-disk composite signing authority has been configured for
+    /// this process. `false` means first bootstrap — no ledger exists yet —
+    /// which is distinct from a configured authority whose
+    /// [`CompositeKeySet::mint_snapshot`] fails (stale or pending cutover).
+    pub fn authority_configured(&self) -> bool {
+        self.authority.read().is_some()
+    }
+
     pub fn configure_authority(
         &self,
         ledger: PathBuf,

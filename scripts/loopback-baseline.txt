@@ -5,11 +5,11 @@
 # is not banked via --update. Files that reach zero drop out on
 # the next --update. Do NOT hand-edit counts upward — the diff
 # is review-visible and that is the only defense.
-1	crates/hyprstream-discovery/src/service.rs
 1	crates/hyprstream-flight/src/cli/commands/sql.rs
 1	crates/hyprstream-flight/src/cli/handlers.rs
 2	crates/hyprstream-flight/src/client.rs
 1	crates/hyprstream-flight/src/lib.rs
+1	crates/hyprstream-ledger/src/postgres.rs
 2	crates/hyprstream-metrics/src/storage/cached.rs
 1	crates/hyprstream-p2p/src/bin/gittorrentd.rs
 1	crates/hyprstream-p2p/src/service.rs

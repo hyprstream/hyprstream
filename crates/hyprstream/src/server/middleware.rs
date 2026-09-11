@@ -1,14 +1,14 @@
 //! Middleware for authentication, logging, and request processing
 
 use crate::auth::jwt;
-use crate::server::state::{ResourceAuthState, ServerState};
+use crate::server::state::ResourceAuthState;
 use axum::{
     extract::{Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use hyprstream_rpc::auth::JtiBlocklist as _;
+use hyprstream_util::InsertIfAbsentNoEvictResult;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -177,13 +177,33 @@ pub async fn auth_middleware(
         // iat ±60s window). Atomic check-and-record on the shared TtlCache.
         {
             let now = chrono::Utc::now().timestamp();
-            let ttl_secs = ((proof.iat + 120) - now).max(0) as u64;
-            if !state.dpop_jti_seen.insert_if_absent(
-                proof.jti.clone(),
+            let Some(ttl_secs) = proof
+                .iat
+                .checked_add(120)
+                .and_then(|deadline| deadline.checked_sub(now))
+                .filter(|remaining| *remaining > 0 && *remaining <= 180)
+                .and_then(|remaining| u64::try_from(remaining).ok())
+            else {
+                return unauthorized_response("Authentication failed", &www_authenticate);
+            };
+            let result = state.dpop_jti_seen.insert_if_absent_no_evict(
+                crate::services::oauth::replay_key::dpop_jti(&proof.jti),
                 (),
                 Duration::from_secs(ttl_secs),
-            ) {
-                debug!("DPoP proof jti already used: {}", proof.jti);
+            );
+            if result != InsertIfAbsentNoEvictResult::Inserted {
+                crate::services::oauth::replay_metrics::record_rejection(
+                    crate::services::oauth::replay_metrics::DPOP,
+                    result,
+                );
+                if crate::services::oauth::replay_metrics::should_warn_full(
+                    crate::services::oauth::replay_metrics::DPOP,
+                    result,
+                ) {
+                    warn!("DPoP replay barrier is full; refusing fresh proof");
+                } else if result == InsertIfAbsentNoEvictResult::Duplicate {
+                    debug!("DPoP proof replayed");
+                }
                 return unauthorized_response("Authentication failed", &www_authenticate);
             }
         }
@@ -548,12 +568,57 @@ pub(crate) async fn verify_resource_token_claims(
         }
     };
 
-    // JTI revocation check (RFC 7009) — shared blocklist with the OAuth
-    // revocation endpoint.
+    // Credential revocation check (RFC 7009) — fail-closed on store absence.
+    // The credential profile makes `jti` REQUIRED on locally issued tokens:
+    // a local token without one is rejected outright (revocation could never
+    // observe it). Federated tokens keep the revocation check only.
+    let token_is_local = hyprstream_rpc::auth::is_local_iss(&claims.iss, local_issuers);
+    if token_is_local && claims.jti.is_none() {
+        return Err("local credential missing required jti");
+    }
     if let Some(ref jti) = claims.jti {
-        if state.jti_blocklist.is_revoked(jti) {
-            return Err("revoked token");
+        let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
+        match hyprstream_rpc::auth::global_credential_revocation_store() {
+            Some(store) => {
+                if store.is_revoked(&cred_id).await {
+                    return Err("revoked token");
+                }
+            }
+            None => return Err("revocation store unavailable"),
         }
+    }
+
+    // Session check (v16 §3.3): a local token carrying a session ID is
+    // rejected when the session is revoked, expired, unknown, or cannot be
+    // checked.
+    if token_is_local {
+        let session_key = match claims.session_key() {
+            Ok(key) => key,
+            Err(_) => return Err("malformed session claims"),
+        };
+        if let Some(session_key) = session_key {
+            match hyprstream_rpc::auth::global_session_registry() {
+                Some(registry) => {
+                    if registry.is_revoked(&session_key).await {
+                        return Err("session revoked");
+                    }
+                }
+                None => return Err("session registry unavailable"),
+            }
+        }
+    }
+
+    // RFC 9068 §2.2.1 (v16 credential profile): every token admitted on this
+    // resource-server path is an `at+jwt` (the verifier positively rejects any
+    // other `typ` before decoding — see the resource verifier's
+    // `is_rfc9068_access_token_type` gate), so it MUST carry a non-empty
+    // `client_id`. This covers local AND trusted federated at+jwt.
+    if claims
+        .client_id
+        .as_deref()
+        .is_none_or(|c| c.trim().is_empty())
+    {
+        return Err("at+jwt credential missing required client_id");
     }
 
     // Federation is trusted for identity, never for choosing a local
@@ -561,13 +626,6 @@ pub(crate) async fn verify_resource_token_claims(
     claims.strip_federated_clearance(local_issuers);
     claims.strip_federated_tenant(local_issuers);
     Ok(claims)
-}
-
-pub(crate) async fn verify_token_claims(
-    state: &ServerState,
-    token: &str,
-) -> Result<jwt::Claims, &'static str> {
-    verify_resource_token_claims(&state.resource_auth_state(), token).await
 }
 
 /// Build WWW-Authenticate header value with resource_metadata URL (RFC 9728).
@@ -1391,11 +1449,14 @@ mod rotation_aware_tests {
         assert_eq!(err, "JWT validation failed");
     }
 
-    #[test]
-    fn revoked_jti_still_rejected() {
-        // A rotation-signed token decodes cleanly, but the shared jti-blocklist
-        // check `verify_token_claims` performs after decode still rejects it.
-        use hyprstream_rpc::auth::{InMemoryJtiBlocklist, JtiBlocklist as _};
+    #[tokio::test]
+    async fn revoked_jti_still_rejected() {
+        // A rotation-signed token decodes cleanly, but the global
+        // credential-revocation store check still rejects it.
+        use hyprstream_rpc::auth::{
+            global_credential_revocation_store, set_global_credential_revocation_store,
+            CredentialId, InMemoryCredentialRevocationStore,
+        };
 
         let ca = new_key();
         let rotation = new_key();
@@ -1413,10 +1474,20 @@ mod rotation_aware_tests {
         .unwrap();
         assert_eq!(claims.jti.as_deref(), Some("jti-777"));
 
-        let blocklist = InMemoryJtiBlocklist::new();
-        blocklist.revoke("jti-777".to_owned(), now() + 3600);
+        // Ensure the global store is set.
+        if global_credential_revocation_store().is_none() {
+            let _ = set_global_credential_revocation_store(std::sync::Arc::new(
+                InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let store = global_credential_revocation_store().unwrap();
+        let issuer = claims.iss.as_str();
+        store
+            .revoke_credential(CredentialId::jwt(issuer, "jti-777"), now() + 3600)
+            .await
+            .unwrap();
         // This mirrors the exact post-decode check in `verify_token_claims`.
-        assert!(blocklist.is_revoked(claims.jti.as_deref().unwrap()));
+        assert!(store.is_revoked(&CredentialId::jwt(issuer, claims.jti.as_deref().unwrap())).await);
     }
 
     #[test]
@@ -1829,9 +1900,12 @@ mod composite_aware_tests {
         .is_err());
     }
 
-    #[test]
-    fn composite_jti_remains_subject_to_revocation() {
-        use hyprstream_rpc::auth::{InMemoryJtiBlocklist, JtiBlocklist as _};
+    #[tokio::test]
+    async fn composite_jti_remains_subject_to_revocation() {
+        use hyprstream_rpc::auth::{
+            global_credential_revocation_store, set_global_credential_revocation_store,
+            CredentialId, InMemoryCredentialRevocationStore,
+        };
 
         let ca = new_ed_key();
         let (pq, pq_vk) = new_ml_dsa();
@@ -1858,9 +1932,18 @@ mod composite_aware_tests {
         )
         .unwrap();
         let jti = verified.jti.as_deref().unwrap();
-        let blocklist = InMemoryJtiBlocklist::new();
-        blocklist.revoke(jti.to_owned(), verified.exp);
-        assert!(blocklist.is_revoked(jti));
+        let issuer = verified.iss.as_str();
+        if global_credential_revocation_store().is_none() {
+            let _ = set_global_credential_revocation_store(std::sync::Arc::new(
+                InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let store = global_credential_revocation_store().unwrap();
+        store
+            .revoke_credential(CredentialId::jwt(issuer, jti), verified.exp)
+            .await
+            .unwrap();
+        assert!(store.is_revoked(&CredentialId::jwt(issuer, jti)).await);
     }
 
     #[test]

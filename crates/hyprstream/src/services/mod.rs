@@ -82,7 +82,9 @@ pub mod model;
 pub mod oauth;
 pub mod oai;
 pub mod policy;
+pub mod public_repo;
 pub mod registry;
+pub mod revocation;
 pub mod router;
 pub mod xet;
 pub mod xet_provenance;
@@ -107,6 +109,11 @@ pub(crate) mod pds_record_pg;
 /// until an operator opts in.
 #[cfg(feature = "ledger")]
 pub mod ledger;
+
+/// Settlement/tariff service (#1399). Behind the `pay` cargo feature.
+/// Implements the MIT `hyprstream_pay` traits with AGPL service logic.
+#[cfg(feature = "pay")]
+pub mod pay;
 
 pub use core::{
     Continuation, EnvelopeContext, RequestService,
@@ -147,6 +154,12 @@ pub use namespace_builder::{build_standard_namespace, StandardNamespaceConfig};
 pub use hyprstream_workers::runtime::WorkerClient;
 pub use oauth::OAuthService;
 pub use oai::OAIService;
+#[cfg(test)]
+pub(crate) use oai::{
+    await_required_native_dependencies as oai_await_required_native_dependencies,
+    healthy_registry as oai_healthy_registry,
+    prove_model_reachability_denial as oai_prove_model_reachability_denial,
+};
 pub use xet::{XetService, XetState};
 pub use at9p_verify::{At9pVerifyService, VerifyFaceState, credential_free_router};
 #[cfg(feature = "oci-image")]
@@ -157,6 +170,38 @@ pub use image_substrate::{
 pub use flight::FlightService;
 pub use discovery::DiscoveryService;
 pub use generated::discovery_client::DiscoveryClient;
+
+/// Construct on the caller's runtime, using the authenticated process profile.
+pub fn policy_client_for_process(
+    signing_key: ed25519_dalek::SigningKey,
+    compatibility_key: ed25519_dalek::VerifyingKey,
+    token: Option<String>,
+) -> anyhow::Result<PolicyClient> {
+    if hyprstream_discovery::native_network_required() {
+        PolicyClient::from_resolver(signing_key, token)
+    } else {
+        PolicyClient::for_local_bootstrap(signing_key, compatibility_key, token)
+    }
+}
+
+/// Discovery's required reach/evidence comes from the checkpoint-backed resolver.
+pub fn discovery_client_for_process(
+    signing_key: ed25519_dalek::SigningKey,
+    compatibility_key: ed25519_dalek::VerifyingKey,
+    token: Option<String>,
+) -> anyhow::Result<DiscoveryClient> {
+    if hyprstream_discovery::native_network_required() {
+        DiscoveryClient::from_resolver(signing_key, token)
+    } else {
+        DiscoveryClient::for_local_bootstrap(signing_key, compatibility_key, token)
+    }
+}
 pub use mcp_service::{McpConfig, McpService};
 #[cfg(feature = "metrics")]
 pub use metrics::MetricsService;
+
+/// Authenticated Event transport and profile-aware initialization.
+pub mod event_network;
+
+/// Native producer/Streams carrier admission and lifecycle.
+pub mod stream_network;

@@ -26,6 +26,9 @@
 //!   /oauth/device/verify                     → user verification page
 //! ```
 
+mod account_worker;
+mod account_tls;
+
 pub mod auth;
 pub mod authorize;
 pub mod browser_session;
@@ -50,6 +53,8 @@ pub mod oidc_callback;
 pub mod oidc_discovery;
 pub mod par;
 pub mod registration;
+pub mod replay_key;
+pub mod replay_metrics;
 pub mod revocation;
 pub mod rpc_handler;
 pub mod scim;
@@ -66,7 +71,7 @@ pub mod userinfo;
 pub mod wit_bootstrap;
 pub mod xrpc;
 
-use std::sync::Arc;
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use axum::{
@@ -76,12 +81,13 @@ use axum::{
     Router,
 };
 use hyprstream_rpc::registry::SocketKind;
+use hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge;
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_service::Spawnable;
 use tokio::sync::Notify;
 use tracing::info;
 
-use crate::config::OAuthConfig;
+use crate::config::{CredentialsBackend, OAuthConfig};
 use crate::services::PolicyClient;
 use state::OAuthState;
 
@@ -406,6 +412,8 @@ fn self_resource_scopes() -> Vec<String> {
 /// handler is never installed behind `AnySigner`, and anonymous MoQ peers never
 /// receive the process-global origin. The endpoint remains usable as the shared
 /// outbound dialer. Native-only.
+#[cfg(test)]
+#[cfg(test)]
 async fn build_oauth_iroh_substrate(
     transport_secret: [u8; 32],
 ) -> anyhow::Result<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate> {
@@ -421,6 +429,117 @@ async fn build_oauth_iroh_substrate(
     .await
 }
 
+async fn warm_hosted_did_index(
+    store: Arc<hyprstream_pds_service::AccountRecordStore>,
+    authority: hyprstream_rpc::Subject,
+    timeout: std::time::Duration,
+) -> Result<(), hyprstream_rpc::error::RpcError> {
+    let mut worker = account_worker::ContainedWorker::spawn("hyprstream-oauth-index-warmup", move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("warm-up runtime: {error}"))?;
+        runtime
+            .block_on(store.refresh_hosted_did_index(&authority))
+            .map_err(|error| format!("index refresh: {error}"))
+    })?;
+    worker.finish(timeout).await?.map_err(|error| {
+        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+            "hosted account index warm-up failed: {error}"
+        ))
+    })
+}
+
+/// Profile-aware bind of OAuth's inbound reach-only substrate, using the
+/// production substrate builder. See [`bind_oauth_substrate_profile`] — the
+/// builder is a parameter only so causal tests can inject a bind failure at
+/// this exact production boundary.
+#[cfg(test)]
+#[cfg(test)]
+async fn build_oauth_substrate_profile(
+    signing_key: &ed25519_dalek::SigningKey,
+    iroh_required: bool,
+) -> Result<
+    Option<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate>,
+    hyprstream_rpc::error::RpcError,
+> {
+    let signing_key = signing_key.clone();
+    bind_oauth_substrate_profile(iroh_required, move || async move {
+        let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
+            &signing_key,
+            "hyprstream-iroh-transport-v1",
+        );
+        build_oauth_iroh_substrate(transport_key.to_bytes()).await
+    })
+    .await
+}
+
+/// Bind POLICY for OAuth's inbound reach-only substrate: Required treats a
+/// bind failure as fatal before READY (the child exits nonzero and the
+/// supervised launcher rolls the spawn back); Compatibility warns and
+/// continues without Iroh (documented degraded mode). Bind policy lives here,
+/// separate from the install disposition ([`classify_oauth_endpoint_install`])
+/// so "mandatory local bind" cannot regress into "must replace the global
+/// dialer".
+#[cfg(test)]
+#[cfg(test)]
+async fn bind_oauth_substrate_profile<F, Fut>(
+    iroh_required: bool,
+    build: F,
+) -> Result<
+    Option<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate>,
+    hyprstream_rpc::error::RpcError,
+>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate>>,
+{
+    match build().await {
+        Ok(substrate) => Ok(Some(substrate)),
+        Err(e) if iroh_required => Err(hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+            "network-iroh-required OAuth iroh substrate bind failed: {e:#}"
+        ))),
+        Err(e) => {
+            tracing::warn!(
+                "OAuth iroh substrate bind failed; continuing without iroh (Compatibility): {e:#}"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Disposition of the process-global client-endpoint install for OAuth's
+/// bound substrate. `install_iroh_client_endpoint` is first-write-wins, so an
+/// occupied slot means a DIFFERENT valid endpoint — in real Required startup,
+/// the authenticated OS-owned bootstrap outbound carrier
+/// (`PROCESS_BOOTSTRAP_CARRIER`) — already owns outbound dials. Both outcomes
+/// are valid and expected; neither is ever a startup error. The two carriers'
+/// endpoint IDs are deliberately different (distinct transport purpose keys)
+/// and are never compared; the OAuth substrate is retained in both cases and
+/// the existing global endpoint is never reset or replaced.
+enum OAuthEndpointInstall {
+    /// The empty process-global slot was won by this substrate's endpoint.
+    InstalledHere,
+    /// A previously-installed global endpoint remains the outbound dialer;
+    /// the returned capability clone is dropped and OAuth's substrate stays
+    /// the independent inbound owner.
+    ExistingGlobalRetained,
+}
+
+fn classify_oauth_endpoint_install(
+    substrate: &hyprstream_rpc::transport::iroh_substrate::IrohSubstrate,
+) -> OAuthEndpointInstall {
+    match hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(
+        substrate.owned_client_endpoint(),
+    ) {
+        Ok(()) => OAuthEndpointInstall::InstalledHere,
+        Err(returned) => {
+            drop(returned);
+            OAuthEndpointInstall::ExistingGlobalRetained
+        }
+}
+}
+
 pub struct OAuthService {
     config: OAuthConfig,
     /// Global TLS configuration (passed from factory, avoids re-loading config)
@@ -430,21 +549,31 @@ pub struct OAuthService {
     account_config: crate::account::AccountZoneConfig,
     /// Global QUIC configuration for cert-hash publication in DID doc (#185).
     quic_config: Option<crate::config::QuicConfig>,
-    /// Signing key for creating the PolicyClient inside `run()`.
+    /// Signing key for creating RPC clients inside `run()`.
     signing_key: hyprstream_rpc::prelude::SigningKey,
     control_transport: TransportConfig,
+    /// Policy transport resolved by the factory. This is an IPC socket when
+    /// OAuth runs in its own rootless Quadlet process.
+    policy_transport: TransportConfig,
+    /// Discovery transport resolved by the factory. This is an IPC socket when
+    /// OAuth runs in its own rootless Quadlet process.
+    discovery_transport: TransportConfig,
     #[allow(dead_code)]
     verifying_key: ed25519_dalek::VerifyingKey,
     /// JWT verifying key (CA key) for JWKS endpoint. This is the key that verifies
     /// JWTs signed by PolicyService, derived from the root signing key.
     jwt_verifying_key: [u8; 32],
     /// Shared JTI blocklist (same Arc as PolicyService) for cross-plane revocation.
-    jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
     /// Authority-owned hosted-account records for ATProto DID → tenant
     /// resolution. Attached by the PDS service composition layer.
     hosted_account_store: Option<Arc<hyprstream_pds_service::AccountRecordStore>>,
     /// Authenticated hosted-account registration and federation-intake face.
     identity_registration_api: Option<Arc<identity_registration::IdentityRegistrationApi>>,
+    /// Authoritative publication root for the hosted-account tree. Set by the
+    /// production factory so OAuth and the public account listener share one
+    /// descriptor-bound store.
+    pds_root: Option<PathBuf>,
+    dedicated_process: bool,
 }
 
 impl OAuthService {
@@ -454,6 +583,8 @@ impl OAuthService {
         account_config: crate::account::AccountZoneConfig,
         signing_key: hyprstream_rpc::prelude::SigningKey,
         control_transport: TransportConfig,
+        policy_transport: TransportConfig,
+        discovery_transport: TransportConfig,
         verifying_key: ed25519_dalek::VerifyingKey,
         jwt_verifying_key: ed25519_dalek::VerifyingKey,
     ) -> Self {
@@ -464,26 +595,20 @@ impl OAuthService {
             quic_config: None,
             signing_key,
             control_transport,
+            policy_transport,
+            discovery_transport,
             verifying_key,
             jwt_verifying_key: jwt_verifying_key.to_bytes(),
-            jti_blocklist: None,
             hosted_account_store: None,
             identity_registration_api: None,
+            pds_root: None,
+            dedicated_process: false,
         }
     }
 
     /// Attach the global QUIC configuration for DID-doc cert-hash publication (#185).
     pub fn with_quic_config(mut self, quic: crate::config::QuicConfig) -> Self {
         self.quic_config = Some(quic);
-        self
-    }
-
-    /// Attach the shared JTI blocklist (same Arc as PolicyService).
-    pub fn with_jti_blocklist(
-        mut self,
-        bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
-    ) -> Self {
-        self.jti_blocklist = Some(bl);
         self
     }
 
@@ -504,7 +629,122 @@ impl OAuthService {
         self.identity_registration_api = Some(api);
         self
     }
+
+    /// Set only from the launcher's explicit single-service process context.
+    pub(crate) fn with_dedicated_process(mut self, dedicated: bool) -> Self {
+        self.dedicated_process = dedicated;
+        self
+    }
+
+    /// Attach the authoritative published-account root used by production
+    /// OAuth/account HTTP composition.
+    pub fn with_pds_root(mut self, root: PathBuf) -> Self {
+        self.pds_root = Some(root);
+        self
+    }
 }
+
+fn account_http_socket_addr(config: &crate::account::AccountHttpConfig) -> Result<SocketAddr> {
+    // Preserve bracketed IPv6 configurations while accepting bare IP literals.
+    let host = config.host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(&config.host);
+    let ip = host.parse::<std::net::IpAddr>()
+        .map_err(|error| anyhow::anyhow!("invalid account HTTP bind IP: {error}"))?;
+    Ok(SocketAddr::new(ip, config.port))
+}
+
+/// Resolve explicitly provisioned TLS material for the public account
+/// listener. Account hosts must never fall back to the node/self-signed
+/// certificate, so enabling the listener requires both PEM paths and a valid
+/// rustls keypair.
+async fn resolve_account_http_tls(
+    config: &crate::account::AccountHttpConfig,
+    zone: &crate::account::AccountZone,
+) -> anyhow::Result<axum_server::tls_rustls::RustlsConfig> {
+    anyhow::ensure!(config.port != 0, "account HTTP listener port must be non-zero");
+    anyhow::ensure!(
+        config.tls_cert.is_file(),
+        "account TLS certificate is unavailable: {}",
+        config.tls_cert.display()
+    );
+    anyhow::ensure!(
+        config.tls_key.is_file(),
+        "account TLS private key is unavailable: {}",
+        config.tls_key.display()
+    );
+    let cert_pem = tokio::fs::read(&config.tls_cert).await?;
+    let key_pem = tokio::fs::read(&config.tls_key).await?;
+    let cert_der = rustls_pemfile::certs(&mut &cert_pem[..])
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("account TLS certificate contains no certificate"))??;
+    let (_, certificate) = x509_parser::parse_x509_certificate(cert_der.as_ref())
+        .map_err(|error| anyhow::anyhow!("invalid account TLS certificate: {error}"))?;
+    let wildcard = zone.wildcard_domain();
+    let covers_zone = certificate.extensions().iter().any(|extension| {
+        matches!(
+            extension.parsed_extension(),
+            x509_parser::extensions::ParsedExtension::SubjectAlternativeName(names)
+                if names.general_names.iter().any(|name| matches!(
+                    name,
+                    x509_parser::extensions::GeneralName::DNSName(dns)
+                        if dns.eq_ignore_ascii_case(wildcard)
+                ))
+        )
+    });
+    anyhow::ensure!(
+        covers_zone,
+        "account TLS certificate does not cover account zone wildcard {wildcard}"
+    );
+    // Validate and install the same bytes, including during rotation. Reopening
+    // the paths here could install a different certificate than the SAN check.
+    axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to load account-zone TLS for {}: {error}",
+                zone.wildcard_domain()
+            )
+        })
+}
+
+#[cfg(test)]
+fn runtime_clients(
+    signing_key: &ed25519_dalek::SigningKey,
+) -> anyhow::Result<(PolicyClient, crate::services::DiscoveryClient)> {
+    let trust = hyprstream_service::global_trust_store();
+    let policy_key = trust
+        .resolve_one("policy")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated policy key"))?;
+    let discovery_key = trust
+        .resolve_one("discovery")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated discovery key"))?;
+    Ok((
+        crate::services::policy_client_for_process(signing_key.clone(), policy_key, None)?,
+        crate::services::discovery_client_for_process(signing_key.clone(), discovery_key, None)?,
+    ))
+}
+
+/// Wait until the required native carrier closes. Normal service shutdown is
+/// handled by the outer `tokio::select!`; keeping this watcher independent of
+/// that signal avoids consuming the single shutdown notification before the
+/// HTTP server observes it.
+async fn wait_for_required_iroh_carrier(
+    substrate: &hyprstream_rpc::transport::iroh_substrate::IrohSubstrate,
+) -> bool {
+    loop {
+        if substrate.router().is_shutdown() || substrate.endpoint().is_closed() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+#[cfg(test)]
+mod required_consumer_tests;
+
+#[cfg(test)]
+mod readiness_tests;
 
 impl Spawnable for OAuthService {
     fn name(&self) -> &str {
@@ -520,6 +760,15 @@ impl Spawnable for OAuthService {
         shutdown: Arc<Notify>,
         on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<(), hyprstream_rpc::error::RpcError> {
+        let contains_account_workers = self.account_config.http.is_some();
+        if contains_account_workers && !self.dedicated_process {
+            return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                "hosted account workers require a dedicated foreground OAuth process".to_owned(),
+            ));
+        }
+        // Timed-out synchronous I/O cannot be cancelled safely. This service
+        // owns the whole process when account workers are enabled; terminal
+        // startup/shutdown therefore ends that process and all its workers.
         // Use single-threaded runtime + LocalSet because HTTP handlers make ZMQ RPC
         // calls (e.g., policy_client.issue_token()), and ZMQ clients use spawn_local.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -528,7 +777,7 @@ impl Spawnable for OAuthService {
             .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
 
         let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async move {
+        let result = local.block_on(&rt, async move {
             let addr_str = format!("{}:{}", self.config.host, self.config.port);
             let addr: std::net::SocketAddr = addr_str.parse().map_err(|e| {
                 hyprstream_rpc::error::RpcError::SpawnFailed(format!("Invalid address: {e}"))
@@ -550,8 +799,11 @@ impl Spawnable for OAuthService {
             // async I/O (TMQ) registers socket FDs with THIS runtime's epoll.
             // Creating them in the factory (main runtime) would cause hangs.
 
-            // Bootstrap: Get service verifying keys from trust store.
-            // The trust store is populated during startup by depends_on services.
+            // Bootstrap: get service verifying keys from the trust store,
+            // populated during startup by depends_on services. Required profile
+            // resolves through the checkpoint-backed discovery resolver;
+            // compatibility dials the deterministic per-process IPC transports
+            // the factory resolved (available to a separate Quadlet process).
             let policy_vk = match hyprstream_service::global_trust_store().resolve_one("policy") {
                 Some(vk) => vk,
                 None => {
@@ -560,16 +812,20 @@ impl Spawnable for OAuthService {
                     ));
                 }
             };
-            let policy_client = PolicyClient::for_local_bootstrap(
-                self.signing_key.clone(),
-                policy_vk,
-                None,
-            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                format!("failed to create PolicyClient: {e}"),
-            ))?;
+            let policy_client = if hyprstream_discovery::native_network_required() {
+                PolicyClient::from_resolver(self.signing_key.clone(), None)
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create PolicyClient: {e}")))?
+            } else {
+                PolicyClient::for_local_transport_bootstrap(
+                    &self.policy_transport,
+                    self.signing_key.clone(),
+                    policy_vk,
+                    None,
+                ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                    format!("failed to create PolicyClient: {e}"),
+                ))?
+            };
 
-            // Get discovery key from trust store (populated by depends_on = ["discovery"]).
-            // Using trust store avoids RPC calls which require LocalSet context.
             let discovery_vk = match hyprstream_service::global_trust_store().resolve_one("discovery") {
                 Some(vk) => vk,
                 None => {
@@ -578,13 +834,19 @@ impl Spawnable for OAuthService {
                     ));
                 }
             };
-            let discovery_client = crate::services::DiscoveryClient::for_local_bootstrap(
-                self.signing_key.clone(),
-                discovery_vk,
-                None,
-            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                format!("failed to create DiscoveryClient: {e}"),
-            ))?;
+            let discovery_client = if hyprstream_discovery::native_network_required() {
+                crate::services::DiscoveryClient::from_resolver(self.signing_key.clone(), None)
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create DiscoveryClient: {e}")))?
+            } else {
+                crate::services::DiscoveryClient::for_local_transport_bootstrap(
+                    &self.discovery_transport,
+                    self.signing_key.clone(),
+                    discovery_vk,
+                    None,
+                ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                    format!("failed to create DiscoveryClient: {e}"),
+                ))?
+            };
 
             let credentials_dir = crate::auth::identity_store::credentials_dir().map_err(|e| {
                 hyprstream_rpc::error::RpcError::SpawnFailed(
@@ -592,114 +854,24 @@ impl Spawnable for OAuthService {
                 )
             })?;
 
-            // Load the user store (account system of record) based on the
-            // configured backend. A configured system-of-record failure fails
-            // closed — never silently fall back to a different account store.
-            use crate::config::CredentialsBackend;
+            // Load account and device storage through the single production
+            // credential-store boundary. Account-store construction failure
+            // fails closed; no caller can inject a raw backend here.
             let credentials_config = crate::config::HyprConfig::load()
                 .map(|c| c.credentials)
                 .unwrap_or_default();
-
-            // The device store is independent of the user-store backend. It
-            // always uses RocksDB (device-authorization state is not account
-            // data and there is no pglite DeviceStore). Every match arm below
-            // assigns it, so the initial `None` is structurally required by
-            // Rust's initialization rules but is always overwritten before read.
-            #[allow(unused_assignments)]
-            let mut device_store_opt: Option<Arc<dyn crate::auth::DeviceStore>> = None;
-
-            // Helper: open a RocksDbUserStore solely for its DeviceStore trait
-            // (used when the account backend is not RocksDB).
-            #[cfg(any(feature = "pglite", feature = "valkey"))]
-            // (used when the account backend is not RocksDB).
-            macro_rules! open_rocksdb_device_store {
-                () => {{
-                    match crate::auth::RocksDbUserStore::open(&credentials_dir) {
-                        Ok(ds) => {
-                            let arc: Arc<crate::auth::RocksDbUserStore> = Arc::new(ds);
-                            Some(arc as Arc<dyn crate::auth::DeviceStore>)
-                        }
-                        Err(e) => {
-                            tracing::warn!("Could not open device store (RocksDB): {e}");
-                            None
-                        }
-                    }
-                }};
-            }
-
-            let user_store: Option<Arc<dyn crate::auth::user_store::UserStore>> = match credentials_config.backend {
-                CredentialsBackend::Pglite => {
-                    #[cfg(feature = "pglite")]
-                    {
-                        let db_path = credentials_dir.join("pglite");
-                        // Open the shared PGlite handle explicitly so it can be
-                        // injected into other repositories (AppView inventory)
-                        // via from_database in the future. #1376's PgliteUserStore
-                        // owns the schema application; we own the connection.
-                        let database = Arc::new(
-                            pglite::PGlite::open(&db_path)
-                                .await
-                                .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                                    format!("failed to open PGlite at {db_path:?}: {e}")
-                                ))?,
-                        );
-                        let store = crate::auth::PgliteUserStore::from_database(database)
-                            .await
-                            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                                format!("failed to initialize UserStore schema: {e}")
-                            ))?;
-                        info!("User store (PGlite) opened at {:?}", db_path);
-                        device_store_opt = open_rocksdb_device_store!();
-                        Some(Arc::new(store) as Arc<dyn crate::auth::user_store::UserStore>)
-                    }
-                    #[cfg(not(feature = "pglite"))]
-                    {
-                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                            "credentials.backend = \"pglite\" but binary was not compiled with --features pglite".to_owned()
-                        ));
-                    }
-                }
-                CredentialsBackend::Rocksdb => {
-                    match crate::auth::RocksDbUserStore::open(&credentials_dir) {
-                        Ok(store) => {
-                            info!("User store (RocksDB) opened at {:?}", credentials_dir);
-                            let arc = Arc::new(store);
-                            // RocksDbUserStore implements both traits — share the object.
-                            device_store_opt = Some(arc.clone() as Arc<dyn crate::auth::DeviceStore>);
-                            Some(arc as Arc<dyn crate::auth::user_store::UserStore>)
-                        }
-                        Err(e) => {
-                            return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                                format!("failed to open RocksDB user store at {credentials_dir:?}: {e}")
-                            ));
-                        }
-                    }
-                }
-                CredentialsBackend::Valkey => {
-                    #[cfg(feature = "valkey")]
-                    {
-                        let url = &credentials_config.valkey.url;
-                        match crate::auth::ValkeyUserStore::connect(url).await {
-                            Ok(store) => {
-                                info!("User store (Valkey) connected at {url}");
-                                device_store_opt = open_rocksdb_device_store!();
-                                Some(Arc::new(store))
-                            }
-                            Err(e) => {
-                                return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                                    format!("failed to connect Valkey user store at {url}: {e}")
-                                ));
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "valkey"))]
-                    {
-                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                            "credentials.backend = \"valkey\" but binary was not compiled with --features valkey".to_owned()
-                        ));
-                    }
-                }
-            };
+            let (user_store, device_store_opt) =
+                crate::auth::ProductionUserStore::open_with_device_store(
+                    &credentials_dir,
+                    &credentials_config,
+                )
+                .await
+                .map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "failed to initialize production credential store: {error:#}"
+                    ))
+                })?;
+            info!("Production credential store admitted at {:?}", credentials_dir);
 
             // Load the CA JWT signing key for browser WIT issuance (POST /oauth/wit).
             // Also seed the signing key store from the same root key.
@@ -773,6 +945,37 @@ impl Spawnable for OAuthService {
                         }
                     }
                 }
+            };
+
+            // The public account face and OAuth's hosted-DID resolver must
+            // share one descriptor-bound store over the authoritative
+            // publication root. Enabling the listener therefore fails closed
+            // when the root or mandatory audit sink is unavailable.
+            let hosted_account_store = if let Some(store) = &self.hosted_account_store {
+                Some(Arc::clone(store))
+            } else if self.account_config.http.is_some() {
+                let root = self.pds_root.clone().ok_or_else(|| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "account HTTP listener enabled without a PDS publication root".to_owned(),
+                    )
+                })?;
+                let sink = audit_sink.clone().ok_or_else(|| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "account HTTP listener requires a usable MAC audit sink".to_owned(),
+                    )
+                })?;
+                let mount = crate::mac::PdsDirectoryMount::open(&root).map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "open published PDS account root {}: {error}",
+                        root.display()
+                    ))
+                })?;
+                Some(crate::mac::production_pds_account_record_store(
+                    Arc::new(mount),
+                    sink,
+                ))
+            } else {
+                None
             };
 
             let (ca_jwt_key, signing_key_store) = match crate::auth::identity_store::load_ca_signing_key(&credentials_dir) {
@@ -868,7 +1071,7 @@ impl Spawnable for OAuthService {
                 discovery_client.clone(),
                 jwt_verifying_key,
             );
-            if let Some(store) = &self.hosted_account_store {
+            if let Some(store) = &hosted_account_store {
                 oauth_state = oauth_state.with_hosted_account_store(Arc::clone(store));
             }
             if let Some(api) = &self.identity_registration_api {
@@ -881,9 +1084,7 @@ impl Spawnable for OAuthService {
                     "OAuth user-token minting disabled: no deployment account zone"
                 ),
             }
-            if let Some(store) = user_store {
-                oauth_state = oauth_state.with_user_store(store);
-            }
+            oauth_state = oauth_state.with_user_store(user_store);
             if let Some(ds) = device_store_opt {
                 oauth_state = oauth_state.with_device_store(ds);
             }
@@ -904,8 +1105,28 @@ impl Spawnable for OAuthService {
             if let Some(sink) = audit_sink {
                 oauth_state = oauth_state.with_audit_sink(sink);
             }
-            if let Some(bl) = self.jti_blocklist {
-                oauth_state = oauth_state.with_jti_blocklist(bl);
+
+            // Warm the authority-owned hosted-DID index before exposing OAuth
+            // readiness. Request paths remain O(1) lookups and never perform
+            // tenant enumeration; a bounded startup failure keeps OAuth
+            // fail-closed instead of serving valid hosted users intermittently
+            // while the first snapshot is still absent.
+            if let Some(store) = &hosted_account_store {
+                let authority = hyprstream_rpc::Subject::new(
+                    hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                );
+                if contains_account_workers {
+                    warm_hosted_did_index(
+                        Arc::clone(store),
+                        authority,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await?;
+                } else if !store.hosted_did_index_ready().await {
+                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "in-process hosted-account store must be warmed before injection".to_owned(),
+                    ));
+                }
             }
             // Populate legacy JWKS nbf/exp from signing-key file mtime (used when store absent).
             let key_nbf = crate::auth::identity_store::node_signing_key_mtime(&credentials_dir);
@@ -1014,41 +1235,122 @@ impl Spawnable for OAuthService {
                         }
                     }
 
-                    // OAuth's iroh inbound ALPNs are deliberately refused until
-                    // fresh application/session proof exists (#1027/#726), so do
-                    // not advertise them as an available DID service.
+                    // The Iroh transport entry is populated before state is
+                    // shared; its RPC plane is bound after bridge readiness.
                 }
             }
 
+            if self
+                .quic_config
+                .as_ref()
+                .is_some_and(|q| q.enabled && q.iroh)
+            {
+                let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
+                    &self.signing_key,
+                    "hyprstream-iroh-transport-v1",
+                );
+                oauth_state.iroh_node_id = Some(transport_key.verifying_key().to_bytes());
+            }
             let state = Arc::new(oauth_state);
             state.spawn_code_sweeper();
 
-            // Phase 0.5 Stage D — publish OIDF entity statement to DiscoveryService
-            // at startup AND periodically thereafter. Periodic re-publish keeps
-            // the cached statement fresh as signing keys rotate and the embedded
-            // JWKS changes; entity statements carry a 24h exp so any longer gap
-            // leaves federation peers falling through to HTTPS unnecessarily.
-            //
-            // Non-fatal on failure: HTTPS fallback continues to work either way.
-            {
-                let publish_state = state.clone();
-                // Re-publish at 1/4 of the entity-statement exp (24h) so we
-                // refresh the cached statement well before consumers reject it
-                // as expired. Concretely: every 6h. Initial publish happens
-                // immediately on the first iteration of the loop.
-                let republish_interval = std::time::Duration::from_secs(6 * 3600);
-                tokio::task::spawn_local(async move {
-                    let mut tick = tokio::time::interval(republish_interval);
-                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    loop {
-                        tick.tick().await;
-                        federation_entity::publish_entity_statement_to_discovery(
-                            publish_state.clone(),
-                        )
-                        .await;
-                    }
-                });
+            // Startup transaction (#1585 YuI7): the HTTP(S) listener is
+            // PREBOUND before any readiness signal and before the irreversible
+            // process-global Iroh endpoint install — an occupied port fails
+            // here, while the supervised launcher still owns the launch.
+            let bound = crate::server::tls::bind_listener(addr, rustls_config, "OAuthService")?;
+
+            // Optional public hosted-account face. It has its own listener,
+            // certificate, and shutdown signal; it is never mounted into the
+            // authenticated OAuth router.
+            let account_endpoint = if let Some(http_config) = self.account_config.http.as_ref() {
+                let zone = self.account_config.resolve_zone().map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "account HTTP listener requires a valid account zone: {error}"
+                    ))
+                })?;
+                let store = hosted_account_store.clone().ok_or_else(|| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "account HTTP listener has no hosted-account store".to_owned(),
+                    )
+                })?;
+                let directory = Arc::new(
+                    hyprstream_pds_service::account_http::MountedHostedAccountHttpDirectory::new_without_refresh(
+                        store,
+                        hyprstream_rpc::Subject::new(
+                            hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                        ),
+                        zone.apex(),
+                    )
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "compose account HTTP directory: {error}"
+                        ))
+                    })?,
+                );
+                let account_app =
+                    hyprstream_pds_service::account_http::router(zone.apex(), directory)
+                        .map_err(|error| {
+                            hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                                "compose account HTTP router: {error}"
+                            ))
+                        })?;
+                let account_addr = account_http_socket_addr(http_config)
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "invalid account HTTP bind host '{}': {error}",
+                            http_config.host
+                        ))
+                    })?;
+                let account_tls = resolve_account_http_tls(http_config, &zone)
+                    .await
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "account HTTP TLS: {error:#}"
+                        ))
+                    })?;
+                let account_bound = crate::server::tls::bind_listener(
+                    account_addr,
+                    Some(account_tls),
+                    "AccountHttpService",
+                )?;
+                Some((account_bound, account_app, http_config.clone(), zone))
+            } else {
+                None
+            };
+
+            let iroh_required = self
+                .quic_config
+                .as_ref()
+                .is_some_and(crate::config::QuicConfig::iroh_required);
+            let iroh_enabled = self
+                .quic_config
+                .as_ref()
+                .is_some_and(|q| q.enabled && q.iroh);
+            if iroh_required && !iroh_enabled {
+                return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                    "network-iroh-required OAuth service requires [quic] enabled with iroh"
+                        .to_owned(),
+                ));
             }
+            let mut substrate_owned: Option<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate> = None;
+
+            // Federation publisher: a DIALING task — spawned only after the
+            // final endpoint decision so its discovery dials use the installed
+            // endpoint. Startup-owned: aborted/joined on every terminal path.
+            let publish_state = state.clone();
+            let publisher_handle = tokio::task::spawn_local(async move {
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    federation_entity::publish_entity_statement_to_discovery(
+                        publish_state.clone(),
+                    )
+                    .await;
+                }
+            });
 
             // Create router with configurable CORS
             let app = create_app(state.clone(), &self.config.cors);
@@ -1057,102 +1359,311 @@ impl Spawnable for OAuthService {
                 "Authorization server metadata at {scheme}://{addr}/.well-known/oauth-authorization-server",
             );
 
-            if let Some(tx) = on_ready {
-                let _ = tx.send(());
-            }
-
-            let _ = hyprstream_rpc::notify::ready();
-
             // User-CRUD RPC serve, alongside the HTTP server. #136: bridged
-            // dispatch over the registered transport (inproc/ipc) instead of the
-            // ZMQ ROUTER. A dedicated `serve_shutdown` stops it once the HTTP
-            // server exits, so the task joins cleanly.
-            let control_transport = self.control_transport.clone();
-            let rpc_signing_key = self.signing_key.clone();
-            let rpc_state = state.clone();
-            // Bind OAuth's domain-separated outbound iroh carrier when enabled.
-            // Its refused inbound ALPNs are not advertised in the DID document.
-            let iroh_enabled = self.quic_config.as_ref().is_some_and(|q| q.enabled && q.iroh);
+            // dispatch over the registered transport (inproc/ipc). The bridge
+            // RUNTIME + handler construction happen on the bridge thread via
+            // `spawn_with`, whose readiness receiver resolves only after that
+            // construction succeeds — `spawn` alone proves only that the
+            // thread started.
+            let nonce_cache = Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new());
+            let rpc_state_build = state.clone();
+            let control_transport_build = self.control_transport.clone();
+            let rpc_signing_key_build = self.signing_key.clone();
             let serve_shutdown = Arc::new(Notify::new());
             let serve_shutdown_task = Arc::clone(&serve_shutdown);
-            let rpc_loop = tokio::task::spawn_local(async move {
-                let handler = rpc_handler::OAuthRpcHandler::new(
-                    rpc_state,
-                    control_transport.clone(),
-                    rpc_signing_key.clone(),
-                );
-                let nonce_cache = Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new());
-                let bridge = match hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
-                    handler,
-                    nonce_cache,
-                    0,
-                ) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::error!("OAuth RPC bridge spawn error: {}", e);
-                        return;
-                    }
-                };
-                let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> =
-                    Arc::new(bridge);
 
-                // Reach-only iroh endpoint. Both inbound ALPNs refuse before the
-                // OAuth user-CRUD bridge or global MoQ origin can be reached.
-                let _iroh_substrate = if iroh_enabled {
-                    let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
-                        &rpc_signing_key,
-                        "hyprstream-iroh-transport-v1",
-                    );
-                    match build_oauth_iroh_substrate(transport_key.to_bytes()).await {
-                        Ok(substrate) => {
-                            let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(
-                                substrate.owned_client_endpoint(),
-                            );
-                            Some(substrate)
+            // Bridge init phase: thread + runtime + handler construction,
+            // bounded by the readiness receiver. The typed bridge is retained
+            // OUTSIDE the spawned RPC future — the outer owner drives the
+            // bounded shutdown on every terminal path. Init failures are
+            // recorded (not returned) so the single common teardown below
+            // always runs: a bare `?` past the publisher spawn would strand
+            // that task and the bound substrate.
+            let mut bridge_owner: Option<Arc<LocalServiceBridge>> = None;
+            // (join handle, whether the select branch already consumed it).
+            let mut rpc_owner: Option<(tokio::task::JoinHandle<anyhow::Result<()>>, bool)> =
+                None;
+            let account_shutdown = Arc::new(Notify::new());
+            let mut account_owner: Option<account_worker::ContainedWorker<
+                Result<(), hyprstream_rpc::error::RpcError>,
+            >> = None;
+            let bridge_init: Result<Arc<LocalServiceBridge>, hyprstream_rpc::error::RpcError> =
+                async {
+                    let (bridge, bridge_ready_rx) =
+                        match LocalServiceBridge::spawn_with(
+                            "oauth-user-crud",
+                            move || async move {
+                                Ok(rpc_handler::OAuthRpcHandler::new(
+                                    rpc_state_build,
+                                    control_transport_build,
+                                    rpc_signing_key_build,
+                                ))
+                            },
+                            nonce_cache,
+                            0,
+                        ) {
+                            Ok(spawned) => spawned,
+                            Err(e) => {
+                                return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                                    format!("OAuth bridge thread spawn failed: {e}"),
+                                ));
+                            }
+                        };
+                    let bridge = Arc::new(bridge);
+                    bridge_owner = Some(bridge.clone());
+                    // Bridge runtime/handler readiness must resolve BEFORE
+                    // serve_bridged (and therefore the external READY signal)
+                    // is allowed to start — this await, not a comment, imposes
+                    // the ordering. Bounded so a stuck bridge cannot hang the
+                    // process.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        bridge_ready_rx,
+                    )
+                    .await
+                    {
+                        Ok(Ok(Ok(()))) => Ok(bridge),
+                        Ok(Ok(Err(closed))) => {
+                            Err(hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                                "OAuth bridge runtime initialization failed: {closed:#}"
+                            )))
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                "OAuth iroh substrate bind failed; continuing without iroh: {e}"
-                            );
-                            None
+                        // The bridge task ended without ever sending a
+                        // readiness result — a fatal init failure, not
+                        // readiness.
+                        Ok(Err(_)) => Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                            "OAuth bridge runtime initialization receiver closed \
+                             without a readiness result"
+                                .to_owned(),
+                        )),
+                        Err(_) => Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                            "OAuth bridge runtime initialization timed out".to_owned(),
+                        )),
+                    }
+                }
+                .await;
+
+            // Serve phase: register/bind the control transport — serve_bridged's
+            // existing boundary emits the ONLY external readiness signals
+            // (on_ready + kernel READY), now gated on bridge runtime readiness,
+            // substrate bind, and the prebound HTTP(S) listener — then serve
+            // the prebound listener concurrently with the RPC loop. Whichever
+            // side finishes first decides the primary outcome; the actual
+            // serve result propagates (no log-and-swallow).
+            let mut primary: anyhow::Result<()> = match bridge_init {
+                Err(e) => Err(anyhow::anyhow!("OAuthService startup failed: {e}")),
+                Ok(bridge) => async {
+                    if iroh_enabled {
+                        let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
+                            &self.signing_key,
+                            "hyprstream-iroh-transport-v1",
+                        );
+                        let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> = bridge.clone();
+                        let rpc_handler = hyprstream_rpc::transport::iroh_rpc::IrohRpcProtocolHandler::with_stream_limit(
+                            processor,
+                            self.signing_key.clone(),
+                            hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
+                        );
+                        let substrate_result = hyprstream_rpc::transport::iroh_substrate::IrohSubstrate::new(
+                            transport_key.to_bytes(),
+                            hyprstream_rpc::transport::iroh_substrate::RefuseHandler::new(
+                                "OAuth MoQ disabled pending verified session proof (#1027/#726)",
+                            ),
+                            rpc_handler,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("OAuth iroh substrate bind failed: {e}"));
+                        match substrate_result {
+                            Ok(substrate) => {
+                                match classify_oauth_endpoint_install(&substrate) {
+                                    OAuthEndpointInstall::InstalledHere => {
+                                        info!("OAuth iroh endpoint installed as the process-global outbound dialer");
+                                    }
+                                    OAuthEndpointInstall::ExistingGlobalRetained => {
+                                        info!("OAuth iroh substrate retained; existing global outbound endpoint is untouched");
+                                    }
+                                }
+                                substrate_owned = Some(substrate);
+                            }
+                            Err(error) => {
+                                // An enabled OAuth Iroh endpoint is advertised in the DID
+                                // document before the HTTP server becomes reachable. A bind
+                                // failure must therefore abort every profile; continuing would
+                                // publish a node id with no live endpoint behind it.
+                                return Err(error);
+                            }
                         }
                     }
-                } else {
-                    None
-                };
-
-                if let Err(e) = hyprstream_rpc::service::serve::serve_bridged(
-                    &control_transport,
-                    processor,
-                    rpc_signing_key,
-                    serve_shutdown_task,
-                    None,
-                )
-                .await
-                {
-                    tracing::error!("OAuth RPC serve error: {}", e);
-                }
-
-                // Drain the iroh substrate (accept loop + handlers) on shutdown.
-                if let Some(substrate) = _iroh_substrate {
-                    if let Err(e) = substrate.shutdown().await {
-                        tracing::warn!("OAuth iroh substrate shutdown error: {e}");
+                    // Finish all fallible account-worker creation before the RPC
+                    // task can signal readiness. Keep the actual thread owner.
+                    if let Some((account_bound, account_app, account_config, account_zone)) = account_endpoint {
+                        let account_shutdown_task = Arc::clone(&account_shutdown);
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|error| hyprstream_rpc::error::RpcError::SpawnFailed(
+                                format!("account HTTP runtime: {error}"),
+                            ))?;
+                        account_owner = Some(account_worker::ContainedWorker::spawn(
+                            "hyprstream-account-http",
+                            move || {
+                                runtime.block_on(account_tls::serve_with_reload(
+                                    account_bound,
+                                    account_app,
+                                    account_shutdown_task,
+                                    account_config,
+                                    account_zone,
+                                    std::time::Duration::from_secs(30),
+                                ))
+                            },
+                        )?);
                     }
-                }
-            });
+                    let control_transport = self.control_transport.clone();
+                    let rpc_signing_key = self.signing_key.clone();
+                    let processor: Arc<
+                        dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor,
+                    > = bridge.clone();
+                    let mut rpc_loop = tokio::task::spawn_local(async move {
+                        hyprstream_rpc::service::serve::serve_bridged(
+                            &control_transport,
+                            processor,
+                            rpc_signing_key,
+                            serve_shutdown_task,
+                            on_ready,
+                        )
+                        .await
+                    });
+                    let mut rpc_consumed = false;
+                    let outcome = tokio::select! {
+                        http = crate::server::tls::serve_bound(
+                            bound,
+                            app,
+                            shutdown.clone(),
+                            "OAuthService",
+                        ) => http.map_err(|e| anyhow::anyhow!("OAuthService HTTP serve error: {e}")),
+                        account = async {
+                            match account_owner.as_mut() {
+                                Some(worker) => worker.result().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            match account {
+                                Ok(Ok(())) => Err(anyhow::anyhow!(
+                                    "AccountHttpService stopped unexpectedly"
+                                )),
+                                Ok(Err(e)) => Err(anyhow::anyhow!(
+                                    "AccountHttpService error: {e}"
+                                )),
+                                Err(join) => Err(anyhow::anyhow!(
+                                    "AccountHttpService task join error: {join}"
+                                )),
+                            }
+                        },
+                        rpc = &mut rpc_loop => {
+                            // This select branch consumed the completed
+                            // JoinHandle — the teardown below must not poll it
+                            // again (poll-after-completion panics).
+                            rpc_consumed = true;
+                            match rpc {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(e)) => Err(anyhow::anyhow!(
+                                    "OAuthService RPC serve error: {e}"
+                                )),
+                                Err(join) => Err(anyhow::anyhow!(
+                                    "OAuthService RPC task join error: {join}"
+                                )),
+                            }
+                        }
+                        _carrier_lost = async {
+                            match substrate_owned.as_ref() {
+                                Some(substrate) => wait_for_required_iroh_carrier(substrate).await,
+                                None => std::future::pending::<bool>().await,
+                            }
+                        }, if iroh_required => {
+                            Err(anyhow::anyhow!(
+                                "OAuth required Iroh carrier terminated unexpectedly"
+                            ))
+                        }
+                    };
+                    rpc_owner = Some((rpc_loop, rpc_consumed));
+                    outcome
+                }.await
+            };
 
-            // Run HTTP(S) server with graceful shutdown
-            let _ = crate::server::tls::serve_app(addr, app, rustls_config, shutdown, "OAuthService").await;
-
-            // HTTP server stopped — stop the RPC serve and join it. notify_one
-            // (not notify_waiters) stores a permit if the serve task hasn't yet
-            // armed its `notified()` await, so the signal can't be missed even if
-            // the HTTP server exited before the RPC task reached serve_bridged.
+            // ── Single common bounded teardown (the one startup owner): runs
+            // on EVERY terminal path past the publisher spawn — bridge spawn /
+            // readiness failure, HTTP or RPC error, or clean shutdown. The
+            // primary error is preserved; cleanup failures are logged as
+            // context, never masked. ──
+            // There is exactly one account listener. `notify_one` preserves a
+            // permit when teardown races worker startup; `notify_waiters` can
+            // lose the signal before the isolated runtime begins awaiting.
+            account_shutdown.notify_one();
             serve_shutdown.notify_one();
-            let _ = rpc_loop.await;
+            if let Some(mut worker) = account_owner.take() {
+                if !worker.is_joined() {
+                    let completion = worker.finish(std::time::Duration::from_secs(45)).await;
+                    if let Err(error) = completion.and_then(|result| result) {
+                        tracing::warn!(%error, "account HTTP worker failed during shutdown");
+                        if primary.is_ok() {
+                            primary = Err(anyhow::anyhow!(error));
+                        }
+                    }
+                }
+            }
+            if let Some(bridge) = &bridge_owner {
+                bridge.begin_shutdown(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                );
+            }
+            if let Some((mut rpc_loop, rpc_consumed)) = rpc_owner.take() {
+                if !rpc_consumed {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(45),
+                        &mut rpc_loop,
+                    )
+                    .await
+                    {
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(Ok(Err(e))) => {
+                            tracing::warn!("OAuth RPC serve task error during shutdown: {e}");
+                        }
+                        Ok(Err(join)) => {
+                            tracing::warn!(
+                                "OAuth RPC serve task join error during shutdown: {join}"
+                            );
+                        }
+                        Err(_) => {
+                            rpc_loop.abort();
+                            tracing::warn!(
+                                "OAuth RPC serve task did not stop within the shutdown budget; aborted"
+                            );
+                        }
+                    }
+                }
+            }
+            publisher_handle.abort();
+            // Abort alone is not teardown: await the cancelled task so its
+            // future (and its state clones) are actually dropped.
+            let _ = publisher_handle.await;
+            if let Some(substrate) = substrate_owned.take() {
+                if let Err(e) = substrate.shutdown().await {
+                    tracing::warn!("OAuth iroh substrate shutdown error: {e}");
+                }
+            }
 
+            primary.map_err(|e| {
+                hyprstream_rpc::error::RpcError::SpawnFailed(format!("{e:#}"))
+            })?;
             Ok(())
-        })
+        });
+        if contains_account_workers {
+            if let Err(error) = &result {
+                tracing::error!(%error, "dedicated OAuth process failed");
+            }
+            std::process::exit(if result.is_ok() { 0 } else { account_worker::WORKER_FAILURE_EXIT });
+        }
+        result
     }
 }
 
@@ -1200,6 +1711,175 @@ pub fn protected_resource_metadata(
 mod tests {
     use super::registration::validate_redirect_uri;
     use super::*;
+
+    /// OAuth owns a separate runtime, so its peer clients are made in `run`.
+    /// The production path must retain the factory-resolved IPC transports;
+    /// process-local bootstrap cannot see Policy or Discovery across rootless
+    /// Quadlet process boundaries.
+    #[test]
+    fn oauth_run_uses_factory_resolved_peer_transports() {
+        let source = include_str!("mod.rs");
+        let production = source
+            .split("// Tests")
+            .next()
+            .expect("tests banner must bound production source");
+        let run_start = production
+            .find("impl Spawnable for OAuthService")
+            .expect("OAuthService must implement Spawnable");
+        let run = &production[run_start..];
+
+        // Merged required/compat shape: required resolves through the
+        // checkpoint-backed discovery resolver; compat dials the
+        // factory-resolved IPC transports (20-space continuation inside the
+        // profile branch).
+        assert!(run.contains(
+            "PolicyClient::for_local_transport_bootstrap(\n                    &self.policy_transport,"
+        ));
+        assert!(run.contains(
+            "DiscoveryClient::for_local_transport_bootstrap(\n                    &self.discovery_transport,"
+        ));
+        assert!(
+            run.contains("if hyprstream_discovery::native_network_required() {\n                PolicyClient::from_resolver("),
+            "Required profile must resolve Policy through the checkpoint resolver"
+        );
+        assert!(
+            run.contains("if hyprstream_discovery::native_network_required() {\n                crate::services::DiscoveryClient::from_resolver("),
+            "Required profile must resolve Discovery through the checkpoint resolver"
+        );
+        assert!(
+            !run.contains("PolicyClient::for_local_bootstrap("),
+            "OAuth must not use the process-local Policy registry"
+        );
+        assert!(
+            !run.contains("DiscoveryClient::for_local_bootstrap("),
+            "OAuth must not use the process-local Discovery registry"
+        );
+    }
+
+    #[test]
+    fn account_http_socket_address_preserves_ipv4_and_ipv6_literals() {
+        let mut config = crate::account::AccountHttpConfig {
+            host: String::new(),
+            port: 8443,
+            tls_cert: "unused.pem".into(),
+            tls_key: "unused.key".into(),
+        };
+        for (host, expected) in [
+            ("127.0.0.1", "127.0.0.1:8443"),
+            ("0.0.0.0", "0.0.0.0:8443"),
+            ("::1", "[::1]:8443"),
+            ("::", "[::]:8443"),
+            ("[::1]", "[::1]:8443"),
+        ] {
+            config.host = host.to_owned();
+            assert_eq!(account_http_socket_addr(&config).unwrap().to_string(), expected);
+        }
+        for invalid in ["localhost", "[::1", "::1]", "127.0.0.1:8443"] {
+            config.host = invalid.to_owned();
+            assert!(account_http_socket_addr(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn account_worker_requires_launcher_process_containment() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let account = crate::account::AccountZoneConfig {
+            http: Some(crate::account::AccountHttpConfig {
+                host: "127.0.0.1".to_owned(),
+                port: 443,
+                tls_cert: PathBuf::from("unused.pem"),
+                tls_key: PathBuf::from("unused.key"),
+            }),
+            ..Default::default()
+        };
+        let transport = TransportConfig::inproc("test-containment-unused");
+        let service = OAuthService::new(
+            Default::default(), Default::default(), account, sk.clone(),
+            transport.clone(), transport.clone(), transport,
+            sk.verifying_key(), sk.verifying_key(),
+        );
+        let result = Box::new(service).run(Arc::new(Notify::new()), None);
+        assert!(matches!(result,
+            Err(hyprstream_rpc::error::RpcError::SpawnFailed(message))
+                if message.contains("dedicated foreground OAuth process")
+        ));
+    }
+
+    #[test]
+    fn oauth_warms_hosted_did_index_before_readiness() {
+        let source = include_str!("mod.rs");
+        let production = source
+            .get(..source
+                .find("\n#[cfg(test)]\n#[allow(clippy::unwrap_used")
+                .expect("test module must remain explicit"))
+            .expect("production source must precede tests");
+        let run_start = production
+            .find("impl Spawnable for OAuthService")
+            .expect("OAuthService must implement Spawnable");
+        let run = &production[run_start..];
+        let warmup = run
+            .find("warm_hosted_did_index(")
+            .expect("OAuth startup must warm the hosted-DID index");
+        let ready = run
+            .find("serve_bridged(")
+            .expect("OAuth readiness boundary must remain explicit");
+        assert!(warmup < ready, "OAuth must not signal readiness before index warm-up");
+        let warmup_block = &run[warmup..ready];
+        assert!(
+            warmup_block.contains("warm_hosted_did_index(")
+                && warmup_block.contains("Duration::from_secs(30)"),
+            "hosted-DID warm-up must have a bounded timeout"
+        );
+        let helper_start = production
+            .find("async fn warm_hosted_did_index(")
+            .expect("warm-up helper must remain explicit");
+        let helper_end = production
+            .find("/// Profile-aware bind of OAuth's inbound reach-only substrate")
+            .expect("warm-up helper must be bounded by the next helper");
+        let helper = &production[helper_start..helper_end];
+        assert!(
+            !helper.contains("spawn_blocking"),
+            "hosted-DID warm-up timeout must not leave an uncancellable blocking task"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hosted_did_warmup_timeout_does_not_wait_for_blocking_scan() {
+        const TEST: &str = "services::oauth::tests::hosted_did_warmup_timeout_does_not_wait_for_blocking_scan";
+        if !account_worker::tests::is_child(TEST) {
+            account_worker::tests::expect_contained_exit(TEST, &[]);
+            return;
+        }
+        struct SlowReads;
+        impl hyprstream_pds_service::AccountRecordReadAuthorizer for SlowReads {
+            fn check_read(
+                &self,
+                _subject: &hyprstream_rpc::Subject,
+                _verified_tenant: Option<&str>,
+                _security_context: Option<&hyprstream_rpc::auth::mac::SecurityContext>,
+                _object_id: &str,
+            ) -> hyprstream_rpc::auth::mac::MacDecision {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                hyprstream_rpc::auth::mac::MacDecision::Permit
+            }
+        }
+
+        let store = Arc::new(hyprstream_pds_service::AccountRecordStore::new(
+            Arc::new(hyprstream_vfs::SyntheticMount::new(
+                hyprstream_vfs::SyntheticNode::dir(),
+            )),
+            Arc::new(SlowReads),
+        ));
+        let _ = warm_hosted_did_index(
+            store,
+            hyprstream_rpc::Subject::new(
+                hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+            ),
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        panic!("timed-out warm-up must terminate its dedicated process");
+    }
 
     fn encode_form(fields: &[(&str, &str)]) -> String {
         let mut serializer = url::form_urlencoded::Serializer::new(String::new());
@@ -1497,6 +2177,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn oauth_handler_atproto_and_legacy_conformance() -> anyhow::Result<()> {
         crate::mac::install_explicit_test_dispatch_pep();
+        // Interactive OAuth issuance (v16 §3.3) registers a fresh session with
+        // the canonical registry, and the in-process policy authority validates
+        // it before minting; both live in THIS process, so publish one isolated
+        // in-memory session registry (plus a revocation store) — mirroring
+        // production `init_process_authority_stores`, which this bespoke
+        // in-process test bypasses. Guarded so a sibling that published first
+        // keeps its handle; the registrations use distinct keys.
+        if hyprstream_rpc::auth::global_session_registry().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_session_registry(std::sync::Arc::new(
+                hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+            ));
+        }
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(std::sync::Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
         use base64::{
             engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
             Engine as _,
@@ -1515,7 +2212,7 @@ mod tests {
         use super::token_store::RocksDbTokenStore;
         use crate::auth::rocksdb_store::RocksDbUserStore;
         use crate::auth::{PolicyManager, UserProfile, UserStore};
-        use crate::services::generated::policy_client::IssueToken;
+        use crate::services::generated::policy_client::{IssueToken, IssueTokenProfile};
         use crate::services::{DiscoveryClient, PolicyClient, PolicyService};
 
         const ISSUER: &str = "https://pds.example.test:8443";
@@ -1555,6 +2252,16 @@ mod tests {
                 pq_store: None,
             },
         );
+        // Resource-token verification fails closed on jti-bearing bearers
+        // without the process-global revocation store. Install an in-memory
+        // authority when no other test in this binary got there first — this
+        // test must not depend on another test's fixture happening to run
+        // earlier.
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
         configure_test_policy_signing_authority()?;
 
         let service_key = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);
@@ -1571,6 +2278,38 @@ mod tests {
             TransportConfig::inproc(&policy_tag),
         )
         .with_default_audience(GENERIC_ISSUER.to_owned())
+        // Production-equivalent key source: token signing resolves the composite
+        // authority through the configured JwtKeySource (a `ClusterKeySource`
+        // defaults its ledger to the process-global authority configured above).
+        .with_jwt_key_source(Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+            service_key.verifying_key(),
+            GENERIC_ISSUER.to_owned(),
+        )))
+        // v16: a dispatch-capable user `at+jwt` (cnf.jwk) binds its authoritative
+        // Primary suite. Production installs WS-C's enrollment resolver; this
+        // fixture stands in for it, resolving `alice` to the exact verified
+        // OAuth challenge key (`user_key`, [0x63; 32]) the flows bind as `cnf`.
+        .with_primary_enrollment_resolver({
+            struct AliceResolver;
+            impl crate::services::policy::PrimaryEnrollmentResolver for AliceResolver {
+                fn primary_group(
+                    &self,
+                    principal: &str,
+                    _tenant: &str,
+                ) -> Option<crate::services::policy::PrimaryGroup> {
+                    (principal == "alice").then(|| crate::services::policy::PrimaryGroup {
+                        suite_id: hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519.to_owned(),
+                        ordered_component_keys: vec![
+                            ed25519_dalek::SigningKey::from_bytes(&[0x63; 32])
+                                .verifying_key()
+                                .to_bytes()
+                                .to_vec(),
+                        ],
+                    })
+                }
+            }
+            Arc::new(AliceResolver)
+        })
         .with_token_clearance_resolver(Arc::new(|subject| {
             use hyprstream_rpc::auth::mac::{
                 Assurance, CompartmentSet, Level, SecurityLabel,
@@ -1700,13 +2439,18 @@ mod tests {
             Arc::new(SyntheticMount::new(pds_root)),
             Arc::new(PermitFixtureAccountReads),
         ));
+        hosted_account_store
+            .refresh_hosted_did_index(&hyprstream_rpc::Subject::new(
+                hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+            ))
+            .await?;
         let mut oauth_state = OAuthState::new(
             &config,
             policy_client,
             DiscoveryClient::new(dummy_rpc),
             service_key.verifying_key().to_bytes(),
         )
-        .with_user_store(user_store)
+        .with_user_store(crate::auth::ProductionUserStore::for_test(user_store))
         .with_hosted_account_store(hosted_account_store)
         .with_atproto_did_resolver(Arc::new(FixtureAtprotoDidResolver(
             atproto_document,
@@ -1796,13 +2540,18 @@ mod tests {
                 "alg": "ES256", "typ": "JWT", "kid": "#atproto"
             }))?,
         );
-        let make_service_jwt = |audience: &str, lxm: &str, jti: &str| -> anyhow::Result<String> {
+        let make_service_jwt_with_times = |audience: &str,
+                                           lxm: &str,
+                                           jti: &str,
+                                           iat: i64,
+                                           exp: i64|
+         -> anyhow::Result<String> {
             let payload = URL_SAFE_NO_PAD.encode(
                 serde_json::to_vec(&serde_json::json!({
                     "iss": MAPPED_DID,
                     "aud": audience,
-                    "iat": now,
-                    "exp": now + 60,
+                    "iat": iat,
+                    "exp": exp,
                     "lxm": lxm,
                     "jti": jti
                 }))?,
@@ -1814,6 +2563,9 @@ mod tests {
                 "{signing_input}.{}",
                 URL_SAFE_NO_PAD.encode(signature.to_bytes())
             ))
+        };
+        let make_service_jwt = |audience: &str, lxm: &str, jti: &str| {
+            make_service_jwt_with_times(audience, lxm, jti, now, now + 60)
         };
         let service_jwt = make_service_jwt(
             "did:web:pds.example.test%3A8443",
@@ -1869,6 +2621,24 @@ mod tests {
             .oneshot(exchange_request(&wrong_lxm, HOSTED_TENANT))
             .await?;
         assert_eq!(rejected_lxm.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // The verifier must reject an unrepresentable signed interval before
+        // DID resolution, replay admission, or a token exchange can occur.
+        let extreme_interval = make_service_jwt_with_times(
+            "did:web:pds.example.test%3A8443",
+            token_exchange::ATPROTO_EXCHANGE_NSID,
+            "demo-1119-extreme-interval",
+            i64::MIN,
+            i64::MAX,
+        )?;
+        let rejected_extreme_interval = app
+            .clone()
+            .oneshot(exchange_request(&extreme_interval, HOSTED_TENANT))
+            .await?;
+        assert_eq!(
+            rejected_extreme_interval.status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
 
         // #1314: the authority-owned account record supplies the binding. A
         // matching request succeeds and the minted credential carries exactly
@@ -2855,6 +3625,9 @@ mod tests {
                 issuer: None,
                 tenant: Some(HOSTED_TENANT.to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2885,6 +3658,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("other.example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2915,6 +3691,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2963,6 +3742,9 @@ mod tests {
                 issuer: None,
                 tenant: Some("example.test".to_owned()),
                 require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
             })
             .await?
             .token;
@@ -2993,6 +3775,758 @@ mod tests {
             jwt_claims(valid_exchange_json["access_token"].as_str().unwrap());
         assert_eq!(valid_exchange_claims["sub"], "scope-valid-user");
         assert_eq!(valid_exchange_claims["scope"], "read:*:*");
+
+        // ── #1425: browser RFC 8693 sender-bound exchange contract ────────────
+        //
+        // Wire-level coverage of the DPoP+cnf.jkt browser exchange: positive
+        // (client_id + DPoP → DPoP-bound token), and negatives (missing proof,
+        // audience substitution, replayed jti). The request body is the exact
+        // form the WASM client sends — built via `exchange_form_body`
+        // (grant_type, subject_token, subject_token_type, client_id, resource)
+        // — so the contract is tested against the frontend's generated
+        // request, not a Rust-local fixture.
+        use rand::Rng as _;
+        use hyprstream_rpc::auth::{jwk_thumbprint, JwkThumbprintInput};
+        use hyprstream_rpc::wasm_token_exchange::BROWSER_PUBLIC_CLIENT_ID;
+        let browser_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("browser-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
+            })
+            .await?
+            .token;
+        let browser_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let browser_point = browser_dpop_key.verifying_key().to_encoded_point(false);
+        let browser_x: [u8; 32] = browser_point.x().unwrap().as_slice().try_into().unwrap();
+        let browser_y: [u8; 32] = browser_point.y().unwrap().as_slice().try_into().unwrap();
+        let expected_browser_jkt = jwk_thumbprint(&JwkThumbprintInput::Es256 {
+            x: &browser_x,
+            y: &browser_y,
+        });
+        let token_endpoint_url = format!("{ISSUER}/oauth/token");
+        // Each exchange needs a fresh DPoP jti (the jti is single-use); the
+        // proof KEY is constant, so cnf.jkt is stable across all of them.
+        let fresh_browser_proof = || -> String {
+            let jti = format!(
+                "browser-{}",
+                URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>())
+            );
+            dpop_proof(&browser_dpop_key, &token_endpoint_url, &jti, None)
+        };
+
+        // Build the exact WASM request body (`exchange_form_body`) + an
+        // optional `audience` override, as owned pairs `post_form` accepts.
+        //
+        // #1425 r2 P2: `exchange_form_body` now always sends `resource` — the
+        // real `fetch_exchange_token` computes it from the exact origin it is
+        // calling (`exchange_endpoint`), which in this test harness is
+        // `ISSUER`. This is the same value the real browser client would send
+        // for a correctly configured deployment (the AS's own origin), so
+        // every test built from this helper now exercises the client
+        // actually sending the modeled resource, not a native-only fixture.
+        let browser_fields =
+            |subject: &str, audience: Option<&str>| -> Vec<(String, String)> {
+                let body = hyprstream_rpc::wasm_token_exchange::exchange_form_body(
+                    subject,
+                    "urn:ietf:params:oauth:token-type:access_token",
+                    BROWSER_PUBLIC_CLIENT_ID,
+                    ISSUER,
+                );
+                let mut pairs: Vec<(String, String)> =
+                    url::form_urlencoded::parse(body.as_bytes())
+                        .into_owned()
+                        .collect();
+                if let Some(aud) = audience {
+                    pairs.push(("audience".to_owned(), aud.to_owned()));
+                }
+                pairs
+            };
+        let str_slice = strs_of;
+        fn strs_of(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
+            pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+        }
+
+        // Negative: no DPoP proof → sender binding is mandatory.
+        let np = browser_fields(&browser_subject, Some(ISSUER));
+        let np_refs = str_slice(&np);
+        let no_proof = post_form(&app, "/oauth/token", &np_refs, None, false).await;
+        assert_eq!(no_proof.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(no_proof).await["error"], "invalid_request");
+
+        // Negative: audience substitution → invalid_target. The browser token
+        // is restricted to the Hyprstream RPC service resource (the AS origin).
+        let ef = browser_fields(&browser_subject, Some("https://evil.example"));
+        let ef_refs = str_slice(&ef);
+        let evil_proof = fresh_browser_proof();
+        let evil = post_form(&app, "/oauth/token", &ef_refs, Some(&evil_proof), false).await;
+        assert_eq!(evil.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(evil).await["error"], "invalid_target");
+
+        // Positive: client_id + valid DPoP proof → DPoP-bound access token.
+        let pf = browser_fields(&browser_subject, Some(ISSUER));
+        let pf_refs = str_slice(&pf);
+        let ok_proof = fresh_browser_proof();
+        let browser_ok =
+            post_form(&app, "/oauth/token", &pf_refs, Some(&ok_proof), false).await;
+        assert_eq!(
+            browser_ok.status(),
+            axum::http::StatusCode::OK,
+            "browser exchange positive path must succeed"
+        );
+        // #1425 acceptance 5: no token leakage. The response is no-store and
+        // never echoes the token in a redirect/Location header.
+        assert_eq!(
+            browser_ok
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert!(browser_ok.headers().get(axum::http::header::LOCATION).is_none());
+        let browser_json = response_json(browser_ok).await;
+        assert_eq!(browser_json["token_type"].as_str(), Some("DPoP"));
+        assert_eq!(
+            browser_json["issued_token_type"].as_str(),
+            Some("urn:ietf:params:oauth:token-type:access_token")
+        );
+        // Access-token only: no refresh token (rotation is a separately
+        // reviewed, metadata-advertised policy).
+        assert!(
+            browser_json.get("refresh_token").is_none(),
+            "browser exchange must not issue a refresh token"
+        );
+        let browser_access = browser_json["access_token"].as_str().unwrap();
+        // The token never appears anywhere except the access_token field.
+        assert_eq!(
+            browser_json
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(_, v)| v.as_str().is_some_and(|s| s.contains(browser_access)))
+                .count(),
+            1,
+            "access_token must not be echoed in any other response field"
+        );
+        let browser_claims = jwt_claims(browser_access);
+        assert_eq!(browser_claims["sub"], "browser-user");
+        assert_eq!(
+            browser_claims["cnf"]["jkt"].as_str(),
+            Some(expected_browser_jkt.as_str()),
+            "minted token must be bound to the DPoP proof key (cnf.jkt)"
+        );
+        assert_eq!(
+            browser_claims["aud"].as_str(),
+            Some(ISSUER),
+            "issued token audience must be restricted to the RPC service resource"
+        );
+        // The "use" half of acceptance 3 (a DPoP-bound token cannot be used as
+        // a plain Bearer; a resource request needs a matching proof + ath) is
+        // enforced by the existing resource middleware in `auth.rs` the moment
+        // the exchange mints `cnf.jkt` — the binding just verified above. That
+        // enforcement has its own coverage in `auth.rs`; the #1425 deliverable
+        // is the exchange producing the binding.
+
+        // Negative: replayed DPoP proof (same jti) → invalid_dpop_proof.
+        // A fresh subject token avoids the subject-replay check.
+        let replay_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("browser-replay".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
+            })
+            .await?
+            .token;
+        let rf = browser_fields(&replay_subject, Some(ISSUER));
+        let rf_refs = str_slice(&rf);
+        // Reuse the positive proof's jti → single-use replay rejection.
+        let replay =
+            post_form(&app, "/oauth/token", &rf_refs, Some(&ok_proof), false).await;
+        assert_eq!(replay.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(replay).await["error"], "invalid_dpop_proof");
+
+        // ── #1425 r1 P1#3: DPoP resource-use wire tests (cnf.jkt token on a
+        //    protected route) ────────────────────────────────────────────────
+        // The exchanged `browser_access` token carries cnf.jkt = the DPoP key's
+        // thumbprint. The resource layer (`require_bearer_token` middleware on
+        // `/oauth/userinfo`) enforces: cnf.jkt tokens rejected as Bearer, DPoP
+        // proof verified (htm/htu/ath/jti/nonce), cnf.jkt matched to the proof
+        // key. These tests exercise that enforcement with the ACTUAL token the
+        // exchange minted, not a fixture.
+        use axum::body::Body as Body_;
+        let userinfo_htu = format!("{ISSUER}/oauth/userinfo");
+
+        // Bearer downgrade rejection (RFC 9449 §7): cnf.jkt token as Bearer.
+        let bearer_downgrade = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/oauth/userinfo")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {browser_access}"))
+                    .body(Body_::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            bearer_downgrade.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "cnf.jkt-bound token presented as Bearer MUST be rejected"
+        );
+
+        // DPoP proof without nonce → 401 use_dpop_nonce (the exchange marked
+        // this key as nonced). Extract the fresh nonce for the retry.
+        let no_nonce_jti = format!("res-no-nonce-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
+        let no_nonce_proof = dpop_resource_proof(
+            &browser_dpop_key,
+            "GET",
+            &userinfo_htu,
+            browser_access,
+            &no_nonce_jti,
+            None,
+        );
+        let no_nonce_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/oauth/userinfo")
+                    .header(axum::http::header::AUTHORIZATION, format!("DPoP {browser_access}"))
+                    .header("DPoP", &no_nonce_proof)
+                    .body(Body_::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_nonce_resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let resource_nonce = no_nonce_resp
+            .headers()
+            .get("DPoP-Nonce")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        assert!(resource_nonce.is_some(), "use_dpop_nonce response MUST carry a DPoP-Nonce header");
+
+        // Resource success WITH the nonce: matching proof key + ath + nonce.
+        let success_jti = format!("res-ok-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
+        let success_proof = dpop_resource_proof(
+            &browser_dpop_key,
+            "GET",
+            &userinfo_htu,
+            browser_access,
+            &success_jti,
+            resource_nonce.as_deref(),
+        );
+        let resource_ok = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/oauth/userinfo")
+                    .header(axum::http::header::AUTHORIZATION, format!("DPoP {browser_access}"))
+                    .header("DPoP", &success_proof)
+                    .body(Body_::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resource_ok.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "DPoP token with matching proof + nonce + cnf.jkt + ath MUST be accepted at the resource"
+        );
+
+        // Key mismatch rejection: attacker proof key ≠ the token's cnf.jkt.
+        let attacker_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let mismatch_jti = format!("res-mismatch-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
+        let mismatch_proof = dpop_resource_proof(
+            &attacker_key,
+            "GET",
+            &userinfo_htu,
+            browser_access,
+            &mismatch_jti,
+            resource_nonce.as_deref(),
+        );
+        let mismatch_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/oauth/userinfo")
+                    .header(axum::http::header::AUTHORIZATION, format!("DPoP {browser_access}"))
+                    .header("DPoP", &mismatch_proof)
+                    .body(Body_::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            mismatch_resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "DPoP proof from a different key MUST be rejected (cnf.jkt mismatch)"
+        );
+
+        // ── #1425 r1 P1#2: Subject-token cnf.jkt same-key binding ───────────
+        // A DPoP-bound subject access token MUST be exchanged under a proof
+        // from the SAME key. An attacker who steals the token string cannot
+        // re-bind it to their own key.
+        let subject_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let subject_point = subject_key.verifying_key().to_encoded_point(false);
+        let subject_x: [u8; 32] = subject_point.x().unwrap().as_slice().try_into().unwrap();
+        let subject_y: [u8; 32] = subject_point.y().unwrap().as_slice().try_into().unwrap();
+        let subject_jkt = jwk_thumbprint(&JwkThumbprintInput::Es256 {
+            x: &subject_x,
+            y: &subject_y,
+        });
+
+        // Mint a DPoP-bound subject token (carries cnf.jkt = subject_key's jkt).
+        let cnf_bound_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("cnf-bound-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: Some(subject_jkt.clone()),
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
+            })
+            .await?
+            .token;
+
+        // Same-key positive: exchange the bound subject under a proof from the
+        // SAME key. Bootstrap (no nonce) is fine — this is the first exchange
+        // for this DPoP key.
+        let same_key_jti = format!("same-key-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
+        let same_key_proof = dpop_proof(&subject_key, &token_endpoint_url, &same_key_jti, None);
+        let same_key_fields = browser_fields(&cnf_bound_subject, Some(ISSUER));
+        let same_key_refs = str_slice(&same_key_fields);
+        let same_key_resp = post_form(
+            &app,
+            "/oauth/token",
+            &same_key_refs,
+            Some(&same_key_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            same_key_resp.status(),
+            axum::http::StatusCode::OK,
+            "same-key exchange (subject cnf.jkt == proof key) must succeed"
+        );
+        let same_key_json = response_json(same_key_resp).await;
+        assert_eq!(same_key_json["token_type"].as_str(), Some("DPoP"));
+        let same_key_access = same_key_json["access_token"].as_str().unwrap();
+        let same_key_claims = jwt_claims(same_key_access);
+        assert_eq!(
+            same_key_claims["cnf"]["jkt"].as_str(),
+            Some(subject_jkt.as_str()),
+            "minted token must carry the SAME cnf.jkt as the subject token"
+        );
+
+        // Cross-key negative (A-token / B-proof): exchange a fresh DPoP-bound
+        // subject token under a proof from a DIFFERENT key. The same-key check
+        // must reject the substitution before consuming the subject token.
+        let attacker_subject_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let cnf_bound_subject_2 = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("cnf-bound-user-2".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: Some(subject_jkt.clone()),
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
+            })
+            .await?
+            .token;
+        let cross_key_jti = format!("cross-key-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
+        let cross_key_proof = dpop_proof(&attacker_subject_key, &token_endpoint_url, &cross_key_jti, None);
+        let cross_key_fields = browser_fields(&cnf_bound_subject_2, Some(ISSUER));
+        let cross_key_refs = str_slice(&cross_key_fields);
+        let cross_key_resp = post_form(
+            &app,
+            "/oauth/token",
+            &cross_key_refs,
+            Some(&cross_key_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            cross_key_resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "cross-key exchange (subject cnf.jkt ≠ proof key) MUST be rejected"
+        );
+        assert_eq!(
+            response_json(cross_key_resp).await["error"],
+            "invalid_dpop_proof",
+            "key substitution must surface as invalid_dpop_proof"
+        );
+
+        // ── #1425 r1/r2 P2: RFC 8693 fields the browser contract does not accept ──
+        // All are rejected before DPoP verification/subject-token
+        // consumption, so the (already-used) `browser_subject` string is safe
+        // to reuse — none of these requests reach subject-token verification.
+        let mut actor_fields = browser_fields(&browser_subject, Some(ISSUER));
+        actor_fields.push(("actor_token".to_owned(), "some-actor-jwt".to_owned()));
+        let actor_resp =
+            post_form(&app, "/oauth/token", &str_slice(&actor_fields), None, false).await;
+        assert_eq!(actor_resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(actor_resp).await["error"], "invalid_request");
+
+        // ── #1425 r2 P2: `actor_token_type` alone (no `actor_token`) must not
+        //    be treated as if the request carried no actor field at all — the
+        //    prior revision only modeled/rejected `actor_token`, so an
+        //    `actor_token_type`-only request was silently dropped by the form
+        //    extractor and reached subject-token verification unrejected.
+        //    No DPoP proof is supplied here either, proving (via the returned
+        //    `invalid_request`, not "requires a DPoP proof") that this is
+        //    rejected before DPoP admission and before subject-token
+        //    consumption — `browser_subject` remains safe to reuse below.
+        let mut actor_type_standalone_fields = browser_fields(&browser_subject, Some(ISSUER));
+        actor_type_standalone_fields.push((
+            "actor_token_type".to_owned(),
+            "urn:ietf:params:oauth:token-type:jwt".to_owned(),
+        ));
+        let actor_type_standalone_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&actor_type_standalone_fields),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            actor_type_standalone_resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "actor_token_type alone must be rejected, not silently ignored"
+        );
+        assert_eq!(
+            response_json(actor_type_standalone_resp).await["error"],
+            "invalid_request"
+        );
+
+        // Duplicate `actor_token_type` fields: proves the rejection is real
+        // field modeling (caught by the same axum::Form duplicate-key
+        // detection already proven for `resource`), not a single manually
+        // inserted value that a second, differently-encoded copy could evade.
+        let mut actor_type_dup_fields = browser_fields(&browser_subject, Some(ISSUER));
+        actor_type_dup_fields.push((
+            "actor_token_type".to_owned(),
+            "urn:ietf:params:oauth:token-type:jwt".to_owned(),
+        ));
+        actor_type_dup_fields.push((
+            "actor_token_type".to_owned(),
+            "urn:ietf:params:oauth:token-type:access_token".to_owned(),
+        ));
+        let actor_type_dup_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&actor_type_dup_fields),
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            actor_type_dup_resp.status().is_client_error(),
+            "duplicate actor_token_type fields must be rejected, not silently take the last \
+             value (got {})",
+            actor_type_dup_resp.status()
+        );
+
+        let mut rtt_fields = browser_fields(&browser_subject, Some(ISSUER));
+        rtt_fields.push((
+            "requested_token_type".to_owned(),
+            "urn:ietf:params:oauth:token-type:refresh_token".to_owned(),
+        ));
+        let rtt_resp =
+            post_form(&app, "/oauth/token", &str_slice(&rtt_fields), None, false).await;
+        assert_eq!(rtt_resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(rtt_resp).await["error"], "invalid_target");
+
+        let mut tenant_fields = browser_fields(&browser_subject, Some(ISSUER));
+        tenant_fields.push(("tenant".to_owned(), "some-other-tenant".to_owned()));
+        let tenant_resp =
+            post_form(&app, "/oauth/token", &str_slice(&tenant_fields), None, false).await;
+        assert_eq!(tenant_resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(tenant_resp).await["error"], "invalid_request");
+
+        // `resource` mismatch → invalid_target, mirroring the `audience` negative above.
+        // `browser_fields` now sends the correct `resource` by default (the
+        // real client always does); strip it before substituting the bad value.
+        let mut resource_bad_fields = browser_fields(&browser_subject, None);
+        resource_bad_fields.retain(|(k, _)| k != "resource");
+        resource_bad_fields.push(("resource".to_owned(), "https://evil.example".to_owned()));
+        let resource_bad_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&resource_bad_fields),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(resource_bad_resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(resource_bad_resp).await["error"], "invalid_target");
+
+        // Duplicate `resource` fields: `axum::Form<TokenRequest>` deserializes
+        // via serde's generated struct visitor, which errors on a field set
+        // twice — a duplicate cannot silently smuggle a second, later-wins
+        // value past the single-value check above.
+        let mut dup_resource_fields = browser_fields(&browser_subject, None);
+        dup_resource_fields.retain(|(k, _)| k != "resource");
+        dup_resource_fields.push(("resource".to_owned(), ISSUER.to_owned()));
+        dup_resource_fields.push(("resource".to_owned(), "https://evil.example".to_owned()));
+        let dup_resource_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&dup_resource_fields),
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            dup_resource_resp.status().is_client_error(),
+            "duplicate resource fields must be rejected, not silently take the last value \
+             (got {})",
+            dup_resource_resp.status()
+        );
+
+        // `resource` matching the canonical RPC resource is accepted (a fresh
+        // subject token, since this request runs the full exchange to success).
+        // #1425 r2 P2: `browser_fields` already sends the correct `resource`
+        // by default via the real `exchange_form_body` — this positive case
+        // needs no manual field push, which is exactly the point: the browser
+        // caller's own request, unmodified, must succeed.
+        let resource_ok_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("resource-field-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
+            })
+            .await?
+            .token;
+        let resource_ok_fields = browser_fields(&resource_ok_subject, None);
+        // A brand-new DPoP key: `browser_dpop_key` was already marked "nonced"
+        // by the earlier positive exchange above, so its bootstrap window has
+        // closed — reusing it here would spuriously hit `use_dpop_nonce`.
+        let resource_ok_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let resource_ok_jti = format!(
+            "resource-ok-{}",
+            URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>())
+        );
+        let resource_ok_proof =
+            dpop_proof(&resource_ok_key, &token_endpoint_url, &resource_ok_jti, None);
+        let resource_ok_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&resource_ok_fields),
+            Some(&resource_ok_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            resource_ok_resp.status(),
+            axum::http::StatusCode::OK,
+            "resource matching the canonical RPC resource must be accepted"
+        );
+
+        // ── #1425 r1 P2: id_token is not a supported browser subject type ──────
+        let mut idt_fields = browser_fields(&browser_subject, Some(ISSUER));
+        for pair in idt_fields.iter_mut() {
+            if pair.0 == "subject_token_type" {
+                pair.1 = "urn:ietf:params:oauth:token-type:id_token".to_owned();
+            }
+        }
+        // A brand-new DPoP key (bootstrap, no nonce needed): `browser_dpop_key`
+        // is already nonced by the earlier positive exchange.
+        let idt_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let idt_jti = format!(
+            "idt-{}",
+            URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>())
+        );
+        let idt_proof = dpop_proof(&idt_key, &token_endpoint_url, &idt_jti, None);
+        let idt_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&idt_fields),
+            Some(&idt_proof),
+            false,
+        )
+        .await;
+        assert_eq!(idt_resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(response_json(idt_resp).await["error"], "invalid_grant");
+
+        // ── #1425 r1 P1#3/#4: the actual WASM-shared functions, end to end ─────
+        // Builds the DPoP proof with the SAME pure functions
+        // `wasm_token_exchange::fetch_exchange_token` calls from the browser
+        // (`ed25519_dpop_signing_input` + `assemble_dpop_proof`), signed by a
+        // real `ed25519_dalek` key — not a Rust-local reconstruction of the
+        // wire shape, the literal shared code. Exercises bootstrap, the
+        // `use_dpop_nonce` retry, and confirms the minted `cnf.jkt` is exactly
+        // `ed25519_dpop_jkt(pubkey)` — the same equality `VfsShell::connect`
+        // relies on to make the token usable on the RPC path (proven against
+        // the real RPC verifier in `service/svc.rs`'s
+        // `browser_cnf_jkt_token_succeeds_over_matching_envelope_signer`).
+        use hyprstream_rpc::wasm_token_exchange::{
+            assemble_dpop_proof, ed25519_dpop_jkt, ed25519_dpop_signing_input,
+        };
+        let wasm_key = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]);
+        let wasm_pubkey: [u8; 32] = wasm_key.verifying_key().to_bytes();
+        let build_wasm_proof = |jti: &str, nonce: Option<&str>| -> String {
+            use ed25519_dalek::Signer as _;
+            let iat = chrono::Utc::now().timestamp();
+            let (signing_input, _) = ed25519_dpop_signing_input(
+                &wasm_pubkey,
+                "POST",
+                &token_endpoint_url,
+                iat,
+                jti,
+                None,
+                nonce,
+            )
+            .unwrap();
+            let signature = wasm_key.sign(signing_input.as_bytes());
+            assemble_dpop_proof(&signing_input, &signature.to_bytes())
+        };
+        let wasm_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("wasm-shared-fn-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
+            })
+            .await?
+            .token;
+        // Bootstrap: no nonce yet for this key.
+        let wasm_bootstrap_proof = build_wasm_proof("wasm-shared-bootstrap", None);
+        let wasm_fields = browser_fields(&wasm_subject, Some(ISSUER));
+        let wasm_bootstrap_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&wasm_fields),
+            Some(&wasm_bootstrap_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            wasm_bootstrap_resp.status(),
+            axum::http::StatusCode::OK,
+            "bootstrap exchange via the real wasm_token_exchange helpers must succeed"
+        );
+        let wasm_json = response_json(wasm_bootstrap_resp).await;
+        let wasm_access = wasm_json["access_token"].as_str().unwrap().to_owned();
+        let wasm_claims = jwt_claims(&wasm_access);
+        assert_eq!(
+            wasm_claims["cnf"]["jkt"].as_str(),
+            Some(ed25519_dpop_jkt(&wasm_pubkey).as_str()),
+            "minted cnf.jkt must equal ed25519_dpop_jkt(pubkey) — the exact check \
+             VfsShell::connect relies on to make the token usable over the matching \
+             RPC envelope signer"
+        );
+
+        // use_dpop_nonce round trip: a second exchange from the SAME wasm key,
+        // without a nonce, must now be required to retry — proving the server
+        // half of the nonce lifecycle the WASM client's `decide_nonce_outcome`
+        // reacts to is real, not asserted only in the pure unit tests.
+        let wasm_subject_2 = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("wasm-shared-fn-user-2".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+                session_id: None,
+                issuance_profile: IssueTokenProfile::Rfc8693,
+                client_id: Some("hyprstream-oauth-client-1".to_owned()),
+            })
+            .await?
+            .token;
+        let wasm_no_nonce_proof = build_wasm_proof("wasm-shared-no-nonce", None);
+        let wasm_fields_2 = browser_fields(&wasm_subject_2, Some(ISSUER));
+        let wasm_nonce_required_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&wasm_fields_2),
+            Some(&wasm_no_nonce_proof),
+            false,
+        )
+        .await;
+        assert_eq!(wasm_nonce_required_resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let wasm_fresh_nonce = wasm_nonce_required_resp
+            .headers()
+            .get("DPoP-Nonce")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .expect("use_dpop_nonce response must carry a fresh DPoP-Nonce");
+        assert_eq!(
+            response_json(wasm_nonce_required_resp).await["error"],
+            "use_dpop_nonce"
+        );
+        // Retry with a fresh proof carrying the server nonce — matches exactly
+        // what `decide_nonce_outcome` -> `NonceOutcome::RetryWithNonce` drives
+        // the browser client to do.
+        let wasm_retry_proof =
+            build_wasm_proof("wasm-shared-retry", Some(&wasm_fresh_nonce));
+        let wasm_retry_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&wasm_fields_2),
+            Some(&wasm_retry_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            wasm_retry_resp.status(),
+            axum::http::StatusCode::OK,
+            "nonce retry via the real wasm_token_exchange helpers must succeed"
+        );
 
         // The real composite token minted above authenticates to a protected
         // OAuth route. This failed when middleware routed every JWT through
@@ -3238,6 +4772,30 @@ mod tests {
             scopes.contains(&"transition:generic".to_owned()),
             "missing transition:generic: {scopes:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn required_iroh_carrier_watcher_detects_endpoint_close() -> anyhow::Result<()> {
+        use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, NoopHandler};
+
+        let signing_key = hyprstream_rpc::prelude::SigningKey::generate(&mut rand::rngs::OsRng);
+        let server = IrohSubstrate::new(
+            signing_key.to_bytes(),
+            NoopHandler::new("oauth watcher moq"),
+            NoopHandler::new("oauth watcher rpc"),
+        )
+        .await?;
+        // Endpoint::close is the same observable carrier failure that the
+        // watcher must convert into a terminal service outcome.
+        server.endpoint().close().await;
+        let lost = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_for_required_iroh_carrier(&server),
+        )
+        .await?;
+        assert!(lost, "closed required carrier must be reported as lost");
+        server.shutdown().await?;
+        Ok(())
     }
 
     #[test]

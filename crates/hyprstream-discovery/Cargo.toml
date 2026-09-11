@@ -2,7 +2,7 @@
 name = "hyprstream-discovery"
 version = "0.1.0"
 edition.workspace = true
-license = "MIT"
+license = "AGPL-3.0-only"
 repository.workspace = true
 description = "Service discovery and endpoint resolution for hyprstream"
 
@@ -15,6 +15,12 @@ crate-type = ["rlib"]  # rlib-only: OnceLock singletons must be shared workspace
 # Pulls in `hyprstream-k8s`, whose re-exported `k8s-openapi` gives the PodSpec /
 # Quantity / Affinity types at the single workspace-pinned `v1_32` version.
 k8s = ["dep:hyprstream-k8s"]
+# Model-free downstream fixtures for the production selector boundary. Never
+# enabled by production features; `hyprstream` enables it only as a dev-dependency.
+test-fixtures = []
+# Native shared/tiered Discovery state. The dependency itself is target-gated
+# below so enabling the feature never pulls sockets into a WASM graph.
+valkey = ["dep:fred"]
 
 [dependencies]
 # Workspace crates
@@ -33,6 +39,7 @@ hyprstream-crypto = { path = "../hyprstream-crypto" }
 
 # Async runtime
 async-trait = { workspace = true }
+futures = { workspace = true }
 
 # Serialization
 capnp = { workspace = true }
@@ -65,11 +72,17 @@ p256 = { workspace = true }
 # Production accepted-state authority is read directly from the concrete
 # checkpointed PDS store. No downstream callback/trait can supply authority.
 rocksdb = "0.23"
+fred = { version = "9", optional = true, features = ["i-scripts", "enable-rustls-ring"] }
+tokio = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [dev-dependencies]
+iroh = { workspace = true }
+bytes = { workspace = true }
+moq-net = { workspace = true }
+web-transport-iroh = { workspace = true }
 # #431 / #524 — build/verify real CAR proofs in getRecord + placement tests.
 p256 = { workspace = true }
 rand = { workspace = true }

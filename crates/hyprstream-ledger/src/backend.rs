@@ -13,6 +13,7 @@ use crate::errors::LedgerError;
 use crate::journal::{
     ChainHead, CheckpointSigner, JournalEntry, OutboxItem, OutboxSeq, SignedCheckpoint, TickReport,
 };
+use crate::mint::MintCapability;
 use crate::types::{
     Account, AccountId, AccountSpec, BalanceView, IssueTransfer, Outcome, Transfer, TransferId,
 };
@@ -36,7 +37,30 @@ pub trait LedgerBackend: Send {
     /// Single-phase issuance: issuer liability → destination. INV-1: the only
     /// entry point that grows a unit's supply; the debit side MUST be the
     /// issuer's `IssuerLiability` account for the unit (checked).
-    fn credit(&mut self, t: IssueTransfer) -> Outcome;
+    ///
+    /// **Sealed.** This takes a [`MintCapability`], which has no public
+    /// constructor — the only way to obtain one is [`Self::authorize_mint`],
+    /// which verifies a hybrid-PQC signature bound to that exact transfer
+    /// against the [`MintAuthority`](crate::mint::MintAuthority) this backend
+    /// was **constructed** with. Holding a backend is therefore not sufficient
+    /// to mint, and neither is holding a `&mut` to one: the authority is fixed
+    /// at construction and there is no setter. See [`crate::mint`].
+    fn credit(&mut self, cap: MintCapability<'_>) -> Outcome;
+
+    /// Verify an issuance authorization against this backend's mint authority,
+    /// yielding the capability [`Self::credit`] requires.
+    ///
+    /// `sig` must be a COSE composite signature over
+    /// [`crate::mint_signing_input`] for `t`. Verification is a concrete
+    /// in-crate check against fixed key material — there is no injectable
+    /// verifier to replace it with a permissive one, which is what makes this
+    /// the sole route to a [`MintCapability`]. A backend with no authority
+    /// refuses every authorization.
+    fn authorize_mint<'a>(
+        &self,
+        t: &'a IssueTransfer,
+        sig: &[u8],
+    ) -> Result<MintCapability<'a>, LedgerError>;
 
     /// Single-phase spend. Overdraft-checked on the debit side (plan §2b.1).
     fn debit(&mut self, t: Transfer) -> Outcome;

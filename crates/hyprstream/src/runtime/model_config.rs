@@ -60,6 +60,14 @@ pub struct ModelConfig {
     pub rope_theta: f32,
     pub rope_scaling: Option<RopeScaling>,
 
+    // Local-RoPE / sliding-window attention (Gemma3 local-attention layers).
+    // A non-`None` sliding window restricts which tokens a local layer attends to;
+    // `rope_local_base_freq` is the RoPE theta used in those local layers. Both
+    // change local-layer K/V values, so they are authoritative for KV reuse
+    // (#1277). `None` for architectures without local attention.
+    pub sliding_window: Option<usize>,
+    pub rope_local_base_freq: Option<f32>,
+
     // Normalization
     pub rms_norm_eps: f32,
     pub layer_norm_eps: Option<f32>,
@@ -319,6 +327,10 @@ impl ModelConfig {
                 .or_else(|| config_source["rope_theta"].as_f64())
                 .unwrap_or(10_000.0) as f32,
             rope_scaling: Self::parse_rope_scaling(config_source),
+            // Local-RoPE / sliding-window (Gemma3); absent (None) for non-local
+            // architectures — present only when config.json carries them.
+            sliding_window: config_source["sliding_window"].as_u64().map(|v| v as usize),
+            rope_local_base_freq: config_source["rope_local_base_freq"].as_f64().map(|v| v as f32),
 
             rms_norm_eps: config_source["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
             layer_norm_eps: config_source["layer_norm_eps"].as_f64().map(|v| v as f32),
@@ -746,6 +758,8 @@ impl Default for ModelConfig {
             max_position_embeddings: 4096,
             rope_theta: 10_000.0,
             rope_scaling: None,
+            sliding_window: None,
+            rope_local_base_freq: None,
             rms_norm_eps: 1e-5,
             layer_norm_eps: None,
             hidden_activation: "silu".to_owned(),

@@ -125,6 +125,14 @@ pub trait EventHandler: Send + Sync {
     ///
     /// Only called if `matches()` returned true.
     async fn handle(&self, event: &ReceivedEvent) -> Result<HandlerResult>;
+
+    /// The workflow id this handler dispatches on behalf of.
+    ///
+    /// Used by adapters to reconcile per-repo handlers: on a strict reload,
+    /// handlers whose workflow id belongs to a repo being rescanned are
+    /// dropped and rebuilt from the fresh workflow set, so a workflow that
+    /// was rejected/deleted can no longer be triggered (#1432 fail-closed).
+    fn workflow_id(&self) -> &super::WorkflowId;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -218,6 +226,10 @@ impl EventHandler for WorkerLifecycleHandler {
             inputs,
         })
     }
+
+    fn workflow_id(&self) -> &super::WorkflowId {
+        &self.workflow_id
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -255,6 +267,10 @@ impl EventHandler for TopicPatternHandler {
             workflow_id: self.workflow_id.clone(),
             inputs,
         })
+    }
+
+    fn workflow_id(&self) -> &super::WorkflowId {
+        &self.workflow_id
     }
 }
 

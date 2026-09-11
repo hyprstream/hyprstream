@@ -101,8 +101,9 @@ pub struct CasMountAuthzRequest<'a> {
 /// bootstrap grants, default-deny). As #699/#767 provenance and MAC plumbing
 /// lands, production namespaces move to a real MAC authorizer; trusted local
 /// single-tenant tools can explicitly opt into [`AllowAllCasAuthorizer`].
+#[async_trait::async_trait]
 pub trait CasMountAuthorizer: Send + Sync {
-    fn authorize(
+    async fn authorize(
         &self,
         caller: &Subject,
         request: CasMountAuthzRequest<'_>,
@@ -113,8 +114,9 @@ pub trait CasMountAuthorizer: Send + Sync {
 #[derive(Debug, Default)]
 pub struct DenyAllCasAuthorizer;
 
+#[async_trait::async_trait]
 impl CasMountAuthorizer for DenyAllCasAuthorizer {
-    fn authorize(
+    async fn authorize(
         &self,
         caller: &Subject,
         request: CasMountAuthzRequest<'_>,
@@ -130,8 +132,9 @@ impl CasMountAuthorizer for DenyAllCasAuthorizer {
 #[derive(Debug, Default)]
 pub struct AllowAllCasAuthorizer;
 
+#[async_trait::async_trait]
 impl CasMountAuthorizer for AllowAllCasAuthorizer {
-    fn authorize(
+    async fn authorize(
         &self,
         _caller: &Subject,
         _request: CasMountAuthzRequest<'_>,
@@ -257,8 +260,9 @@ impl Default for BootstrapCasAuthorizer {
     }
 }
 
+#[async_trait::async_trait]
 impl CasMountAuthorizer for BootstrapCasAuthorizer {
-    fn authorize(
+    async fn authorize(
         &self,
         caller: &Subject,
         request: CasMountAuthzRequest<'_>,
@@ -702,43 +706,47 @@ impl CasMount {
         self
     }
 
-    fn authorize(
+    async fn authorize(
         &self,
         caller: &Subject,
         kind: CasMountObjectKind,
         address: &str,
         operation: &'static str,
     ) -> Result<(), MountError> {
-        self.authorizer.authorize(
-            caller,
-            CasMountAuthzRequest {
-                kind,
-                address,
-                domain: &self.domain,
-                verified_tenant: self.verified_tenant.as_deref(),
-                operation,
-                requested_label: None,
-            },
-        )
+        self.authorizer
+            .authorize(
+                caller,
+                CasMountAuthzRequest {
+                    kind,
+                    address,
+                    domain: &self.domain,
+                    verified_tenant: self.verified_tenant.as_deref(),
+                    operation,
+                    requested_label: None,
+                },
+            )
+            .await
     }
 
-    fn authorize_label(
+    async fn authorize_label(
         &self,
         caller: &Subject,
         address: &str,
         requested_label: &SecurityLabel,
     ) -> Result<(), MountError> {
-        self.authorizer.authorize(
-            caller,
-            CasMountAuthzRequest {
-                kind: CasMountObjectKind::Stage,
-                address,
-                domain: &self.domain,
-                verified_tenant: self.verified_tenant.as_deref(),
-                operation: "stage:label",
-                requested_label: Some(requested_label),
-            },
-        )
+        self.authorizer
+            .authorize(
+                caller,
+                CasMountAuthzRequest {
+                    kind: CasMountObjectKind::Stage,
+                    address,
+                    domain: &self.domain,
+                    verified_tenant: self.verified_tenant.as_deref(),
+                    operation: "stage:label",
+                    requested_label: Some(requested_label),
+                },
+            )
+            .await
     }
 
     async fn read_all(
@@ -889,7 +897,7 @@ impl CasMount {
         match tokens.next() {
             None => Ok(()), // blank line
             Some("commit") => {
-                self.authorize(caller, CasMountObjectKind::Stage, id, "stage:commit")?;
+                self.authorize(caller, CasMountObjectKind::Stage, id, "stage:commit").await?;
                 self.seal_slot(slot).await.map(|_| ())
             }
             Some("abort") => {
@@ -925,14 +933,14 @@ impl CasMount {
                     },
                 }
             }
-            Some("label") => self.declare_label_cmd(id, slot, tokens.collect(), caller),
+            Some("label") => self.declare_label_cmd(id, slot, tokens.collect(), caller).await,
             Some(cmd) => Err(MountError::InvalidArgument(format!(
                 "unknown ctl command: {cmd}"
             ))),
         }
     }
 
-    fn declare_label_cmd(
+    async fn declare_label_cmd(
         &self,
         id: &str,
         slot: &Arc<StagingSlot>,
@@ -972,7 +980,7 @@ impl CasMount {
         // Authorization sees the fully parsed label and runs before slot
         // mutation. A rejection therefore cannot transition or persist label
         // state, and a clearance-aware authorizer can enforce dominance.
-        self.authorize_label(caller, id, &label)?;
+        self.authorize_label(caller, id, &label).await?;
         slot.declare_label(label)
     }
 
@@ -1128,7 +1136,7 @@ impl Mount for CasMount {
                         "CAS obj/xorb files are read-only".into(),
                     ));
                 }
-                self.authorize(caller, *kind, address, "open")?;
+                self.authorize(caller, *kind, address, "open").await?;
                 *opened = true;
                 Ok(())
             }
@@ -1163,7 +1171,7 @@ impl Mount for CasMount {
                 if !opened {
                     return Err(MountError::InvalidArgument("fid is not open".into()));
                 }
-                self.authorize(caller, *kind, address, "read")?;
+                self.authorize(caller, *kind, address, "read").await?;
                 let bytes = self.read_all(*kind, address).await?;
                 Ok(slice_bytes(&bytes, offset, count))
             }
@@ -1205,7 +1213,7 @@ impl Mount for CasMount {
             CasFid::StageData { id, mode } => {
                 check_writable(*mode)?;
                 let slot = self.slot_for(id, caller)?;
-                self.authorize(caller, CasMountObjectKind::Stage, id, "stage:write")?;
+                self.authorize(caller, CasMountObjectKind::Stage, id, "stage:write").await?;
 
                 let off = usize::try_from(offset)
                     .map_err(|_| MountError::InvalidArgument("write offset overflow".into()))?;
@@ -1300,7 +1308,7 @@ impl Mount for CasMount {
             ));
         }
 
-        self.authorize(caller, CasMountObjectKind::Stage, "new", "stage:create")?;
+        self.authorize(caller, CasMountObjectKind::Stage, "new", "stage:create").await?;
 
         let id = self.staging.mint(caller, self.staging_cfg.slot_quota_bytes);
         *inner = CasFid::StageRoot {
@@ -1370,7 +1378,7 @@ impl Mount for CasMount {
             CasFid::XorbDir => Ok(dir_stat("xorb", 2)),
             CasFid::StageDir => Ok(dir_stat("stage", 3)),
             CasFid::File { kind, address, .. } => {
-                self.authorize(caller, *kind, address, "stat")?;
+                self.authorize(caller, *kind, address, "stat").await?;
                 let len = self.read_all(*kind, address).await?.len() as u64;
                 Ok(file_stat(address, len))
             }
@@ -1546,8 +1554,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl CasMountAuthorizer for std::sync::Arc<RecordingAuthorizer> {
-        fn authorize(
+        async fn authorize(
             &self,
             caller: &Subject,
             request: CasMountAuthzRequest<'_>,
@@ -1749,8 +1758,8 @@ mod tests {
         assert!(matches!(err, MountError::PermissionDenied(_)));
     }
 
-    #[test]
-    fn bootstrap_grant_list_ratchets_to_deny_all() {
+    #[tokio::test]
+    async fn bootstrap_grant_list_ratchets_to_deny_all() {
         // The ratchet terminus: an empty grant list denies even the day-one
         // xorb read, equivalent to DenyAllCasAuthorizer.
         let authz = BootstrapCasAuthorizer::with_grants(Vec::new());
@@ -1765,6 +1774,7 @@ mod tests {
         };
         let err = authz
             .authorize(&Subject::new("alice"), request)
+            .await
             .unwrap_err();
         assert!(matches!(err, MountError::PermissionDenied(_)));
     }
@@ -1777,8 +1787,8 @@ mod tests {
         assert_eq!(grant.operations, &["open", "read"]);
     }
 
-    #[test]
-    fn bootstrap_cannot_grant_labels_without_verified_clearance() {
+    #[tokio::test]
+    async fn bootstrap_cannot_grant_labels_without_verified_clearance() {
         let authz = BootstrapCasAuthorizer::with_grants(vec![CasMountGrant {
             name: "test:stage-label",
             subject: CasGrantSubject::AnyAuthenticated,
@@ -1798,6 +1808,7 @@ mod tests {
 
         let err = authz
             .authorize(&Subject::new("alice"), request)
+            .await
             .unwrap_err();
         assert!(matches!(err, MountError::PermissionDenied(_)));
     }

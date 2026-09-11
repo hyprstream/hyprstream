@@ -1,12 +1,25 @@
 //! User credential store abstraction.
 //!
-//! `UserStore` is the trait. `RocksDbUserStore` is the production implementation
-//! with atomic updates and multi-pubkey support.
+//! `UserStore` is the sealed backend trait. Production callers obtain an
+//! admitted [`super::ProductionUserStore`] rather than constructing or
+//! injecting an arbitrary implementation.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
+
+/// Private supertrait preventing downstream crates from implementing
+/// `UserStore` and injecting a plaintext persistence backend.
+pub(crate) mod private {
+    pub trait Sealed {}
+
+    // Unit tests inside this crate use purpose-built fault stores. Integration
+    // and downstream crates compile the library without `cfg(test)` and cannot
+    // access this module.
+    #[cfg(test)]
+    impl<T: Send + Sync> Sealed for T {}
+}
 
 /// Who controls the account's authentication key material.
 ///
@@ -257,7 +270,7 @@ pub struct ExternalIdentityResolution {
 ///
 /// Supports profile CRUD and multi-pubkey management (like GitHub SSH keys).
 #[async_trait]
-pub trait UserStore: Send + Sync {
+pub trait UserStore: private::Sealed + Send + Sync {
     // ─── Profile CRUD ────────────────────────────────────────────────────────
 
     /// Get a user's profile (OIDC claims).

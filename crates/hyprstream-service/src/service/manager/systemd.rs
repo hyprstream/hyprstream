@@ -489,7 +489,8 @@ pub fn encrypt_credentials_if_available(secrets_dir: Option<&std::path::Path>) -
 
     let mut encrypted_count = 0usize;
 
-    // Encrypt node-level credentials (flat: signing-key, ca-pubkey, bootstrap-pubkeys, rsa-key, TLS)
+    // Encrypt node-level credentials (flat: signing-key, ca-pubkey,
+    // ca-mldsa-pubkey, bootstrap-pubkeys, rsa-key, TLS)
     // Note: signing-key is written as a copy of the CA key so PolicyService can load it
     for name in units::NODE_CREDENTIAL_NAMES.iter().chain(std::iter::once(&"signing-key")) {
         let secret_path = dir.join(name);

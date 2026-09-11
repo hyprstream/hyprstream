@@ -5,6 +5,8 @@
 .context
 _future
 target
+# npm tarball + integrity evidence emitted by .github/scripts/package-rpc-std-wasm.sh
+dist
 codegen-out
 models
 libtorch
@@ -20,3 +22,6 @@ appimage/appimagetool
 
 # Obsidian editor state
 docs/.obsidian/
+
+# CI browser-conformance runtime receipt (written by browser-wasm-test.sh)
+browser-wasm-receipt.txt

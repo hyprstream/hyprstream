@@ -22,10 +22,12 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use super::state::{DeviceCodeStatus, OAuthState, RefreshTokenEntry};
-use crate::services::generated::policy_client::IssueToken;
+use super::state::{DeviceCodeStatus, DpopJtiAdmission, OAuthState, RefreshTokenEntry};
+use crate::services::generated::policy_client::{IssueToken, IssueTokenProfile};
 use hyprstream_pds::repo_authority::is_path_form_did_web;
 use hyprstream_rpc::auth::{jwk_thumbprint, JwkThumbprintInput};
+// #1425: the public browser client_id routes the sender-bound exchange.
+use hyprstream_rpc::wasm_token_exchange::BROWSER_PUBLIC_CLIENT_ID;
 
 /// Device code grant type URN (RFC 8628).
 const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
@@ -71,12 +73,22 @@ pub struct TokenRequest {
     pub requested_token_type: Option<String>,
     #[serde(default)]
     pub actor_token: Option<String>,
+    // RFC 8693 §2.1 actor-token type indicator (#1425 r2 P2). Modeled
+    // explicitly so it is never silently dropped by the form extractor —
+    // a request that names an actor_token_type but omits actor_token must
+    // still be recognized and rejected by the browser handler, not treated
+    // as if it had no actor field at all.
+    #[serde(default)]
+    pub actor_token_type: Option<String>,
     #[serde(default)]
     pub scope: Option<String>,
     #[serde(default)]
     pub audience: Option<String>,
     #[serde(default)]
     pub tenant: Option<String>,
+    // RFC 8707 resource indicator (token-exchange, #1425).
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 
 /// POST /oauth/token — token exchange
@@ -210,6 +222,27 @@ pub async fn exchange_token(
                 )
                 .await;
             }
+            // #1425: the browser RFC 8693 sender-bound exchange (DPoP +
+            // cnf.jkt). Routed on the public browser client_id so it cannot be
+            // confused with the generic OIDC/WIT bearer exchange or the UCAN
+            // grant path. DPoP is mandatory inside the handler.
+            if params.client_id == BROWSER_PUBLIC_CLIENT_ID {
+                return super::token_exchange::exchange_browser_token_exchange(
+                    &state,
+                    &subject_token,
+                    &subject_token_type,
+                    dpop_header.as_deref(),
+                    params.audience.as_deref(),
+                    params.resource.as_deref(),
+                    params.scope.as_deref(),
+                    params.requested_token_type.as_deref(),
+                    params.actor_token.as_deref(),
+                    params.actor_token_type.as_deref(),
+                    params.tenant.as_deref(),
+                    &params.client_id,
+                )
+                .await;
+            }
             let output_dpop_jkt = match dpop_header.as_deref() {
                 Some(proof) => {
                     let endpoint =
@@ -238,6 +271,7 @@ pub async fn exchange_token(
                 output_dpop_jkt,
                 params.requested_token_type.as_deref(),
                 params.tenant.as_deref(),
+                &params.client_id,
             )
             .await
         }
@@ -491,13 +525,17 @@ async fn verify_dpop_at_token_endpoint(
             )));
         }
     };
-    // JTI replay check.
-    if !state.check_and_record_dpop_jti(&proof.jti, proof.iat) {
-        tracing::warn!(jti = %proof.jti, "DPoP JTI replay detected");
+    // JTI replay check. A full barrier is already metered and warning-rate-
+    // limited at insertion; only a duplicate emits a generic debug event.
+    let admission = state.check_and_record_dpop_jti_admission(&proof.jti, proof.iat);
+    if !admission.is_inserted() {
+        if let Some(message) = dpop_jti_rejection_log_message(admission) {
+            tracing::debug!("{message}");
+        }
         return Some(Err(token_error(
             StatusCode::BAD_REQUEST,
             "invalid_dpop_proof",
-            Some("DPoP proof jti already used"),
+            Some("DPoP proof rejected"),
         )));
     }
 
@@ -535,6 +573,12 @@ async fn verify_dpop_at_token_endpoint(
     }
 
     Some(Ok(proof.jkt))
+}
+
+/// A saturated barrier is logged only by its rate-limited insertion path.
+/// Duplicate proofs receive a generic diagnostic that never includes a JTI.
+fn dpop_jti_rejection_log_message(admission: DpopJtiAdmission) -> Option<&'static str> {
+    (admission == DpopJtiAdmission::Duplicate).then_some("DPoP JTI replay rejected")
 }
 
 /// Build a `400 use_dpop_nonce` response with the current nonce in the
@@ -700,6 +744,7 @@ async fn exchange_authorization_code(
         &sub,
         pending.oidc_nonce,
         true,
+        None,
         vk_ref,
         dpop_jkt,
         client_assertion_jkt,
@@ -851,6 +896,35 @@ async fn exchange_refresh_token(
         }
     }
 
+    // Refresh prevention (v16 §3.3): a revoked or unknown session cannot
+    // refresh. Checked BEFORE the single-use claim so a rejected or
+    // unavailable check never consumes the credential (mirrors the DPoP
+    // ordering above).
+    if let Some(ref session_id) = entry.session_id {
+        let session_key =
+            hyprstream_rpc::auth::SessionKey::oidc(token_issuer.clone(), session_id.clone());
+        match hyprstream_rpc::auth::global_session_registry() {
+            Some(registry) => {
+                if registry.is_revoked(&session_key).await {
+                    tracing::warn!(username = %entry.username, "refresh rejected: session is revoked");
+                    return token_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        Some("session has been revoked"),
+                    );
+                }
+            }
+            None => {
+                tracing::error!("refresh rejected: session registry is not available");
+                return token_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    Some("session authority is unavailable"),
+                );
+            }
+        }
+    }
+
     // Atomically claim only after all retryable DPoP validation succeeds.
     // A successful claim prevents every other OAuth replica from minting with
     // this single-use refresh credential.
@@ -892,6 +966,7 @@ async fn exchange_refresh_token(
         &claimed.username,
         None,
         false,
+        claimed.session_id.clone(),
         stored_vk.as_ref(),
         dpop_jkt,
         carried_assertion_jkt,
@@ -1083,6 +1158,7 @@ async fn exchange_device_code(
                 &approved_by,
                 None,
                 false,
+                None,
                 device_vk.as_ref(),
                 dpop_jkt,
                 client_assertion_jkt,
@@ -1187,6 +1263,7 @@ async fn issue_token_with_refresh(
     sub: &str,
     oidc_nonce: Option<String>,
     initial_auth: bool,
+    session_id: Option<String>,
     user_verifying_key: Option<&ed25519_dalek::VerifyingKey>,
     dpop_jkt: Option<String>,
     client_assertion_jkt: Option<String>,
@@ -1270,6 +1347,50 @@ async fn issue_token_with_refresh(
         sub.to_owned()
     };
     let token_issuer = state.issuer_for_scopes(&scopes);
+    // Session binding (v16 §3.3): interactive/user session credentials MUST
+    // carry a `sid`. A fresh issuance (`None` — authorization_code, device
+    // code, or a pre-session legacy refresh) registers a new session with the
+    // canonical authority; a refresh passes the persisted session through so
+    // rotation keeps one stable sid across distinct credential IDs.
+    // Registration is fail-closed: no unregistered session is ever minted.
+    let session_id = match session_id {
+        Some(sid) => Some(sid),
+        None => {
+            use rand::RngCore;
+            let mut sid_bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut sid_bytes);
+            let sid = URL_SAFE_NO_PAD.encode(sid_bytes);
+            let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
+                tracing::error!("rejecting token issuance: session registry is not available");
+                return token_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    Some("session authority is unavailable"),
+                );
+            };
+            let now = chrono::Utc::now().timestamp();
+            let session_key =
+                hyprstream_rpc::auth::SessionKey::oidc(token_issuer.clone(), sid.clone());
+            let session_state = hyprstream_rpc::auth::SessionState {
+                subject: jwt_sub.clone(),
+                tenant: hosted_account_tenant.clone(),
+                kind: hyprstream_rpc::auth::SessionKind::Interactive,
+                created_at: now,
+                expires_at: now + state.refresh_token_ttl as i64,
+                status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                clearance_epoch: 0,
+            };
+            if let Err(e) = registry.register_session(session_key, session_state).await {
+                tracing::error!(error = %e, "rejecting token issuance: session registration failed");
+                return token_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    Some("session authority rejected the registration"),
+                );
+            }
+            Some(sid)
+        }
+    };
     let issue_oidc_id_token =
         scopes.iter().any(|scope| scope == "openid") && initial_auth && state.signing_key.is_some();
     // Resolve the durable OIDC subject before issuing or persisting any token.
@@ -1329,6 +1450,10 @@ async fn issue_token_with_refresh(
             issuer: Some(token_issuer.clone()),
             tenant: Some(hosted_account_tenant.clone()),
             require_clearance: false,
+            session_id: session_id.clone(),
+            issuance_profile: IssueTokenProfile::InteractiveSession,
+            // RFC 9068 §2.2.1: the OAuth client this access token is issued to.
+            client_id: Some(client_id.to_owned()),
         })
         .await;
 
@@ -1385,6 +1510,7 @@ async fn issue_token_with_refresh(
                     dpop_jkt: dpop_jkt.clone(),
                     client_assertion_jkt: client_assertion_jkt.clone(),
                     ucan_grant: None, // generic OAuth refresh; not a UCAN grant (MAC #547 B1)
+                    session_id: session_id.clone(),
                 };
                 if let Err(e) = state
                     .put_refresh_token(&refresh_token, &entry, state.refresh_token_ttl as u64)
@@ -1558,6 +1684,19 @@ fn token_error_body(error: &str, description: Option<&str>) -> serde_json::Value
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dpop_replay_logging_is_generic_and_never_bypasses_full_rate_limit() {
+        assert_eq!(
+            dpop_jti_rejection_log_message(DpopJtiAdmission::Duplicate),
+            Some("DPoP JTI replay rejected")
+        );
+        assert_eq!(dpop_jti_rejection_log_message(DpopJtiAdmission::Full), None);
+        assert_eq!(
+            dpop_jti_rejection_log_message(DpopJtiAdmission::InvalidLifetime),
+            None
+        );
+    }
 
     #[test]
     fn hosted_account_tenant_is_zone_bound_into_host_form_did() {
@@ -1888,6 +2027,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -1930,6 +2070,7 @@ mod tests {
             dpop_jkt: None,
             client_assertion_jkt: None,
             ucan_grant: None,
+            session_id: None,
         };
         state
             .put_refresh_token("legacy-refresh", &path_form_entry, 3600)
@@ -1952,9 +2093,11 @@ mod tests {
             subject_token_type: None,
             requested_token_type: None,
             actor_token: None,
+            actor_token_type: None,
             scope: None,
             audience: None,
             tenant: None,
+            resource: None,
         };
         let resp = exchange_refresh_token(Arc::clone(&state), params, None, None, None).await;
 
@@ -1996,6 +2139,7 @@ mod tests {
             dpop_jkt: None,
             client_assertion_jkt: None,
             ucan_grant: None,
+            session_id: None,
         };
         state
             .put_refresh_token("repairable-refresh", &entry, 3600)
@@ -2017,9 +2161,11 @@ mod tests {
             subject_token_type: None,
             requested_token_type: None,
             actor_token: None,
+            actor_token_type: None,
             scope: None,
             audience: None,
             tenant: None,
+            resource: None,
         };
         let response =
             exchange_refresh_token(Arc::clone(&state), params, None, None, None).await;
@@ -2054,6 +2200,7 @@ mod tests {
                 requested_scope: Some("read:model:demo".to_owned()),
                 audience: None,
             }),
+            session_id: None,
         };
         state
             .put_refresh_token("legacy-ucan-refresh", &path_form_entry, 3600)
@@ -2075,9 +2222,11 @@ mod tests {
             subject_token_type: None,
             requested_token_type: None,
             actor_token: None,
+            actor_token_type: None,
             scope: None,
             audience: None,
             tenant: None,
+            resource: None,
         };
         let resp = exchange_refresh_token(state.clone(), params, None, None, None).await;
 

@@ -13,7 +13,8 @@ pub use git::{GitAction, GitCommand};
 pub use policy::{PolicyCommand, RoleCommand, TokenCommand};
 pub use training::{TrainingAction, TrainingCommand};
 pub use trust::{
-    DelegateRegistrySignerArgs, MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs,
+    DelegateRegistrySignerArgs, EnrollServiceKeyArgs, InstallDeploymentTrustArgs,
+    MintAnchorCapsuleArgs, MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs,
     TrustCommand, VerifyDeploymentArgs,
 };
 pub use user::{UserCommand, UserKeysCommand, UserKeysImportFormat};
@@ -271,13 +272,41 @@ pub enum ServiceAction {
         verbose: bool,
     },
 
-    /// Diagnose, initialize, and repair hyprstream installation
+    /// Diagnose the hyprstream installation
     ///
-    /// Alias for `service install --verbose`. Runs all setup checks and fixes
-    /// without starting services.
+    /// Runs all setup checks (directories, registry, policy, signing keys,
+    /// TLS, bootstrap-pubkeys hybrid posture) and reports status without
+    /// starting services. Dispatches before the hybrid gate so it works on
+    /// a partially-broken install.
     Repair {
         /// Show verbose output for each check
         #[arg(long, short = 'v')]
         verbose: bool,
+    },
+
+    /// Generate or load a service's signing key and write its public sidecars
+    ///
+    /// Runs the same key loader the service itself uses (with
+    /// `resolve_service_signing_key` semantics, so `policy` resolves to the
+    /// flat node/CA key), then ensures the public sidecars exist next to the
+    /// seed: `signing-key.pub` (32-byte Ed25519 verifying key, 0644) and
+    /// `service-pubkey.hybrid` (1984-byte hybrid bootstrap entry, 0644).
+    ///
+    /// Idempotent: an existing key is loaded, never rotated, and up-to-date
+    /// sidecars are left untouched. Does not start any services — intended
+    /// for provisioning/keygen units that run before service startup.
+    EnsureKey {
+        /// Service name (e.g. registry, discovery, policy)
+        name: String,
+    },
+
+    /// Persist built-in policy templates directly into the configured policy store
+    ///
+    /// This offline provisioning command is intended for boot orchestration before
+    /// Policy or Registry starts. It does not contact a service or load credentials.
+    ProvisionPolicyTemplates {
+        /// Built-in template name; repeat for each template to provision
+        #[arg(long, required = true, action = clap::ArgAction::Append)]
+        template: Vec<String>,
     },
 }

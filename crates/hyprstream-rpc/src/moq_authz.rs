@@ -205,8 +205,10 @@ impl PeerIdentity {
 /// ## Wiring status
 ///
 /// - **iroh `moql` path** ([`crate::transport::iroh_moq::IrohMoqProtocolHandler`]):
-///   `remote_id()` is carrier metadata, so the hook receives anonymous until
-///   #1027 supplies fresh proof.
+///   `remote_id()` is carrier metadata, never identity. With a
+///   [`crate::transport::moql_admission::MoqlAdmissionAuthenticator`] installed
+///   (#1027) the hook receives the admitted (verified) peer; without one it
+///   receives anonymous and the accept path refuses.
 /// - **quinn `/moq` path** ([`crate::transport::quinn_transport::QuinnRpcServer`]):
 ///   as of #1153 the CONNECT is authenticated by
 ///   [`crate::transport::moq_connect_auth::MoqConnectAuthz`] (bearer JWT,
@@ -216,15 +218,20 @@ impl PeerIdentity {
 ///   [`PeerIdentity::anonymous`] (single-tenant/open model); a policy-gated
 ///   authorizer will deny *private* subscribes from anonymous quinn peers
 ///   (fail-closed) while public broadcasts remain open.
+///
+/// Async because the MAC-backed authorizer revalidates credential-bearing
+/// cached subject contexts against the canonical revocation authority on
+/// every decision.
+#[async_trait::async_trait]
 pub trait SubscribeAuthorizer: Send + Sync {
     /// Decide whether `peer` may subscribe to `track_name`.
-    fn authorize(&self, peer: &PeerIdentity, track_name: &str) -> SubscribeDecision;
+    async fn authorize(&self, peer: &PeerIdentity, track_name: &str) -> SubscribeDecision;
 
     /// Decide admission while moq-net provides no track name callback (#276).
     ///
     /// The default is deny. Implementations with an audit path should override
     /// this method to record the coarse session denial.
-    fn authorize_without_track_hook(&self, _peer: &PeerIdentity) -> SubscribeDecision {
+    async fn authorize_without_track_hook(&self, _peer: &PeerIdentity) -> SubscribeDecision {
         SubscribeDecision::Deny
     }
 }
@@ -287,8 +294,9 @@ impl DefaultAuthorizer {
     }
 }
 
+#[async_trait::async_trait]
 impl SubscribeAuthorizer for DefaultAuthorizer {
-    fn authorize(&self, peer: &PeerIdentity, track_name: &str) -> SubscribeDecision {
+    async fn authorize(&self, peer: &PeerIdentity, track_name: &str) -> SubscribeDecision {
         match (self.visibility)(track_name) {
             Visibility::Public => SubscribeDecision::Allow,
             Visibility::Private => match &self.policy {
@@ -323,6 +331,10 @@ pub type SharedSubscribeAuthorizer = Arc<dyn SubscribeAuthorizer>;
 /// (the §7.5 DH-derived topic capability) never substitutes for this decision —
 /// it gates metadata visibility, the MAC floor gates the labeled content.
 ///
+/// Typed identity (v16 §10 / #1510): the track name is parsed into the
+/// stream-plane typed identity exactly once at this boundary; a name that
+/// does not decode denies as an unknown identity.
+///
 /// Constructing this adapter installs an active PEP, so missing clearance and
 /// missing labels deny. Leaving the containing transport's authorizer unset is
 /// the dormant pre-activation state and remains pass-through.
@@ -337,15 +349,17 @@ impl MacSubscribeAuthorizer {
     }
 }
 
+#[async_trait::async_trait]
 impl SubscribeAuthorizer for MacSubscribeAuthorizer {
-    fn authorize(&self, peer: &PeerIdentity, track_name: &str) -> SubscribeDecision {
+    async fn authorize(&self, peer: &PeerIdentity, track_name: &str) -> SubscribeDecision {
         let subject = match &peer.subject {
             Some(s) => Subject::new(s.clone()),
             None => Subject::anonymous(),
         };
         if matches!(
             self.pep
-                .check(&subject, track_name, MoqEventAction::Subscribe),
+                .check_stream_track(&subject, track_name, MoqEventAction::Subscribe)
+                .await,
             MacDecision::Permit
         ) {
             SubscribeDecision::Allow
@@ -354,12 +368,12 @@ impl SubscribeAuthorizer for MacSubscribeAuthorizer {
         }
     }
 
-    fn authorize_without_track_hook(&self, peer: &PeerIdentity) -> SubscribeDecision {
+    async fn authorize_without_track_hook(&self, peer: &PeerIdentity) -> SubscribeDecision {
         let subject = match &peer.subject {
             Some(s) => Subject::new(s.clone()),
             None => Subject::anonymous(),
         };
-        self.pep.deny_track_admission_without_hook(&subject);
+        self.pep.deny_track_admission_without_hook(&subject).await;
         SubscribeDecision::Deny
     }
 }
@@ -439,25 +453,25 @@ mod tests {
         assert!(filter_announces_by_tenant(names.iter().copied(), "zzz").is_empty());
     }
 
-    #[test]
-    fn public_stream_is_allowed_even_anonymous() {
+    #[tokio::test]
+    async fn public_stream_is_allowed_even_anonymous() {
         let authz = DefaultAuthorizer::permissive();
-        let decision = authz.authorize(&PeerIdentity::anonymous(), "alice/s/t/i");
+        let decision = authz.authorize(&PeerIdentity::anonymous(), "alice/s/t/i").await;
         assert_eq!(decision, SubscribeDecision::Allow);
         assert!(decision.is_allowed());
     }
 
-    #[test]
-    fn private_stream_without_gate_is_denied() {
+    #[tokio::test]
+    async fn private_stream_without_gate_is_denied() {
         // All-private classifier, no gate installed → fail-closed deny.
         let authz =
             DefaultAuthorizer::new(Arc::new(|_| Visibility::Private), None);
-        let decision = authz.authorize(&PeerIdentity::authenticated("did:key:z6Mk..."), "alice/s/t/i");
+        let decision = authz.authorize(&PeerIdentity::authenticated("did:key:z6Mk..."), "alice/s/t/i").await;
         assert_eq!(decision, SubscribeDecision::Deny);
     }
 
-    #[test]
-    fn private_stream_authorized_peer_is_allowed() {
+    #[tokio::test]
+    async fn private_stream_authorized_peer_is_allowed() {
         // Private classifier + gate that allows a specific subject.
         let gate: PolicyGate = Arc::new(|peer: &PeerIdentity, _track: &str| {
             peer.subject.as_deref() == Some("alice-node")
@@ -466,12 +480,12 @@ mod tests {
             DefaultAuthorizer::new(Arc::new(|_| Visibility::Private), Some(gate));
 
         let allowed =
-            authz.authorize(&PeerIdentity::authenticated("alice-node"), "alice/s/t/i");
+            authz.authorize(&PeerIdentity::authenticated("alice-node"), "alice/s/t/i").await;
         assert_eq!(allowed, SubscribeDecision::Allow);
     }
 
-    #[test]
-    fn private_stream_unauthorized_peer_is_rejected() {
+    #[tokio::test]
+    async fn private_stream_unauthorized_peer_is_rejected() {
         let gate: PolicyGate = Arc::new(|peer: &PeerIdentity, _track: &str| {
             peer.subject.as_deref() == Some("alice-node")
         });
@@ -480,16 +494,16 @@ mod tests {
 
         // Different subject → denied.
         let denied =
-            authz.authorize(&PeerIdentity::authenticated("mallory-node"), "alice/s/t/i");
+            authz.authorize(&PeerIdentity::authenticated("mallory-node"), "alice/s/t/i").await;
         assert_eq!(denied, SubscribeDecision::Deny);
 
         // Anonymous peer on a private stream → denied (fail-closed).
-        let anon = authz.authorize(&PeerIdentity::anonymous(), "alice/s/t/i");
+        let anon = authz.authorize(&PeerIdentity::anonymous(), "alice/s/t/i").await;
         assert_eq!(anon, SubscribeDecision::Deny);
     }
 
-    #[test]
-    fn mixed_visibility_routes_public_open_private_gated() {
+    #[tokio::test]
+    async fn mixed_visibility_routes_public_open_private_gated() {
         // Public iff under "pub/" prefix; everything else private.
         let visibility: VisibilityFn = Arc::new(|track: &str| {
             if tenant_of(track) == Some("pub") {
@@ -505,17 +519,17 @@ mod tests {
 
         // Public stream: open even to anonymous.
         assert_eq!(
-            authz.authorize(&PeerIdentity::anonymous(), "pub/s/t/i"),
+            authz.authorize(&PeerIdentity::anonymous(), "pub/s/t/i").await,
             SubscribeDecision::Allow
         );
         // Private stream: authorized subject allowed.
         assert_eq!(
-            authz.authorize(&PeerIdentity::authenticated("priv-allowed"), "alice/s/t/i"),
+            authz.authorize(&PeerIdentity::authenticated("priv-allowed"), "alice/s/t/i").await,
             SubscribeDecision::Allow
         );
         // Private stream: other subject denied.
         assert_eq!(
-            authz.authorize(&PeerIdentity::authenticated("nope"), "alice/s/t/i"),
+            authz.authorize(&PeerIdentity::authenticated("nope"), "alice/s/t/i").await,
             SubscribeDecision::Deny
         );
     }
@@ -601,10 +615,10 @@ mod scope_tests {
         assert!(config.authorizer.is_none());
     }
 
-    #[test]
-    fn mac_subscribe_authorizer_fail_closed_denies_all() {
+    #[tokio::test]
+    async fn mac_subscribe_authorizer_fail_closed_denies_all() {
         use crate::auth::mac::{
-            DenyAllClearanceSource, DenyAllObjectResolver, MoqMacAuditReason, MoqMacAuditRecord,
+            DenyAllClearanceSource, DenyAllMoqEventResolver, MoqMacAuditReason, MoqMacAuditRecord,
             MoqMacAuditSink,
         };
         use parking_lot::Mutex;
@@ -624,23 +638,25 @@ mod scope_tests {
         let audit = Arc::new(RecordingAudit::default());
         let authz = Arc::new(super::MacSubscribeAuthorizer::new(
             crate::auth::mac::MoqEventPep::new(
-                Arc::new(DenyAllObjectResolver),
+                Arc::new(DenyAllMoqEventResolver),
                 Arc::new(DenyAllClearanceSource),
                 audit.clone(),
             ),
         ));
         assert_eq!(
-            authz.authorize(&PeerIdentity::anonymous(), "t"),
+            authz.authorize(&PeerIdentity::anonymous(), "t").await,
             SubscribeDecision::Deny
         );
         assert_eq!(
-            authz.authorize(&PeerIdentity::authenticated("did:web:x"), "t"),
+            authz.authorize(&PeerIdentity::authenticated("did:web:x"), "t").await,
             SubscribeDecision::Deny
         );
         let config =
             crate::transport::iroh_moq::MoqAuthzConfig::default().with_authorizer(authz);
         assert_eq!(
-            config.authorize_without_track_hook(&PeerIdentity::authenticated("did:web:x")),
+            config
+                .authorize_without_track_hook(&PeerIdentity::authenticated("did:web:x"))
+                .await,
             SubscribeDecision::Deny
         );
         let records = audit.records.lock();

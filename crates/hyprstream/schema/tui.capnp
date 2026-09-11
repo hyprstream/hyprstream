@@ -9,12 +9,15 @@
 
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
+using import "/annotations.capnp".dispatchMac;
+using import "/annotations.capnp".mutationSemantics;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".vfsPath;
 # #275: the moq reach model (network-routable dial parameters) so a cross-process
 # TUI viewer can dial the producer's networked moq plane instead of its own local
 # UDS plane. Shared 1:1 with the inference StreamInfo's reach (streaming.capnp).
 using import "/streaming.capnp".Destination;
+using import "/streaming.capnp".MoqlServerIdentity;
 
 # ═══════════════════════════════════════════════════════════════════
 # Frame Types (streamed via StreamPublisher, not RPC)
@@ -121,76 +124,82 @@ struct TuiRequest {
   union {
     # Connect a new viewer to a session (creates session if needed)
     connect @1 :ConnectRequest
-      $scope(write) $mcpDescription("Connect viewer to TUI session");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Connect viewer to TUI session");
 
     # Disconnect a viewer
     disconnect @2 :UInt32  # viewer_id
-      $scope(write) $mcpDescription("Disconnect viewer from TUI session");
+      $scope(write) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Disconnect viewer from TUI session");
 
     # Create a new window in the current session
     createWindow @3 :Void
-      $scope(write) $mcpDescription("Create a new window");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Create a new window");
 
     # Close a window
     closeWindow @4 :UInt32  # window_id
-      $scope(write) $mcpDescription("Close a window");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Close a window");
 
     # List all windows in a session
     listWindows @5 :UInt32  # session_id
-      $scope(query) $mcpDescription("List all windows in a session")
+      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("List all windows in a session")
       $vfsPath("{arg}/windows");
 
     # Focus a window
     focusWindow @6 :UInt32  # window_id
-      $scope(write) $mcpDescription("Focus a window");
+      $scope(write) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Focus a window");
 
     # Split the active pane
     splitPane @7 :SplitRequest
-      $scope(write) $mcpDescription("Split active pane horizontally or vertically");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Split active pane horizontally or vertically");
 
     # Close a pane
     closePane @8 :UInt32  # pane_id
-      $scope(write) $mcpDescription("Close a pane");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Close a pane");
 
     # Focus a pane
     focusPane @9 :UInt32  # pane_id
-      $scope(write) $mcpDescription("Focus a pane");
+      $scope(write) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Focus a pane");
 
     # Get a snapshot of the current display state
     snapshot @10 :UInt32  # session_id (0 = current)
-      $scope(query) $mcpDescription("Get snapshot of current display")
+      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Get snapshot of current display")
       $vfsPath("{arg}/snapshot");
 
     # Resize the terminal
     resize @11 :ResizeRequest
-      $scope(write) $mcpDescription("Resize terminal dimensions");
+      $scope(write) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Resize terminal dimensions");
 
     # Send input to the active pane
     sendInput @12 :SendInputRequest
-      $scope(write) $mcpDescription("Send input to active pane");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Send input to active pane");
 
     # Spawn a shell process in a pane
     spawnShell @13 :SpawnShellRequest
-      $scope(write) $mcpDescription("Spawn a shell in a pane");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Spawn a shell in a pane");
 
     # Poll for stdin bytes queued for this viewer (alternative to ZMQ SUB relay).
-    # Returns all bytes received since the last poll, concatenated.
+    # Returns all bytes received since the last poll, concatenated. The poll
+    # DRAINS the viewer's queue (pop_front), so a lost reply consumes bytes a
+    # retry cannot redeliver. The required guarantee is retry-safe delivery of
+    # the exact drained result — dequeue plus recorded result committed
+    # atomically or equivalently fenced (exactly-once-visible behavior); bare
+    # at-most-once delivery would still permit loss. No such mechanism is
+    # implemented — this records the required contract, not an existing one.
     pollStdin @14 :UInt32  # viewer_id
-      $scope(query) $mcpDescription("Poll for stdin bytes queued for this viewer");
+      $scope(query) $mutationSemantics("transaction-ledger-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Poll for stdin bytes queued for this viewer");
 
     # Spawn the ShellApp chrome process inside TuiService so no fork occurs
     # in the client process (avoids ZMQ signaler assertion after fork).
     spawnChromeShell @15 :SpawnChromeShellRequest
-      $scope(write) $mcpDescription("Spawn ShellApp chrome renderer in a TuiService pane");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Spawn ShellApp chrome renderer in a TuiService pane");
 
     # Spawn a ChatApp inference pane connected to a loaded model.
     spawnChatApp @16 :SpawnChatAppRequest
-      $scope(write) $mcpDescription("Spawn ChatApp inference pane");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Spawn ChatApp inference pane");
 
     # Create a private pane whose content is client-owned.
     # The server publishes a [PRIVATE] placeholder to other viewers.
     createPrivatePane @17 :CreatePrivatePaneRequest
-      $scope(write) $mcpDescription("Create a private client-owned pane");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Create a private client-owned pane");
   }
 }
 
@@ -401,6 +410,10 @@ struct StreamInfo {
   # viewers ignore this and use the same-host UDS fast path resolved from LOCAL
   # config (never advertised here).
   announcedAt @3 :List(Destination);
+  # Resolver-verified accepted-state witness for the TUI server that produced
+  # this record. Native Iroh viewers carry it into mutual admission; an empty
+  # witness fails closed rather than being silently replaced by local state.
+  moqlServerIdentity @4 :MoqlServerIdentity;
 }
 
 # Window information

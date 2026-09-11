@@ -1421,7 +1421,9 @@ mod tests {
                 crate::services::DiscoveryClient::new(make_client()),
                 signing_key.verifying_key().to_bytes(),
             )
-            .with_user_store(user_store.clone())
+            .with_user_store(crate::auth::ProductionUserStore::for_test(
+                user_store.clone(),
+            ))
             .with_identity_registration_api(identity_api)
             .with_hosted_account_zone(crate::account::AccountZone::new("accounts.example.test")?),
         );

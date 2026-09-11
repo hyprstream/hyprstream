@@ -38,6 +38,7 @@ pub mod device_pool; // Multi-GPU device abstraction (DevicePool) — Send+Sync,
 pub mod image_utils; // Image loading and preprocessing for multimodal models
 pub mod inference_profile; // Explicit inference isolation/deployment scheduling profile
 pub mod kv_cache; // Key-Value caching for efficient autoregressive generation
+pub mod kv_compat; // KV-cache compatibility fingerprint + rejection policy (#1277)
 pub mod model_config; // Unified model configuration management
 pub mod model_factory; // Single factory for model creation
 pub mod rope; // Rotary Position Embedding (RoPE) implementation
@@ -56,6 +57,12 @@ pub use device_pool::DevicePool;
 
 // KV cache exports for multi-session support
 pub use kv_cache::{CacheConfig, CacheOwner, KVCacheManager, KVCacheRegistry};
+
+// KV-cache compatibility fingerprint + rejection policy (#1277)
+pub use kv_compat::{
+    check_compatibility, KvCompatDescriptor, KvCompatFingerprint, KvCompatMismatch,
+    KvDtype, KvQuantMode, WeightIdentity, KV_COMPAT_FORMAT_VERSION,
+};
 
 // Generation metrics exports for self-supervised training
 pub use generation_metrics::{GenerationMetricsAccumulator, GenerationQualityMetrics, SessionMetrics};

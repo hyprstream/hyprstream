@@ -40,6 +40,19 @@ use crate::transport::iroh_substrate::{ALPN_HYPRSTREAM_RPC, OwnedIrohClientEndpo
 use crate::transport::iroh_transport::{IrohPendingStream, IrohPublishStub, IrohTransport};
 use crate::transport_traits::Transport;
 
+/// Availability failures before a request is dispatched. This deliberately
+/// excludes malformed addresses, missing client setup, peer authentication,
+/// ALPN rejection, and all errors after connection establishment.
+#[derive(Debug, thiserror::Error)]
+pub enum IrohPeerUnavailable {
+    #[error("iroh connect timed out")]
+    ConnectTimeout,
+    #[error("iroh peer is in reconnect backoff")]
+    ReconnectBackoff,
+    #[error("iroh peer address discovery is not available yet")]
+    AddressDiscovery(#[source] iroh::endpoint::ConnectError),
+}
+
 /// Default per-request deadline when the caller passes `None`.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -55,11 +68,21 @@ static IROH_CLIENT_ENDPOINT: OnceLock<iroh::Endpoint> = OnceLock::new();
 /// originate outbound RPC dials. First-write-wins (mirrors
 /// `install_verify_config`); returns `Err(endpoint)` if one is already set.
 ///
-/// The daemon calls this once during bootstrap with the shared endpoint (the
-/// same one its inbound iroh substrate listens on, so outbound dials reuse the
-/// node identity). The capability can only be obtained from
+/// In production the authenticated OS-owned process bootstrap calls this
+/// FIRST, with a distinct outbound-only carrier endpoint (retained in
+/// `PROCESS_BOOTSTRAP_CARRIER`, transport purpose key
+/// `hyprstream-bootstrap-client-transport-v1`). A service that later binds
+/// its own inbound substrate therefore receives `Err(returned_capability)`;
+/// that is valid and expected — it keeps its substrate as the independent
+/// inbound owner and leaves the global endpoint untouched. The global
+/// endpoint is the outbound dialer only: it is not a DID, subject, tenant,
+/// response-signing key, or authorization authority. The capability can only
+/// be obtained from
 /// [`crate::transport::iroh_substrate::IrohSubstrate::owned_client_endpoint`],
-/// which proves the endpoint was bound with the exact hybrid-only provider.
+/// which proves the endpoint was bound with the provider configured for N0
+/// interoperability. Owned Hyprstream ALPNs still require the hybrid group at
+/// the completed-carrier admission hook, while public relay/pkarr HTTPS needs
+/// the provider's X25519 fallback.
 ///
 /// Arbitrary already-bound endpoints are rejected by the type system:
 ///
@@ -97,6 +120,9 @@ pub struct LazyIrohTransport {
     relay_url: Option<String>,
     /// Cached session + reconnect backoff (#156).
     state: Mutex<LazyState<IrohTransport>>,
+    /// Accessed only while holding `state`: a later backoff must not turn a
+    /// prior authentication/configuration rejection into availability.
+    availability_backoff: std::sync::atomic::AtomicBool,
     /// Test-only dial endpoint override.
     ///
     /// Production always dials from the process-global install-once endpoint
@@ -125,6 +151,7 @@ impl LazyIrohTransport {
             direct_addrs,
             relay_url,
             state: Mutex::new(LazyState::default()),
+            availability_backoff: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             endpoint_override: None,
         }
@@ -145,6 +172,7 @@ impl LazyIrohTransport {
             direct_addrs,
             relay_url,
             state: Mutex::new(LazyState::default()),
+            availability_backoff: std::sync::atomic::AtomicBool::new(false),
             endpoint_override: Some(endpoint),
         }
     }
@@ -184,9 +212,11 @@ impl LazyIrohTransport {
             return Ok(transport.clone());
         }
         if let Some(remaining) = guard.backoff.cooldown_remaining() {
-            return Err(anyhow!(
-                "iroh peer is in reconnect backoff — retry in {remaining:.1?}"
-            ));
+            return if self.availability_backoff.load(std::sync::atomic::Ordering::Relaxed) {
+                Err(IrohPeerUnavailable::ReconnectBackoff.into())
+            } else {
+                Err(anyhow!("iroh peer is in reconnect backoff — retry in {remaining:.1?}"))
+            };
         }
         let endpoint = self.dial_endpoint().ok_or_else(|| {
             anyhow!(
@@ -203,14 +233,28 @@ impl LazyIrohTransport {
         {
             Err(_) => {
                 guard.backoff.record_failure();
-                Err(anyhow!("iroh connect timed out after {CONNECT_TIMEOUT:?}"))
+                self.availability_backoff.store(true, std::sync::atomic::Ordering::Relaxed);
+                Err(IrohPeerUnavailable::ConnectTimeout.into())
             }
             Ok(Err(e)) => {
                 guard.backoff.record_failure();
-                Err(anyhow!("iroh connect: {e}"))
+                let unavailable = matches!(
+                    &e,
+                    iroh::endpoint::ConnectError::Connect {
+                        source: iroh::endpoint::ConnectWithOptsError::NoAddress { .. },
+                        ..
+                    }
+                );
+                self.availability_backoff.store(unavailable, std::sync::atomic::Ordering::Relaxed);
+                if unavailable {
+                    Err(IrohPeerUnavailable::AddressDiscovery(e).into())
+                } else {
+                    Err(anyhow::Error::new(e).context("iroh connect"))
+                }
             }
             Ok(Ok(conn)) => {
                 guard.backoff.record_success();
+                self.availability_backoff.store(false, std::sync::atomic::Ordering::Relaxed);
                 let transport = IrohTransport::new(conn);
                 guard.cached = Some(transport.clone());
                 Ok(transport)
@@ -224,6 +268,7 @@ impl LazyIrohTransport {
         let mut guard = self.state.lock().await;
         guard.cached = None;
         guard.backoff.record_failure();
+        self.availability_backoff.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -279,6 +324,26 @@ mod tests {
         let mut k = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut k);
         k
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lazy_iroh_absent_peer_is_typed_availability_before_dispatch() {
+        let client = IrohSubstrate::new_test(
+            fresh_key(), NoopHandler::new("client moq"), NoopHandler::new("client rpc"),
+        ).await.unwrap();
+        let peer = ed25519_dalek::SigningKey::from_bytes(&fresh_key()).verifying_key().to_bytes();
+        // Minimal test carrier has neither a relay nor address lookup. No
+        // server exists, so these bytes can never have reached a handler.
+        let transport = LazyIrohTransport::new_with_endpoint(peer, vec![], None, client.endpoint().clone());
+        let error = transport.send(b"not-dispatched".to_vec(), Some(100)).await.unwrap_err();
+        assert!(crate::transport_traits::is_pre_dispatch_transport_error(&error));
+        assert!(error.chain().any(|cause| cause.downcast_ref::<IrohPeerUnavailable>().is_some()));
+        assert!(transport.state.lock().await.cached.is_none());
+        // Backoff preserves its explicit availability provenance.
+        let error = transport.send(b"still-not-dispatched".to_vec(), Some(100)).await.unwrap_err();
+        assert!(error.chain().any(|cause| matches!(cause.downcast_ref::<IrohPeerUnavailable>(), Some(IrohPeerUnavailable::ReconnectBackoff))));
+        drop(transport);
+        client.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -354,8 +419,13 @@ mod tests {
         let res = tokio::time::timeout(Duration::from_secs(8), t.send(b"x".to_vec(), Some(3_000)))
             .await
             .expect("send must complete (with an error) — wrong identity should reject, not hang");
-        assert!(res.is_err(), "dialing a server's address under a wrong EndpointId must fail");
+        let error = res.expect_err("dialing a server's address under a wrong EndpointId must fail");
+        assert!(!error.chain().any(|cause| cause.downcast_ref::<IrohPeerUnavailable>().is_some()),
+            "a peer-identity handshake rejection must not become retryable availability");
         assert!(t.state.lock().await.cached.is_none(), "a failed handshake caches nothing");
+        let backoff_error = t.send(b"x".to_vec(), Some(3_000)).await.expect_err("rejection backoff");
+        assert!(!backoff_error.chain().any(|cause| cause.downcast_ref::<IrohPeerUnavailable>().is_some()),
+            "backoff must retain the prior permanent failure classification");
 
         // As above, release the transport's endpoint clone before cleanly
         // draining every substrate owned by this test.

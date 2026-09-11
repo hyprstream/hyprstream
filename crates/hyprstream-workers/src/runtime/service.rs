@@ -77,6 +77,7 @@ use super::client::{
 // Domain entities (business logic)
 use super::container::Container;
 use super::pool::SandboxPool;
+use super::ExecMount;
 use super::sandbox::PodSandbox;
 use super::{RUNTIME_NAME, RUNTIME_VERSION};
 
@@ -91,6 +92,11 @@ pub struct WorkerService {
     // Business logic
     /// Sandbox pool for VM management
     sandbox_pool: Arc<SandboxPool>,
+
+    /// The single task-owned execution adapter. The CRI production caller and
+    /// the Plan 9 `/exec/instances/<id>/fd/{1,2}` view use this same owner, so
+    /// command execution is never duplicated into a private stream tree.
+    exec_mount: Arc<ExecMount>,
 
     /// Image store — the CRI image backend (`RafsStore` under `oci-image`,
     /// registered via inventory). `None` when no image backend is compiled in;
@@ -143,6 +149,7 @@ impl WorkerService {
         signing_key: SigningKey,
     ) -> AnyhowResult<Self> {
         let sandbox_pool = Arc::new(SandboxPool::new(pool_config, backend));
+        let exec_mount = Arc::new(ExecMount::new(Arc::clone(&sandbox_pool)));
 
         // Create event publisher for worker lifecycle events
         let event_publisher = EventPublisher::new("worker")?;
@@ -153,6 +160,7 @@ impl WorkerService {
         );
         Ok(Self {
             sandbox_pool,
+            exec_mount,
             image_store,
             containers: RwLock::new(HashMap::new()),
             container_sandbox_map: RwLock::new(HashMap::new()),
@@ -689,20 +697,16 @@ impl WorkerService {
     // Exec
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Execute a command in a container synchronously (host-level, limited support)
-    ///
-    /// **IMPORTANT**: In host-level mode without a guest agent, exec is not supported.
-    /// This returns an error explaining the limitation.
-    ///
-    /// For workloads that need exec:
-    /// - Use vsock with a minimal agent
-    /// - Pre-configure the VM image with the workload
-    /// - Use serial console (not recommended for production)
+    /// Execute a command in a container through the shared task-owned stdio
+    /// adapter. The caller is the verified RPC subject, never a request field;
+    /// `ExecMount` compares it with the subject bound when the sandbox was
+    /// admitted before invoking the backend.
     pub async fn exec_sync(
         &self,
+        caller: &hyprstream_vfs::Subject,
         container_id: &str,
         cmd: &[String],
-        _timeout: i64,
+        timeout: i64,
     ) -> Result<ExecSyncResult> {
         let containers = self.containers.read().await;
 
@@ -718,21 +722,28 @@ impl WorkerService {
             });
         }
 
-        // Host-level exec limitation:
-        // Without a guest agent, we cannot execute commands inside the VM.
-        // The VM is a black box from the host's perspective.
+        drop(containers);
 
-        tracing::warn!(
-            container_id = %container_id,
-            cmd = ?cmd,
-            "Exec not supported in host-level mode (no guest agent)"
-        );
+        let sandbox_id = self
+            .container_sandbox_map
+            .read()
+            .await
+            .get(container_id)
+            .cloned()
+            .ok_or_else(|| WorkerError::SandboxNotFound(container_id.to_owned()))?;
+        let timeout_secs = u64::try_from(timeout)
+            .map_err(|_| WorkerError::ExecFailed("exec timeout must be non-negative".to_owned()))?;
+        let result = self
+            .exec_mount
+            .exec_task(&sandbox_id, caller, cmd, timeout_secs)
+            .await
+            .map_err(|error| WorkerError::ExecFailed(error.to_string()))?;
 
-        // Return error indicating exec is not supported
-        Err(WorkerError::ExecFailed(
-            "exec not supported in host-level mode without guest agent. \
-             Configure VM image with workload or use vsock agent.".to_owned(),
-        ))
+        Ok(ExecSyncResult {
+            stdout: result.stdout,
+            stderr: result.stderr,
+            exit_code: result.exit_code,
+        })
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -939,6 +950,7 @@ impl WorkerService {
             qos: stream_ctx.qos().clone(),
             broadcast_path,
             announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
+            moql_server_identity: stream_ctx.moql_server_identity(),
             kem_ciphertexts: Vec::new(), // #554: classical FD stream (dh_public path), no hybrid KEM
         };
 
@@ -1319,8 +1331,8 @@ impl ContainerHandler for WorkerService {
         Ok(stats)
     }
 
-    async fn handle_exec(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &ExecSyncRequest) -> AnyhowResult<ExecSyncResult> {
-        let resp = self.exec_sync(&data.container_id, &data.cmd, data.timeout).await?;
+    async fn handle_exec(&self, ctx: &EnvelopeContext, _request_id: u64, data: &ExecSyncRequest) -> AnyhowResult<ExecSyncResult> {
+        let resp = self.exec_sync(&ctx.subject(), &data.container_id, &data.cmd, data.timeout).await?;
         Ok(resp)
     }
 
@@ -1428,6 +1440,16 @@ impl WorkerHandler for WorkerService {
 
 #[async_trait(?Send)]
 impl RequestService for WorkerService {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        // The ONE bounded decode (v16 §5.2): the generated decoder derives
+        // the full method leaf and returns the decoded message that policy,
+        // MAC, and dispatch below all consume.
+        crate::generated::worker_client::decode_worker_request_body(signed_body)
+    }
+
     fn producer_reach_config_handle(&self) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
         Some(self.stream_channel.reach_config_handle())
     }
@@ -1436,13 +1458,13 @@ impl RequestService for WorkerService {
         Some(self.stream_channel.moq_origin_handle())
     }
 
-    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
+    async fn handle_request(&self, ctx: &EnvelopeContext, body: &hyprstream_rpc::service::DecodedRequestBody,) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
         debug!(
             "Worker request from {} (request_id={})",
             ctx.subject(),
             ctx.request_id
         );
-        dispatch_worker(self, ctx, payload).await
+        dispatch_worker(self, ctx, body).await
     }
 
     fn name(&self) -> &str {

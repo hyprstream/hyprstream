@@ -16,7 +16,27 @@ use super::user_service::UserService;
 use crate::auth::user_store::UserStore;
 use crate::config::OAuthConfig;
 use crate::services::{DiscoveryClient, PolicyClient};
-use hyprstream_util::TtlCache;
+use hyprstream_util::{InsertIfAbsentNoEvictResult, TtlCache};
+
+use super::replay_key::ReplayKey;
+
+/// Result of attempting to admit a DPoP proof to its replay barrier.
+///
+/// The token endpoint needs this distinction so a saturated barrier remains
+/// separately metered and rate-limited instead of being logged as a replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DpopJtiAdmission {
+    Inserted,
+    Duplicate,
+    Full,
+    InvalidLifetime,
+}
+
+impl DpopJtiAdmission {
+    pub(crate) fn is_inserted(self) -> bool {
+        self == Self::Inserted
+    }
+}
 
 /// Read-only resolver used by the ATProto service-auth exchange perimeter.
 #[async_trait::async_trait]
@@ -274,7 +294,108 @@ mod tests {
             DiscoveryClient::new(make_client()),
             signing_key.verifying_key().to_bytes(),
         )
-        .with_user_store(store)
+        .with_user_store(crate::auth::ProductionUserStore::for_test(store))
+    }
+
+    fn state_for_replay_barrier_tests() -> OAuthState {
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x43; 32]);
+        let remote_key = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]).verifying_key();
+        let make_client = || {
+            Arc::new(
+                RpcClientImpl::new(
+                    LocalSigner::new(signing_key.clone()),
+                    LazyUdsTransport::new("/dev/null/replay-barrier-test.sock".into()),
+                    Some(remote_key),
+                )
+                .with_response_verify_policy(CryptoPolicy::Classical),
+            )
+        };
+        OAuthState::new(
+            &OAuthConfig::default(),
+            PolicyClient::new(make_client()),
+            DiscoveryClient::new(make_client()),
+            signing_key.verifying_key().to_bytes(),
+        )
+    }
+
+    #[test]
+    fn replay_callers_keep_seen_jtis_after_a_full_barrier() {
+        let mut state = state_for_replay_barrier_tests();
+        state.dpop_jti_seen = TtlCache::new(2, 16);
+        let now = chrono::Utc::now().timestamp();
+
+        assert_eq!(
+            state.check_and_record_dpop_jti_admission("dpop-first", now),
+            DpopJtiAdmission::Inserted
+        );
+        assert_eq!(
+            state.check_and_record_dpop_jti_admission("dpop-second", now),
+            DpopJtiAdmission::Inserted
+        );
+        assert_eq!(
+            state.check_and_record_dpop_jti_admission("dpop-fresh-when-full", now),
+            DpopJtiAdmission::Full,
+            "a fresh DPoP JTI must be refused once the barrier is full"
+        );
+        assert_eq!(
+            state.check_and_record_dpop_jti_admission("dpop-first", now),
+            DpopJtiAdmission::Duplicate,
+            "a full barrier must not evict an earlier DPoP JTI"
+        );
+
+        state.assertion_jti_seen = TtlCache::new(2, 16);
+        let exp = now + 60;
+        assert!(state.check_and_record_assertion_jti("client", "assertion-first", exp));
+        assert!(state.check_and_record_assertion_jti("client", "assertion-second", exp));
+        assert!(
+            !state.check_and_record_assertion_jti("client", "assertion-fresh-when-full", exp),
+            "a fresh client assertion JTI must be refused once the barrier is full"
+        );
+        assert!(
+            !state.check_and_record_assertion_jti("client", "assertion-first", exp),
+            "a full barrier must not evict an earlier client assertion JTI"
+        );
+    }
+
+    #[test]
+    fn replay_caps_cover_maximum_admitted_future_skew() {
+        assert_eq!(OAuthState::DPOP_JTI_MAX_ENTRIES, 216_000);
+        assert_eq!(OAuthState::ASSERTION_JTI_MAX_ENTRIES, 43_200);
+
+        let state = state_for_replay_barrier_tests();
+        let now = chrono::Utc::now().timestamp();
+        assert!(state.check_and_record_dpop_jti("dpop-future-skew", now + 60));
+        assert!(state.check_and_record_assertion_jti(
+            "client",
+            "assertion-future-skew",
+            now + 360
+        ));
+    }
+
+    #[test]
+    fn extreme_replay_expirations_are_rejected_without_consuming_capacity() {
+        let mut state = state_for_replay_barrier_tests();
+        state.assertion_jti_seen = TtlCache::new(1, 16);
+        assert!(!state.check_and_record_assertion_jti("client", "min", i64::MIN));
+        assert!(!state.check_and_record_assertion_jti("client", "max", i64::MAX));
+        assert!(state.check_and_record_assertion_jti(
+            "client",
+            "ordinary",
+            chrono::Utc::now().timestamp() + 60
+        ));
+
+        state.atproto_service_jti_seen = TtlCache::new(1, 16);
+        assert!(!state.check_and_record_atproto_service_jti("did:plc:test", "min", i64::MIN));
+        assert!(!state.check_and_record_atproto_service_jti("did:plc:test", "max", i64::MAX));
+        assert!(state.check_and_record_atproto_service_jti(
+            "did:plc:test",
+            "ordinary",
+            chrono::Utc::now().timestamp() + 60
+        ));
     }
 
     struct KeyReadErrorStore {
@@ -915,6 +1036,13 @@ pub struct RefreshTokenEntry {
     /// keeps the generic OAuth 2.1 rotation path unchanged.
     #[serde(default)]
     pub ucan_grant: Option<UcanGrantRefresh>,
+    /// OIDC session ID (`sid`) of the interactive session this refresh token
+    /// belongs to. The same session spans every rotation (distinct credential
+    /// IDs, one stable sid — v16 §3.3); the refresh path checks it against
+    /// the session authority before consuming the single-use token, so a
+    /// revoked session cannot refresh. `None` only on pre-session records.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Re-evaluation context persisted alongside a UCAN-grant refresh token so the
@@ -1058,16 +1186,18 @@ pub struct OAuthState {
     pub rsa_kid: Option<String>,
     /// Seen DPoP JTIs for replay prevention (RFC 9449 §11.1). Backed by
     /// the shared `TtlCache` with atomic check-and-record — see
-    /// `check_and_record_dpop_jti`. TTL = iat + 120s per entry.
-    pub dpop_jti_seen: TtlCache<String, ()>,
+    /// `check_and_record_dpop_jti`. A BLAKE3-256 digest retains a fixed-size
+    /// key; TTL = iat + 120s per entry.
+    pub dpop_jti_seen: TtlCache<ReplayKey, ()>,
     /// Seen client-assertion JTIs for replay prevention (RFC 7523 §3 /
-    /// atproto OAuth; #1146 T3.3). Keyed `{client_id}\u{1f}{jti}`; TTL =
-    /// the assertion's remaining `exp` lifetime. See
+    /// atproto OAuth; #1146 T3.3). Keyed by a BLAKE3-256 digest of
+    /// `{client_id}\u{1f}{jti}`; TTL = the assertion's remaining `exp`
+    /// lifetime. See
     /// `check_and_record_assertion_jti`.
-    pub assertion_jti_seen: TtlCache<String, ()>,
-    /// One-use ATProto service-auth JTIs, namespaced by issuer and retained
-    /// until the source assertion expires.
-    pub atproto_service_jti_seen: TtlCache<String, ()>,
+    pub assertion_jti_seen: TtlCache<ReplayKey, ()>,
+    /// One-use ATProto service-auth JTIs, keyed by a BLAKE3-256 digest of the
+    /// issuer/JTI composite and retained until the source assertion expires.
+    pub atproto_service_jti_seen: TtlCache<ReplayKey, ()>,
     /// Validated did:plc/did:web document source for service-auth keys.
     pub atproto_did_resolver: Arc<dyn AtprotoDidDocumentResolver>,
     /// Server-issued DPoP nonces. Value = expiry unix timestamp.
@@ -1095,7 +1225,6 @@ pub struct OAuthState {
     /// When present, JWKS serves all slots and issuance uses the active key.
     pub signing_key_store: Option<Arc<crate::auth::SigningKeyStore>>,
     /// Shared JWT ID blocklist for access token revocation (shared with PolicyService).
-    pub jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
     /// ES256 (P-256) signing key rotation store for JWKS and DPoP/atproto interop.
     pub es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 signing key rotation store for PQ-hybrid JWT issuance.
@@ -1169,14 +1298,18 @@ fn mesh_kem_public_for_policy(
 }
 
 impl OAuthState {
-    /// DPoP jti replay-dedup cache: capacity bound (memory ceiling for the
-    /// `TtlCache<String, ()>`). 120s TTL per entry.
-    const DPOP_JTI_MAX_ENTRIES: usize = 10_000;
+    const MAX_CLIENT_ASSERTION_REPLAY_SECS: i64 = 360;
+    const MAX_ATPROTO_SERVICE_ASSERTION_REPLAY_SECS: i64 = 3_600;
+    /// DPoP admits iat up to 60 seconds in the future and retains through
+    /// iat + 120 seconds: 180 seconds at 1,000 proofs/s plus 20% headroom.
+    /// Fixed BLAKE3-256 digest keys plan 216,000 entries at about 26.4 MiB.
+    const DPOP_JTI_MAX_ENTRIES: usize = 216_000;
     /// Inline reap budget per access (heap pops). Bounds tail latency.
     const DPOP_JTI_REAP_BUDGET: usize = 64;
-    /// Client-assertion jti replay-dedup cache: same bounds as the DPoP
-    /// registry; per-entry TTL is the assertion's remaining lifetime.
-    const ASSERTION_JTI_MAX_ENTRIES: usize = 10_000;
+    /// Client assertions admit iat up to 60 seconds future and live for at
+    /// most 300 seconds from iat: 360 seconds at 100/s plus 20% headroom.
+    /// Fixed digest keys plan 43,200 entries at about 5.3 MiB.
+    const ASSERTION_JTI_MAX_ENTRIES: usize = 43_200;
     /// Inline reap budget per access (heap pops). Bounds tail latency.
     const ASSERTION_JTI_REAP_BUDGET: usize = 64;
 
@@ -1236,7 +1369,16 @@ impl OAuthState {
                 Self::ASSERTION_JTI_REAP_BUDGET,
             ),
             atproto_service_jti_seen: TtlCache::new(
-                Self::ASSERTION_JTI_MAX_ENTRIES,
+                // ATProto service assertions can live for one hour. This is a
+                // 64 MiB per-barrier memory budget, not an unsupported
+                // traffic estimate. The fixed digest cache uses 120 bytes per
+                // live entry on 64-bit targets (64-byte map allocation at its
+                // 7/8 load factor + 56-byte heap node), rounded to 128 bytes
+                // for planning. At this cap its geometric map and heap arrays
+                // each top out at 524,288 slots: roughly 56.5 MiB including
+                // HashMap control bytes, below the 64 MiB budget. Full barriers
+                // fail closed and are metered.
+                432_000,
                 Self::ASSERTION_JTI_REAP_BUDGET,
             ),
             atproto_did_resolver: atproto_did_resolver(config),
@@ -1248,7 +1390,6 @@ impl OAuthState {
             jwt_key_nbf: chrono::Utc::now().timestamp(),
             jwt_key_exp: chrono::Utc::now().timestamp() + 14 * 86400,
             signing_key_store: None,
-            jti_blocklist: None,
             es256_key_store: None,
             ml_dsa_key_store: None,
             audit_sink: None,
@@ -1399,19 +1540,6 @@ impl OAuthState {
         self
     }
 
-    /// Attach the shared JWT ID blocklist (shared with PolicyService).
-    ///
-    /// When set, `POST /oauth/revoke` on access tokens writes the JTI into
-    /// this blocklist so the PolicyService RPC enforcement path also rejects
-    /// revoked tokens — closing the gap between HTTP revocation and RPC auth.
-    pub fn with_jti_blocklist(
-        mut self,
-        bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
-    ) -> Self {
-        self.jti_blocklist = Some(bl);
-        self
-    }
-
     /// Return the verifying key to use for JWT bearer token validation.
     ///
     /// Prefers the active slot from the signing key store; falls back to the
@@ -1447,9 +1575,9 @@ impl OAuthState {
         self.signing_key.clone().map(Arc::new)
     }
 
-    /// Attach a user credential store. Creates a `UserService` backed by the store
-    /// for SCIM/RPC access and legacy OAuth handler reads.
-    pub fn with_user_store(mut self, store: Arc<dyn UserStore>) -> Self {
+    /// Attach an account store admitted by the sole production construction
+    /// boundary.
+    pub fn with_user_store(mut self, store: crate::auth::ProductionUserStore) -> Self {
         self.user_service = Some(Arc::new(UserService::new(store)));
         self
     }
@@ -1462,14 +1590,15 @@ impl OAuthState {
 
     /// Attach a pre-built `UserService`. Used when the service is constructed externally
     /// (e.g., for testing or when the store is shared across services).
-    pub fn with_user_service(mut self, service: Arc<UserService>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_user_service(mut self, service: Arc<UserService>) -> Self {
         self.user_service = Some(service);
         self
     }
 
     /// Get read access to the user store via the UserService.
     /// Returns None if no user store is configured.
-    pub fn user_store_reader(&self) -> Option<Arc<dyn UserStore>> {
+    pub(crate) fn user_store_reader(&self) -> Option<Arc<dyn UserStore>> {
         self.user_service.as_ref().map(|s| s.store())
     }
 
@@ -1569,28 +1698,79 @@ impl OAuthState {
     /// Check a DPoP JTI for replay and record it if new.
     ///
     /// Returns `true` when the JTI is fresh (caller should proceed).
-    /// Returns `false` when the JTI has been seen within its validity window (replay).
+    /// Returns `false` when the JTI is a replay or the fail-closed barrier is full.
     /// Expired entries are pruned opportunistically on each call.
     pub fn check_and_record_dpop_jti(&self, jti: &str, iat: i64) -> bool {
+        self.check_and_record_dpop_jti_admission(jti, iat)
+            .is_inserted()
+    }
+
+    /// Check a DPoP JTI while retaining the fail-closed admission outcome for
+    /// callers that must distinguish an actual replay from a full barrier.
+    pub(crate) fn check_and_record_dpop_jti_admission(
+        &self,
+        jti: &str,
+        iat: i64,
+    ) -> DpopJtiAdmission {
         let now = chrono::Utc::now().timestamp();
         // Window ends at iat + 120s (±60s skew + 60s buffer); TTL = remainder.
-        let ttl_secs = ((iat + 120) - now).max(0) as u64;
-        self.dpop_jti_seen
-            .insert_if_absent(jti.to_owned(), (), Duration::from_secs(ttl_secs))
+        let Some(ttl_secs) = iat
+            .checked_add(120)
+            .and_then(|deadline| deadline.checked_sub(now))
+            .filter(|remaining| *remaining > 0 && *remaining <= 180)
+            .and_then(|remaining| u64::try_from(remaining).ok())
+        else {
+            return DpopJtiAdmission::InvalidLifetime;
+        };
+        let result = self.dpop_jti_seen.insert_if_absent_no_evict(
+            super::replay_key::dpop_jti(jti),
+            (),
+            Duration::from_secs(ttl_secs),
+        );
+        if result != InsertIfAbsentNoEvictResult::Inserted {
+            super::replay_metrics::record_rejection(super::replay_metrics::DPOP, result);
+            if super::replay_metrics::should_warn_full(super::replay_metrics::DPOP, result) {
+                tracing::warn!("DPoP replay barrier is full; refusing fresh proof");
+            }
+        }
+        match result {
+            InsertIfAbsentNoEvictResult::Inserted => DpopJtiAdmission::Inserted,
+            InsertIfAbsentNoEvictResult::Duplicate => DpopJtiAdmission::Duplicate,
+            InsertIfAbsentNoEvictResult::Full => DpopJtiAdmission::Full,
+        }
     }
 
     /// Atomically consume an ATProto service-auth assertion identifier.
     pub fn check_and_record_atproto_service_jti(&self, issuer: &str, jti: &str, exp: i64) -> bool {
-        let remaining = exp - chrono::Utc::now().timestamp();
-        if remaining <= 0 {
+        let Some(ttl_secs) = exp
+            .checked_sub(chrono::Utc::now().timestamp())
+            .filter(|remaining| {
+                *remaining > 0 && *remaining <= Self::MAX_ATPROTO_SERVICE_ASSERTION_REPLAY_SECS
+            })
+            .and_then(|remaining| u64::try_from(remaining).ok())
+        else {
             return false;
-        }
-        let ttl_secs = remaining as u64;
-        self.atproto_service_jti_seen.insert_if_absent_no_evict(
-            format!("{issuer}\u{1f}{jti}"),
+        };
+        let result = self.atproto_service_jti_seen.insert_if_absent_no_evict(
+            super::replay_key::atproto_service_assertion_jti(issuer, jti),
             (),
             Duration::from_secs(ttl_secs),
-        )
+        );
+        if result != InsertIfAbsentNoEvictResult::Inserted {
+            super::replay_metrics::record_rejection(
+                super::replay_metrics::ATPROTO_SERVICE_ASSERTION,
+                result,
+            );
+            if super::replay_metrics::should_warn_full(
+                super::replay_metrics::ATPROTO_SERVICE_ASSERTION,
+                result,
+            ) {
+                tracing::warn!(
+                    "ATProto service-assertion replay barrier is full; refusing fresh assertion"
+                );
+            }
+        }
+        result == InsertIfAbsentNoEvictResult::Inserted
     }
 
     /// Check a client-assertion JTI for replay and record it if new
@@ -1603,15 +1783,36 @@ impl OAuthState {
     /// rejected as expired anyway.
     ///
     /// Returns `true` when the JTI is fresh (caller should proceed);
-    /// `false` when it was seen within its validity window (replay).
+    /// `false` when it is a replay or the fail-closed barrier is full.
     pub fn check_and_record_assertion_jti(&self, client_id: &str, jti: &str, exp: i64) -> bool {
         let now = chrono::Utc::now().timestamp();
-        let ttl_secs = (exp - now).max(0) as u64;
-        self.assertion_jti_seen.insert_if_absent(
-            format!("{client_id}\u{1f}{jti}"),
+        let Some(ttl_secs) = exp
+            .checked_sub(now)
+            .filter(|remaining| {
+                *remaining > 0 && *remaining <= Self::MAX_CLIENT_ASSERTION_REPLAY_SECS
+            })
+            .and_then(|remaining| u64::try_from(remaining).ok())
+        else {
+            return false;
+        };
+        let result = self.assertion_jti_seen.insert_if_absent_no_evict(
+            super::replay_key::client_assertion_jti(client_id, jti),
             (),
             Duration::from_secs(ttl_secs),
-        )
+        );
+        if result != InsertIfAbsentNoEvictResult::Inserted {
+            super::replay_metrics::record_rejection(
+                super::replay_metrics::CLIENT_ASSERTION,
+                result,
+            );
+            if super::replay_metrics::should_warn_full(
+                super::replay_metrics::CLIENT_ASSERTION,
+                result,
+            ) {
+                tracing::warn!("client-assertion replay barrier is full; refusing fresh assertion");
+            }
+        }
+        result == InsertIfAbsentNoEvictResult::Inserted
     }
 
     /// Issue a fresh server-side DPoP nonce (RFC 9449 §8).
@@ -1795,7 +1996,7 @@ impl OAuthState {
                 // Sweep expired DPoP JTIs and nonces
                 {
                     let now = chrono::Utc::now().timestamp();
-                    // dpop_jti_seen is a TtlCache (self-evicting); sweep the
+                    // dpop_jti_seen reaps expired entries on access; sweep the
                     // nonce + client-dedup maps only.
                     state.dpop_nonces.write().await.retain(|_, exp| *exp > now);
                     state

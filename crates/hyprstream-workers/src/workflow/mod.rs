@@ -35,7 +35,7 @@ pub mod adapter;
 pub mod gh_adapter;
 
 pub use service::WorkflowService;
-pub use parser::{Workflow, Job, JobResources, Step};
+pub use parser::{ParseMode, Workflow, Job, JobResources, Step};
 pub use triggers::{EventTrigger, EventHandler, HandlerResult};
 pub use subscription::WorkflowSubscription;
 pub use runner::WorkflowRunner;

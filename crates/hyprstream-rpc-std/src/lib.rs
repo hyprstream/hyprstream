@@ -4,7 +4,7 @@
 //! generated client types for all standard hyprstream services (model,
 //! registry, inference, policy, mcp, etc.).
 //!
-//! MIT licensed. Depends only on hyprstream-rpc (also MIT).
+//! Apache-2.0 licensed. Depends only on hyprstream-rpc (also Apache-2.0).
 //! Compiles to native and wasm32.
 
 #![allow(dead_code, unused_imports)]
@@ -158,6 +158,8 @@ pub mod stream_mount;
 pub mod wasm_exports;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_rpc_client;
+#[cfg(target_arch = "wasm32")]
+pub mod browser_session;
 // Pure framing/reach-parsing for the moq worker — host-testable (not wasm-gated).
 pub mod moq_frame;
 #[cfg(target_arch = "wasm32")]

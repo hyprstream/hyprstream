@@ -7,6 +7,9 @@
 
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
+using import "/annotations.capnp".dispatchMac;
+using import "/annotations.capnp".mutationSemantics;
+using import "/annotations.capnp".dispatchPublic;
 using import "/annotations.capnp".scopeExempt;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
@@ -22,76 +25,127 @@ struct PolicyRequest {
     # Authorization check
     # Intentionally unscoped — authorization check cannot require authorization (circular dependency)
     check @1 :PolicyCheck
-      $scopeExempt("the authz check itself cannot require authz — circular dependency");
+      $scopeExempt("the authz check itself cannot require authz — circular dependency")
+      $dispatchPublic("the authz check itself cannot require authz without circularity; it is the one leaf dispatched unauthenticated");
 
     # JWT token issuance
-    issueToken @2 :IssueToken $scope(manage);
+    issueToken @2 :IssueToken $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
 
     # List all supported authorization scopes discovered from service schemas
-    listScopes @3 :Void $scope(query) $mcpDescription("List all supported authorization scopes discovered from service schemas");
+    listScopes @3 :Void $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("List all supported authorization scopes discovered from service schemas");
 
     # Get current policy rules and role assignments
-    getPolicy @4 :Void $scope(query) $mcpDescription("Get current policy rules and role assignments");
+    getPolicy @4 :Void $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Get current policy rules and role assignments");
 
     # Apply a built-in template (overwrites policy.csv)
-    applyTemplate @5 :ApplyTemplate $scope(manage) $mcpDescription("Apply a built-in policy template");
+    applyTemplate @5 :ApplyTemplate $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Apply a built-in policy template");
 
     # Commit draft changes (uncommitted policy.csv edits)
-    applyDraft @6 :ApplyDraft $scope(manage) $mcpDescription("Commit draft policy changes");
+    applyDraft @6 :ApplyDraft $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Commit draft policy changes");
 
     # Rollback to a previous policy version
-    rollback @7 :RollbackPolicy $scope(manage) $mcpDescription("Rollback to a previous policy version");
+    rollback @7 :RollbackPolicy $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Rollback to a previous policy version");
 
     # Get policy commit history
-    getHistory @8 :GetHistory $scope(query) $mcpDescription("Get policy commit history");
+    getHistory @8 :GetHistory $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Get policy commit history");
 
     # Get diff of uncommitted policy changes vs a ref (default HEAD)
-    getDiff @9 :GetDiff $scope(query) $mcpDescription("Get diff of uncommitted policy changes");
+    getDiff @9 :GetDiff $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Get diff of uncommitted policy changes");
 
     # Check if there are uncommitted policy changes
-    getDraftStatus @10 :Void $scope(query) $mcpDescription("Check if there are uncommitted policy changes");
+    getDraftStatus @10 :Void $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Check if there are uncommitted policy changes");
 
     # Assign a role to a user
-    addGrouping @11 :AddGrouping $scope(manage) $mcpDescription("Assign a role to a user");
+    addGrouping @11 :AddGrouping $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Assign a role to a user");
 
     # Remove a role from a user
-    removeGrouping @12 :RemoveGrouping $scope(manage) $mcpDescription("Remove a role from a user");
+    removeGrouping @12 :RemoveGrouping $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Remove a role from a user");
 
     # Set a model branch as public or private
-    setBranchVisibility @13 :SetBranchVisibility $scope(manage) $mcpDescription("Set a model branch as public or private");
+    setBranchVisibility @13 :SetBranchVisibility $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Set a model branch as public or private");
 
     # Register an event prefix for publishing
-    registerEventPrefix @14 :RegisterEventPrefix $scope(manage) $mcpDescription("Register an event prefix for publishing");
+    registerEventPrefix @14 :RegisterEventPrefix $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Register an event prefix for publishing");
 
     # Subscribe to an event prefix
-    subscribeEventPrefix @15 :SubscribeEventPrefix $scope(manage) $mcpDescription("Subscribe to an event prefix");
+    subscribeEventPrefix @15 :SubscribeEventPrefix $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Subscribe to an event prefix");
 
     # Get pending subscribers for a prefix
-    getPendingSubscribers @16 :GetPendingSubscribers $scope(query) $mcpDescription("Get pending subscribers for a prefix");
+    getPendingSubscribers @16 :GetPendingSubscribers $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Get pending subscribers for a prefix");
 
     # Deposit wrapped keys for subscribers
-    depositWrappedKeys @17 :DepositWrappedKeys $scope(manage) $mcpDescription("Deposit wrapped keys for subscribers");
+    depositWrappedKeys @17 :DepositWrappedKeys $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Deposit wrapped keys for subscribers");
 
     # Resolve a service name to its Ed25519 verifying key
-    resolveServiceKey @18 :ResolveServiceKey $scope(query) $mcpDescription("Resolve a service name to its Ed25519 verifying key");
+    resolveServiceKey @18 :ResolveServiceKey $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Resolve a service name to its Ed25519 verifying key");
 
     # Register a service's verifying key with the CA
     # Internal CA operation — any caller with a valid CA-signed JWT can register.
     # No authorization scope required; the JWT itself proves CA attestation.
     registerServiceKey @19 :RegisterServiceKey
       $scopeExempt("gated by CA-signed JWT attestation, not by a scope")
+      $mutationSemantics("naturally-idempotent")
+      $dispatchMac("internal:pq-hybrid")
       $mcpDescription("Register a service verifying key with the CA");
 
     # Renew the caller's service JWT. Identity is taken from the signed envelope —
     # no explicit subject field; the CA signs a fresh 30-day JWT for the caller.
     refreshServiceToken @20 :RefreshServiceTokenRequest
-      $scope(manage) $mcpDescription("Renew the caller's service JWT; identity from signed envelope");
+      $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Renew the caller's service JWT; identity from signed envelope");
 
     # Exchange the caller's envelope WIT for an OAuth at+jwt.
     # Identity and cnf.jwk are read from the verified envelope — no credential submission.
     # Requires 'exchange' permission on 'policy:exchange-wit' in Casbin policy.
     exchangeWit @21 :ExchangeWit
-      $scope(manage) $mcpDescription("Exchange the caller's envelope WIT for an OAuth at+jwt; identity from signed envelope");
+      $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid") $mcpDescription("Exchange the caller's envelope WIT for an OAuth at+jwt; identity from signed envelope");
+
+    # Bounded vector of the same envelope-authenticated checks (maximum 256).
+    checkBatch @22 :PolicyCheckBatch
+      $scopeExempt("the authz check itself cannot require authz — circular dependency")
+      $dispatchPublic("the authz check itself cannot require authz without circularity; it is the one leaf dispatched unauthenticated");
+
+    # Publish a credential revocation to the canonical store owned by this service.
+    # Restricted to the OAuth revocation authority (service:oauth) by Casbin —
+    # the RFC 7009 endpoint is the only legitimate publisher.
+    revokeCredential @23 :RevokeCredential
+      $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid");
+
+    # Ask the revocation authority whether a credential has been revoked.
+    # Service-identities only (service:*): every enrolled service process
+    # checks revocations on its verification path and probes at startup;
+    # anonymous/end-user callers have no legitimate read.
+    checkCredentialRevocation @24 :CheckCredentialRevocation
+      $scope(query) $dispatchMac("internal:pq-hybrid");
+
+    # Register a new session with the canonical session registry. Restricted
+    # to the OAuth authority (service:oauth), which owns user-session
+    # lifecycle at issuance. Session identifiers are never reassigned.
+    registerSession @25 :RegisterSession
+      $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid");
+
+    # Revoke a session: every credential carrying it is then rejected.
+    # Restricted to the OAuth authority (service:oauth).
+    revokeSession @26 :RevokeSession
+      $scope(manage) $mutationSemantics("naturally-idempotent") $dispatchMac("internal:pq-hybrid");
+
+    # Ask the session authority whether a session is active.
+    # Service-identities only (service:*); the result Bool is true = ACTIVE
+    # and known — revoked, expired, unknown, or malformed all read false
+    # (fail-closed; note the opposite polarity from
+    # checkCredentialRevocationResult, which reports revoked=true).
+    checkSession @27 :CheckSession
+      $scope(query) $dispatchMac("internal:pq-hybrid");
+
+    # RFC 8693 §4 on-behalf-of delegated mint (v16 §8.1 AsOriginator). The
+    # AUTHENTICATED RPC caller is the terminal actor: the authority derives the
+    # actor subject and cnf from the verified envelope — never from a request
+    # field — verifies the presented originator source credential, and mints a
+    # NEW delegated credential (fresh jti, originator `sub`, nested terminal
+    # `act`, terminal-actor `cnf`, fail-closed `meet(originator, every actor)`
+    # clearance, attenuated scope, conditional `sid`). Reusable (no
+    # consume-once). WS-E calls this for a derived AsOriginator dispatch.
+    exchangeDelegated @28 :ExchangeDelegated
+      $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
   }
 }
 
@@ -108,6 +162,24 @@ struct PolicyCheck {
 
   # Operation being performed (e.g., "infer", "query", "write")
   operation @3 :Text;
+}
+
+struct PolicyCheckBatch {
+  checks @0 :List(PolicyCheck);
+}
+
+struct PolicyCheckBatchResult {
+  allowed @0 :List(Bool);
+}
+
+# Issuance profile selected by the authority-owned caller. The default is the
+# session-bound interactive profile so an older or malformed caller cannot turn
+# a missing profile into an unsessioned user credential.
+enum IssueTokenProfile {
+  interactiveSession @0;
+  rfc8693 @1;
+  rfc7523 @2;
+  service @3;
 }
 
 # JWT token issuance parameters
@@ -150,6 +222,25 @@ struct IssueToken {
   # clearance for the subject before minting. The resolved clearance is
   # clamped to Classical assurance and stamped into the signed claims.
   requireClearance @8 :Bool;
+
+  # OIDC session ID (`sid` claim) to stamp on the minted token. Set by the
+  # OAuth authority for interactive user sessions only; the caller owns the
+  # session lifecycle (registration is a separate authority operation —
+  # issuance never registers). Empty/absent = no session (standalone service
+  # credentials carry no session — v16 §3.3).
+  sessionId @9 :Text $optional;
+
+  # Credential issuance profile. Interactive user/OIDC issuance MUST carry
+  # `sessionId`; RFC 8693 and RFC 7523 are deliberate non-interactive
+  # profiles; service issuance is limited to `service:*` subjects.
+  issuanceProfile @10 :IssueTokenProfile;
+
+  # RFC 9068 §2.2.1 `client_id`: the OAuth client the access token is issued to.
+  # REQUIRED (non-empty) for the user `at+jwt` profiles (interactive/RFC 8693/
+  # RFC 7523); the authority stamps it into the signed `client_id` claim. The
+  # service profile mints a `wit+jwt` and carries no `client_id`. Empty/absent =
+  # not supplied.
+  clientId @11 :Text $optional;
 }
 
 # Apply a built-in policy template
@@ -256,6 +347,27 @@ struct PolicyResponse {
 
     # at+jwt from exchangeWit
     exchangeWitResult @22 :TokenInfo;
+
+    checkBatchResult @23 :PolicyCheckBatchResult;
+
+    # Revocation publication acknowledged (durable)
+    revokeCredentialResult @24 :Void;
+
+    # Revocation check result (true = revoked or unknown — fail-closed)
+    checkCredentialRevocationResult @25 :Bool;
+
+    # Session registration acknowledged (durable)
+    registerSessionResult @26 :Void;
+
+    # Session revocation acknowledged (durable)
+    revokeSessionResult @27 :Void;
+
+    # Session check result (true = ACTIVE and known; false = revoked,
+    # expired, unknown, or malformed — fail-closed)
+    checkSessionResult @28 :Bool;
+
+    # Minted delegated at+jwt/wit from exchangeDelegated (fresh jti).
+    exchangeDelegatedResult @29 :TokenInfo;
   }
 }
 
@@ -429,4 +541,122 @@ struct ExchangeWit {
 
   # TTL override in seconds. Server clamps to configured [min, max].
   ttl @2 :Opt.OptionUint32;
+}
+
+# RFC 8693 §4 delegated on-behalf-of mint (v16 §8.1 AsOriginator).
+#
+# The terminal actor is NEVER a field here: it is the authenticated RPC caller,
+# derived from the verified policy envelope (subject + cnf), so E cannot supply
+# an arbitrary actor identity, clearance, or key. Only the ORIGINATOR authority
+# (the presented source credential) and the requested attenuation subset cross
+# the wire. The authority derives originator/session/scope/clearance from the
+# verified source credential and actor/cnf/tenant from the verified envelope,
+# computes the fail-closed meet, and mints a fresh delegated credential.
+struct ExchangeDelegated {
+  # The originator's already-issued source credential (at+jwt / wit+jwt) whose
+  # authority is being delegated. The authority verifies its signature, expiry,
+  # revocation, and issuer/tenant/subject coherence — it is never trusted as
+  # plaintext. `sub` becomes the delegated credential's originator.
+  sourceCredential @0 :Text;
+
+  # The derived-call OAuth scope subset (space-delimited). v16 §8.1 requires
+  # EXPLICIT attenuation at every hop: a scope-bearing source requires an
+  # explicit non-empty subset here (equality is allowed only when explicitly
+  # requested) — an empty/absent value against a scope-bearing source DENIES (no
+  # silent full inheritance). A source with no scope grants none: any requested
+  # scope denies. Every requested scope MUST be held by the source; broadening
+  # is rejected.
+  requestedScopes @1 :Text $optional;
+
+  # The derived-call MAC/UCAN capability subset (`ability@resource` tokens,
+  # space-delimited). v16 derived authority is BOTH OAuth scope AND capability;
+  # this attenuates the capability axis via the reviewed `Capability` cover
+  # relation. Same explicit-attenuation rule as requestedScopes: a cap-bearing
+  # source requires an explicit non-empty subset (equality allowed only if
+  # explicitly requested); empty/absent against a cap-bearing source DENIES; a
+  # source with no `cap` grants none. Any capability not covered by the source
+  # is rejected as broadening.
+  requestedCapabilities @4 :Text $optional;
+
+  # RFC 8707 resource indicator for the derived call's target. REQUIRED and
+  # non-empty: the authority binds it to the reviewed derived-call contract via
+  # the fail-closed DelegationEdgeAuthorizer, never an arbitrary string, and
+  # never defaulted to the issuer.
+  audience @2 :Text $optional;
+
+  # The generated method identifier of the derived call (e.g. "model.Infer").
+  # REQUIRED and non-empty: the authority passes it to the
+  # DelegationEdgeAuthorizer so the exact reviewed DispatchCallManifest method
+  # edge is enforced. It is a request descriptor of the outbound call, not an
+  # identity or clearance; an absent/empty value denies (no wildcard).
+  targetMethodId @5 :Text $optional;
+
+  # TTL override in seconds. Clamped to the configured [min, max] AND never
+  # beyond the source credential's own remaining lifetime, the terminal actor's
+  # authority, or a retained session bound.
+  ttl @3 :Opt.OptionUint32;
+}
+
+# Issuer-scoped credential identifier (iss, jti/cti). JWT jti text and CWT cti
+# bytes are disjoint typed namespaces — mirrors the verifier-side
+# CredentialValue type; a CWT cti is never stringified into the JWT namespace.
+struct CredentialIdRef {
+  # The token `iss` claim identifying the credential issuer.
+  issuer @0 :Text;
+  union {
+    # JWT `jti` claim (RFC 7519) — case-sensitive text.
+    jwtJti @1 :Text;
+    # CWT `cti` claim (RFC 8392) — raw bytes.
+    cwtCti @2 :Data;
+  }
+}
+
+# Publish a credential revocation. The entry may be garbage-collected once
+# `expiresAt` passes (natural token expiry rejects it anyway).
+struct RevokeCredential {
+  credential @0 :CredentialIdRef;
+  # The token's `exp` (Unix seconds) — GC hint for the durable store.
+  expiresAt @1 :Int64;
+}
+
+# Query the revocation authority for a credential's revocation state.
+struct CheckCredentialRevocation {
+  credential @0 :CredentialIdRef;
+}
+
+# Issuer-scoped session identifier (iss, sid/workload_session_id). The two
+# variants are disjoint typed namespaces — mirrors SessionIdentifier.
+struct SessionKeyRef {
+  # The token `iss` claim identifying the session's issuer.
+  issuer @0 :Text;
+  union {
+    # OIDC user-session ID (the registered `sid` claim).
+    oidcSid @1 :Text;
+    # Workload credential family session ID.
+    workloadSessionId @2 :Text;
+  }
+}
+
+# Register a new session. `expiresAt` bounds the session's lifetime (checked
+# against the authority's configured horizon, same as revocation entries).
+struct RegisterSession {
+  session @0 :SessionKeyRef;
+  # Subject identifier (`sub`) the session belongs to.
+  subject @1 :Text;
+  # Verified tenant/domain the session is bound to.
+  tenant @2 :Text;
+  # Session expiry (Unix seconds).
+  expiresAt @3 :Int64;
+  # Clearance epoch at registration.
+  clearanceEpoch @4 :UInt64;
+}
+
+# Revoke a session: every credential carrying it is then rejected.
+struct RevokeSession {
+  session @0 :SessionKeyRef;
+}
+
+# Query the session authority for a session's active state.
+struct CheckSession {
+  session @0 :SessionKeyRef;
 }

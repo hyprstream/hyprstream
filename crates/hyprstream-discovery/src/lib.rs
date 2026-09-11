@@ -53,6 +53,11 @@ pub mod generated {
 }
 
 mod service;
+mod state_store;
+pub use state_store::{
+    DiscoveryState, DiscoveryStateBackend, DiscoveryStateConfig, MemoryStateConfig,
+    TieredStateConfig, ValkeyStateConfig,
+};
 #[cfg(not(target_arch = "wasm32"))]
 mod checkpointed_pds;
 
@@ -62,6 +67,14 @@ mod checkpointed_pds;
 pub fn initialize_deployment_checkpoint_store() -> anyhow::Result<()> {
     checkpointed_pds::initialize_deployment_store()
 }
+
+/// The first-boot provisioning marker RocksDB key, written by
+/// [`initialize_deployment_checkpoint_store`] and deleted by the registry in
+/// the same `WriteBatch` as its first accepted-state commit. Re-exported so
+/// the app crate's QUIC startup gate and registry writer can share the exact
+/// key.
+#[cfg(not(target_arch = "wasm32"))]
+pub use checkpointed_pds::FIRST_BOOT_KEY;
 
 /// #893 (at9p D1) — `did:at9p` capsule resolver: turns a GATE-verified capsule
 /// into a dialable `TransportConfig::iroh` (sibling to
@@ -127,20 +140,38 @@ pub mod podspec;
 pub use hyprstream_rpc::registry::SocketKind;
 pub use hyprstream_rpc::resolver::Resolver;
 #[cfg(not(target_arch = "wasm32"))]
-pub use did_anchored::{DeploymentTrustSource, DidAnchors};
+pub use did_anchored::{
+    verify_anchor_material, DeploymentTrustSource, DidAnchors, VerifiedAnchorMaterial,
+};
 pub use plc_directory::{
     ConnectTimeDiscovery, DidOpSuccessorWitness, InMemoryPlcDirectoryStore, LivePlcDiscovery,
     PlcDirectory, PlcDirectoryRecord, PlcDirectoryStore, ResolvedPlcIdentity,
     SignedPlcDirectoryGenesis,
 };
 pub use service::{
+    authenticate_local_deployment_registry,
+    native_network_required, installed_bootstrap_discovery_client,
+    production_moq_event_target, production_moql_accepted_state_authority,
     bootstrap_deployment_process, deployment_registry_verifier, resolve_and_authenticate_did_anchors,
-    AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
+    AuthorizationProvider, DiscoveryService, DiscoverySelfAnnouncer, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
     production_browser_currentness_verifier, production_browser_provisioning,
-    production_rpc_client, verify_genesis_deployment_artifacts,
+    production_inference_rpc_client_at_transport, production_rpc_client,
+    verify_genesis_deployment_artifacts,
     verify_deployment_artifacts_with_authority_log, verify_deployment_public_ca,
+    verify_os_owned_service_key_enrollment, verify_service_key_enrollment,
+    registry_mint_capability, service_key_enrollment_capability,
+    delegation_capability_set_grants_enrollment, validate_delegation_ucan,
+    validate_registry_delegation,
     DeploymentAuthorityCheckpoint, DeploymentAuthorityLog, RegistryDelegationArtifact,
-    VerifiedDeploymentArtifacts,
+    ServiceKeyEnrollmentArtifact, ServiceKeyEnrollmentSigningBody,
+    ValidatedDelegation, VerifiedDeploymentArtifacts, VerifiedServiceKeyEnrollment,
+    SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES,
+};
+#[cfg(feature = "test-fixtures")]
+#[doc(hidden)]
+pub use service::test_fixtures::{
+    install_bootstrap_discovery_client_fixture, install_production_inference_fixture,
+    ProductionInferenceFixture,
 };
 
 // Re-export generated types that consumers need

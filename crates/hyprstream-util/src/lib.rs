@@ -10,4 +10,4 @@
 
 pub mod ttl_cache;
 
-pub use ttl_cache::TtlCache;
+pub use ttl_cache::{InsertIfAbsentNoEvictResult, TtlCache};

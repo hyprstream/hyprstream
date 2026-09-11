@@ -34,6 +34,7 @@ const MODEL_KIND: &str = "Model";
 const ADAPTER_KIND: &str = "Adapter";
 const TRAINING_RUN_KIND: &str = "TrainingRun";
 const INFERENCE_SERVICE_KIND: &str = "InferenceService";
+#[cfg(feature = "grant")]
 const TENANT_BINDING_KIND: &str = "TenantBinding";
 const TRAINING_RUN_FINALIZER: &str = "training.hyprstream.io/finalizer";
 const SERVING_APP_LABEL: &str = "hyprstream.io/serving-app";
@@ -246,13 +247,10 @@ pub struct OperatorState<R> {
     rpc: Arc<R>,
     config: OperatorConfig,
     tenant_bindings: TenantBindingCache,
-    /// The operator's tenant-grant issuer key (#929). `None` = the
-    /// `TenantBinding` controller compiles no grants (bindings stay the pure
-    /// namespace↔tenant map). Set by [`OperatorState::with_grant_issuer`] when
-    /// the `grant` feature is enabled and the operator was given issuer key
-    /// material at startup.
+    /// Downstream service adapter for tenant-grant issuance (#929/#1422).
+    /// `None` fails closed for authored entitlements.
     #[cfg(feature = "grant")]
-    tenant_grant_issuer: Option<Arc<crate::grant::TenantGrantIssuer>>,
+    tenant_grant_service: Option<Arc<dyn crate::grant::TenantGrantService>>,
     /// Monotonic allocation-epoch counter for compiled grants (#929). Revocation
     /// = stop renewing + bump the epoch; enforcers honor the epoch, never an
     /// unbounded bearer token (#921). Seeded at startup; a future renewal layer
@@ -272,22 +270,22 @@ where
             config,
             tenant_bindings: TenantBindingCache::default(),
             #[cfg(feature = "grant")]
-            tenant_grant_issuer: None,
+            tenant_grant_service: None,
             #[cfg(feature = "grant")]
             grant_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 
-    /// Set the operator's tenant-grant issuer (#929), enabling the
-    /// `TenantBinding` → grant compilation controller. `None` disables grant
-    /// compilation (the default); bindings reconcile to the no-grant `Bound`
-    /// status only. Only available with the `grant` feature.
+    /// Set the downstream tenant-grant service (#929/#1422).
+    ///
+    /// `None` leaves entitlement-bearing bindings rejected; bindings without
+    /// entitlements remain ordinary namespace↔tenant mappings.
     #[cfg(feature = "grant")]
-    pub fn with_grant_issuer(
+    pub fn with_grant_service(
         mut self,
-        issuer: Option<Arc<crate::grant::TenantGrantIssuer>>,
+        service: Option<Arc<dyn crate::grant::TenantGrantService>>,
     ) -> Self {
-        self.tenant_grant_issuer = issuer;
+        self.tenant_grant_service = service;
         self
     }
 }
@@ -327,8 +325,8 @@ pub enum OperatorError {
 /// With the `grant` feature, this runs the `TenantBinding` controller too, but
 /// with no issuer configured: bindings without an entitlement reconcile to the
 /// no-grant `Bound` status, and an authored entitlement is `Rejected` (no
-/// issuer to sign it). Use [`run_operator_with_grant_issuer`] to enable grant
-/// compilation (#929).
+/// service to issue it). Use [`run_operator_with_grant_service`] to enable
+/// grant compilation (#929/#1422).
 pub async fn run_operator<R>(
     client: Client,
     rpc: Arc<R>,
@@ -341,20 +339,23 @@ where
     run_operator_with_state(client, state).await
 }
 
-/// Run every controller with the operator's tenant-grant issuer configured
-/// (#929): the `TenantBinding` controller compiles authored entitlements into
-/// issuer-signed grants. `None` behaves exactly like [`run_operator`].
+/// Run every controller with a downstream tenant-grant service configured.
+///
+/// The Apache operator owns generic reconciliation; the service owns
+/// authority-bearing issuance and PDS allocation behavior. `None` behaves
+/// exactly like [`run_operator`].
 #[cfg(feature = "grant")]
-pub async fn run_operator_with_grant_issuer<R>(
+pub async fn run_operator_with_grant_service<R>(
     client: Client,
     rpc: Arc<R>,
     config: OperatorConfig,
-    issuer: Option<Arc<crate::grant::TenantGrantIssuer>>,
+    service: Option<Arc<dyn crate::grant::TenantGrantService>>,
 ) -> Result<(), OperatorError>
 where
     R: HyprstreamOperatorRpc,
 {
-    let state = Arc::new(OperatorState::new(client.clone(), rpc, config).with_grant_issuer(issuer));
+    let state =
+        Arc::new(OperatorState::new(client.clone(), rpc, config).with_grant_service(service));
     run_operator_with_state(client, state).await
 }
 
@@ -551,11 +552,11 @@ where
 {
     use std::sync::atomic::Ordering;
 
-    // No issuer configured ⇒ grant compilation is disabled. Reflect a no-grant
+    // No service configured ⇒ grant compilation is disabled. Reflect a no-grant
     // Bound status only when the status is stale, so the controller does not
     // hot-loop an apiserver that has nothing to write.
-    let Some(issuer) = state.tenant_grant_issuer.clone() else {
-        if tenant_binding_status_observed_current(binding.as_ref()) {
+    let Some(service) = state.tenant_grant_service.clone() else {
+        if tenant_binding_status_without_service_up_to_date(binding.as_ref()) {
             return Ok(Action::requeue(state.config.requeue));
         }
         let status = crate::grant::compile_tenant_binding_status(
@@ -586,7 +587,7 @@ where
     let now = crate::grant::now_unix();
     let status = crate::grant::compile_tenant_binding_status(
         binding.as_ref(),
-        Some(issuer.as_ref()),
+        Some(service.as_ref()),
         epoch,
         now,
     );
@@ -615,19 +616,68 @@ fn tenant_binding_status_observed_current(binding: &TenantBinding) -> bool {
         == binding.meta().generation
 }
 
+/// A missing service is a fail-closed state for authored entitlements.
+///
+/// A status from a previously configured service must therefore be replaced
+/// with a rejection even when the CRD generation has not changed.
+#[cfg(feature = "grant")]
+fn tenant_binding_status_without_service_up_to_date(binding: &TenantBinding) -> bool {
+    if !tenant_binding_status_observed_current(binding) {
+        return false;
+    }
+    let Some(status) = binding.status.as_ref() else {
+        return false;
+    };
+    match binding.spec.entitlement.as_ref() {
+        Some(_) => {
+            status.bound == Some(false)
+                && status.phase.as_deref() == Some("Rejected")
+                && status.grant_cid.is_none()
+                && status.allocation_cid.is_none()
+                && status.epoch.is_none()
+        }
+        None => tenant_binding_status_is_bound_without_grant(status),
+    }
+}
+
+#[cfg(feature = "grant")]
+fn tenant_binding_status_is_bound_without_grant(status: &crate::mesh::TenantBindingStatus) -> bool {
+    status.bound == Some(true)
+        && status.phase.as_deref() == Some("Bound")
+        && status.grant_cid.is_none()
+        && status.allocation_cid.is_none()
+        && status.epoch.is_none()
+}
+
+#[cfg(feature = "grant")]
+fn tenant_binding_status_is_bound_with_grant(
+    status: &crate::mesh::TenantBindingStatus,
+    epoch: u64,
+) -> bool {
+    status.bound == Some(true)
+        && status.phase.as_deref() == Some("Bound")
+        && status.epoch == Some(epoch)
+        && status.grant_cid.as_ref().is_some_and(|reference| {
+            crate::grant::ContentReference::parse(reference.clone()).is_ok()
+        })
+        && status.allocation_cid.as_ref().is_some_and(|reference| {
+            crate::grant::ContentReference::parse(reference.clone()).is_ok()
+        })
+}
+
 /// Whether a `TenantBinding`'s status is current enough to skip a reconcile at
 /// `epoch` (#929).
 ///
 /// Two cases:
-/// - **Entitlement present** — the recorded grant must be compiled at the
-///   *current* epoch (`status.epoch == Some(epoch)`), with **both** compiled
-///   CIDs present, and the observed generation must match. A bumped epoch
-///   (revocation) or an edited entitlement (generation change) forces a
-///   recompile. The epoch match is load-bearing: it is what makes a
-///   revocation reissue the grant even when the CRD generation is unchanged.
-/// - **No entitlement** — "current" is a no-grant status (`grant_cid` is
-///   absent) at the observed generation; the epoch is irrelevant because no
-///   grant exists to revoke.
+/// - **Entitlement present** — `bound=true`, phase `Bound`, two canonical
+///   CIDv1 references, the current epoch, and the observed generation.
+/// - **No entitlement** — `bound=true`, phase `Bound`, no grant, allocation,
+///   or epoch, and the observed generation.
+///
+/// A bumped epoch (revocation), edited entitlement, malformed legacy
+/// reference, partial status, or inconsistent phase/bound pair forces a
+/// reconcile. The epoch match is load-bearing: it makes revocation reissue the
+/// grant even when the CRD generation is unchanged.
 ///
 /// No status yet ⇒ not current (must reconcile).
 #[cfg(feature = "grant")]
@@ -639,12 +689,8 @@ fn tenant_binding_status_up_to_date(binding: &TenantBinding, epoch: u64) -> bool
         return false;
     }
     match binding.spec.entitlement.as_ref() {
-        Some(_) => {
-            status.epoch == Some(epoch)
-                && status.grant_cid.as_ref().is_some()
-                && status.allocation_cid.as_ref().is_some()
-        }
-        None => status.grant_cid.as_ref().is_none(),
+        Some(_) => tenant_binding_status_is_bound_with_grant(status, epoch),
+        None => tenant_binding_status_is_bound_without_grant(status),
     }
 }
 
@@ -1840,8 +1886,10 @@ mod tests {
     use super::*;
     use crate::{
         AdapterSpec, InferenceServiceSpec, ModelSpec, ModelStage, TenantBindingSpec,
-        TenantEntitlement, TenantGrantClass, TrainingRunSpec,
+        TrainingRunSpec,
     };
+    #[cfg(feature = "grant")]
+    use crate::{TenantEntitlement, TenantGrantClass};
 
     #[test]
     fn model_success_status_reports_observed_ref() {
@@ -2489,6 +2537,7 @@ mod tests {
     /// Build a TenantBinding whose status claims a grant compiled at `epoch`.
     #[cfg(feature = "grant")]
     fn bound_with_grant(observed_generation: Option<i64>, epoch: Option<u64>) -> TenantBinding {
+        const VALID_CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3g3gd3lst2gq2r2a6y4m5x4zi";
         let mut binding = TenantBinding::new(
             "tb",
             TenantBindingSpec {
@@ -2507,8 +2556,8 @@ mod tests {
             phase: Some("Bound".to_owned()),
             message: None,
             observed_generation,
-            grant_cid: Some("bafyreibafyreibafyreibafyreibafyre".to_owned()),
-            allocation_cid: Some("bafyreibafyreibafyreibafyreibafyre".to_owned()),
+            grant_cid: Some(VALID_CID.to_owned()),
+            allocation_cid: Some(VALID_CID.to_owned()),
             epoch,
         });
         // meta().generation defaults to None on a ::new binding; align it with
@@ -2572,9 +2621,72 @@ mod tests {
 
     #[cfg(feature = "grant")]
     #[test]
+    fn grant_status_malformed_references_force_recompile() {
+        const VALID_CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3g3gd3lst2gq2r2a6y4m5x4zi";
+        const CID_V0: &str = "QmdfTbBqBPQ7VNxZEYEj14VmRuZBkqFbiwReogJgS1zR1n";
+        const UPPERCASE_CID_V1: &str =
+            "BAFYBEIGDYRZT5SFP7UDM7HU76UH7Y26NF3G3GD3LST2GQ2R2A6Y4M5X4ZI";
+        const BASE58_CID_V1: &str = "zdj7Wic6KcJAfWz1c9o4M6kq9Lwd5LLn1FiHURxSKgZVwmaJD";
+        let invalid_references = [
+            String::new(),
+            " ".to_owned(),
+            "not-a-cid".to_owned(),
+            CID_V0.to_owned(),
+            UPPERCASE_CID_V1.to_owned(),
+            BASE58_CID_V1.to_owned(),
+            format!("/ipfs/{VALID_CID}"),
+        ];
+        for reference in invalid_references {
+            let mut binding = bound_with_grant(Some(3), Some(7));
+            if let Some(status) = binding.status.as_mut() {
+                status.grant_cid = Some(reference.clone());
+                status.allocation_cid = Some(reference.clone());
+            }
+            assert!(
+                !tenant_binding_status_up_to_date(&binding, 7),
+                "invalid reference unexpectedly remained current: {reference:?}"
+            );
+        }
+
+        for (grant, allocation) in [(VALID_CID, ""), ("not-a-cid", VALID_CID)] {
+            let mut binding = bound_with_grant(Some(3), Some(7));
+            if let Some(status) = binding.status.as_mut() {
+                status.grant_cid = Some(grant.to_owned());
+                status.allocation_cid = Some(allocation.to_owned());
+            }
+            assert!(
+                !tenant_binding_status_up_to_date(&binding, 7),
+                "partially valid status unexpectedly remained current"
+            );
+        }
+    }
+
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_inconsistent_bound_or_phase_forces_recompile() {
+        for (bound, phase) in [
+            (Some(false), Some("Bound")),
+            (Some(true), Some("Rejected")),
+            (None, Some("Bound")),
+            (Some(true), None),
+        ] {
+            let mut binding = bound_with_grant(Some(3), Some(7));
+            if let Some(status) = binding.status.as_mut() {
+                status.bound = bound;
+                status.phase = phase.map(str::to_owned);
+            }
+            assert!(
+                !tenant_binding_status_up_to_date(&binding, 7),
+                "inconsistent entitlement status remained current: {bound:?}, {phase:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "grant")]
+    #[test]
     fn grant_status_no_entitlement_is_current_without_grant() {
-        // A binding with no entitlement is "current" once it carries a no-grant
-        // status at the observed generation; the epoch is irrelevant.
+        // A binding with no entitlement is current only with a complete Bound,
+        // no-grant status at the observed generation.
         let mut binding = TenantBinding::new(
             "tb",
             TenantBindingSpec {
@@ -2585,12 +2697,94 @@ mod tests {
         );
         binding.meta_mut().generation = Some(1);
         binding.status = Some(crate::mesh::TenantBindingStatus {
+            bound: Some(true),
+            phase: Some("Bound".to_owned()),
             observed_generation: Some(1),
             ..Default::default()
         });
         assert!(
             tenant_binding_status_up_to_date(&binding, 99),
-            "a no-entitlement binding with a no-grant status is current at any epoch"
+            "a complete no-entitlement Bound status is current"
+        );
+        assert!(
+            tenant_binding_status_without_service_up_to_date(&binding),
+            "the no-service path must recognize the same complete invariant"
+        );
+    }
+
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_no_entitlement_rejects_partial_or_inconsistent_state() {
+        let mut binding = TenantBinding::new(
+            "tb",
+            TenantBindingSpec {
+                namespace: "acme".to_owned(),
+                tenant: "did:web:acme".to_owned(),
+                entitlement: None,
+            },
+        );
+        binding.meta_mut().generation = Some(1);
+
+        let invalid_statuses = [
+            crate::mesh::TenantBindingStatus {
+                bound: Some(true),
+                phase: Some("Bound".to_owned()),
+                observed_generation: Some(1),
+                grant_cid: Some(
+                    "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3g3gd3lst2gq2r2a6y4m5x4zi".to_owned(),
+                ),
+                ..Default::default()
+            },
+            crate::mesh::TenantBindingStatus {
+                bound: Some(true),
+                phase: Some("Bound".to_owned()),
+                observed_generation: Some(1),
+                allocation_cid: Some(
+                    "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3g3gd3lst2gq2r2a6y4m5x4zi".to_owned(),
+                ),
+                ..Default::default()
+            },
+            crate::mesh::TenantBindingStatus {
+                bound: Some(true),
+                phase: Some("Bound".to_owned()),
+                observed_generation: Some(1),
+                epoch: Some(7),
+                ..Default::default()
+            },
+            crate::mesh::TenantBindingStatus {
+                bound: Some(false),
+                phase: Some("Bound".to_owned()),
+                observed_generation: Some(1),
+                ..Default::default()
+            },
+            crate::mesh::TenantBindingStatus {
+                bound: Some(true),
+                phase: Some("Rejected".to_owned()),
+                observed_generation: Some(1),
+                ..Default::default()
+            },
+        ];
+
+        for status in invalid_statuses {
+            binding.status = Some(status);
+            assert!(
+                !tenant_binding_status_up_to_date(&binding, 7),
+                "configured-service path preserved invalid no-entitlement status"
+            );
+            assert!(
+                !tenant_binding_status_without_service_up_to_date(&binding),
+                "no-service path preserved invalid no-entitlement status"
+            );
+        }
+    }
+
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_previously_bound_is_not_current_without_service() {
+        let binding = bound_with_grant(Some(3), Some(7));
+        assert!(
+            !tenant_binding_status_without_service_up_to_date(&binding),
+            "removing the service must invalidate a previously issued grant status"
         );
     }
 }

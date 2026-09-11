@@ -168,6 +168,7 @@ async fn did_anchored_bootstrap_boots_same_node() {
         node_key,
         DeploymentTrustSource::DidAnchored(fixture.anchors()),
         false,
+        false,
     )
     .await
     .expect("same-node DID-anchored bootstrap must boot without network liveness");

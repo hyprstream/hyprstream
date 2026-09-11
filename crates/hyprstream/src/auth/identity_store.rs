@@ -16,7 +16,7 @@
 //!   the systemd credentials ramfs), missing secrets are a hard error rather than
 //!   triggering key generation.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use zeroize::{Zeroize, Zeroizing};
@@ -118,6 +118,51 @@ pub fn write_secret_exclusive(dir: &std::path::Path, name: &str, value: &[u8]) -
     }
 }
 
+/// Write a named **public** trust artifact to `dir` atomically (tempfile +
+/// rename).
+///
+/// Same atomic-write contract as [`write_secret`], but for non-secret material
+/// (public keys, attestations): the resulting file has mode 0644 so other
+/// local readers (e.g. a credential-mint unit mounting the directory) can
+/// consume it. NEVER pass secret material here.
+pub fn write_public(dir: &std::path::Path, name: &str, value: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    ensure_secrets_dir(dir)?;
+    let path = dir.join(name);
+
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("failed to create temp file in '{}'", dir.display()))?;
+
+    tmp.write_all(value)
+        .with_context(|| format!("failed to write public file in '{}'", dir.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("failed to chmod public file in '{}'", dir.display()))?;
+    }
+
+    tmp.persist(&path)
+        .with_context(|| format!("failed to persist public file to '{}'", path.display()))?;
+
+    tracing::debug!("wrote public file '{}'", path.display());
+    Ok(())
+}
+
+/// Write a public artifact only when it is missing or its content differs.
+///
+/// Keeps re-provisioning and service restarts idempotent: an up-to-date
+/// sidecar is left untouched (no mtime churn, no rewrite).
+fn write_public_if_changed(dir: &std::path::Path, name: &str, value: &[u8]) -> Result<()> {
+    if let Some(existing) = read_secret(dir, name)? {
+        if existing == value {
+            return Ok(());
+        }
+    }
+    write_public(dir, name, value)
+}
+
 /// Returns `true` if `dir` exists and is writable (or can be created).
 ///
 /// Uses `tempfile::tempfile_in` so no named probe file is left on disk,
@@ -169,8 +214,11 @@ fn missing_in_readonly(secrets_dir: &std::path::Path, name: &str) -> anyhow::Err
 /// credentials/
 ///   ca-key            # CA private key (policy service only)
 ///   ca-pubkey         # CA verifying key (public, all services)
+///   ca-mldsa-pubkey   # CA derived ML-DSA-65 verifying key (public, all services)
 ///   {service}/
 ///     signing-key     # service's own Ed25519 private key
+///     signing-key.pub # service's Ed25519 verifying key (public sidecar, 0644)
+///     service-pubkey.hybrid  # hybrid bootstrap entry (public sidecar, 0644)
 ///     service-jwt     # CA-signed JWT certificate
 ///   bootstrap-pubkeys # JSON: { "policy": "base64...", "discovery": "base64..." }
 /// ```
@@ -211,6 +259,77 @@ pub fn validate_service_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// File name of the public Ed25519 sidecar written alongside a service's
+/// `signing-key` seed: the raw 32-byte verifying key.
+pub const SIGNING_KEY_PUB_NAME: &str = "signing-key.pub";
+
+/// File name of the public hybrid (Ed25519 ‖ ML-DSA-65) sidecar written
+/// alongside a service's `signing-key` seed.
+///
+/// Contents are exactly the service's 1984-byte `bootstrap-pubkeys` entry
+/// value (see `docs/bootstrap-pubkeys-format.md`), so a bootstrap-enrollment
+/// mint can consume it without ever touching secret material — the ML-DSA-65
+/// half is derived from the Ed25519 seed and cannot be recomputed from a
+/// public key alone.
+pub const SERVICE_PUBKEY_HYBRID_NAME: &str = "service-pubkey.hybrid";
+
+/// The directory holding `service_name`'s signing key under `secrets_dir` for
+/// the given profile.
+///
+/// Mirrors [`resolve_service_signing_key`]'s file layout: "policy" and any
+/// per-service-scoped directory use the flat layout, everything else gets a
+/// `{service_name}/` subdirectory.
+pub fn service_signing_key_dir(
+    secrets_dir: &std::path::Path,
+    service_name: &str,
+    profile: SecretsProfile,
+) -> std::path::PathBuf {
+    match (profile, service_name) {
+        (_, "policy") | (SecretsProfile::PerServiceScoped, _) => secrets_dir.to_path_buf(),
+        (SecretsProfile::SharedDirectory, _) => secrets_dir.join(service_name),
+    }
+}
+
+/// Write the public sidecars for a service signing key next to its seed:
+///
+/// - [`SIGNING_KEY_PUB_NAME`] — the 32-byte Ed25519 verifying key.
+/// - [`SERVICE_PUBKEY_HYBRID_NAME`] — the 1984-byte hybrid `bootstrap-pubkeys`
+///   entry (Ed25519 ‖ derived ML-DSA-65) for bootstrap enrollment.
+///
+/// Both are public trust material (mode 0644) derived from the key's public
+/// half only; the seed never appears in either. Idempotent: a sidecar whose
+/// content already matches is left untouched.
+pub fn ensure_service_key_sidecars(
+    service_dir: &std::path::Path,
+    service_key: &SigningKey,
+) -> Result<()> {
+    write_public_if_changed(
+        service_dir,
+        SIGNING_KEY_PUB_NAME,
+        service_key.verifying_key().as_bytes(),
+    )?;
+    let hybrid = BootstrapPubkey::for_service_key(service_key)?.to_key_bytes();
+    write_public_if_changed(service_dir, SERVICE_PUBKEY_HYBRID_NAME, &hybrid)?;
+    Ok(())
+}
+
+/// Best-effort sidecar write from the key loader.
+///
+/// Never fails key loading over a public sidecar (e.g. on a read-only
+/// credentials mount): the sidecar is backfilled on every writable load and
+/// by `hyprstream service ensure-key`.
+fn backfill_service_key_sidecars(
+    service_dir: &std::path::Path,
+    service_name: &str,
+    service_key: &SigningKey,
+) {
+    if let Err(e) = ensure_service_key_sidecars(service_dir, service_key) {
+        tracing::warn!(
+            "could not write public key sidecars for service '{service_name}': {e:#}"
+        );
+    }
+}
+
 pub fn load_or_generate_service_signing_key(
     credentials_dir: &std::path::Path,
     service_name: &str,
@@ -226,6 +345,9 @@ pub fn load_or_generate_service_signing_key(
         let sk = SigningKey::from_bytes(&arr);
         bytes.zeroize();
         arr.zeroize();
+        // Backfill the public sidecars for pre-existing seeds (written on
+        // generate below, but a seed written by an older version has none).
+        backfill_service_key_sidecars(&service_dir, service_name, &sk);
         tracing::info!("Loaded Ed25519 signing key for service '{service_name}'");
         return Ok(sk);
     }
@@ -239,6 +361,7 @@ pub fn load_or_generate_service_signing_key(
     match write_secret_exclusive(&service_dir, NAME, &raw) {
         Ok(true) => {
             raw.zeroize();
+            backfill_service_key_sidecars(&service_dir, service_name, &key);
             tracing::info!("Generated new Ed25519 signing key for service '{service_name}'");
             Ok(key)
         }
@@ -257,6 +380,7 @@ pub fn load_or_generate_service_signing_key(
             let sk = SigningKey::from_bytes(&arr);
             bytes.zeroize();
             arr.zeroize();
+            backfill_service_key_sidecars(&service_dir, service_name, &sk);
             Ok(sk)
         }
         Err(e) => {
@@ -311,6 +435,36 @@ pub fn load_ca_verifying_key(credentials_dir: &std::path::Path) -> Result<Verify
 /// Write the CA verifying key to the credentials directory.
 pub fn write_ca_verifying_key(credentials_dir: &std::path::Path, key: &VerifyingKey) -> Result<()> {
     write_secret(credentials_dir, "ca-pubkey", key.as_bytes())
+}
+
+/// Load the CA's derived ML-DSA-65 verifying key (public, distributed to all
+/// services).
+///
+/// This is the post-quantum half of the CA JWT composite pair: the CA signs
+/// hybrid service WITs with `(derive_mesh_mldsa_key(ca_jwt_key), ca_jwt_key)`,
+/// and verifiers resolve the composite kid to this key plus `ca-pubkey`.
+pub fn load_ca_ml_dsa_verifying_key(
+    credentials_dir: &std::path::Path,
+) -> Result<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey> {
+    const NAME: &str = "ca-mldsa-pubkey";
+    if let Some(bytes) = read_secret(credentials_dir, NAME)? {
+        hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&bytes)
+            .map_err(|e| anyhow!("invalid ca-mldsa-pubkey: {e}"))
+    } else {
+        Err(missing_in_readonly(credentials_dir, NAME))
+    }
+}
+
+/// Write the CA's derived ML-DSA-65 verifying key to the credentials directory.
+pub fn write_ca_ml_dsa_verifying_key(
+    credentials_dir: &std::path::Path,
+    key: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
+) -> Result<()> {
+    write_secret(
+        credentials_dir,
+        "ca-mldsa-pubkey",
+        &hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(key),
+    )
 }
 
 fn provisioned_service_jwt_dir(
@@ -368,6 +522,34 @@ pub fn load_service_jwt_for_profile(
     }
 }
 
+/// Seed a provisioned service JWT under the key selected by startup.
+///
+/// Service factories first consult the process trust store. Keeping this
+/// bridge beside the profile-aware loader lets a caller that already resolved
+/// a custom config path carry the authoritative JWT into a factory that has no
+/// config handle of its own.
+pub fn seed_service_jwt_into_trust_store(
+    service_name: &str,
+    signing_key: &SigningKey,
+    credentials_dir: &std::path::Path,
+    profile: SecretsProfile,
+) {
+    if let Ok(Some(jwt_str)) = load_service_jwt_for_profile(credentials_dir, service_name, profile) {
+        let expires_at = decode_jwt_exp_raw(&jwt_str).unwrap_or(0);
+        hyprstream_service::global_trust_store().insert(
+            signing_key.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: std::iter::once(service_name.to_owned()).collect(),
+                subject: None,
+                jwt: Some(jwt_str),
+                expires_at,
+                attested_by: None,
+            },
+        );
+        tracing::info!(service = %service_name, "Seeded trust store with own service-jwt from credential dir");
+    }
+}
+
 /// Persist a service JWT using the same profile-aware path startup reads.
 pub fn write_service_jwt_for_profile(
     credentials_dir: &std::path::Path,
@@ -411,44 +593,349 @@ pub fn write_service_jwt(
 /// Contains the pubkeys of PolicyService and DiscoveryService, which must be
 /// known to all services so they can verify RPC responses from these bootstrap
 /// services without querying discovery (chicken-and-egg).
+///
+/// Wire format (see `docs/bootstrap-pubkeys-format.md`): a flat JSON object
+/// `{ "<service>": "<base64>" }`, base64 using the URL-safe-no-pad alphabet
+/// (RFC 4648 §5, no `+`/`/`/`=`). Each value decodes either to 32 raw Ed25519
+/// bytes (classical entry) or to 1984 bytes — 32 Ed25519 followed by 1952
+/// ML-DSA-65 — for a hybrid entry, the same concatenation the deployment CA
+/// root uses.
+///
+/// This projection returns only the Ed25519 anchor of each entry, so callers
+/// that predate hybrid entries keep working unchanged. Callers that need the
+/// bound post-quantum key use [`load_bootstrap_pubkeys_hybrid`].
 pub fn load_bootstrap_pubkeys(
     credentials_dir: &std::path::Path,
 ) -> Result<std::collections::HashMap<String, VerifyingKey>> {
-    const NAME: &str = "bootstrap-pubkeys";
-    match read_secret(credentials_dir, NAME) {
-        Ok(Some(bytes)) => {
-            let json: std::collections::HashMap<String, String> = serde_json::from_slice(&bytes)
-                .context("bootstrap-pubkeys is not valid JSON")?;
-            let mut map = std::collections::HashMap::new();
-            for (name, b64) in json {
-                let pubkey_bytes: Vec<u8> = URL_SAFE_NO_PAD.decode(b64)
-                    .with_context(|| format!("invalid base64 in bootstrap-pubkeys for '{name}'"))?;
-                let arr: [u8; 32] = pubkey_bytes.try_into()
-                    .map_err(|_| anyhow!("bootstrap-pubkey for '{name}' must be 32 bytes"))?;
-                let vk = VerifyingKey::from_bytes(&arr)
-                    .map_err(|e| anyhow!("invalid bootstrap-pubkey for '{name}': {e}"))?;
-                map.insert(name, vk);
-            }
-            Ok(map)
-        }
-        Ok(None) => Ok(std::collections::HashMap::new()),
-        Err(e) => Err(e),
-    }
+    Ok(load_bootstrap_pubkeys_hybrid(credentials_dir)?
+        .into_iter()
+        .map(|(name, entry)| (name, entry.ed25519))
+        .collect())
 }
 
 /// Write bootstrap pubkeys to the credentials directory.
+///
+/// Every entry is written in the classical 32-byte form. Use
+/// [`write_bootstrap_pubkeys_hybrid`] to persist entries that carry a bound
+/// ML-DSA-65 key.
 pub fn write_bootstrap_pubkeys(
     credentials_dir: &std::path::Path,
     pubkeys: &std::collections::HashMap<String, VerifyingKey>,
 ) -> Result<()> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let hybrid: std::collections::HashMap<String, BootstrapPubkey> = pubkeys
+        .iter()
+        .map(|(name, vk)| (name.clone(), BootstrapPubkey::classical(*vk)))
+        .collect();
+    write_bootstrap_pubkeys_hybrid(credentials_dir, &hybrid)
+}
+
+// ─── Hybrid bootstrap entries ────────────────────────────────────────────────
+
+/// Length of a raw Ed25519 verifying key.
+const BOOTSTRAP_ED25519_BYTES: usize = 32;
+/// Length of a raw ML-DSA-65 verifying key.
+const BOOTSTRAP_ML_DSA_65_BYTES: usize = 1952;
+/// Length of the concatenated hybrid form (Ed25519 ‖ ML-DSA-65).
+const BOOTSTRAP_HYBRID_BYTES: usize = BOOTSTRAP_ED25519_BYTES + BOOTSTRAP_ML_DSA_65_BYTES;
+
+/// The on-disk file name of the bootstrap pubkeys seed.
+const BOOTSTRAP_PUBKEYS_NAME: &str = "bootstrap-pubkeys";
+
+/// One `bootstrap-pubkeys` entry: the Ed25519 anchor plus an optional bound
+/// ML-DSA-65 verifying key.
+///
+/// The Ed25519 key is always the identity of the entry — the post-quantum key
+/// is bound *to* it, mirroring the user identity and deployment-CA layouts.
+/// Verification is per-identity: an entry that carries no PQ key verifies
+/// classically, an entry that carries one requires both signatures.
+#[derive(Clone, Debug)]
+pub struct BootstrapPubkey {
+    pub ed25519: VerifyingKey,
+    pub ml_dsa_65: Option<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>,
+}
+
+impl BootstrapPubkey {
+    /// A classical (Ed25519-only) entry.
+    pub fn classical(ed25519: VerifyingKey) -> Self {
+        Self { ed25519, ml_dsa_65: None }
+    }
+
+    /// A hybrid entry binding an ML-DSA-65 key to an Ed25519 anchor.
+    pub fn hybrid(
+        ed25519: VerifyingKey,
+        ml_dsa_65: hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
+    ) -> Self {
+        Self { ed25519, ml_dsa_65: Some(ml_dsa_65) }
+    }
+
+    /// The hybrid entry for a service that signs with `service_key`.
+    ///
+    /// The ML-DSA-65 half is DERIVED from the service's Ed25519 key with
+    /// [`hyprstream_rpc::node_identity::derive_mesh_mldsa_key`] rather than
+    /// generated independently. That is not merely convenient — it is required
+    /// for the entry to be usable: every signer in the tree (the local signer,
+    /// the service dispatch default, the published `#mesh-pq` verification
+    /// method) produces its post-quantum signature from exactly that
+    /// derivation, so an independently generated key would anchor a public key
+    /// nothing ever signs with. It also keeps the service's secret material a
+    /// single Ed25519 seed — nothing new to persist, protect, back up or
+    /// rotate.
+    pub fn for_service_key(service_key: &SigningKey) -> Result<Self> {
+        let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(service_key);
+        let pq_vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk);
+        let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&pq_vk_bytes)
+            .context("derived mesh ML-DSA-65 verifying key is malformed")?;
+        Ok(Self::hybrid(service_key.verifying_key(), pq_vk))
+    }
+
+    /// Whether this entry carries a bound post-quantum key.
+    pub fn is_hybrid(&self) -> bool {
+        self.ml_dsa_65.is_some()
+    }
+
+    /// The canonical byte encoding: the 32 raw Ed25519 bytes, followed by the
+    /// 1952 raw ML-DSA-65 bytes when the entry is hybrid.
+    pub fn to_key_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(if self.is_hybrid() {
+            BOOTSTRAP_HYBRID_BYTES
+        } else {
+            BOOTSTRAP_ED25519_BYTES
+        });
+        out.extend_from_slice(self.ed25519.as_bytes());
+        if let Some(pq) = &self.ml_dsa_65 {
+            out.extend_from_slice(&hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(pq));
+        }
+        out
+    }
+
+    /// Decode the canonical byte encoding, discriminating on length.
+    ///
+    /// `service` names the entry only so the error text is actionable.
+    pub fn from_key_bytes(service: &str, bytes: &[u8]) -> Result<Self> {
+        let (ed_bytes, pq_bytes) = match bytes.len() {
+            BOOTSTRAP_ED25519_BYTES => (bytes, None),
+            BOOTSTRAP_HYBRID_BYTES => {
+                let (ed, pq) = bytes.split_at(BOOTSTRAP_ED25519_BYTES);
+                (ed, Some(pq))
+            }
+            other => {
+                return Err(anyhow!(
+                    "bootstrap-pubkey for '{service}' must decode to either \
+                     {BOOTSTRAP_ED25519_BYTES} bytes (raw Ed25519 verifying key) or \
+                     {BOOTSTRAP_HYBRID_BYTES} bytes (32-byte Ed25519 followed by \
+                     {BOOTSTRAP_ML_DSA_65_BYTES}-byte ML-DSA-65 verifying key); \
+                     got {other} bytes"
+                ))
+            }
+        };
+
+        let arr: [u8; BOOTSTRAP_ED25519_BYTES] = ed_bytes
+            .try_into()
+            .map_err(|_| anyhow!("bootstrap-pubkey for '{service}' has a malformed Ed25519 part"))?;
+        let ed25519 = VerifyingKey::from_bytes(&arr)
+            .map_err(|e| anyhow!("invalid bootstrap-pubkey for '{service}': {e}"))?;
+
+        let ml_dsa_65 = match pq_bytes {
+            Some(pq) => Some(
+                hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(pq).map_err(|e| {
+                    anyhow!("bootstrap-pubkey for '{service}' has a malformed ML-DSA-65 part: {e}")
+                })?,
+            ),
+            None => None,
+        };
+
+        Ok(Self { ed25519, ml_dsa_65 })
+    }
+
+    /// Verify a signature over `message` under this entry's per-identity policy.
+    ///
+    /// - Classical entry: the Ed25519 signature must verify. A post-quantum
+    ///   signature cannot be checked against an entry with no bound PQ key, so
+    ///   supplying one is an error rather than a silently ignored input.
+    /// - Hybrid entry: **both** the Ed25519 and the ML-DSA-65 signature must be
+    ///   present and verify.
+    ///
+    /// Post-quantum verification is never demanded of an entry that does not
+    /// carry a post-quantum key — a classical entry keeps its classical floor.
+    pub fn verify(
+        &self,
+        message: &[u8],
+        ed25519_sig: &ed25519_dalek::Signature,
+        ml_dsa_65_sig: Option<&[u8]>,
+    ) -> Result<()> {
+        use ed25519_dalek::Verifier;
+
+        self.ed25519
+            .verify(message, ed25519_sig)
+            .map_err(|e| anyhow!("Ed25519 signature verification failed: {e}"))?;
+
+        match (&self.ml_dsa_65, ml_dsa_65_sig) {
+            (Some(pq_key), Some(sig)) => hyprstream_rpc::crypto::pq::ml_dsa_verify(pq_key, message, sig),
+            (Some(_), None) => Err(anyhow!(
+                "this bootstrap key is hybrid (Ed25519 + ML-DSA-65) but no ML-DSA-65 \
+                 signature was supplied; both signatures are required"
+            )),
+            (None, Some(_)) => Err(anyhow!(
+                "an ML-DSA-65 signature was supplied but this bootstrap key is \
+                 Ed25519-only, so the signature cannot be verified; re-provision the \
+                 entry in its 1984-byte hybrid form to enable post-quantum verification"
+            )),
+            (None, None) => Ok(()),
+        }
+    }
+}
+
+/// Load bootstrap pubkeys, preserving any bound post-quantum key material.
+///
+/// Accepts both the classical (32-byte value) and the hybrid (1984-byte value)
+/// form in the same file; the two are distinguished by decoded length. Files
+/// written before hybrid entries existed load unchanged.
+pub fn load_bootstrap_pubkeys_hybrid(
+    credentials_dir: &std::path::Path,
+) -> Result<std::collections::HashMap<String, BootstrapPubkey>> {
+    let Some(bytes) = read_secret(credentials_dir, BOOTSTRAP_PUBKEYS_NAME)? else {
+        return Ok(std::collections::HashMap::new());
+    };
+
+    let json: std::collections::HashMap<String, String> = serde_json::from_slice(&bytes).context(
+        "bootstrap-pubkeys is not valid JSON: expected a flat object \
+         `{ \"<service>\": \"<base64>\" }` (see docs/bootstrap-pubkeys-format.md)",
+    )?;
+
+    let mut map = std::collections::HashMap::new();
+    let mut classical_only = Vec::new();
+    for (name, b64) in json {
+        let key_bytes: Vec<u8> = URL_SAFE_NO_PAD.decode(&b64).with_context(|| {
+            format!(
+                "invalid base64 in bootstrap-pubkeys for '{name}': expected \
+                 URL-safe-no-pad alphabet (RFC 4648 §5, no '+'/'/'/'='), got {b64:?}"
+            )
+        })?;
+        let entry = BootstrapPubkey::from_key_bytes(&name, &key_bytes)?;
+        if !entry.is_hybrid() {
+            classical_only.push(name.clone());
+        }
+        map.insert(name, entry);
+    }
+
+    if !classical_only.is_empty() {
+        classical_only.sort();
+        tracing::debug!(
+            services = %classical_only.join(", "),
+            "bootstrap-pubkeys entries are Ed25519-only; they verify classically \
+             until re-provisioned with a bound ML-DSA-65 key"
+        );
+    }
+
+    Ok(map)
+}
+
+/// Reject a `bootstrap-pubkeys` map that still carries Ed25519-only service
+/// entries.
+///
+/// Every service this node provisions gets a bound ML-DSA-65 key: there is no
+/// classical-only install path, so a classical entry here is stale material
+/// from a pre-hybrid provisioning run, not a supported configuration. Left
+/// alone it does not degrade gracefully — the service is simply never anchored
+/// in the post-quantum trust store, and its RPC is later refused with an
+/// opaque "no anchored ML-DSA-65 signer key" at verification time. Failing
+/// here converts that into an actionable provisioning error.
+///
+/// Deliberately NOT enforced inside [`load_bootstrap_pubkeys_hybrid`]: the
+/// low-level loader must stay able to read a legacy file so tooling — and this
+/// error itself — can report precisely which entries are stale.
+pub fn ensure_bootstrap_pubkeys_hybrid(
+    entries: &std::collections::HashMap<String, BootstrapPubkey>,
+) -> Result<()> {
+    let mut classical: Vec<&str> = entries
+        .iter()
+        .filter(|(_, entry)| !entry.is_hybrid())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if classical.is_empty() {
+        return Ok(());
+    }
+    classical.sort_unstable();
+    Err(anyhow!(
+        "bootstrap-pubkeys has Ed25519-only entries for service(s): {}. Service \
+         identities must be hybrid (Ed25519 + ML-DSA-65); these were written by a \
+         pre-hybrid provisioning run and cannot be anchored for post-quantum \
+         verification. Re-provision this node by running 'hyprstream wizard' — \
+         it re-provisions in place, preserving existing keys while binding the \
+         ML-DSA-65 half for every service — to rewrite {BOOTSTRAP_PUBKEYS_NAME}.",
+        classical.join(", ")
+    ))
+}
+
+/// Write bootstrap pubkeys, encoding hybrid entries in their concatenated form.
+///
+/// Classical entries are written exactly as the pre-hybrid writer wrote them, so
+/// a file round-trips byte-for-byte when no entry carries a PQ key.
+pub fn write_bootstrap_pubkeys_hybrid(
+    credentials_dir: &std::path::Path,
+    pubkeys: &std::collections::HashMap<String, BootstrapPubkey>,
+) -> Result<()> {
     let json: std::collections::HashMap<String, String> = pubkeys
         .iter()
-        .map(|(name, vk)| (name.clone(), URL_SAFE_NO_PAD.encode(vk.as_bytes())))
+        .map(|(name, entry)| (name.clone(), URL_SAFE_NO_PAD.encode(entry.to_key_bytes())))
         .collect();
-    let data = serde_json::to_vec(&json)
-        .context("failed to serialize bootstrap-pubkeys")?;
-    write_secret(credentials_dir, "bootstrap-pubkeys", &data)
+    let data = serde_json::to_vec(&json).context("failed to serialize bootstrap-pubkeys")?;
+    write_secret(credentials_dir, BOOTSTRAP_PUBKEYS_NAME, &data)
+}
+
+/// Directory sibling to `bootstrap-pubkeys` holding the per-service chain-signed
+/// enrollment attestations (hyprstream#1562 H3): `{service}.json` per
+/// allowlisted service.
+pub const BOOTSTRAP_PUBKEYS_ENROLLMENT_DIR: &str = "bootstrap-pubkeys.enrollment";
+
+/// Fail-closed enrollment check for OS-owned deployments (hyprstream#1562 H3).
+///
+/// Every bootstrap entry for a service in the fixed enrollment allowlist
+/// (`hyprstream_discovery::SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES`) must be
+/// backed by an attestation in
+/// `{credentials_dir}/bootstrap-pubkeys.enrollment/{service}.json` that
+/// verifies against the node's OS-owned deployment trust chain and names
+/// exactly this entry's hybrid key — the unsigned-TOFU posture is refused.
+/// Missing, malformed, expired, or mismatched attestations are fatal. Entries
+/// outside the allowlist cannot be enrolled by design and keep their existing
+/// local posture. Wizard/dev (non-OsOwnedFiles) deployments never call this.
+pub fn ensure_bootstrap_pubkeys_enrolled(
+    credentials_dir: &std::path::Path,
+    entries: &std::collections::HashMap<String, BootstrapPubkey>,
+) -> Result<()> {
+    let mut names: Vec<&str> = entries.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    for name in names {
+        if !hyprstream_discovery::SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES.contains(&name) {
+            continue;
+        }
+        let path = credentials_dir
+            .join(BOOTSTRAP_PUBKEYS_ENROLLMENT_DIR)
+            .join(format!("{name}.json"));
+        let bytes = std::fs::read(&path).map_err(|error| {
+            anyhow!(
+                "OS-owned deployment requires a chain-signed enrollment attestation for \
+                 service '{name}' at {}: {error} (re-run the service-key enrollment \
+                 provisioning step)",
+                path.display()
+            )
+        })?;
+        let verified = hyprstream_discovery::verify_os_owned_service_key_enrollment(&bytes)
+            .with_context(|| format!("enrollment attestation for service '{name}' rejected"))?;
+        ensure!(
+            verified.service == name,
+            "enrollment attestation at {} is for service '{}', not '{name}'",
+            path.display(),
+            verified.service
+        );
+        let entry = &entries[name];
+        ensure!(
+            entry.is_hybrid() && verified.hybrid_public_key == entry.to_key_bytes(),
+            "enrollment attestation for service '{name}' does not match its \
+             bootstrap-pubkeys entry"
+        );
+    }
+    Ok(())
 }
 
 // ─── Node-level key loaders ──────────────────────────────────────────────────
@@ -575,6 +1062,24 @@ pub fn resolve_service_signing_key(
             load_or_generate_service_signing_key(secrets_dir, service_name)
         }
     }
+}
+
+/// Load a provisioned service identity without ever generating a replacement.
+pub fn load_existing_service_signing_key(
+    secrets_dir: &std::path::Path,
+    service_name: &str,
+    profile: SecretsProfile,
+) -> Result<SigningKey> {
+    validate_service_name(service_name)?;
+    let directory = match (profile, service_name) {
+        (_, "policy") | (SecretsProfile::PerServiceScoped, _) => secrets_dir.to_owned(),
+        (SecretsProfile::SharedDirectory, _) => secrets_dir.join(service_name),
+    };
+    let bytes = Zeroizing::new(read_secret(&directory, "signing-key")?
+        .ok_or_else(|| anyhow!("provisioned signing key is missing for service {service_name}"))?);
+    let seed = Zeroizing::new(<[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| anyhow!("service {service_name} signing-key must be 32 bytes"))?);
+    Ok(SigningKey::from_bytes(&seed))
 }
 
 // The `#atproto` commit-signing key is NOT loaded here. It is the *active* key
@@ -1628,5 +2133,452 @@ mod tests {
             resolve_service_signing_key(dir.path(), "model", SecretsProfile::SharedDirectory)
                 .unwrap();
         assert_eq!(model_1.to_bytes(), model_2.to_bytes());
+    }
+
+    // ── service key public sidecars (#1562 H1) ──────────────────────────────
+
+    #[cfg(unix)]
+    fn file_mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn test_service_key_sidecars_written_on_generate() {
+        let dir = TempDir::new().unwrap();
+        let key = load_or_generate_service_signing_key(dir.path(), "discovery").unwrap();
+        let svc = dir.path().join("discovery");
+
+        let pub_bytes = std::fs::read(svc.join(SIGNING_KEY_PUB_NAME)).unwrap();
+        assert_eq!(pub_bytes, key.verifying_key().as_bytes());
+
+        let hybrid_bytes = std::fs::read(svc.join(SERVICE_PUBKEY_HYBRID_NAME)).unwrap();
+        let expected = BootstrapPubkey::for_service_key(&key).unwrap().to_key_bytes();
+        assert_eq!(hybrid_bytes, expected);
+        assert_eq!(hybrid_bytes.len(), 1984);
+
+        #[cfg(unix)]
+        {
+            assert_eq!(file_mode(&svc.join("signing-key")), 0o600);
+            assert_eq!(file_mode(&svc.join(SIGNING_KEY_PUB_NAME)), 0o644);
+            assert_eq!(file_mode(&svc.join(SERVICE_PUBKEY_HYBRID_NAME)), 0o644);
+        }
+    }
+
+    #[test]
+    fn test_service_key_sidecars_backfilled_on_load_of_preexisting_seed() {
+        let dir = TempDir::new().unwrap();
+        // Simulate a pre-H1 install: only the seed exists, no sidecars.
+        let seed = SigningKey::generate(&mut rand::rngs::OsRng);
+        write_secret(&dir.path().join("discovery"), "signing-key", &seed.to_bytes()).unwrap();
+        let svc = dir.path().join("discovery");
+        assert!(!svc.join(SIGNING_KEY_PUB_NAME).exists());
+        assert!(!svc.join(SERVICE_PUBKEY_HYBRID_NAME).exists());
+
+        let loaded = load_or_generate_service_signing_key(dir.path(), "discovery").unwrap();
+        assert_eq!(
+            loaded.to_bytes(),
+            seed.to_bytes(),
+            "load must adopt the existing seed, not rotate it"
+        );
+
+        let pub_bytes = std::fs::read(svc.join(SIGNING_KEY_PUB_NAME)).unwrap();
+        assert_eq!(pub_bytes, seed.verifying_key().as_bytes());
+        let hybrid_bytes = std::fs::read(svc.join(SERVICE_PUBKEY_HYBRID_NAME)).unwrap();
+        assert_eq!(
+            hybrid_bytes,
+            BootstrapPubkey::for_service_key(&seed).unwrap().to_key_bytes()
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(file_mode(&svc.join(SIGNING_KEY_PUB_NAME)), 0o644);
+            assert_eq!(file_mode(&svc.join(SERVICE_PUBKEY_HYBRID_NAME)), 0o644);
+        }
+    }
+
+    #[test]
+    fn test_service_key_sidecars_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let first = load_or_generate_service_signing_key(dir.path(), "registry").unwrap();
+        let svc = dir.path().join("registry");
+        let pub1 = std::fs::read(svc.join(SIGNING_KEY_PUB_NAME)).unwrap();
+        let hyb1 = std::fs::read(svc.join(SERVICE_PUBKEY_HYBRID_NAME)).unwrap();
+
+        let second = load_or_generate_service_signing_key(dir.path(), "registry").unwrap();
+        assert_eq!(
+            first.to_bytes(),
+            second.to_bytes(),
+            "re-running must not rotate the key"
+        );
+        assert_eq!(std::fs::read(svc.join(SIGNING_KEY_PUB_NAME)).unwrap(), pub1);
+        assert_eq!(std::fs::read(svc.join(SERVICE_PUBKEY_HYBRID_NAME)).unwrap(), hyb1);
+        #[cfg(unix)]
+        {
+            assert_eq!(file_mode(&svc.join(SIGNING_KEY_PUB_NAME)), 0o644);
+            assert_eq!(file_mode(&svc.join(SERVICE_PUBKEY_HYBRID_NAME)), 0o644);
+        }
+    }
+
+    #[test]
+    fn test_service_key_sidecars_contain_no_secret_material() {
+        let dir = TempDir::new().unwrap();
+        let key = load_or_generate_service_signing_key(dir.path(), "model").unwrap();
+        let seed = key.to_bytes();
+        let svc = dir.path().join("model");
+
+        for name in [SIGNING_KEY_PUB_NAME, SERVICE_PUBKEY_HYBRID_NAME] {
+            let bytes = std::fs::read(svc.join(name)).unwrap();
+            assert_ne!(bytes, seed.as_slice());
+            assert!(
+                !bytes.windows(seed.len()).any(|w| w == seed.as_slice()),
+                "{name} must not embed the seed anywhere"
+            );
+        }
+
+        // Positive control: the sidecar bytes are exactly the public derivation
+        // of the seed — Ed25519 verifying key, then the derived ML-DSA-65
+        // verifying key.
+        let pub_bytes = std::fs::read(svc.join(SIGNING_KEY_PUB_NAME)).unwrap();
+        assert_eq!(pub_bytes, key.verifying_key().as_bytes());
+        let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
+        let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk);
+        let hybrid_bytes = std::fs::read(svc.join(SERVICE_PUBKEY_HYBRID_NAME)).unwrap();
+        assert_eq!(&hybrid_bytes[..32], key.verifying_key().as_bytes());
+        assert_eq!(&hybrid_bytes[32..], pq_vk.as_slice());
+    }
+
+    #[test]
+    fn test_service_signing_key_dir_matches_resolve_layout() {
+        let base = std::path::Path::new("/credentials");
+        assert_eq!(
+            service_signing_key_dir(base, "policy", SecretsProfile::SharedDirectory),
+            base
+        );
+        assert_eq!(
+            service_signing_key_dir(base, "policy", SecretsProfile::PerServiceScoped),
+            base
+        );
+        assert_eq!(
+            service_signing_key_dir(base, "model", SecretsProfile::PerServiceScoped),
+            base
+        );
+        assert_eq!(
+            service_signing_key_dir(base, "model", SecretsProfile::SharedDirectory),
+            base.join("model")
+        );
+    }
+
+    // ── bootstrap-pubkeys wire format ────────────────────────────────────────
+
+    fn bootstrap_ed_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Write a `bootstrap-pubkeys` file verbatim, as an external provisioner
+    /// (or an older release of this code) would have left it on disk.
+    fn write_raw_bootstrap_pubkeys(dir: &std::path::Path, entries: &[(&str, &str)]) {
+        let json: std::collections::BTreeMap<&str, &str> = entries.iter().copied().collect();
+        write_secret(dir, "bootstrap-pubkeys", &serde_json::to_vec(&json).unwrap()).unwrap();
+    }
+
+    // ── mandatory hybrid service entries ─────────────────────────────────────
+
+    /// A classical service entry is a hard, actionable error — never a silent
+    /// downgrade to the classical floor.
+    #[test]
+    fn classical_service_entry_is_a_hard_actionable_error() {
+        let dir = TempDir::new().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "discovery".to_owned(),
+            BootstrapPubkey::classical(bootstrap_ed_key(11).verifying_key()),
+        );
+        map.insert(
+            "policy".to_owned(),
+            BootstrapPubkey::for_service_key(&bootstrap_ed_key(12)).unwrap(),
+        );
+        write_bootstrap_pubkeys_hybrid(dir.path(), &map).unwrap();
+
+        // The low-level loader still reads the file, so the error can name the
+        // offending entries precisely.
+        let loaded = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        let err = format!("{:#}", ensure_bootstrap_pubkeys_hybrid(&loaded).unwrap_err());
+        assert!(err.contains("discovery"), "error names the classical service: {err}");
+        assert!(
+            !err.contains("policy"),
+            "error must not implicate the hybrid service: {err}"
+        );
+        assert!(err.contains("wizard"), "error names the working recovery: {err}");
+        assert!(
+            !err.contains("service repair"),
+            "error must not name the dead-end 'service repair' command: {err}"
+        );
+        assert!(err.contains("ML-DSA-65"), "error names what is missing: {err}");
+    }
+
+    /// An all-hybrid file passes, and an unprovisioned (empty) node is not an
+    /// error — there are no service identities to be wrong about yet.
+    #[test]
+    fn hybrid_service_entries_and_empty_file_both_pass() {
+        let mut map = std::collections::HashMap::new();
+        for (name, seed) in [("policy", 21u8), ("discovery", 22), ("inference", 23)] {
+            map.insert(
+                name.to_owned(),
+                BootstrapPubkey::for_service_key(&bootstrap_ed_key(seed)).unwrap(),
+            );
+        }
+        ensure_bootstrap_pubkeys_hybrid(&map).unwrap();
+        ensure_bootstrap_pubkeys_hybrid(&std::collections::HashMap::new()).unwrap();
+    }
+
+    /// H3: in an OS-owned deployment an allowlisted service without a
+    /// chain-signed enrollment attestation fails closed — the missing-file
+    /// check fires before any chain access, so no trust dir is needed here.
+    #[test]
+    fn enrollment_attestation_missing_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "discovery".to_owned(),
+            BootstrapPubkey::for_service_key(&bootstrap_ed_key(41)).unwrap(),
+        );
+        let err = ensure_bootstrap_pubkeys_enrolled(dir.path(), &map)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(BOOTSTRAP_PUBKEYS_ENROLLMENT_DIR),
+            "error names the enrollment directory: {err}"
+        );
+        assert!(err.contains("discovery"), "error names the service: {err}");
+    }
+
+    /// H3: services outside the fixed enrollment allowlist cannot be enrolled
+    /// by design, so they require no attestation — and an empty (unprovisioned)
+    /// node passes, matching the hybrid check's posture.
+    #[test]
+    fn unallowlisted_bootstrap_entries_need_no_attestation() {
+        let dir = TempDir::new().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "inference".to_owned(),
+            BootstrapPubkey::for_service_key(&bootstrap_ed_key(42)).unwrap(),
+        );
+        ensure_bootstrap_pubkeys_enrolled(dir.path(), &map).unwrap();
+        ensure_bootstrap_pubkeys_enrolled(dir.path(), &std::collections::HashMap::new()).unwrap();
+    }
+
+    /// A provisioned service entry round-trips through the file and then
+    /// verifies a real hybrid signature made with the keys the service actually
+    /// signs with — the Ed25519 key plus the ML-DSA-65 key derived from it.
+    #[test]
+    fn provisioned_service_entry_verifies_a_hybrid_signature_end_to_end() {
+        use ed25519_dalek::Signer;
+
+        let dir = TempDir::new().unwrap();
+        let service_key = bootstrap_ed_key(31);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "discovery".to_owned(),
+            BootstrapPubkey::for_service_key(&service_key).unwrap(),
+        );
+        write_bootstrap_pubkeys_hybrid(dir.path(), &map).unwrap();
+
+        let loaded = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap();
+        let entry = &loaded["discovery"];
+        assert!(entry.is_hybrid());
+        ensure_bootstrap_pubkeys_hybrid(&loaded).unwrap();
+
+        // Sign exactly as the service's own signer does.
+        let msg = b"service response payload";
+        let ed_sig = service_key.sign(msg);
+        let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&service_key);
+        let pq_sig = hyprstream_rpc::crypto::pq::ml_dsa_sign(&pq_sk, msg);
+
+        entry.verify(msg, &ed_sig, Some(&pq_sig)).unwrap();
+
+        // And the Ed25519 signature alone is not enough for a provisioned service.
+        assert!(
+            entry.verify(msg, &ed_sig, None).is_err(),
+            "a provisioned service entry must require both signatures"
+        );
+    }
+
+    #[test]
+    fn bootstrap_pubkeys_classical_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let vk = bootstrap_ed_key(7).verifying_key();
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("discovery".to_owned(), vk);
+        write_bootstrap_pubkeys(dir.path(), &map).unwrap();
+
+        let loaded = load_bootstrap_pubkeys(dir.path()).unwrap();
+        assert_eq!(loaded.get("discovery"), Some(&vk));
+
+        let hybrid = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap();
+        let entry = &hybrid["discovery"];
+        assert!(!entry.is_hybrid(), "an entry written from a bare Ed25519 key is classical");
+        assert_eq!(entry.to_key_bytes().len(), 32);
+    }
+
+    #[test]
+    fn bootstrap_pubkeys_hybrid_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let ed = bootstrap_ed_key(9).verifying_key();
+        let (_pq_sk, pq_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("discovery".to_owned(), BootstrapPubkey::hybrid(ed, pq_vk.clone()));
+        write_bootstrap_pubkeys_hybrid(dir.path(), &map).unwrap();
+
+        let loaded = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap();
+        let entry = &loaded["discovery"];
+        assert!(entry.is_hybrid());
+        assert_eq!(entry.ed25519, ed);
+        assert_eq!(
+            hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(entry.ml_dsa_65.as_ref().unwrap()),
+            hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&pq_vk)
+        );
+        assert_eq!(entry.to_key_bytes().len(), 1984);
+
+        // The Ed25519-only projection still sees the anchor, so callers that
+        // predate hybrid entries keep resolving the same key.
+        assert_eq!(load_bootstrap_pubkeys(dir.path()).unwrap().get("discovery"), Some(&ed));
+    }
+
+    #[test]
+    fn bootstrap_pubkeys_legacy_file_loads_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let discovery = bootstrap_ed_key(0x11).verifying_key();
+        let policy = bootstrap_ed_key(0x22).verifying_key();
+
+        // Exactly the shape deployed nodes and external provisioning emit:
+        // a flat map of URL-safe-no-pad base64 over 32 raw Ed25519 bytes.
+        write_raw_bootstrap_pubkeys(
+            dir.path(),
+            &[
+                ("discovery", &URL_SAFE_NO_PAD.encode(discovery.as_bytes())),
+                ("policy", &URL_SAFE_NO_PAD.encode(policy.as_bytes())),
+            ],
+        );
+
+        let loaded = load_bootstrap_pubkeys(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get("discovery"), Some(&discovery));
+        assert_eq!(loaded.get("policy"), Some(&policy));
+
+        let hybrid = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap();
+        assert!(hybrid.values().all(|e| !e.is_hybrid()));
+    }
+
+    #[test]
+    fn bootstrap_pubkeys_mixed_file_verifies_per_identity() {
+        let dir = TempDir::new().unwrap();
+        let legacy_sk = bootstrap_ed_key(0x33);
+        let hybrid_ed_sk = bootstrap_ed_key(0x44);
+        let (pq_sk, pq_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+
+        let hybrid_entry = BootstrapPubkey::hybrid(hybrid_ed_sk.verifying_key(), pq_vk);
+        write_raw_bootstrap_pubkeys(
+            dir.path(),
+            &[
+                ("policy", &URL_SAFE_NO_PAD.encode(legacy_sk.verifying_key().as_bytes())),
+                ("discovery", &URL_SAFE_NO_PAD.encode(hybrid_entry.to_key_bytes())),
+            ],
+        );
+
+        let loaded = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        let msg = b"bootstrap trust seed";
+
+        // Classical entry: an Ed25519 signature alone is sufficient, and no
+        // post-quantum material is demanded of it.
+        let legacy = &loaded["policy"];
+        assert!(!legacy.is_hybrid());
+        let legacy_sig = {
+            use ed25519_dalek::Signer;
+            legacy_sk.sign(msg)
+        };
+        legacy.verify(msg, &legacy_sig, None).unwrap();
+
+        // Hybrid entry: both signatures are required, and the classical half
+        // alone is rejected.
+        let hybrid = &loaded["discovery"];
+        assert!(hybrid.is_hybrid());
+        let hybrid_ed_sig = {
+            use ed25519_dalek::Signer;
+            hybrid_ed_sk.sign(msg)
+        };
+        let pq_sig = hyprstream_rpc::crypto::pq::ml_dsa_sign(&pq_sk, msg);
+        hybrid.verify(msg, &hybrid_ed_sig, Some(&pq_sig)).unwrap();
+        assert!(
+            hybrid.verify(msg, &hybrid_ed_sig, None).is_err(),
+            "a hybrid entry must not verify on the Ed25519 signature alone"
+        );
+
+        // A post-quantum signature has nothing to check against on a classical
+        // entry, so it is rejected rather than silently ignored.
+        assert!(legacy.verify(msg, &legacy_sig, Some(&pq_sig)).is_err());
+    }
+
+    #[test]
+    fn bootstrap_pubkeys_reject_wrong_length_values() {
+        let dir = TempDir::new().unwrap();
+        // 33 bytes: neither the classical nor the hybrid length.
+        write_raw_bootstrap_pubkeys(dir.path(), &[("discovery", &URL_SAFE_NO_PAD.encode([0u8; 33]))]);
+
+        let err = load_bootstrap_pubkeys(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("'discovery'"), "error names the offending service: {err}");
+        assert!(err.contains("32 bytes"), "error states the classical shape: {err}");
+        assert!(err.contains("1984 bytes"), "error states the hybrid shape: {err}");
+        assert!(err.contains("got 33 bytes"), "error states what was found: {err}");
+    }
+
+    #[test]
+    fn bootstrap_pubkeys_reject_standard_alphabet_base64() {
+        let dir = TempDir::new().unwrap();
+        // Standard-alphabet base64 with padding is not the documented alphabet.
+        write_raw_bootstrap_pubkeys(dir.path(), &[("discovery", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")]);
+
+        let err = format!("{:#}", load_bootstrap_pubkeys(dir.path()).unwrap_err());
+        assert!(err.contains("URL-safe-no-pad"), "error states the expected alphabet: {err}");
+    }
+
+    #[test]
+    fn bootstrap_pubkeys_reject_malformed_pq_length() {
+        let dir = TempDir::new().unwrap();
+        // Correct Ed25519 prefix, truncated ML-DSA-65 tail.
+        let mut bytes = bootstrap_ed_key(0x55).verifying_key().as_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 1951]);
+        write_raw_bootstrap_pubkeys(dir.path(), &[("discovery", &URL_SAFE_NO_PAD.encode(&bytes))]);
+
+        let err = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("1984 bytes"), "error states the hybrid shape: {err}");
+    }
+
+    /// The hybrid `discovery` value published as the worked example in
+    /// `docs/bootstrap-pubkeys-format.md`. Kept verbatim so the documented
+    /// example cannot drift away from what the parser actually accepts.
+    const DOC_EXAMPLE_HYBRID_VALUE: &str = "JIrL26-eBQGW3nBL6i1odw5RkVDRA7WH2uLZytU92TAXHtJkdXNEM19SNj1GPxnt-7mImdVPdRRENw5lnPLIVkDc3BiWsqDvmLI2x9roidQrSRArrQ-itYpEyQaLf-y6ckpa1NdkeN9ibwNu393M3E8PD2N3Vh9vx_sD2mbn532l0QXGV3i-9lQppfKcFwzinBkQN7eLLWRrInMfbE3IY_7FnC9Q0scH7bUMBvNY7k5jEDNtz1ZpEWgR-1u2M-iF221WgzT9AnQX5X88dd9gYs0SsIHLjx5o8-nnHk0XRxPq1JtegEupUKLf5a7e3IEm62VSXRJhH_V2IA9PAJMlSL8rJGYHdMwjscP1DyKCpCquSgYIH8zJDQCPqVUFBujtdq3x-eMFd0CxpVssPuLeoNb_4YZbtSwdk6iMMPupiDYIKOgknxymsnYGxR1PiA_7b1lZVaD62pCZHSCi9nJEDVoWuQ0_cSMB589zaDSTcI7r5Ks6l0MUPtVsa_yWQ4jwS8GnDMikXXmLvKegE5V6rZpG6AXx707kEvpxyESIzwnMU9UO2h4MGI1uWp36SXzHxF5RSZrY3Wr1ei1MwnJj7kgve4w1skjtZ32EE4A8r7R8mIl8L6LkXsD6n4FXFWQWocLdBerVvVBSDTDca8mQ3Lqr-3Q8wasUx-Ifqk6AAOZTmPseQ50uoiZnr0MCzxVkbAmvB5o_I5J_BqxKqQUimv0xiq69n9Vr__7FS8HTd9139LUPBkBDduZeH4qqJyIkDshEPJeXqOwBQZDIupnjc-PvDNKRM6o8Kg1OtaBjYwWWL6pVFRXYw3NeGb52N77-T9dEOCR659RHFrI-741xIaJ_gTJb6G43C7Go-EMI0aMkzakh-LSyTrv4C2s-KYksgVap-EsREaKmX1FAinmWsn0222V-tzJ-9dvPKKwCnTyTXpYRK3ltR-3LnP-onbg4ysP_tpVMg8K7jAeCzYsEEZCIjoJr5qpTkwGncfytwVvT6sHsoD988S10in7Dz9TNcNnFmb_foYqELht6jhAv_X6nf8IJEZgaLNaz9eV-_L87TdgQDF4iKrgHcuUZjPlfi-az1B6uV1Z7pqUsqJBT5XQkCqr3j4chZ2gNEw8SpconZVuXsT1tEtSWyo9GmvNntsiCvGM30faWGj-_cIsrCveMeMfLLsfNP3X7jG7Jgb7uYbj50Mwf7b-VqrdAmIJ0CMmCSygBaWV7YDx_qTEEuE7oL-R6_fXkhmXeZYyhFPF-As70CrVW-KwAJVp0mYasmPwu9YZ-Mlerg-QgHiAXnNpVjXE-wvnqP6JKbrbgaUZiLC4gXn0VTnB70y4e97Efl8ztGqE7AazPxwRMDyfher5oGpVm2lh9StBZYqaoAO7XQTUKvczld7imzqDugagVpWRW7ffE5qKp0ezq5PUwws4GB7UfTrmBm2gQ2HmT8aouV15b5zJaI1x9sOsNUjFrL1yL3V-Fi8adOXfRc5MR1JzdsaAki5YZhyjjYEHzdZfD8mwvN8jxN5U03tq495bR87ER_tHZNNd875gYZNYQ-pkD8zBlLWq54mDj5AKCwdTce3gOVTx9CtNYm3LFxsaB9VL_B93X81IR_Czaf_cHNQPsTpd8wWCWTZbc9zBhHUYtlrTrxhzXV68yBDcjnVF3LkbOcqapBCsUTrQ6XgloOp-fkUYd1LWTQN7ofcCXvR7x30BXXsM_qZnlUR4zminj2lWlJacV90Uqf7SL4HAEefqH8btyoVepUG_5JYQ7bp7NsUWUlw-Jc0hkumvNcaNX5uNFCLIIVTGgA9dG8ELuC3g-bhVjokIr4wSHVCyjFJs2qo93VdHy-abKdwpjeRwo6r66uaideZKEBxKUlZ_XHiZmT_FksJZIOHrq-8gQVPyjwo0oyI9Dq8xF-5aVN8NpHaJU7x4VcsndfHqsY5CGQUV0ZfuDpA94Srx-vvnvAJeM8ql63Ng2-0dNDra6fr8fgdEZeyJaIhdVBU8wBlshyeX32N2dbiJR7qWY5VqLbaKjePvqLa1LnnMtWdS2PqMX2UE_Q44Oa_FUdOB2sFdvKpxEbHDS74w5sd6C5AZzYPNUL1ICrV1F-c0Mxm9Z2j8PFEuYDz6fpR4Z1iDzLH9QKFUwus9fPzCU7b-ptTU3T3vnFTN4NLgxR6Ih78B-Mp3QrrCOxW3NtBNpnImuqHgRYBBPkg_dM659hgNtgCMYefiQuWJlpS22GG3kwPVuHoG8eqa-NDtxgMgFOPy30IKJcLh9ooG-QD9reZht_TBkLWbDW1JfeINAeJ86oZ5g3qtTdVAftVHaRCHLQN0ClLXPquM-v1GJm2F_tIXFJF-utsp0SgCDKo2VUymmMSgXQL3iP29lHQcp6Jzgisk6ZAEs6MqzrGV-T0cl0sQ4pKECzGHUL-8B8CKmMtshHZLCX4hvc3ALGd8ls72e6sh2JkFcU84I_8GLPgJu66dN5eZtOPR9CkmTKa2Ph1MgXqBGwmcYcvlg5GVZvzZC-UlhTrF7WAbObzDrGQbIGHBKG09dobSuSXpiSmZljJUh-88qsTXEVW12C4ZoWyDQ4OzH09JofMByTzb-k5Hn8cKIawcJBqCaAXElF5Z6MLrxxwagcL9XuMMdKG3UtEWY9HrsGY6qsA";
+
+    #[test]
+    fn documented_hybrid_example_loads_as_a_hybrid_entry() {
+        let dir = TempDir::new().unwrap();
+        write_raw_bootstrap_pubkeys(dir.path(), &[("discovery", DOC_EXAMPLE_HYBRID_VALUE)]);
+
+        let loaded = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap();
+        let entry = &loaded["discovery"];
+        assert!(entry.is_hybrid(), "the documented example must be a hybrid entry");
+        assert_eq!(entry.to_key_bytes().len(), 1984);
+        // The documented Ed25519 anchor is the leading 43 base64 characters.
+        assert!(
+            DOC_EXAMPLE_HYBRID_VALUE
+                .starts_with(&URL_SAFE_NO_PAD.encode(entry.ed25519.as_bytes())),
+            "the documented anchor prefix must be the entry's Ed25519 key"
+        );
     }
 }

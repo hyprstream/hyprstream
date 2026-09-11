@@ -99,6 +99,12 @@ pub enum Git2DBError {
     #[error("Internal error: {message}")]
     Internal { message: String },
 
+    /// Structured merge-conflict report from in-memory candidate composition
+    /// (issue #1428). Carries path + side detail rather than a string-only
+    /// message, so callers can render or programmatically handle conflicts.
+    #[error("{0}")]
+    MergeConflictReport(#[from] crate::merge::ConflictReport),
+
     /// LFS operation errors
     #[error("LFS error ({kind:?}): {message}")]
     Lfs { kind: LfsErrorKind, message: String },
@@ -132,6 +138,7 @@ impl Git2DBError {
             | Self::InvalidOperation { message }
             | Self::Internal { message }
             | Self::Lfs { message, .. } => message.clone(),
+            Self::MergeConflictReport(report) => report.to_string(),
             Self::WorktreeExists { path } => {
                 format!("Worktree already exists at {}", path.display())
             }

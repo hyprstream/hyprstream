@@ -8,12 +8,14 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::io::{Read, Write};
 use std::path::Path;
 
-use crate::auth::{RocksDbUserStore, UserStore};
+use crate::auth::ProductionUserStore;
 use crate::cli::commands::UserKeysImportFormat;
 use crate::cli::enroll::{enroll_user, EnrollKeySource};
 
-fn open_store(credentials_dir: &Path) -> Result<RocksDbUserStore> {
-    RocksDbUserStore::open(credentials_dir).context("Failed to open credential store")
+async fn open_store(credentials_dir: &Path) -> Result<ProductionUserStore> {
+    ProductionUserStore::open(credentials_dir)
+        .await
+        .context("Failed to open production credential store")
 }
 
 /// Resolve key material: from -f <path>, -f -, or inline data.
@@ -73,7 +75,7 @@ fn parse_ssh_ed25519(line: &str) -> Result<VerifyingKey> {
 
 /// Handle `user register <username>`
 pub async fn handle_user_register(credentials_dir: &Path, username: &str) -> Result<()> {
-    let store = open_store(credentials_dir)?;
+    let store = open_store(credentials_dir).await?;
     store.register(username).await.context("Failed to register user")?;
     println!("Registered user '{username}'");
     Ok(())
@@ -81,7 +83,7 @@ pub async fn handle_user_register(credentials_dir: &Path, username: &str) -> Res
 
 /// Handle `user list`
 pub async fn handle_user_list(credentials_dir: &Path) -> Result<()> {
-    let store = open_store(credentials_dir)?;
+    let store = open_store(credentials_dir).await?;
     let mut users = store.list_users().await?;
     if users.is_empty() {
         println!("No users registered.");
@@ -110,7 +112,7 @@ pub async fn handle_user_remove(
             return Ok(());
         }
     }
-    let store = open_store(credentials_dir)?;
+    let store = open_store(credentials_dir).await?;
     let removed = store.remove(username).await?;
     if removed {
         println!("Removed user '{username}'");
@@ -122,7 +124,7 @@ pub async fn handle_user_remove(
 
 /// Handle `user keys list <username>`
 pub async fn handle_user_keys_list(credentials_dir: &Path, username: &str) -> Result<()> {
-    let store = open_store(credentials_dir)?;
+    let store = open_store(credentials_dir).await?;
     let pubkeys = store.list_pubkeys(username).await?;
     if pubkeys.is_empty() {
         println!("No keys registered for '{username}'");
@@ -161,7 +163,7 @@ pub async fn handle_user_keys_import(
         }
     };
 
-    let store = open_store(credentials_dir)?;
+    let store = open_store(credentials_dir).await?;
     let fingerprint = store
         .add_pubkey(username, pubkey, label)
         .await
@@ -185,7 +187,7 @@ pub async fn handle_user_create(
     key: Option<&str>,
     ssh: Option<&str>,
 ) -> Result<()> {
-    let store = open_store(credentials_dir)?;
+    let store = open_store(credentials_dir).await?;
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()
         .context("Failed to resolve secrets directory")?;
 
@@ -195,7 +197,7 @@ pub async fn handle_user_create(
     // suite as envelope traffic.
     let policy = hyprstream_rpc::envelope::mandatory_envelope_policy();
 
-    let outcome = enroll_user(&store, &secrets_dir, username, source, policy)
+    let outcome = enroll_user(&*store, &secrets_dir, username, source, policy)
         .await
         .context("Failed to enroll user")?;
 
@@ -339,7 +341,7 @@ pub async fn handle_user_keys_remove(
         owned = format!("SHA256:{fingerprint}");
         &owned
     };
-    let store = open_store(credentials_dir)?;
+    let store = open_store(credentials_dir).await?;
     let removed = store.remove_pubkey(username, fp).await?;
     if removed {
         println!("Removed key {fp}");

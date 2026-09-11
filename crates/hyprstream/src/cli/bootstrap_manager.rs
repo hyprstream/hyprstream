@@ -5,7 +5,7 @@
 //! service startup. It implements WizardBackend for the TUI, using bounded channels
 //! with drain-to-latest pattern to bridge async operations to the 30fps render loop.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
@@ -17,7 +17,7 @@ use hyprstream_tui::wizard::backend::*;
 
 use crate::auth::identity_store;
 use crate::auth::policy_templates::{get_template, get_templates};
-use crate::auth::{RocksDbUserStore, PolicyManager};
+use crate::auth::{PolicyManager, ProductionUserStore};
 use crate::cli::gpu_detect;
 use crate::cli::policy_handlers::{
     load_or_generate_signing_key, mint_local_token, parse_duration,
@@ -49,6 +49,12 @@ pub struct BootstrapManager {
     // Service phase state
     service_rx: Option<mpsc::Receiver<OpStatus>>,
     service_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Test-only dispatch injection for the service-start routing tests.
+    /// Production never consults an override — `new()` stores `None` and the
+    /// real `handle_service_start` path always runs (#1585).
+    #[cfg(test)]
+    start_dispatch: Option<StartDispatchFn>,
 
     // Cached environment (avoid re-detecting)
     cached_env: Option<EnvironmentInfo>,
@@ -86,6 +92,35 @@ fn os_username() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "anonymous".to_owned())
+}
+
+/// Test-only signature of the wizard's service-start dispatch seam: the
+/// resolved service list, explicit-config provenance, direct-launch decision,
+/// and required-native profile. Never named outside `#[cfg(test)]` code —
+/// production always runs the ordinary `dispatch_real_start` path.
+#[cfg(test)]
+type StartDispatchFn = Arc<
+    dyn Fn(
+            Vec<String>,
+            Option<PathBuf>,
+            bool,
+            bool,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+/// The actual production start: installed systemd units for the default
+/// profile, direct launch when `daemon` is set for explicit-config and
+/// required-native profiles (#1585).
+async fn dispatch_real_start(
+    services: &[String],
+    explicit_config: Option<&Path>,
+    daemon: bool,
+    iroh_required: bool,
+) -> anyhow::Result<()> {
+    crate::cli::handle_service_start(services, None, daemon, explicit_config, iroh_required).await
 }
 
 // The shared enroll routine (#438 wizard + #439 `user create`) lives in
@@ -129,9 +164,19 @@ impl BootstrapManager {
             bootstrap_cancel: None,
             service_rx: None,
             service_handle: None,
+            #[cfg(test)]
+            start_dispatch: None,
             cached_env: None,
             policy_manager: None,
         }
+    }
+
+    /// Inject the test-only service-start dispatch. Never called in
+    /// production; exists only so the routing tests can observe which launch
+    /// mode and profile provenance the wizard resolves (#1585).
+    #[cfg(test)]
+    fn set_start_dispatch(&mut self, dispatch: StartDispatchFn) {
+        self.start_dispatch = Some(dispatch);
     }
 
     fn data_dir(&self) -> PathBuf {
@@ -168,7 +213,10 @@ impl BootstrapManager {
                 return;
             }
         };
-        let store = match RocksDbUserStore::open(&credentials_dir) {
+        let store = match self
+            .rt
+            .block_on(ProductionUserStore::open(&credentials_dir))
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -196,7 +244,7 @@ impl BootstrapManager {
         // envelope traffic.
         let policy = hyprstream_rpc::envelope::mandatory_envelope_policy();
         match self.rt.block_on(
-            enroll_user(&store, &secrets_dir, username, EnrollKeySource::Generate, policy),
+            enroll_user(&*store, &secrets_dir, username, EnrollKeySource::Generate, policy),
         ) {
             Ok(outcome) => {
                 // Surface enrollment notices (e.g. the classical-downgrade
@@ -464,10 +512,63 @@ impl WizardBackend for BootstrapManager {
         let (tx, rx) = mpsc::sync_channel(8);
         self.service_rx = Some(rx);
         let services = self.config_services.clone();
+        // Forward this process's pinned config provenance and native profile
+        // so bootstrap-launched children load what the operator loaded (#1585).
+        let explicit_config = crate::config::explicit_config_path().cloned();
+        // Fail closed: an unloadable configuration is never silently treated
+        // as the default profile (#1585). Installed systemd units cannot carry
+        // this process's explicit --config provenance or the required-native
+        // profile, so those starts take the direct launch path via `daemon`.
+        let (daemon, iroh_required) = match crate::config::HyprConfig::load() {
+            Ok(config) => {
+                let required = config.quic.iroh_required();
+                (explicit_config.is_some() || required, required)
+            }
+            Err(error) => {
+                let message = format!("configuration load failed: {error}");
+                self.service_handle = Some(self.rt.spawn(async move {
+                    let _ = tx.send(OpStatus::InProgress);
+                    let _ = tx.send(OpStatus::Failed(message));
+                }));
+                return;
+            }
+        };
+
+        #[cfg(test)]
+        let start_override = self.start_dispatch.clone();
 
         self.service_handle = Some(self.rt.spawn(async move {
             let _ = tx.send(OpStatus::InProgress);
-            match crate::cli::handle_service_start(&services, None, false).await {
+            #[cfg(test)]
+            let outcome = match start_override {
+                Some(seam) => {
+                    seam(
+                        services.clone(),
+                        explicit_config.clone(),
+                        daemon,
+                        iroh_required,
+                    )
+                    .await
+                }
+                None => {
+                    dispatch_real_start(
+                        &services,
+                        explicit_config.as_deref(),
+                        daemon,
+                        iroh_required,
+                    )
+                    .await
+                }
+            };
+            #[cfg(not(test))]
+            let outcome = dispatch_real_start(
+                &services,
+                explicit_config.as_deref(),
+                daemon,
+                iroh_required,
+            )
+            .await;
+            match outcome {
                 Ok(()) => {
                     let _ = tx.send(OpStatus::Done);
                 }
@@ -709,53 +810,31 @@ async fn do_bootstrap(
                 identity_store::write_ca_verifying_key(&credentials_dir, &ca_jwt_key.verifying_key())?;
             }
         }
-        // Always sync signing-key and verifying key (derived from root_key, harmless to overwrite)
+        // Always sync signing-key and verifying keys (derived from root_key, harmless to overwrite).
+        // The ML-DSA-65 verifying key is the post-quantum half of the CA JWT
+        // composite pair: hybrid service JWTs are signed with the exact pair
+        // (derive_mesh_mldsa_key(ca_jwt_key), ca_jwt_key), and verifiers need
+        // this public key on disk to resolve the composite kid.
         identity_store::write_secret(&credentials_dir, "signing-key", &root_key.to_bytes())?;
         identity_store::write_ca_verifying_key(&credentials_dir, &ca_jwt_key.verifying_key())?;
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca_jwt_key);
+        identity_store::write_ca_ml_dsa_verifying_key(
+            &credentials_dir,
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq),
+        )?;
 
         // Generate independent keypairs for each registered service
         use hyprstream_service::list_factories;
 
-        let mut bootstrap_pubkeys = std::collections::HashMap::new();
-        let now = chrono::Utc::now().timestamp();
-
-        for factory in list_factories() {
-            let service_name = factory.name;
-
-            // PolicyService's identity IS the root/CA key: unlike every other
-            // service it has no independent per-service keypair, so it resolves
-            // to `root_key` rather than `load_or_generate_service_signing_key`
-            // (which would read/generate a divergent `policy/signing-key`).
-            //
-            // But it is NOT skipped: we still mint a CA-signed `service:policy`
-            // JWT — self-signed in the sense that the CA JWT key signs it, with
-            // `cnf` binding the root verifying key — and persist it to
-            // `policy/service-jwt`. That makes PolicyService symmetric with
-            // every other service and keeps the trust store (which records
-            // `root_key.verifying_key()` for "policy") in lockstep with the
-            // on-disk JWT, so a later `service repair`/reinstall can no longer
-            // leave a stale `policy` key/JWT pair that disagrees with the
-            // current CA key (#448). It also enables future per-service
-            // rotation of the policy credential.
-            let service_key = if service_name == "policy" {
-                root_key.clone()
-            } else {
-                identity_store::load_or_generate_service_signing_key(
-                    &credentials_dir, service_name,
-                )?
-            };
-            let service_vk = service_key.verifying_key();
-
-            let jwt = crate::auth::service_jwt::issue_or_load_service_jwt(
-                &credentials_dir, service_name, &ca_jwt_key, &service_vk, &local_issuer_url, now,
-            )?;
-            identity_store::write_service_jwt(&credentials_dir, service_name, &jwt)?;
-
-            bootstrap_pubkeys.insert(service_name.to_owned(), service_vk);
-        }
-
-        // Write bootstrap pubkeys for all services
-        identity_store::write_bootstrap_pubkeys(&credentials_dir, &bootstrap_pubkeys)?;
+        let service_names: Vec<&str> = list_factories().map(|f| f.name).collect();
+        let bootstrap_pubkeys = provision_service_identities(
+            &credentials_dir,
+            &root_key,
+            &ca_jwt_key,
+            &local_issuer_url,
+            &service_names,
+            chrono::Utc::now().timestamp(),
+        )?;
 
         tracing::info!(
             "Generated service keypairs + JWTs for {} services",
@@ -772,12 +851,348 @@ async fn do_bootstrap(
     Ok(())
 }
 
+/// Provision one identity per named service: an Ed25519 signing key, a CA-signed
+/// service JWT, and the `bootstrap-pubkeys` entry that publishes the key.
+///
+/// Every entry written here is hybrid (Ed25519 + a derived ML-DSA-65 key). There
+/// is no classical provisioning mode and no flag to request one: the derived
+/// post-quantum key is what the service's own signer signs with, so publishing
+/// it is what makes the service verifiable at all. Re-running is idempotent —
+/// existing per-service keys and JWTs are loaded rather than replaced, so the
+/// entries it rewrites describe the same identities.
+fn provision_service_identities(
+    credentials_dir: &std::path::Path,
+    root_key: &ed25519_dalek::SigningKey,
+    ca_jwt_key: &ed25519_dalek::SigningKey,
+    local_issuer_url: &str,
+    service_names: &[&str],
+    now: i64,
+) -> anyhow::Result<std::collections::HashMap<String, identity_store::BootstrapPubkey>> {
+    let mut bootstrap_pubkeys = std::collections::HashMap::new();
+
+    for service_name in service_names {
+        let service_name = *service_name;
+
+        // PolicyService's identity IS the root/CA key: unlike every other
+        // service it has no independent per-service keypair, so it resolves
+        // to `root_key` rather than `load_or_generate_service_signing_key`
+        // (which would read/generate a divergent `policy/signing-key`).
+        //
+        // But it is NOT skipped: we still mint a CA-signed `service:policy`
+        // JWT — self-signed in the sense that the CA JWT key signs it, with
+        // `cnf` binding the root verifying key — and persist it to
+        // `policy/service-jwt`. That makes PolicyService symmetric with
+        // every other service and keeps the trust store (which records
+        // `root_key.verifying_key()` for "policy") in lockstep with the
+        // on-disk JWT, so a later `service repair`/reinstall can no longer
+        // leave a stale `policy` key/JWT pair that disagrees with the
+        // current CA key (#448). It also enables future per-service
+        // rotation of the policy credential.
+        let service_key = if service_name == "policy" {
+            root_key.clone()
+        } else {
+            identity_store::load_or_generate_service_signing_key(credentials_dir, service_name)?
+        };
+
+        // The hybrid entry: the Ed25519 identity plus the ML-DSA-65 key derived
+        // from it. This is what `seed_bootstrap_pq_bindings` later anchors, and
+        // what turns post-quantum enforcement on for this service.
+        bootstrap_pubkeys.insert(
+            service_name.to_owned(),
+            identity_store::BootstrapPubkey::for_service_key(&service_key)?,
+        );
+
+        // Publish the public sidecars (`signing-key.pub`, `service-pubkey.hybrid`)
+        // next to the key so the bootstrap-enrollment mint can read them without
+        // secret material (#1562 H1). For non-policy services the key loader
+        // already wrote them — an idempotent no-op here; for policy this writes
+        // them flat, alongside the node/CA seed.
+        let sidecar_dir = identity_store::service_signing_key_dir(
+            credentials_dir,
+            service_name,
+            identity_store::SecretsProfile::SharedDirectory,
+        );
+        identity_store::ensure_service_key_sidecars(&sidecar_dir, &service_key)?;
+    }
+
+    identity_store::write_bootstrap_pubkeys_hybrid(credentials_dir, &bootstrap_pubkeys)?;
+
+    // v16 §11: the enrollment manifest is derived BEFORE any credential is
+    // minted, so every bootstrap service JWT is clearance-bearing from first
+    // issue. The manifest is the authority for target clearance; minting
+    // consults it per service. On first provision the manifest is written
+    // with wizard defaults; on re-provision the existing manifest is
+    // authoritative — any drift (missing/extra service, changed Ed25519 or
+    // PQ half) is a hard error until the operator edits the manifest
+    // deliberately (the reviewed rotation).
+    let freshly_written;
+    let enrollment =
+        match crate::auth::service_enrollment::ServiceEnrollmentManifest::load(credentials_dir)? {
+            Some(existing) => {
+                freshly_written = false;
+                existing
+            }
+            None => {
+                let manifest =
+                    crate::auth::service_enrollment::ServiceEnrollmentManifest::from_bootstrap(
+                        &bootstrap_pubkeys,
+                    );
+                manifest.write(credentials_dir)?;
+                freshly_written = true;
+                manifest
+            }
+        };
+    if !freshly_written {
+        enrollment
+            .reconcile_with_bootstrap(&bootstrap_pubkeys)
+            .context("service enrollment manifest disagrees with bootstrap keys")?;
+    }
+
+    for (service_name, entry) in &bootstrap_pubkeys {
+        let jwt = crate::auth::service_jwt::issue_or_load_service_jwt(
+            credentials_dir,
+            service_name,
+            ca_jwt_key,
+            entry,
+            local_issuer_url,
+            now,
+            enrollment.clearance_for_service(service_name).as_ref(),
+        )?;
+        identity_store::write_service_jwt(credentials_dir, service_name, &jwt)?;
+    }
+
+    Ok(bootstrap_pubkeys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::{RocksDbUserStore, UserStore};
     use crate::cli::enroll::bind_user_signing_key;
     use tempfile::TempDir;
+
+    /// What the wizard's service-start dispatch was invoked with.
+    #[derive(Debug)]
+    struct RecordedStart {
+        services: Vec<String>,
+        explicit: Option<PathBuf>,
+        daemon: bool,
+        required: bool,
+    }
+
+    /// Gate marking a re-exec'd child that runs one service-start routing
+    /// scenario in an isolated process (the pinned/explicit config slots are
+    /// process-global and write-once).
+    const ROUTE_CHILD: &str = "HYPRSTREAM_BOOTSTRAP_ROUTE_CHILD";
+
+    /// BootstrapManager service-start routing through the real profile load:
+    /// the default profile stays on installed systemd units (daemon=false);
+    /// explicit-config and required-native route to the direct launch path
+    /// (daemon=true); an unloadable configuration fails closed with a Failed
+    /// status and never reaches the dispatch at all.
+    #[tokio::test]
+    async fn bootstrap_start_services_routes_profiles_causally() -> anyhow::Result<()> {
+        if let Ok(scenario) = std::env::var(ROUTE_CHILD) {
+            return start_services_child_scenario(&scenario).await;
+        }
+        for scenario in ["default", "explicit", "required", "invalid"] {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "cli::bootstrap_manager::tests::bootstrap_start_services_routes_profiles_causally",
+                    "--nocapture",
+                ])
+                .env(ROUTE_CHILD, scenario)
+                .status()?;
+            anyhow::ensure!(
+                status.success(),
+                "bootstrap service routing scenario '{scenario}' failed"
+            );
+        }
+        Ok(())
+    }
+
+    async fn start_services_child_scenario(scenario: &str) -> anyhow::Result<()> {
+        let recorded: Arc<parking_lot::Mutex<Vec<RecordedStart>>> = Arc::default();
+        let sink = recorded.clone();
+        let models = TempDir::new()?;
+        let mut manager = BootstrapManager::new(
+            // The test's own ambient runtime: start_services spawns onto this
+            // handle and the await-based drain below lets the task run.
+            tokio::runtime::Handle::current(),
+            models.path().to_path_buf(),
+            vec!["policy".to_owned()],
+        );
+        manager.set_start_dispatch(Arc::new(
+            move |services: Vec<String>, explicit: Option<PathBuf>, daemon: bool, required: bool| {
+                sink.lock().push(RecordedStart {
+                    services,
+                    explicit,
+                    daemon,
+                    required,
+                });
+                Box::pin(async { Ok::<(), anyhow::Error>(()) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>
+            },
+        ));
+
+        match scenario {
+            "default" => {
+                let _ = crate::config::install_pinned_config(crate::config::HyprConfig::default());
+                manager.start_services();
+                assert_eq!(drain_to_terminal(&mut manager).await, OpStatus::Done);
+                let calls = recorded.lock();
+                assert_eq!(calls.len(), 1, "the dispatch must run exactly once");
+                let call = &calls[0];
+                assert_eq!(call.services, vec!["policy".to_owned()]);
+                assert_eq!(call.explicit, None, "default profile has no explicit provenance");
+                assert!(!call.daemon, "default profile must keep the installed systemd unit route");
+                assert!(!call.required, "default profile is not required-native");
+            }
+            "explicit" => {
+                let _ = crate::config::install_pinned_config(crate::config::HyprConfig::default());
+                let explicit = TempDir::new()?;
+                let marker = explicit.path().join("operator.toml");
+                assert!(
+                    crate::config::install_explicit_config_path(marker.clone()),
+                    "explicit provenance slot must be installable in a fresh child"
+                );
+                manager.start_services();
+                assert_eq!(drain_to_terminal(&mut manager).await, OpStatus::Done);
+                let calls = recorded.lock();
+                assert_eq!(calls.len(), 1, "the dispatch must run exactly once");
+                let call = &calls[0];
+                assert_eq!(call.explicit, Some(marker), "provenance must be forwarded");
+                assert!(call.daemon, "explicit --config provenance must take the direct launch route");
+                assert!(!call.required);
+            }
+            "required" => {
+                let mut required_config = crate::config::HyprConfig::default();
+                required_config.quic.enabled = true;
+                required_config.quic.iroh = true;
+                required_config.quic.native_network_profile =
+                    crate::config::NativeNetworkProfile::NetworkIrohRequired;
+                required_config.validate()?;
+                let _ = crate::config::install_pinned_config(required_config);
+                manager.start_services();
+                assert_eq!(drain_to_terminal(&mut manager).await, OpStatus::Done);
+                let calls = recorded.lock();
+                assert_eq!(calls.len(), 1, "the dispatch must run exactly once");
+                let call = &calls[0];
+                assert!(call.required, "the required-native profile must be observed");
+                assert!(call.daemon, "required-native must take the direct launch route");
+                assert_eq!(call.explicit, None);
+            }
+            "invalid" => {
+                // No pinned snapshot: force the XDG re-derivation onto a
+                // garbage config file so HyprConfig::load() itself fails.
+                let root = TempDir::new()?;
+                let xdg = root.path().join("xdg-config");
+                std::env::set_var("XDG_CONFIG_HOME", &xdg);
+                let config_dir = xdg.join("hyprstream");
+                std::fs::create_dir_all(&config_dir)?;
+                std::fs::write(config_dir.join("config.toml"), "this is = not [valid toml")?;
+                manager.start_services();
+                let terminal = drain_to_terminal(&mut manager).await;
+                match terminal {
+                    OpStatus::Failed(message) => assert!(
+                        message.contains("configuration load failed"),
+                        "unloadable configuration must fail closed naming the cause, got: {message}"
+                    ),
+                    other => panic!("unloadable configuration must surface Failed, got {other:?}"),
+                }
+                assert!(
+                    recorded.lock().is_empty(),
+                    "an unloadable configuration must never reach the service dispatch"
+                );
+            }
+            other => anyhow::bail!("unknown bootstrap routing scenario '{other}'"),
+        }
+        Ok(())
+    }
+
+    /// Drain pending service status until a terminal one arrives (bounded,
+    /// mirroring the wizard's poll loop without the fixed sleep pacing).
+    async fn drain_to_terminal(manager: &mut BootstrapManager) -> OpStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match manager.poll_pending() {
+                OpStatus::InProgress => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "service start never reached a terminal status"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                terminal => return terminal,
+            }
+        }
+    }
+
+    /// A fresh provisioning run writes a hybrid entry for EVERY service, and
+    /// those entries anchor into the post-quantum trust store.
+    ///
+    /// There is no classical provisioning mode to compare against — this is the
+    /// only path, so the assertion is that it has no classical output at all.
+    #[test]
+    fn provisioning_writes_hybrid_entries_that_anchor_for_every_service() -> anyhow::Result<()> {
+        use ed25519_dalek::SigningKey;
+        use hyprstream_rpc::envelope::{KeyedPqTrustStore, PqTrustStore};
+
+        let creds = TempDir::new()?;
+        let root_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let ca_jwt_key =
+            hyprstream_rpc::node_identity::derive_purpose_key(&root_key, "hyprstream-jwt-v1");
+        let services = ["policy", "discovery", "inference", "storage"];
+
+        let provisioned = provision_service_identities(
+            creds.path(),
+            &root_key,
+            &ca_jwt_key,
+            "https://node.invalid",
+            &services,
+            1_700_000_000,
+        )?;
+
+        assert_eq!(provisioned.len(), services.len());
+        for name in services {
+            let entry = provisioned
+                .get(name)
+                .unwrap_or_else(|| panic!("no bootstrap entry provisioned for '{name}'"));
+            assert!(entry.is_hybrid(), "service '{name}' was provisioned classical");
+        }
+
+        // What landed on disk is hybrid too, and passes the strict check.
+        let on_disk = identity_store::load_bootstrap_pubkeys_hybrid(creds.path())?;
+        assert_eq!(on_disk.len(), services.len());
+        identity_store::ensure_bootstrap_pubkeys_hybrid(&on_disk)?;
+
+        // Every provisioned service anchors into the PQ trust store.
+        let mut store = KeyedPqTrustStore::new();
+        let anchored =
+            crate::auth::mesh_trust::seed_bootstrap_pq_bindings(&mut store, creds.path());
+        assert_eq!(anchored, services.len(), "every service must anchor");
+        for name in services {
+            let entry = &on_disk[name];
+            assert!(
+                store.ml_dsa_key_for(&entry.ed25519.to_bytes()).is_some(),
+                "service '{name}' is not anchored in the PQ trust store"
+            );
+        }
+
+        // The anchored ML-DSA key is the one the service's signer signs with.
+        let policy_pq = store
+            .ml_dsa_key_for(&root_key.verifying_key().to_bytes())
+            .ok_or_else(|| anyhow::anyhow!("policy identity not anchored"))?;
+        let msg = b"anchored-key round trip";
+        let sig = hyprstream_rpc::crypto::pq::ml_dsa_sign(
+            &hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&root_key),
+            msg,
+        );
+        hyprstream_rpc::crypto::pq::ml_dsa_verify(&policy_pq, msg, &sig)?;
+
+        Ok(())
+    }
 
     /// Replicates the register + bind sequence performed by
     /// `register_local_identity` against a temp store/secrets dir, then asserts

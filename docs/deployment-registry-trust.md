@@ -1,5 +1,34 @@
 # Deployment registry trust provisioning
 
+> This document covers deployment-level trust: the OS-owned CA pin, authority
+> log/checkpoint, and registry credential below. It does not cover
+> `bootstrap-pubkeys`, the unrelated node-local, unattested service-key file —
+> see [bootstrap-pubkeys-format.md](bootstrap-pubkeys-format.md).
+
+## Terminology
+
+Four words describe overlapping scopes in this codebase and its docs; they
+are not synonyms:
+
+- **Node** — one running Hyprstream process/host with its own signing key.
+  Nodes are the only thing that exists; there is no separate "cell" or
+  "cluster" object anywhere in the type system.
+- **Cell** — the set of nodes sharing one deployment CA (one admitted
+  trust root, one ledger). A cell is emergent, not a distinct entity: a cell
+  is simply what you get when N nodes are provisioned with the same
+  `/etc/hyprstream/trust/*` artifacts (or the same DID anchor). Multi-node is
+  still single-cell; there is currently no cross-cell interaction in this
+  repository (see `placement-indexer-architecture.md`'s "not ... a
+  cross-cell directory").
+- **Cluster** (as in `cluster_at9p_did` / `cluster_did_web`) — the specific
+  configuration surface for pointing a node at a DID-anchored deployment. It
+  names the same scope as "cell," from the perspective of one node's config.
+- **Deployment** — this document's scope: the CA, authority log, and
+  credential that anchor trust for a cell. "Deployment trust" and "cell
+  trust" mean the same thing.
+- **Federation** — interaction *across* cells. Not implemented; out of
+  scope for every document in this section.
+
 Production Discovery/PDS authority is rooted before commands, factories, plugins,
 or generated clients run. The executable consults only the explicit deployment
 trust sources described below. It does not consult XDG/user configuration,
@@ -20,9 +49,11 @@ The OS-owned deployment seam is deliberately small and fail-closed:
   provisioned expected log head: schema, deployment domain, log DID, sequence,
   and head CID. The supplied log must match it exactly.
 
-By default, all installed files and parent directories must be real,
-root-owned paths and not group/world writable. Missing, malformed, symlinked,
-or incorrectly owned material makes production resolver startup fail closed.
+All installed files and parent directories must be real, owned by root or the
+daemon's effective service UID, and not group/world writable. This invariant is
+identical for fixed and explicitly overridden paths. Missing, malformed,
+symlinked, or incorrectly owned material makes production resolver startup fail
+closed.
 Missing log or checkpoint never selects a less restrictive verifier. Both JWT
 signature components are verified against the checkpointed active authority
 before its key is represented by an opaque verification-only capability. The
@@ -31,7 +62,7 @@ Discovery APIs.
 
 The repository does not yet contain an operator enrollment protocol. Deployments
 using this OS-owned source must therefore provision the `/etc` pin through their
-OS image, configuration manager, measured-boot policy, or equivalent root-owned
+OS image, configuration manager, measured-boot policy, or equivalent trusted
 mechanism, and project the registry JWT into the fixed `/run` location before
 starting hyprstream.
 
@@ -50,13 +81,13 @@ from systemd's absolute `$CREDENTIALS_DIRECTORY` as
 `$CREDENTIALS_DIRECTORY/registry-service.jwt`. Either variable being present
 but empty, relative, or containing `..` components is a startup error; it
 never falls back to a fixed path. When a variable is absent, only its fixed
-root-owned path is used.
+path is used.
 
-Explicit user-service artifacts and every real ancestor must be owned by root
-or the daemon's effective user and must not be group/world writable. Symlinks
-are rejected and the final file is opened with `O_NOFOLLOW`. This mode trusts
-the service account to provision its own development trust inputs; it does not
-turn XDG or general secret directories into authority.
+Every selected artifact and real ancestor must be owned by root or the daemon's
+effective user and must not be group/world writable. Symlinks are rejected and
+the final file is opened with `O_NOFOLLOW`. The service identity is the trusted
+principal in the non-root production model; this does not turn XDG or general
+secret directories into authority.
 
 Path selection changes no cryptographic rule. The CA is still exactly the
 mandatory 1,984-byte Ed25519 + ML-DSA-65 pair; the authority log must still

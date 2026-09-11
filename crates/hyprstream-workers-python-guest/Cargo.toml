@@ -2,7 +2,7 @@
 name = "hyprstream-workers-python-guest"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 description = "RustPython guest compiled to wasm32-unknown-unknown for the #505 capability sandbox (P1 host)"
 
 # This crate is intentionally NOT a workspace member. It is listed in the root

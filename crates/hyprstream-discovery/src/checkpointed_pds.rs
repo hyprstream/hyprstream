@@ -26,6 +26,7 @@ const AT9P_CHECKPOINT_AAD: &[u8] = b"hyprstream-at9p-monotonic-checkpoint/1";
 pub(super) struct CheckpointedPdsAcceptedStateSource {
     path: PathBuf,
     acceptance_identity: Arc<dyn AcceptanceVerifier>,
+    network_bootstrap: bool,
 }
 
 trait AcceptanceVerifier: Send + Sync {
@@ -59,6 +60,7 @@ impl CheckpointedPdsAcceptedStateSource {
         Ok(Self {
             path: path.to_path_buf(),
             acceptance_identity: Arc::new(acceptance_identity),
+            network_bootstrap: false,
         })
     }
 
@@ -69,7 +71,26 @@ impl CheckpointedPdsAcceptedStateSource {
     ) -> Result<Self> {
         let _probe = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)
             .with_context(|| format!("failed to open checkpointed PDS store at {path:?}"))?;
-        Ok(Self { path: path.to_path_buf(), acceptance_identity: Arc::new(acceptance_identity) })
+        Ok(Self { path: path.to_path_buf(), acceptance_identity: Arc::new(acceptance_identity), network_bootstrap: false })
+    }
+
+    pub(super) fn with_network_bootstrap(mut self, required: bool) -> Self {
+        self.network_bootstrap = required;
+        self
+    }
+
+    fn bootstrap_states(&self) -> Result<Vec<AcceptedAt9pState>> {
+        let db = rocksdb::DB::open_for_read_only(&readonly_opts(), &self.path, false)?;
+        let mut states = Vec::new();
+        for entry in db.prefix_iterator(b"at9p-state\0") {
+            let (key, _) = entry?;
+            let Some(subject) = key.strip_prefix(b"at9p-state\0") else { break; };
+            let subject = std::str::from_utf8(subject)?;
+            if let Some(state) = load_at9p_state_from_db(&db, subject, self.acceptance_identity.as_ref())? {
+                states.push(state);
+            }
+        }
+        Ok(states)
     }
 
     pub(super) fn accepted_state(&self, did: &str) -> Result<Option<AcceptedAt9pState>> {
@@ -85,9 +106,27 @@ impl CheckpointedPdsAcceptedStateSource {
     }
 }
 
+/// RocksDB key for the first-boot provisioning marker.
+///
+/// Written by [`initialize_deployment_store`] (and any other path that creates
+/// a fresh empty store) and deleted by the registry service **in the same
+/// synchronous `WriteBatch` as the first accepted-state commit** — so the
+/// lifecycle transition is atomic with provisioning completion, not a
+/// best-effort filesystem side-effect. Its presence alongside an empty store
+/// is the ONLY lifecycle evidence that distinguishes a genuine first boot
+/// (store freshly provisioned, no accepted state written yet) from a
+/// steady-state store that lost its data. The QUIC startup gate reads it via
+/// [`PdsRecordStore::first_boot_pending`] in the app crate.
+pub const FIRST_BOOT_KEY: &[u8] = b"first-boot-pending";
+
 /// Explicitly create the empty checkpoint store for a newly provisioned
 /// deployment. Resolver startup never calls this: a missing store there is
 /// treated as lost security history and fails closed.
+///
+/// Also writes the [`FIRST_BOOT_KEY`] so the QUIC startup gate can recognize
+/// this as a genuine first boot (defer-eligible) rather than data loss. The
+/// registry deletes the key (in the same RocksDB batch as the first
+/// accepted-state commit) once provisioning completes.
 pub(crate) fn initialize_deployment_store() -> Result<()> {
     let path = hyprstream_service::deployment_data_dir()?.join("pds-store");
     anyhow::ensure!(
@@ -97,15 +136,30 @@ pub(crate) fn initialize_deployment_store() -> Result<()> {
     );
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
-    drop(rocksdb::DB::open(&opts, &path).with_context(|| {
-        format!("failed to initialize checkpointed PDS store at {path:?}")
-    })?);
+    let db = rocksdb::DB::open(&opts, &path)
+        .with_context(|| format!("failed to initialize checkpointed PDS store at {path:?}"))?;
+    // Write the first-boot marker as a durable RocksDB key (not a filesystem
+    // side-effect) so its deletion can be atomic with the first accepted-state
+    // commit. A failed put propagates — provisioning must not appear successful
+    // if the marker wasn't written.
+    db.put(FIRST_BOOT_KEY, b"")
+        .with_context(|| format!("failed to write first-boot marker in store at {path:?}"))?;
     Ok(())
 }
 
 impl super::service::AcceptedStateSource for CheckpointedPdsAcceptedStateSource {
     fn accepted_state(&self, did: &str) -> Result<Option<AcceptedAt9pState>> {
         self.accepted_state(did)
+    }
+
+    fn bootstrap_endpoints(&self, service_name: &str) -> Result<Option<Vec<crate::state_store::AnnouncedEndpoint>>> {
+        if !self.network_bootstrap || !matches!(service_name, "discovery" | "policy") {
+            return Ok(None);
+        }
+        let key = hyprstream_service::global_trust_store().resolve_one(service_name)
+            .ok_or_else(|| anyhow::anyhow!("trusted bootstrap {service_name} response key is missing"))?;
+        super::service::project_bootstrap_endpoint(&self.bootstrap_states()?, service_name, &key)
+            .map(|endpoint| Some(vec![endpoint]))
     }
 }
 
@@ -344,6 +398,20 @@ fn decode_state_body(subject: &str, bytes: &[u8]) -> Result<AcceptedAt9pState> {
 }
 
 #[cfg(test)]
+pub(super) fn write_test_state(path: &Path, state: &AcceptedAt9pState, identity: &ed25519_dalek::SigningKey) -> Result<()> {
+    let audit = ed25519_dalek::SigningKey::from_bytes(&[0x43; 32]);
+    let (envelope, checkpoint) = tests::encode_fixture(state, identity, &audit);
+    let mut options = rocksdb::Options::default();
+    options.create_if_missing(true);
+    let db = rocksdb::DB::open(&options, path)?;
+    let mut batch = rocksdb::WriteBatch::default();
+    batch.put(state_key(&state.subject_cid512), envelope);
+    batch.put(checkpoint_key(&state.subject_cid512), checkpoint);
+    db.write(batch)?;
+    Ok(())
+}
+
+#[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
@@ -442,7 +510,7 @@ mod tests {
         ));
     }
 
-    fn encode_fixture(
+    pub(super) fn encode_fixture(
         state: &AcceptedAt9pState,
         identity: &ed25519_dalek::SigningKey,
         audit: &ed25519_dalek::SigningKey,
