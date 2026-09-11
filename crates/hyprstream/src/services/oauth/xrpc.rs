@@ -2152,6 +2152,14 @@ mod tests {
                 ("/record/facets/0/index/byteStart", json!(-1)),
                 ("/record/facets/0/features/0/did", json!("did::private")),
                 (
+                    "/record/facets/0/features/0/did",
+                    json!("did:key:zExample%"),
+                ),
+                (
+                    "/record/reply/root/uri",
+                    json!("at://did:key:zExample%/app.bsky.feed.post/key"),
+                ),
+                (
                     "/record/facets/0/features/1/uri",
                     json!("https://example.com/invalid space"),
                 ),

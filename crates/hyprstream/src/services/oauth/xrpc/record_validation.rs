@@ -320,7 +320,7 @@ fn valid_did(value: &str) -> bool {
         && !method.is_empty()
         && method.bytes().all(|b| b.is_ascii_lowercase())
         && !id.is_empty()
-        && !id.ends_with(':')
+        && !id.ends_with([':', '%'])
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._:%-".contains(&b))
