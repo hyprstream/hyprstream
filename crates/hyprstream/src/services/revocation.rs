@@ -131,7 +131,7 @@ impl PolicyAuthoritySessionRegistry {
         Self::with_client_provider(move || {
             let token = crate::services::factories::service_token(&signing_key)
                 .context("current service JWT unavailable for session authority")?;
-            PolicyClient::from_resolver(signing_key.clone(), Some(token)).map(Arc::new)
+            PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), Some(token)).map(Arc::new)
         })
     }
 }
@@ -244,7 +244,7 @@ impl PolicyAuthorityRevocationStore {
         Self::with_client_provider(move || {
             let token = crate::services::factories::service_token(&signing_key)
                 .context("current service JWT unavailable for revocation authority")?;
-            PolicyClient::from_resolver(signing_key.clone(), Some(token)).map(Arc::new)
+            PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), Some(token)).map(Arc::new)
         })
     }
 }

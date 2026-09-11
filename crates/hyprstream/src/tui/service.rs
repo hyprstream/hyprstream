@@ -845,11 +845,11 @@ impl TuiService {
 
         let models = {
             let registry_client: hyprstream_rpc_std::registry_client::RegistryClient =
-                hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(
+                hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
                     self.signing_key.clone(),
                     None,
                 )?;
-            let model_client_for_status = hyprstream_rpc_std::model_client::ModelClient::from_resolver(
+            let model_client_for_status = hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
                 self.signing_key.clone(),
                 None,
             )?;
@@ -900,7 +900,7 @@ impl TuiService {
                 let h   = handle_load.clone();
                 // Submit load — returns "accepted" immediately (Continuation pattern).
                 h.block_on(async {
-                    let client = match hyprstream_rpc_std::model_client::ModelClient::from_resolver(
+                    let client = match hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
                         sk.clone(),
                         None,
                     ) {
@@ -924,7 +924,7 @@ impl TuiService {
                     for _ in 0..60u32 {   // max ~2 minutes (60 × 2 s)
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let loaded = h_poll.block_on(async {
-                            let client = match hyprstream_rpc_std::model_client::ModelClient::from_resolver(
+                            let client = match hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
                                 sk_poll.clone(),
                                 None,
                             ) {
@@ -952,7 +952,7 @@ impl TuiService {
             let sk = sk_unload.clone();
             let mr = model_ref.to_owned();
             handle_unload.block_on(async move {
-                let client = match hyprstream_rpc_std::model_client::ModelClient::from_resolver(
+                let client = match hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
                     sk.clone(),
                     None,
                 ) {
@@ -980,7 +980,7 @@ impl TuiService {
                 let rmd = rmd_clone.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(sk, None) {
+                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1079,7 +1079,7 @@ impl TuiService {
                 let h = h_pull.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(sk, None) {
+                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1118,7 +1118,7 @@ impl TuiService {
                 let h = h_push.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(sk, None) {
+                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1163,7 +1163,7 @@ impl TuiService {
                 let h = h_status.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(sk, None) {
+                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("Failed to create RegistryClient: {e}");
@@ -1192,14 +1192,14 @@ impl TuiService {
                 let rmd = rmd_refresh.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry_client = match hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(sk.clone(), None) {
+                        let registry_client = match hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk.clone(), None) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("model-list refresh: RegistryClient: {e}");
                                 return;
                             }
                         };
-                        let model_client = match hyprstream_rpc_std::model_client::ModelClient::from_resolver(sk, None) {
+                        let model_client = match hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("model-list refresh: ModelClient: {e}");

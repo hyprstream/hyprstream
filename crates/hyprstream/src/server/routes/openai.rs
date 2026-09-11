@@ -216,7 +216,7 @@ fn model_client_for_request(
     state: &ServerState,
     jwt_token: Option<&str>,
 ) -> anyhow::Result<ModelClient> {
-    ModelClient::from_resolver(
+    ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
         (*state.signing_key).clone(),
         jwt_token.map(str::to_owned),
     )

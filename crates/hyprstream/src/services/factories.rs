@@ -481,7 +481,7 @@ fn policy_client_for_deployment(
     token: Option<String>,
 ) -> anyhow::Result<PolicyClient> {
     if ctx.iroh_required() {
-        PolicyClient::from_resolver(signing_key, token)
+        PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, token)
     } else {
         // Deterministic same-host PolicyService IPC endpoint: unlike
         // `registered_endpoint`, it is available to a separate `podman exec`
@@ -505,7 +505,7 @@ fn schedule_network_service_key_registration(
         let mut delay = std::time::Duration::from_secs(2);
         loop {
             let attempt = async {
-                let client = PolicyClient::from_resolver(signing_key.clone(), Some(service_jwt.clone()))?;
+                let client = PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), Some(service_jwt.clone()))?;
                 client.register_service_key(&RegisterServiceKey {
                     service_name: service_name.clone(),
                     verifying_key: signing_key.verifying_key().as_bytes().to_vec(),
@@ -615,7 +615,7 @@ fn spawn_jwt_renewal_task(
             };
 
     let policy_client = match if iroh_required {
-        PolicyClient::from_resolver(signing_key.clone(), Some(current_jwt))
+        PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), Some(current_jwt))
     } else {
         policy_client_for_transport(
             &policy_transport,
@@ -1401,7 +1401,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 
     // Create registry client
     let registry_client: RegistryClient =
-        RegistryClient::from_resolver(sk.clone(), service_token(&sk))?;
+        RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk.clone(), service_token(&sk))?;
 
     #[allow(clippy::expect_used)]
     let mut model_service = tokio::task::block_in_place(|| {
@@ -1433,7 +1433,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     // key is in the trust store (depends_on includes "discovery"). Best-effort:
     // if discovery isn't resolvable, ModelService simply has no federation client
     // and at:// refs fall through to local resolution.
-    match hyprstream_rpc_std::discovery_client::DiscoveryClient::from_resolver(sk.clone(), None) {
+    match hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk.clone(), None) {
         Ok(dc) => {
             model_service = model_service.with_discovery_client(std::sync::Arc::new(dc));
         }
@@ -1819,7 +1819,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     register_service_key(ctx, "oai", &sk)?;
 
     // Create authenticated clients for Model and Policy services.
-    let model_client = ModelClient::from_resolver(sk.clone(), service_token(&sk))?;
+    let model_client = ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk.clone(), service_token(&sk))?;
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
@@ -1828,7 +1828,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
     // Create registry client
     let registry_client: RegistryClient =
-        RegistryClient::from_resolver(sk.clone(), service_token(&sk))?;
+        RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk.clone(), service_token(&sk))?;
 
     // Create server state (blocking since we're in sync context)
     let resource_url = config.oai.resource_url();
@@ -1912,7 +1912,7 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
     // Dial the registry — the authenticated write core the HTTP face translates to.
     let registry_client: RegistryClient =
-        RegistryClient::from_resolver(sk.clone(), service_token(&sk))?;
+        RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk.clone(), service_token(&sk))?;
 
     // Reuse the same narrow authentication core as OAI without constructing an
     // inference-oriented ServerState. The policy client is used by federated
@@ -2033,7 +2033,7 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>> =
         if config.flight.default_dataset.is_some() {
             let registry_client: RegistryClient =
-                RegistryClient::from_resolver(sk.clone(), service_token(&sk))?;
+                RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk.clone(), service_token(&sk))?;
             Some(Arc::new(registry_client))
         } else {
             None
@@ -3184,7 +3184,7 @@ mod tests {
                 "{function} must not construct a local Policy client in the deployed chain"
             );
         }
-        assert!(source.contains("PolicyClient::from_resolver"));
+        assert!(source.contains("PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider"));
     }
 
     #[test]

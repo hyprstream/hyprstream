@@ -813,7 +813,7 @@ impl Spawnable for OAuthService {
                 }
             };
             let policy_client = if hyprstream_discovery::native_network_required() {
-                PolicyClient::from_resolver(self.signing_key.clone(), None)
+                PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, self.signing_key.clone(), None)
                     .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create PolicyClient: {e}")))?
             } else {
                 PolicyClient::for_local_transport_bootstrap(
@@ -835,7 +835,7 @@ impl Spawnable for OAuthService {
                 }
             };
             let discovery_client = if hyprstream_discovery::native_network_required() {
-                hyprstream_rpc_std::discovery_client::DiscoveryClient::from_resolver(self.signing_key.clone(), None)
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, self.signing_key.clone(), None)
                     .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create DiscoveryClient: {e}")))?
             } else {
                 hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_transport_bootstrap(
@@ -1739,11 +1739,11 @@ mod tests {
             "DiscoveryClient::for_local_transport_bootstrap(\n                    &self.discovery_transport,"
         ));
         assert!(
-            run.contains("if hyprstream_discovery::native_network_required() {\n                PolicyClient::from_resolver("),
+            run.contains("if hyprstream_discovery::native_network_required() {\n                PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, "),
             "Required profile must resolve Policy through the checkpoint resolver"
         );
         assert!(
-            run.contains("if hyprstream_discovery::native_network_required() {\n                hyprstream_rpc_std::discovery_client::DiscoveryClient::from_resolver("),
+            run.contains("if hyprstream_discovery::native_network_required() {\n                hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, "),
             "Required profile must resolve Discovery through the checkpoint resolver"
         );
         assert!(

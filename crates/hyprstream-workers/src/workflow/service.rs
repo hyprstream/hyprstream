@@ -10,13 +10,14 @@ use tokio_util::sync::CancellationToken;
 use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
 use hyprstream_rpc::prelude::SigningKey;
+use hyprstream_rpc::events::EventSubscriber;
 use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 
 use hyprstream_vfs::Namespace;
 
 use crate::error::Result;
-use crate::events::{EventSubscriber, ReceivedEvent};
+use crate::events::ReceivedEvent;
 use crate::generated::workflow_client::{WorkflowHandler, dispatch_workflow};
 use hyprstream_rpc_std::workflow_client::{
     WorkflowResponseVariant,

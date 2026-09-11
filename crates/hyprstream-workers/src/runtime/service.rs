@@ -1,4 +1,4 @@
-//! WorkerService — CRI RuntimeClient + ImageClient control plane.
+//! WorkerService — AGPL implementation of the canonical worker control plane.
 //!
 //! Implements the `RequestService` trait for handling CRI-aligned requests.
 //!
@@ -15,7 +15,7 @@
 //!
 //! The **asynchronous** surfaces of the worker already ride the moq-lite
 //! streaming plane, mirroring the event-bus migration (#167): lifecycle events
-//! publish via [`EventPublisher`] (moq-backed — see `crate::events`) and
+//! publish via [`EventPublisher`] (moq-backed — see `hyprstream_rpc::events`) and
 //! terminal attach/detach FD data streams via `StreamChannel` /
 //! `AnyStreamPublisher` (moq). moq is a pub/sub fan-out plane, not a
 //! request/response RPC transport, so the synchronous CRI req/rep control plane
@@ -35,6 +35,7 @@ use tracing::{debug, info, warn};
 // bridged transport (inproc/UDS/QUIC/iroh) + the moq streaming plane. ZMQ is
 // gone (#138/#167) — this is not a ZMQ socket API.
 use hyprstream_rpc::moq_stream::AnyStreamPublisher;
+use hyprstream_rpc::events::EventPublisher;
 use hyprstream_rpc::prelude::SigningKey;
 use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, RequestService};
 use hyprstream_rpc::streaming::StreamChannel;
@@ -43,7 +44,6 @@ use hyprstream_rpc::transport::TransportConfig;
 use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 use crate::events::{
-    EventPublisher,
     // Event types and serialization helpers
     ContainerStarted, ContainerStopped, SandboxStarted, SandboxStopped,
     serialize_container_started, serialize_container_stopped,
@@ -89,7 +89,7 @@ use super::{RUNTIME_NAME, RUNTIME_VERSION};
 /// Service name for endpoint registry
 const SERVICE_NAME: &str = "worker";
 
-/// WorkerService handles CRI RuntimeClient and ImageClient requests
+/// WorkerService handles requests from the canonical worker contract.
 ///
 /// Implements the RequestService trait for integration with hyprstream's
 /// Cap'n Proto bridged RPC transport (inproc/UDS/systemd-fd + QUIC/Iroh); ZMQ is gone.

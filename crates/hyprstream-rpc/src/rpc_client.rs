@@ -1239,33 +1239,6 @@ pub trait RpcClientProvider: Send + Sync {
     ) -> Result<Arc<dyn RpcClient>>;
 }
 
-/// Install the process-wide provider used only by legacy
-/// `Client::from_resolver` compatibility constructors.
-///
-/// New applications should pass an explicit provider to `Client::from_provider`.
-/// The global is an opaque trait object: this crate does not know how a
-/// deployment resolves identities or endpoints.
-pub fn install_rpc_client_provider(provider: Arc<dyn RpcClientProvider>) -> Result<()> {
-    RPC_CLIENT_PROVIDER
-        .set(provider)
-        .map_err(|_| anyhow::anyhow!("RPC client provider is already installed"))
-}
-
-/// Resolve a client through the provider installed by the host application.
-pub fn rpc_client_from_provider(
-    service_name: &str,
-    signing_key: crate::crypto::SigningKey,
-    token: Option<String>,
-) -> Result<Arc<dyn RpcClient>> {
-    RPC_CLIENT_PROVIDER
-        .get()
-        .ok_or_else(|| anyhow::anyhow!("RPC client provider is not installed"))?
-        .rpc_client(service_name, signing_key, token)
-}
-
-static RPC_CLIENT_PROVIDER: std::sync::OnceLock<Arc<dyn RpcClientProvider>> =
-    std::sync::OnceLock::new();
-
 /// Blanket impl: any `RpcClientImpl<S, T>` satisfies `RpcClient`.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]

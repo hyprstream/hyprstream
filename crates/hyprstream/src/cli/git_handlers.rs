@@ -1335,7 +1335,7 @@ pub async fn handle_infer(
     let _ = ModelRef::parse(model_ref_str)?;
 
     // ModelService is already running (started by main.rs in inproc mode, or by systemd in ipc-systemd mode).
-    let model_client = ModelClient::from_resolver(
+    let model_client = ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
         signing_key.clone(),
         None,
     )?;
@@ -1492,7 +1492,7 @@ pub async fn handle_load(
     let load_kv_quant = if kv_quant == hyprstream_rpc_std::model_client::KVQuantType::None { None } else { Some(kv_quant) };
 
     // Issue the load RPC directly (returns immediately - Continuation pattern).
-    let model_client = ModelClient::from_resolver(
+    let model_client = ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
         signing_key.clone(), None,
     )?;
     match model_client.load(&LoadModelRequest {
@@ -1708,7 +1708,7 @@ pub async fn handle_unload(
     // Validate model reference format
     let _ = ModelRef::parse(model_ref_str)?;
 
-    let model_client = ModelClient::from_resolver(signing_key, None)?;
+    let model_client = ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
 
     model_client.unload(&UnloadModelRequest { model_ref: model_ref_str.to_owned() }).await?;
 

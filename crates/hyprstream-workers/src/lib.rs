@@ -8,10 +8,10 @@
 //!
 //! Two main services:
 //!
-//! - **WorkerService**: CRI-aligned RuntimeClient + ImageClient
+//! - **WorkerService**: AGPL implementation of the canonical worker contracts
 //!   - PodSandbox = Kata VM (maps to CRI sandbox concept)
 //!   - Container = OCI container within VM
-//!   - ImageClient backed by Nydus RAFS for chunk-level deduplication
+//!   - Image operations backed by Nydus RAFS for chunk-level deduplication
 //!
 //! - **WorkflowService**: High-level workflow orchestration
 //!   - Discovers `.github/workflows/*.yml` from RegistryService repos
@@ -85,8 +85,6 @@ pub use image::RafsStore;
 
 pub use workflow::WorkflowService;
 pub use events::{
-    // Publisher/Subscriber (moq-backed, no ZMQ context needed)
-    EventPublisher, EventSubscriber,
     // Event types
     WorkerEvent, ReceivedEvent,
     SandboxStarted, SandboxStopped, ContainerStarted, ContainerStopped,

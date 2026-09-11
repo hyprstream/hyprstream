@@ -1,4 +1,4 @@
-//! CRI RuntimeClient implementation
+//! CRI runtime service implementation
 //!
 //! Provides Kubernetes CRI-aligned APIs for managing pod sandboxes (Kata VMs)
 //! and containers. PodSandbox maps to a Kata VM, Container to an OCI container
@@ -9,7 +9,7 @@
 //! ```text
 //! WorkerService (RequestService)
 //!     │
-//!     ├── RuntimeClient trait (client-side interface)
+//!     ├── canonical RuntimeClient contract (`hyprstream-rpc-std`)
 //!     │     ├── run_pod_sandbox()    → Creates Kata VM
 //!     │     ├── create_container()   → Creates container in VM
 //!     │     ├── start_container()    → Starts container

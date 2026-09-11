@@ -26,7 +26,7 @@ use hyprstream_rpc_std::tui_client::{TuiClient, ConnectRequest, DisplayMode, Sen
 pub fn create_tui_client(signing_key: &SigningKey) -> Result<TuiClient> {
     let sk = signing_key.clone();
 
-    TuiClient::from_resolver(sk, None).context("Failed to create TuiClient")
+    TuiClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk, None).context("Failed to create TuiClient")
 }
 
 /// Attach to an existing TUI session.

@@ -163,14 +163,14 @@ pub async fn handle_shell_tui(
     let models = fetch_models(signing_key, models_dir).await;
 
     // Model load-status channel (background polling → event loop).
-    let model_client = hyprstream_rpc_std::model_client::ModelClient::from_resolver(
+    let model_client = hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
         signing_key.clone(), None,
     )?;
     // Worker client for sandbox/container/image management.
     let worker_client = {
-        hyprstream_rpc_std::worker_client::WorkerClient::from_resolver(signing_key.clone(), None)?
+        hyprstream_rpc_std::worker_client::WorkerClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), None)?
     };
-    let registry = hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(signing_key.clone(), None)?;
+    let registry = hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), None)?;
 
     let (model_status_tx, mut model_status_rx) =
         tokio::sync::mpsc::channel::<ModelStatusUpdate>(32);
@@ -505,7 +505,7 @@ pub async fn handle_shell_tui(
 
             _ = worker_refresh.tick() => {
                 if matches!(compositor.chrome.mode, hyprstream_compositor::ShellMode::WorkerManager { .. }) {
-                    
+
                     // Poll sandboxes + containers
                     if let Ok(sandbox_infos) = worker_client.sandbox().list(&hyprstream_rpc_std::worker_client::PodSandboxFilter::default()).await {
                         let mut entries = Vec::new();
@@ -1565,7 +1565,7 @@ async fn fetch_models(
     models_dir: &std::path::Path,
 ) -> Vec<ModelEntry> {
 
-    let registry: hyprstream_rpc_std::registry_client::RegistryClient = match hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(
+    let registry: hyprstream_rpc_std::registry_client::RegistryClient = match hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
         signing_key.clone(),
         None,
     ) {
@@ -1575,7 +1575,7 @@ async fn fetch_models(
             return Vec::new();
         }
     };
-    let model_client_for_status = match hyprstream_rpc_std::model_client::ModelClient::from_resolver(
+    let model_client_for_status = match hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
         signing_key.clone(),
         None,
     ) {

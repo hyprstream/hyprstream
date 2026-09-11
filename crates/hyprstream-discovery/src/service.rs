@@ -1373,13 +1373,6 @@ impl DiscoveryService {
             }))
             .map_err(|_| anyhow::anyhow!("production service resolver is already installed"))?;
 
-        // Keep the resolver implementation and its evidence in this AGPL
-        // crate, but make the typed-client compatibility path available to
-        // the host through the Apache provider seam. Explicit consumers should
-        // continue to use `Client::from_provider` instead.
-        let _ = hyprstream_rpc::install_rpc_client_provider(Arc::new(
-            crate::ProductionRpcClientProvider,
-        ));
         Ok(())
     }
 
@@ -6388,7 +6381,7 @@ mod resolver_tests {
         let resolver = Arc::new(resolver);
         let _ = PRODUCTION_RESOLVER.set(resolver);
         let client_signing = SigningKey::from_bytes(&[0x44; 32]);
-        let _client = hyprstream_rpc_std::discovery_client::DiscoveryClient::from_resolver(client_signing, None)
+        let _client = hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&crate::ProductionRpcClientProvider, client_signing, None)
             .unwrap_or_else(|e| panic!("generated resolver path failed: {e}"));
     }
 

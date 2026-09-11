@@ -1,6 +1,8 @@
 //! Cap'n Proto generated schemas
 //!
-//! This module re-exports the generated Cap'n Proto Rust code for:
+//! Canonical generated Cap'n Proto Rust code for the public RPC contracts lives
+//! in `hyprstream-rpc` and `hyprstream-rpc-std`; this module contains only
+//! application-specific stream payloads and compatibility-free helpers:
 //! - Events (pub/sub messaging)
 //! - Inference (generation requests/responses)
 //! - Registry (git repository management)

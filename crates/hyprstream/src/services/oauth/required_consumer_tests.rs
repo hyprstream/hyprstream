@@ -583,8 +583,8 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
         let model_service = crate::services::ModelService::new(
             crate::services::ModelServiceConfig::default(),
             model.clone(),
-            hyprstream_rpc_std::policy_client::PolicyClient::from_resolver(model.clone(), None)?,
-            hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(model.clone(), None)?,
+            hyprstream_rpc_std::policy_client::PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, model.clone(), None)?,
+            hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, model.clone(), None)?,
             TransportConfig::ipc(directory.path().join("model-must-not-exist.sock")),
             TransportConfig::ipc(&policy_socket),
         )
@@ -603,7 +603,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
         .await?;
         let registry_service = crate::services::RegistryService::new(
             directory.path().join("registry-data"),
-            hyprstream_rpc_std::policy_client::PolicyClient::from_resolver(
+            hyprstream_rpc_std::policy_client::PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
                 registry.clone(),
                 Some(registry_jwt),
             )?,
@@ -679,7 +679,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
             })
             .expect("checkpoint-accepted Model state");
         let registry_announcer =
-            hyprstream_rpc_std::discovery_client::DiscoveryClient::from_resolver(registry.clone(), None)?;
+            hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, registry.clone(), None)?;
         registry_announcer
             .announce(&service_announcement(
                 "registry",
@@ -688,7 +688,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
                 &policy,
             ))
             .await?;
-        let model_announcer = hyprstream_rpc_std::discovery_client::DiscoveryClient::from_resolver(model.clone(), None)?;
+        let model_announcer = hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, model.clone(), None)?;
         model_announcer
             .announce(&service_announcement(
                 "model",
@@ -697,11 +697,11 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
                 &policy,
             ))
             .await?;
-        let registry_client = hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(
+        let registry_client = hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
             oai.clone(),
             Some(oai_jwt.clone()),
         )?;
-        let model_client = hyprstream_rpc_std::model_client::ModelClient::from_resolver(
+        let model_client = hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
             oai.clone(),
             Some(oai_jwt),
         )?;
@@ -1011,7 +1011,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
             .expect_err("non-healthy Registry response must withhold OAI readiness");
         assert!(unhealthy.to_string().contains("degraded"));
         *registry_status.lock() = "healthy".to_owned();
-        let unauthenticated = hyprstream_rpc_std::registry_client::RegistryClient::from_resolver(
+        let unauthenticated = hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
             SigningKey::from_bytes(&[0x7f; 32]),
             None,
         )?;

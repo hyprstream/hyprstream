@@ -1,4 +1,4 @@
-//! CRI ImageClient implementation with Dragonfly-native blob fetching
+//! CRI image service implementation with Dragonfly-native blob fetching
 //!
 //! Provides Kubernetes CRI-aligned APIs for managing container images.
 //! Backed by Nydus RAFS for chunk-level CAS deduplication.
@@ -6,7 +6,7 @@
 //! # Architecture
 //!
 //! ```text
-//! ImageClient (CRI-aligned, client-side interface)
+//! The canonical ImageClient contract and client live in `hyprstream-rpc-std`.
 //!     │
 //!     ├── list_images()     → List available images
 //!     ├── image_status()    → Get image details

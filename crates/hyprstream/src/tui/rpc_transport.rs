@@ -59,7 +59,7 @@ pub fn make_chat_spawner(
             };
 
             rt.block_on(async move {
-                let model_client = match ModelClient::from_resolver(sk_inner.clone(), None) {
+                let model_client = match ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk_inner.clone(), None) {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = tx.send(ChatEvent::StreamError(format!(
@@ -256,7 +256,7 @@ pub fn make_tool_caller(
                 .build()
                 .ok()?;
             rt.block_on(async move {
-                let gen: GenMcpClient = GenMcpClient::from_resolver(sk_fetch, None).ok()?;
+                let gen: GenMcpClient = GenMcpClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk_fetch, None).ok()?;
                 let tool_list = gen.list_tools().await.ok()?;
                 let mut descs = HashMap::new();
                 let mut tools = Vec::new();
@@ -300,7 +300,7 @@ pub fn make_tool_caller(
                         Err(e) => return format!("error: {e}"),
                     };
                     rt.block_on(async move {
-                        let mcp_client = match GenMcpClient::from_resolver(sk_c, None) {
+                        let mcp_client = match GenMcpClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk_c, None) {
                             Ok(c) => c,
                             Err(e) => return format!("error: failed to create McpClient: {e}"),
                         };

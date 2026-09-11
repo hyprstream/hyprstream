@@ -154,7 +154,7 @@ pub fn policy_client_for_process(
     token: Option<String>,
 ) -> anyhow::Result<PolicyClient> {
     if hyprstream_discovery::native_network_required() {
-        PolicyClient::from_resolver(signing_key, token)
+        PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, token)
     } else {
         PolicyClient::for_local_bootstrap(signing_key, compatibility_key, token)
     }
@@ -167,7 +167,7 @@ pub fn discovery_client_for_process(
     token: Option<String>,
 ) -> anyhow::Result<DiscoveryClient> {
     if hyprstream_discovery::native_network_required() {
-        DiscoveryClient::from_resolver(signing_key, token)
+        DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, token)
     } else {
         DiscoveryClient::for_local_bootstrap(signing_key, compatibility_key, token)
     }

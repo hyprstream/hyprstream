@@ -504,7 +504,7 @@ fn register_scoped_tools_recursive(
                             {
                                 "registry" => {
                                     let client: RegistryClient =
-                                        RegistryClient::from_resolver(ctx.signing_key, None)?;
+                                        RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, ctx.signing_key, None)?;
                                     client
                                         .call_scoped_streaming_method(
                                             &scope_refs,
@@ -515,7 +515,7 @@ fn register_scoped_tools_recursive(
                                         .await?
                                 }
                                 "model" => {
-                                    let client = ModelClient::from_resolver(ctx.signing_key, None)?;
+                                    let client = ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, ctx.signing_key, None)?;
                                     client
                                         .call_scoped_streaming_method(
                                             &scope_refs,
@@ -624,11 +624,11 @@ async fn dispatch_scoped_call(
     let result = match service {
         "registry" => {
             let client: RegistryClient =
-                RegistryClient::from_resolver(ctx.signing_key.clone(), None)?;
+                RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, ctx.signing_key.clone(), None)?;
             client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         "model" => {
-            let client = ModelClient::from_resolver(ctx.signing_key.clone(), None)?;
+            let client = ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, ctx.signing_key.clone(), None)?;
             client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         _ => anyhow::bail!("No scoped dispatch for service: {service}"),
@@ -690,19 +690,19 @@ fn register_streaming_tool(
                 let stream_info: hyprstream_rpc::stream_info::StreamInfo = match service.as_str() {
                     "registry" => {
                         let client: RegistryClient =
-                            RegistryClient::from_resolver(ctx.signing_key, None)?;
+                            RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, ctx.signing_key, None)?;
                         client
                             .call_streaming_method(&method, &ctx.args, client_pubkey_bytes)
                             .await?
                     }
                     "model" => {
-                        let client = ModelClient::from_resolver(ctx.signing_key, None)?;
+                        let client = ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, ctx.signing_key, None)?;
                         client
                             .call_streaming_method(&method, &ctx.args, client_pubkey_bytes)
                             .await?
                     }
                     "tui" => {
-                        let client = TuiClient::from_resolver(ctx.signing_key, None)?;
+                        let client = TuiClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, ctx.signing_key, None)?;
                         client
                             .call_streaming_method(&method, &ctx.args, client_pubkey_bytes)
                             .await?
@@ -834,28 +834,28 @@ async fn dispatch_schema_call(
 
     match service {
         "model" => {
-            let client = ModelClient::from_resolver(signing_key, None)?;
+            let client = ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
             client.call_method(method, &ctx.args).await
         }
         "registry" => {
-            let client: RegistryClient = RegistryClient::from_resolver(signing_key, None)?;
+            let client: RegistryClient = RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
             client.call_method(method, &ctx.args).await
         }
         "policy" => ctx.policy_client.call_method(method, &ctx.args).await,
         "tui" => {
-            let client = TuiClient::from_resolver(signing_key, None)?;
+            let client = TuiClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
             client.call_method(method, &ctx.args).await
         }
         "workflow" => {
             // Delegated-bearer relay path (#989 review). The MCP envelope is
             // signed by the MCP service key, so a cnf.jwk/cnf.jkt-bound caller
             // token MUST travel as a delegated bearer (with_delegated_bearer),
-            // not as a direct bearer on from_resolver — direct would bind cnf
+            // not as a direct bearer on from_provider — direct would bind cnf
             // to the relay key and the token would fail verification at
             // WorkflowService. WorkflowService's authorize callback relays the
             // delegated bearer to PolicyService via check_with_verified_bearer
             // (same path as WorkerService), which validates the delegation.
-            let mut client = WorkflowClient::from_resolver(signing_key, None)?;
+            let mut client = WorkflowClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
             if let Some(bearer) = ctx.token.as_ref() {
                 client = client.with_delegated_bearer(bearer.clone());
             }
@@ -953,7 +953,7 @@ impl McpService {
         // IPC transport — registry-free, so a separate rootless Quadlet
         // process can reach the PolicyService socket.
         let policy_client = if hyprstream_discovery::native_network_required() {
-            PolicyClient::from_resolver(config.signing_key.clone(), None)?
+            PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, config.signing_key.clone(), None)?
         } else {
             PolicyClient::for_local_transport_bootstrap(
                 &config.policy_transport,
@@ -1348,7 +1348,7 @@ impl McpHandler for McpService {
     ) -> anyhow::Result<McpResponseVariant> {
         let loaded_model_count = {
             // Status check uses local identity (internal health check, no user context)
-            let client = ModelClient::from_resolver(self.signing_key.clone(), None)?;
+            let client = ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, self.signing_key.clone(), None)?;
             client
                 .status(&hyprstream_rpc_std::model_client::StatusRequest {
                     model_ref: String::new(),
@@ -1572,20 +1572,15 @@ mod tests {
 
     /// #989 review (1194b0d55 follow-up): the workflow dispatch arm must relay a
     /// cnf.jwk/cnf.jkt-bound caller token via the **delegated-bearer** path
-    /// (`with_delegated_bearer`), not as a direct bearer on `from_resolver`. The
+    /// (`with_delegated_bearer`), not as a direct bearer on `from_provider`. The
     /// MCP envelope is signed by the MCP service key; a direct bearer would bind
     /// `cnf` to the relay key and the token would fail at WorkflowService.
     ///
-    /// `WorkflowClient::from_resolver` unconditionally requires
-    /// `hyprstream_discovery`'s checkpoint-backed production resolver to be
-    /// installed (`production_rpc_client` bails otherwise) — a process-bootstrap
-    /// singleton no unit test installs, and no local/inproc registration can
-    /// substitute for. Dynamically constructing a real `WorkflowClient` here is
-    /// therefore not possible in an isolated unit test; pin the dispatch arm's
-    /// bearer semantics structurally instead, directly over its source text, so
-    /// no bootstrap globals (registry/policy/discovery) are needed at all. Full
-    /// runtime validation (token reaches `WorkflowService::authorize` via a live
-    /// resolver + PolicyService) remains CI/integration-test scope.
+    /// The production provider is deployment-owned, so an isolated unit test
+    /// pins the dispatch arm's bearer semantics structurally over its source
+    /// text. Full runtime validation (token reaches
+    /// `WorkflowService::authorize` via a live resolver + PolicyService)
+    /// remains CI/integration-test scope.
     #[test]
     fn workflow_dispatch_uses_delegated_bearer_relay_path() {
         let source = include_str!("mcp_service.rs");
@@ -1603,8 +1598,8 @@ mod tests {
         let workflow_arm = &production[arm_start..arm_start + arm_end];
 
         assert!(
-            workflow_arm.contains("WorkflowClient::from_resolver(signing_key, None)"),
-            "workflow arm must dial with from_resolver(signing_key, None) — no direct bearer"
+            workflow_arm.contains("WorkflowClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)"),
+            "workflow arm must dial with the explicit provider — no direct bearer"
         );
         assert!(
             workflow_arm.contains("if let Some(bearer) = ctx.token.as_ref()"),
@@ -1615,8 +1610,8 @@ mod tests {
             "workflow arm must relay the caller token via with_delegated_bearer, not a direct bearer"
         );
         assert!(
-            !workflow_arm.contains("from_resolver(signing_key, Some"),
-            "workflow arm must NOT pass the caller token as a direct bearer on from_resolver — \
+            !workflow_arm.contains("from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, Some"),
+            "workflow arm must NOT pass the caller token as a direct bearer on from_provider — \
              a cnf.jwk/cnf.jkt-bound caller token would fail verification at WorkflowService"
         );
     }
