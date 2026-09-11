@@ -8,6 +8,9 @@ This crate bundles:
 
 - **Cap'n Proto generated modules** for every first-party service: `inference_capnp`, `model_capnp`, `registry_capnp`, `policy_capnp`, `mcp_capnp`, `metrics_capnp`, `notification_capnp`, `discovery_capnp`, `worker_capnp`, `workflow_capnp`, `tui_capnp`, and compositor IPC.
 - **Generated typed clients** (`InferenceClient`, `ModelClient`, `PolicyClient`, `WorkerClient`, `WorkflowClient`, `DiscoveryClient`, `TuiClient`, etc.) produced by `generate_rpc_client!`. They are Apache-2.0 and accept an application-supplied `RpcClientProvider` for deployment-specific endpoint resolution.
+- **MIT settlement/tariff protocol** re-exported as `pay_client`; the source
+  remains `hyprstream-pay` and the AGPL service implementation is not pulled
+  into this crate.
 - **WASM bindings** (`wasm_api.rs`): `wasm_bindgen` exports for the browser RPC client — `send_rpc`, `verify_signed_envelope`, `register_pq_trust`, `unregister_pq_trust`, `clear_pq_trust`.
 
 ## Targets

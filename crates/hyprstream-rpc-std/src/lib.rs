@@ -4,8 +4,10 @@
 //! generated client types for all standard hyprstream services (model,
 //! registry, inference, policy, mcp, etc.).
 //!
-//! Apache-2.0 licensed. Depends only on hyprstream-rpc (also Apache-2.0).
-//! Compiles to native and wasm32.
+//! The generated service client/data surface is Apache-2.0.  The
+//! `pay_client` module is a license-preserving re-export of the separately
+//! MIT-licensed `hyprstream-pay` protocol.  No AGPL service implementation is
+//! in this dependency graph. Compiles to native and wasm32.
 
 #![allow(dead_code, unused_imports)]
 
