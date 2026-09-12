@@ -6,6 +6,7 @@
 #
 # Commands:
 #   build [VARIANT]      Build and package AppImage (default: all variants + universal)
+#   package-universal    Package universal AppImage from staged backend outputs
 #   clean [VARIANT]      Clean libtorch cache and build artifacts
 #   help                 Show this help message
 #
@@ -19,6 +20,7 @@
 #   ./build-appimage.sh build                    # Build all variants + universal
 #   ./build-appimage.sh build cpu --version 1.0  # Build only CPU variant
 #   ./build-appimage.sh build universal          # Build all variants into universal AppImage
+#   ./build-appimage.sh package-universal        # Package from prior stage commands
 #   ./build-appimage.sh clean                    # Clean everything
 #   ./build-appimage.sh clean cuda128            # Clean only CUDA 12.8 libtorch
 #
@@ -207,6 +209,7 @@ create_appimage() {
 
 # Create universal AppImage with all backends
 create_universal_appimage() {
+    local staged_only="${1:-0}"
     local appdir="$BUILD_DIR/hyprstream-universal.AppDir"
     local output="$OUTPUT_DIR/hyprstream-${VERSION}-${APPIMAGE_ARCH}.AppImage"
     local staging="$BUILD_DIR/universal-staging"
@@ -222,6 +225,9 @@ create_universal_appimage() {
             cp "$staging/bin/hyprstream-$variant" "$appdir/usr/bin/"
             mkdir -p "$appdir/usr/lib/$variant/libtorch/lib"
             cp -r "$staging/lib/$variant/libtorch/lib/"* "$appdir/usr/lib/$variant/libtorch/lib/"
+        elif [[ "$staged_only" == "1" ]]; then
+            log_error "Staged backend output is missing for $variant"
+            return 1
         else
             cp "$BUILD_DIR/bin/hyprstream-$variant" "$appdir/usr/bin/"
             mkdir -p "$appdir/usr/lib/$variant/libtorch/lib"
@@ -240,6 +246,18 @@ create_universal_appimage() {
     mkdir -p "$OUTPUT_DIR"
     ARCH="$APPIMAGE_ARCH" "$APPIMAGETOOL" "$appdir" "$output"
     log_success "Created: $output"
+}
+
+# Package a universal AppImage without compiling or downloading anything. The
+# per-backend workflow steps call stage before clean, so this command consumes
+# only outputs from this run and fails closed when one is absent.
+cmd_package_universal() {
+    validate_variant universal
+    log_info "Packaging universal AppImage from staged backend outputs"
+    ensure_appimagetool
+    create_universal_appimage 1
+    log_success "Universal package complete"
+    ls -lh "$OUTPUT_DIR/hyprstream-${VERSION}-${APPIMAGE_ARCH}.AppImage"
 }
 
 # Command: build
@@ -357,6 +375,9 @@ main() {
             ;;
         stage)
             cmd_stage "$variant"
+            ;;
+        package-universal)
+            cmd_package_universal
             ;;
         clean)
             cmd_clean "$variant"

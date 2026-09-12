@@ -68,6 +68,11 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
+      - name: Verify cache credentials before compilation
+        run: |
+          aws sts get-caller-identity
+          sccache --show-stats
+
       - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
@@ -113,6 +118,20 @@ jobs:
           path: appimage/output/*-cuda128-*.AppImage
           retention-days: 5
 
+      # The x86 variants are intentionally kept on one runner so they share
+      # Cargo and libtorch downloads. Refresh the short-lived OIDC session
+      # before the remaining builds can cross the default one-hour boundary.
+      - name: Refresh cache credentials before CUDA 13.0 and ROCm
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_SCCACHE_REGION }}
+
+      - name: Restart sccache with refreshed credentials
+        run: |
+          sccache --stop-server || true
+          aws sts get-caller-identity
+
       - name: Build CUDA 13.0 AppImage
         run: |
           ./appimage/build-appimage.sh build cuda130 --version ${{ steps.version.outputs.version }}
@@ -141,7 +160,7 @@ jobs:
 
       - name: Build Universal AppImage
         run: |
-          ./appimage/build-appimage.sh build universal --version ${{ steps.version.outputs.version }}
+          ./appimage/build-appimage.sh package-universal --version ${{ steps.version.outputs.version }}
 
       - name: Upload Universal AppImage
         uses: actions/upload-artifact@v4
@@ -186,7 +205,7 @@ jobs:
             "$BUILDER_IMAGE" \
             bash -euo pipefail -c '
               apt-get update
-              apt-get install -y --no-install-recommends squashfs-tools
+              apt-get install -y --no-install-recommends file squashfs-tools
               version="${GITHUB_REF_NAME#v}"
               [[ "$version" == "$GITHUB_REF_NAME" ]] && version=dev
               ./appimage/build-appimage.sh build cpu --version "$version"
