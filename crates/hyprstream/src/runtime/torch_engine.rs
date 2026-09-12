@@ -1605,6 +1605,91 @@ impl TorchEngine {
     }
 }
 
+/// Rewind the model's installed session cache to a matched prefix.
+///
+/// Pure-attention models: truncating the KV cache to `prefix_len` is exact, so
+/// any prefix length is reusable (unchanged behavior).
+///
+/// Hybrid recurrent models (Qwen3.5): the GDN conv/rec state is Markovian and
+/// cannot be truncated to an arbitrary position — it can only be restored to
+/// the end-of-prefill snapshot stored with the cached tokens (see
+/// [`KVCacheManager::set_cached_tokens_with_ssm`]). A prefix hit is therefore
+/// reusable only when the FULL cached sequence matched
+/// (`prefix_len == cached_token_count()`) and a snapshot is present; anything
+/// else discards KV + SSM state and forces a full recompute, because decoding
+/// from a truncated KV with stale recurrent state silently produces tokens
+/// conditioned on the wrong context.
+///
+/// Returns the number of reusable prefix tokens (0 = cache cleared, full
+/// prefill required). The caller must guarantee a strict partial hit
+/// (`prefix_len < prompt_len`); the exact-prompt-repeat decision lives in
+/// [`resolve_session_prefill_start`].
+pub(crate) fn rewind_session_state(model: &dyn ModelOperations, prefix_len: usize) -> usize {
+    let Some(cache) = model.get_kv_cache() else {
+        return 0;
+    };
+    let q35 = model
+        .as_any()
+        .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>();
+    let Some(q35) = q35 else {
+        cache.lock().truncate_to(prefix_len);
+        return prefix_len;
+    };
+
+    let snapshot = {
+        let cache_guard = cache.lock();
+        if prefix_len == cache_guard.cached_token_count() {
+            cache_guard.ssm_snapshot()
+        } else {
+            None
+        }
+    };
+    match snapshot {
+        Some((conv_snap, rec_snap)) => {
+            cache.lock().truncate_to(prefix_len);
+            q35.restore_ssm_states(conv_snap, rec_snap);
+            prefix_len
+        }
+        None => {
+            // Partial prefix match (or no snapshot): recurrent state cannot be
+            // rewound to an intermediate position — recompute from scratch.
+            model.clear_kv_cache();
+            0
+        }
+    }
+}
+
+/// Decide the prefill start position for a session-cache prefix match.
+///
+/// A strict partial hit (`0 < prefix_len < prompt_len`) is reusable: there is
+/// a nonempty suffix left to prefill, and [`rewind_session_state`] puts the
+/// cache and model into the exact end-of-prefix state.
+///
+/// An exact-prompt repeat (`prefix_len == prompt_len` — the session resending
+/// its previous prompt verbatim, `prefix_len == cached_token_count()`) is NOT
+/// reusable even though the full cached sequence matched: no tokens remain to
+/// prefill, and sampling the first new token needs logits for the last prompt
+/// position, which the cache does not retain. The engine must re-run the whole
+/// prompt, and that re-run must start from CLEARED state — prefilling onto the
+/// restored KV plus end-of-prefill GDN snapshot would advance the recurrent
+/// state over the prompt a second time, producing wrong logits (and a wrong
+/// end-of-prefill snapshot for the next turn). A miss (`prefix_len == 0`)
+/// clears and starts fresh as before.
+///
+/// Returns the prefill start position (0 = cache cleared, full prefill).
+pub(crate) fn resolve_session_prefill_start(
+    model: &dyn ModelOperations,
+    prefix_len: usize,
+    prompt_len: usize,
+) -> usize {
+    if prefix_len > 0 && prefix_len < prompt_len {
+        rewind_session_state(model, prefix_len)
+    } else {
+        model.clear_kv_cache();
+        0
+    }
+}
+
 impl TorchEngine {
     /// Stable, content-free label identifying the loaded model for OTel metric
     /// attributes (#1261). Prefers the model name (set on load); falls back to
@@ -2597,6 +2682,213 @@ mod tests {
         }
     }
 
+    // ===== Session-cache recording vs cancellation-before-first-poll =====
+
+    /// Minimal `ArchitectureConfig` for the recording stub below: no model
+    /// math is exercised, only the configuration surface the trait requires.
+    struct StubArchConfig;
+    impl crate::runtime::architectures::ArchitectureConfig for StubArchConfig {
+        fn num_attention_heads(&self) -> usize { 4 }
+        fn num_key_value_heads(&self) -> usize { 4 }
+        fn hidden_size(&self) -> usize { 16 }
+        fn intermediate_size(&self) -> usize { 32 }
+        fn vocab_size(&self) -> usize { 16 }
+        fn max_position_embeddings(&self) -> usize { 64 }
+        fn rope_theta(&self) -> Option<f32> { None }
+        fn rope_dim(&self) -> Option<usize> { None }
+        fn layer_norm_eps(&self) -> f32 { 1e-5 }
+        fn use_rms_norm(&self) -> bool { true }
+    }
+
+    /// Model stub for cache-recording tests: holds a real (empty)
+    /// `KVCacheManager` and serves it to the engine's save path via
+    /// `get_kv_cache`. No forward is ever called — these tests exercise stream
+    /// construction, drop, and cache recording only, so every compute method
+    /// stays on the trait's `Err`/no-op defaults.
+    struct RecordingStubModel {
+        cache: Option<Arc<Mutex<crate::runtime::KVCacheManager>>>,
+    }
+    impl ModelOperations for RecordingStubModel {
+        fn architecture(&self) -> crate::runtime::architectures::ModelArchitecture {
+            crate::runtime::architectures::ModelArchitecture::Llama { version: 3 }
+        }
+        fn config(&self) -> &dyn crate::runtime::architectures::ArchitectureConfig {
+            &StubArchConfig
+        }
+        fn forward(&self, _input: &Tensor, _past_kv: Option<&Tensor>) -> Result<Tensor> {
+            Err(anyhow!("recording tests never poll the stream"))
+        }
+        fn reshape_for_attention(&self, tensor: &Tensor, _is_key_value: bool) -> Result<Tensor> {
+            Ok(tensor.shallow_clone())
+        }
+        fn apply_rope(&self, tensor: &Tensor, _position_ids: &Tensor) -> Result<Tensor> {
+            Ok(tensor.shallow_clone())
+        }
+        fn normalize(&self, tensor: &Tensor) -> Result<Tensor> {
+            Ok(tensor.shallow_clone())
+        }
+        fn get_attention_mask(&self, _seq_len: usize, _past_kv_len: usize) -> Result<Tensor> {
+            Err(anyhow!("recording tests never poll the stream"))
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn get_kv_cache(
+            &self,
+        ) -> Option<Arc<Mutex<crate::runtime::KVCacheManager>>> {
+            self.cache.clone()
+        }
+        fn set_kv_cache(&mut self, cache: Arc<Mutex<crate::runtime::KVCacheManager>>) {
+            self.cache = Some(cache);
+        }
+        fn clear_kv_cache(&self) {
+            // Same shape as the real architectures: route the clear through
+            // the installed KVCacheManager so the metadata contract under
+            // test is the production `clear_all` path.
+            if let Some(cache) = &self.cache {
+                let mut guard = cache.lock();
+                guard.clear_all();
+            }
+        }
+    }
+
+    /// Regression (cancellation before first poll): dropping a stream that was
+    /// never polled must NOT record its prompt IDs into the session cache.
+    /// Exact-hit/miss resolution in `TextStream::new` clears the cache at
+    /// generation setup, before any forward — recording IDs over that empty
+    /// state would let a later extending prompt claim a prefix_len against KV
+    /// that does not exist (the pure-attention hit path would partial-prefill
+    /// from mid-prompt with no history behind it). `prefill_time_ms` is Some
+    /// exactly when the first prefill forward completed, so it gates recording.
+    #[test]
+    fn drop_before_first_poll_does_not_record_session_cache() {
+        let mut engine = TorchEngine::new(RuntimeConfig {
+            use_gpu: false,
+            ..RuntimeConfig::default()
+        })
+        .expect("CPU engine should construct without a model");
+
+        // In-memory tokenizer (same pattern as the log-redaction tests);
+        // "hello world" → [0, 1].
+        *engine.tokenizer.lock() = Some(redact_test_tokenizer());
+
+        // A real empty KV cache served by the stub model — the recording target.
+        let cache: Arc<Mutex<crate::runtime::KVCacheManager>> =
+            Arc::new(Mutex::new(crate::runtime::KVCacheManager::new(
+            2,
+            64,
+            crate::runtime::KVQuantType::None,
+        )));
+        engine.persistent_model = Some(Arc::new(Mutex::new(Box::new(RecordingStubModel {
+            cache: Some(cache.clone()),
+        }))));
+
+        let request = GenerationRequest {
+            prompt: "hello world".to_owned(),
+            ..Default::default()
+        };
+        let stream = TextStream::new(&engine, request).expect("stream should construct");
+        // Cancellation: dropped before the first poll — no prefill ever ran.
+        drop(stream);
+
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            0,
+            "a drop before the first poll must not record prompt IDs over the cleared cache"
+        );
+
+        // The downstream hazard: a later extending prompt must not claim a
+        // reusable prefix over state that was never prefilled.
+        let extended = vec![0i64, 1, 5, 9];
+        assert_eq!(
+            cache.lock().prefix_match_len(&extended),
+            0,
+            "no prefix may be claimed over cache state that was never computed"
+        );
+    }
+
+    /// Regression (prior-session metadata vs cancellation): a cache populated
+    /// by an earlier turn (prompt IDs + end-of-prefill SSM snapshot) must not
+    /// retain that metadata after the set-up clear that a later turn's exact
+    /// hit or miss performs at generation setup. That clear runs before any
+    /// forward; if the turn is then cancelled before its first poll, nothing
+    /// new is recorded — so a subsequent extending prompt would otherwise
+    /// claim a prefix (and, for hybrid models, restore a stale snapshot)
+    /// against KV that no longer exists.
+    #[test]
+    fn setup_clear_drops_prior_session_metadata_on_cancelled_turn() {
+        let mut engine = TorchEngine::new(RuntimeConfig {
+            use_gpu: false,
+            ..RuntimeConfig::default()
+        })
+        .expect("CPU engine should construct without a model");
+        *engine.tokenizer.lock() = Some(redact_test_tokenizer());
+
+        // Registry + session owner so the swap path engages: the set-up clear
+        // then runs through resolve_session_prefill_start exactly as the
+        // production prefix-detection branch drives it.
+        let registry = Arc::new(crate::runtime::kv_cache::KVCacheRegistry::new(
+            crate::runtime::kv_cache::CacheConfig {
+                num_layers: 2,
+                max_seq_len: 64,
+                quant_type: crate::runtime::KVQuantType::None,
+                paged: false,
+            },
+            None,
+        ));
+        let owner = crate::runtime::kv_cache::CacheOwner::Session("s1".to_owned());
+        let prior = registry.get_or_create(owner.clone());
+        // Stamp the cache compatibly so the #1277 reuse policy keeps it and
+        // prefix detection actually sees the prior metadata.
+        let mut desc = crate::runtime::kv_compat::KvCompatDescriptor::default();
+        desc.weights.base_revision = "test-base".to_owned();
+        desc.set_tokenizer(16, Some("test-tok-hash".to_owned()));
+        *engine.kv_compat.lock() = Some(desc);
+        {
+            let mut prior_guard = prior.lock();
+            prior_guard.set_compat_fingerprint(engine.kv_compat_fingerprint_for(0).unwrap());
+            let opt = (tch::Kind::Float, Device::Cpu);
+            let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
+            let rec = vec![Some(Tensor::zeros([4], opt)), None];
+            // Prior turn's prompt [0, 1, 7] strictly extends this turn's
+            // ("hello world" → [0, 1]): the request is an exact hit, whose
+            // set-up clear routes through resolve_session_prefill_start →
+            // model.clear_kv_cache() — the production boundary under test.
+            prior_guard.set_cached_tokens_with_ssm(vec![0, 1, 7], Some((conv, rec)));
+        }
+        engine.kv_cache_registry = Some(registry);
+        *engine.active_cache_owner.lock() = Some(owner);
+        engine.persistent_model = Some(Arc::new(Mutex::new(Box::new(RecordingStubModel {
+            cache: None,
+        }))));
+
+        let request = GenerationRequest {
+            prompt: "hello world".to_owned(),
+            ..Default::default()
+        };
+        let stream = TextStream::new(&engine, request).expect("stream should construct");
+        // Cancelled before the first poll: the set-up clear has run, and no
+        // new recording can happen.
+        drop(stream);
+
+        // `prior` is the same Arc the swap installed into the model.
+        let guard = prior.lock();
+        assert_eq!(
+            guard.cached_token_count(),
+            0,
+            "prior prompt IDs must not survive the set-up clear"
+        );
+        assert!(
+            guard.ssm_snapshot().is_none(),
+            "prior end-of-prefill SSM snapshot must not survive the set-up clear"
+        );
+        assert_eq!(
+            guard.prefix_match_len(&[0, 1, 7, 4]),
+            0,
+            "an extending prompt must not claim a prefix over cleared KV"
+        );
+    }
+
     /// Run `f` under a thread-local TRACE subscriber whose output is captured.
     /// TRACE is deliberate: #1253 forbids relocating prompt text to DEBUG, so
     /// the canary must be absent even at the lowest log level.
@@ -3254,6 +3546,12 @@ pub struct TextStream<'a> {
     prompt_len: usize,
     /// Position from which prefill should start (0 = full prefill, >0 = partial via prefix cache hit)
     prefill_start_pos: usize,
+    /// SSM (conv/rec) state snapshot captured at end-of-prefill (hybrid
+    /// recurrent models only; `None` for pure-attention models). Saved into
+    /// the session cache by `save_cached_tokens` so a later prefix hit can
+    /// rewind the recurrent state alongside the KV truncation
+    /// (`rewind_session_state`).
+    prefill_ssm_snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>,
     /// KV cache position tracking for this stream
     /// Each stream has exclusive access via &mut self, so no atomic needed
     kv_cache_position: usize,
@@ -3400,15 +3698,20 @@ impl<'a> TextStream<'a> {
             };
 
             if prefix_len > 0 && prefix_len <= prompt_len {
-                // Truncate cache to the matched prefix (discard stale suffix from prior turn)
+                // Resolve the hit: a strict partial prefix rewinds cached
+                // state (KV truncation; hybrid recurrent models additionally
+                // restore the end-of-prefill GDN conv/rec snapshot). An
+                // exact-prompt repeat (`prefix_len == prompt_len`) must
+                // recompute from cleared state instead — there is no suffix
+                // left to prefill, and the fresh forward would double-advance
+                // restored recurrent state. Both decisions live in
+                // `resolve_session_prefill_start`.
                 if let Some(model_arc) = &engine.persistent_model {
                     let model = model_arc.lock();
-                    if let Some(cache) = model.get_kv_cache() {
-                        let cache_guard = cache.lock();
-                        cache_guard.truncate_to(prefix_len);
-                    }
+                    resolve_session_prefill_start(model.as_ref(), prefix_len, prompt_len)
+                } else {
+                    0
                 }
-                prefix_len
             } else {
                 // No match — clear and start fresh
                 engine.clear_kv_cache();
@@ -3491,6 +3794,7 @@ impl<'a> TextStream<'a> {
             decode_stream,
             prompt_len,
             prefill_start_pos,
+            prefill_ssm_snapshot: None, // Captured after prefill (see sample_next_token)
             // KV cache starts with prompt already in it after first forward
             kv_cache_position: prompt_len,
             tokens_generated: 0,
@@ -3584,7 +3888,24 @@ impl<'a> TextStream<'a> {
     /// Save the current token sequence (prompt + generated) to the session KV cache.
     ///
     /// Called when generation finishes so the next turn can detect prefix overlap.
-    fn save_cached_tokens(&self) {
+    /// For hybrid recurrent models (Qwen3.5) the end-of-prefill SSM snapshot
+    /// captured in `sample_next_token` is stored alongside the tokens, making
+    /// the next turn's prefix hit rewindable (`rewind_session_state`).
+    fn save_cached_tokens(&mut self) {
+        // Session-cache recording describes the model's live KV/SSM state,
+        // which exists only once this stream's first prefill completed. A drop
+        // before the first poll (cancellation, client disconnect) reaches this
+        // Drop with the cache already cleared — exact-hit/miss resolution runs
+        // at generation setup, before any forward — and a failed first prefill
+        // can leave partial forward state matching no token count. Recording
+        // prompt IDs in either case lets a later extending prompt claim a
+        // prefix_len over missing or wrong state (a pure-attention partial
+        // prefill would then resume with no history behind it). `prefill_time_ms`
+        // is set exactly when the first prefill forward returned successfully
+        // (see `sample_next_token`), so it is the fail-safe recording gate.
+        if self.prefill_time_ms.is_none() {
+            return;
+        }
         if let Some(model_arc) = &self.engine.persistent_model {
             let model = model_arc.lock();
             if let Some(cache) = model.get_kv_cache() {
@@ -3593,7 +3914,10 @@ impl<'a> TextStream<'a> {
                 // We only save the prompt (not generated tokens) because the next turn's
                 // prompt will include the assistant's response via the chat template —
                 // so the entire current prompt becomes a prefix of the next turn's prompt.
-                cache_guard.set_cached_tokens(self.prompt_tokens.clone());
+                cache_guard.set_cached_tokens_with_ssm(
+                    self.prompt_tokens.clone(),
+                    self.prefill_ssm_snapshot.take(),
+                );
                 tracing::debug!(
                     "Saved {} cached tokens for prefix matching on next turn",
                     cache_guard.cached_token_count()
@@ -3673,6 +3997,13 @@ impl<'a> TextStream<'a> {
                 }
             };
             let prefill_elapsed = prefill_start.elapsed();
+
+            // Hybrid recurrent models (Qwen3.5): capture the SSM conv/rec state
+            // as of end-of-prefill, before decode advances it. `save_cached_tokens`
+            // stores it with the prompt tokens so a later session prefix hit can
+            // rewind the recurrent state (KV truncation alone cannot). This is a
+            // cheap downcast returning `None` for pure-attention models.
+            self.prefill_ssm_snapshot = self.engine.snapshot_ssm_states();
 
             // Store prefill timing
             self.prefill_time_ms = Some(prefill_elapsed.as_millis() as u64);
