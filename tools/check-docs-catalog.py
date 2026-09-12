@@ -116,12 +116,39 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
     cli, mcp = strip_rust_noncode(cli_source), strip_rust_noncode(mcp_source)
     factories, vfs = strip_rust_noncode(factories_source), strip_rust_noncode(vfs_source)
 
-    registrations: list[tuple[int, str, list[str] | None]] = []
+    registrations: list[tuple[int, str, list[str] | None, dict[str, str] | None]] = []
+    metadata_bindings = {
+        match.group("binding"): match.group("module")
+        for match in re.finditer(
+            r'\blet\s+(?P<binding>[a-zA-Z_]\w*)\s*=\s*extract_methods!\s*\(\s*'
+            r'(?P<module>[A-Za-z_][\w:]*)::schema_metadata\s*\(\s*\)\s*\)\s*;', cli
+        )
+    }
+    scoped_tree_bindings = {
+        match.group("binding"): match.group("module")
+        for match in re.finditer(
+            r'\blet\s+(?P<binding>[a-zA-Z_]\w*)\s*=\s*'
+            r'(?P<module>[A-Za-z_][\w:]*)::scoped_client_tree\s*\(\s*\)\s*;', cli
+        )
+    }
     for match in re.finditer(r'\bbuild_service_command\s*\(\s*', cli):
         if re.match(r'"', cli_source[match.end():]) is None:
             continue
-        service, _ = rust_string(cli_source, match.end(), "CLI service registration")
-        registrations.append((match.start(), service, None))
+        service, end = rust_string(cli_source, match.end(), "CLI service registration")
+        arguments = re.match(
+            r'\s*,\s*&(?P<metadata>[a-zA-Z_]\w*)\s*,\s*(?P<tree>[a-zA-Z_]\w*)\s*,?\s*\)',
+            cli[end:],
+        )
+        required(arguments is not None, f"CLI registration for {service} lacks metadata/tree bindings")
+        metadata, tree = arguments.group("metadata"), arguments.group("tree")
+        required(metadata in metadata_bindings,
+                 f"CLI registration for {service} uses an unbound metadata argument {metadata}")
+        required(tree in scoped_tree_bindings,
+                 f"CLI registration for {service} uses an unbound scoped-tree argument {tree}")
+        registrations.append((match.start(), service, None, {
+            "metadata": metadata_bindings[metadata],
+            "scoped_tree": scoped_tree_bindings[tree],
+        }))
     for match in re.finditer(
         r'\blet\s+(?P<binding>[a-zA-Z_]\w*)\s*=\s*Command::new\s*\(\s*', cli
     ):
@@ -138,12 +165,13 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
             rust_string(cli_source, end + command.end(), "manual CLI method")[0]
             for command in re.finditer(r'\bCommand::new\s*\(\s*', body)
         ]
-        registrations.append((match.start(), service, methods))
+        registrations.append((match.start(), service, methods, None))
     registrations.sort()
-    cli_services = [service for _, service, _ in registrations]
+    cli_services = [service for _, service, _, _ in registrations]
     guard = "if method.cli_hidden || method.is_streaming"
     cli_guarded = all(guard in rust_fn_body(cli, name) for name in CLI_BUILDERS)
-    manual_services = {service: methods for _, service, methods in registrations if methods is not None}
+    manual_services = {service: methods for _, service, methods, _ in registrations if methods is not None}
+    cli_modules = {service: modules for _, service, _, modules in registrations if modules is not None}
     mcp_modules = re.findall(r"register_top_level!\(\s*reg,\s*([a-zA-Z0-9_:]+)::schema_metadata\(\)\s*\)", mcp)
     mcp_services = [module.rsplit("::", 1)[-1].removesuffix("_client") for module in mcp_modules]
     factory_services, features, schema_attributes = [], {}, {}
@@ -191,6 +219,7 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
             "source": CONSUMER_SOURCE_PATHS["cli"],
             "services": cli_services,
             "manual_services": manual_services,
+            "module_bindings": cli_modules,
             "method_policy": {
                 "hidden": "excluded" if cli_guarded else "unknown",
                 "streaming": "excluded" if cli_guarded else "unknown",
@@ -474,19 +503,47 @@ def strip_capnp_noncode(source: str) -> str:
 
 
 def js_code_and_strings(source: str) -> tuple[str, dict[int, str]]:
-    """Offset-preserving JS/TS lexer: blank comments, mask string bodies, and
-    record each string body keyed by its placeholder offset in the output."""
+    """Offset-preserving JS/TS lexer for dependency extraction.
+
+    Comments and regex literals are blanked, while string bodies are masked and
+    retained by output offset so the dependency grammar can inspect only real
+    quoted specifiers. This is intentionally a small lexer, not a JS parser.
+    """
     out: list[str] = []
     strings: dict[int, str] = {}
     cursor, index, length = 0, 0, len(source)
+    can_start_regex = True
+    expression_keywords = {"case", "delete", "do", "else", "in", "instanceof", "new", "return", "throw", "typeof", "void", "yield", "await"}
+    def blank(value: str) -> str:
+        return "".join("\n" if char == "\n" else " " for char in value)
     while index < length:
         char = source[index]
         pair = source[index:index + 2]
         if pair == "//" or pair == "/*":
             end = source.find("\n", index) if pair == "//" else source.find("*/", index + 2)
             end = length if end < 0 else end if pair == "//" else end + 2
-            blank = "".join("\n" if c == "\n" else " " for c in source[index:end])
-            out.append(blank); cursor += len(blank); index = end; continue
+            masked = blank(source[index:end])
+            out.append(masked); cursor += len(masked); index = end; continue
+        if char == "/" and can_start_regex:
+            end, character_class = index + 1, False
+            while end < length:
+                current = source[end]
+                if current == "\\":
+                    end += 2; continue
+                if current == "[":
+                    character_class = True
+                elif current == "]":
+                    character_class = False
+                elif current == "/" and not character_class:
+                    end += 1
+                    while end < length and source[end].isalpha():
+                        end += 1
+                    break
+                elif current == "\n":
+                    break
+                end += 1
+            masked = blank(source[index:end])
+            out.append(masked); cursor += len(masked); index = end; can_start_regex = False; continue
         if char in "'\"`":
             end = index + 1
             while end < length:
@@ -499,8 +556,20 @@ def js_code_and_strings(source: str) -> tuple[str, dict[int, str]]:
             out.append(char + "\0" * len(body) + char)
             strings[cursor + 1] = body
             cursor += len(body) + 2
-            index = end; continue
+            index = end; can_start_regex = False; continue
+        identifier = re.match(r"[A-Za-z_$][\w$]*", source[index:])
+        if identifier:
+            value = identifier.group(0)
+            out.append(value); cursor += len(value); index += len(value)
+            can_start_regex = value in expression_keywords
+            continue
         out.append(char); cursor += 1; index += 1
+        if char in ")]}":
+            can_start_regex = False
+        elif char == ".":
+            can_start_regex = False
+        elif not char.isspace():
+            can_start_regex = True
     return "".join(out), strings
 
 
@@ -917,6 +986,7 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
             required(record.get("method_policy") == actual.get("method_policy"), f"{surface} hidden/streaming policy drift")
         if surface == "cli":
             required(record.get("manual_services") == actual.get("manual_services"), "CLI manual registration drift")
+            required(record.get("module_bindings") == actual.get("module_bindings"), "CLI metadata/scoped-tree module binding drift")
         if surface == "factory":
             required(record.get("feature_conditions") == actual.get("feature_conditions"), "factory feature condition drift")
             required(record.get("schema_attributes") == actual.get("schema_attributes"), "factory schema/metadata attribute drift")
@@ -1088,6 +1158,12 @@ def self_test(repo: Path) -> None:
         'impl_service_dispatch!(RegistryDispatch, "registry", crate::model_client)', 1)
     expect_failure("VFS generated-module swap", repo, copy.deepcopy(catalog), corpus, schemas,
                    source_services(repo, {vfs_mount: module_swap}), {vfs_mount: module_swap})
+    cli_path = "crates/hyprstream/src/cli/schema_cli.rs"
+    cli_module_swap = text(repo, cli_path, None).replace(
+        "let registry_tree = registry_client::scoped_client_tree();",
+        "let registry_tree = model_client::scoped_client_tree();", 1)
+    expect_failure("CLI metadata/scoped-tree module swap", repo, copy.deepcopy(catalog), corpus, schemas,
+                   source_services(repo, {cli_path: cli_module_swap}), {cli_path: cli_module_swap})
     removed_schema = "crates/hyprstream-rpc/schema/optional.capnp"
     probe_catalog = copy.deepcopy(catalog)
     probe_catalog["schemas"] = [entry for entry in probe_catalog["schemas"] if entry["path"] != removed_schema]
@@ -1177,7 +1253,6 @@ def self_test(repo: Path) -> None:
     ]:
         mutated = text(repo, path, None).replace(before, after)
         expect_failure(name, repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, {path: mutated}))
-    cli_path = "crates/hyprstream/src/cli/schema_cli.rs"
     renamed = text(repo, cli_path, None).replace('Command::new("discovery")', 'Command::new("settlement")', 1)
     expect_failure("manual CLI rename", repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, {cli_path: renamed}))
     removed = text(repo, cli_path, None).replace("tool = tool.subcommand(discovery);", "// manual discovery registration removed", 1)
@@ -1351,6 +1426,9 @@ def self_test(repo: Path) -> None:
     marked_comment = {"web/decoy.ts": '// import { manifest } from "@hyprstream/docs";\n/* const tree = require("./generated/echo.capnp"); */\nconst note = "loads codegen-out via @hyprstream/docs .capnp";\nconst tip = `see docs/x.capnp for details`;\n'}
     required(typescript_schema_sources(repo, marked_comment, ["web/decoy.ts"]) == [],
              "commented or string-only schema marker counted as a consumer")
+    regex_literal = {"web/regex.ts": 'const dependency_decoy = /require("fixture.capnp")/;\n'}
+    required(typescript_schema_sources(repo, regex_literal, ["web/regex.ts"]) == [],
+             "regex-literal schema marker counted as a consumer")
     mcp_path = "crates/hyprstream/src/services/mcp_service.rs"
     for label, needle in [("hidden policy", "if method.hidden {"),
                           ("streaming policy", "if method.is_streaming {")]:
