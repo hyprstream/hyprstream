@@ -237,9 +237,11 @@ def path_matches(path: str, pattern: str) -> bool:
     return re.fullmatch("".join(pieces) + "$", path) is not None
 
 
-def provenance_paths(repo: Path, corpus: dict[str, Any]) -> list[str]:
+def provenance_paths(repo: Path, corpus: dict[str, Any],
+                     mutations: dict[str, str] | None = None) -> list[str]:
     manifests = [str(Path(directory).parent / "Cargo.toml") for directory in OWNER_DIRECTORIES]
-    return sorted(set(tracked(repo, "*.capnp") + corpus_paths(repo, corpus) + tracked(repo, "build.rs", "**/build.rs") + [
+    return sorted(set(tracked(repo, "*.capnp") + corpus_paths(repo, corpus) + tracked(repo, "build.rs", "**/build.rs")
+                      + typescript_schema_sources(repo, mutations) + [
         "crates/hyprstream/src/cli/schema_cli.rs", "crates/hyprstream/src/services/mcp_service.rs",
         "crates/hyprstream/src/services/factories.rs", "crates/hyprstream-rpc-std/src/vfs_mount.rs",
         ".github/license-boundary.toml", *manifests,
@@ -290,7 +292,7 @@ def check_provenance(record: dict[str, Any], repo: Path, label: str, corpus: dic
              f"{label} source_commit must not self-reference HEAD")
     required(tree != git(repo, "rev-parse", "HEAD^{tree}") or staged_catalog,
              f"{label} source_tree must not self-reference HEAD")
-    paths = provenance_paths(repo, corpus)
+    paths = provenance_paths(repo, corpus, mutations)
     required(input_digest(repo, paths, mutations) == declared_digest,
              f"{label} current audited inputs differ from source_input_digest")
     if pair_exists and not mutations:
@@ -510,22 +512,72 @@ def cgr_inventory(build_file: str, source: str) -> list[dict[str, Any]]:
 def capnp_only_inputs(build_file: str, source: str) -> list[str]:
     """Resolve literal capnpc::CompilerCommand inputs without trusting comments/literals."""
     code = strip_rust_noncode(source)
-    bindings: dict[str, list[tuple[int, str]]] = {}
-    for match in re.finditer(r'\blet\s+([A-Za-z_]\w*)\s*=\s*format!\s*\(\s*', code):
-        template, _ = rust_literal(source, match.end(), "capnp-only compiler input")
-        bindings.setdefault(match.group(1), []).append((match.start(), template))
+    build_dir = str(Path(build_file).parent)
+    # Bindings are (position, kind, value); kind is "format" (a template with an
+    # optional {manifest} placeholder), "path" (a literal relative to this build
+    # script), or "join" ("base\0literal" resolved against prior bindings).
+    bindings: dict[str, list[tuple[int, str, str]]] = {}
+    def literal(at: int, label: str) -> str | None:
+        try:
+            value, _ = rust_literal(source, at, label)
+            return value
+        except CatalogError:
+            return None
+    for match in re.finditer(r'\blet\s+([A-Za-z_]\w*)\s*=\s*', code):
+        rest = code[match.end():]
+        prefix = re.match(r'format!\s*\(\s*', rest)
+        if prefix is not None:
+            template = literal(match.end() + prefix.end(), "capnp-only compiler input")
+            if template is not None:
+                bindings.setdefault(match.group(1), []).append((match.start(), "format", template))
+            continue
+        path_new = re.match(r'(?:std::path::)?Path::new\s*\(\s*', rest)
+        if path_new is not None:
+            after = match.end() + path_new.end()
+            try:
+                value, end = rust_literal(source, after, "capnp-only path binding")
+            except CatalogError:
+                value = None
+            if value is not None:
+                tail = re.match(r'\s*\)\s*\.\s*join\s*\(\s*', source[end:])
+                if tail is not None:
+                    joined = literal(end + tail.end(), "capnp-only join input")
+                    if joined is not None:
+                        value = value + "/" + joined
+                bindings.setdefault(match.group(1), []).append((match.start(), "path", value))
+            continue
+        join = re.match(r'&?([A-Za-z_]\w*)\s*\.\s*join\s*\(\s*', rest)
+        if join is not None:
+            value = literal(match.end() + join.end(), "capnp-only join input")
+            if value is not None:
+                bindings.setdefault(match.group(1), []).append((match.start(), "join", join.group(1) + "\0" + value))
+    def resolve(entry: tuple[int, str, str], seen: frozenset[str] = frozenset()) -> str | None:
+        position, kind, value = entry
+        if kind == "format":
+            return "format:" + value
+        if kind == "path":
+            return value
+        base_name, joined = value.split("\0", 1)
+        bases = [candidate for candidate in bindings.get(base_name, []) if candidate[0] < position]
+        if not bases or base_name in seen:
+            return None
+        base = resolve(bases[-1], seen | {base_name})
+        if base is None or base.startswith("format:"):
+            return None
+        return base + "/" + joined
     inputs: list[str] = []
     for match in re.finditer(r'\bcapnpc\s*::\s*CompilerCommand\s*::\s*new\s*\(\s*\)(?:(?!;).)*?\.file\s*\(\s*', code, re.DOTALL):
         tail = source[match.end():]
         binding = re.match(r'&?([A-Za-z_]\w*)', tail)
         if binding is not None:
-            choices = [template for position, template in bindings.get(binding.group(1), []) if position < match.start()]
-            required(choices,
+            choices = [entry for entry in bindings.get(binding.group(1), []) if entry[0] < match.start()]
+            resolved = resolve(choices[-1]) if choices else None
+            required(resolved is not None,
                      f"{build_file} capnp-only compiler input is unresolved")
-            raw = choices[-1]
+            raw = resolved[7:].replace("{manifest}", build_dir) if resolved.startswith("format:") else build_dir + "/" + resolved
         else:
             raw, _ = rust_literal(source, match.end(), "capnp-only compiler input")
-        raw = raw.replace("{manifest}", str(Path(build_file).parent))
+        raw = raw.replace("{manifest}", build_dir)
         inputs.append(os.path.normpath(raw).replace("\\", "/"))
     return inputs
 
@@ -544,8 +596,10 @@ def check_cgr(catalog: dict[str, Any], repo: Path, schemas: list[dict[str, Any]]
         required(isinstance(import_roots, list) and import_roots, f"{build_file} lacks import roots")
         required(inventories[build_file] == EXPECTED_CGR_INVOCATIONS[build_file]["invocations"],
                  f"{build_file} persisted-CGR invocation inventory drift")
-    capnp_only = capnp_only_inputs("crates/hyprstream-rpc-build/build.rs",
-                                   text(repo, "crates/hyprstream-rpc-build/build.rs", mutations))
+    direct_inputs = sorted({path for build_file in sorted(build_files)
+                            for path in capnp_only_inputs(build_file, text(repo, build_file, mutations))})
+    cgr_claimed = {entry["path"] for entry in schemas if entry.get("cgr_producer")}
+    capnp_only = [path for path in direct_inputs if path not in cgr_claimed]
     expected_capnp_only = sorted(entry["path"] for entry in schemas if entry.get("compiled_by") == "capnp_only")
     required(sorted(capnp_only) == expected_capnp_only,
              "capnp-only compiler input inventory drift")
@@ -555,7 +609,10 @@ def check_cgr(catalog: dict[str, Any], repo: Path, schemas: list[dict[str, Any]]
             mode = entry.get("compiled_by")
             required(mode in {"capnp_only", "not_compiled"}, f"{entry['path']} must distinguish non-CGR compilation")
             if mode == "capnp_only":
-                required(entry["path"] in capnp_only, f"{entry['path']} capnp-only claim drift")
+                required(entry["path"] in direct_inputs, f"{entry['path']} capnp-only claim drift")
+            else:
+                required(entry["path"] not in direct_inputs,
+                         f"{entry['path']} is compiled directly by a build script")
             continue
         required(producer in roots, f"{entry['path']} producer is not an audited persisted-CGR root")
         matched = [call for call in inventories[producer] if entry["path"].startswith(f"{call['source_root']}/") and Path(entry["path"]).stem in call["schemas"]]
@@ -776,7 +833,7 @@ def expect_failure(name: str, repo: Path, catalog: dict[str, Any], corpus: dict[
         # compiler assertion—not the outer provenance guard—must reject drift.
         trial_catalog, trial_corpus = copy.deepcopy(catalog), copy.deepcopy(corpus)
         if mutations and rebind_digest:
-            digest = input_digest(repo, provenance_paths(repo, trial_corpus), mutations)
+            digest = input_digest(repo, provenance_paths(repo, trial_corpus, mutations), mutations)
             trial_catalog["source_input_digest"] = digest
             trial_corpus["source_input_digest"] = digest
         validate(repo, trial_catalog, trial_corpus, schemas, consumers, mutations)
@@ -798,7 +855,7 @@ def expect_success(name: str, repo: Path, catalog: dict[str, Any], corpus: dict[
                    schemas: list[str], mutations: dict[str, str]) -> None:
     """Prove a non-code decoy does not alter the source-derived inventory."""
     trial_catalog, trial_corpus = copy.deepcopy(catalog), copy.deepcopy(corpus)
-    digest = input_digest(repo, provenance_paths(repo, trial_corpus), mutations)
+    digest = input_digest(repo, provenance_paths(repo, trial_corpus, mutations), mutations)
     trial_catalog["source_input_digest"] = digest
     trial_corpus["source_input_digest"] = digest
     try:
@@ -964,6 +1021,14 @@ def self_test(repo: Path) -> None:
     )
     expect_failure("capnp-only effective shadow binding", repo, copy.deepcopy(catalog), corpus,
                    schemas, consumers, {fixture_build: fixture_shadow})
+    tui_build = "crates/hyprstream-tui/build.rs"
+    required(capnp_only_inputs(tui_build, text(repo, tui_build, None)) == ["crates/hyprstream/schema/compositor_ipc.capnp"],
+             "capnp-only join-binding resolution drift")
+    direct_drift = text(repo, discovery_build, None).replace(
+        "\n}", '\n    capnpc::CompilerCommand::new().file("../hyprstream-pay/schema/settlement.capnp").run();\n}', 1
+    )
+    expect_failure("direct capnpc compiles uncompiled schema", repo, copy.deepcopy(catalog), corpus,
+                   schemas, consumers, {discovery_build: direct_drift})
     shadowed = text(repo, discovery_build, None).replace(
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");\n    let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-workers/schema");',
@@ -1013,6 +1078,8 @@ def self_test(repo: Path) -> None:
     unrelated_js = {"website/unrelated.js": "export const unrelated = true;\n"}
     required(typescript_schema_sources(repo, unrelated_js, ["website/unrelated.js"]) == [],
              "unrelated tracked JavaScript is a schema consumer")
+    required(set(typescript_schema_sources(repo)) <= set(provenance_paths(repo, corpus)),
+             "TypeScript schema consumers are omitted from the provenance digest")
     mcp_path = "crates/hyprstream/src/services/mcp_service.rs"
     for label, needle in [("hidden policy", "if method.hidden {"),
                           ("streaming policy", "if method.is_streaming {")]:
