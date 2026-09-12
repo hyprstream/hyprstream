@@ -2471,6 +2471,16 @@ mod tests {
                 hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
             ))
             .await?;
+        let account_zone = crate::account::AccountZone::new("acct.example.test")?;
+        let resolver_user_store: Arc<dyn UserStore> = user_store.clone();
+        let resolver_account_store = Arc::clone(&hosted_account_store);
+        let native_session_resolver = Arc::new(
+            crate::services::oauth::atproto_session::NativeAtprotoSessionResolver::new(
+                resolver_user_store,
+                resolver_account_store,
+                account_zone.clone(),
+            ),
+        );
         let mut oauth_state = OAuthState::new(
             &config,
             policy_client,
@@ -2482,9 +2492,8 @@ mod tests {
         .with_atproto_did_resolver(Arc::new(FixtureAtprotoDidResolver(
             atproto_document,
         )))
-        .with_hosted_account_zone(crate::account::AccountZone::new(
-            "acct.example.test",
-        )?);
+        .with_atproto_session_resolver(native_session_resolver)
+        .with_hosted_account_zone(account_zone);
         let token_dir = tempfile::TempDir::new()?;
         oauth_state.with_token_store_impl(Arc::new(RocksDbTokenStore::open(
             token_dir.path().join("refresh.db"),
@@ -2945,6 +2954,37 @@ mod tests {
         assert_eq!(claims["tenant"], HOSTED_TENANT);
         assert_eq!(claims["aud"], ISSUER);
         assert_eq!(claims["scope"], "atproto");
+
+        // The standard protected getSession route must use the same
+        // authority-backed native resolver as production composition. This
+        // exercises the real OAuth bearer/DPoP middleware and the durable
+        // profile plus hosted-DID authority checks.
+        let get_session_htu = format!("{ISSUER}/xrpc/com.atproto.server.getSession");
+        let get_session_proof = dpop_resource_proof(
+            &dpop_key,
+            "GET",
+            &get_session_htu,
+            &token_response.access_token,
+            "handler-get-session-jti",
+            Some(&token_nonce),
+        );
+        let get_session = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/xrpc/com.atproto.server.getSession")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("DPoP {}", token_response.access_token),
+                    )
+                    .header("DPoP", get_session_proof)
+                    .body(axum::body::Body::empty())?,
+            )
+            .await?;
+        assert_eq!(get_session.status(), axum::http::StatusCode::OK);
+        let get_session_json = response_json(get_session).await;
+        assert_eq!(get_session_json["did"], MAPPED_DID);
+        assert_eq!(get_session_json["handle"], "alice.acct.example.test");
+        assert_eq!(get_session_json["active"], true);
 
         // The protected hosted-PDS route consumes the standard DPoP-bound
         // OAuth access token and signs the exact #1354 method/audience with
