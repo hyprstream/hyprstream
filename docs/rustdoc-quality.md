@@ -115,8 +115,11 @@ For each additional crate, in this order:
 4. **Extend the evidence job** — for each opted-in crate, in the same PR that
    opts the crate in, extend `.github/workflows/rustdoc.yml` three ways:
 
-   - add a scoped `cargo doc -p <crate> --no-deps` invocation (one scoped
-     invocation per crate keeps failures attributable);
+   - add a scoped `cargo doc -p <crate> --no-deps` invocation to **both**
+     rustdoc passes — the generation step and the strict-evidence step whose
+     `RUSTDOCFLAGS="-D warnings"` output is teed to `rustdoc-warnings.log` —
+     so the opted-in crate's warnings reach the uploaded evidence (one scoped
+     invocation per crate per pass keeps failures attributable);
    - add a matching scoped `cargo test -p <crate> --doc` invocation. Broken
      doctests are a generation failure (invariant 1), so the lane must run
      each opted-in crate's documented examples — extending only the `cargo
