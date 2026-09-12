@@ -2701,6 +2701,16 @@ mod tests {
                     },
                 )
                 .await?;
+                let hosted_store = hosted_account_store("multiprocess-oauth", "example.test")?;
+                // The production account store warms its signed hosted-DID
+                // index during startup.  This isolated multi-process fixture
+                // constructs the store directly, so warm the same index before
+                // the OAuth child accepts its first authorization-code exchange.
+                hosted_store
+                    .refresh_hosted_did_index(&hyprstream_rpc::Subject::new(
+                        hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                    ))
+                    .await?;
                 let state = Arc::new(
                     crate::services::oauth::state::OAuthState::new(
                         &config,
@@ -2712,10 +2722,7 @@ mod tests {
                     .with_hosted_account_zone(crate::account::AccountZone::new(
                         "example.test",
                     )?)
-                    .with_hosted_account_store(hosted_account_store(
-                        "multiprocess-oauth",
-                        "example.test",
-                    )?),
+                    .with_hosted_account_store(hosted_store),
                 );
                 let verifier = "multiprocess-pkce-verifier";
                 let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
