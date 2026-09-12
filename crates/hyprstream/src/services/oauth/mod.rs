@@ -2247,7 +2247,7 @@ mod tests {
         const CLIENT_ID: &str = "handler-client";
         const PRIVATE_CLIENT_ID: &str = "handler-private-client";
         const REDIRECT_URI: &str = "https://client.example.test/callback";
-        const MAPPED_DID: &str = "did:web:alice.acct.example.test";
+        const MAPPED_DID: &str = "did:web:alice.acct.example.com";
         const HOSTED_TENANT: &str = "tenant-demo";
 
         struct PermitFixtureAccountReads;
@@ -2263,6 +2263,26 @@ mod tests {
                 hyprstream_rpc::auth::mac::MacDecision::Permit
             }
         }
+
+        struct DirectSelfPublicationAuthorizer;
+
+        impl crate::services::public_repo::PublicPublicationAuthorizer
+            for DirectSelfPublicationAuthorizer
+        {
+            fn authorize(&self, principal: &str, account: &str, collection: &str) -> anyhow::Result<()> {
+                anyhow::ensure!(principal == account, "direct-self principal/account mismatch");
+                anyhow::ensure!(
+                    matches!(collection, "app.bsky.feed.post" | "app.bsky.actor.profile"),
+                    "collection is outside the direct-self slice"
+                );
+                Ok(())
+            }
+
+            fn authorize_key_promotion(&self, _principal: &str, _account: &str) -> anyhow::Result<()> {
+                anyhow::bail!("key promotion is outside the direct-self conformance slice")
+            }
+        }
+
         const PKCE_VERIFIER: &str = "r5-handler-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
         const GENERIC_PKCE_VERIFIER: &str =
             "r7-generic-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
@@ -2444,6 +2464,16 @@ mod tests {
         let atproto_signing_key = sealed_account.atproto_signing_key().clone();
         let atproto_document =
             serde_json::from_slice(sealed_account.did_document().as_bytes())?;
+        let public_repo_dir = tempfile::TempDir::new()?;
+        let public_repo_store = Arc::new(crate::services::public_repo::PublicRepoStore::open(
+            public_repo_dir.path(),
+        )?);
+        let public_repo_writer = Arc::new(crate::services::public_repo::PublicRepoWriter::new(
+            public_repo_store,
+            MAPPED_DID,
+            atproto_signing_key.clone(),
+            Arc::new(DirectSelfPublicationAuthorizer),
+        )?);
         let pds_root = SyntheticNode::dir().with_child(
             HOSTED_TENANT,
             SyntheticNode::dir().with_child(
@@ -2471,7 +2501,7 @@ mod tests {
                 hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
             ))
             .await?;
-        let account_zone = crate::account::AccountZone::new("acct.example.test")?;
+        let account_zone = crate::account::AccountZone::new("acct.example.com")?;
         let resolver_user_store: Arc<dyn UserStore> = user_store.clone();
         let resolver_account_store = Arc::clone(&hosted_account_store);
         let native_session_resolver = Arc::new(
@@ -2493,6 +2523,7 @@ mod tests {
             atproto_document,
         )))
         .with_atproto_session_resolver(native_session_resolver)
+        .with_public_repo_writer(public_repo_writer)
         .with_hosted_account_zone(account_zone);
         let token_dir = tempfile::TempDir::new()?;
         oauth_state.with_token_store_impl(Arc::new(RocksDbTokenStore::open(
@@ -2981,10 +3012,61 @@ mod tests {
             )
             .await?;
         assert_eq!(get_session.status(), axum::http::StatusCode::OK);
+        let session_nonce = get_session
+            .headers()
+            .get("DPoP-Nonce")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .unwrap_or_else(|| token_nonce.clone());
         let get_session_json = response_json(get_session).await;
         assert_eq!(get_session_json["did"], MAPPED_DID);
-        assert_eq!(get_session_json["handle"], "alice.acct.example.test");
+        assert_eq!(get_session_json["handle"], "alice.acct.example.com");
         assert_eq!(get_session_json["active"], true);
+
+        // The first direct-self public write uses the same account authority
+        // key as the hosted account record. The explicit owner-only authorizer
+        // remains a required opt-in; no public writer is installed by default.
+        let create_record_proof = dpop_resource_proof(
+            &dpop_key,
+            "POST",
+            &format!("{ISSUER}/xrpc/com.atproto.repo.createRecord"),
+            &token_response.access_token,
+            "handler-create-record-jti",
+            Some(&session_nonce),
+        );
+        let create_record = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/xrpc/com.atproto.repo.createRecord")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("DPoP {}", token_response.access_token),
+                    )
+                    .header("DPoP", create_record_proof)
+                    .header("Idempotency-Key", "handler-create-record-1")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "repo": MAPPED_DID,
+                            "collection": "app.bsky.feed.post",
+                            "rkey": "3jzfcijpj2z2a",
+                            "record": {
+                                "$type": "app.bsky.feed.post",
+                                "text": "native direct-self conformance",
+                            },
+                            "returnRecord": true,
+                        })
+                        .to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(create_record.status(), axum::http::StatusCode::OK);
+        let create_record_json = response_json(create_record).await;
+        assert_eq!(create_record_json["uri"], format!("at://{MAPPED_DID}/app.bsky.feed.post/3jzfcijpj2z2a"));
+        assert_eq!(
+            create_record_json["value"]["text"],
+            "native direct-self conformance"
+        );
 
         // The protected hosted-PDS route consumes the standard DPoP-bound
         // OAuth access token and signs the exact #1354 method/audience with
