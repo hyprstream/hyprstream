@@ -146,7 +146,7 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
     manual_services = {service: methods for _, service, methods in registrations if methods is not None}
     mcp_modules = re.findall(r"register_top_level!\(\s*reg,\s*([a-zA-Z0-9_:]+)::schema_metadata\(\)\s*\)", mcp)
     mcp_services = [module.rsplit("::", 1)[-1].removesuffix("_client") for module in mcp_modules]
-    factory_services, features = [], {}
+    factory_services, features, schema_attributes = [], {}, {}
     cfgs: list[tuple[int, int, str]] = []
     for match in re.finditer(r'#\s*\[\s*cfg\s*\(\s*feature\s*=\s*', factories):
         feature, end = rust_string(factories_source, match.end(), "factory feature condition")
@@ -154,17 +154,37 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
         if close is not None:
             cfgs.append((match.start(), end + close.end(), feature))
     for match in re.finditer(r'#\s*\[\s*service_factory\s*\(\s*', factories):
+        depth, index = 1, match.end()
+        while depth:
+            required(index < len(factories), "unterminated service_factory attribute")
+            depth += (factories[index] == "(") - (factories[index] == ")")
+            index += 1
+        attribute = factories[match.end():index - 1]
         name, _ = rust_string(factories_source, match.end(), "factory registration")
         factory_services.append(name)
+        declared = re.search(r'\bschema\s*=\s*', attribute)
+        schema_value = None
+        if declared:
+            schema_value, _ = rust_literal(factories_source, match.end() + declared.end(), "factory schema attribute")
+        declared_meta = re.search(r'\bmetadata\s*=\s*', attribute)
+        metadata_value = None
+        if declared_meta:
+            found = re.match(r'[A-Za-z_][\w:]*', attribute[declared_meta.end():])
+            required(found is not None, f"factory {name} metadata attribute is not a module path")
+            metadata_value = found.group(0)
+        schema_attributes[name] = {"schema": schema_value, "metadata": metadata_value}
         prior = [feature for _, end, feature in cfgs
                  if end <= match.start() and factories[end:match.start()].strip() == ""]
         if prior:
             required(len(prior) == 1, f"ambiguous feature condition for factory {name}")
             features[name] = f"feature={prior[0]}"
-    vfs_services = [
-        rust_string(vfs_source, match.end(), "VFS service registration")[0]
-        for match in re.finditer(r'\bimpl_service_dispatch!\s*\(\s*[A-Za-z_]\w*\s*,\s*', vfs)
-    ]
+    vfs_services, vfs_dispatches = [], {}
+    for match in re.finditer(r'\bimpl_service_dispatch!\s*\(\s*([A-Za-z_]\w*)\s*,\s*', vfs):
+        name, end = rust_string(vfs_source, match.end(), "VFS service registration")
+        tail = re.match(r'\s*,\s*([A-Za-z_][\w:]*)\s*\)', vfs[end:])
+        required(tail is not None, f"VFS registration for {name} lacks a generated module binding")
+        vfs_dispatches[name] = {"dispatch": match.group(1), "module": tail.group(1)}
+        vfs_services.append(name)
     ts_sources = typescript_schema_sources(repo, mutations)
     return {
         "cli": {
@@ -184,8 +204,8 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
                 "streaming": "included" if len(re.findall(r"if\s+method\.is_streaming\s*\{", mcp)) == 2 else "unknown",
             },
         },
-        "factory": {"source": CONSUMER_SOURCE_PATHS["factory"], "services": factory_services, "feature_conditions": features},
-        "vfs": {"source": CONSUMER_SOURCE_PATHS["vfs"], "services": vfs_services},
+        "factory": {"source": CONSUMER_SOURCE_PATHS["factory"], "services": factory_services, "feature_conditions": features, "schema_attributes": schema_attributes},
+        "vfs": {"source": CONSUMER_SOURCE_PATHS["vfs"], "services": vfs_services, "dispatches": vfs_dispatches},
         "typescript": {"tracked_sources": ts_sources},
     }
 
@@ -485,7 +505,7 @@ def js_code_and_strings(source: str) -> tuple[str, dict[int, str]]:
 
 
 TS_SPECIFIER_MARKER = re.compile(r"@hyprstream/docs|codegen-out|\.capnp$")
-TS_DEPENDENCY = re.compile(r"(?:\brequire\s*\(\s*|\bimport\s*\(\s*|\bimport\s+|\bfrom\s+)(['\"]\0+['\"`])")
+TS_DEPENDENCY = re.compile(r"(?:\brequire\s*\(\s*|\bimport\s*\(\s*|\bimport\s+|\bfrom\s+)(['\"`]\0+['\"`])")
 
 
 def ts_source_is_consumer(source: str) -> bool:
@@ -899,6 +919,9 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
             required(record.get("manual_services") == actual.get("manual_services"), "CLI manual registration drift")
         if surface == "factory":
             required(record.get("feature_conditions") == actual.get("feature_conditions"), "factory feature condition drift")
+            required(record.get("schema_attributes") == actual.get("schema_attributes"), "factory schema/metadata attribute drift")
+        if surface == "vfs":
+            required(record.get("dispatches") == actual.get("dispatches"), "VFS generated-module binding drift")
         if surface == "typescript":
             continue
         for service in record[key]:
@@ -1053,16 +1076,59 @@ def self_test(repo: Path) -> None:
     # collide with the declared tree, which still contains the deleted file.
     # The deletion is simulated in this worktree's own index (ls-files reads
     # it) and restored afterwards; worktree indexes are not shared.
+    factories_path = "crates/hyprstream/src/services/factories.rs"
+    attribute_swap = text(repo, factories_path, None).replace(
+        'schema = "../../../hyprstream-rpc-std/schema/registry.capnp", metadata = crate::services::generated::registry_client::schema_metadata',
+        'schema = "../../../hyprstream-rpc-std/schema/model.capnp", metadata = crate::services::generated::model_client::schema_metadata', 1)
+    expect_failure("factory schema/metadata attribute swap", repo, copy.deepcopy(catalog), corpus, schemas,
+                   source_services(repo, {factories_path: attribute_swap}), {factories_path: attribute_swap})
+    vfs_mount = "crates/hyprstream-rpc-std/src/vfs_mount.rs"
+    module_swap = text(repo, vfs_mount, None).replace(
+        'impl_service_dispatch!(RegistryDispatch, "registry", crate::registry_client)',
+        'impl_service_dispatch!(RegistryDispatch, "registry", crate::model_client)', 1)
+    expect_failure("VFS generated-module swap", repo, copy.deepcopy(catalog), corpus, schemas,
+                   source_services(repo, {vfs_mount: module_swap}), {vfs_mount: module_swap})
     removed_schema = "crates/hyprstream-rpc/schema/optional.capnp"
     probe_catalog = copy.deepcopy(catalog)
     probe_catalog["schemas"] = [entry for entry in probe_catalog["schemas"] if entry["path"] != removed_schema]
     pruned = [path for path in schemas if path != removed_schema]
-    subprocess.run(["git", "-C", str(repo), "rm", "--cached", "--quiet", removed_schema], check=False)
+    def staged_entries(path: str) -> list[str]:
+        out = subprocess.run(["git", "-C", str(repo), "ls-files", "--stage", path],
+                             capture_output=True, text=True).stdout.strip()
+        return [line for line in out.splitlines() if line]
+    def stage_edit(path: str, suffix: str) -> str:
+        original = (repo / path).read_text()
+        blob = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+                              input=original + suffix, text=True, capture_output=True, check=True).stdout.strip()
+        subprocess.run(["git", "-C", str(repo), "update-index", "--cacheinfo", f"100644,{blob},{path}"], check=True)
+        return blob
+    unrelated_schema = "crates/hyprstream-rpc/schema/common.capnp"
+    optional_prior = staged_entries(removed_schema)
+    common_prior = staged_entries(unrelated_schema)
+    optional_blob = stage_edit(removed_schema, "\n// staged schema edit\n")
+    common_blob = stage_edit(unrelated_schema, "\n// staged schema edit\n")
     try:
-        expect_failure("declared tree attests removed input", repo, probe_catalog, corpus, pruned,
-                       consumers, {removed_schema: None})
+        subprocess.run(["git", "-C", str(repo), "rm", "--cached", "--force", "--quiet", removed_schema], check=True)
+        try:
+            expect_failure("declared tree attests removed input", repo, probe_catalog, corpus, pruned,
+                           consumers, {removed_schema: None})
+        finally:
+            if optional_prior:
+                subprocess.run(["git", "-C", str(repo), "update-index", "--add", "--cacheinfo",
+                                f"100644,{optional_blob},{removed_schema}"], check=True)
+        restored = staged_entries(removed_schema)
+        required(restored and restored[0].split()[1] == optional_blob,
+                 "removal probe did not preserve the caller's staged index entry")
+        after = staged_entries(unrelated_schema)
+        required(after and after[0].split()[1] == common_blob,
+                 "removal probe unstaged an unrelated schema change")
+        if optional_prior:
+            mode, sha = optional_prior[0].split()[:2]
+            subprocess.run(["git", "-C", str(repo), "update-index", "--cacheinfo", f"{mode},{sha},{removed_schema}"], check=True)
     finally:
-        subprocess.run(["git", "-C", str(repo), "restore", "--staged", removed_schema], check=False)
+        if common_prior:
+            mode, sha = common_prior[0].split()[:2]
+            subprocess.run(["git", "-C", str(repo), "update-index", "--cacheinfo", f"{mode},{sha},{unrelated_schema}"], check=True)
     committed = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--quiet", "--",
                                 "docs/schema-catalog.json", "docs/corpus-sources.json"]).returncode == 0
     bad = copy.deepcopy(catalog); bad["source_commit"] = git(repo, "rev-parse", "HEAD"); bad["source_tree"] = git(repo, "rev-parse", "HEAD^{tree}")
@@ -1276,6 +1342,9 @@ def self_test(repo: Path) -> None:
              "unrelated tracked JavaScript is a schema consumer")
     required(set(typescript_schema_sources(repo)) <= set(provenance_paths(repo, corpus)),
              "TypeScript schema consumers are omitted from the provenance digest")
+    backtick_only = {"web/ts_only.ts": 'import(`@hyprstream/docs`);\nexport const tree = require(`./generated/catalog.capnp`);\n'}
+    required(typescript_schema_sources(repo, backtick_only, ["web/ts_only.ts"]) == ["web/ts_only.ts"],
+             "backtick-only schema dependency missed")
     real_import = {"web/real.ts": 'import { manifest } from "@hyprstream/docs";\nexport const tree = require("./generated/catalog.capnp");\nexport const doc = import(`./generated/echo.capnp`);\n'}
     required(typescript_schema_sources(repo, real_import, ["web/real.ts"]) == ["web/real.ts"],
              "valid schema import or require missed")
