@@ -878,8 +878,8 @@ inventory::submit! {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::hyprstream_rpc_std::worker_client::{KeyValue, PodSandboxConfig};
     use super::*;
+    use hyprstream_rpc_std::worker_client::{KeyValue, PodSandboxConfig};
     use std::path::PathBuf;
 
     fn new_pod(id: &str, cfg: &PodSandboxConfig) -> PodSandbox {
