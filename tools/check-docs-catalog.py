@@ -17,6 +17,7 @@ from typing import Any
 
 SURFACES = ("cli", "mcp", "factory", "vfs", "typescript")
 CATALOG_SURFACES = (*SURFACES, "docs")
+CLI_BUILDERS = ("build_service_command", "build_scoped_command_from_node")
 CONSUMER_SOURCE_PATHS = {
     "cli": "crates/hyprstream/src/cli/schema_cli.rs",
     "mcp": "crates/hyprstream/src/services/mcp_service.rs",
@@ -140,6 +141,8 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
         registrations.append((match.start(), service, methods))
     registrations.sort()
     cli_services = [service for _, service, _ in registrations]
+    guard = "if method.cli_hidden || method.is_streaming"
+    cli_guarded = all(guard in rust_fn_body(cli, name) for name in CLI_BUILDERS)
     manual_services = {service: methods for _, service, methods in registrations if methods is not None}
     mcp_modules = re.findall(r"register_top_level!\(\s*reg,\s*([a-zA-Z0-9_:]+)::schema_metadata\(\)\s*\)", mcp)
     mcp_services = [module.rsplit("::", 1)[-1].removesuffix("_client") for module in mcp_modules]
@@ -169,8 +172,8 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
             "services": cli_services,
             "manual_services": manual_services,
             "method_policy": {
-                "hidden": "excluded" if "if method.cli_hidden || method.is_streaming" in cli else "unknown",
-                "streaming": "excluded" if "if method.cli_hidden || method.is_streaming" in cli else "unknown",
+                "hidden": "excluded" if cli_guarded else "unknown",
+                "streaming": "excluded" if cli_guarded else "unknown",
             },
         },
         "mcp": {
@@ -383,6 +386,20 @@ def rust_string(source: str, start: int, label: str) -> tuple[str, int]:
     return value, end
 
 
+def rust_fn_body(source: str, name: str) -> str:
+    """Body of the top-level `fn <name>` in comment/literal-masked Rust source."""
+    marker = source.find(f"fn {name}")
+    required(marker >= 0, f"missing fn {name}")
+    open_brace = source.find("{", marker)
+    required(open_brace >= 0, f"fn {name} has no body")
+    index, depth = open_brace, 1
+    while depth:
+        index += 1
+        required(index < len(source), f"unterminated fn {name}")
+        depth += (source[index] == "{") - (source[index] == "}")
+    return source[open_brace + 1:index]
+
+
 def strip_capnp_noncode(source: str) -> str:
     """Offset-preserving lexer for Cap'n Proto line comments and string values."""
     out, index = [], 0
@@ -441,7 +458,7 @@ def typescript_schema_sources(repo: Path, mutations: dict[str, str] | None = Non
     candidates = candidates if candidates is not None else tracked(repo, "*.ts", "*.tsx", "*.js", "*.jsx", "package.json")
     result = []
     marker = re.compile(r"@hyprstream/docs|codegen-out|\.capnp$")
-    dependency = re.compile(r"(?:\brequire\s*\(\s*|\bimport\s*\(\s*|\bimport\s+|\bfrom\s+)(['\"]\0+['\"])")
+    dependency = re.compile(r"(?:\brequire\s*\(\s*|\bimport\s*\(\s*|\bimport\s+|\bfrom\s+)(['\"]\0+['\"`])")
     for path in candidates:
         source = text(repo, path, mutations)
         if path == "package.json":
@@ -617,10 +634,19 @@ def capnp_only_inputs(build_file: str, source: str) -> list[str]:
     for name in constructors:
         required(not re.search(rf"\blet\s+(?:mut\s+)?{re.escape(name)}\b|\b{re.escape(name)}\s*=", code),
                  f"{build_file} shadows the imported CompilerCommand alias {name}")
+    module_aliases: set[str] = set()
+    for match in re.finditer(r"\buse\s+capnpc\s+as\s+([A-Za-z_]\w*)\s*;", code):
+        module_aliases.add(match.group(1))
+    for alias in module_aliases:
+        required(not re.search(rf"\blet\s+(?:mut\s+)?{re.escape(alias)}\b|\b{re.escape(alias)}\s*=", code),
+                 f"{build_file} shadows the capnpc module alias {alias}")
+        foreign = [path for path in re.findall(rf"\buse\s+([A-Za-z_][\w:]*)\s+as\s+{re.escape(alias)}\s*;", code) if path != "capnpc"]
+        required(not foreign, f"{build_file} has an ambiguous module alias {alias}")
     patterns = [r"capnpc\s*::\s*CompilerCommand\s*::\s*new\s*\(\s*\)"]
     patterns += [rf"(?<![:\w]){re.escape(name)}\s*::\s*new\s*\(\s*\)" for name in sorted(constructors)]
+    patterns += [rf"(?<![:\w]){re.escape(alias)}\s*::\s*CompilerCommand\s*::\s*new\s*\(\s*\)" for alias in sorted(module_aliases)]
     recognized = re.compile("|".join(f"(?:{pattern})" for pattern in patterns))
-    constructor = re.compile(r"(?:capnpc\s*::\s*|(?<![:\w]))CompilerCommand\s*::\s*new\s*\(")
+    constructor = re.compile(r"\b(?:[A-Za-z_]\w*\s*::\s*)?CompilerCommand\s*::\s*new\s*\(")
     inputs: list[str] = []
     statement_starts: set[int] = set()
     for match in recognized.finditer(code):
@@ -1029,6 +1055,20 @@ def self_test(repo: Path) -> None:
     expect_failure("manual CLI rename", repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, {cli_path: renamed}))
     removed = text(repo, cli_path, None).replace("tool = tool.subcommand(discovery);", "// manual discovery registration removed", 1)
     expect_failure("manual CLI removal", repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, {cli_path: removed}))
+    raw_cli = text(repo, cli_path, None)
+    builder_guard = "if method.cli_hidden || method.is_streaming"
+    guard_offsets = [item.start() for item in re.finditer(re.escape(builder_guard), raw_cli)]
+    required(len(guard_offsets) == 2, "unexpected CLI builder guard count")
+    for label, builder in [("CLI service builder policy", "fn build_service_command"),
+                           ("CLI scoped builder policy", "fn build_scoped_command_from_node")]:
+        fn_at = raw_cli.find(builder)
+        following = raw_cli.find("\nfn ", fn_at + 1)
+        span_end = len(raw_cli) if following < 0 else following
+        inside = [offset for offset in guard_offsets if fn_at < offset < span_end]
+        required(len(inside) == 1, f"{builder} guard not uniquely located")
+        mutated = raw_cli[:inside[0]] + "if false" + raw_cli[inside[0] + len(builder_guard):]
+        expect_failure(label, repo, copy.deepcopy(catalog), corpus, schemas,
+                       source_services(repo, {cli_path: mutated}), {cli_path: mutated})
     worker_path = "crates/hyprstream-workers/schema/worker.capnp"
     hidden_removed = text(repo, worker_path, None).replace("$cliHidden ", "", 1)
     expect_failure("schema hidden annotation", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: hidden_removed})
@@ -1112,6 +1152,12 @@ def self_test(repo: Path) -> None:
     )
     expect_failure("imported capnpc compiles uncompiled schema", repo, copy.deepcopy(catalog), corpus,
                    schemas, consumers, {discovery_build: aliased_drift})
+    module_drift = text(repo, discovery_build, None).replace(
+        "\n}",
+        '\n}\n\nuse capnpc as cp;\n\nfn extra() {\n    cp::CompilerCommand::new().file("../hyprstream-pay/schema/settlement.capnp").run().expect("module-aliased");\n}', 1
+    )
+    expect_failure("module-aliased capnpc compiles uncompiled schema", repo, copy.deepcopy(catalog), corpus,
+                   schemas, consumers, {discovery_build: module_drift})
     shadowed = text(repo, discovery_build, None).replace(
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");\n    let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-workers/schema");',
@@ -1163,10 +1209,10 @@ def self_test(repo: Path) -> None:
              "unrelated tracked JavaScript is a schema consumer")
     required(set(typescript_schema_sources(repo)) <= set(provenance_paths(repo, corpus)),
              "TypeScript schema consumers are omitted from the provenance digest")
-    real_import = {"web/real.ts": 'import { manifest } from "@hyprstream/docs";\nexport const tree = require("./generated/catalog.capnp");\n'}
+    real_import = {"web/real.ts": 'import { manifest } from "@hyprstream/docs";\nexport const tree = require("./generated/catalog.capnp");\nexport const doc = import(`./generated/echo.capnp`);\n'}
     required(typescript_schema_sources(repo, real_import, ["web/real.ts"]) == ["web/real.ts"],
              "valid schema import or require missed")
-    marked_comment = {"web/decoy.ts": '// import { manifest } from "@hyprstream/docs";\n/* const tree = require("./generated/echo.capnp"); */\nconst note = "loads codegen-out via @hyprstream/docs .capnp";\n'}
+    marked_comment = {"web/decoy.ts": '// import { manifest } from "@hyprstream/docs";\n/* const tree = require("./generated/echo.capnp"); */\nconst note = "loads codegen-out via @hyprstream/docs .capnp";\nconst tip = `see docs/x.capnp for details`;\n'}
     required(typescript_schema_sources(repo, marked_comment, ["web/decoy.ts"]) == [],
              "commented or string-only schema marker counted as a consumer")
     mcp_path = "crates/hyprstream/src/services/mcp_service.rs"
