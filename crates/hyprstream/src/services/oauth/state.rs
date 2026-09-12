@@ -1165,6 +1165,9 @@ pub struct OAuthState {
     /// by the write path (#910) and tests; the read endpoints consult it
     /// directly. Default-empty so existing construction sites need no change.
     pub xrpc_repos: Arc<super::xrpc::XrpcRepoStore>,
+    /// Optional native-authorized public repository writer. No public write
+    /// routes are mounted while this is absent.
+    pub public_repo_writer: Option<Arc<crate::services::public_repo::PublicRepoWriter>>,
     /// When `true`, the XRPC read-slice routes (`/xrpc/…`) are mounted on the
     /// OAuth router (#1112). Copied from `OAuthConfig::xrpc_read_slice`.
     pub xrpc_read_slice: bool,
@@ -1358,6 +1361,7 @@ impl OAuthState {
             ),
             sessions: super::session::SessionStore::default(),
             xrpc_repos: Arc::new(super::xrpc::XrpcRepoStore::new()),
+            public_repo_writer: None,
             xrpc_read_slice: config.xrpc_read_slice,
             deployment_well_known_dir: config.deployment_well_known_dir.clone(),
             rsa_encoding_key: None,
@@ -1424,6 +1428,16 @@ impl OAuthState {
         store: Arc<hyprstream_pds_service::AccountRecordStore>,
     ) -> Self {
         self.hosted_account_store = Some(store);
+        self
+    }
+
+    /// Install the explicit native-authorized public repository writer. This
+    /// opt-in is required before standard XRPC repository writes are exposed.
+    pub fn with_public_repo_writer(
+        mut self,
+        writer: Arc<crate::services::public_repo::PublicRepoWriter>,
+    ) -> Self {
+        self.public_repo_writer = Some(writer);
         self
     }
 
@@ -2246,7 +2260,7 @@ pub fn canonical_issuer_origin(issuer_url: &str) -> Option<String> {
 /// while a non-default port is retained and its domain-segment separator is
 /// encoded as `%3A`. IPv6 is rejected until client and server share one
 /// canonical DID representation for it.
-fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
+pub(super) fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
     let url = url::Url::parse(issuer_url).ok()?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()
