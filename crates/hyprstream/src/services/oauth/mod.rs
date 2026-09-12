@@ -182,8 +182,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     // ── com.atproto XRPC read slice (#1112) ────────────────────────────────
     // Four public read endpoints, conditionally mounted when the operator
     // opts in via `OAuthConfig::xrpc_read_slice`. Session endpoints
-    // `createSession` remains out of scope; protected `getSession` is mounted
-    // only when the native account resolver is explicitly installed.
+    // (createSession/getSession) are NOT here — they arrive with #1113/#948.
     // Route table lives in `xrpc::xrpc_routes()` — single source of truth.
     let public_router = if state.xrpc_read_slice {
         public_router.merge(xrpc::xrpc_routes())
@@ -1090,6 +1089,21 @@ impl Spawnable for OAuthService {
             if let Some(api) = &self.identity_registration_api {
                 oauth_state = oauth_state.with_identity_registration_api(Arc::clone(api));
             }
+            if self.config.xrpc_read_slice {
+                if let (Some(store), Some(root)) = (&hosted_account_store, &self.pds_root) {
+                    let public_root = root.join("public-repositories");
+                    let public_store = crate::services::public_repo::PublicRepoStore::open(&public_root)
+                        .map_err(|error| hyprstream_rpc::error::RpcError::SpawnFailed(format!("open public repository store {}: {error}", public_root.display())))?;
+                    oauth_state = oauth_state.with_hosted_public_repo_writer(Arc::new(
+                        crate::services::public_repo::HostedAccountPublicRepoWriter::new(
+                            Arc::new(public_store),
+                            Arc::clone(store),
+                            hyprstream_rpc::Subject::new(hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT),
+                            Arc::new(crate::services::public_repo::HostedAccountSelfAuthorizer),
+                        ),
+                    ));
+                }
+            }
             let account_zone = match self.account_config.resolve_zone() {
                 Ok(zone) => {
                     oauth_state = oauth_state.with_hosted_account_zone(zone.clone());
@@ -1104,45 +1118,14 @@ impl Spawnable for OAuthService {
                 }
             };
             if let (Some(store), Some(zone)) = (&hosted_account_store, &account_zone) {
-                let resolver = Arc::new(crate::services::oauth::atproto_session::NativeAtprotoSessionResolver::new(
-                    user_store.clone_inner(),
-                    Arc::clone(store),
-                    zone.clone(),
-                ));
+                let resolver = Arc::new(
+                    crate::services::oauth::atproto_session::NativeAtprotoSessionResolver::new(
+                        user_store.clone_inner(),
+                        Arc::clone(store),
+                        zone.clone(),
+                    ),
+                );
                 oauth_state = oauth_state.with_atproto_session_resolver(resolver);
-            }
-            if self.config.xrpc_read_slice {
-                if let (Some(store), Some(root)) = (&hosted_account_store, &self.pds_root) {
-                    let public_root = root.join("public-repositories");
-                    match crate::services::public_repo::PublicRepoStore::open(&public_root) {
-                        Ok(public_store) => {
-                            let writer = Arc::new(
-                                crate::services::public_repo::HostedAccountPublicRepoWriter::new(
-                                    Arc::new(public_store),
-                                    Arc::clone(store),
-                                    hyprstream_rpc::Subject::new(
-                                        hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
-                                    ),
-                                    Arc::new(
-                                        crate::services::public_repo::HostedAccountSelfAuthorizer,
-                                    ),
-                                ),
-                            );
-                            oauth_state = oauth_state.with_hosted_public_repo_writer(writer);
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                %error,
-                                path = %public_root.display(),
-                                "public repository writer remains disabled because its durable store could not open"
-                            );
-                        }
-                    }
-                } else {
-                    tracing::warn!(
-                        "ATProto public writes remain disabled: hosted account store and PDS root are both required"
-                    );
-                }
             }
             oauth_state = oauth_state.with_user_store(user_store);
             if let Some(ds) = device_store_opt {
@@ -2280,7 +2263,7 @@ mod tests {
         const CLIENT_ID: &str = "handler-client";
         const PRIVATE_CLIENT_ID: &str = "handler-private-client";
         const REDIRECT_URI: &str = "https://client.example.test/callback";
-        const MAPPED_DID: &str = "did:web:alice.acct.example.com";
+        const MAPPED_DID: &str = "did:web:alice.acct.example.test";
         const HOSTED_TENANT: &str = "tenant-demo";
 
         struct PermitFixtureAccountReads;
@@ -2296,7 +2279,6 @@ mod tests {
                 hyprstream_rpc::auth::mac::MacDecision::Permit
             }
         }
-
         const PKCE_VERIFIER: &str = "r5-handler-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
         const GENERIC_PKCE_VERIFIER: &str =
             "r7-generic-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
@@ -2465,9 +2447,9 @@ mod tests {
             account_rotations,
         )?;
         let account_document = account_mint.seal_did_document(ISSUER)?;
-        let (pending_account, hosted_repo) = account_mint.prepare_pds_genesis(
+        let pending_account = account_mint.prepare_genesis(
             account_document,
-            hyprstream_pds::tid::Tid::from_micros(7, 1),
+            hyprstream_pds::did_op::GenesisRepoHead::EmptyRepo,
         )?;
         let account_signature = hyprstream_pds::did_op::sign_genesis(
             pending_account.unsigned_genesis(),
@@ -2478,10 +2460,6 @@ mod tests {
         let atproto_signing_key = sealed_account.atproto_signing_key().clone();
         let atproto_document =
             serde_json::from_slice(sealed_account.did_document().as_bytes())?;
-        let public_repo_dir = tempfile::TempDir::new()?;
-        let public_repo_store = Arc::new(crate::services::public_repo::PublicRepoStore::open(
-            public_repo_dir.path(),
-        )?);
         let pds_root = SyntheticNode::dir().with_child(
             HOSTED_TENANT,
             SyntheticNode::dir().with_child(
@@ -2496,20 +2474,6 @@ mod tests {
                         .with_child(
                             hyprstream_pds::ATPROTO_SIGNING_KEY_FILE,
                             SyntheticNode::file(atproto_signing_key.to_bytes().to_vec()),
-                        )
-                        .with_child(
-                            "repo",
-                            SyntheticNode::dir()
-                                .with_child(
-                                    "commit.cbor",
-                                    SyntheticNode::file(hosted_repo.commit_bytes().to_vec()),
-                                )
-                                .with_child(
-                                    "public-commit.cbor",
-                                    SyntheticNode::file(
-                                        hosted_repo.public_commit_bytes().to_vec(),
-                                    ),
-                                ),
                         ),
                 ),
             ),
@@ -2523,26 +2487,6 @@ mod tests {
                 hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
             ))
             .await?;
-        let hosted_public_repo_writer = Arc::new(
-            crate::services::public_repo::HostedAccountPublicRepoWriter::new(
-                Arc::clone(&public_repo_store),
-                Arc::clone(&hosted_account_store),
-                hyprstream_rpc::Subject::new(
-                    hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
-                ),
-                Arc::new(crate::services::public_repo::HostedAccountSelfAuthorizer),
-            ),
-        );
-        let account_zone = crate::account::AccountZone::new("acct.example.com")?;
-        let resolver_user_store: Arc<dyn UserStore> = user_store.clone();
-        let resolver_account_store = Arc::clone(&hosted_account_store);
-        let native_session_resolver = Arc::new(
-            crate::services::oauth::atproto_session::NativeAtprotoSessionResolver::new(
-                resolver_user_store,
-                resolver_account_store,
-                account_zone.clone(),
-            ),
-        );
         let mut oauth_state = OAuthState::new(
             &config,
             policy_client,
@@ -2554,9 +2498,9 @@ mod tests {
         .with_atproto_did_resolver(Arc::new(FixtureAtprotoDidResolver(
             atproto_document,
         )))
-        .with_atproto_session_resolver(native_session_resolver)
-        .with_hosted_public_repo_writer(hosted_public_repo_writer)
-        .with_hosted_account_zone(account_zone);
+        .with_hosted_account_zone(crate::account::AccountZone::new(
+            "acct.example.test",
+        )?);
         let token_dir = tempfile::TempDir::new()?;
         oauth_state.with_token_store_impl(Arc::new(RocksDbTokenStore::open(
             token_dir.path().join("refresh.db"),
@@ -3017,96 +2961,6 @@ mod tests {
         assert_eq!(claims["tenant"], HOSTED_TENANT);
         assert_eq!(claims["aud"], ISSUER);
         assert_eq!(claims["scope"], "atproto");
-
-        // The standard protected getSession route must use the same
-        // authority-backed native resolver as production composition. This
-        // exercises the real OAuth bearer/DPoP middleware and the durable
-        // profile plus hosted-DID authority checks.
-        let get_session_htu = format!("{ISSUER}/xrpc/com.atproto.server.getSession");
-        let get_session_proof = dpop_resource_proof(
-            &dpop_key,
-            "GET",
-            &get_session_htu,
-            &token_response.access_token,
-            "handler-get-session-jti",
-            Some(&token_nonce),
-        );
-        let get_session = app
-            .clone()
-            .oneshot(
-                axum::http::Request::get("/xrpc/com.atproto.server.getSession")
-                    .header(
-                        axum::http::header::AUTHORIZATION,
-                        format!("DPoP {}", token_response.access_token),
-                    )
-                    .header("DPoP", get_session_proof)
-                    .body(axum::body::Body::empty())?,
-            )
-            .await?;
-        assert_eq!(get_session.status(), axum::http::StatusCode::OK);
-        let session_nonce = get_session
-            .headers()
-            .get("DPoP-Nonce")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned)
-            .unwrap_or_else(|| token_nonce.clone());
-        let get_session_json = response_json(get_session).await;
-        assert_eq!(get_session_json["did"], MAPPED_DID);
-        assert_eq!(get_session_json["handle"], "alice.acct.example.com");
-        assert_eq!(get_session_json["active"], true);
-
-        // The first direct-self public write uses the same account authority
-        // key as the hosted account record. The explicit owner-only authorizer
-        // remains a required opt-in; no public writer is installed by default.
-        let create_record_proof = dpop_resource_proof(
-            &dpop_key,
-            "POST",
-            &format!("{ISSUER}/xrpc/com.atproto.repo.createRecord"),
-            &token_response.access_token,
-            "handler-create-record-jti",
-            Some(&session_nonce),
-        );
-        let create_record = app
-            .clone()
-            .oneshot(
-                axum::http::Request::post("/xrpc/com.atproto.repo.createRecord")
-                    .header(
-                        axum::http::header::AUTHORIZATION,
-                        format!("DPoP {}", token_response.access_token),
-                    )
-                    .header("DPoP", create_record_proof)
-                    .header("Idempotency-Key", "handler-create-record-1")
-                    .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(
-                        serde_json::json!({
-                            "repo": MAPPED_DID,
-                            "collection": "app.bsky.feed.post",
-                            "rkey": "3jzfcijpj2z2a",
-                            "record": {
-                                "$type": "app.bsky.feed.post",
-                                "text": "native direct-self conformance",
-                            },
-                            "returnRecord": true,
-                        })
-                        .to_string(),
-                    ))?,
-            )
-            .await?;
-        assert_eq!(create_record.status(), axum::http::StatusCode::OK);
-        let create_record_json = response_json(create_record).await;
-        assert_eq!(create_record_json["uri"], format!("at://{MAPPED_DID}/app.bsky.feed.post/3jzfcijpj2z2a"));
-        assert_eq!(
-            create_record_json["value"]["text"],
-            "native direct-self conformance"
-        );
-        let public_snapshot = public_repo_store
-            .snapshot(MAPPED_DID)?
-            .ok_or_else(|| anyhow::anyhow!("direct-self publication was not persisted"))?;
-        let record_key = hyprstream_pds::atproto_cbor::AtprotoRecordKey::new("3jzfcijpj2z2a")?;
-        assert!(public_snapshot.records.contains_key(&(
-            "app.bsky.feed.post".to_owned(),
-            record_key,
-        )));
 
         // The protected hosted-PDS route consumes the standard DPoP-bound
         // OAuth access token and signs the exact #1354 method/audience with

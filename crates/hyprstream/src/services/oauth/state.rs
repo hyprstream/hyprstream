@@ -1173,8 +1173,7 @@ pub struct OAuthState {
     pub hosted_public_repo_writer:
         Option<Arc<crate::services::public_repo::HostedAccountPublicRepoWriter>>,
     /// Optional native account resolver for the protected standard
-    /// `com.atproto.server.getSession` route. No session route is mounted
-    /// while this is absent.
+    /// `com.atproto.server.getSession` route.
     pub atproto_session_resolver: Option<Arc<dyn super::xrpc::AtprotoSessionResolver>>,
     /// When `true`, the XRPC read-slice routes (`/xrpc/…`) are mounted on the
     /// OAuth router (#1112). Copied from `OAuthConfig::xrpc_read_slice`.
@@ -1451,9 +1450,6 @@ impl OAuthState {
         self
     }
 
-    /// Install the production hosted-account writer. This remains explicit at
-    /// composition time and stays absent when the account authority or public
-    /// repository root is not configured.
     pub fn with_hosted_public_repo_writer(
         mut self,
         writer: Arc<crate::services::public_repo::HostedAccountPublicRepoWriter>,
@@ -1462,9 +1458,6 @@ impl OAuthState {
         self
     }
 
-    /// Install the explicit native account resolver used by standard
-    /// `com.atproto.server.getSession`. The resolver owns handle, DID-document
-    /// and lifecycle truth; no session route is mounted without it.
     pub fn with_atproto_session_resolver(
         mut self,
         resolver: Arc<dyn super::xrpc::AtprotoSessionResolver>,
@@ -2292,7 +2285,7 @@ pub fn canonical_issuer_origin(issuer_url: &str) -> Option<String> {
 /// while a non-default port is retained and its domain-segment separator is
 /// encoded as `%3A`. IPv6 is rejected until client and server share one
 /// canonical DID representation for it.
-fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
+pub(super) fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
     let url = url::Url::parse(issuer_url).ok()?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()
