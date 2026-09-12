@@ -2,9 +2,9 @@
   "schema_version": 1,
   "source_commit": "b2ff7bb91460f7eba55a6df8484a41086839c0a7",
   "source_tree": "2a4f0178d37fb2e2cf22c40000f117530dd47fa8",
-  "source_input_digest": "cd447ce4ccc307fd4deaaa35682648f81e9e8783b0a3557f76740af0813f4dd6",
+  "source_input_digest": "b8a5df2f3bfb597e03d40572678fef6e2fe63bee7c833b455db1c22e6c36efdb",
   "authority": "docs/system-ontology.md",
-  "api_manifest": {"version": 1, "path": "api/v1/{service}/{method}.json", "id": "api:{service}:{method}", "integrity": "sha256 of canonical UTF-8 JSON", "limit_bytes": 1048576},
+  "api_manifest": {"version": 1, "path": "api/v1/{service}/{scope}/{method}.json", "id": "api:{service}:{scope}:{method}", "integrity": "sha256 of canonical UTF-8 JSON", "limit_bytes": 1048576},
   "corpus_manifest": {"version": 1, "path": "corpus/v1/{document_id}.md", "id": "doc:{repository-relative-path}", "integrity": "sha256 of source bytes", "limit_bytes": 2097152},
   "public_prose": [
     {"glob":"docs/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository prose"},

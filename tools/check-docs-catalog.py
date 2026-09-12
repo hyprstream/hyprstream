@@ -240,21 +240,29 @@ def path_matches(path: str, pattern: str) -> bool:
     return re.fullmatch("".join(pieces) + "$", path) is not None
 
 
+def deleted(path: str, mutations: dict[str, str] | None) -> bool:
+    """A mutations entry of None marks the file as deleted in this probe."""
+    return bool(mutations) and path in mutations and mutations[path] is None
+
+
 def provenance_paths(repo: Path, corpus: dict[str, Any],
                      mutations: dict[str, str] | None = None) -> list[str]:
     manifests = [str(Path(directory).parent / "Cargo.toml") for directory in OWNER_DIRECTORIES]
-    return sorted(set(tracked(repo, "*.capnp") + corpus_paths(repo, corpus) + tracked(repo, "build.rs", "**/build.rs")
-                      + typescript_schema_sources(repo, mutations) + [
+    paths = sorted(set(tracked(repo, "*.capnp") + corpus_paths(repo, corpus) + tracked(repo, "build.rs", "**/build.rs")
+                       + typescript_schema_sources(repo, mutations) + [
         "crates/hyprstream/src/cli/schema_cli.rs", "crates/hyprstream/src/services/mcp_service.rs",
         "crates/hyprstream/src/services/factories.rs", "crates/hyprstream-rpc-std/src/vfs_mount.rs",
         ".github/license-boundary.toml", *manifests,
     ]))
+    return [path for path in paths if not deleted(path, mutations)]
 
 
 def input_digest(repo: Path, paths: list[str], mutations: dict[str, str] | None = None,
                  tree: str | None = None) -> str:
     digest = hashlib.sha256()
     for path in paths:
+        if deleted(path, mutations):
+            continue
         if tree is None:
             content = text(repo, path, mutations).encode("utf-8")
         else:
@@ -263,6 +271,26 @@ def input_digest(repo: Path, paths: list[str], mutations: dict[str, str] | None 
             content = result.stdout
         digest.update(path.encode("utf-8") + b"\0" + content + b"\0")
     return digest.hexdigest()
+
+
+def attested_tree_universe(repo: Path, tree: str, corpus: dict[str, Any]) -> set[str]:
+    """Audited paths present in a declared tree, mirroring provenance_paths."""
+    manifests = {str(Path(directory).parent / "Cargo.toml") for directory in OWNER_DIRECTORIES}
+    fixed = {"crates/hyprstream/src/cli/schema_cli.rs", "crates/hyprstream/src/services/mcp_service.rs",
+             "crates/hyprstream/src/services/factories.rs", "crates/hyprstream-rpc-std/src/vfs_mount.rs",
+             ".github/license-boundary.toml", *manifests}
+    universe: set[str] = set()
+    for path in git(repo, "ls-tree", "-r", "--name-only", tree).splitlines():
+        if path.endswith(".capnp") or path.endswith("/build.rs") or path == "build.rs" or path in fixed:
+            universe.add(path)
+        elif path.startswith("docs/") and path.endswith(".md") \
+                and any(path_matches(path, item["glob"]) for item in corpus.get("public_prose", [])) \
+                and not any(path_matches(path, item["glob"]) for item in corpus.get("excluded", [])):
+            universe.add(path)
+        elif (path.endswith((".ts", ".tsx", ".js", ".jsx")) or path == "package.json") \
+                and ts_source_is_consumer(git(repo, "show", f"{tree}:{path}")):
+            universe.add(path)
+    return universe
 
 
 def check_provenance(record: dict[str, Any], repo: Path, label: str, corpus: dict[str, Any],
@@ -298,6 +326,10 @@ def check_provenance(record: dict[str, Any], repo: Path, label: str, corpus: dic
     paths = provenance_paths(repo, corpus, mutations)
     required(input_digest(repo, paths, mutations) == declared_digest,
              f"{label} current audited inputs differ from source_input_digest")
+    if pair_exists:
+        removed = sorted(attested_tree_universe(repo, tree, corpus) - set(paths))
+        required(not removed,
+                 f"{label} declared tree attests inputs removed from the current checkout: {', '.join(removed)}")
     if pair_exists and not mutations:
         required(input_digest(repo, paths, tree=tree) == declared_digest,
                  f"{label} source_tree does not reproduce the audited input digest")
@@ -452,13 +484,24 @@ def js_code_and_strings(source: str) -> tuple[str, dict[int, str]]:
     return "".join(out), strings
 
 
+TS_SPECIFIER_MARKER = re.compile(r"@hyprstream/docs|codegen-out|\.capnp$")
+TS_DEPENDENCY = re.compile(r"(?:\brequire\s*\(\s*|\bimport\s*\(\s*|\bimport\s+|\bfrom\s+)(['\"]\0+['\"`])")
+
+
+def ts_source_is_consumer(source: str) -> bool:
+    code, strings = js_code_and_strings(source)
+    for match in TS_DEPENDENCY.finditer(code):
+        specifier = strings.get(match.start(1) + 1)
+        if specifier is not None and TS_SPECIFIER_MARKER.search(specifier):
+            return True
+    return False
+
+
 def typescript_schema_sources(repo: Path, mutations: dict[str, str] | None = None,
                               candidates: list[str] | None = None) -> list[str]:
     """Select tracked frontend sources importing or requiring a schema dependency."""
     candidates = candidates if candidates is not None else tracked(repo, "*.ts", "*.tsx", "*.js", "*.jsx", "package.json")
     result = []
-    marker = re.compile(r"@hyprstream/docs|codegen-out|\.capnp$")
-    dependency = re.compile(r"(?:\brequire\s*\(\s*|\bimport\s*\(\s*|\bimport\s+|\bfrom\s+)(['\"]\0+['\"`])")
     for path in candidates:
         source = text(repo, path, mutations)
         if path == "package.json":
@@ -470,12 +513,8 @@ def typescript_schema_sources(repo: Path, mutations: dict[str, str] | None = Non
             if any("@hyprstream/docs" in section for section in sections if isinstance(section, dict)):
                 result.append(path)
             continue
-        code, strings = js_code_and_strings(source)
-        for match in dependency.finditer(code):
-            specifier = strings.get(match.start(1) + 1)
-            if specifier is not None and marker.search(specifier):
-                result.append(path)
-                break
+        if ts_source_is_consumer(source):
+            result.append(path)
     return sorted(result)
 
 
@@ -710,6 +749,7 @@ def check_cgr(catalog: dict[str, Any], repo: Path, schemas: list[dict[str, Any]]
             else:
                 required(entry["path"] not in direct_inputs,
                          f"{entry['path']} is compiled directly by a build script")
+            required(entry.get("cgr_producers") is None, f"{entry['path']} must not claim CGR producers")
             continue
         required(producer in roots, f"{entry['path']} producer is not an audited persisted-CGR root")
         matched = [call for call in inventories[producer] if entry["path"].startswith(f"{call['source_root']}/") and Path(entry["path"]).stem in call["schemas"]]
@@ -819,8 +859,10 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
         actual_cgr = [producer for producer, calls in inventories.items()
                       if any(entry["path"].startswith(f"{call['source_root']}/") and stem in call["schemas"] for call in calls)]
         if actual_cgr:
-            required(entry.get("cgr_producer") == actual_cgr[0] and "compiled_by" not in entry,
+            required(entry.get("cgr_producer") == sorted(actual_cgr)[0] and "compiled_by" not in entry,
                      f"{entry['path']} persisted-CGR compiler classification drift")
+            required(entry.get("cgr_producers") == sorted(actual_cgr),
+                     f"{entry['path']} CGR producer inventory drift")
         elif entry["path"].endswith("wire_roundtrip_fixture.capnp"):
             required(entry.get("cgr_producer") is None and entry.get("compiled_by") == "capnp_only",
                      f"{entry['path']} capnp-only compiler input drift")
@@ -877,7 +919,7 @@ def check_corpus(corpus: dict[str, Any], repo: Path, mutations: dict[str, str] |
         record = corpus.get(name, {})
         required(record.get("version") == 1 and isinstance(record.get("limit_bytes"), int) and record["limit_bytes"] > 0, f"invalid {name}")
         required(all(record.get(key) for key in ("path", "id", "integrity")), f"{name} lacks stable contract fields")
-    required(corpus["api_manifest"] == {"version": 1, "path": "api/v1/{service}/{method}.json", "id": "api:{service}:{method}", "integrity": "sha256 of canonical UTF-8 JSON", "limit_bytes": 1048576},
+    required(corpus["api_manifest"] == {"version": 1, "path": "api/v1/{service}/{scope}/{method}.json", "id": "api:{service}:{scope}:{method}", "integrity": "sha256 of canonical UTF-8 JSON", "limit_bytes": 1048576},
              "API manifest contract drift")
     required(corpus["corpus_manifest"] == {"version": 1, "path": "corpus/v1/{document_id}.md", "id": "doc:{repository-relative-path}", "integrity": "sha256 of source bytes", "limit_bytes": 2097152},
              "corpus manifest contract drift")
@@ -1007,6 +1049,20 @@ def self_test(repo: Path) -> None:
         expect_event_failure("fabricated provenance commit", repo, bad, corpus, schemas, consumers, "pull_request", pr_base)
     # A committed catalog may not self-reference; during staged authoring the
     # transient HEAD-referencing pair is the sanctioned authoring state.
+    # Removal direction: deleting an audited schema and its catalog entry must
+    # collide with the declared tree, which still contains the deleted file.
+    # The deletion is simulated in this worktree's own index (ls-files reads
+    # it) and restored afterwards; worktree indexes are not shared.
+    removed_schema = "crates/hyprstream-rpc/schema/optional.capnp"
+    probe_catalog = copy.deepcopy(catalog)
+    probe_catalog["schemas"] = [entry for entry in probe_catalog["schemas"] if entry["path"] != removed_schema]
+    pruned = [path for path in schemas if path != removed_schema]
+    subprocess.run(["git", "-C", str(repo), "rm", "--cached", "--quiet", removed_schema], check=False)
+    try:
+        expect_failure("declared tree attests removed input", repo, probe_catalog, corpus, pruned,
+                       consumers, {removed_schema: None})
+    finally:
+        subprocess.run(["git", "-C", str(repo), "restore", "--staged", removed_schema], check=False)
     committed = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--quiet", "--",
                                 "docs/schema-catalog.json", "docs/corpus-sources.json"]).returncode == 0
     bad = copy.deepcopy(catalog); bad["source_commit"] = git(repo, "rev-parse", "HEAD"); bad["source_tree"] = git(repo, "rev-parse", "HEAD^{tree}")
@@ -1163,6 +1219,12 @@ def self_test(repo: Path) -> None:
     )
     expect_failure("module-aliased capnpc compiles uncompiled schema", repo, copy.deepcopy(catalog), corpus,
                    schemas, consumers, {discovery_build: module_drift})
+    module_drift = text(repo, discovery_build, None).replace(
+        "\n}",
+        '\n}\n\nuse capnpc as cp;\n\nfn extra() {\n    cp::CompilerCommand::new().file("../hyprstream-pay/schema/settlement.capnp").run().expect("module-aliased");\n}', 1
+    )
+    expect_failure("module-aliased capnpc compiles uncompiled schema", repo, copy.deepcopy(catalog), corpus,
+                   schemas, consumers, {discovery_build: module_drift})
     shadowed = text(repo, discovery_build, None).replace(
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");\n    let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-workers/schema");',
@@ -1258,6 +1320,16 @@ def self_test(repo: Path) -> None:
     expect_failure("package exports", repo, catalog, bad, schemas, consumers)
     bad = copy.deepcopy(catalog); bad["consumer_sets"]["cli"]["state"] = "absent"
     expect_failure("consumer state contradiction", repo, bad, corpus, schemas, consumers)
+    shared = next(entry for entry in catalog["schemas"] if entry["path"].endswith("streaming.capnp"))
+    required(shared.get("cgr_producers") == ["crates/hyprstream-rpc/build.rs", "crates/hyprstream/build.rs"],
+             "shared-schema CGR producer inventory drift")
+    bad = copy.deepcopy(catalog)
+    shared_entry = next(entry for entry in bad["schemas"] if entry["path"].endswith("streaming.capnp"))
+    shared_entry["cgr_producers"] = shared_entry["cgr_producers"][:1]
+    expect_failure("shared schema producer under-recorded", repo, bad, corpus, schemas, consumers)
+    scoped = ["worker", "pod-sandbox", "pod-sandbox/container", "image"]
+    identities = {corpus["api_manifest"]["id"].format(service="worker", scope=item, method="list") for item in scoped}
+    required(len(identities) == len(scoped), "scoped API identities collide")
     top_level = "docs/KV-CACHE-ARCHITECTURE.md"
     changed_top_level = text(repo, top_level, None) + "\nprovenance mutation\n"
     expect_failure("top-level corpus provenance", repo, catalog, corpus, schemas, consumers, {top_level: changed_top_level}, False)
