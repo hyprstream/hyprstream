@@ -6926,6 +6926,7 @@ dependencies = [
  "jsonwebtoken 10.3.0",
  "k256",
  "keyring",
+ "language-tags",
  "libc",
  "listenfd",
  "log",
@@ -6994,6 +6995,8 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "tui-logger",
+ "unicode-segmentation",
+ "uriparse",
  "url",
  "urlencoding",
  "users",
@@ -8139,8 +8142,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fca9b4b462c343ff88fc0af4096c186f939b602a0bc08723536ef2c31c93971"
+source = "git+https://github.com/ewindisch/iroh.git?rev=df6302e0561fadcbf91199ad15d564224a3e7d93#df6302e0561fadcbf91199ad15d564224a3e7d93"
 dependencies = [
  "backon",
  "blake3",
@@ -9059,6 +9061,12 @@ dependencies = [
  "libc",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "language-tags"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4345964bb142484797b161f473a503a434de77149dd8c7427788c6e13379388"
 
 [[package]]
 name = "lazy_static"
@@ -17276,6 +17284,16 @@ dependencies = [
  "serde_json",
  "url",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "uriparse"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0200d0fc04d809396c2ad43f3c95da3582a2556eba8d453c1087f4120ee352ff"
+dependencies = [
+ "fnv",
+ "lazy_static",
 ]
 
 [[package]]

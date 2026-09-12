@@ -13,6 +13,7 @@
 2	crates/hyprstream-metrics/src/storage/cached.rs
 1	crates/hyprstream-p2p/src/bin/gittorrentd.rs
 1	crates/hyprstream-p2p/src/service.rs
+3	crates/hyprstream-pds/src/repo_authority.rs
 1	crates/hyprstream-rpc/src/auth/key_source.rs
 3	crates/hyprstream-rpc/src/did_web.rs
 2	crates/hyprstream-service/src/service/spawner/service.rs

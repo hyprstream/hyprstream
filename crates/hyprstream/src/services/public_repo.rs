@@ -12,7 +12,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, ensure, Context as _, Result};
-use hyprstream_pds::atproto_cbor::AtprotoRecord;
+use base64::{
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+    Engine as _,
+};
+use hyprstream_pds::atproto_cbor::{AtprotoRecord, AtprotoRecordKey};
 use hyprstream_pds::commit::{Commit, UnsignedCommit};
 use hyprstream_pds::dag_cbor::DagCbor;
 use hyprstream_pds::mst::Node;
@@ -24,9 +28,77 @@ use serde::{Deserialize, Serialize};
 
 const RECORD_PREFIX: &str = "public-rk\0";
 const COMMIT_PREFIX: &str = "public-commit\0";
+const COMMIT_BLOCK_PREFIX: &str = "public-commit-block\0";
 const INTENT_PREFIX: &str = "public-intent\0";
 const MAX_REQUEST_ID: usize = 128;
 const MAX_PRINCIPAL: usize = 512;
+/// Deployment ceiling on complete canonical DAG-CBOR record bytes (64 KiB).
+/// A conservative storage policy, not a universal protocol maximum; large
+/// payloads belong in linked blobs. Includes CBOR map/type/length overhead.
+/// See https://atproto.com/specs/repository#security-considerations.
+pub const MAX_PUBLIC_RECORD_BYTES: usize = 64 * 1024;
+
+/// MVP repository capacity: bounds raw records, decoded trees and MST work for
+/// every snapshot caller. Key bytes count too; tiny records also have a limit.
+pub const MAX_PUBLIC_SNAPSHOT_BYTES: usize = 1024 * 1024;
+pub const MAX_PUBLIC_SNAPSHOT_RECORDS: usize = 256;
+
+#[derive(Default)]
+struct SnapshotBudget {
+    bytes: usize,
+    records: usize,
+}
+
+impl SnapshotBudget {
+    fn charge(&mut self, key_bytes: usize, record_bytes: usize) -> Result<()> {
+        ensure!(
+            record_bytes <= MAX_PUBLIC_RECORD_BYTES,
+            "public snapshot record exceeds byte budget"
+        );
+        let bytes = self
+            .bytes
+            .checked_add(key_bytes)
+            .and_then(|bytes| bytes.checked_add(record_bytes));
+        ensure!(
+            self.records < MAX_PUBLIC_SNAPSHOT_RECORDS
+                && bytes.is_some_and(|bytes| bytes <= MAX_PUBLIC_SNAPSHOT_BYTES),
+            "public snapshot exceeds aggregate budget"
+        );
+        self.bytes = bytes.ok_or_else(|| anyhow!("public snapshot byte count overflow"))?;
+        self.records += 1;
+        Ok(())
+    }
+}
+
+/// Blob storage is not wired to this public writer. Never accept caller-supplied
+/// blob claims as proof of account ownership, bytes, MIME type or size. Scan
+/// every object, including open unions/extensions and legacy blob objects.
+pub(crate) fn reject_unverified_blobs(value: &DagCbor) -> Result<()> {
+    match value {
+        DagCbor::Map(entries) => {
+            let field = |name: &str| {
+                entries.iter().find_map(|(key, value)| {
+                    matches!(key, DagCbor::Text(key) if key == name).then_some(value)
+                })
+            };
+            ensure!(
+                !matches!(field("$type"), Some(DagCbor::Text(kind)) if kind == "blob")
+                    && !(field("cid").is_some() && field("mimeType").is_some()),
+                "blob storage verification is unavailable"
+            );
+            for (_, value) in entries {
+                reject_unverified_blobs(value)?;
+            }
+        }
+        DagCbor::List(values) => {
+            for value in values {
+                reject_unverified_blobs(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 fn record_prefix(did: &str) -> Vec<u8> {
     format!("{RECORD_PREFIX}{did}\0").into_bytes()
@@ -38,6 +110,10 @@ fn record_key(did: &str, collection: &str, rkey: &str) -> Vec<u8> {
 
 fn commit_key(did: &str) -> Vec<u8> {
     format!("{COMMIT_PREFIX}{did}").into_bytes()
+}
+
+fn commit_block_key(did: &str, cid: &str) -> Vec<u8> {
+    format!("{COMMIT_BLOCK_PREFIX}{did}\0{cid}").into_bytes()
 }
 
 fn intent_key(did: &str, request_id: &str) -> Vec<u8> {
@@ -86,6 +162,14 @@ pub trait PublicPublicationAuthorizer: Send + Sync {
     /// read or written. Implementations should apply native identity,
     /// assurance, account, collection, tenant, expiry and revocation policy.
     fn authorize(&self, principal: &str, account: &str, collection: &str) -> Result<()>;
+
+    /// Separate account-owner authority: permission to publish a record never
+    /// implicitly permits key replacement. Existing authorizers fail closed.
+    fn authorize_key_promotion(&self, _principal: &str, _account: &str) -> Result<()> {
+        Err(anyhow!(
+            "repository signing key promotion is not authorized"
+        ))
+    }
 }
 
 /// A request to create one immutable public record under an owned repo.
@@ -95,7 +179,9 @@ pub struct PublicCreateRequest {
     pub principal: String,
     pub did: String,
     pub collection: String,
-    pub rkey: Tid,
+    /// Explicit general AT record key, or None to allocate a fresh TID under
+    /// the transaction lock. Retries recover a generated key from the intent.
+    pub rkey: Option<AtprotoRecordKey>,
     pub value: DagCbor,
     /// Required repo-head CAS value. None means this must create the genesis
     /// record; retries use the request id and never silently fork a head.
@@ -113,7 +199,7 @@ pub struct PublicCommitResult {
 #[derive(Clone, Debug)]
 pub struct PublicRepoSnapshot {
     pub did: String,
-    pub records: BTreeMap<(String, Tid), AtprotoRecord>,
+    pub records: BTreeMap<(String, AtprotoRecordKey), AtprotoRecord>,
     pub commit: Commit,
 }
 
@@ -124,8 +210,44 @@ struct PublicationIntent {
     did: String,
     collection: String,
     rkey: String,
+    /// Old intents always had an explicit key. Preserve their retry behavior.
+    #[serde(default)]
+    generated_rkey: bool,
     cid: String,
     commit_cid: String,
+    /// Missing on older receipts: condition identity cannot safely be inferred.
+    #[serde(default)]
+    head_condition: Option<String>,
+}
+
+#[derive(Default)]
+struct AccountSigningState {
+    // Held through snapshot/rebuild/sign/persist and through promotion. All
+    // handles for exactly one DID share this guard and its active authority.
+    active_key: Mutex<Option<p256::ecdsa::SigningKey>>,
+}
+
+/// Native callers retain genesis-or-exact CAS; XRPC may omit its condition.
+enum PublicHeadCondition {
+    Unconditional,
+    Exact(Option<Cid>),
+}
+
+impl PublicHeadCondition {
+    fn identity(&self) -> String {
+        match self {
+            Self::Unconditional => "unconditional".to_owned(),
+            Self::Exact(None) => "exact:genesis".to_owned(),
+            Self::Exact(Some(cid)) => format!("exact:{cid}"),
+        }
+    }
+
+    fn matches(&self, actual: Option<Cid>) -> bool {
+        match self {
+            Self::Unconditional => true,
+            Self::Exact(expected) => *expected == actual,
+        }
+    }
 }
 
 /// Durable public repository storage. It uses a distinct RocksDB directory
@@ -133,7 +255,9 @@ struct PublicationIntent {
 /// bytes.
 pub struct PublicRepoStore {
     db: Arc<rocksdb::DB>,
-    write_lock: Mutex<()>,
+    // Held only to find/insert a shared account state, never during account
+    // locking, cryptography or database access. Unrelated DIDs can progress.
+    accounts: Mutex<BTreeMap<String, Arc<AccountSigningState>>>,
 }
 
 impl std::fmt::Debug for PublicRepoStore {
@@ -143,6 +267,103 @@ impl std::fmt::Debug for PublicRepoStore {
 }
 
 impl PublicRepoStore {
+    #[cfg(test)]
+    pub(crate) fn insert_snapshot_budget_fixture_for_test(
+        &self,
+        did: &str,
+        count: usize,
+        payload_bytes: usize,
+    ) -> Result<()> {
+        let value = DagCbor::str_map([
+            ("$type", DagCbor::Text("app.bsky.feed.post".into())),
+            ("text", DagCbor::Text("x".repeat(payload_bytes))),
+        ]);
+        let record = AtprotoRecord::new(
+            "app.bsky.feed.post",
+            AtprotoRecordKey::new("fixture")?,
+            value,
+        )?;
+        let mut batch = rocksdb::WriteBatch::default();
+        for index in 0..count {
+            let key = record_key(did, "app.bsky.feed.post", &format!("{index:04}"));
+            if index + 1 == count {
+                // Same size, invalid CBOR: capacity must fail BEFORE decoding it.
+                batch.put(key, vec![0xff; record.bytes().len()]);
+            } else {
+                batch.put(key, record.bytes());
+            }
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_unverified_blob_for_test(&self, did: &str) -> Result<()> {
+        let account = self
+            .accounts
+            .lock()
+            .get(did)
+            .cloned()
+            .ok_or_else(|| anyhow!("test writer account missing"))?;
+        let key = account.active_key.lock();
+        let record = AtprotoRecord::new(
+            "app.bsky.feed.post",
+            AtprotoRecordKey::new("legacy")?,
+            DagCbor::str_map([
+                ("$type", DagCbor::Text("app.bsky.feed.post".into())),
+                (
+                    "extension",
+                    DagCbor::str_map([
+                        ("$type", DagCbor::Text("blob".into())),
+                        ("ref", DagCbor::Link(Cid::from_raw(b"absent-content"))),
+                        ("mimeType", DagCbor::Text("image/png".into())),
+                        ("size", DagCbor::Unsigned(14)),
+                    ]),
+                ),
+            ]),
+        )?;
+        let keyed = BTreeMap::from([("app.bsky.feed.post/legacy".to_owned(), record.cid())]);
+        let (root, _) = Node::from_keyed_records(&keyed).to_node_data_with_blocks_atproto()?;
+        let commit = Commit::sign_atproto(
+            &UnsignedCommit::new(did.to_owned(), root.cid_atproto()?, Tid::from_raw(7), None),
+            key.as_ref()
+                .ok_or_else(|| anyhow!("test signing authority missing"))?,
+        )?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(
+            record_key(did, record.collection(), record.rkey().as_str()),
+            record.bytes(),
+        );
+        batch.put(commit_key(did), commit.to_atproto_dag_cbor()?);
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_account_lock_for_test(&self, did: &str, held: impl FnOnce()) -> Result<()> {
+        let account = self
+            .accounts
+            .lock()
+            .get(did)
+            .cloned()
+            .ok_or_else(|| anyhow!("test writer account missing"))?;
+        let _guard = account.active_key.lock();
+        held();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_malformed_record_for_test(
+        &self,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> Result<()> {
+        self.db
+            .put(record_key(did, collection, rkey), b"invalid CBOR")?;
+        Ok(())
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)
             .with_context(|| format!("failed to create public repo store at {path:?}"))?;
@@ -152,44 +373,68 @@ impl PublicRepoStore {
             .with_context(|| format!("failed to open public repo store at {path:?}"))?;
         Ok(Self {
             db: Arc::new(db),
-            write_lock: Mutex::new(()),
+            accounts: Mutex::new(BTreeMap::new()),
         })
     }
 
     pub fn snapshot(&self, did: &str) -> Result<Option<PublicRepoSnapshot>> {
         validate_did(did)?;
+        // Iteration and the head lookup must observe the same database
+        // sequence, even when a writer commits a batch during the scan.
+        let snapshot = self.db.snapshot();
         let prefix = record_prefix(did);
         let mut records = BTreeMap::new();
-        for item in self.db.prefix_iterator(&prefix) {
-            let (key, bytes) = item.context("public repo record scan failed")?;
+        let mut budget = SnapshotBudget::default();
+        // Borrow RocksDB's current key/value so oversized values are rejected
+        // before the iterator or decoder copies them into Rust-owned buffers.
+        let mut iterator = snapshot.raw_iterator();
+        iterator.seek(&prefix);
+        while iterator.valid() {
+            let key = iterator
+                .key()
+                .ok_or_else(|| anyhow!("public record key unavailable"))?;
             if !key.starts_with(&prefix) {
                 break;
             }
+            let bytes = iterator
+                .value()
+                .ok_or_else(|| anyhow!("public record bytes unavailable"))?;
+            budget.charge(key.len(), bytes.len())?;
             let suffix = std::str::from_utf8(&key[prefix.len()..])
                 .context("public repo record key is not UTF-8")?;
             let (collection, rkey) = suffix
                 .split_once('\0')
                 .ok_or_else(|| anyhow!("public repo record key missing separator"))?;
-            let rkey = Tid::parse(rkey)?;
-            let record = AtprotoRecord::from_bytes(collection, rkey, &bytes)
-                .with_context(|| format!("invalid public record {did}/{collection}/{rkey}"))?;
+            let rkey = AtprotoRecordKey::new(rkey)?;
+            let record =
+                AtprotoRecord::from_bytes(collection, &rkey, bytes).with_context(|| {
+                    format!("invalid public record {did}/{collection}/{}", rkey.as_str())
+                })?;
+            reject_unverified_blobs(record.value())?;
             records.insert((collection.to_owned(), rkey), record);
+            iterator.next();
         }
+        iterator
+            .status()
+            .context("public repo record scan failed")?;
         if records.is_empty() {
             return Ok(None);
         }
-        let bytes = self
-            .db
-            .get(commit_key(did))
+        let bytes = snapshot
+            .get_pinned(commit_key(did))
             .context("public repo commit read failed")?
             .ok_or_else(|| anyhow!("public repo has records but no signed commit"))?;
+        ensure!(
+            bytes.len() <= MAX_PUBLIC_RECORD_BYTES,
+            "public commit exceeds byte budget"
+        );
         let commit = Commit::from_atproto_dag_cbor(&bytes)
             .context("public repo signed commit is invalid")?;
         ensure!(commit.did == did, "public repo commit DID mismatch");
         let keyed = records
             .iter()
             .map(|((collection, rkey), record)| {
-                (format!("{collection}/{}", rkey.encode()), record.cid())
+                (format!("{collection}/{}", rkey.as_str()), record.cid())
             })
             .collect();
         let tree = Node::from_keyed_records(&keyed);
@@ -228,6 +473,12 @@ impl PublicRepoStore {
             record_key(did, record.collection(), record.rkey().as_str()),
             record.bytes(),
         );
+        // The mutable head may advance before a caller retries. Retain the
+        // exact commit block that backs each durable publication receipt.
+        batch.put(
+            commit_block_key(did, &commit.cid_atproto()?.to_string()),
+            &commit_bytes,
+        );
         batch.put(commit_key(did), commit_bytes);
         batch.put(intent_key(did, &intent.request_id), intent_bytes);
         let mut options = rocksdb::WriteOptions::default();
@@ -239,11 +490,27 @@ impl PublicRepoStore {
     }
 }
 
+/// Write failures are classified at their origin. HTTP callers must use these
+/// variants and fixed public messages; sources are for local diagnostics only.
+#[derive(Debug, thiserror::Error)]
+pub enum PublicRepoWriteError {
+    #[error("invalid publication request: {0}")]
+    InvalidRequest(#[source] anyhow::Error),
+    #[error("publication authorization failed: {0}")]
+    Authorization(#[source] anyhow::Error),
+    #[error("record key already exists")]
+    RecordAlreadyExists,
+    #[error("public repo head CAS conflict")]
+    InvalidSwap,
+    #[error("internal public repository failure: {0}")]
+    Internal(#[from] anyhow::Error),
+}
+
 /// Public repository writer with an explicit native authorization gate.
 pub struct PublicRepoWriter {
     store: Arc<PublicRepoStore>,
     did: String,
-    signing_key: p256::ecdsa::SigningKey,
+    account: Arc<AccountSigningState>,
     authorizer: Arc<dyn PublicPublicationAuthorizer>,
 }
 
@@ -260,6 +527,24 @@ impl PublicRepoWriter {
         &self.did
     }
 
+    /// Blocking public read boundary. The account guard keeps the snapshot and
+    /// published verifying key consistent with concurrent writes/key promotion.
+    pub(crate) fn public_snapshot(
+        &self,
+    ) -> Result<Option<(PublicRepoSnapshot, p256::ecdsa::VerifyingKey)>> {
+        let state = self.account.active_key.lock();
+        let key = state
+            .as_ref()
+            .ok_or_else(|| anyhow!("public signing authority is unavailable"))?;
+        let Some(snapshot) = self.store.snapshot(&self.did)? else {
+            return Ok(None);
+        };
+        snapshot.commit.verify_atproto(key.verifying_key())?;
+        Ok(Some((snapshot, *key.verifying_key())))
+    }
+
+    /// Bind a trusted account key to this store. All writer handles for the
+    /// same DID share one active authority; a different key requires promotion.
     pub fn new(
         store: Arc<PublicRepoStore>,
         did: impl Into<String>,
@@ -268,43 +553,186 @@ impl PublicRepoWriter {
     ) -> Result<Self> {
         let did = did.into();
         validate_did(&did)?;
+        let account = {
+            let mut accounts = store.accounts.lock();
+            Arc::clone(accounts.entry(did.clone()).or_default())
+        };
+        {
+            let mut state = account.active_key.lock();
+            if let Some(active) = state.as_ref() {
+                ensure!(
+                    active.verifying_key() == signing_key.verifying_key(),
+                    "repo signing key differs from active authority; use explicit promotion"
+                );
+            } else {
+                // On reopen, never silently adopt a key that disagrees with
+                // the durable head. Recover/promote through the account owner.
+                if let Some(repo) = store.snapshot(&did)? {
+                    repo.commit
+                        .verify_atproto(signing_key.verifying_key())
+                        .context("repo head does not match supplied active signing authority")?;
+                }
+                *state = Some(signing_key);
+            }
+        }
         Ok(Self {
             store,
             did,
-            signing_key,
+            account,
             authorizer,
         })
     }
 
-    pub fn create_record(&self, request: PublicCreateRequest) -> Result<PublicCommitResult> {
-        ensure!(
-            request.did == self.did,
-            "public request account does not match writer"
-        );
-        validate_request_id(&request.request_id)?;
-        validate_principal(&request.principal)?;
-        self.authorizer
-            .authorize(&request.principal, &self.did, &request.collection)?;
+    /// Resolve this account's active public key from shared transaction state.
+    /// DID-document publication must use this authority after promotion returns.
+    pub fn active_verifying_key(&self) -> Result<p256::ecdsa::VerifyingKey> {
+        self.account
+            .active_key
+            .lock()
+            .as_ref()
+            .map(|key| *key.verifying_key())
+            .ok_or_else(|| anyhow!("no active signing authority for repository"))
+    }
 
-        let _guard = self.store.write_lock.lock();
-        let record = AtprotoRecord::new(request.collection.clone(), request.rkey, request.value)?;
+    /// Explicit account-owner promotion boundary. The trusted caller must
+    /// validate/secure the candidate and publish it in the account DID document
+    /// only after this succeeds. This is not the node-global OAuth key store.
+    ///
+    /// Serializes with all writers for this store/account. Re-signs an idle
+    /// head over identical canonical unsigned bytes, persists the new head and
+    /// immutable block synchronously, then exposes the candidate to surviving
+    /// writers and public-key readers. Errors leave the active key unchanged.
+    /// Old blocks and publication intents remain immutable for original retries.
+    /// This in-process boundary does not subscribe to external key rotations;
+    /// account lifecycle wiring must route promotion through it.
+    pub fn promote_signing_key(
+        &self,
+        principal: &str,
+        expected_active: &p256::ecdsa::VerifyingKey,
+        candidate: p256::ecdsa::SigningKey,
+    ) -> Result<Option<Cid>> {
+        validate_principal(principal)?;
+        self.authorizer
+            .authorize_key_promotion(principal, &self.did)?;
+        let mut state = self.account.active_key.lock();
+        let active = state
+            .as_mut()
+            .ok_or_else(|| anyhow!("no active signing authority for repository"))?;
+        ensure!(
+            active.verifying_key() == expected_active,
+            "repo signing authority CAS conflict"
+        );
+        let head = if let Some(repo) = self.store.snapshot(&self.did)? {
+            repo.commit
+                .verify_atproto(active.verifying_key())
+                .context("current repo head does not verify under active authority")?;
+            let resigned = Commit::sign_atproto(&repo.commit.unsigned(), &candidate)?;
+            let bytes = resigned.to_atproto_dag_cbor()?;
+            let cid = resigned.cid_atproto()?;
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.put(commit_block_key(&self.did, &cid.to_string()), &bytes);
+            batch.put(commit_key(&self.did), bytes);
+            let mut options = rocksdb::WriteOptions::default();
+            options.set_sync(true);
+            self.store
+                .db
+                .write_opt(batch, &options)
+                .context("public repo signing authority reconciliation failed")?;
+            Some(cid)
+        } else {
+            None
+        };
+        *active = candidate;
+        Ok(head)
+    }
+
+    pub fn create_record(
+        &self,
+        request: PublicCreateRequest,
+    ) -> Result<PublicCommitResult, PublicRepoWriteError> {
+        let condition = PublicHeadCondition::Exact(request.expected_prev);
+        self.create_record_with_condition(request, condition)
+    }
+
+    fn create_record_with_condition(
+        &self,
+        request: PublicCreateRequest,
+        condition: PublicHeadCondition,
+    ) -> Result<PublicCommitResult, PublicRepoWriteError> {
+        if request.did != self.did {
+            return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                "public request account does not match writer"
+            )));
+        }
+        validate_request_id(&request.request_id).map_err(PublicRepoWriteError::InvalidRequest)?;
+        validate_principal(&request.principal).map_err(PublicRepoWriteError::InvalidRequest)?;
+        self.authorizer
+            .authorize(&request.principal, &self.did, &request.collection)
+            .map_err(PublicRepoWriteError::Authorization)?;
+
+        reject_unverified_blobs(&request.value).map_err(PublicRepoWriteError::InvalidRequest)?;
+        let state = self.account.active_key.lock();
+        let signing_key = state
+            .as_ref()
+            .ok_or_else(|| anyhow!("no active signing authority for repository"))?;
         if let Some(intent) = self.store.intent(&self.did, &request.request_id)? {
-            ensure!(
-                intent.did == self.did
-                    && intent.collection == record.collection()
-                    && intent.rkey == record.rkey().as_str()
-                    && intent.cid == record.cid().to_string(),
-                "publication request id was reused with different content"
-            );
+            if intent.head_condition.as_deref() != Some(condition.identity().as_str()) {
+                return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                    "publication request condition changed or is not bound"
+                )));
+            }
+            if intent.generated_rkey != request.rkey.is_none() {
+                return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                    "publication request id was reused with a different key mode"
+                )));
+            }
+            let rkey = match request.rkey.as_ref() {
+                Some(rkey) => rkey.clone(),
+                None => AtprotoRecordKey::new(intent.rkey.clone())?,
+            };
+            let record = AtprotoRecord::new(request.collection.clone(), &rkey, request.value)
+                .map_err(PublicRepoWriteError::InvalidRequest)?;
+            if record.bytes().len() > MAX_PUBLIC_RECORD_BYTES {
+                return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                    "public record exceeds {MAX_PUBLIC_RECORD_BYTES}-byte canonical encoded limit"
+                )));
+            }
+            if !(intent.request_id == request.request_id
+                && intent.principal == request.principal
+                && intent.did == self.did
+                && intent.collection == record.collection()
+                && intent.rkey == record.rkey().as_str()
+                && intent.cid == record.cid().to_string())
+            {
+                return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                    "publication request id was reused with different content"
+                )));
+            }
             let snapshot = self
                 .store
                 .snapshot(&self.did)?
                 .ok_or_else(|| anyhow!("publication intent exists without a repository"))?;
-            let commit_cid = snapshot.commit.cid_atproto()?;
-            ensure!(
-                intent.commit_cid == commit_cid.to_string(),
-                "publication intent commit does not match repository head"
-            );
+            if !snapshot
+                .records
+                .get(&(request.collection.clone(), rkey))
+                .is_some_and(|stored| stored.bytes() == record.bytes())
+            {
+                return Err(anyhow!("publication intent record does not match repository").into());
+            }
+            let commit_bytes = self
+                .store
+                .db
+                .get(commit_block_key(&self.did, &intent.commit_cid))
+                .context("publication intent commit block read failed")?
+                .ok_or_else(|| anyhow!("publication intent commit block is missing"))?;
+            let commit = Commit::from_atproto_dag_cbor(&commit_bytes)
+                .context("publication intent commit is invalid")?;
+            let commit_cid = commit.cid_atproto()?;
+            if commit.did != self.did || intent.commit_cid != commit_cid.to_string() {
+                return Err(
+                    anyhow!("publication intent commit does not match stored block").into(),
+                );
+            }
             return Ok(PublicCommitResult {
                 uri: record.uri(&self.did),
                 cid: record.cid(),
@@ -313,36 +741,58 @@ impl PublicRepoWriter {
         }
 
         let existing = self.store.snapshot(&self.did)?;
+        let mut budget = SnapshotBudget::default();
         let (mut keyed, previous, previous_rev) = match existing {
             Some(snapshot) => {
                 let previous = snapshot.commit.cid_atproto()?;
                 let previous_rev = snapshot.commit.rev;
-                ensure!(
-                    request.expected_prev == Some(previous),
-                    "public repo head CAS conflict"
-                );
+                if !condition.matches(Some(previous)) {
+                    return Err(PublicRepoWriteError::InvalidSwap);
+                }
+                for ((collection, rkey), record) in &snapshot.records {
+                    budget.charge(
+                        record_key(&self.did, collection, rkey.as_str()).len(),
+                        record.bytes().len(),
+                    )?;
+                }
                 let keyed = snapshot
                     .records
                     .into_iter()
                     .map(|((collection, rkey), record)| {
-                        (format!("{collection}/{}", rkey.encode()), record.cid())
+                        (format!("{collection}/{}", rkey.as_str()), record.cid())
                     })
                     .collect();
                 (keyed, Some(previous), Some(previous_rev))
             }
             None => {
-                ensure!(
-                    request.expected_prev.is_none(),
-                    "public repo genesis CAS conflict"
-                );
+                if !condition.matches(None) {
+                    return Err(PublicRepoWriteError::InvalidSwap);
+                }
                 (BTreeMap::new(), None, None)
             }
         };
+        let generated_rkey = request.rkey.is_none();
+        let rkey = match request.rkey {
+            Some(rkey) => rkey,
+            None => allocate_record_key(&request.collection, &keyed, previous_rev)?,
+        };
+        let record = AtprotoRecord::new(request.collection.clone(), rkey, request.value)
+            .map_err(PublicRepoWriteError::InvalidRequest)?;
+        if record.bytes().len() > MAX_PUBLIC_RECORD_BYTES {
+            return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                "public record exceeds {MAX_PUBLIC_RECORD_BYTES}-byte canonical encoded limit"
+            )));
+        }
         let record_key = format!("{}/{}", record.collection(), record.rkey().as_str());
-        ensure!(
-            !keyed.contains_key(&record_key),
-            "record key already exists"
-        );
+        if keyed.contains_key(&record_key) {
+            return Err(PublicRepoWriteError::RecordAlreadyExists);
+        }
+        budget
+            .charge(
+                self::record_key(&self.did, record.collection(), record.rkey().as_str()).len(),
+                record.bytes().len(),
+            )
+            .map_err(PublicRepoWriteError::InvalidRequest)?;
         keyed.insert(record_key, record.cid());
 
         let tree = Node::from_keyed_records(&keyed);
@@ -353,7 +803,7 @@ impl PublicRepoWriter {
             next_revision(previous_rev),
             previous,
         );
-        let commit = Commit::sign_atproto(&unsigned, &self.signing_key)?;
+        let commit = Commit::sign_atproto(&unsigned, signing_key)?;
         let commit_cid = commit.cid_atproto()?;
         let intent = PublicationIntent {
             request_id: request.request_id,
@@ -361,8 +811,10 @@ impl PublicRepoWriter {
             did: self.did.clone(),
             collection: record.collection().to_owned(),
             rkey: record.rkey().as_str().to_owned(),
+            generated_rkey,
             cid: record.cid().to_string(),
             commit_cid: commit_cid.to_string(),
+            head_condition: Some(condition.identity()),
         };
         self.store
             .write_transaction(&self.did, &record, &commit, &intent)?;
@@ -373,35 +825,90 @@ impl PublicRepoWriter {
         })
     }
 
-    /// Variant used by JSON/XRPC adapters, which receive the standard base32
-    /// CID text form. The string is compared with the durable public head
-    /// before delegating to the typed transaction; no unvalidated CID parser
-    /// or native-format fallback is introduced.
+    /// XRPC creation with an optional base32 CID head condition. Unlike the
+    /// native typed API, omission permits a new write on any current head.
+    /// Authorization, retry lookup, head comparison and the write all use the
+    /// shared transaction path; no repository state is read by this adapter.
+    /// This argument supersedes `request.expected_prev`.
     pub fn create_record_with_expected_prev_text(
         &self,
-        mut request: PublicCreateRequest,
+        request: PublicCreateRequest,
         expected_prev: Option<&str>,
-    ) -> Result<PublicCommitResult> {
-        request.expected_prev = match expected_prev {
-            None => None,
-            Some(expected) if !expected.is_empty() => {
-                let snapshot = self
-                    .store
-                    .snapshot(&self.did)?
-                    .ok_or_else(|| anyhow!("public repo head is absent"))?;
-                let actual = snapshot.commit.cid_atproto()?;
-                ensure!(actual.to_string() == expected, "public repo head CAS conflict");
-                Some(actual)
-            }
-            Some(_) => return Err(anyhow!("swapCommit must be a non-empty CID")),
+    ) -> Result<PublicCommitResult, PublicRepoWriteError> {
+        let condition = match expected_prev {
+            None => PublicHeadCondition::Unconditional,
+            Some(expected) => PublicHeadCondition::Exact(Some(
+                parse_atproto_json_cid(expected)
+                    .context("invalid swapCommit CID")
+                    .map_err(PublicRepoWriteError::InvalidRequest)?,
+            )),
         };
-        self.create_record(request)
+        self.create_record_with_condition(request, condition)
     }
 }
 
-/// Convert the JSON data model accepted by AT records into the bounded native
-/// value type used by the public codec. Floats, non-string object keys and
-/// integers outside signed 64-bit range are rejected before serialization.
+/// Allocate after authorization, retry lookup and head selection, while the
+/// writer lock is held. Advancing from the durable revision survives restarts
+/// and clock rollback; collision checks also cover explicitly supplied keys.
+fn allocate_record_key(
+    collection: &str,
+    keyed: &BTreeMap<String, Cid>,
+    previous_rev: Option<Tid>,
+) -> Result<AtprotoRecordKey> {
+    let mut candidate = next_revision(previous_rev);
+    loop {
+        let rkey = AtprotoRecordKey::from(candidate);
+        if !keyed.contains_key(&format!("{collection}/{}", rkey.as_str())) {
+            return Ok(rkey);
+        }
+        candidate = Tid::from_raw(
+            candidate
+                .to_raw()
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("public record key space exhausted"))?,
+        );
+    }
+}
+
+/// Decode a canonical AT JSON CID link without accepting other codecs,
+/// hashes, overlong varints, or noncanonical base32 spellings.
+fn parse_atproto_json_cid(text: &str) -> Result<Cid> {
+    // CIDv1, one-byte raw/DAG-CBOR codec, sha2-256, and 32 digest bytes.
+    // These 36 bytes occupy 58 base32 digits plus the multibase prefix.
+    ensure!(
+        text.len() == 59 && text.starts_with('b'),
+        "invalid AT CID text"
+    );
+    let mut raw = Vec::with_capacity(36);
+    let mut pending = 0u16;
+    let mut bits = 0u32;
+    for digit in text.bytes().skip(1) {
+        let digit = match digit {
+            b'a'..=b'z' => digit - b'a',
+            b'2'..=b'7' => digit - b'2' + 26,
+            _ => return Err(anyhow!("AT CID must use lowercase base32")),
+        };
+        pending = (pending << 5) | u16::from(digit);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            raw.push((pending >> bits) as u8);
+            pending &= (1 << bits) - 1;
+        }
+    }
+    ensure!(
+        pending == 0
+            && raw.len() == 36
+            && matches!(raw.as_slice(), [1, 0x55 | 0x71, 0x12, 0x20, ..]),
+        "AT CID requires canonical raw or DAG-CBOR SHA-256 bytes"
+    );
+    Cid::from_bytes(&raw)
+}
+
+/// Convert AT JSON into the value type used by the public codec. Reserved
+/// single-key `$link` and `$bytes` objects become links and byte strings,
+/// never ordinary maps. Invalid wrappers, floats and integers outside signed
+/// 64-bit range are rejected before serialization.
 pub fn json_to_dag_cbor(value: &serde_json::Value) -> Result<DagCbor> {
     Ok(match value {
         serde_json::Value::Null => DagCbor::Null,
@@ -424,6 +931,26 @@ pub fn json_to_dag_cbor(value: &serde_json::Value) -> Result<DagCbor> {
                 .map(json_to_dag_cbor)
                 .collect::<Result<Vec<_>>>()?,
         ),
+        serde_json::Value::Object(values) if values.contains_key("$link") => {
+            ensure!(values.len() == 1, "AT JSON link must contain only $link");
+            let text = values
+                .get("$link")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("AT JSON $link must be a CID string"))?;
+            DagCbor::Link(parse_atproto_json_cid(text)?)
+        }
+        serde_json::Value::Object(values) if values.contains_key("$bytes") => {
+            ensure!(values.len() == 1, "AT JSON bytes must contain only $bytes");
+            let text = values
+                .get("$bytes")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("AT JSON $bytes must be a base64 string"))?;
+            let bytes = STANDARD
+                .decode(text)
+                .or_else(|_| STANDARD_NO_PAD.decode(text))
+                .context("invalid AT JSON base64 bytes")?;
+            DagCbor::Bytes(bytes)
+        }
         serde_json::Value::Object(values) => DagCbor::Map(
             values
                 .iter()
@@ -457,6 +984,11 @@ mod tests {
             ensure!(self.allow.load(Ordering::Acquire), "publication denied");
             Ok(())
         }
+
+        fn authorize_key_promotion(&self, _: &str, _: &str) -> Result<()> {
+            ensure!(self.allow.load(Ordering::Acquire), "promotion denied");
+            Ok(())
+        }
     }
 
     fn post() -> DagCbor {
@@ -464,6 +996,471 @@ mod tests {
             ("$type", DagCbor::Text("app.bsky.feed.post".into())),
             ("text", DagCbor::Text("durable".into())),
         ])
+    }
+
+    fn create_request(rkey: u64, expected_prev: Option<Cid>) -> PublicCreateRequest {
+        PublicCreateRequest {
+            request_id: format!("req-{rkey}"),
+            principal: "did:at9p:agent".into(),
+            did: "did:web:tormentnexus.social".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: Some(Tid::from_raw(rkey).into()),
+            value: post(),
+            expected_prev,
+        }
+    }
+
+    #[test]
+    fn public_repo_account_locks_allow_independent_dids_and_serialize_same_did() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let key_a = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let key_b = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let next_b = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let next_b_vk = *next_b.verifying_key();
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let request_a = create_request(1, None);
+        let writer_a =
+            PublicRepoWriter::new(store.clone(), &request_a.did, key_a.clone(), gate.clone())
+                .unwrap();
+        let same_did =
+            PublicRepoWriter::new(store.clone(), &request_a.did, key_a.clone(), gate.clone())
+                .unwrap();
+        assert!(Arc::ptr_eq(&writer_a.account, &same_did.account));
+        let mut request_b = create_request(1, None);
+        request_b.did = "did:web:independent.example.com".into();
+        let did_b = request_b.did.clone();
+
+        // Model a long account-A transaction/promotion without sleeping or
+        // filling a large repo. Another A handle must wait; B must finish its
+        // constructor, create and key promotion while A is still locked.
+        let held = writer_a.account.active_key.lock();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (same_tx, same_rx) = mpsc::channel();
+        let same_thread = std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            let _ = same_tx.send(same_did.create_record(request_a));
+        });
+        let other_store = store.clone();
+        let (other_tx, other_rx) = mpsc::channel();
+        let other_thread = std::thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let other = PublicRepoWriter::new(
+                    other_store.clone(),
+                    &request_b.did,
+                    key_b.clone(),
+                    gate,
+                )?;
+                let first = other.create_record(request_b.clone())?;
+                let head =
+                    other.promote_signing_key("did:at9p:agent", key_b.verifying_key(), next_b)?;
+                ensure!(
+                    head.is_some() && head != Some(first.commit_cid),
+                    "B promotion must reconcile its head"
+                );
+                ensure!(
+                    other.create_record(request_b)? == first,
+                    "B retry must retain original receipt"
+                );
+                Ok(())
+            })();
+            let _ = other_tx.send(result);
+        });
+        let started = started_rx.recv_timeout(Duration::from_secs(10));
+        let independent = other_rx.recv_timeout(Duration::from_secs(10));
+        let same_while_locked = same_rx.try_recv();
+        // Always release before assertions/joins: a regression must fail the
+        // bounded timeout rather than leave worker threads deadlocked.
+        drop(held);
+        same_thread.join().unwrap();
+        other_thread.join().unwrap();
+        started.unwrap();
+        independent
+            .expect("unrelated DID blocked behind account A")
+            .unwrap();
+        assert!(
+            matches!(same_while_locked, Err(mpsc::TryRecvError::Empty)),
+            "same-DID write bypassed its transaction lock"
+        );
+        let result_a = same_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let repo_a = store
+            .snapshot("did:web:tormentnexus.social")
+            .unwrap()
+            .unwrap();
+        assert_eq!(repo_a.commit.cid_atproto().unwrap(), result_a.commit_cid);
+        repo_a.commit.verify_atproto(key_a.verifying_key()).unwrap();
+        assert_eq!(
+            writer_a.active_verifying_key().unwrap(),
+            *key_a.verifying_key()
+        );
+        store
+            .snapshot(&did_b)
+            .unwrap()
+            .unwrap()
+            .commit
+            .verify_atproto(&next_b_vk)
+            .unwrap();
+    }
+
+    #[test]
+    fn public_repo_rotation_reconciles_idle_head_and_surviving_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let old = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let candidate = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let request = create_request(1, None);
+        let writer =
+            PublicRepoWriter::new(store.clone(), &request.did, old.clone(), gate.clone()).unwrap();
+        let survivor =
+            PublicRepoWriter::new(store.clone(), &request.did, old.clone(), gate.clone()).unwrap();
+        let first = writer.create_record(request.clone()).unwrap();
+        let original = store.snapshot(&request.did).unwrap().unwrap().commit;
+        let original_block = store
+            .db
+            .get(commit_block_key(
+                &request.did,
+                &first.commit_cid.to_string(),
+            ))
+            .unwrap()
+            .unwrap();
+        let reconciled = writer
+            .promote_signing_key("did:at9p:agent", old.verifying_key(), candidate.clone())
+            .unwrap()
+            .unwrap();
+        assert_ne!(reconciled, first.commit_cid);
+        assert_eq!(
+            survivor.active_verifying_key().unwrap(),
+            *candidate.verifying_key()
+        );
+        let idle = store.snapshot(&request.did).unwrap().unwrap().commit;
+        assert_eq!(idle.unsigned(), original.unsigned());
+        idle.verify_atproto(candidate.verifying_key()).unwrap();
+        assert!(idle.verify_atproto(old.verifying_key()).is_err());
+        assert_eq!(survivor.create_record(request.clone()).unwrap(), first);
+        assert_eq!(
+            store
+                .db
+                .get(commit_block_key(
+                    &request.did,
+                    &first.commit_cid.to_string()
+                ))
+                .unwrap()
+                .unwrap(),
+            original_block
+        );
+        assert!(
+            PublicRepoWriter::new(store.clone(), &request.did, old.clone(), gate.clone()).is_err()
+        );
+        let second = survivor
+            .create_record(create_request(2, Some(reconciled)))
+            .unwrap();
+        let head = store.snapshot(&request.did).unwrap().unwrap().commit;
+        head.verify_atproto(candidate.verifying_key()).unwrap();
+        assert!(head.verify_atproto(old.verifying_key()).is_err());
+        assert_eq!(head.prev, Some(reconciled));
+        assert_eq!(head.cid_atproto().unwrap(), second.commit_cid);
+        drop(survivor);
+        drop(writer);
+        drop(store);
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        assert!(PublicRepoWriter::new(store.clone(), &request.did, old, gate.clone()).is_err());
+        let reopened = PublicRepoWriter::new(store, &request.did, candidate, gate).unwrap();
+        assert_eq!(reopened.create_record(request).unwrap(), first);
+    }
+
+    #[test]
+    fn public_repo_rotation_failure_keeps_active_authority_and_durable_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let old = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let candidate = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let request = create_request(1, None);
+        let writer = PublicRepoWriter::new(store.clone(), &request.did, old.clone(), gate).unwrap();
+        writer.create_record(request.clone()).unwrap();
+        let all_bytes = || {
+            store
+                .db
+                .iterator(rocksdb::IteratorMode::Start)
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before = all_bytes();
+        struct RecordOnly;
+        impl PublicPublicationAuthorizer for RecordOnly {
+            fn authorize(&self, _: &str, _: &str, _: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        let unprivileged = PublicRepoWriter::new(
+            store.clone(),
+            &request.did,
+            old.clone(),
+            Arc::new(RecordOnly),
+        )
+        .unwrap();
+        assert!(unprivileged
+            .promote_signing_key("did:at9p:agent", old.verifying_key(), candidate.clone())
+            .is_err());
+        assert_eq!(writer.active_verifying_key().unwrap(), *old.verifying_key());
+        assert_eq!(all_bytes(), before);
+        assert!(writer
+            .promote_signing_key(
+                "did:at9p:agent",
+                candidate.verifying_key(),
+                candidate.clone()
+            )
+            .is_err());
+        assert_eq!(writer.active_verifying_key().unwrap(), *old.verifying_key());
+        assert_eq!(all_bytes(), before);
+        // A validly encoded head signed by the wrong key must not be blessed
+        // by rotation. Reconciliation fails without exposing the candidate.
+        let head = store.snapshot(&request.did).unwrap().unwrap().commit;
+        let substituted = Commit::sign_atproto(&head.unsigned(), &candidate).unwrap();
+        store
+            .db
+            .put(
+                commit_key(&request.did),
+                substituted.to_atproto_dag_cbor().unwrap(),
+            )
+            .unwrap();
+        let before = all_bytes();
+        assert!(writer
+            .promote_signing_key("did:at9p:agent", old.verifying_key(), candidate)
+            .is_err());
+        assert_eq!(writer.active_verifying_key().unwrap(), *old.verifying_key());
+        assert_eq!(all_bytes(), before);
+    }
+
+    #[test]
+    fn public_repo_oauth_port_authority_survives_commit_reopen_and_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let mut request = create_request(1, None);
+        request.did = "did:web:pds.example.test%3A8443".into();
+        let writer =
+            PublicRepoWriter::new(store.clone(), &request.did, key.clone(), gate.clone()).unwrap();
+        let result = writer.create_record(request.clone()).unwrap();
+        assert!(result
+            .uri
+            .starts_with("at://did:web:pds.example.test%3A8443/"));
+        drop(writer);
+        drop(store);
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let snapshot = store.snapshot(&request.did).unwrap().unwrap();
+        assert_eq!(snapshot.commit.did, request.did);
+        snapshot.commit.verify_atproto(key.verifying_key()).unwrap();
+        let writer = PublicRepoWriter::new(store, &request.did, key, gate).unwrap();
+        assert_eq!(writer.create_record(request).unwrap(), result);
+    }
+
+    #[test]
+    fn public_repo_encoded_size_boundary_rejects_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let writer = PublicRepoWriter::new(
+            store.clone(),
+            "did:web:tormentnexus.social",
+            p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng),
+            gate,
+        )
+        .unwrap();
+        let sized_request = |rkey, prev, size| {
+            let mut request = create_request(rkey, prev);
+            let value = |payload| {
+                DagCbor::str_map([
+                    ("$type", DagCbor::Text(request.collection.clone())),
+                    ("text", DagCbor::Text("x".repeat(payload))),
+                ])
+            };
+            let overhead = AtprotoRecord::new(
+                &request.collection,
+                request.rkey.as_ref().unwrap(),
+                value(1024),
+            )
+            .unwrap()
+            .bytes()
+            .len()
+                - 1024;
+            request.value = value(size - overhead);
+            assert_eq!(
+                AtprotoRecord::new(
+                    &request.collection,
+                    request.rkey.as_ref().unwrap(),
+                    request.value.clone()
+                )
+                .unwrap()
+                .bytes()
+                .len(),
+                size
+            );
+            request
+        };
+        let oversized = sized_request(1, None, MAX_PUBLIC_RECORD_BYTES + 1);
+        assert!(writer
+            .create_record(oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("canonical encoded limit"));
+        assert!(store
+            .db
+            .iterator(rocksdb::IteratorMode::Start)
+            .next()
+            .is_none());
+        let at_limit = sized_request(1, None, MAX_PUBLIC_RECORD_BYTES);
+        let first = writer.create_record(at_limit.clone()).unwrap();
+        assert_eq!(writer.create_record(at_limit).unwrap(), first);
+        let all_bytes = || {
+            store
+                .db
+                .iterator(rocksdb::IteratorMode::Start)
+                .map(|item| item.unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before = all_bytes();
+        assert!(writer
+            .create_record(sized_request(
+                2,
+                Some(first.commit_cid),
+                MAX_PUBLIC_RECORD_BYTES + 1
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("canonical encoded limit"));
+        assert_eq!(
+            all_bytes(),
+            before,
+            "oversize rejection must not modify record/head/intent/block state"
+        );
+        let snapshot = store
+            .snapshot("did:web:tormentnexus.social")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.commit.cid_atproto().unwrap(), first.commit_cid);
+        assert_eq!(snapshot.records.len(), 1);
+    }
+
+    #[test]
+    fn public_repo_rejects_invalid_authorities_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        for did in [
+            "did:plc:abc",
+            "did:plc:ewvi7nxzyoun6zhxrhs64oiz#key",
+            "did:web:example.com#fragment",
+            "did:web:example.com?query",
+            "did:web:example.com/path",
+            "did:web:example..com",
+            "did:web:example.com%2Fpath",
+            "did:web:example.arpa",
+            "did:web:example.onion",
+            "did:web:example.123",
+            "did:web:example.1com",
+            "did:web:127.0.0.1",
+        ] {
+            assert!(PublicRepoWriter::new(store.clone(), did, key.clone(), gate.clone()).is_err());
+            assert!(store.snapshot(did).is_err());
+        }
+        assert!(store
+            .db
+            .iterator(rocksdb::IteratorMode::Start)
+            .next()
+            .is_none());
+        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+        let writer = PublicRepoWriter::new(store.clone(), did, key, gate).unwrap();
+        let mut request = create_request(1, None);
+        request.did = did.to_owned();
+        writer.create_record(request).unwrap();
+        assert_eq!(store.snapshot(did).unwrap().unwrap().commit.did, did);
+    }
+
+    #[test]
+    fn public_repo_general_keys_preserve_profile_self_through_reopen_and_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let mut profile = create_request(1, None);
+        profile.collection = "app.bsky.actor.profile".into();
+        profile.rkey = Some(AtprotoRecordKey::new("self").unwrap());
+        profile.value = DagCbor::str_map([
+            ("$type", DagCbor::Text(profile.collection.clone())),
+            ("displayName", DagCbor::Text("Profile".into())),
+        ]);
+        let writer =
+            PublicRepoWriter::new(store.clone(), &profile.did, key.clone(), gate.clone()).unwrap();
+        let first = writer.create_record(profile.clone()).unwrap();
+        assert_eq!(
+            first.uri,
+            format!("at://{}/app.bsky.actor.profile/self", profile.did)
+        );
+        let mut post = create_request(2, Some(first.commit_cid));
+        post.rkey = Some(AtprotoRecordKey::new("custom-key:~").unwrap());
+        let second = writer.create_record(post.clone()).unwrap();
+        assert_eq!(writer.create_record(profile.clone()).unwrap(), first);
+        let mut duplicate = profile.clone();
+        duplicate.request_id = "duplicate-profile".into();
+        duplicate.expected_prev = Some(second.commit_cid);
+        assert!(writer
+            .create_record(duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
+        drop(writer);
+        drop(store);
+
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let snapshot = store.snapshot(&profile.did).unwrap().unwrap();
+        assert_eq!(snapshot.records.len(), 2);
+        let stored =
+            &snapshot.records[&(profile.collection.clone(), profile.rkey.clone().unwrap())];
+        assert_eq!(stored.rkey().as_str(), "self");
+        assert_eq!(stored.cid(), first.cid);
+        assert_eq!(stored.value(), &profile.value);
+        assert!(snapshot
+            .records
+            .contains_key(&(post.collection, post.rkey.unwrap())));
+        snapshot.commit.verify_atproto(key.verifying_key()).unwrap();
+        assert_eq!(snapshot.commit.cid_atproto().unwrap(), second.commit_cid);
+        let writer = PublicRepoWriter::new(store.clone(), &profile.did, key, gate).unwrap();
+        assert_eq!(writer.create_record(profile).unwrap(), first);
+
+        // Storage reconstruction validates keys instead of treating an
+        // arbitrary path or separator as an ordinary record key.
+        store
+            .db
+            .put(
+                record_key(writer.did.as_str(), "app.bsky.actor.profile", "bad/key"),
+                stored.bytes(),
+            )
+            .unwrap();
+        assert!(store.snapshot(&writer.did).is_err());
     }
 
     #[test]
@@ -474,19 +1471,24 @@ mod tests {
             allow: AtomicBool::new(true),
         });
         let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-        let writer = PublicRepoWriter::new(store.clone(), "did:web:tormentnexus.social", key, gate)
-            .expect("writer");
+        let writer = PublicRepoWriter::new(
+            store.clone(),
+            "did:web:tormentnexus.social",
+            key.clone(),
+            gate.clone(),
+        )
+        .expect("writer");
         let request = PublicCreateRequest {
             request_id: "req-1".into(),
             principal: "did:at9p:agent".into(),
             did: "did:web:tormentnexus.social".into(),
             collection: "app.bsky.feed.post".into(),
-            rkey: Tid::from_raw(7),
+            rkey: Some(Tid::from_raw(7).into()),
             value: post(),
             expected_prev: None,
         };
         let first = writer.create_record(request.clone()).expect("create");
-        let retry = writer.create_record(request).expect("retry");
+        let retry = writer.create_record(request.clone()).expect("retry");
         assert_eq!(first, retry);
         let second = writer
             .create_record(PublicCreateRequest {
@@ -494,24 +1496,31 @@ mod tests {
                 principal: "did:at9p:agent".into(),
                 did: "did:web:tormentnexus.social".into(),
                 collection: "app.bsky.feed.post".into(),
-                rkey: Tid::from_raw(8),
+                rkey: Some(Tid::from_raw(8).into()),
                 value: post(),
                 expected_prev: Some(first.commit_cid),
             })
             .expect("second create");
         assert_ne!(first.commit_cid, second.commit_cid);
+        assert_eq!(
+            writer
+                .create_record(request.clone())
+                .expect("retry after head advance"),
+            first
+        );
         let snapshot = store
             .snapshot("did:web:tormentnexus.social")
             .expect("snapshot")
             .expect("repo");
         assert_eq!(snapshot.records.len(), 2);
+        assert_eq!(snapshot.commit.cid_atproto().unwrap(), second.commit_cid);
         snapshot
             .commit
-            .verify_atproto(writer.signing_key.verifying_key())
+            .verify_atproto(&writer.active_verifying_key().unwrap())
             .expect("commit signature");
         drop(writer);
         drop(store);
-        let reopened = PublicRepoStore::open(dir.path()).expect("reopen");
+        let reopened = Arc::new(PublicRepoStore::open(dir.path()).expect("reopen"));
         assert_eq!(
             reopened
                 .snapshot("did:web:tormentnexus.social")
@@ -520,6 +1529,162 @@ mod tests {
                 .records
                 .len(),
             2
+        );
+        let writer = PublicRepoWriter::new(
+            reopened.clone(),
+            "did:web:tormentnexus.social",
+            key,
+            gate.clone(),
+        )
+        .expect("reopened writer");
+        assert_eq!(
+            writer
+                .create_record(request.clone())
+                .expect("durable retry"),
+            first
+        );
+        assert_eq!(
+            reopened
+                .snapshot(&request.did)
+                .unwrap()
+                .unwrap()
+                .commit
+                .cid_atproto()
+                .unwrap(),
+            second.commit_cid
+        );
+        gate.allow.store(false, Ordering::Release);
+        assert!(writer
+            .create_record(request)
+            .unwrap_err()
+            .to_string()
+            .contains("publication denied"));
+    }
+
+    #[test]
+    fn retry_checks_intent_record_and_commit_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let request = create_request(1, None);
+        let writer = PublicRepoWriter::new(store.clone(), &request.did, key, gate).unwrap();
+        let first = writer.create_record(request.clone()).unwrap();
+        let mut changed = request.clone();
+        changed.value = DagCbor::str_map([
+            ("$type", DagCbor::Text(request.collection.clone())),
+            ("text", DagCbor::Text("changed".into())),
+        ]);
+        assert!(writer
+            .create_record(changed)
+            .unwrap_err()
+            .to_string()
+            .contains("different content"));
+        let mut changed = request.clone();
+        changed.principal = "another-agent".into();
+        assert!(writer
+            .create_record(changed)
+            .unwrap_err()
+            .to_string()
+            .contains("different content"));
+
+        let block_key = commit_block_key(&request.did, &first.commit_cid.to_string());
+        let original = store.db.get(&block_key).unwrap().unwrap();
+        let mut tampered = Commit::from_atproto_dag_cbor(&original).unwrap();
+        tampered.rev = Tid::from_raw(tampered.rev.to_raw() + 1);
+        store
+            .db
+            .put(&block_key, tampered.to_atproto_dag_cbor().unwrap())
+            .unwrap();
+        assert!(writer
+            .create_record(request.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("does not match stored block"));
+        store.db.delete(&block_key).unwrap();
+        assert!(writer
+            .create_record(request.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("commit block is missing"));
+        store.db.put(&block_key, original).unwrap();
+
+        // A valid repository containing another record must not satisfy an
+        // intent whose record path has disappeared.
+        let other_request = create_request(2, Some(first.commit_cid));
+        writer.create_record(other_request).unwrap();
+        let mut intent = store
+            .intent(&request.did, &request.request_id)
+            .unwrap()
+            .unwrap();
+        let missing = create_request(3, None);
+        intent.rkey = missing.rkey.as_ref().unwrap().as_str().to_owned();
+        store
+            .db
+            .put(
+                intent_key(&request.did, &request.request_id),
+                serde_json::to_vec(&intent).unwrap(),
+            )
+            .unwrap();
+        let mut missing = missing;
+        missing.request_id = request.request_id;
+        assert!(writer
+            .create_record(missing)
+            .unwrap_err()
+            .to_string()
+            .contains("record does not match repository"));
+    }
+
+    #[test]
+    fn snapshots_remain_consistent_during_concurrent_publications() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let verifying_key = *key.verifying_key();
+        let writer =
+            PublicRepoWriter::new(store.clone(), "did:web:tormentnexus.social", key, gate).unwrap();
+        let first = writer.create_record(create_request(1, None)).unwrap();
+        let start = std::sync::Barrier::new(4);
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    start.wait();
+                    let mut reads = 0;
+                    while !done.load(Ordering::Acquire) || reads == 0 {
+                        let snapshot = store
+                            .snapshot("did:web:tormentnexus.social")
+                            .unwrap()
+                            .unwrap();
+                        assert!(!snapshot.records.is_empty());
+                        snapshot.commit.verify_atproto(&verifying_key).unwrap();
+                        reads += 1;
+                    }
+                });
+            }
+            start.wait();
+            let mut head = first.commit_cid;
+            for rkey in 2..=64 {
+                head = writer
+                    .create_record(create_request(rkey, Some(head)))
+                    .unwrap()
+                    .commit_cid;
+            }
+            done.store(true, Ordering::Release);
+        });
+        assert_eq!(
+            store
+                .snapshot("did:web:tormentnexus.social")
+                .unwrap()
+                .unwrap()
+                .records
+                .len(),
+            64
         );
     }
 
@@ -539,7 +1704,7 @@ mod tests {
                 principal: "agent".into(),
                 did: "did:web:tormentnexus.social".into(),
                 collection: "app.bsky.feed.post".into(),
-                rkey: Tid::from_raw(1),
+                rkey: Some(Tid::from_raw(1).into()),
                 value: post(),
                 expected_prev: None,
             })
@@ -556,5 +1721,688 @@ mod tests {
         });
         let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
         assert!(PublicRepoWriter::new(store, "did:at9p:agent", key, gate).is_err());
+    }
+
+    fn transaction_fixture() -> (
+        tempfile::TempDir,
+        Arc<PublicRepoStore>,
+        Arc<Gate>,
+        PublicRepoWriter,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(PublicRepoStore::open(dir.path()).expect("store"));
+        let gate = Arc::new(Gate {
+            allow: AtomicBool::new(true),
+        });
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let writer = PublicRepoWriter::new(
+            store.clone(),
+            "did:web:tormentnexus.social",
+            key,
+            gate.clone(),
+        )
+        .expect("writer");
+        (dir, store, gate, writer)
+    }
+
+    fn transaction_request(id: u64) -> PublicCreateRequest {
+        PublicCreateRequest {
+            request_id: format!("req-{id}"),
+            principal: "did:at9p:agent".into(),
+            did: "did:web:tormentnexus.social".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: Some(Tid::from_raw(id).into()),
+            value: post(),
+            expected_prev: None,
+        }
+    }
+
+    #[test]
+    fn general_keys_survive_restart_and_legacy_intents_remain_retriable() {
+        let (dir, store, gate, writer) = transaction_fixture();
+        let first = writer.create_record(transaction_request(7)).unwrap();
+        // Model an intent written before generated_rkey existed.
+        let mut legacy =
+            serde_json::to_value(store.intent(writer.did(), "req-7").unwrap().unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("generated_rkey");
+        store
+            .db
+            .put(
+                intent_key(writer.did(), "req-7"),
+                serde_json::to_vec(&legacy).unwrap(),
+            )
+            .unwrap();
+        let mut profile = transaction_request(8);
+        profile.collection = "app.bsky.actor.profile".into();
+        profile.rkey = Some(AtprotoRecordKey::new("self").unwrap());
+        profile.value = DagCbor::str_map([("$type", DagCbor::Text(profile.collection.clone()))]);
+        profile.expected_prev = Some(first.commit_cid);
+        let second = writer.create_record(profile.clone()).unwrap();
+        let mut general = transaction_request(9);
+        general.collection = "com.example.record".into();
+        general.rkey = Some(AtprotoRecordKey::new("literal:key~one").unwrap());
+        general.value = DagCbor::str_map([("$type", DagCbor::Text(general.collection.clone()))]);
+        general.expected_prev = Some(second.commit_cid);
+        let third = writer.create_record(general.clone()).unwrap();
+        let signing_key = writer.account.active_key.lock().as_ref().unwrap().clone();
+        drop(writer);
+        drop(store);
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let writer = PublicRepoWriter::new(
+            store.clone(),
+            "did:web:tormentnexus.social",
+            signing_key,
+            gate,
+        )
+        .unwrap();
+        assert_eq!(writer.create_record(transaction_request(7)).unwrap(), first);
+        assert_eq!(writer.create_record(profile).unwrap(), second);
+        assert_eq!(writer.create_record(general).unwrap(), third);
+        let snapshot = store.snapshot(writer.did()).unwrap().unwrap();
+        assert_eq!(snapshot.records.len(), 3);
+        assert!(snapshot.records.contains_key(&(
+            "app.bsky.actor.profile".into(),
+            AtprotoRecordKey::new("self").unwrap()
+        )));
+        assert!(snapshot.records.contains_key(&(
+            "com.example.record".into(),
+            AtprotoRecordKey::new("literal:key~one").unwrap()
+        )));
+        snapshot
+            .commit
+            .verify_atproto(&writer.active_verifying_key().unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn generated_key_retry_survives_account_key_promotion_and_reopen() {
+        let (dir, store, gate, writer) = transaction_fixture();
+        let mut request = transaction_request(7);
+        request.rkey = None;
+        let first = writer
+            .create_record_with_expected_prev_text(request.clone(), None)
+            .unwrap();
+        let candidate = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let promoted = writer
+            .promote_signing_key(
+                "did:at9p:agent",
+                &writer.active_verifying_key().unwrap(),
+                candidate.clone(),
+            )
+            .unwrap()
+            .unwrap();
+        let mut later = transaction_request(8);
+        later.rkey = None;
+        writer
+            .create_record_with_expected_prev_text(later, Some(&promoted.to_string()))
+            .unwrap();
+        assert_eq!(
+            writer
+                .create_record_with_expected_prev_text(request.clone(), None)
+                .unwrap(),
+            first
+        );
+        drop(writer);
+        drop(store);
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let writer =
+            PublicRepoWriter::new(store.clone(), &request.did, candidate.clone(), gate).unwrap();
+        assert_eq!(
+            writer
+                .create_record_with_expected_prev_text(request, None)
+                .unwrap(),
+            first
+        );
+        let snapshot = store.snapshot(writer.did()).unwrap().unwrap();
+        assert_eq!(snapshot.records.len(), 2);
+        snapshot
+            .commit
+            .verify_atproto(candidate.verifying_key())
+            .unwrap();
+    }
+
+    #[test]
+    fn generated_keys_recover_after_restart_and_bind_request_shape() {
+        let (dir, store, gate, writer) = transaction_fixture();
+        let mut request = transaction_request(7);
+        request.rkey = None;
+        let first = writer
+            .create_record_with_expected_prev_text(request.clone(), None)
+            .unwrap();
+        let first_key = first.uri.rsplit('/').next().unwrap();
+        assert!(Tid::parse(first_key).is_ok());
+        let mut second_request = transaction_request(8);
+        second_request.rkey = None;
+        let second = writer
+            .create_record_with_expected_prev_text(second_request, None)
+            .unwrap();
+        assert_ne!(first.uri, second.uri);
+        let signing_key = writer.account.active_key.lock().as_ref().unwrap().clone();
+        drop(writer);
+        drop(store);
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let writer = PublicRepoWriter::new(
+            store.clone(),
+            "did:web:tormentnexus.social",
+            signing_key,
+            gate.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            writer
+                .create_record_with_expected_prev_text(request.clone(), None)
+                .unwrap(),
+            first
+        );
+        let mut explicit_retry = request.clone();
+        explicit_retry.rkey = Some(AtprotoRecordKey::new(first_key).unwrap());
+        assert!(writer
+            .create_record_with_expected_prev_text(explicit_retry, None)
+            .unwrap_err()
+            .to_string()
+            .contains("key mode"));
+        let mut changed = request.clone();
+        changed.value = DagCbor::str_map([
+            ("$type", DagCbor::Text(changed.collection.clone())),
+            ("text", DagCbor::Text("different".into())),
+        ]);
+        assert!(writer
+            .create_record_with_expected_prev_text(changed, None)
+            .is_err());
+        let mut other_principal = request.clone();
+        other_principal.principal = "did:at9p:other".into();
+        assert!(writer
+            .create_record_with_expected_prev_text(other_principal, None)
+            .is_err());
+        let explicit = transaction_request(9);
+        writer
+            .create_record_with_expected_prev_text(explicit.clone(), None)
+            .unwrap();
+        let mut omitted = explicit;
+        omitted.rkey = None;
+        assert!(writer
+            .create_record_with_expected_prev_text(omitted, None)
+            .unwrap_err()
+            .to_string()
+            .contains("key mode"));
+        gate.allow.store(false, Ordering::Release);
+        assert!(writer
+            .create_record_with_expected_prev_text(request, None)
+            .unwrap_err()
+            .to_string()
+            .contains("publication denied"));
+        assert_eq!(
+            store.snapshot(writer.did()).unwrap().unwrap().records.len(),
+            3
+        );
+    }
+
+    #[test]
+    fn generated_keys_are_unique_or_recovered_under_concurrent_requests() {
+        for same_request in [false, true] {
+            let (_dir, store, _gate, writer) = transaction_fixture();
+            let writer = Arc::new(writer);
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let results = std::thread::scope(|scope| {
+                let mut workers = Vec::new();
+                for id in [7, if same_request { 7 } else { 8 }] {
+                    let writer = writer.clone();
+                    let start = start.clone();
+                    workers.push(scope.spawn(move || {
+                        let mut request = transaction_request(id);
+                        request.rkey = None;
+                        start.wait();
+                        writer
+                            .create_record_with_expected_prev_text(request, None)
+                            .unwrap()
+                    }));
+                }
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(results[0] == results[1], same_request);
+            let expected = if same_request { 1 } else { 2 };
+            assert_eq!(
+                store.snapshot(writer.did()).unwrap().unwrap().records.len(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn generated_key_skips_collisions_after_a_durable_future_revision() {
+        let previous = Tid::from_raw(1 << 62);
+        let collection = "app.bsky.feed.post";
+        let mut keyed = BTreeMap::new();
+        for offset in [1, 2] {
+            keyed.insert(
+                format!(
+                    "{collection}/{}",
+                    Tid::from_raw(previous.to_raw() + offset).encode()
+                ),
+                Cid::from_dag_cbor(b"occupied"),
+            );
+        }
+        let key = allocate_record_key(collection, &keyed, Some(previous)).unwrap();
+        assert_eq!(key.as_str(), Tid::from_raw(previous.to_raw() + 3).encode());
+    }
+
+    #[test]
+    fn xrpc_omitted_swap_allows_subsequent_creates_without_weakening_native_cas() {
+        let (_dir, store, _gate, writer) = transaction_fixture();
+        let first = writer
+            .create_record_with_expected_prev_text(transaction_request(7), None)
+            .expect("genesis");
+        let native_none = writer
+            .create_record(transaction_request(8))
+            .expect_err("native genesis only");
+        assert!(native_none.to_string().contains("CAS conflict"));
+        let second = writer
+            .create_record_with_expected_prev_text(transaction_request(8), None)
+            .expect("unconditional second write");
+        let mut third = transaction_request(9);
+        third.expected_prev = Some(first.commit_cid);
+        assert!(
+            writer.create_record(third.clone()).is_err(),
+            "native stale CAS"
+        );
+        third.expected_prev = Some(second.commit_cid);
+        writer.create_record(third).expect("native exact CAS");
+        assert_eq!(
+            store.snapshot(writer.did()).unwrap().unwrap().records.len(),
+            3
+        );
+    }
+
+    #[test]
+    fn publication_capacity_rejects_before_commit_and_keeps_existing_retries_valid() {
+        for payload_bytes in [0, 60_000] {
+            let (_dir, store, _gate, writer) = transaction_fixture();
+            let mut last = None;
+            for id in 1..=MAX_PUBLIC_SNAPSHOT_RECORDS + 1 {
+                let mut request = transaction_request(id as u64);
+                request.value = DagCbor::str_map([
+                    ("$type", DagCbor::Text(request.collection.clone())),
+                    ("text", DagCbor::Text("x".repeat(payload_bytes))),
+                ]);
+                let result = writer.create_record_with_expected_prev_text(request.clone(), None);
+                if let Ok(result) = result {
+                    last = Some((request, result));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(PublicRepoWriteError::InvalidRequest(_))
+                    ));
+                    let (request, original) = last.as_ref().unwrap();
+                    let snapshot = store.snapshot(writer.did()).unwrap().unwrap();
+                    assert_eq!(snapshot.records.len(), id - 1);
+                    assert_eq!(snapshot.commit.cid_atproto().unwrap(), original.commit_cid);
+                    assert_eq!(
+                        writer
+                            .create_record_with_expected_prev_text(request.clone(), None)
+                            .unwrap(),
+                        *original
+                    );
+                    if payload_bytes == 0 {
+                        assert_eq!(snapshot.records.len(), MAX_PUBLIC_SNAPSHOT_RECORDS);
+                    } else {
+                        assert!(snapshot.records.len() < MAX_PUBLIC_SNAPSHOT_RECORDS);
+                    }
+                    break;
+                }
+                assert!(id <= MAX_PUBLIC_SNAPSHOT_RECORDS);
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_budget_fails_before_decoding_over_limit_records() {
+        for (count, bytes) in [
+            (MAX_PUBLIC_SNAPSHOT_RECORDS + 1, 1),
+            (18, 60_000),
+            (1, MAX_PUBLIC_RECORD_BYTES + 1),
+        ] {
+            let (_dir, store, _gate, writer) = transaction_fixture();
+            store
+                .insert_snapshot_budget_fixture_for_test(writer.did(), count, bytes)
+                .unwrap();
+            // Last record is intentionally invalid; budget wins before decode.
+            let error = store.snapshot(writer.did()).unwrap_err().to_string();
+            assert!(error.contains("budget"), "{error}");
+            assert!(writer
+                .public_snapshot()
+                .unwrap_err()
+                .to_string()
+                .contains("budget"));
+        }
+    }
+
+    #[test]
+    fn retries_bind_original_condition_under_race_and_legacy_receipts_fail_closed() {
+        let (_dir, store, _gate, writer) = transaction_fixture();
+        let first = writer
+            .create_record_with_expected_prev_text(transaction_request(7), None)
+            .unwrap();
+        let previous = first.commit_cid.to_string();
+        let barrier = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let workers: Vec<_> = [None, Some(previous.as_str())]
+                .into_iter()
+                .map(|condition| {
+                    let writer = &writer;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        (
+                            condition,
+                            writer.create_record_with_expected_prev_text(
+                                transaction_request(8),
+                                condition,
+                            ),
+                        )
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        assert!(outcomes
+            .iter()
+            .any(|(_, result)| matches!(result, Err(PublicRepoWriteError::InvalidRequest(_)))));
+        let (condition, result) = outcomes.iter().find(|(_, result)| result.is_ok()).unwrap();
+        assert_eq!(
+            &writer
+                .create_record_with_expected_prev_text(transaction_request(8), *condition)
+                .unwrap(),
+            result.as_ref().unwrap()
+        );
+        assert_eq!(
+            store.snapshot(writer.did()).unwrap().unwrap().records.len(),
+            2
+        );
+        let mut legacy =
+            serde_json::to_value(store.intent(writer.did(), "req-8").unwrap().unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("head_condition");
+        store
+            .db
+            .put(
+                intent_key(writer.did(), "req-8"),
+                serde_json::to_vec(&legacy).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            writer.create_record_with_expected_prev_text(transaction_request(8), *condition),
+            Err(PublicRepoWriteError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn native_publication_rejects_unverified_blob_extensions_without_mutation() {
+        let (_dir, store, _gate, writer) = transaction_fixture();
+        let mut request = transaction_request(7);
+        request.value = DagCbor::str_map([
+            ("$type", DagCbor::Text(request.collection.clone())),
+            (
+                "extension",
+                DagCbor::List(vec![DagCbor::str_map([(
+                    "$type",
+                    DagCbor::Text("blob".into()),
+                )])]),
+            ),
+        ]);
+        assert!(matches!(
+            writer.create_record(request),
+            Err(PublicRepoWriteError::InvalidRequest(_))
+        ));
+        assert!(store.snapshot(writer.did()).unwrap().is_none());
+    }
+
+    #[test]
+    fn xrpc_retries_return_original_result_after_later_commit_and_reopen() {
+        let (dir, store, gate, writer) = transaction_fixture();
+        let first = writer
+            .create_record_with_expected_prev_text(transaction_request(7), None)
+            .expect("genesis");
+        let previous = first.commit_cid.to_string();
+        let second = writer
+            .create_record_with_expected_prev_text(transaction_request(8), Some(&previous))
+            .expect("conditional second write");
+        assert_eq!(
+            writer
+                .create_record_with_expected_prev_text(transaction_request(8), Some(&previous))
+                .unwrap(),
+            second,
+            "immediate retry must not compare against its own new head"
+        );
+        let third = writer
+            .create_record_with_expected_prev_text(transaction_request(9), None)
+            .expect("head advances again");
+        let key = writer.account.active_key.lock().as_ref().unwrap().clone();
+        drop(writer);
+        drop(store);
+        let store = Arc::new(PublicRepoStore::open(dir.path()).expect("reopen"));
+        let writer = PublicRepoWriter::new(
+            store.clone(),
+            "did:web:tormentnexus.social",
+            key,
+            gate.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            writer
+                .create_record_with_expected_prev_text(transaction_request(7), None)
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            writer
+                .create_record_with_expected_prev_text(transaction_request(8), Some(&previous))
+                .unwrap(),
+            second,
+            "durable retry returns original commit, not the latest head"
+        );
+        for changed in [None, Some(third.commit_cid.to_string().as_str())] {
+            assert!(matches!(
+                writer.create_record_with_expected_prev_text(transaction_request(8), changed),
+                Err(PublicRepoWriteError::InvalidRequest(_))
+            ));
+        }
+        let mut changed = transaction_request(8);
+        changed.value = DagCbor::str_map([
+            ("$type", DagCbor::Text("app.bsky.feed.post".into())),
+            ("text", DagCbor::Text("changed".into())),
+        ]);
+        assert!(writer
+            .create_record_with_expected_prev_text(changed, Some(&previous))
+            .is_err());
+        let mut different_principal = transaction_request(8);
+        different_principal.principal = "did:at9p:other".into();
+        assert!(writer
+            .create_record_with_expected_prev_text(different_principal, Some(&previous))
+            .is_err());
+        gate.allow.store(false, Ordering::Release);
+        let denied = writer
+            .create_record_with_expected_prev_text(transaction_request(8), Some(&previous))
+            .unwrap_err();
+        assert!(
+            denied.to_string().contains("publication denied"),
+            "retries reauthorize"
+        );
+        let snapshot = store.snapshot(writer.did()).unwrap().unwrap();
+        assert_eq!(snapshot.records.len(), 3);
+        assert_eq!(snapshot.commit.cid_atproto().unwrap(), third.commit_cid);
+    }
+
+    #[test]
+    fn xrpc_cas_and_unconditional_writes_share_one_atomic_head_selection() {
+        for conditional in [true, false] {
+            let (_dir, store, _gate, writer) = transaction_fixture();
+            let first = writer.create_record(transaction_request(7)).unwrap();
+            let writer = Arc::new(writer);
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let results = std::thread::scope(|scope| {
+                let mut workers = Vec::new();
+                for id in [8, 9] {
+                    let writer = writer.clone();
+                    let start = start.clone();
+                    let expected = conditional.then(|| first.commit_cid.to_string());
+                    workers.push(scope.spawn(move || {
+                        start.wait();
+                        writer.create_record_with_expected_prev_text(
+                            transaction_request(id),
+                            expected.as_deref(),
+                        )
+                    }));
+                }
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().expect("writer thread"))
+                    .collect::<Vec<_>>()
+            });
+            let expected_successes = if conditional { 1 } else { 2 };
+            assert_eq!(
+                results.iter().filter(|result| result.is_ok()).count(),
+                expected_successes
+            );
+            for error in results.iter().filter_map(|result| result.as_ref().err()) {
+                assert!(error.to_string().contains("CAS conflict"));
+            }
+            let snapshot = store.snapshot(writer.did()).unwrap().unwrap();
+            assert_eq!(snapshot.records.len(), 1 + expected_successes);
+            snapshot
+                .commit
+                .verify_atproto(&writer.active_verifying_key().unwrap())
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn xrpc_swap_authorizes_before_reading_repository_state() {
+        let (_dir, store, gate, writer) = transaction_fixture();
+        // A read would fail decoding this record before reaching the gate in
+        // the old text adapter. A denied request must not inspect it at all.
+        let key = record_key(
+            writer.did(),
+            "app.bsky.feed.post",
+            Tid::from_raw(7).encode().as_str(),
+        );
+        store.db.put(&key, b"malformed record").unwrap();
+        gate.allow.store(false, Ordering::Release);
+        let expected = Cid::from_dag_cbor(b"any head").to_string();
+        let error = writer
+            .create_record_with_expected_prev_text(transaction_request(8), Some(&expected))
+            .unwrap_err();
+        assert!(error.to_string().contains("publication denied"));
+        assert_eq!(store.db.get(key).unwrap().unwrap(), b"malformed record");
+        assert!(store.db.get(commit_key(writer.did())).unwrap().is_none());
+        assert!(store.intent(writer.did(), "req-8").unwrap().is_none());
+    }
+
+    #[test]
+    fn json_links_and_bytes_match_independent_public_record_fixture() {
+        // Independently encoded using Python hashlib/base64 and a minimal
+        // RFC 8949 encoder with public map ordering and tag-42 links.
+        let json = serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "json",
+            "payload": {"$bytes": "AQI="},
+            "links": [{"$link": "bafyreifqwkmiw256ojf2zws6tzjeonw6bpd5vza4i22ccpcq4hjv2ts7cm"}],
+            "blob": {
+                "$type": "blob",
+                "ref": {"$link": "bafkreifbfby75yqq7odbski6v2qziwa4xustdzfsg5m5ejpwqbush5rsei"},
+                "mimeType": "image/png",
+                "size": 2
+            }
+        });
+        let value = json_to_dag_cbor(&json).expect("AT JSON");
+        let record = AtprotoRecord::new("app.bsky.feed.post", Tid::from_raw(7), value)
+            .expect("public record");
+        let fixture = hex::decode(concat!(
+            "a564626c6f62a463726566d82a58250001551220a12871fee210fb8619291eaea194581cbd2531e4b23759d225f6806923f63222",
+            "6473697a650265247479706564626c6f62686d696d655479706569696d6167652f706e676474657874646a736f6e",
+            "652474797065726170702e62736b792e666565642e706f7374656c696e6b7381d82a58250001711220b0b2988b6bbe724bacda5e9e524736de0bc7dae41c46b4213c50e1d35d4e5f13",
+            "677061796c6f6164420102"
+        )).expect("fixture");
+        assert_eq!(record.bytes(), fixture);
+        assert_eq!(
+            record.cid().to_string(),
+            "bafyreie3irn4tnywq3hxjm3knxuq7ovhni7cjqxa7weo7dncxsw6rj3s4m"
+        );
+        assert!(
+            AtprotoRecord::from_bytes("app.bsky.feed.post", Tid::from_raw(7), &fixture).is_ok()
+        );
+    }
+
+    #[test]
+    fn json_bytes_accept_standard_base64_with_optional_padding() {
+        for text in ["", "AQI", "AQI=", "+/8=", "+/8"] {
+            let value = json_to_dag_cbor(&serde_json::json!({"$bytes": text})).expect("bytes");
+            let expected = match text {
+                "" => vec![],
+                "AQI" | "AQI=" => vec![1, 2],
+                _ => vec![251, 255],
+            };
+            assert_eq!(value, DagCbor::Bytes(expected));
+        }
+    }
+
+    #[test]
+    fn json_rejects_malformed_reserved_wrappers_at_any_depth() {
+        let cid = Cid::from_raw(b"blob").to_string();
+        let malformed = [
+            serde_json::json!({"$link": false}),
+            serde_json::json!({"$link": "not-a-cid"}),
+            serde_json::json!({"$link": cid, "extra": 1}),
+            serde_json::json!({"$link": cid, "$bytes": "AQI="}),
+            serde_json::json!({"$bytes": 12}),
+            serde_json::json!({"$bytes": "AQI=", "extra": 1}),
+            serde_json::json!({"$bytes": "-_8="}),
+            serde_json::json!({"$bytes": "AQJ="}),
+            serde_json::json!({"$bytes": "AQI=="}),
+        ];
+        for value in malformed {
+            assert!(json_to_dag_cbor(&value).is_err(), "{value}");
+            assert!(json_to_dag_cbor(&serde_json::json!({"nested": [value]})).is_err());
+        }
+    }
+
+    #[test]
+    fn json_links_reject_noncanonical_and_unsupported_cids() {
+        let cid = Cid::from_raw(b"blob");
+        let text = cid.to_string();
+        assert_eq!(parse_atproto_json_cid(&text).expect("canonical"), cid);
+        assert!(parse_atproto_json_cid(&text.to_uppercase()).is_err());
+        assert!(parse_atproto_json_cid(&format!("{text}=")).is_err());
+        let mut noncanonical = text.into_bytes();
+        let last = noncanonical.last_mut().expect("last digit");
+        // The last base32 digit has two zero padding bits. Setting one leaves
+        // the decoded CID bytes unchanged but must not be accepted.
+        let alphabet = b"abcdefghijklmnopqrstuvwxyz234567";
+        let position = alphabet.iter().position(|c| c == last).expect("base32");
+        *last = alphabet[position + 1];
+        assert!(parse_atproto_json_cid(&String::from_utf8(noncanonical).unwrap()).is_err());
+        for (position, replacement) in [(1, 0x70), (2, 0x13), (3, 0x1f)] {
+            let mut raw = cid.as_bytes().to_vec();
+            raw[position] = replacement;
+            // Encode invalid bytes independently of the production parser.
+            let encoded = raw
+                .iter()
+                .flat_map(|byte| (0..8).rev().map(move |bit| (byte >> bit) & 1))
+                .collect::<Vec<_>>();
+            let mut text = String::from("b");
+            for chunk in encoded.chunks(5) {
+                let n = chunk.iter().fold(0u8, |n, bit| (n << 1) | bit) << (5 - chunk.len());
+                text.push(alphabet[n as usize] as char);
+            }
+            assert!(parse_atproto_json_cid(&text).is_err());
+        }
     }
 }

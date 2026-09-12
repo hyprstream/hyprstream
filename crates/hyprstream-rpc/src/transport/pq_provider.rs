@@ -1,14 +1,14 @@
 //! Post-quantum hybrid TLS crypto-provider policies (#557 / S6 of epic #550).
 //!
-//! The owned internal mesh (zmtp and both iroh ALPNs) is hybrid-only: it has no
-//! classical key-exchange fallback. The process-wide provider used by the
-//! external WebTransport/HTTP perimeter deliberately retains X25519 fallback
-//! for browser and third-party interoperability. Application-layer HyKEM is the
-//! primary, transport-independent confidentiality guarantee on every path.
+//! The owned iroh endpoint uses a provider that offers hybrid X25519MLKEM768
+//! plus classical X25519 because iroh reuses it for public N0 relay and pkarr
+//! HTTPS. The owned Hyprstream ALPNs remain hybrid-only at the completed
+//! carrier-admission hook, and application-layer HyKEM remains the primary,
+//! transport-independent confidentiality guarantee on every path.
 
 use std::sync::Arc;
 
-use rustls::crypto::{aws_lc_rs, CryptoProvider};
+use rustls::crypto::{CryptoProvider, aws_lc_rs};
 
 const INTERNAL_MESH_GROUPS: &[rustls::NamedGroup] = &[rustls::NamedGroup::X25519MLKEM768];
 const EXTERNAL_INTEROP_GROUPS: &[rustls::NamedGroup] = &[

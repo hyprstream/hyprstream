@@ -164,7 +164,8 @@ http = "1"
 # Note: web-transport-iroh 0.6.x requires iroh ^1 (0.5.x pinned =1.0.0-rc.0 exactly);
 # co-bump these together. Staying on the RC held noq/noq-proto at 1.0.0-rc.0, which
 # predates the n0-computer/noq#690 GSO-batch alignment fix (#1456).
-iroh = { version = "^1", default-features = false, features = ["tls-ring"] }
+iroh = { git = "https://github.com/ewindisch/iroh.git", rev = "df6302e0561fadcbf91199ad15d564224a3e7d93", default-features = false, features = ["tls-ring"] }
+
 moq-net = "0.1"
 web-transport-iroh = { version = "0.6.0", default-features = false, features = ["ring"] }
 web-transport-quinn = { version = "0.11.9", default-features = false, features = ["ring"] }
@@ -283,6 +284,9 @@ criterion = "0.5.1"
 # web_sys::WebTransport-backed Session can drive the moq subscriber. Upstreamed as
 # moq-dev/moq#2085 (merged 2026-07-04, commit 07f558fea819c9b4c9a68617383146449f5edc87).
 [patch.crates-io]
+# Hyprstream's owned carrier stays on the exact iroh commit below; this also
+# overrides web-transport-iroh's registry edge so both crates share one type.
+iroh = { git = "https://github.com/ewindisch/iroh.git", rev = "df6302e0561fadcbf91199ad15d564224a3e7d93" }
 # Pinned to the upstream merge commit rather than a crates-io release: #2085 landed
 # on moq-dev/moq main but hasn't shipped in a moq-net release yet. Pinning to a rev
 # (not a branch) keeps the build reproducible even if main advances further. Drop
