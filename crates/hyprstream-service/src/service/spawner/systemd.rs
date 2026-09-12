@@ -21,7 +21,7 @@ use std::process::Stdio;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use super::{ProcessConfig, ProcessKind, SpawnedProcess, SpawnerBackend};
+use super::{ProcessConfig, ProcessKind, ProcessReadiness, SpawnedProcess, SpawnerBackend};
 use hyprstream_rpc::error::{Result, RpcError};
 
 /// Systemd spawner backend using transient units.
@@ -154,6 +154,14 @@ impl Default for SystemdBackend {
 #[async_trait::async_trait]
 impl SpawnerBackend for SystemdBackend {
     async fn spawn(&self, config: ProcessConfig) -> Result<SpawnedProcess> {
+        // Notification readiness is a standalone-supervision contract (#1585);
+        // transient systemd-run units are not the launcher's path and get no
+        // half-wired imitation of it.
+        if config.readiness != ProcessReadiness::Immediate {
+            return Err(RpcError::InvalidOperation(
+                "notification readiness is only supported by the standalone spawner".to_owned(),
+            ));
+        }
         let unit_name = self.generate_unit_name(&config.name);
 
         tracing::debug!(

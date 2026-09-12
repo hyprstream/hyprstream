@@ -135,6 +135,54 @@ impl EventNetworkService {
             announce: ctx.native_iroh_announcement_callback("event")?,
         })
     }
+
+    async fn run_until_shutdown(
+        self,
+        shutdown: Arc<tokio::sync::Notify>,
+        ready: impl FnOnce(),
+    ) -> hyprstream_rpc::error::Result<()> {
+        use hyprstream_rpc::error::RpcError;
+        // Keep the same registered waiter through bind, publication and readiness.
+        // Replacing it after READY can lose notify_waiters() from an owner that
+        // stops the service as soon as readiness is observed.
+        let stopped = shutdown.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
+        let substrate = hyprstream_rpc::transport::iroh_substrate::IrohSubstrate::new(
+            self.secret, self.handler,
+            hyprstream_rpc::transport::iroh_substrate::RefuseHandler::new("Event provides only authenticated moql"),
+        ).await.map_err(|e| RpcError::SpawnFailed(format!("native Event bind: {e}")))?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let _cancel_on_exit = cancellation.clone().drop_guard();
+        let announce_cancel = cancellation.clone();
+        let announce = self.announce;
+        let node_id = self.node_id;
+        let initial = tokio::select! {
+            biased;
+            _ = &mut stopped => Err(RpcError::SpawnFailed("Event stopped before announcement".into())),
+            result = tokio::task::spawn_blocking(move || announce(announce_cancel, node_id)) => {
+                result.map_err(|e| RpcError::SpawnFailed(format!("Event announcement task: {e}")))
+                    .and_then(|r| r.map_err(|e| RpcError::SpawnFailed(format!("Event initial announcement: {e}"))))
+            }
+        };
+        if let Err(error) = initial {
+            cancellation.cancel();
+            let _ = substrate.shutdown().await;
+            return Err(error);
+        }
+        ready();
+        tokio::select! {
+            _ = &mut stopped => {},
+            _ = cancellation.cancelled() => {},
+            _ = async {
+                while !substrate.router().is_shutdown() && !substrate.endpoint().is_closed() {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            } => {},
+        }
+        cancellation.cancel();
+        substrate.shutdown().await.map_err(|e| RpcError::SpawnFailed(format!("Event shutdown: {e}")))
+    }
 }
 
 impl hyprstream_rpc::service::Spawnable for EventNetworkService {
@@ -159,43 +207,10 @@ impl hyprstream_rpc::service::Spawnable for EventNetworkService {
             .enable_all()
             .build()
             .map_err(|e| RpcError::SpawnFailed(e.to_string()))?;
-        runtime.block_on(async move {
-            let substrate = hyprstream_rpc::transport::iroh_substrate::IrohSubstrate::new(
-                self.secret, self.handler,
-                hyprstream_rpc::transport::iroh_substrate::RefuseHandler::new("Event provides only authenticated moql"),
-            ).await.map_err(|e| RpcError::SpawnFailed(format!("native Event bind: {e}")))?;
-            let cancellation = tokio_util::sync::CancellationToken::new();
-            let _cancel_on_exit = cancellation.clone().drop_guard();
-            let announce_cancel = cancellation.clone();
-            let announce = self.announce;
-            let node_id = self.node_id;
-            let initial = tokio::select! {
-                biased;
-                _ = shutdown.notified() => Err(RpcError::SpawnFailed("Event stopped before announcement".into())),
-                result = tokio::task::spawn_blocking(move || announce(announce_cancel, node_id)) => {
-                    result.map_err(|e| RpcError::SpawnFailed(format!("Event announcement task: {e}")))
-                        .and_then(|r| r.map_err(|e| RpcError::SpawnFailed(format!("Event initial announcement: {e}"))))
-                }
-            };
-            if let Err(error) = initial {
-                cancellation.cancel();
-                let _ = substrate.shutdown().await;
-                return Err(error);
-            }
+        runtime.block_on((*self).run_until_shutdown(shutdown, move || {
             if let Some(ready) = on_ready { let _ = ready.send(()); }
             let _ = hyprstream_rpc::notify::ready();
-            tokio::select! {
-                _ = shutdown.notified() => {},
-                _ = cancellation.cancelled() => {},
-                _ = async {
-                    while !substrate.router().is_shutdown() && !substrate.endpoint().is_closed() {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                } => {},
-            }
-            cancellation.cancel();
-            substrate.shutdown().await.map_err(|e| RpcError::SpawnFailed(format!("Event shutdown: {e}")))
-        })
+        }))
     }
 }
 
@@ -234,6 +249,70 @@ pub async fn probe_event_network(timeout: std::time::Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_event_service(
+        announce: hyprstream_service::service::factory::NativeIrohAnnouncementCallback,
+    ) -> EventNetworkService {
+        use hyprstream_rpc::transport::iroh_moq::{IrohMoqProtocolHandler, OriginShared};
+        let key = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+        let origin = hyprstream_rpc::moq_event::MoqEventOrigin::new();
+        EventNetworkService {
+            secret: key.to_bytes(),
+            node_id: key.verifying_key().to_bytes(),
+            handler: IrohMoqProtocolHandler::with_origin(OriginShared::from_pair(
+                origin.producer(),
+                origin.consumer(),
+            )),
+            announce,
+        }
+    }
+
+    #[tokio::test]
+    async fn event_shutdown_at_readiness_is_retained() -> Result<()> {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let announced = Arc::new(parking_lot::Mutex::new(cancellation.clone()));
+        let observed = Arc::clone(&announced);
+        let service = test_event_service(Arc::new(move |token, _| {
+            *observed.lock() = token;
+            Ok(())
+        }));
+        let ready = std::cell::Cell::new(false);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            service.run_until_shutdown(Arc::clone(&shutdown), || {
+                ready.set(true);
+                // Deterministically stop inside readiness, before the final
+                // serving select is polled. A newly created waiter loses this.
+                shutdown.notify_waiters();
+            }),
+        )
+        .await
+        .context("Event lost shutdown at readiness")??;
+        anyhow::ensure!(ready.get(), "Event never reached readiness");
+        anyhow::ensure!(announced.lock().is_cancelled(), "announcement was not cancelled");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_shutdown_during_announcement_prevents_readiness() -> Result<()> {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let stopping = Arc::clone(&shutdown);
+        let service = test_event_service(Arc::new(move |_, _| {
+            stopping.notify_waiters();
+            Ok(())
+        }));
+        let ready = std::cell::Cell::new(false);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            service.run_until_shutdown(shutdown, || ready.set(true)),
+        )
+        .await
+        .context("Event did not stop during announcement")?;
+        anyhow::ensure!(result.is_err(), "startup shutdown must fail readiness");
+        anyhow::ensure!(!ready.get(), "Event became ready after startup shutdown");
+        Ok(())
+    }
 
     /// A required CLI/service initializer must reject absent proof before it
     /// installs an origin or spawns a compatibility socket task. Isolate process

@@ -177,6 +177,12 @@ fn build_cli() -> ClapCommand {
                     .about("Initialize the checkpoint store for an explicitly provisioned fresh deployment"),
             )
             .subcommand(
+                ClapCommand::new("inspect-services")
+                    .about("Read existing checkpoint-verified service identities as public JSON without provisioning or renewal")
+                    .arg(Arg::new("service").long("service").required(true)
+                        .action(clap::ArgAction::Append).value_delimiter(',')),
+            )
+            .subcommand(
                 ClapCommand::new("provision-services")
                     .about("Admit existing local service identities before starting the registry")
                     .arg(Arg::new("service").long("service").required(true)
@@ -1319,7 +1325,7 @@ fn handle_quick_command(
                         // Wire up policy-backed authorization
                         let worker_policy_client = hyprstream_core::services::policy_client_for_process(
                             signing_key.clone(),
-                            resolve_service_vk("policy")
+                            resolve_service_vk("policy", Some(ctx.config()))
                                 .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
                             None,
                         )?;
@@ -1333,7 +1339,7 @@ fn handle_quick_command(
                         // is in scope here, so the mesh PQ store is empty (#157):
                         // identical to prior behavior (Hybrid fails closed for
                         // unknown peers).
-                        install_envelope_verify_config(None);
+                        install_envelope_verify_config(None, None);
 
                         let manager = InprocManager::new();
                         Some(
@@ -1551,6 +1557,69 @@ fn resolve_moq_relay_reach(
         .ok_or_else(|| anyhow::anyhow!("relay URI is not a network-routable transport"))
 }
 
+/// Resolve the services hosted by this foreground process independently of
+/// transport profile. Background start commands do not host their children.
+fn foreground_service_process_names(matches: &clap::ArgMatches, config: &HyprConfig) -> Result<Option<Vec<String>>> {
+    let Some(("service", service_matches)) = matches.subcommand() else {
+        return Ok(None);
+    };
+    let action = ServiceAction::from_arg_matches(service_matches)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let ServiceAction::Start { name, foreground, standalone, services, .. } = action else {
+        return Ok(None);
+    };
+    if !foreground && !standalone {
+        return Ok(None);
+    }
+    let names = if standalone {
+        config.services.startup.clone()
+    } else {
+        services.unwrap_or_else(|| name.into_iter().collect())
+    };
+    Ok(Some(names))
+}
+
+/// Process termination is safe only when this process hosts one known service.
+fn dedicated_service_process_name(matches: &clap::ArgMatches, config: &HyprConfig) -> Result<Option<String>> {
+    let Some(names) = foreground_service_process_names(matches, config)? else {
+        return Ok(None);
+    };
+    match names.as_slice() {
+        [service] if get_factory(service).is_some() => Ok(Some(service.clone())),
+        _ => Ok(None),
+    }
+}
+
+/// Select the process identity before constructing any resolver/client. Transport
+/// flags do not decide whose identity a required-native split service uses.
+fn native_service_process_name(matches: &clap::ArgMatches, config: &HyprConfig) -> Result<Option<String>> {
+    if !config.quic.iroh_required() {
+        return Ok(None);
+    }
+    let Some(names) = foreground_service_process_names(matches, config)? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(names.len() == 1,
+        "network-iroh-required requires exactly one service per foreground process; launch each provisioned service separately");
+    let service = names.into_iter().next().context("native service name missing")?;
+    anyhow::ensure!(hyprstream_service::get_factory(&service).is_some(), "unknown native service: {service}");
+    Ok(Some(service))
+}
+
+/// Required service startup consumes the provisioner's retained key. Missing or
+/// malformed material is never a reason to generate a new identity or use the
+/// CLI/root key. Compatibility commands retain their existing key behavior.
+async fn load_process_signing_key(config: &HyprConfig, native_service: Option<&str>) -> Result<SigningKey> {
+    if let Some(service) = native_service {
+        let secrets = HyprConfig::resolve_secrets_dir_for(Some(config))?;
+        return hyprstream_core::auth::identity_store::load_existing_service_signing_key(
+            &secrets, service, hyprstream_core::auth::identity_store::SecretsProfile::from_env()?,
+        ).with_context(|| format!("load provisioned native identity for {service}"));
+    }
+    let keys_dir = config.models_dir().join(".registry").join("keys");
+    load_or_generate_signing_key(&keys_dir).await
+}
+
 /// A QUIC process currently owns one native MoQ dialer and its admission-proof
 /// slot. Sharing that slot across separately checkpointed services would make a
 /// later service dial as the first service's DID. Refuse that topology until the
@@ -1594,14 +1663,18 @@ fn select_iroh_moql_admission_proof<T>(
     }
 }
 
-fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
+fn resolve_service_vk(
+    service_name: &str,
+    config: Option<&HyprConfig>,
+) -> Option<VerifyingKey> {
     let trust = hyprstream_service::global_trust_store();
     // Fast path: already populated (service startup seeded it)
     if let Some(vk) = trust.resolve_one(service_name) {
         return Some(vk);
     }
-    // CLI mode: seed from bootstrap-pubkeys on first use
-    let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir() else {
+    // CLI mode: seed from bootstrap-pubkeys on first use. When startup already
+    // loaded a config (including --config), keep that path authoritative.
+    let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir_for(config) else {
         return None;
     };
     // Load the full entries so the hybrid requirement can be enforced before
@@ -1665,7 +1738,7 @@ async fn install_process_production_resolver(
     //
     // Scoped to this node's OWN service identities. External classical clients
     // and federated peers do not appear in this file and are not affected.
-    if let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir() {
+    if let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir_for(Some(config)) {
         let entries =
             hyprstream_core::auth::identity_store::load_bootstrap_pubkeys_hybrid(&secrets_dir)?;
         hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries)?;
@@ -1688,7 +1761,7 @@ async fn install_process_production_resolver(
     // store; in CLI/service-start mode nothing has seeded it yet. Seed from
     // the node's own bootstrap-pubkeys (the same source resolve_service_vk
     // uses on first use) — a no-op when already populated or unprovisioned.
-    let _ = resolve_service_vk("discovery");
+    let _ = resolve_service_vk("discovery", Some(config));
     // Private-PKI deployments may terminate the did:web host with an internal
     // CA; the extra root is additive (never disables verification), and an
     // unreadable file is a hard configuration error, not a silent skip.
@@ -1790,8 +1863,13 @@ fn quic_checkpoint_policy(
 /// When `oauth` is `Some`, the kid-anchored PQ trust store is populated eagerly
 /// from `mesh_peers` (#157). When `None` (e.g. the standalone worker entrypoint,
 /// which has no config in scope), the store is empty — identical to the prior
-/// behavior. Either way the store is immutable after install.
-fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthConfig>) {
+/// behavior. `config` carries the already-loaded CLI config so its explicit
+/// secrets path remains authoritative. Either way the store is immutable after
+/// install.
+fn install_envelope_verify_config(
+    oauth: Option<&hyprstream_core::config::OAuthConfig>,
+    config: Option<&HyprConfig>,
+) {
     use hyprstream_rpc::envelope::{
         install_response_verify_config, install_verify_config, mandatory_envelope_policy,
         EnvelopeVerifyConfig, KeyedPqTrustStore, PqTrustStore, ResponseVerifyConfig,
@@ -1815,7 +1893,7 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
     // envelope verify path consults, so supplying hybrid material actually
     // turns PQ enforcement on for those services. A classical-only file
     // anchors nothing and changes nothing.
-    if let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir() {
+    if let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir_for(config) {
         let anchored = hyprstream_core::auth::mesh_trust::seed_bootstrap_pq_bindings(
             &mut keyed_store,
             &secrets_dir,
@@ -2283,6 +2361,46 @@ where
     result
 }
 
+/// Policy must serve authority probes while Discovery starts, but is not READY
+/// until Discovery accepts its announcement. Only typed pre-dispatch Iroh
+/// unavailability can keep that initial publication pending.
+const POLICY_INITIAL_PUBLICATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+const POLICY_INITIAL_PUBLICATION_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
+
+async fn wait_for_policy_initial_publication<F, Fut>(
+    cancellation: &tokio_util::sync::CancellationToken,
+    budget: std::time::Duration,
+    mut attempt: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => anyhow::bail!("Policy initial publication cancelled"),
+            _ = tokio::time::sleep_until(deadline) => anyhow::bail!("Policy initial publication deadline exceeded"),
+            result = async { attempt().await } => result,
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if hyprstream_rpc::transport_traits::is_pre_dispatch_transport_error(&error)
+                && error.chain().any(|cause| cause.downcast_ref::<hyprstream_rpc::transport::lazy_iroh::IrohPeerUnavailable>().is_some()) => {
+                tracing::info!(%error, "Policy awaiting Discovery initial publication");
+            }
+            Err(error) => return Err(error),
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => anyhow::bail!("Policy initial publication cancelled"),
+            _ = tokio::time::sleep_until(deadline) => anyhow::bail!("Policy initial publication deadline exceeded"),
+            _ = tokio::time::sleep(POLICY_INITIAL_PUBLICATION_RETRY) => {}
+        }
+    }
+}
+
 /// Spawn the native-announcement refresh loop on its own current-thread Tokio
 /// runtime and return a channel for the first announcement result.
 ///
@@ -2495,20 +2613,67 @@ fn main() -> Result<()> {
         .get_one::<std::path::PathBuf>("config")
         .map(std::path::PathBuf::as_path);
 
+    // Canonicalize the explicit selector (CLI `--config` or the
+    // `HYPRSTREAM_CONFIG` env) BEFORE the first load, so the file that is
+    // loaded, the snapshot provenance, and the path forwarded to spawned
+    // children are one and the same value — and a relative selector stays
+    // meaningful regardless of a child's working directory. `None` means
+    // defaults-resolution, which children reproduce on their own.
+    let explicit_config_path: Option<std::path::PathBuf> = match config_path {
+        Some(path) => Some(std::fs::canonicalize(path).with_context(|| {
+            format!("canonicalizing explicit config path {}", path.display())
+        })?),
+        None => None,
+    };
+    // Library-side launchers (bootstrap manager, wizard) forward the same
+    // provenance their process pinned, so every launch path composes.
+    if let Some(canonical) = &explicit_config_path {
+        let _ = hyprstream_core::config::install_explicit_config_path(canonical.clone());
+    }
+
     // Load configuration early
-    let config = load_config(config_path)?;
+    let config = load_config(explicit_config_path.as_deref())?;
 
     // Validate configuration
     config
         .validate()
         .context("Configuration validation failed")?;
 
+    // Pin the validated configuration for the whole process (#1585): every
+    // later `HyprConfig::load()` — service-factory reloads included — observes
+    // this snapshot instead of re-deriving XDG defaults that would silently
+    // drop an explicit `--config` deployment's settings. Write-once, immutable
+    // afterwards; installed before any resolver, factory, or runtime thread.
+    let _ = hyprstream_core::config::install_pinned_config(config.clone());
+
+    // `Option<&Path>` is Copy, so both service arms below can borrow it.
+    let explicit_config: Option<&std::path::Path> = explicit_config_path.as_deref();
+    let iroh_required = config.quic.iroh_required();
+
+    // Read-only accepted-state inspection must precede tracing (which may
+    // create log files), endpoint/runtime initialization and all bootstrap/key
+    // generation paths. Buffer the complete verified roster before stdout.
+    if let Some(("pds", pds)) = matches.subcommand() {
+        if let Some(("inspect-services", inspect)) = pds.subcommand() {
+            let services = inspect.get_many::<String>("service")
+                .context("service roster is required")?.cloned().collect::<Vec<_>>();
+            // Inspection errors may include trusted-artifact or configured
+            // secrets paths. Keep those details out of the process error sink
+            // and log collectors while preserving the public JSON success
+            // document unchanged.
+            let bytes = hyprstream_core::cli::deployment_bootstrap::inspect_services(&config, &services)
+                .map_err(|_| anyhow::anyhow!("read-only service roster inspection failed"))?;
+            std::io::Write::write_all(&mut std::io::stdout().lock(), &bytes)?;
+            return Ok(());
+        }
+    }
+
     // RPC clients are used by ordinary CLI commands (`quick`, `tui`, etc.),
     // not only by service entrypoints. Install both request- and response-side
     // verification defaults before dispatch so every command uses the
     // operator-configured mesh trust store (#1018). The installer is
     // first-write-wins, so the service-specific calls below remain harmless.
-    install_envelope_verify_config(Some(&config.oauth));
+    install_envelope_verify_config(Some(&config.oauth), Some(&config));
 
     // Install the per-service streaming-response concurrency cap from config
     // (#186) before any RPC service starts. First-write-wins; ignore if already
@@ -2636,7 +2801,6 @@ fn main() -> Result<()> {
         init_registry(mode, runtime_dir);
     }
     // ========== END ENDPOINT REGISTRY INITIALIZATION ==========
-
     // ── Wizard / first-run early dispatch ───────────────────────────────────
     // The wizard is a bootstrap command: it creates credentials that the
     // registry client init (below) depends on. Handle both `wizard` and the
@@ -2857,6 +3021,9 @@ fn main() -> Result<()> {
         }
     }
 
+    let native_service_name = native_service_process_name(&matches, &config)?;
+    let dedicated_service_name = dedicated_service_process_name(&matches, &config)?;
+
     // Start registry service ONCE at CLI level
     let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2871,8 +3038,7 @@ fn main() -> Result<()> {
         bool,
     ) = _registry_runtime
         .block_on(async {
-            let keys_dir = config.models_dir().join(".registry").join("keys");
-            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+            let signing_key = load_process_signing_key(&config, native_service_name.as_deref()).await?;
             let verifying_key = signing_key.verifying_key();
 
             let is_os_owned_bootstrap = install_process_production_resolver(&signing_key, &config).await
@@ -2935,7 +3101,7 @@ fn main() -> Result<()> {
                             multi_threaded: true,
                         },
                         || async move {
-                            handle_service_install(&models_dir, &services, filter, start, enable, target, verbose).await
+                            handle_service_install(&models_dir, &services, filter, start, enable, target, verbose, explicit_config, iroh_required).await
                         },
                     )?;
                 }
@@ -2988,6 +3154,10 @@ fn main() -> Result<()> {
                             }
                         };
 
+                        // --services with one member selects that service's identity,
+                        // never the synthetic "multi"/"standalone" command label.
+                        let name = native_service_name.clone().unwrap_or(name);
+
                         // Standard foreground service startup
                         let rpc_mode = if ipc {
                             hyprstream_rpc::registry::EndpointMode::Ipc
@@ -3024,8 +3194,12 @@ fn main() -> Result<()> {
 
                                 let models_dir = config.models_dir();
                                 let keys_dir = models_dir.join(".registry").join("keys");
-                                let signing_key =
-                                    load_or_generate_signing_key(&keys_dir).await?;
+                                let signing_key = if native_service_name.is_some() {
+                                    // Same retained key already installed in the process resolver.
+                                    signing_key.clone()
+                                } else {
+                                    load_or_generate_signing_key(&keys_dir).await?
+                                };
                                 let verifying_key = signing_key.verifying_key();
 
                                 let fed_src: Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
@@ -3039,7 +3213,24 @@ fn main() -> Result<()> {
                                     models_dir.clone(),
                                 )
                                 .with_oauth_issuer(config.oauth.issuer_url())
-                                .with_federation_key_source(fed_src);
+                                .with_federation_key_source(fed_src)
+                                // Same authoritative resolver the startup key/JWT
+                                // seeding above used (#759): without it, factory-time
+                                // key registration and the hourly JWT renewal task
+                                // would resolve a config-free default directory and
+                                // silently skip custom `--config [secrets].path`
+                                // deployments.
+                                .with_secrets_dir(
+                                    hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(
+                                        Some(&config),
+                                    )?,
+                                );
+
+                                // Containment follows the actual single-service launch,
+                                // independently of native/compatibility transport selection.
+                                if let Some(service) = &dedicated_service_name {
+                                    ctx = ctx.with_dedicated_process_service(service.clone());
+                                }
 
                                 // Wire QUIC shared config from --quic-bind or [quic] config
                                 let mut quic_cfg = if let Some(ref bind_addr) = quic_bind {
@@ -3063,8 +3254,8 @@ fn main() -> Result<()> {
                                     vec![name.clone()]
                                 };
 
-                                if ipc {
-                                    // Multi-process mode: each service gets its own independent key.
+                                if ipc || native_service_name.is_some() {
+                                    // Split-service identity is independent of local IPC transport.
                                     //
                                     // #759: resolve via the SAME authoritative path
                                     // `HyprConfig::resolve_secrets_dir()` uses elsewhere in this
@@ -3077,7 +3268,7 @@ fn main() -> Result<()> {
                                     // than this process reads from — the same "consumer silently
                                     // re-derives instead of reading the authoritative record"
                                     // disease #441 targets, just one directory earlier.
-                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
                                     ctx = ctx.with_ca_verifying_key(
                                         hyprstream_core::auth::identity_store::load_ca_verifying_key(
                                             &secrets_dir,
@@ -3121,50 +3312,40 @@ fn main() -> Result<()> {
                                     // secrets profile — see `resolve_service_signing_key` for why.
                                     let secrets_profile =
                                         hyprstream_core::auth::identity_store::SecretsProfile::from_env()?;
-                                    let own_key = hyprstream_core::auth::identity_store::resolve_service_signing_key(
-                                        &secrets_dir, &name, secrets_profile,
-                                    )?;
+                                    let own_key = if native_service_name.is_some() {
+                                        signing_key.clone()
+                                    } else {
+                                        hyprstream_core::auth::identity_store::resolve_service_signing_key(
+                                            &secrets_dir, &name, secrets_profile,
+                                        )?
+                                    };
 
                                     if name == "policy" {
                                         // PolicyService: signing_key IS the CA key (already loaded).
-                                        ctx = ctx.with_service_key(&name, own_key);
+                                        ctx = ctx.with_service_key(&name, own_key.clone());
                                     } else {
                                         // Non-policy: swap signing_key to service's own independent key.
                                         // CA key is no longer accessible via ctx.signing_key().
                                         ctx = ctx.swap_signing_key(own_key.clone());
                                         ctx = ctx.with_service_key(&name, own_key.clone());
-
-                                        // In systemd mode the credential dir is flat (%d = secrets_dir).
-                                        // Load our own service-jwt from disk and seed the trust store so
-                                        // that register_service_key() finds it on first call — otherwise
-                                        // the trust store only has pubkeys (jwt: None) from bootstrap-pubkeys
-                                        // and registration is silently skipped.
-                                        if let Ok(Some(jwt_str)) = hyprstream_core::auth::identity_store::load_service_jwt_for_profile(
-                                            &secrets_dir,
-                                            &name,
-                                            secrets_profile,
-                                        ) {
-                                            let exp = hyprstream_core::auth::identity_store::decode_jwt_exp_raw(&jwt_str).unwrap_or(0);
-                                            hyprstream_service::global_trust_store().insert(
-                                                own_key.verifying_key(),
-                                                hyprstream_service::Attestation {
-                                                    scopes: std::iter::once(name.clone()).collect(),
-                                                    subject: None,
-                                                    jwt: Some(jwt_str),
-                                                    expires_at: exp,
-                                                    attested_by: None,
-                                                },
-                                            );
-                                            tracing::info!(service = %name, "Seeded trust store with own service-jwt from credential dir");
-                                        }
                                     }
+                                    // Both Policy and non-Policy factories need the
+                                    // provisioned JWT. Policy's required-native factory
+                                    // registers its own key too, so seed after the shared
+                                    // key selection rather than only in the non-Policy arm.
+                                    hyprstream_core::auth::identity_store::seed_service_jwt_into_trust_store(
+                                        &name,
+                                        &own_key,
+                                        &secrets_dir,
+                                        secrets_profile,
+                                    );
                                 } else {
                                     // Single-process mode: load keys from disk (same as IPC).
                                     // Wizard must have run to create credentials.
                                     //
                                     // #759: same authoritative resolver as the `--ipc` branch above —
                                     // see the comment there.
-                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
                                     ctx = ctx.with_ca_verifying_key(
                                         hyprstream_core::auth::identity_store::load_ca_verifying_key(
                                             &secrets_dir,
@@ -3256,7 +3437,7 @@ fn main() -> Result<()> {
                                 // no manifest-backed clearance.
                                 {
                                     let secrets_dir =
-                                        hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
+                                        hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
                                     match hyprstream_core::auth::service_enrollment::ServiceEnrollmentManifest::load_and_validate(&secrets_dir)
                                         .context("service enrollment manifest validation failed")?
                                     {
@@ -3442,6 +3623,52 @@ fn main() -> Result<()> {
                                                                 return;
                                                             }
                                                         };
+                                                        if service_name == "policy"
+                                                            && hyprstream_discovery::native_network_required()
+                                                            && matches!(request.reach, hyprstream_service::NativeAnnouncementReach::Iroh { .. })
+                                                        {
+                                                            let cancellation = request.cancellation.clone();
+                                                            let initial = wait_for_policy_initial_publication(
+                                                                &cancellation,
+                                                                POLICY_INITIAL_PUBLICATION_BUDGET,
+                                                                || {
+                                                                    // Re-read signed current state and the exact service
+                                                                    // key's credential on every attempt, before any dial.
+                                                                    let announcement = hyprstream_core::services::factories::current_native_announcement(&mut request);
+                                                                    let client = &client;
+                                                                    async move {
+                                                                        let announcement = announcement?;
+                                                                        let jwt_expiry = announcement.service_jwt.as_deref()
+                                                                            .and_then(hyprstream_core::auth::identity_store::decode_jwt_exp_raw)
+                                                                            .and_then(|seconds| seconds.checked_mul(1_000))
+                                                                            .context("Policy initial announcement requires a bounded service JWT")?;
+                                                                        let expiry = announcement.expires_at_unix_ms.min(jwt_expiry);
+                                                                        let remaining = expiry.saturating_sub(chrono::Utc::now().timestamp_millis());
+                                                                        anyhow::ensure!(remaining > 0, "Policy initial announcement authority expired");
+                                                                        let duration = std::time::Duration::from_millis(u64::try_from(remaining)?);
+                                                                        tokio::time::timeout(duration, client.announce(&announcement)).await
+                                                                            .context("Policy initial announcement authority expired during publication")??;
+                                                                        anyhow::ensure!(chrono::Utc::now().timestamp_millis() < expiry,
+                                                                            "Policy initial announcement authority expired before readiness");
+                                                                        Ok(())
+                                                                    }
+                                                                },
+                                                            ).await;
+                                                            // Report only success or terminal failure, never a
+                                                            // transient availability error. The spawner's existing
+                                                            // bind/publication READY and cancellation gates remain.
+                                                            if let Some(tx) = announce_tx.as_ref() {
+                                                                if let Some(tx) = tx.lock().take() {
+                                                                    let _ = tx.send(initial.as_ref().map(|_| ()).map_err(ToString::to_string));
+                                                                }
+                                                            }
+                                                            if initial.is_err() { return; }
+                                                            tokio::select! {
+                                                                biased;
+                                                                _ = cancellation.cancelled() => return,
+                                                                _ = tokio::time::sleep(std::time::Duration::from_secs(25)) => {}
+                                                            }
+                                                        }
                                                         let _completion = refresh_native_announcement(
                                                             &service_name,
                                                             &socket_kind,
@@ -3479,7 +3706,7 @@ fn main() -> Result<()> {
 
                                 // Populate ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
                                 {
-                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
                                     let ml_dsa_store = hyprstream_core::auth::key_rotation::global_ml_dsa_key_store(
                                         &secrets_dir,
                                         &config.oauth,
@@ -3586,7 +3813,7 @@ fn main() -> Result<()> {
                                 //
                                 // Policy: Hybrid is mandatory. With no anchored
                                 // peer key the verifier FAILS CLOSED.
-                                install_envelope_verify_config(Some(&config.oauth));
+                                install_envelope_verify_config(Some(&config.oauth), Some(&config));
 
                                 // Install MoQ/event authorization in every
                                 // production service process before any model,
@@ -3633,6 +3860,44 @@ fn main() -> Result<()> {
                                     &service_names, ctx.iroh_required(),
                                 );
 
+                                // In a split required-native launch each child
+                                // sees only its own `service_names` entry, while
+                                // the parent stages the configured roster. If
+                                // this child is one of the services scheduled
+                                // before Policy (currently event, discovery,
+                                // or streams), defer its startup probe so the
+                                // parent can reach the Policy stage. A
+                                // standalone policy-dependent child retains
+                                // the eager probe and cannot report ready with
+                                // an unavailable authority.
+                                let defer_policy_probe = if ctx.iroh_required()
+                                    && service_names.len() == 1
+                                {
+                                    let configured_stages =
+                                        hyprstream_service::service::ordering::startup_stages_for_profile(
+                                            &services,
+                                            true,
+                                        );
+                                    let policy_position = configured_stages.iter().enumerate().find_map(
+                                        |(stage_index, stage)| {
+                                            stage.iter().position(|name| name == "policy")
+                                                .map(|service_index| (stage_index, service_index))
+                                        },
+                                    );
+                                    let service_position = configured_stages.iter().enumerate().find_map(
+                                        |(stage_index, stage)| {
+                                            stage.iter().position(|name| name == &service_names[0])
+                                                .map(|service_index| (stage_index, service_index))
+                                        },
+                                    );
+                                    match (service_position, policy_position) {
+                                        (Some(service), Some(policy)) => service < policy,
+                                        _ => false,
+                                    }
+                                } else {
+                                    false
+                                };
+
                                 // Publish the process-global authority stores
                                 // (credential revocation + session registry)
                                 // BEFORE any factory runs. The policy process
@@ -3646,6 +3911,7 @@ fn main() -> Result<()> {
                                     &ctx,
                                     ctx.signing_key(),
                                     service_names.iter().any(|n| n == "policy"),
+                                    defer_policy_probe,
                                 )
                                 .await
                                 .context("revocation/session authority initialization failed")?;
@@ -3748,7 +4014,7 @@ fn main() -> Result<()> {
                                 multi_threaded: false,
                             },
                             || async move {
-                                handle_service_start(&services, name, daemon).await
+                                handle_service_start(&services, name, daemon, explicit_config, iroh_required).await
                             },
                         )?;
                     }
@@ -4094,6 +4360,310 @@ mod resolver_startup_controls {
         assert!(super::build_cli()
             .try_get_matches_from(["hyprstream", "service", "provision-policy-templates",])
             .is_err());
+    }
+
+    #[test]
+    fn native_service_identity_loads_existing_key_without_ipc() -> anyhow::Result<()> {
+        const CHILD: &str = "HYPRSTREAM_NATIVE_SERVICE_IDENTITY_TEST";
+        let Ok(profile) = std::env::var(CHILD) else {
+            for profile in ["shared-directory", "per-service-scoped"] {
+                let status = std::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", "resolver_startup_controls::native_service_identity_loads_existing_key_without_ipc", "--nocapture"])
+                    .env(CHILD, profile)
+                    .env("HYPRSTREAM_SECRETS_PROFILE", profile)
+                    .env_remove("HYPRSTREAM__SECRETS__PATH")
+                    .env_remove("HYPRSTREAM__SIGNING_KEY")
+                    .status()?;
+                anyhow::ensure!(status.success(), "isolated {profile} identity regression failed");
+            }
+            return Ok(());
+        };
+        let root = tempfile::tempdir()?;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        for (service, seed) in [("policy", 31u8), ("model", 32u8), ("registry", 33u8)] {
+            let secrets = root.path().join(format!("{service}-credentials"));
+            std::fs::create_dir_all(secrets.join(service))?;
+            let key_path = if service == "policy" || profile == "per-service-scoped" {
+                // A misleading service subdirectory must not replace a scoped
+                // identity, especially Policy's canonical flat key.
+                std::fs::write(secrets.join(service).join("signing-key"), [99u8; 32])?;
+                secrets.join("signing-key")
+            } else {
+                // A retained root/Policy key must not become a native Model or
+                // Registry process identity merely because --ipc is absent.
+                std::fs::write(secrets.join("signing-key"), [31u8; 32])?;
+                secrets.join(service).join("signing-key")
+            };
+            std::fs::write(&key_path, [seed; 32])?;
+            let mut configured = super::HyprConfig::default();
+            configured.quic.native_network_profile = hyprstream_core::config::NativeNetworkProfile::NetworkIrohRequired;
+            configured.secrets.path = Some(secrets.clone());
+            configured.storage.models_dir = root.path().join(format!("{service}-models"));
+            let config_path = root.path().join(format!("{service}.toml"));
+            configured.to_file(&config_path)?;
+            let matches = super::build_cli().try_get_matches_from([
+                "hyprstream", "--config", config_path.to_str().expect("temporary UTF-8 path"),
+                "service", "start", service, "--foreground",
+            ])?;
+            let config = super::load_config(matches.get_one::<std::path::PathBuf>("config").map(std::path::PathBuf::as_path))?;
+            let selected = super::native_service_process_name(&matches, &config)?;
+            assert_eq!(selected.as_deref(), Some(service));
+            let key = runtime.block_on(super::load_process_signing_key(&config, selected.as_deref()))?;
+            assert_eq!(key.to_bytes(), [seed; 32]);
+            let ctx = super::ServiceContext::new(key.clone(), key.verifying_key(), false, config.models_dir().clone())
+                .with_service_key(service, key.clone());
+            assert_eq!(ctx.signing_key().verifying_key(), key.verifying_key());
+            assert_eq!(ctx.service_signing_key(service).verifying_key(), key.verifying_key());
+            assert!(!config.models_dir().join(".registry/keys").exists(), "native startup must not materialize a CLI/root key");
+            std::fs::remove_file(&key_path)?;
+            assert!(runtime.block_on(super::load_process_signing_key(&config, selected.as_deref())).is_err());
+            assert!(!key_path.exists(), "missing provisioned key must not be regenerated");
+            std::fs::write(&key_path, [seed; 31])?;
+            assert!(runtime.block_on(super::load_process_signing_key(&config, selected.as_deref())).is_err());
+            assert_eq!(std::fs::read(&key_path)?, vec![seed; 31], "malformed key must not be repaired during startup");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dedicated_service_containment_is_independent_of_network_profile() -> anyhow::Result<()> {
+        use hyprstream_core::config::NativeNetworkProfile;
+        let mut config = super::HyprConfig::default();
+        config.account.http = Some(hyprstream_core::account::AccountHttpConfig {
+            host: "::1".to_owned(),
+            port: 8443,
+            tls_cert: "unused.pem".into(),
+            tls_key: "unused.key".into(),
+        });
+        for profile in [NativeNetworkProfile::Compatibility, NativeNetworkProfile::NetworkIrohRequired] {
+            config.quic.native_network_profile = profile;
+            for argv in [
+                vec!["hyprstream", "service", "start", "oauth", "--foreground"],
+                vec!["hyprstream", "service", "start", "--foreground", "--services", "oauth"],
+                vec!["hyprstream", "service", "start", "--standalone"],
+            ] {
+                config.services.startup = vec!["oauth".into()];
+                let matches = super::build_cli().try_get_matches_from(argv)?;
+                let service = super::dedicated_service_process_name(&matches, &config)?
+                    .expect("a single OAuth foreground service has process containment");
+                assert_eq!(service, "oauth");
+                let key = super::SigningKey::from_bytes(&[9; 32]);
+                let context = super::ServiceContext::new(
+                    key.clone(), key.verifying_key(), false, "/unused".into(),
+                ).with_dedicated_process_service(service);
+                assert!(context.is_dedicated_process_for("oauth"));
+                assert!(!context.is_dedicated_process_for("registry"));
+                assert_eq!(
+                    super::native_service_process_name(&matches, &config)?.is_some(),
+                    config.quic.iroh_required(),
+                    "containment must not change compatibility signing-key selection",
+                );
+            }
+            config.services.startup = vec!["oauth".into(), "registry".into()];
+            for argv in [
+                vec!["hyprstream", "service", "start", "oauth"],
+                vec!["hyprstream", "service", "start", "--standalone"],
+                vec!["hyprstream", "service", "start", "--foreground", "--services", "oauth,registry"],
+                vec!["hyprstream", "service", "status"],
+            ] {
+                let matches = super::build_cli().try_get_matches_from(argv)?;
+                assert_eq!(super::dedicated_service_process_name(&matches, &config)?, None);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_service_identity_rejects_multi_and_selects_single_service_list() -> anyhow::Result<()> {
+        let mut config = super::HyprConfig::default();
+        config.quic.native_network_profile = hyprstream_core::config::NativeNetworkProfile::NetworkIrohRequired;
+        let single = super::build_cli().try_get_matches_from([
+            "hyprstream", "service", "start", "--foreground", "--services", "model",
+        ])?;
+        assert_eq!(super::native_service_process_name(&single, &config)?.as_deref(), Some("model"));
+        let multi = super::build_cli().try_get_matches_from([
+            "hyprstream", "service", "start", "--foreground", "--services", "model,registry",
+        ])?;
+        assert!(super::native_service_process_name(&multi, &config).is_err());
+        let standalone = super::build_cli().try_get_matches_from([
+            "hyprstream", "service", "start", "--standalone",
+        ])?;
+        config.services.startup = vec!["model".into(), "registry".into()];
+        assert!(super::native_service_process_name(&standalone, &config).is_err());
+        config.quic.native_network_profile = hyprstream_core::config::NativeNetworkProfile::Compatibility;
+        assert_eq!(super::native_service_process_name(&multi, &config)?, None);
+        assert_eq!(super::native_service_process_name(&single, &config)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn native_service_identity_seeds_discovery_from_loaded_config() -> anyhow::Result<()> {
+        const CHILD: &str = "HYPRSTREAM_NATIVE_DISCOVERY_SEED_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "resolver_startup_controls::native_service_identity_seeds_discovery_from_loaded_config",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("HYPRSTREAM__SECRETS__PATH")
+                .env_remove("HYPRSTREAM_SECRETS_PROFILE")
+                .status()?;
+            anyhow::ensure!(status.success(), "isolated discovery seeding regression failed");
+            return Ok(());
+        }
+
+        let root = tempfile::tempdir()?;
+        let xdg_config_home = root.path().join("xdg-config");
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+
+        // Keep a different, valid bootstrap file at the default location so
+        // this catches accidental re-resolution through HyprConfig::load().
+        let default_secrets = xdg_config_home.join("hyprstream/credentials");
+        let default_key = ed25519_dalek::SigningKey::from_bytes(&[91u8; 32]);
+        let mut default_entries = std::collections::HashMap::new();
+        default_entries.insert(
+            "discovery".to_owned(),
+            hyprstream_core::auth::identity_store::BootstrapPubkey::for_service_key(
+                &default_key,
+            )?,
+        );
+        hyprstream_core::auth::identity_store::write_bootstrap_pubkeys_hybrid(
+            &default_secrets,
+            &default_entries,
+        )?;
+
+        let custom_secrets = root.path().join("custom-credentials");
+        let custom_key = ed25519_dalek::SigningKey::from_bytes(&[92u8; 32]);
+        let mut custom_entries = std::collections::HashMap::new();
+        custom_entries.insert(
+            "discovery".to_owned(),
+            hyprstream_core::auth::identity_store::BootstrapPubkey::for_service_key(
+                &custom_key,
+            )?,
+        );
+        hyprstream_core::auth::identity_store::write_bootstrap_pubkeys_hybrid(
+            &custom_secrets,
+            &custom_entries,
+        )?;
+
+        let mut config = super::HyprConfig::default();
+        config.secrets.path = Some(custom_secrets);
+        let selected = super::resolve_service_vk("discovery", Some(&config))
+            .expect("configured bootstrap-pubkeys must seed discovery");
+        assert_eq!(selected, custom_key.verifying_key());
+        assert_ne!(selected, default_key.verifying_key());
+        assert_eq!(
+            hyprstream_service::global_trust_store().resolve_one("discovery"),
+            Some(custom_key.verifying_key()),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn readonly_roster_cli_requires_services_and_has_no_mutation_options() {
+        let matches = super::build_cli().try_get_matches_from([
+            "hyprstream", "pds", "inspect-services", "--service", "model,event",
+        ]).expect("read-only roster CLI");
+        let inspect = matches.subcommand_matches("pds").expect("pds")
+            .subcommand_matches("inspect-services").expect("inspect");
+        assert_eq!(inspect.get_many::<String>("service").expect("services")
+            .map(String::as_str).collect::<Vec<_>>(), vec!["model", "event"]);
+        for args in [
+            vec!["hyprstream", "pds", "inspect-services"],
+            vec!["hyprstream", "pds", "inspect-services", "--service", "model", "--valid-for-seconds", "86400"],
+            vec!["hyprstream", "pds", "inspect-services", "--service", "model", "--roster-export", "out.json"],
+        ] { assert!(super::build_cli().try_get_matches_from(args).is_err()); }
+    }
+
+    fn unavailable_policy_publication() -> anyhow::Error {
+        hyprstream_rpc::transport_traits::PreDispatchTransportError::new(
+            hyprstream_rpc::transport::lazy_iroh::IrohPeerUnavailable::ConnectTimeout.into(),
+        ).into()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn policy_initial_publication_retries_only_typed_availability_and_reprojects() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mut projections = 0;
+        let start = tokio::time::Instant::now();
+        super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), || {
+            projections += 1;
+            let generation = projections;
+            async move {
+                if generation < 3 { Err(unavailable_policy_publication()) } else { Ok(()) }
+            }
+        }).await.expect("late Discovery should allow Policy to publish");
+        assert_eq!(projections, 3, "every retry must request fresh authority material");
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn policy_initial_publication_permanent_error_after_availability_is_terminal() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        // These are intentionally untyped security/projection errors. Even
+        // availability-looking text must never select the retry path.
+        for terminal in ["expired current authority", "revoked service JWT", "iroh connect timed out"] {
+            let mut attempts = 0;
+            let error = super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), || {
+                attempts += 1;
+                let first = attempts == 1;
+                async move {
+                    if first { Err(unavailable_policy_publication()) } else { anyhow::bail!(terminal) }
+                }
+            }).await.expect_err("security failures must be terminal");
+            assert_eq!(error.to_string(), terminal);
+            assert_eq!(attempts, 2);
+        }
+        let mut attempts = 0;
+        let error = super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), || {
+            attempts += 1;
+            async {
+                Err(hyprstream_rpc::transport_traits::PreDispatchTransportError::new(
+                    anyhow::anyhow!("missing Iroh client endpoint"),
+                ).into())
+            }
+        }).await.expect_err("pre-dispatch alone is not an availability proof");
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("missing Iroh client endpoint"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn policy_initial_publication_deadline_bounds_retries_and_inflight_call() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let start = tokio::time::Instant::now();
+        let error = super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(2), || async {
+            Err(unavailable_policy_publication())
+        }).await.expect_err("absent Discovery cannot keep startup pending forever");
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
+        let start = tokio::time::Instant::now();
+        let error = super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(2), std::future::pending).await
+            .expect_err("deadline also interrupts a stalled RPC");
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn policy_initial_publication_cancellation_precedes_success() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let mut called = false;
+        super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), || {
+            called = true;
+            async { Ok(()) }
+        }).await.expect_err("cancelled startup cannot publish or become ready");
+        assert!(!called);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancel = cancellation.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            cancel.cancel();
+        });
+        super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), std::future::pending).await
+            .expect_err("shutdown interrupts an in-flight publication");
+        cancel_task.await.expect("canceller");
     }
 
     #[test]
@@ -4813,5 +5383,290 @@ mod native_announcement_wiring {
         assert!(error.contains("fresh checkpoint unavailable"));
         assert!(!observed.load(std::sync::atomic::Ordering::SeqCst),
             "failed authority projection must never publish stale reach");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod native_launcher {
+    //! Causal coverage for the direct child launch path (#1585): the produced
+    //! child invocation must load the operator's explicit custom config
+    //! (relative path with spaces included), select the provisioned native
+    //! identity — not defaults — through the real parser/identity path, and
+    //! report readiness only through the authenticated notification boundary.
+
+    use super::*;
+    use hyprstream_core::cli::service_handlers::direct_child_process_config;
+    use std::path::Path;
+
+    const CAUSAL_CHILD: &str = "HYPRSTREAM_LAUNCHER_CAUSAL_CHILD";
+    const CAUSAL_MODE: &str = "HYPRSTREAM_LAUNCHER_CAUSAL_MODE";
+    const CAUSAL_ARGV: &str = "HYPRSTREAM_LAUNCHER_CAUSAL_ARGV";
+    const CAUSAL_PROOF: &str = "HYPRSTREAM_LAUNCHER_CAUSAL_PROOF";
+    const CAUSAL_STOP: &str = "HYPRSTREAM_LAUNCHER_CAUSAL_STOP";
+    const SERVICE: &str = "model";
+    const KEY_SEED: u8 = 0x5A;
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_parser_loads_non_utf8_config_path_without_changing_bytes() -> anyhow::Result<()> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let root = tempfile::tempdir()?;
+        let config_path = root
+            .path()
+            .join(std::ffi::OsString::from_vec(b"parent-\xff.toml".to_vec()));
+        HyprConfig::default().to_file(&config_path)?;
+        let canonical = std::fs::canonicalize(&config_path)?;
+        assert!(canonical.to_str().is_none(), "fixture path must be non-UTF-8");
+
+        let matches = build_cli().try_get_matches_from([
+            std::ffi::OsString::from("hyprstream"),
+            std::ffi::OsString::from("--config"),
+            canonical.as_os_str().to_owned(),
+        ])?;
+        let parsed = matches
+            .get_one::<std::path::PathBuf>("config")
+            .context("config PathBuf parsed by clap")?;
+        assert_eq!(
+            parsed.as_os_str().as_bytes(),
+            canonical.as_os_str().as_bytes(),
+            "clap must preserve the explicit selector byte for byte"
+        );
+        let config = load_config(Some(parsed))?;
+        config.validate()?;
+        Ok(())
+    }
+
+    fn provision_custom_config(
+        root: &tempfile::TempDir,
+        seed: u8,
+        with_key: bool,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let secrets = root.path().join("custom credentials");
+        if with_key {
+            std::fs::create_dir_all(secrets.join(SERVICE))?;
+            std::fs::write(secrets.join(SERVICE).join("signing-key"), [seed; 32])?;
+        }
+        let mut configured = HyprConfig::default();
+        configured.quic.native_network_profile =
+            hyprstream_core::config::NativeNetworkProfile::NetworkIrohRequired;
+        configured.secrets.path = Some(secrets);
+        configured.storage.models_dir = root.path().join("custom-models");
+        // A relative path containing spaces, relative to the launch directory.
+        let launch_dir = root.path().join("launch dir");
+        let config_dir = launch_dir.join("my configs");
+        std::fs::create_dir_all(&config_dir)?;
+        let config_path = config_dir.join("custom.toml");
+        configured.to_file(&config_path)?;
+        Ok(config_path)
+    }
+
+    async fn launcher_child() -> anyhow::Result<()> {
+        let mode = std::env::var(CAUSAL_MODE).unwrap_or_default();
+        // The exact argv the launcher helper produced for the real binary.
+        let args: Vec<String> = serde_json::from_str(&std::env::var(CAUSAL_ARGV)?)?;
+        let matches = build_cli().try_get_matches_from(
+            std::iter::once("hyprstream".to_owned()).chain(args),
+        )?;
+        let config = load_config(
+            matches
+                .get_one::<std::path::PathBuf>("config")
+                .map(std::path::PathBuf::as_path),
+        )?;
+        config.validate().context("child configuration validation")?;
+        let _ = hyprstream_core::config::install_pinned_config(config.clone());
+
+        let selected = native_service_process_name(&matches, &config)?;
+        anyhow::ensure!(
+            selected.as_deref() == Some(SERVICE),
+            "child selected {selected:?} instead of the configured native service"
+        );
+        if mode == "missing-key" {
+            // Negative control: the provisioned key is absent, so the real
+            // required-native identity path must refuse — never generate.
+            let outcome = load_process_signing_key(&config, selected.as_deref()).await;
+            anyhow::ensure!(
+                outcome.is_err(),
+                "missing provisioned key must fail required-native startup"
+            );
+            anyhow::bail!("missing-key control refused startup as required");
+        }
+
+        let key = load_process_signing_key(&config, selected.as_deref()).await?;
+        // Proof carries the PUBLIC verifying key only — never private material.
+        let proof = std::env::var(CAUSAL_PROOF)?;
+        std::fs::write(&proof, key.verifying_key().to_bytes())?;
+        // Authentic readiness: only after the config/identity assertions.
+        hyprstream_rpc::notify::ready()?;
+        // Stay alive so the supervisor observes a genuinely RUNNING ready
+        // child (its post-READY liveness recheck would otherwise race our
+        // exit), and exit only on the parent's controlled stop signal.
+        let stop_file = std::path::PathBuf::from(std::env::var(CAUSAL_STOP)?);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !stop_file.exists() {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("supervisor stop signal never arrived");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Ok(())
+    }
+
+    async fn spawn_causal_child(
+        supervisor: &hyprstream_service::ProcessSpawner,
+        launch_args: &[std::ffi::OsString],
+        mode: &str,
+        proof: &Path,
+        stop_file: &Path,
+        working_dir: &Path,
+        child_instance: &str,
+    ) -> anyhow::Result<
+        Result<hyprstream_service::SpawnedProcess, hyprstream_rpc::error::RpcError>,
+    > {
+        let exe = std::env::current_exe()?;
+        // Unique supervisor name: PID artifacts land under a test-owned
+        // namespace, never the shared `model.pid` of a real deployment.
+        let serialized_args: Vec<&str> = launch_args
+            .iter()
+            .map(|arg| {
+                arg.to_str()
+                    .context("UTF-8 fixture argument for launcher causal-test envelope")
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let mut child = hyprstream_service::ProcessConfig::new(child_instance, &exe)
+            .args([
+                "--exact",
+                "native_launcher::launcher_child_loads_explicit_config_and_provisioned_identity",
+                "--nocapture",
+            ])
+            .env(CAUSAL_CHILD, "1")
+            .env(CAUSAL_MODE, mode)
+            .env(CAUSAL_ARGV, serde_json::to_string(&serialized_args)?)
+            .env(CAUSAL_PROOF, proof.display().to_string())
+            .env(CAUSAL_STOP, stop_file.display().to_string())
+            // Deterministic identity layout, isolated runtime namespace.
+            .env("HYPRSTREAM_SECRETS_PROFILE", "shared-directory")
+            .env("HYPRSTREAM_INSTANCE", child_instance)
+            .working_dir(working_dir);
+        child.readiness = hyprstream_service::ProcessReadiness::Notify {
+            timeout: std::time::Duration::from_secs(30),
+        };
+        Ok(supervisor.spawn(child).await)
+    }
+
+    #[tokio::test]
+    async fn launcher_child_loads_explicit_config_and_provisioned_identity() -> anyhow::Result<()> {
+        if std::env::var_os(CAUSAL_CHILD).is_some() {
+            return launcher_child().await;
+        }
+
+        let root = tempfile::tempdir()?;
+        let config_path = provision_custom_config(&root, KEY_SEED, true)?;
+        let canonical = std::fs::canonicalize(&config_path)?;
+        let expected_vk = ed25519_dalek::SigningKey::from_bytes(&[KEY_SEED; 32])
+            .verifying_key()
+            .to_bytes();
+
+        // The exact invocation the launcher builds for the real binary.
+        let plan = direct_child_process_config(
+            SERVICE,
+            true,
+            Some(&canonical),
+            Path::new("hyprstream"),
+        )?;
+        let launch_args = plan.args.clone();
+        assert!(
+            !launch_args.iter().any(|arg| arg == "--ipc"),
+            "required-native child plan must contain no service IPC argument"
+        );
+        assert!(
+            launch_args.windows(2).any(|pair| pair[0] == "--config"
+                && pair[1] == canonical.to_str().expect("utf-8 canonical path")),
+            "canonical absolute config path must be forwarded verbatim"
+        );
+
+        // Child runs from a DIFFERENT working directory than the launcher's
+        // config-relative layout: only the canonical path makes the relative
+        // selector meaningful across the spawner cwd.
+        let proof = root.path().join("proof.vk");
+        let stop_file = root.path().join("stop");
+        let spawner = hyprstream_service::ProcessSpawner::standalone();
+        let supervisor = "launcher-causal-happy";
+        let process = spawn_causal_child(
+            &spawner,
+            &launch_args,
+            "happy",
+            &proof,
+            &stop_file,
+            root.path(),
+            supervisor,
+        )
+        .await?
+        .expect("ready child proves config load, identity selection, and notify barrier");
+        let observed = std::fs::read(&proof)?;
+        assert_eq!(observed, expected_vk, "child selected the provisioned signer");
+        // The READY child is genuinely running (its notification was not a
+        // last-gasp message), with its PID file published under the unique
+        // supervisor name.
+        assert!(
+            spawner.is_running(&process).await?,
+            "the ready child must still be alive after the spawn reports success"
+        );
+        assert!(
+            hyprstream_rpc::paths::service_pid_file(supervisor).exists(),
+            "a ready child publishes its PID file"
+        );
+        // Controlled shutdown: signal stop, wait for the child's own exit,
+        // then have the SAME supervisor stop reap it and remove the PID
+        // artifact — no manual deletion, no second backend.
+        std::fs::write(&stop_file, b"stop")?;
+        let stopped = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while spawner.is_running(&process).await? {
+            if std::time::Instant::now() >= stopped {
+                anyhow::bail!("child did not exit after the controlled stop signal");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        spawner.stop(&process).await?;
+        assert!(!spawner.is_running(&process).await?);
+        assert!(
+            !hyprstream_rpc::paths::service_pid_file(supervisor).exists(),
+            "supervised stop must remove the published PID file"
+        );
+
+        // Negative control: absent provisioned key fails the launch honestly.
+        let missing_root = tempfile::tempdir()?;
+        let missing_config = provision_custom_config(&missing_root, KEY_SEED, false)?;
+        let missing_canonical = std::fs::canonicalize(&missing_config)?;
+        let missing_plan = direct_child_process_config(
+            SERVICE,
+            true,
+            Some(&missing_canonical),
+            Path::new("hyprstream"),
+        )?;
+        let missing_spawner = hyprstream_service::ProcessSpawner::standalone();
+        let missing_supervisor = "launcher-causal-missing";
+        let missing_outcome = spawn_causal_child(
+            &missing_spawner,
+            &missing_plan.args,
+            "missing-key",
+            &missing_root.path().join("unused.vk"),
+            &missing_root.path().join("stop"),
+            missing_root.path(),
+            missing_supervisor,
+        )
+        .await?;
+        let error = missing_outcome
+            .expect_err("launch must fail when the provisioned key is absent");
+        assert!(
+            error.to_string().contains("exited during startup"),
+            "child startup failure must propagate, got: {error}"
+        );
+        assert!(
+            !hyprstream_rpc::paths::service_pid_file(missing_supervisor).exists(),
+            "a never-ready child must not publish a PID file"
+        );
+        Ok(())
     }
 }

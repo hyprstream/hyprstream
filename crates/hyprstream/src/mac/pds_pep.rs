@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use hyprstream_pds::ATPROTO_SIGNING_KEY_FILE;
 use hyprstream_pds_service::{
     AccountRecordReadAuthorizer, OAUTH_ACCOUNT_RESOLVER_SUBJECT, PDS_ACCOUNTS_DIRECTORY,
-    PDS_ACCOUNT_RECORD_FILE,
+    PDS_ACCOUNT_DID_DOCUMENT_FILE, PDS_ACCOUNT_DID_LOG_FILE, PDS_ACCOUNT_RECORD_FILE,
 };
 use hyprstream_rpc::auth::mac::{
     Assurance, CompartmentSet, Level, MacDecision, MacDenyReason, ObjectLabelResolver, ObjectRef,
@@ -63,11 +63,30 @@ impl ObjectLabelResolver for PdsAccountObjectLabelResolver {
         };
         match components {
             ["pds"] => Some(pds_account_label()),
+            ["pds", tenant] if valid_tenant_component(tenant) => Some(pds_account_label()),
+            ["pds", tenant, accounts]
+                if valid_tenant_component(tenant) && *accounts == PDS_ACCOUNTS_DIRECTORY =>
+            {
+                Some(pds_account_label())
+            }
+            ["pds", tenant, accounts, account]
+                if valid_tenant_component(tenant)
+                    && *accounts == PDS_ACCOUNTS_DIRECTORY
+                    && valid_account_component(account) =>
+            {
+                Some(pds_account_label())
+            }
             ["pds", tenant, accounts, account, file]
                 if valid_tenant_component(tenant)
                     && *accounts == PDS_ACCOUNTS_DIRECTORY
                     && valid_account_component(account)
-                    && matches!(*file, PDS_ACCOUNT_RECORD_FILE | ATPROTO_SIGNING_KEY_FILE) =>
+                    && matches!(
+                        *file,
+                        PDS_ACCOUNT_RECORD_FILE
+                            | ATPROTO_SIGNING_KEY_FILE
+                            | PDS_ACCOUNT_DID_DOCUMENT_FILE
+                            | PDS_ACCOUNT_DID_LOG_FILE
+                    ) =>
             {
                 Some(pds_account_label())
             }
@@ -879,12 +898,8 @@ mod tests {
             sink.clone(),
         ));
         let store = AccountRecordStore::new(mount.clone(), authorizer);
-
         let error = store
-            .resolve_tenant_for_hosted_did(
-                &Subject::new(OAUTH_ACCOUNT_RESOLVER_SUBJECT),
-                "did:web:alice.example.test",
-            )
+            .refresh_hosted_did_index(&Subject::new(OAUTH_ACCOUNT_RESOLVER_SUBJECT))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1000,12 +1015,49 @@ mod tests {
             Some(pds_account_label())
         );
         assert_eq!(
+            resolver.resolve(ObjectRef::Path(&["pds", "acme"])),
+            Some(pds_account_label())
+        );
+        assert_eq!(
+            resolver.resolve(ObjectRef::Path(&["pds", "acme", PDS_ACCOUNTS_DIRECTORY,])),
+            Some(pds_account_label())
+        );
+        assert_eq!(
+            resolver.resolve(ObjectRef::Path(&[
+                "pds",
+                "acme",
+                PDS_ACCOUNTS_DIRECTORY,
+                "alice",
+            ])),
+            Some(pds_account_label())
+        );
+        assert_eq!(
             resolver.resolve(ObjectRef::Path(&[
                 "pds",
                 "acme",
                 PDS_ACCOUNTS_DIRECTORY,
                 "alice",
                 PDS_ACCOUNT_RECORD_FILE,
+            ])),
+            Some(pds_account_label())
+        );
+        assert_eq!(
+            resolver.resolve(ObjectRef::Path(&[
+                "pds",
+                "acme",
+                PDS_ACCOUNTS_DIRECTORY,
+                "alice",
+                PDS_ACCOUNT_DID_DOCUMENT_FILE,
+            ])),
+            Some(pds_account_label())
+        );
+        assert_eq!(
+            resolver.resolve(ObjectRef::Path(&[
+                "pds",
+                "acme",
+                PDS_ACCOUNTS_DIRECTORY,
+                "alice",
+                PDS_ACCOUNT_DID_LOG_FILE,
             ])),
             Some(pds_account_label())
         );

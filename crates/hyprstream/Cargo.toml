@@ -106,6 +106,7 @@ prost.workspace = true
 rcgen.workspace = true  # Self-signed TLS cert generation for QUIC
 rustls.workspace = true  # TLS runtime (ring crypto provider for axum-server)
 rustls-pemfile.workspace = true  # PEM file parsing for TLS certs
+x509-parser.workspace = true
 rustls-acme.workspace = true  # ACME (Let's Encrypt / step-ca) automatic cert provisioning
 web-transport-quinn.workspace = true
 zeroize.workspace = true  # Zeroing private key material on drop

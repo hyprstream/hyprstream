@@ -11,6 +11,10 @@ mod network_bootstrap_tests;
 #[path = "event_network_bootstrap_tests.rs"]
 mod event_network_bootstrap_tests;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "moql_checkpoint_admission_tests.rs"]
+mod moql_checkpoint_admission_tests;
+
 use async_trait::async_trait;
 use hyprstream_rpc::browser_provisioning::{
     BrowserCarrierProfile, BrowserCurrentnessVerifier, BrowserProvisioningDocument,

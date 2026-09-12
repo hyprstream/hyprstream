@@ -505,6 +505,9 @@ pub struct ServiceContext {
     /// Identity provider for purpose-keyed signing
     identity_provider: Arc<hyprstream_rpc::node_identity::NodeIdentityProvider>,
 
+    /// Launcher-proven single service hosted by this process; never derived from transport.
+    dedicated_process_service: Option<String>,
+
     /// Whether running in IPC mode (vs inproc)
     ipc: bool,
 
@@ -557,6 +560,13 @@ pub struct ServiceContext {
     ///
     /// In multi-process mode, loaded from the `ca-mldsa-pubkey` credential.
     ca_ml_dsa_verifying_key: Option<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>,
+
+    /// Explicitly resolved credentials/secrets directory — the location the
+    /// loading process actually selected (honoring `--config [secrets].path`
+    /// and the `HYPRSTREAM__SECRETS__PATH` override). `None` lets factory
+    /// code fall back to the config-free resolver, preserving compatibility
+    /// for constructors that never carried a config handle.
+    secrets_dir: Option<std::path::PathBuf>,
 }
 
 /// Owned callback joining carrier binding to the signed announcement lifecycle.
@@ -609,6 +619,7 @@ impl ServiceContext {
             signing_key,
             verifying_key,
             identity_provider,
+            dedicated_process_service: None,
             ipc,
             models_dir,
             quic_shared: None,
@@ -623,7 +634,38 @@ impl ServiceContext {
                 std::sync::Arc::new(std::sync::RwLock::new(Vec::new()))
             },
             ca_ml_dsa_verifying_key: None,
+            secrets_dir: None,
         }
+    }
+
+    /// The launcher may set this only after enforcing one service per process.
+    /// It authorizes that service to terminate the process on an unjoinable worker.
+    pub fn with_dedicated_process_service(mut self, service: String) -> Self {
+        self.dedicated_process_service = Some(service);
+        self
+    }
+
+    pub fn is_dedicated_process_for(&self, service: &str) -> bool {
+        self.dedicated_process_service.as_deref() == Some(service)
+    }
+
+    /// Carry the explicitly resolved credentials directory into factories.
+    ///
+    /// Startup resolves `[secrets].path` from the loaded config and reads the
+    /// retained signing key and service JWT from that directory; factory-time
+    /// helpers (key registration, JWT renewal) have no config handle of their
+    /// own and must not re-resolve from env/defaults, or a custom
+    /// `--config [secrets].path` deployment would work at startup and then
+    /// renew against the wrong directory.
+    pub fn with_secrets_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.secrets_dir = Some(dir);
+        self
+    }
+
+    /// The explicitly resolved credentials directory, when the constructing
+    /// process carried one.
+    pub fn secrets_dir(&self) -> Option<&std::path::Path> {
+        self.secrets_dir.as_deref()
     }
 
     /// Set the shared ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
@@ -1838,5 +1880,21 @@ mod tests {
             .status()
             .expect("authority mutation subprocess");
         assert!(status.success(), "authority mutation subprocess failed");
+    }
+}
+
+#[cfg(test)]
+mod dedicated_process_tests {
+    use super::*;
+
+    #[test]
+    fn process_containment_is_explicit_and_service_specific() {
+        let key = SigningKey::from_bytes(&[9; 32]);
+        // IPC transport alone must never authorize killing the process.
+        let context = ServiceContext::new(key.clone(), key.verifying_key(), true, "models".into());
+        assert!(!context.is_dedicated_process_for("oauth"));
+        let context = context.with_dedicated_process_service("oauth".to_owned());
+        assert!(context.is_dedicated_process_for("oauth"));
+        assert!(!context.is_dedicated_process_for("model"));
     }
 }
