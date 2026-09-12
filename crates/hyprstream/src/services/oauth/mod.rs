@@ -2469,7 +2469,7 @@ mod tests {
             public_repo_dir.path(),
         )?);
         let public_repo_writer = Arc::new(crate::services::public_repo::PublicRepoWriter::new(
-            public_repo_store,
+            Arc::clone(&public_repo_store),
             MAPPED_DID,
             atproto_signing_key.clone(),
             Arc::new(DirectSelfPublicationAuthorizer),
@@ -3067,6 +3067,14 @@ mod tests {
             create_record_json["value"]["text"],
             "native direct-self conformance"
         );
+        let public_snapshot = public_repo_store
+            .snapshot(MAPPED_DID)?
+            .ok_or_else(|| anyhow::anyhow!("direct-self publication was not persisted"))?;
+        let record_key = hyprstream_pds::atproto_cbor::AtprotoRecordKey::new("3jzfcijpj2z2a")?;
+        assert!(public_snapshot.records.contains_key(&(
+            "app.bsky.feed.post".to_owned(),
+            record_key,
+        )));
 
         // The protected hosted-PDS route consumes the standard DPoP-bound
         // OAuth access token and signs the exact #1354 method/audience with
