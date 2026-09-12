@@ -1175,7 +1175,7 @@ pub async fn create_record(
             principal: user.user,
             did: repo.to_owned(),
             collection: collection.to_owned(),
-            rkey,
+            rkey: rkey.into(),
             value: record,
             expected_prev: None,
         },
