@@ -48,27 +48,31 @@ impl NativeAtprotoSessionResolver {
     /// account zone. Reject ports, paths, percent escapes, extra labels and
     /// case changes instead of normalizing an ambiguous identity.
     fn label_for_did(&self, did: &str) -> Result<Option<String>> {
-        let Some(host) = did.strip_prefix("did:web:") else {
-            return Ok(None);
-        };
-        if host.is_empty()
-            || host != host.to_ascii_lowercase()
-            || host.contains([':', '/', '%'])
-            || !host.is_ascii()
-        {
-            return Err(anyhow!("invalid host-form hosted account DID"));
-        }
-        let suffix = format!(".{}", self.zone.apex());
-        let Some(label) = host.strip_suffix(&suffix) else {
-            return Ok(None);
-        };
-        if label.is_empty() || label.contains('.') || self.zone.host_for_label(label)? != host {
-            return Err(anyhow!(
-                "hosted account DID is outside the configured account zone"
-            ));
-        }
-        Ok(Some(label.to_owned()))
+        hosted_label_for_did(&self.zone, did)
     }
+}
+
+fn hosted_label_for_did(zone: &AccountZone, did: &str) -> Result<Option<String>> {
+    let Some(host) = did.strip_prefix("did:web:") else {
+        return Ok(None);
+    };
+    if host.is_empty()
+        || host != host.to_ascii_lowercase()
+        || host.contains([':', '/', '%'])
+        || !host.is_ascii()
+    {
+        return Err(anyhow!("invalid host-form hosted account DID"));
+    }
+    let suffix = format!(".{}", zone.apex());
+    let Some(label) = host.strip_suffix(&suffix) else {
+        return Ok(None);
+    };
+    if label.is_empty() || label.contains('.') || zone.host_for_label(label)? != host {
+        return Err(anyhow!(
+            "hosted account DID is outside the configured account zone"
+        ));
+    }
+    Ok(Some(label.to_owned()))
 }
 
 #[async_trait]
@@ -117,36 +121,18 @@ mod tests {
     #[test]
     fn only_exact_single_label_zone_hosts_are_accepted() -> Result<()> {
         let zone = AccountZone::new("accounts.example.test")?;
-        fn label(zone: &AccountZone, did: &str) -> Result<Option<String>> {
-            let Some(host) = did.strip_prefix("did:web:") else {
-                return Ok(None);
-            };
-            if host.is_empty()
-                || host != host.to_ascii_lowercase()
-                || host.contains([':', '/', '%'])
-                || !host.is_ascii()
-            {
-                return Err(anyhow!("invalid host-form hosted account DID"));
-            }
-            let suffix = format!(".{}", zone.apex());
-            let Some(label) = host.strip_suffix(&suffix) else {
-                return Ok(None);
-            };
-            if label.is_empty() || label.contains('.') || zone.host_for_label(label)? != host {
-                return Err(anyhow!(
-                    "hosted account DID is outside the configured account zone"
-                ));
-            }
-            Ok(Some(label.to_owned()))
-        }
         assert_eq!(
-            label(&zone, "did:web:alice.accounts.example.test")?,
+            hosted_label_for_did(&zone, "did:web:alice.accounts.example.test")?,
             Some("alice".to_owned())
         );
-        assert!(label(&zone, "did:web:a.b.accounts.example.test").is_err());
-        assert!(label(&zone, "did:web:alice.accounts.example.test:8443").is_err());
-        assert_eq!(label(&zone, "did:web:other.example.test")?, None);
-        assert_eq!(label(&zone, "did:plc:abc")?, None);
+        assert!(hosted_label_for_did(&zone, "did:web:a.b.accounts.example.test").is_err());
+        assert!(hosted_label_for_did(&zone, "did:web:alice.accounts.example.test:8443").is_err());
+        assert!(hosted_label_for_did(&zone, "did:web:Alice.accounts.example.test").is_err());
+        assert_eq!(
+            hosted_label_for_did(&zone, "did:web:other.example.test")?,
+            None
+        );
+        assert_eq!(hosted_label_for_did(&zone, "did:plc:abc")?, None);
         Ok(())
     }
 }
