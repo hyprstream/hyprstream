@@ -298,10 +298,10 @@ def provenance_paths(repo: Path, corpus: dict[str, Any],
                      mutations: dict[str, str] | None = None) -> list[str]:
     manifests = [str(Path(directory).parent / "Cargo.toml") for directory in OWNER_DIRECTORIES]
     paths = sorted(set(tracked(repo, "*.capnp") + corpus_paths(repo, corpus) + tracked(repo, "build.rs", "**/build.rs")
-                       + typescript_schema_sources(repo, mutations) + [
+                      + typescript_schema_sources(repo, mutations) + [
         "crates/hyprstream/src/cli/schema_cli.rs", "crates/hyprstream/src/services/mcp_service.rs",
         "crates/hyprstream/src/services/factories.rs", "crates/hyprstream-rpc-std/src/vfs_mount.rs",
-        ".github/license-boundary.toml", *manifests,
+        ".github/license-boundary.toml", "tools/check-docs-catalog.py", *manifests,
     ]))
     return [path for path in paths if not deleted(path, mutations)]
 
@@ -327,7 +327,7 @@ def attested_tree_universe(repo: Path, tree: str, corpus: dict[str, Any]) -> set
     manifests = {str(Path(directory).parent / "Cargo.toml") for directory in OWNER_DIRECTORIES}
     fixed = {"crates/hyprstream/src/cli/schema_cli.rs", "crates/hyprstream/src/services/mcp_service.rs",
              "crates/hyprstream/src/services/factories.rs", "crates/hyprstream-rpc-std/src/vfs_mount.rs",
-             ".github/license-boundary.toml", *manifests}
+             ".github/license-boundary.toml", "tools/check-docs-catalog.py", *manifests}
     universe: set[str] = set()
     for path in git(repo, "ls-tree", "-r", "--name-only", tree).splitlines():
         if path.endswith(".capnp") or path.endswith("/build.rs") or path == "build.rs" or path in fixed:
