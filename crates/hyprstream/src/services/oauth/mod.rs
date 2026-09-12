@@ -181,7 +181,8 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     // ── com.atproto XRPC read slice (#1112) ────────────────────────────────
     // Four public read endpoints, conditionally mounted when the operator
     // opts in via `OAuthConfig::xrpc_read_slice`. Session endpoints
-    // (createSession/getSession) are NOT here — they arrive with #1113/#948.
+    // `createSession` remains out of scope; protected `getSession` is mounted
+    // only when the native account resolver is explicitly installed.
     // Route table lives in `xrpc::xrpc_routes()` — single source of truth.
     let public_router = if state.xrpc_read_slice {
         public_router.merge(xrpc::xrpc_routes())
@@ -242,6 +243,11 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         .merge(authority_router)
         .merge(if state.public_repo_writer.is_some() {
             xrpc::xrpc_write_routes()
+        } else {
+            Router::new()
+        })
+        .merge(if state.atproto_session_resolver.is_some() {
+            xrpc::xrpc_session_routes()
         } else {
             Router::new()
         });
