@@ -43,9 +43,16 @@ use crate::services::{
     RegistryService,
 };
 
-/// Load HyprConfig, falling back to default on error.
-fn load_config() -> HyprConfig {
-    HyprConfig::load().unwrap_or_default()
+/// Load HyprConfig, failing closed on error.
+///
+/// A config that cannot be loaded or parsed must NOT silently become the
+/// defaults: backend selection (#1257) keys off `[rds]`, so discarding a
+/// configured RDS binding would flip an RDS-bound node back to the local
+/// RocksDB backend while its AZ peers run Postgres. A missing config file is
+/// not an error (the loader treats it as optional); parse/IO failures are.
+fn load_config() -> anyhow::Result<HyprConfig> {
+    HyprConfig::load()
+        .map_err(|e| anyhow::anyhow!("failed to load hyprstream configuration: {e}"))
 }
 
 /// Get the JWT bound to this service instance's exact signing key.
@@ -97,6 +104,68 @@ pub(crate) fn pds_store_dir(ctx: &ServiceContext) -> anyhow::Result<std::path::P
     Ok(ctx.deployment_data_dir()?.join("pds-store"))
 }
 
+/// Select and open the PDS record store based on the configured backend (#1257).
+///
+/// The records-role binding is resolved from `[rds]` TOML first, then the
+/// role-scoped env vars (`HYPRSTREAM_RECORDS_URL_FILE` /
+/// `HYPRSTREAM_RECORDS_SSLROOTCERT_FILE`), then the shared credentials
+/// directory — see [`crate::config::RdsConfig::resolved_from_env`]. When a
+/// binding resolves (the deployed posture):
+/// - With `pds-postgres` feature: open against shared RDS Multi-AZ Postgres
+///   (FATAL-on-unavailable — never a silent local fallback).
+/// - Without `pds-postgres` feature: FATAL (binary not built for RDS).
+///
+/// When no binding resolves (local/workstation): open the RocksDB
+/// backend at `pds_store_dir(ctx)`.
+///
+/// `readonly` selects the resolver (`true`) vs publisher (`false`) posture.
+/// The D2 invariant (signed bytes verbatim, SQL = projection-free KV) is
+/// enforced by the Postgres backend regardless of this flag.
+fn open_pds_record_store(
+    ctx: &ServiceContext,
+    readonly: bool,
+) -> anyhow::Result<crate::services::discovery::PdsRecordStore> {
+    open_pds_record_store_at(&pds_store_dir(ctx)?, readonly)
+}
+
+/// [`open_pds_record_store`] for callers that hold no `ServiceContext` (the
+/// QUIC startup gate's announcement refresh): the local-backend directory is
+/// passed explicitly and consulted only when no RDS binding resolves.
+fn open_pds_record_store_at(
+    store_dir: &std::path::Path,
+    readonly: bool,
+) -> anyhow::Result<crate::services::discovery::PdsRecordStore> {
+    let rds = load_config()?.rds.resolved_from_env()?;
+    if rds.is_configured() {
+        #[cfg(feature = "pds-postgres")]
+        {
+            tracing::info!(
+                cell_id = %rds.cell_id,
+                "opening PDS record store against shared RDS Postgres ({} mode)",
+                if readonly { "read-only" } else { "read-write" }
+            );
+            return crate::services::discovery::PdsRecordStore::open_postgres(
+                &rds,
+                readonly,
+            );
+        }
+        #[cfg(not(feature = "pds-postgres"))]
+        {
+            anyhow::bail!(
+                "RDS is configured ([rds] section or HYPRSTREAM_RECORDS_URL_FILE) but this \
+                 binary was not built with the `pds-postgres` feature — refusing to silently \
+                 fall back to local RocksDB. Rebuild with --features pds-postgres."
+            );
+        }
+    }
+    // Local RocksDB backend (workstation / dev).
+    if readonly {
+        crate::services::discovery::PdsRecordStore::open_readonly(store_dir)
+    } else {
+        crate::services::discovery::PdsRecordStore::open(store_dir)
+    }
+}
+
 /// The lifecycle state of the checkpointed PDS store, as seen by the QUIC
 /// startup gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +182,11 @@ pub enum PdsBootState {
 }
 
 /// Classify the checkpointed PDS store for the QUIC startup gate.
+///
+/// The store consulted is the CONFIGURED backend (#1257): with an RDS binding
+/// resolved, classification reads the shared Postgres store (the local
+/// directory is never consulted — accepted states and the first-boot marker
+/// live in RDS); otherwise it reads the local RocksDB store.
 ///
 /// This replaces the prior emptiness check, which could not distinguish a
 /// freshly provisioned first-boot store from a steady-state store that lost
@@ -131,10 +205,37 @@ pub enum PdsBootState {
 /// - Any read/decode/signature/consistency failure → `Err` (propagated;
 ///   fail-closed at the checkpoint boundary).
 ///
+/// (In RDS posture the four directory cases above apply to the shared store
+/// instead of the directory: no directory-absence case exists, and the
+/// empty-unmarked case means the shared store lost its data.)
+///
 /// Only [`PdsBootState::FirstBoot`] may enter a QUIC deferral path; every
 /// other outcome either proceeds with checkpointed announcements or fails
 /// startup.
 pub fn classify_pds_store_for_quic(ctx: &ServiceContext) -> anyhow::Result<PdsBootState> {
+    if load_config()?.rds.resolved_from_env()?.is_configured() {
+        // RDS posture: lifecycle evidence lives in the shared store. The
+        // local directory is deliberately NOT consulted — reading a stale or
+        // empty local store here misclassified the deployment.
+        let acceptance_identity = hyprstream_discovery::deployment_registry_verifier()?;
+        let store = open_pds_record_store(ctx, true)?
+            .with_at9p_deployment_verifier(acceptance_identity);
+        // Propagates connection, decode, signature-verification, and
+        // consistency failures as Err — these are NEVER evidence of first boot.
+        let states = store.accepted_at9p_states()?;
+        if !states.is_empty() {
+            return Ok(PdsBootState::Populated);
+        }
+        if store.first_boot_pending()? {
+            return Ok(PdsBootState::FirstBoot);
+        }
+        anyhow::bail!(
+            "the RDS-backed PDS accepted-state store holds no verified accepted \
+             states and no first-boot provisioning marker. This indicates data loss \
+             or corruption, not first boot; refusing to defer QUIC startup. Run \
+             `init-deployment-store` to provision a fresh deployment against RDS."
+        );
+    }
     let store_dir = pds_store_dir(ctx)?;
     if !store_dir.exists() {
         // A missing store is indistinguishable from deletion of security
@@ -189,13 +290,18 @@ fn accepted_state_matches_service(
 
 /// Rebuild one running service's announcement from a fresh checkpoint read
 /// and the latest registered JWT. No stale authority is returned on failure.
+///
+/// The checkpoint read honors the configured records backend (#1257): in RDS
+/// posture it reads the shared Postgres store, so the announcement reflects
+/// cross-AZ accepted states — never an absent or stale local RocksDB.
 pub fn current_native_announcement(
     request: &mut hyprstream_service::NativeAnnouncementRequest,
 ) -> anyhow::Result<hyprstream_discovery::ServiceAnnouncement> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     let verifier = hyprstream_discovery::deployment_registry_verifier()?;
-    let store = crate::services::discovery::PdsRecordStore::open_readonly(
+    let store = open_pds_record_store_at(
         &hyprstream_service::deployment_data_dir()?.join("pds-store"),
+        true,
     )?.with_at9p_deployment_verifier(verifier);
     let now = chrono::Utc::now();
     let state = store.accepted_at9p_state(&request.service_did.to_string(), Some(&now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)))?
@@ -254,7 +360,7 @@ pub fn with_checkpointed_native_announcements(
     service_names: &[String],
 ) -> anyhow::Result<ServiceContext> {
     let acceptance_identity = hyprstream_discovery::deployment_registry_verifier()?;
-    let store = crate::services::discovery::PdsRecordStore::open_readonly(&pds_store_dir(&ctx)?)?
+    let store = open_pds_record_store(&ctx, true)?
         .with_at9p_deployment_verifier(acceptance_identity);
     let states = store.accepted_at9p_states()?;
     // The native-profile flag is installed during authenticated deployment
@@ -686,7 +792,7 @@ fn create_event_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     info!("Creating EventService (moq-lite event bus)");
 
     if !hyprstream_rpc::events::event_authz_installed() {
-        let config = load_config();
+        let config = load_config()?;
         let sk = ctx.service_signing_key("event");
         // Declared MoQ/event track policy (v16 §10 / #1510). The generated
         // dispatch inventory (WS-D / #1505) is the end-state producer of these
@@ -807,7 +913,7 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     info!("Creating LedgerService (Phase-1 local-enforcer, #925)");
 
-    let config = load_config();
+    let config = load_config()?;
     let lcfg = config.ledger.clone();
     if !lcfg.is_enabled() {
         anyhow::bail!(
@@ -1033,7 +1139,7 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         });
     });
 
-    let config = load_config();
+    let config = load_config()?;
     // Bind issuance and revocation horizons by construction: the revocation
     // authority's retention bound derives from every configured issuance
     // maximum (plus one day of clock-skew margin), so an operator raising
@@ -1114,7 +1220,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     // Initialize this process's local moq plane. Idempotent.
     init_local_moq_stream_plane("registry", ctx.iroh_required());
 
-    let config = load_config();
+    let config = load_config()?;
     let sk = ctx.service_signing_key("registry");
 
     // Register this service's verifying key with PolicyService
@@ -1136,11 +1242,18 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     // from the shared `Es256SigningKeyStore` — the same P-256 key
     // `oauth::did_document` publishes as the `#atproto` verification method, so
     // the writer and the published key are one source of truth (classical —
-    // atproto has no PQ variant). Best-effort: any failure here disables PDS
-    // publish with a warning rather than failing the registry. The key lives
+    // atproto has no PQ variant). Failure handling is backend-dependent
+    // (#1257): with an RDS binding resolved the store contract is
+    // FATAL-on-unavailable — construction errors propagate and the registry
+    // refuses to start (the resolver side is already fatal, so degrading the
+    // writer to warn+disable would silently stall record/repo state across
+    // every AZ). With no RDS binding (local/workstation) it stays
+    // best-effort: any failure here disables PDS publish with a warning
+    // rather than failing the registry. The key lives
     // only in the writer's memory — never in the record DB (#910a H1). Paths
     // fail closed rather than fall back to /tmp (H2).
-    let pds_publisher = (|| -> anyhow::Result<crate::services::discovery::PdsPublisher> {
+    let pds_rds_configured = config.rds.resolved_from_env()?.is_configured();
+    let pds_publisher = match (|| -> anyhow::Result<crate::services::discovery::PdsPublisher> {
         let store_dir = pds_store_dir(ctx)?;
         let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
         // C4 (#1170, closes #1123): the publisher resolves the active
@@ -1172,7 +1285,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         );
         let audit_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&audit_ed);
         let store = Arc::new(
-            crate::services::discovery::PdsRecordStore::open(&store_dir)?
+            open_pds_record_store(ctx, false)?
                 .with_at9p_acceptance_identity(acceptance_identity.verifying_key()),
         );
         let alarm_path = store_dir.join("at9p-duplicity.wal");
@@ -1193,9 +1306,20 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
             .with_at9p_state_ingest(at9p_state)
             .with_es256_store(es256_store),
         )
-    })()
-    .map_err(|e| tracing::warn!("PDS publish disabled: {e}"))
-    .ok();
+    })() {
+        Ok(publisher) => Some(publisher),
+        Err(error) if pds_rds_configured => {
+            return Err(error).context(
+                "PDS publisher construction failed while an RDS records backend is \
+                 configured — the store contract is FATAL-on-unavailable; refusing \
+                 to start the registry with PDS publish disabled",
+            );
+        }
+        Err(error) => {
+            tracing::warn!("PDS publish disabled: {error}");
+            None
+        }
+    };
 
     // Create registry service with infrastructure (blocking since we're in sync context)
     let mut registry_service = tokio::task::block_in_place(|| {
@@ -1385,7 +1509,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 
     use crate::services::{ModelService, ModelServiceConfig};
 
-    let config = load_config();
+    let config = load_config()?;
     let sk = ctx.service_signing_key("model");
 
     // Register this service's verifying key with PolicyService
@@ -1454,7 +1578,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 fn create_inference_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating standalone CPU InferenceService");
 
-    let config = load_config();
+    let config = load_config()?;
     config.inference.validate()?;
     config.inference.verify_materialized_oid()?;
 
@@ -1538,7 +1662,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     use hyprstream_workers::image::RafsStore;
     use hyprstream_workers::{resolve_backend, BackendCtx, SandboxBackend, WorkerService};
 
-    let config = load_config();
+    let config = load_config()?;
     let sk = ctx.service_signing_key("worker");
     let worker_quic_port = config.worker.as_ref().and_then(|w| w.quic_port);
     // Operator-selected backend name ("auto" or a registered backend); resolved
@@ -1698,7 +1822,7 @@ fn create_workflow_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
 
     info!("Creating WorkflowService");
 
-    let config = load_config();
+    let config = load_config()?;
     let wcfg = config
         .worker
         .as_ref()
@@ -1811,7 +1935,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     use crate::services::OAIService;
 
     // Load full config for OAI settings
-    let config = load_config();
+    let config = load_config()?;
     let sk = ctx.service_signing_key("oai");
 
     // Register this service's verifying key with PolicyService
@@ -1903,7 +2027,7 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     use crate::server::state::ResourceAuthState;
     use crate::services::{XetService, XetState};
 
-    let config = load_config();
+    let config = load_config()?;
     let sk = ctx.service_signing_key("xet");
 
     // Register this service's verifying key with PolicyService.
@@ -1979,7 +2103,7 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 fn create_at9p_verify_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     use crate::services::At9pVerifyService;
 
-    let config = load_config();
+    let config = load_config()?;
     Ok(Box::new(At9pVerifyService::new(
         config.at9p_verify.clone(),
         config.tls.clone(),
@@ -2001,7 +2125,7 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     use crate::services::FlightService;
 
     // Load full config for Flight settings
-    let config = load_config();
+    let config = load_config()?;
     let sk = ctx.service_signing_key("flight");
 
     // Register this service's verifying key with PolicyService
@@ -2063,7 +2187,7 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 
     use crate::services::OAuthService;
 
-    let config = load_config();
+    let config = load_config()?;
     let sk = ctx.service_signing_key("oauth");
 
     // Register this service's verifying key with PolicyService
@@ -2119,7 +2243,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     info!("Creating McpService");
 
     // Load full config for MCP settings
-    let config = load_config();
+    let config = load_config()?;
 
     // Create McpConfig for the service
     let _oauth_issuer = ctx.oauth_issuer_url().map(str::to_owned);
@@ -2157,6 +2281,12 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let mcp_tls_config = config.tls.clone();
     let mcp_tls_cert = config.mcp.tls_cert.clone();
     let mcp_tls_key = config.mcp.tls_key.clone();
+    // RFC 9728 protected-resource metadata values come from THIS fail-closed
+    // load — reloading the config inside the spawned server task and falling
+    // back to defaults on error would silently discard a configured [rds]
+    // backend (and serve wrong issuer metadata) instead of failing closed.
+    let mcp_resource_url = config.mcp.resource_url();
+    let mcp_oauth_issuer = config.oauth.issuer_url();
     // Use the shared FederationKeySource from ServiceContext if available,
     // otherwise fall back to a locally-constructed resolver from config.
     // The fallback path wires its own PolicyClient so the unified
@@ -2197,9 +2327,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                     StreamableHttpServerConfig::default(),
                 );
             // Add protected resource metadata (RFC 9728) for OAuth discovery
-            let mcp_full_config = crate::config::HyprConfig::load().unwrap_or_default();
-            let mcp_resource_url = mcp_full_config.mcp.resource_url();
-            let mcp_oauth_issuer = mcp_full_config.oauth.issuer_url();
+            // (values captured from the factory's fail-closed config load).
             let www_authenticate = format!(
                 "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
                 mcp_resource_url
@@ -2660,7 +2788,7 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     // we initialize one here. Idempotent — no-op if already set.
     init_local_moq_stream_plane("tui", ctx.iroh_required());
 
-    let config = load_config();
+    let config = load_config()?;
     let tui_config = &config.tui;
     let sk = ctx.service_signing_key("tui");
 
@@ -2703,35 +2831,40 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     Ok(ctx.into_spawnable_quic(tui_service, tui_config.quic_port))
 }
 
-/// Open the PDS record store (#910a) read-only, bootstrapping an empty
-/// RocksDB database at `dir` first if nothing has been published yet.
+/// Open the PDS record store read-only, selecting the backend from config.
 ///
-/// `PdsRecordStore::open_readonly` requires the RocksDB files to already
-/// exist (`create_if_missing(false)`, matching `RocksDbUserStore::open_readonly`),
-/// which is normally true because the registry service (the writer) creates
-/// it. On a fresh install the discovery service may start before any model
-/// has ever been registered — bootstrap by briefly opening read-write (which
-/// creates the DB files) and releasing the handle, then retry read-only.
+/// For the **Postgres** backend (#1257): no bootstrap dance is needed — the
+/// schema migration runs on `connect`, and there is no single-writer lock to
+/// race. Just calls [`open_pds_record_store`] with `readonly = true`.
 ///
-/// When this path creates a fresh empty store it also writes the durable
-/// first-boot RocksDB key, so the QUIC startup gate recognizes it as a
-/// genuine first boot rather than data loss.
+/// For the **RocksDB** backend: bootstraps an empty database at `dir` first if
+/// nothing has been published yet (the registry service creates the DB files;
+/// on a fresh install the discovery service may start before any model has
+/// been registered). When this path creates a fresh empty store it also
+/// writes the durable first-boot RocksDB key, so the QUIC startup gate
+/// recognizes it as a genuine first boot rather than data loss.
 ///
 /// Known limitation: if the registry and discovery services start
 /// concurrently on a brand-new install, both may race to bootstrap the same
 /// directory; one loses the RocksDB lock and its factory call fails, which
 /// the service manager will retry.
 fn open_pds_store_readonly(
-    dir: &std::path::Path,
+    ctx: &ServiceContext,
 ) -> anyhow::Result<crate::services::discovery::PdsRecordStore> {
-    match crate::services::discovery::PdsRecordStore::open_readonly(dir) {
+    let rds = load_config()?.rds.resolved_from_env()?;
+    if rds.is_configured() {
+        // Postgres: no bootstrap dance needed.
+        return open_pds_record_store(ctx, true);
+    }
+    let dir = pds_store_dir(ctx)?;
+    match crate::services::discovery::PdsRecordStore::open_readonly(&dir) {
         Ok(store) => Ok(store),
         Err(orig) => {
             // Bootstrap the DB files by briefly opening read-write, then retry
             // read-only. If bootstrap itself fails (e.g. the writer holds the
             // lock, or the path is corrupt), surface BOTH errors so the real
             // cause is visible rather than masked by the retry (#910a, fable M3).
-            let store = crate::services::discovery::PdsRecordStore::open(dir)
+            let store = crate::services::discovery::PdsRecordStore::open(&dir)
                 .with_context(|| {
                     format!("read-only open failed ({orig}); bootstrap open also failed")
                 })?;
@@ -2742,7 +2875,7 @@ fn open_pds_store_readonly(
             // successful.
             store.mark_first_boot()?;
             drop(store);
-            crate::services::discovery::PdsRecordStore::open_readonly(dir)
+            crate::services::discovery::PdsRecordStore::open_readonly(&dir)
         }
     }
 }
@@ -2759,7 +2892,7 @@ fn open_pds_store_readonly(
 fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating DiscoveryService");
 
-    let config = load_config();
+    let config = load_config()?;
     let sk = ctx.service_signing_key("discovery");
 
     // Register this service's verifying key with PolicyService
@@ -2787,9 +2920,8 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     // registry process signs with its stable service credential, whose public
     // key is anchored in the global service trust store.
     let at9p_acceptance_identity = hyprstream_discovery::deployment_registry_verifier()?;
-    let pds_store_path = pds_store_dir(ctx)?;
     let pds_store = std::sync::Arc::new(
-        open_pds_store_readonly(&pds_store_path)
+        open_pds_store_readonly(ctx)
             .context("failed to open PDS record store (read-only)")?
             .with_at9p_deployment_verifier(at9p_acceptance_identity),
     );
@@ -2948,7 +3080,7 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     use hyprstream_metrics::storage::duckdb::DuckDbBackend;
     use hyprstream_metrics::StorageBackend as _;
 
-    let config = load_config();
+    let config = load_config()?;
     let mc = &config.metrics;
 
     let backend = Arc::new(
@@ -3184,6 +3316,93 @@ mod tests {
             );
         }
         assert!(source.contains("PolicyClient::from_resolver"));
+    }
+
+    /// Slice one top-level item out of a source file: from `marker` to the
+    /// first column-0 item/comment/attribute line that follows it.
+    /// (Owned return, no lifetime parameters: a `'` token desyncs the
+    /// loopback-burndown test-region skipper, which is not a full lexer.)
+    fn top_level_body(source: &str, marker: &str) -> String {
+        let start = source.find(marker).expect("item exists");
+        let rest = &source[start + marker.len()..];
+        let end = [
+            "\nfn ",
+            "\npub fn",
+            "\npub(crate) fn",
+            "\npub enum",
+            "\nenum ",
+            "\n///",
+            "\n//",
+            "\n#[",
+        ]
+        .iter()
+        .filter_map(|needle| rest.find(needle))
+        .min()
+        .unwrap_or(rest.len());
+        rest[..end].to_owned()
+    }
+
+    /// #1257 followup: in RDS posture no production caller may bypass the
+    /// configured records backend with a direct local RocksDB open, and no
+    /// RDS-configured failure may degrade to warn+disable. These source-level
+    /// contract checks pin the exact seams; the functional fail-closed
+    /// behavior is pinned in `cli::deployment_bootstrap` tests.
+    #[test]
+    fn rds_mode_has_no_silent_local_fallback_in_pds_callers() {
+        // Production code only: include_str! would otherwise let these
+        // pattern assertions match this very test module.
+        let source = include_str!("factories.rs");
+        let source = &source[..source.find("\nmod tests").expect("tests module")];
+
+        // QUIC startup gate: resolves the binding and opens the configured
+        // backend in RDS posture before ever touching the local directory.
+        let gate = top_level_body(source, "pub fn classify_pds_store_for_quic(");
+        assert!(
+            gate.contains("resolved_from_env()?"),
+            "the QUIC gate must resolve the records-role binding"
+        );
+        assert!(
+            gate.contains("open_pds_record_store(ctx, true)"),
+            "the QUIC gate must open the configured backend in RDS posture"
+        );
+
+        // Announcement refresh: routes through the backend-selecting helper;
+        // no direct local open remains in the function.
+        let announcement = top_level_body(source, "pub fn current_native_announcement(");
+        assert!(
+            announcement.contains("open_pds_record_store_at("),
+            "announcement refresh must open the configured backend"
+        );
+        assert!(
+            !announcement.contains("PdsRecordStore::open_readonly("),
+            "announcement refresh must not bypass backend selection with a direct local open"
+        );
+
+        // Publisher construction: warn+disable survives only for the local
+        // posture; an RDS-configured failure returns instead of degrading.
+        let registry = top_level_body(source, "fn create_registry_service(");
+        assert!(
+            registry.contains("Err(error) if pds_rds_configured =>"),
+            "publisher construction must fail closed when RDS is configured"
+        );
+        assert!(
+            registry.contains("tracing::warn!(\"PDS publish disabled"),
+            "local posture keeps the documented best-effort warn+disable"
+        );
+
+        // The selecting helper itself: RDS-configured without the feature is
+        // a hard error, and every configured open goes through open_postgres.
+        let helper = top_level_body(source, "fn open_pds_record_store_at(");
+        assert!(helper.contains("resolved_from_env()?"));
+        assert!(helper.contains("PdsRecordStore::open_postgres("));
+        assert!(helper.contains("not built with the `pds-postgres` feature"));
+
+        // Config loading is fail-closed everywhere in this module: no
+        // HyprConfig load may silently discard a configured [rds] section.
+        assert!(
+            !source.contains("Config::load().unwrap_or_default()"),
+            "config load must fail closed, never fall back to defaults"
+        );
     }
 
     #[test]

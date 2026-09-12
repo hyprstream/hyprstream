@@ -228,6 +228,35 @@ def _assert(cond: bool, msg: str) -> None:
         raise AssertionError(msg)
 
 
+def _podman_quoted_script(job_block: str, job: str) -> str:
+    """Return the body of the job's single-quoted `bash -euo pipefail -c '…'` script.
+
+    Fails closed if the script opener or its closing quote line is missing.
+    The body is everything between the opener line and the first line that is
+    only a single quote — exactly what the container's bash receives, so an
+    assertion against the body reasons about what actually runs inside it.
+    """
+    lines = job_block.splitlines()
+    start: int | None = None
+    for i, line in enumerate(lines):
+        if line.rstrip().endswith("bash -euo pipefail -c '"):
+            start = i + 1
+            break
+    _assert(
+        start is not None,
+        f"rust.yml: job {job!r} must run its container commands in a "
+        "single-quoted bash script",
+    )
+    body: list[str] = []
+    for line in lines[start:]:
+        if line.strip() == "'":
+            return "\n".join(body)
+        body.append(line)
+    raise AssertionError(
+        f"rust.yml: job {job!r} single-quoted bash script is never closed"
+    )
+
+
 def check_rust_text(text: str) -> None:
     trigger_blocks = _on_blocks(text)
     triggers = set(trigger_blocks)
@@ -295,6 +324,30 @@ def check_rust_text(text: str) -> None:
             re.search(r"\\\n[ \t]*#", block) is None,
             f"rust.yml: job {name!r} must not put comments inside continued shell commands",
         )
+
+    # #1257 (followup): the pds-postgres feature lint must run INSIDE the
+    # builder container's single-quoted script. An ASCII apostrophe anywhere
+    # in that script terminates the quote early (bash word-splitting on the
+    # outer shell), which is exactly how the feature lint once landed on the
+    # host and died with `cargo: command not found`. Pin both the placement
+    # and the apostrophe-free shape so the gate cannot silently regress to
+    # linting only default features — or failing spuriously — again.
+    clippy_script = _podman_quoted_script(job_blocks["clippy"], "clippy")
+    _assert(
+        "cargo clippy --workspace --all-targets -- -D warnings" in clippy_script,
+        "rust.yml: job 'clippy' must run the workspace lint inside the builder container",
+    )
+    _assert(
+        "cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings"
+        in clippy_script,
+        "rust.yml: job 'clippy' must run the pds-postgres feature lint inside "
+        "the builder container (not on the host, not after the closing quote)",
+    )
+    _assert(
+        "'" not in clippy_script,
+        "rust.yml: job 'clippy' container script must not contain an ASCII "
+        "apostrophe — it terminates the single-quoted bash script early",
+    )
 
 
 def check_appimage_text(text: str) -> None:
@@ -442,6 +495,22 @@ def _rust_mutations(rust_text: str) -> list[tuple[str, str]]:
             rust_text.replace(
                 "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \\\n",
                 "          # unsafe inline comment \\\n          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \\\n",
+                1,
+            ),
+        ),
+        (
+            "apostrophe terminates the quoted clippy script early",
+            rust_text.replace(
+                "`pds-postgres`) is cfg-gated",
+                "`pds-postgres`) is cfg'd",
+                1,
+            ),
+        ),
+        (
+            "pds-postgres lint moved outside the quoted script",
+            rust_text.replace(
+                "            cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings\n            sccache --show-stats\n          '",
+                "            sccache --show-stats\n          '\n            cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings",
                 1,
             ),
         ),

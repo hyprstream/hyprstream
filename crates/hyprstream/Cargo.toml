@@ -33,7 +33,7 @@ webpki-roots = { workspace = true, optional = true }       # Mozilla CA roots fo
 aes-gcm-siv.workspace = true             # At-rest UserStore envelope encryption (#1377)
 aes.workspace = true                     # Enable ZeroizeOnDrop on AES key schedules (#1377 M5)
 futures.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
 tonic.workspace = true
 async-trait.workspace = true
 tokio-util.workspace = true
@@ -278,6 +278,12 @@ ledger = ["dep:hyprstream-ledger"]
 postgres-ledger = ["ledger", "hyprstream-ledger/postgres", "dep:hyprstream-pay"]
 # Settlement/tariff service + MIT seam crate (#1399). Implies ledger.
 pay = ["ledger", "dep:hyprstream-pay"]
+# Postgres-backed PDS record store (#1257): RDS Multi-AZ is the deployed
+# backend; RocksDB stays for local/workstation. When a `[rds]` section is
+# configured the Postgres store is selected and is FATAL-on-unavailable —
+# never a silent local fallback. Honors D2 (signed bytes verbatim as
+# authoritative source-of-truth; SQL rows are a projection-free KV shell).
+pds-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls"]
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler
@@ -302,6 +308,7 @@ rand.workspace = true
 tower = { version = "0.5", features = ["util"] }
 # Test-only: WebSocket client for the 9P-over-WS attach round-trip (H1a / #764).
 tokio-tungstenite = "0.24"
+tokio-rustls.workspace = true
 # Test-only: the `testing` feature exposes `InMemoryMetricExporter` for the
 # token-burn meter tests. The SDK compiles it under cfg(test) or this feature;
 # dependencies are not built with cfg(test), so the feature is required here.

@@ -122,6 +122,10 @@ struct RepoState {
     /// The signed commit persisted by the writer — served verbatim on reads,
     /// never re-signed.
     commit: Commit,
+    /// The exact stored bytes of `commit`. The Postgres backend compare-and-
+    /// swaps the repo head against these bytes, so a publish is gated on the
+    /// exact head it was built from — re-encoding is never involved.
+    commit_bytes: Vec<u8>,
 }
 
 // ── RocksDB key scheme ───────────────────────────────────────────────────────
@@ -241,6 +245,16 @@ enum RecordBacking {
     /// `open_for_read_only` handle so writes from the publisher process become
     /// visible without a restart.
     ReadOnly(PathBuf),
+    /// Shared RDS (Multi-AZ Postgres) backend (#1257). Both the publisher and
+    /// the resolver connect to the same RDS instance — a write via one AZ is
+    /// immediately readable by the other. **D2 invariant**: values are the
+    /// exact signed bytes the publisher commits, stored verbatim in a
+    /// projection-free BYTEA KV; nothing is normalized into SQL columns.
+    #[cfg(feature = "pds-postgres")]
+    Postgres {
+        kv: super::pds_record_pg::PgKv,
+        readonly: bool,
+    },
 }
 
 impl PdsRecordStore {
@@ -283,6 +297,55 @@ impl PdsRecordStore {
         })
     }
 
+    /// Open the store against a shared RDS (Multi-AZ Postgres) instance (#1257).
+    ///
+    /// This is the **deployed** backend: two stateless PDS services in two AZs
+    /// share one RDS instance. A write via the publisher in AZ-a is immediately
+    /// readable by the resolver in AZ-b (MVCC, no reopen dance). The store is
+    /// **FATAL-on-unavailable** — `connect` fails at startup rather than
+    /// silently degrading to a local backend.
+    ///
+    /// `rds` must already be the effective binding — callers pass
+    /// [`crate::config::RdsConfig::resolved_from_env`] output so TOML, the
+    /// role-scoped env vars, and the shared credentials directory are all
+    /// honored. Conditional writes (repo head, accepted at9p head) are SQL
+    /// compare-and-swaps, so two publishers in two AZs cannot lose an update.
+    ///
+    /// **D2 invariant**: the signed record/commit/at9p bytes are stored
+    /// verbatim in a projection-free BYTEA KV table; SQL never normalizes,
+    /// parses, or reconstructs them. This is "ship the already-signed evidence
+    /// across the seam" at zero cost when region federation arrives.
+    ///
+    /// `readonly = true` selects the resolver posture (write methods bail);
+    /// `readonly = false` selects the publisher posture.
+    #[cfg(feature = "pds-postgres")]
+    pub fn open_postgres(rds: &crate::config::RdsConfig, readonly: bool) -> AnyResult<Self> {
+        let url = rds.read_url()?;
+        let root_cert_file = rds
+            .root_cert_file()
+            .ok_or_else(|| anyhow!("RDS root_cert_file not configured"))?;
+        let kv = super::pds_record_pg::PgKv::connect(&url, root_cert_file, &rds.cell_id)?;
+        Ok(Self {
+            backing: RecordBacking::Postgres { kv, readonly },
+            at9p_acceptance_identity: None,
+            at9p_advance_lock: parking_lot::Mutex::new(()),
+        })
+    }
+
+    /// TEST-ONLY: open the Postgres backend against an operator-provided
+    /// scratch database (no TLS, no URL validation). Live tests use this to
+    /// hold two independent handles — the in-process model of a publisher in
+    /// AZ-a and a resolver in AZ-b sharing one RDS instance.
+    #[cfg(all(test, feature = "pds-postgres"))]
+    fn open_postgres_test(driver_url: &str, readonly: bool) -> AnyResult<Self> {
+        let kv = super::pds_record_pg::PgKv::connect_test(driver_url, "test-cell")?;
+        Ok(Self {
+            backing: RecordBacking::Postgres { kv, readonly },
+            at9p_acceptance_identity: None,
+            at9p_advance_lock: parking_lot::Mutex::new(()),
+        })
+    }
+
     /// Pin the deployment identity that certifies accepted-state envelopes.
     pub(crate) fn with_at9p_deployment_verifier(
         mut self,
@@ -305,6 +368,15 @@ impl PdsRecordStore {
     /// The record and the commit that covers it advance together in one
     /// `WriteBatch`, so a reader never observes a record whose MST root the
     /// stored commit does not sign. Fails if this store was opened read-only.
+    ///
+    /// `expected_head` is the exact stored bytes of the commit the new head
+    /// was built from (`None` = first publish; the commit key must be absent).
+    /// The Postgres backend enforces it with a SQL compare-and-swap on the
+    /// commit key: two publishers in two AZs cannot both advance the same
+    /// head — the loser's write is rejected instead of silently committing a
+    /// head that does not cover the full record set. The RocksDB backend
+    /// needs no such guard (the OS file lock makes it single-writer) and
+    /// ignores the parameter.
     fn put_record_and_commit(
         &self,
         did: &str,
@@ -312,10 +384,36 @@ impl PdsRecordStore {
         tid: Tid,
         record: &ModelRecord,
         commit: &Commit,
+        expected_head: Option<&[u8]>,
     ) -> AnyResult<()> {
         let RecordBacking::ReadWrite(db) = &self.backing else {
+            #[cfg(feature = "pds-postgres")]
+            if let RecordBacking::Postgres { kv, readonly } = &self.backing {
+                if *readonly {
+                    bail!("PdsRecordStore::put_record_and_commit called on a read-only Postgres store");
+                }
+                let ops = vec![(record_key(did, collection, tid), record.to_dag_cbor())];
+                let committed = kv
+                    .cas_put(
+                        &commit_key(did),
+                        expected_head,
+                        &commit.to_dag_cbor(),
+                        &ops,
+                        &[],
+                    )
+                    .context("PDS record+commit Postgres write failed")?;
+                anyhow::ensure!(
+                    committed,
+                    "PDS repo head for {did} advanced concurrently — refusing to commit \
+                     a head that does not cover the record set; reload the repo and retry \
+                     the publish"
+                );
+                return Ok(());
+            }
             bail!("PdsRecordStore::put_record_and_commit called on a read-only store");
         };
+        #[cfg(not(feature = "pds-postgres"))]
+        let _ = expected_head;
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(record_key(did, collection, tid), record.to_dag_cbor());
         batch.put(commit_key(did), commit.to_dag_cbor());
@@ -326,11 +424,30 @@ impl PdsRecordStore {
     /// Write ONLY the commit block (no record) — used by the #918 head re-sign
     /// path to replace the persisted head's signature without changing any
     /// record data. The MST root / `rev` / `prev` are unchanged; only `sig`
-    /// is refreshed.
-    fn put_commit(&self, did: &str, commit: &Commit) -> AnyResult<()> {
+    /// is refreshed. `expected_head` gates the Postgres compare-and-swap
+    /// exactly as in `put_record_and_commit`: a re-sign based on a head that
+    /// was concurrently advanced is rejected, never silently overwritten.
+    fn put_commit(&self, did: &str, commit: &Commit, expected_head: Option<&[u8]>) -> AnyResult<()> {
         let RecordBacking::ReadWrite(db) = &self.backing else {
+            #[cfg(feature = "pds-postgres")]
+            if let RecordBacking::Postgres { kv, readonly } = &self.backing {
+                if *readonly {
+                    bail!("PdsRecordStore::put_commit called on a read-only Postgres store");
+                }
+                let committed = kv
+                    .cas_put(&commit_key(did), expected_head, &commit.to_dag_cbor(), &[], &[])
+                    .context("PDS commit-only Postgres write failed")?;
+                anyhow::ensure!(
+                    committed,
+                    "PDS repo head for {did} advanced concurrently with the re-sign — \
+                     refusing to overwrite it; reload the repo and retry"
+                );
+                return Ok(());
+            }
             bail!("PdsRecordStore::put_commit called on a read-only store");
         };
+        #[cfg(not(feature = "pds-postgres"))]
+        let _ = expected_head;
         db.put(commit_key(did), commit.to_dag_cbor())
             .context("PDS commit-only write failed")?;
         Ok(())
@@ -348,6 +465,10 @@ impl PdsRecordStore {
             RecordBacking::ReadOnly(path) => {
                 let db = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)?;
                 load_at9p_state_from_db(&db, subject_cid512, acceptance_identity)
+            }
+            #[cfg(feature = "pds-postgres")]
+            RecordBacking::Postgres { kv, .. } => {
+                load_at9p_state_from_pg(kv, subject_cid512, acceptance_identity)
             }
         }
     }
@@ -420,6 +541,63 @@ impl PdsRecordStore {
                 let db = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)?;
                 read(&db)
             }
+            #[cfg(feature = "pds-postgres")]
+            RecordBacking::Postgres { kv, .. } => {
+                // One read-only transaction covering BOTH prefix scans: a
+                // concurrent accepted-state commit cannot interleave a new
+                // state envelope with an old checkpoint scan (or vice versa).
+                // Pairing and verification happen locally on the snapshot
+                // bytes, with the same half-missing/watermark/digest checks
+                // as the single-subject read path.
+                let state_prefix = b"at9p-state\0".to_vec();
+                let checkpoint_prefix = b"at9p-checkpoint\0".to_vec();
+                let state_end = super::pds_record_pg::prefix_upper_bound(&state_prefix)
+                    .ok_or_else(|| anyhow!("at9p state prefix has no successor key"))?;
+                let checkpoint_end =
+                    super::pds_record_pg::prefix_upper_bound(&checkpoint_prefix)
+                        .ok_or_else(|| anyhow!("at9p checkpoint prefix has no successor key"))?;
+                let snap = kv.read_snapshot(
+                    &[
+                        (checkpoint_prefix.clone(), checkpoint_end),
+                        (state_prefix.clone(), state_end),
+                    ],
+                    &[],
+                )?;
+                let mut ranges = snap.ranges.into_iter();
+                let (checkpoint_pairs, state_pairs) = match (ranges.next(), ranges.next()) {
+                    (Some(checkpoints), Some(states)) => (checkpoints, states),
+                    _ => bail!("RDS read_snapshot returned fewer ranges than requested"),
+                };
+                let mut checkpoints: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+                for (key, value) in checkpoint_pairs {
+                    checkpoints.insert(
+                        key.get(checkpoint_prefix.len()..)
+                            .ok_or_else(|| {
+                                anyhow!("accepted-checkpoint key is shorter than its prefix")
+                            })?
+                            .to_vec(),
+                        value,
+                    );
+                }
+                let mut states = Vec::new();
+                for (key, value) in state_pairs {
+                    let subject_bytes = key.get(state_prefix.len()..).ok_or_else(|| {
+                        anyhow!("accepted-state key is shorter than its prefix")
+                    })?;
+                    let subject = std::str::from_utf8(subject_bytes)
+                        .context("accepted-state key is not UTF-8")?;
+                    let checkpoint = checkpoints.remove(subject_bytes).ok_or_else(|| {
+                        anyhow!("accepted at9p state exists without its monotonic checkpoint")
+                    })?;
+                    states.push(verify_at9p_pair(subject, &value, &checkpoint, acceptance_identity)?);
+                }
+                anyhow::ensure!(
+                    checkpoints.is_empty(),
+                    "accepted at9p checkpoint exists without its state envelope"
+                );
+                states.sort_by(|a, b| a.did.cmp(&b.did));
+                Ok(states)
+            }
         }
     }
 
@@ -438,6 +616,10 @@ impl PdsRecordStore {
                 let db = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)?;
                 check(&db)
             }
+            #[cfg(feature = "pds-postgres")]
+            RecordBacking::Postgres { kv, .. } => {
+                Ok(kv.get(hyprstream_discovery::FIRST_BOOT_KEY)?.is_some())
+            }
         }
     }
 
@@ -446,6 +628,15 @@ impl PdsRecordStore {
     /// initialization cannot appear successful without the marker.
     pub fn mark_first_boot(&self) -> AnyResult<()> {
         let RecordBacking::ReadWrite(db) = &self.backing else {
+            #[cfg(feature = "pds-postgres")]
+            if let RecordBacking::Postgres { kv, readonly } = &self.backing {
+                if *readonly {
+                    bail!("first-boot marker write attempted on a read-only Postgres PDS store");
+                }
+                kv.put(hyprstream_discovery::FIRST_BOOT_KEY, b"")
+                    .context("failed to write first-boot provisioning marker")?;
+                return Ok(());
+            }
             bail!("first-boot marker write attempted on a read-only PDS store");
         };
         db.put(hyprstream_discovery::FIRST_BOOT_KEY, b"")
@@ -461,6 +652,78 @@ impl PdsRecordStore {
         audit_key: &ed25519_dalek::SigningKey,
     ) -> AnyResult<ConditionalAdvance> {
         let RecordBacking::ReadWrite(db) = &self.backing else {
+            #[cfg(feature = "pds-postgres")]
+            if let RecordBacking::Postgres { kv, readonly } = &self.backing {
+                if *readonly {
+                    bail!(
+                        "accepted did:at9p state write attempted on a read-only Postgres PDS store"
+                    );
+                }
+                let local_verifier =
+                    At9pAcceptanceVerifier::Local(acceptance_identity.verifying_key());
+                let state_key = at9p_state_key(&state.subject_cid512);
+                let checkpoint_key = at9p_checkpoint_key(&state.subject_cid512);
+                // One snapshot read of the durable pair: enforces the
+                // watermark precondition AND yields the exact bytes the SQL
+                // compare-and-swap gates on.
+                let raw = kv.get_batch(&[state_key.clone(), checkpoint_key.clone()])?;
+                let mut raw = raw.into_iter();
+                let (raw_state, raw_checkpoint) = (raw.next().flatten(), raw.next().flatten());
+                let current = match (&raw_state, &raw_checkpoint) {
+                    (None, None) => None,
+                    (Some(_), None) => {
+                        bail!("accepted at9p state exists without its monotonic checkpoint")
+                    }
+                    (None, Some(_)) => {
+                        bail!("accepted at9p checkpoint exists without its state envelope")
+                    }
+                    (Some(envelope), Some(checkpoint)) => Some(verify_at9p_pair(
+                        &state.subject_cid512,
+                        envelope,
+                        checkpoint,
+                        &local_verifier,
+                    )?),
+                };
+                if current.as_ref().map(AcceptedAt9pState::watermark) != expected {
+                    return current.map_or_else(
+                        || bail!(
+                            "conditional accepted-state advance expected a durable head, but none exists"
+                        ),
+                        |current| Ok(ConditionalAdvance::Conflict(Box::new(current))),
+                    );
+                }
+                let encoded = encode_at9p_state(state, acceptance_identity, audit_key)?;
+                let checkpoint = encode_at9p_checkpoint(state, &encoded, acceptance_identity)?;
+                // The cross-AZ correctness mechanism: the advance is a SQL
+                // compare-and-swap on the exact current state bytes, in ONE
+                // transaction with the checkpoint write and the first-boot
+                // marker removal (mirroring the RocksDB WriteBatch below).
+                // The process-local `at9p_advance_lock` guards nothing across
+                // AZs; the row lock serializes the publishers and the loser
+                // reports Conflict instead of silently overwriting.
+                let committed = kv
+                    .cas_put(
+                        &state_key,
+                        raw_state.as_deref(),
+                        &encoded,
+                        &[(checkpoint_key, checkpoint)],
+                        &[hyprstream_discovery::FIRST_BOOT_KEY.to_vec()],
+                    )
+                    .context("synchronous accepted did:at9p state+checkpoint Postgres commit failed")?;
+                if !committed {
+                    // Lost the commit race between the precondition read and
+                    // the CAS: re-read and report the winner's durable state.
+                    let winner =
+                        load_at9p_state_from_pg(kv, &state.subject_cid512, &local_verifier)?;
+                    return winner.map_or_else(
+                        || bail!(
+                            "conditional accepted-state advance lost the commit race, and no durable head is readable"
+                        ),
+                        |winner| Ok(ConditionalAdvance::Conflict(Box::new(winner))),
+                    );
+                }
+                return Ok(ConditionalAdvance::Committed);
+            }
             bail!("accepted did:at9p state write attempted on a read-only PDS store");
         };
         let _advance = self.at9p_advance_lock.lock();
@@ -522,6 +785,8 @@ impl PdsRecordStore {
                     .with_context(|| format!("failed to reopen PDS record store at {path:?}"))?;
                 Self::load_repo_from(&db, did)
             }
+            #[cfg(feature = "pds-postgres")]
+            RecordBacking::Postgres { kv, .. } => Self::load_repo_from_pg(kv, did),
         }
     }
 
@@ -562,7 +827,71 @@ impl PdsRecordStore {
         };
         let commit = Commit::from_dag_cbor(&commit_bytes)
             .with_context(|| format!("corrupt signed commit for {did}"))?;
-        Ok(Some(RepoState { records, commit }))
+        Ok(Some(RepoState {
+            records,
+            commit,
+            commit_bytes,
+        }))
+    }
+
+    /// Postgres counterpart of [`load_repo_from`] (#1257). The record range
+    /// scan and the commit get run in ONE read-only transaction (see
+    /// [`super::pds_record_pg::PgKv::read_snapshot`]), so a concurrent writer
+    /// cannot interleave old records with a new signed commit — the
+    /// reconstructed MST root always verifies against the commit it is served
+    /// with. Identical semantics otherwise, D2-preserving (signed bytes
+    /// verbatim).
+    #[cfg(feature = "pds-postgres")]
+    fn load_repo_from_pg(
+        kv: &super::pds_record_pg::PgKv,
+        did: &str,
+    ) -> AnyResult<Option<RepoState>> {
+        let prefix = record_prefix(did);
+        let mut records = BTreeMap::new();
+        let upper = super::pds_record_pg::prefix_upper_bound(&prefix);
+        let (pairs, commit_bytes) = if let Some(end) = &upper {
+            let snap = kv.read_snapshot(
+                &[(prefix.clone(), end.clone())],
+                &[commit_key(did)],
+            )?;
+            let mut values = snap.values.into_iter();
+            (snap.ranges.into_iter().next().unwrap_or_default(), values.next().flatten())
+        } else {
+            // Unreachable for well-formed prefixes (they end in NUL, so an
+            // upper bound always exists); kept as a defensive fallback.
+            let pairs = kv
+                .all_pairs()?
+                .into_iter()
+                .filter(|(k, _)| k.starts_with(prefix.as_slice()))
+                .collect();
+            let commit_bytes = kv
+                .get(&commit_key(did))
+                .context("PDS Postgres commit read failed")?;
+            (pairs, commit_bytes)
+        };
+        for (key, value) in pairs {
+            let (collection, tid) = parse_record_key(&key, did)?;
+            let record = ModelRecord::from_dag_cbor(&value)
+                .with_context(|| format!("corrupt PDS record for {did}/{collection}/{tid}"))?;
+            records.insert((collection, tid), record);
+        }
+        if records.is_empty() {
+            return Ok(None);
+        }
+        let Some(commit_bytes) = commit_bytes else {
+            tracing::warn!(
+                did,
+                "PDS repo has records but no signed commit — refusing to serve (resolver holds no key)"
+            );
+            return Ok(None);
+        };
+        let commit = Commit::from_dag_cbor(&commit_bytes)
+            .with_context(|| format!("corrupt signed commit for {did}"))?;
+        Ok(Some(RepoState {
+            records,
+            commit,
+            commit_bytes,
+        }))
     }
 
     /// Build the MST over a repo's record set. The MST is a deterministic,
@@ -675,6 +1004,30 @@ fn decode_at9p_checkpoint(
     })
 }
 
+/// Decode and cross-verify one durable accepted-state pair (state envelope +
+/// monotonic checkpoint) against the acceptance identity. Both halves must be
+/// present, the checkpoint watermark must equal the body watermark, and the
+/// checkpoint digest must bind the exact envelope bytes — any mismatch is a
+/// hard consistency failure, never "absent".
+fn verify_at9p_pair(
+    subject: &str,
+    envelope: &[u8],
+    checkpoint: &[u8],
+    identity: &At9pAcceptanceVerifier,
+) -> AnyResult<AcceptedAt9pState> {
+    let state = decode_at9p_state(subject, envelope, identity)?;
+    let checkpoint = decode_at9p_checkpoint(subject, checkpoint, identity)?;
+    anyhow::ensure!(
+        checkpoint.watermark == state.watermark(),
+        "accepted at9p checkpoint/body watermark mismatch"
+    );
+    anyhow::ensure!(
+        checkpoint.envelope_digest == h512(envelope),
+        "accepted at9p checkpoint/state envelope mismatch"
+    );
+    Ok(state)
+}
+
 fn load_at9p_state_from_db(
     db: &rocksdb::DB,
     subject: &str,
@@ -688,17 +1041,26 @@ fn load_at9p_state_from_db(
         (Some(_), None) => bail!("accepted at9p state exists without its monotonic checkpoint"),
         (None, Some(_)) => bail!("accepted at9p checkpoint exists without its state envelope"),
         (Some(envelope), Some(checkpoint)) => {
-            let state = decode_at9p_state(subject, &envelope, identity)?;
-            let checkpoint = decode_at9p_checkpoint(subject, &checkpoint, identity)?;
-            anyhow::ensure!(
-                checkpoint.watermark == state.watermark(),
-                "accepted at9p checkpoint/body watermark mismatch"
-            );
-            anyhow::ensure!(
-                checkpoint.envelope_digest == h512(&envelope),
-                "accepted at9p checkpoint/state envelope mismatch"
-            );
-            Ok(Some(state))
+            Ok(Some(verify_at9p_pair(subject, &envelope, &checkpoint, identity)?))
+        }
+    }
+}
+
+/// Postgres counterpart of [`load_at9p_state_from_db`]. Uses `get_batch` for
+/// a snapshot-consistent read of the state envelope + checkpoint (#1257).
+#[cfg(feature = "pds-postgres")]
+fn load_at9p_state_from_pg(
+    kv: &super::pds_record_pg::PgKv,
+    subject: &str,
+    identity: &At9pAcceptanceVerifier,
+) -> AnyResult<Option<AcceptedAt9pState>> {
+    let vals = kv.get_batch(&[at9p_state_key(subject), at9p_checkpoint_key(subject)])?;
+    match (&vals[0], &vals[1]) {
+        (None, None) => Ok(None),
+        (Some(_), None) => bail!("accepted at9p state exists without its monotonic checkpoint"),
+        (None, Some(_)) => bail!("accepted at9p checkpoint exists without its state envelope"),
+        (Some(envelope), Some(checkpoint)) => {
+            Ok(Some(verify_at9p_pair(subject, envelope, checkpoint, identity)?))
         }
     }
 }
@@ -1009,13 +1371,16 @@ struct StoreGenerationSource(Arc<crate::auth::key_rotation::Es256SigningKeyStore
 
 impl crate::auth::ActiveGenerationSource for StoreGenerationSource {
     fn active_generation(&self) -> AnyResult<Option<crate::auth::ActiveGeneration>> {
-        Ok(self.0.active_slot().map(|slot| crate::auth::ActiveGeneration {
-            seq: 0,
-            kid: slot.kid(),
-            verifying_key: *slot.key.verifying_key(),
-            signing_key: slot.key.as_ref().clone(),
-            head_at_op: None,
-        }))
+        Ok(self
+            .0
+            .active_slot()
+            .map(|slot| crate::auth::ActiveGeneration {
+                seq: 0,
+                kid: slot.kid(),
+                verifying_key: *slot.key.verifying_key(),
+                signing_key: slot.key.as_ref().clone(),
+                head_at_op: None,
+            }))
     }
 }
 
@@ -1049,7 +1414,10 @@ impl IntoPdsGenerationSource for Arc<crate::auth::key_rotation::Es256SigningKeyS
         Arc<dyn crate::auth::ActiveGenerationSource>,
         Option<Arc<crate::auth::key_rotation::Es256SigningKeyStore>>,
     ) {
-        (Arc::new(StoreGenerationSource(Arc::clone(&self))), Some(self))
+        (
+            Arc::new(StoreGenerationSource(Arc::clone(&self))),
+            Some(self),
+        )
     }
 }
 
@@ -1360,8 +1728,20 @@ impl PdsPublisher {
             })?;
         let commit = Commit::sign(&unsigned, &generation.signing_key);
 
-        self.store
-            .put_record_and_commit(&self.did, collection, tid, &record, &commit)
+        // Gate the durable write on the exact head this publish was built
+        // from: on the Postgres backend the commit-key compare-and-swap
+        // rejects the write if another publisher (in either AZ) advanced the
+        // head since `load_repo`, so a commit never silently lands without
+        // covering the full record set (#1257 cross-AZ invariant).
+        let expected_head = existing.as_ref().map(|r| r.commit_bytes.as_slice());
+        self.store.put_record_and_commit(
+            &self.did,
+            collection,
+            tid,
+            &record,
+            &commit,
+            expected_head,
+        )
     }
 
     /// #918 re-sign-on-rotation: re-sign the EXISTING persisted repo head with
@@ -1405,10 +1785,14 @@ impl PdsPublisher {
         };
         // Re-sign over the same canonical unsigned bytes — only the `sig`
         // changes. The commit CID changes because it includes `sig`; the next
-        // normal publish will link `prev` to this re-signed head's CID.
+        // normal publish will link `prev` to this re-signed head's CID. The
+        // re-sign is gated on the exact head bytes it was computed from, so a
+        // concurrent publish in either AZ cannot be silently overwritten by
+        // the refreshed signature.
         let unsigned = repo.commit.unsigned();
         let re_signed = Commit::sign(&unsigned, key);
-        self.store.put_commit(&self.did, &re_signed)?;
+        self.store
+            .put_commit(&self.did, &re_signed, Some(&repo.commit_bytes))?;
         Ok(true)
     }
 }
@@ -1738,11 +2122,8 @@ mod pds_store_tests {
         let pds_store = Arc::new(PdsRecordStore::open(pds_dir.path()).expect("open rw"));
         let source: Arc<dyn crate::auth::ActiveGenerationSource> =
             Arc::new(SealedHeadEs256Source::new(state, secrets));
-        let publisher = PdsPublisher::with_generation_source(
-            Arc::clone(&pds_store),
-            DID.to_owned(),
-            source,
-        );
+        let publisher =
+            PdsPublisher::with_generation_source(Arc::clone(&pds_store), DID.to_owned(), source);
 
         publisher.publish("repo-a", SAMPLE_OID).expect("publish K1");
         let commit1 = pds_store
@@ -1763,7 +2144,9 @@ mod pds_store_tests {
 
         // Same publisher instance, new commit. It MUST be signed by K2 — the
         // publisher observed the rotation through the re-sealed head.
-        publisher.publish("repo-a", SAMPLE_OID_2).expect("publish K2");
+        publisher
+            .publish("repo-a", SAMPLE_OID_2)
+            .expect("publish K2");
         let commit2 = pds_store
             .load_repo(DID)
             .expect("load")
@@ -2362,7 +2745,7 @@ mod pds_store_tests {
         let unsigned = UnsignedCommit::new("did:key:zX", tree.root_cid(), Tid::now(), None);
         let commit = Commit::sign(&unsigned, &sk);
         let err = ro
-            .put_record_and_commit("did:key:zX", COLLECTION_NSID, Tid::now(), &record, &commit)
+            .put_record_and_commit("did:key:zX", COLLECTION_NSID, Tid::now(), &record, &commit, None)
             .unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
@@ -2647,6 +3030,7 @@ mod pds_store_tests {
                 PdsRecordStore::tid_for_repo("rogue"),
                 &rogue,
                 &stale_commit,
+                None,
             )
             .expect("raw write");
 
@@ -3186,7 +3570,9 @@ mod pds_store_tests {
         );
 
         // No durable anchor was written: the store holds no commit for this DID.
-        let RecordBacking::ReadWrite(db) = &store.backing else { panic!("read-write store") };
+        let RecordBacking::ReadWrite(db) = &store.backing else {
+            panic!("read-write store")
+        };
         assert!(
             db.get(commit_key(&path_form_did)).unwrap().is_none(),
             "no commit key must be persisted for a path-form authority",
@@ -3214,5 +3600,439 @@ mod pds_store_tests {
                 .publish("repo-a", SAMPLE_OID)
                 .unwrap_or_else(|e| panic!("host-form/key authority {accepted} must publish: {e}"));
         }
+    }
+}
+
+/// Live Postgres-backed store tests (#1257). Every test skips itself green
+/// unless the operator provides a scratch database via
+/// `HYPRSTREAM_POSTGRES_TEST_URL_FILE` — a file path, never a direct env var,
+/// mirroring the production file-backed credential model (metal v1.1). These
+/// cover exactly the semantics where RocksDB and Postgres could diverge:
+/// cross-handle visibility (the two-AZ invariant), repo-head compare-and-swap,
+/// concurrent accepted-state advance, and the first-boot lifecycle marker.
+#[cfg(all(test, feature = "pds-postgres"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod pg_tests {
+    use super::*;
+    use p256::ecdsa::SigningKey;
+
+    const COLLECTION: &str = "ai.hyprstream.model";
+    const NOW: &str = "2026-07-16T12:00:00Z";
+    const FUTURE: &str = "2099-01-01T00:00:00Z";
+
+    fn test_url() -> Option<String> {
+        let path = std::env::var_os("HYPRSTREAM_POSTGRES_TEST_URL_FILE")?;
+        let url = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read test URL file {}: {e}", path.to_string_lossy()));
+        let url = url.trim();
+        assert!(!url.is_empty(), "test URL file is empty");
+        Some(url.to_owned())
+    }
+
+    macro_rules! require_db {
+        () => {{
+            let Some(url) = test_url() else {
+                eprintln!(
+                    "skipping PdsRecordStore Postgres test: \
+                     HYPRSTREAM_POSTGRES_TEST_URL_FILE unset"
+                );
+                return;
+            };
+            url
+        }};
+    }
+
+    /// A DID unique to this process run so repeated runs against a shared
+    /// scratch database never collide with their own prior writes.
+    fn unique_did(label: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("did:key:zPg{label}{}{nanos}", std::process::id())
+    }
+
+    fn open_pair(url: &str) -> (PdsRecordStore, PdsRecordStore) {
+        let writer = PdsRecordStore::open_postgres_test(url, false).expect("open writer handle");
+        let reader = PdsRecordStore::open_postgres_test(url, true).expect("open reader handle");
+        (writer, reader)
+    }
+
+    fn record_for(did: &str, tag: &str) -> ModelRecord {
+        ModelRecord::new(
+            format!("at://{did}"),
+            format!("bafyreipgtest{tag}{}", "0".repeat(40 - tag.len())),
+            "2026-06-23T12:34:56.789Z",
+        )
+        .expect("record")
+    }
+
+    /// Sign the commit covering `records`, chained on `prev`.
+    fn sign_covering_commit(
+        did: &str,
+        records: &BTreeMap<(String, Tid), ModelRecord>,
+        prev: Option<&Commit>,
+        sk: &SigningKey,
+    ) -> Commit {
+        let tree = PdsRecordStore::build_tree(records);
+        let (rev, prev_cid) = match prev {
+            Some(prev) => (next_rev(prev.rev), Some(prev.cid())),
+            None => (Tid::now(), None),
+        };
+        let unsigned = UnsignedCommit::new(did.to_owned(), tree.root_cid(), rev, prev_cid);
+        Commit::sign(&unsigned, sk)
+    }
+
+    // ── at9p fixtures (mirrors of the pds_store_tests helpers, which are
+    //    private to that sibling module) ────────────────────────────────────
+
+    struct At9pSigner {
+        ed: ed25519_dalek::SigningKey,
+        pq: hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+        pair: hyprstream_pds::at9p::HybridKeyPair,
+    }
+
+    fn at9p_signer(tag: u8) -> At9pSigner {
+        use hyprstream_rpc::crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
+        let mut seed = [0u8; 32];
+        seed[0] = tag;
+        seed[31] = tag.wrapping_add(17);
+        let ed = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let (pq, pq_vk) = ml_dsa_generate_keypair();
+        let pair = hyprstream_pds::at9p::HybridKeyPair::new(
+            ed.verifying_key().to_bytes().to_vec(),
+            ml_dsa_vk_bytes(&pq_vk),
+        )
+        .expect("hybrid pair");
+        At9pSigner { ed, pq, pair }
+    }
+
+    fn at9p_body(
+        current: &At9pSigner,
+        next: &[&At9pSigner],
+        service_tag: &str,
+    ) -> hyprstream_pds::at9p::CapsuleBody {
+        use hyprstream_pds::at9p::{
+            CapsuleBody, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
+        };
+        let endpoint = ServiceEndpoint::new(Transport::Iroh, format!("iroh://{service_tag}"))
+            .expect("endpoint");
+        let service =
+            ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).expect("service");
+        let mut body =
+            CapsuleBody::new(vec![current.pair.clone()], vec![service]).expect("capsule body");
+        body.next_key_commitments = next
+            .iter()
+            .map(|signer| signer.pair.commitment_digest())
+            .collect();
+        body
+    }
+
+    fn acceptance_identity() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[90u8; 32])
+    }
+
+    fn audit_ed() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[91u8; 32])
+    }
+
+    fn audit_pq() -> hyprstream_rpc::crypto::pq::MlDsaSigningKey {
+        hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&[92u8; 32])
+    }
+
+    fn pg_at9p_publisher(store: Arc<PdsRecordStore>, alarm: &std::path::Path) -> PdsPublisher {
+        use crate::auth::key_rotation::{Es256KeySlot, Es256KeySlots, Es256SigningKeyStore};
+        let es256 = Arc::new(Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(Es256KeySlot::new(
+                SigningKey::random(&mut rand::rngs::OsRng),
+                0,
+                i64::MAX,
+            )),
+            lead: None,
+        }));
+        let ingest = At9pStateIngest::open(
+            Arc::clone(&store),
+            alarm,
+            acceptance_identity(),
+            audit_ed(),
+            audit_pq(),
+        )
+        .expect("open accepted-state owner");
+        PdsPublisher::new(store, "did:key:zPgTestNode".to_owned(), es256)
+            .with_at9p_state_ingest(ingest)
+    }
+
+    // ── tests ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn live_two_handle_persistence_and_visibility() {
+        let url = require_db!();
+        let did = unique_did("Vis");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let tid = PdsRecordStore::tid_for_repo("repo-vis");
+        let record = record_for(&did, "vis");
+        let mut records = BTreeMap::new();
+        records.insert((COLLECTION.to_owned(), tid), record.clone());
+        let commit = sign_covering_commit(&did, &records, None, &sk);
+
+        {
+            let (writer, reader) = open_pair(&url);
+            writer
+                .put_record_and_commit(&did, COLLECTION, tid, &record, &commit, None)
+                .expect("publish via AZ-a handle");
+
+            // Cross-AZ invariant: the write is visible to the resolver handle.
+            let repo = reader
+                .load_repo(&did)
+                .expect("read via AZ-b handle")
+                .expect("repo visible through the second handle");
+            assert_eq!(repo.records.get(&(COLLECTION.to_owned(), tid)), Some(&record));
+            assert_eq!(repo.commit_bytes, commit.to_dag_cbor());
+
+            // The resolver posture is read-only.
+            let err = reader
+                .put_record_and_commit(&did, COLLECTION, tid, &record, &commit, None)
+                .expect_err("resolver handle must reject writes");
+            assert!(err.to_string().contains("read-only"), "got: {err}");
+        } // both handles (and their bridges) drop here
+
+        // Persistence: a fresh handle on a fresh bridge sees the same bytes.
+        let reopened = PdsRecordStore::open_postgres_test(&url, true).expect("reopen reader");
+        let repo = reopened
+            .load_repo(&did)
+            .expect("reload")
+            .expect("repo persists across handle close");
+        assert_eq!(repo.commit_bytes, commit.to_dag_cbor());
+
+        // An unknown DID is absent, never an error and never a torn read.
+        assert!(
+            reopened
+                .load_repo(&unique_did("Absent"))
+                .expect("absent repo read")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn live_repo_head_cas_rejects_stale_publish() {
+        let url = require_db!();
+        let did = unique_did("Cas");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let writer_a = PdsRecordStore::open_postgres_test(&url, false).expect("open publisher A");
+        let writer_b = PdsRecordStore::open_postgres_test(&url, false).expect("open publisher B");
+
+        // A's genesis publish (no prior head).
+        let tid1 = PdsRecordStore::tid_for_repo("repo-1");
+        let rec1 = record_for(&did, "r1");
+        let mut records = BTreeMap::new();
+        records.insert((COLLECTION.to_owned(), tid1), rec1.clone());
+        let commit1 = sign_covering_commit(&did, &records, None, &sk);
+        writer_a
+            .put_record_and_commit(&did, COLLECTION, tid1, &rec1, &commit1, None)
+            .expect("genesis publish");
+        let head1 = writer_a
+            .load_repo(&did)
+            .expect("load")
+            .map(|r| r.commit_bytes)
+            .expect("head 1 durable");
+
+        // B reads the same head through its own handle.
+        let repo_b = writer_b
+            .load_repo(&did)
+            .expect("load via B")
+            .expect("head 1 visible via B");
+        assert_eq!(repo_b.commit_bytes, head1);
+
+        // A advances the head (covers r1 + r2).
+        let tid2 = PdsRecordStore::tid_for_repo("repo-2");
+        let rec2 = record_for(&did, "r2");
+        records.insert((COLLECTION.to_owned(), tid2), rec2.clone());
+        let commit2 = sign_covering_commit(&did, &records, Some(&commit1), &sk);
+        writer_a
+            .put_record_and_commit(&did, COLLECTION, tid2, &rec2, &commit2, Some(&head1))
+            .expect("advance with the current head commits");
+
+        // B publishes from the STALE head: rejected, never silently committed.
+        let tid3 = PdsRecordStore::tid_for_repo("repo-3");
+        let rec3 = record_for(&did, "r3");
+        let mut stale_records = BTreeMap::new();
+        stale_records.insert((COLLECTION.to_owned(), tid1), rec1.clone());
+        stale_records.insert((COLLECTION.to_owned(), tid3), rec3.clone());
+        let commit3 = sign_covering_commit(&did, &stale_records, Some(&commit1), &sk);
+        let err = writer_b
+            .put_record_and_commit(&did, COLLECTION, tid3, &rec3, &commit3, Some(&head1))
+            .expect_err("publish from a stale head must be rejected");
+        assert!(
+            err.to_string().contains("advanced concurrently"),
+            "error must name the lost race: {err}"
+        );
+
+        // The durable head still covers exactly A's record set — no clobber.
+        let durable = writer_b
+            .load_repo(&did)
+            .expect("reload")
+            .expect("repo present");
+        assert!(durable.records.contains_key(&(COLLECTION.to_owned(), tid2)));
+        assert!(!durable.records.contains_key(&(COLLECTION.to_owned(), tid3)));
+
+        // B reloads, rebases on the current head, and its retry commits.
+        let tid4 = PdsRecordStore::tid_for_repo("repo-4");
+        let rec4 = record_for(&did, "r4");
+        let mut rebased = durable.records.clone();
+        rebased.insert((COLLECTION.to_owned(), tid4), rec4.clone());
+        let commit4 = sign_covering_commit(&did, &rebased, Some(&durable.commit), &sk);
+        writer_b
+            .put_record_and_commit(
+                &did,
+                COLLECTION,
+                tid4,
+                &rec4,
+                &commit4,
+                Some(&durable.commit_bytes),
+            )
+            .expect("retry on the current head commits");
+    }
+
+    #[test]
+    fn live_at9p_concurrent_advance_has_exactly_one_winner() {
+        use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
+        use std::sync::Barrier;
+
+        let url = require_db!();
+        let (g, n1) = (at9p_signer(61), at9p_signer(62));
+        let genesis =
+            sign_capsule(at9p_body(&g, &[&n1], "genesis"), &g.ed, &g.pq).expect("genesis");
+        let genesis_bytes = genesis.to_dag_cbor().expect("genesis bytes");
+        let cid = genesis.cid512().expect("cid");
+        let did = format!("{DID_AT9P_PREFIX}{cid}");
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Produce the epoch-1 accepted state on a scratch local store (same
+        // fixtures → same deterministic state) without touching Postgres.
+        let state0;
+        let state1;
+        {
+            let scratch_dir = tempfile::tempdir().expect("scratch tempdir");
+            let scratch = Arc::new(
+                PdsRecordStore::open(&scratch_dir.path().join("pds")).expect("scratch store"),
+            );
+            let publisher = pg_at9p_publisher(scratch, &scratch_dir.path().join("alarm"));
+            state0 = publisher
+                .ingest_at9p_genesis(&did, &genesis_bytes)
+                .expect("scratch genesis");
+            let update = sign_update_record(
+                cid.clone(),
+                1,
+                state0.head_digest,
+                at9p_body(&n1, &[], "rotated"),
+                FUTURE.to_owned(),
+                &n1.ed,
+                &n1.pq,
+            )
+            .expect("update");
+            state1 = publisher
+                .ingest_at9p_successor(&did, &update.to_dag_cbor().expect("update bytes"), NOW)
+                .expect("scratch successor");
+        }
+
+        // Seed the genesis state into Postgres through handle A.
+        let store_a = Arc::new(
+            PdsRecordStore::open_postgres_test(&url, false)
+                .expect("open pg A")
+                .with_at9p_acceptance_identity(acceptance_identity().verifying_key()),
+        );
+        let store_b = Arc::new(
+            PdsRecordStore::open_postgres_test(&url, false)
+                .expect("open pg B")
+                .with_at9p_acceptance_identity(acceptance_identity().verifying_key()),
+        );
+        let publisher_a = pg_at9p_publisher(Arc::clone(&store_a), &dir.path().join("alarm-a"));
+        publisher_a
+            .ingest_at9p_genesis(&did, &genesis_bytes)
+            .expect("seed genesis into Postgres");
+        // Cross-handle visibility of the accepted state before the race.
+        let seen = store_b
+            .accepted_at9p_state(&did, None)
+            .expect("read via B")
+            .expect("genesis visible via B");
+        assert_eq!(seen.watermark(), state0.watermark());
+
+        // Two publishers race the same conditional advance from the genesis
+        // watermark: exactly one commits; the loser reports Conflict instead
+        // of overwriting (#1405 review: no lost updates across AZs).
+        let barrier = Barrier::new(2);
+        let outcome = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                barrier.wait();
+                store_a.conditional_advance_at9p_state(
+                    Some(state0.watermark()),
+                    &state1,
+                    &acceptance_identity(),
+                    &audit_ed(),
+                )
+            });
+            let b = scope.spawn(|| {
+                barrier.wait();
+                store_b.conditional_advance_at9p_state(
+                    Some(state0.watermark()),
+                    &state1,
+                    &acceptance_identity(),
+                    &audit_ed(),
+                )
+            });
+            [
+                a.join().expect("racer A panicked"),
+                b.join().expect("racer B panicked"),
+            ]
+        });
+        let outcomes = outcome;
+        let committed = outcomes
+            .iter()
+            .filter(|o| matches!(o, Ok(ConditionalAdvance::Committed)))
+            .count();
+        let mut conflicts = outcomes.iter().filter_map(|o| match o {
+            Ok(ConditionalAdvance::Conflict(current)) => Some(current.as_ref()),
+            _ => None,
+        });
+        assert_eq!(
+            committed, 1,
+            "exactly one publisher commits the advance: {outcomes:?}"
+        );
+        let loser = conflicts
+            .next()
+            .expect("exactly one publisher reports the conflict")
+            .watermark();
+        assert!(
+            conflicts.next().is_none(),
+            "at most one conflict: {outcomes:?}"
+        );
+        assert_eq!(
+            loser,
+            state1.watermark(),
+            "the loser's conflict reports the winner's durable state"
+        );
+
+        // The durable head is the epoch-1 state, readable through both handles.
+        let durable = store_b
+            .accepted_at9p_state(&did, None)
+            .expect("final read")
+            .expect("state present");
+        assert_eq!(durable.watermark(), state1.watermark());
+    }
+
+    #[test]
+    fn live_first_boot_marker_visible_across_handles() {
+        let url = require_db!();
+        let (writer, reader) = open_pair(&url);
+        writer.mark_first_boot().expect("write marker via writer handle");
+        assert!(
+            writer.first_boot_pending().expect("read via writer"),
+            "writer observes its own marker"
+        );
+        assert!(
+            reader.first_boot_pending().expect("read via reader"),
+            "the marker is visible through the resolver handle"
+        );
     }
 }

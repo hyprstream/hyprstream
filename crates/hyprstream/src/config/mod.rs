@@ -72,8 +72,7 @@ pub fn explicit_config_path() -> Option<&'static PathBuf> {
 }
 
 /// Unified configuration for the Hyprstream system
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HyprConfig {
     /// HTTP server configuration
     #[serde(default)]
@@ -265,6 +264,21 @@ pub struct HyprConfig {
     #[serde(default)]
     pub ledger: crate::services::ledger::LedgerConfig,
 
+    /// Records/repository RDS (Multi-AZ Postgres) configuration (#1257).
+    ///
+    /// This is the records role's TOML-only binding. It is not a generic or
+    /// shared credential interface: deployment renders this role's explicit
+    /// URL and CA paths into `[rds]`. When unset, the record store falls back
+    /// to its local backend (RocksDB); when set, the Postgres backend is
+    /// selected and is FATAL-on-unavailable — never a silent local fallback.
+    ///
+    /// **D2 invariant** (`ARCH-recursive-federation-verdict-fable.md`): the
+    /// signed, content-addressed record/op-log bytes remain the authoritative
+    /// source of truth; the RDS rows are a projection-free KV shell over those
+    /// exact signed bytes, never a normalization of them.
+    #[serde(default)]
+    pub rds: RdsConfig,
+
     /// Postgres URL for the durable ledger backend (PAY-01 #1389).
     /// When set and the `postgres-ledger` feature is compiled, the factory
     /// constructs PostgresLedger. When empty/unset, MemLedger is used (dev/test).
@@ -276,6 +290,274 @@ pub struct HyprConfig {
     #[cfg(feature = "postgres-ledger")]
     #[serde(default)]
     pub ledger_postgres_pool_size: Option<usize>,
+}
+
+/// Records/repository RDS (Multi-AZ Postgres) configuration.
+///
+/// The effective binding is resolved by [`RdsConfig::resolved_from_env`]:
+/// explicit TOML values win; otherwise the records role's scoped environment
+/// variables carry the paths (`HYPRSTREAM_RECORDS_URL_FILE`,
+/// `HYPRSTREAM_RECORDS_SSLROOTCERT_FILE` — metal RDS runtime contract v1.1);
+/// as a last resort the shared credentials directory is consulted
+/// (`$HYPRSTREAM_POSTGRES_CREDENTIALS_PATH/records-url` and `rds-ca.pem`),
+/// but only when the `records-url` file actually exists there, so a
+/// credentials-role-only deployment never silently activates the records
+/// backend. An env var carries only the *path* to a secret file — the
+/// password-bearing URL itself never transits the process environment.
+///
+/// The URL file contains one newline-terminated libpq URL. It is file-backed
+/// so rotation/repointing is a deployment-side file swap, not a secret-bearing
+/// config or environment value.
+///
+/// `cell_id` stamps the cell (single-writer consistency domain) this node
+/// belongs to — the honorable-mention guard from the arch verdict so no code
+/// path assumes it is the only cell in the universe. For the demo leaf this is
+/// the one provider/region cell; it becomes the placement key at Stage 2.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RdsConfig {
+    /// Path to the records role's Postgres URL file. When `None` (and no
+    /// env binding resolves), the local backend (RocksDB) is used; deployed
+    /// records services resolve this to the records role's URL file.
+    #[serde(default)]
+    pub url_file: Option<PathBuf>,
+
+    /// Path to the records role's PEM CA file. Mandatory whenever
+    /// `url_file` is configured; the connector pins this trust store for the
+    /// RDS connection.
+    #[serde(default)]
+    pub root_cert_file: Option<PathBuf>,
+
+    /// Cell identifier (consistency-domain label). Stamped into the schema;
+    /// the demo leaf has exactly one cell. Honorable-mention guard from the
+    /// recursive-federation arch verdict.
+    #[serde(default = "default_rds_cell_id")]
+    pub cell_id: String,
+}
+
+/// A contract-validated records URL translated for the pinned driver.
+///
+/// The original password-bearing URL is intentionally private and this type
+/// does not implement `Debug` or `Display`. Metal's `verify-full` policy has
+/// already been checked structurally; the internal URL uses the pinned
+/// driver's `sslmode=require`, with CA and hostname verification supplied by
+/// the rustls connector. It deliberately does not implement `Debug` or
+/// `Display`, so a password-bearing URL cannot leak through diagnostics.
+#[cfg(feature = "pds-postgres")]
+pub(crate) struct ValidatedRdsUrl {
+    driver_url: String,
+    dns_hostname: String,
+}
+
+#[cfg(feature = "pds-postgres")]
+impl ValidatedRdsUrl {
+    #[cfg(feature = "pds-postgres")]
+    pub(crate) fn driver_url(&self) -> &str {
+        &self.driver_url
+    }
+
+    #[cfg(feature = "pds-postgres")]
+    pub(crate) fn dns_hostname(&self) -> &str {
+        &self.dns_hostname
+    }
+}
+
+fn default_rds_cell_id() -> String {
+    "demo-leaf".to_owned()
+}
+
+impl RdsConfig {
+    /// Records-role env var carrying the PATH to the Postgres URL file
+    /// (metal RDS runtime contract v1.1). Never the URL itself.
+    pub const RECORDS_URL_FILE_ENV: &'static str = "HYPRSTREAM_RECORDS_URL_FILE";
+    /// Records-role env var carrying the PATH to the pinned RDS CA PEM.
+    pub const RECORDS_SSLROOTCERT_FILE_ENV: &'static str =
+        "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE";
+    /// Shared Postgres credentials directory env var (metal renders the
+    /// per-role URL files and `rds-ca.pem` under it).
+    pub const POSTGRES_CREDENTIALS_PATH_ENV: &'static str = "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH";
+    /// File names metal renders under the shared credentials directory.
+    const RECORDS_URL_FILE_NAME: &'static str = "records-url";
+    const RDS_CA_FILE_NAME: &'static str = "rds-ca.pem";
+
+    /// True when a Postgres URL is configured (the deployed posture).
+    pub fn is_configured(&self) -> bool {
+        self.url_file.is_some()
+    }
+
+    /// Resolve the effective records-role binding. Explicit TOML values win;
+    /// otherwise the records role's scoped env vars; otherwise the shared
+    /// credentials directory — consulted only when `records-url` actually
+    /// exists there, so a credentials-role-only deployment does not activate
+    /// the records backend. The `cell_id` is preserved as configured.
+    ///
+    /// Fails closed when the directory fallback's `records-url` candidate is
+    /// rendered-but-broken: a stat failure other than `NotFound` (e.g. an
+    /// unreadable parent) is itself an error, and a dangling symlink still
+    /// binds so the later URL read fails loudly. Only a genuinely absent
+    /// candidate leaves the local backend selected — a broken binding must
+    /// never silently become "not rendered".
+    pub fn resolved_from_env(&self) -> anyhow::Result<Self> {
+        self.resolve_with(|key| std::env::var_os(key))
+    }
+
+    /// The testable core of [`Self::resolved_from_env`]: the environment is
+    /// injected so resolution is exercised without mutating process state.
+    fn resolve_with(
+        &self,
+        env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> anyhow::Result<Self> {
+        let credentials_dir = || env(Self::POSTGRES_CREDENTIALS_PATH_ENV).map(PathBuf::from);
+        let url_file = match self
+            .url_file
+            .clone()
+            .or_else(|| env(Self::RECORDS_URL_FILE_ENV).map(PathBuf::from))
+        {
+            Some(explicit) => Some(explicit),
+            None => match credentials_dir() {
+                Some(dir) => {
+                    let candidate = dir.join(Self::RECORDS_URL_FILE_NAME);
+                    // Directory fallback is opt-in by file presence: a shared
+                    // credentials dir that holds no records role must not turn
+                    // the records store Postgres-bound. Presence is lexical
+                    // (symlink_metadata, not is_file): a dangling symlink
+                    // still binds so the subsequent read fails closed, and a
+                    // stat error other than NotFound (ENOTDIR/EACCES on a
+                    // parent) is itself fatal — both are "rendered but
+                    // broken", never "not rendered".
+                    match std::fs::symlink_metadata(&candidate) {
+                        Ok(_) => Some(candidate),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "records-role URL candidate at {} cannot be stat'ed ({e}); \
+                                 refusing to silently select the local backend",
+                                candidate.display()
+                            ));
+                        }
+                    }
+                }
+                None => None,
+            },
+        };
+        let root_cert_file = self
+            .root_cert_file
+            .clone()
+            .or_else(|| env(Self::RECORDS_SSLROOTCERT_FILE_ENV).map(PathBuf::from))
+            .or_else(|| credentials_dir().map(|dir| dir.join(Self::RDS_CA_FILE_NAME)));
+        Ok(Self {
+            url_file,
+            root_cert_file,
+            cell_id: self.cell_id.clone(),
+        })
+    }
+
+    /// Read and validate the records role's URL and CA-file bindings.
+    ///
+    /// The contract URL must use `postgresql`/`postgres`, name one nonempty DNS
+    /// host, and contain exactly one query pair `sslmode=verify-full`. After
+    /// validation, that value is translated to the pinned driver's supported
+    /// `require` mode; rustls supplies the CA and hostname verification that
+    /// implements the validated verify-full policy.
+    #[cfg(feature = "pds-postgres")]
+    pub(crate) fn read_url(&self) -> anyhow::Result<ValidatedRdsUrl> {
+        let url_path = self
+            .url_file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("RDS url_file not configured"))?;
+        let root_cert_path = self
+            .root_cert_file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("RDS root_cert_file not configured"))?;
+
+        let url = std::fs::read_to_string(url_path)
+            .map_err(|e| anyhow::anyhow!("failed to read RDS url_file at {url_path:?}: {e}"))?;
+        let url = url.trim();
+        anyhow::ensure!(
+            !url.is_empty(),
+            "RDS url_file at {url_path:?} is empty — refusing to start with no backend"
+        );
+
+        let validated = Self::validate_url(url)
+            .map_err(|e| anyhow::anyhow!("RDS URL at {url_path:?} is nonconformant: {e}"))?;
+
+        std::fs::File::open(root_cert_path).map_err(|e| {
+            anyhow::anyhow!("RDS root_cert_file at {root_cert_path:?} is not readable: {e}")
+        })?;
+
+        Ok(validated)
+    }
+
+    /// Structurally validate the v1.1 URL and produce a driver-compatible URL.
+    /// The URL itself is never included in an error.
+    #[cfg(feature = "pds-postgres")]
+    pub(crate) fn validate_url(url: &str) -> anyhow::Result<ValidatedRdsUrl> {
+        let mut parsed =
+            url::Url::parse(url).map_err(|e| anyhow::anyhow!("not a valid URL: {e}"))?;
+
+        anyhow::ensure!(
+            matches!(parsed.scheme(), "postgresql" | "postgres"),
+            "URL scheme must be 'postgresql' or 'postgres', got '{}'",
+            parsed.scheme()
+        );
+
+        let dns_hostname = match parsed.host() {
+            Some(url::Host::Domain(host)) if !host.is_empty() => {
+                let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+                let loopback_name = ["local", "host"].concat();
+                let loopback_v4 = ["127", "0", "0", "1"].join(".");
+                anyhow::ensure!(
+                    normalized != loopback_name && normalized != loopback_v4,
+                    "URL host must not be a local loopback endpoint"
+                );
+                host.to_owned()
+            }
+            Some(url::Host::Ipv4(host)) => {
+                anyhow::ensure!(
+                    !host.is_loopback(),
+                    "URL host must not be a local loopback endpoint"
+                );
+                host.to_string()
+            }
+            Some(url::Host::Ipv6(host)) => {
+                anyhow::ensure!(
+                    !host.is_loopback(),
+                    "URL host must not be a local loopback endpoint"
+                );
+                host.to_string()
+            }
+            Some(url::Host::Domain(_)) | None => anyhow::bail!("URL is missing a nonempty host"),
+        };
+
+        let mut sslmode_values = Vec::new();
+        let mut driver_pairs = Vec::new();
+        for (key, value) in parsed.query_pairs() {
+            if key == "sslmode" {
+                sslmode_values.push(value.into_owned());
+                driver_pairs.push((key.into_owned(), "require".to_owned()));
+            } else {
+                driver_pairs.push((key.into_owned(), value.into_owned()));
+            }
+        }
+        anyhow::ensure!(
+            sslmode_values.len() == 1,
+            "URL must contain exactly one sslmode query parameter"
+        );
+        anyhow::ensure!(
+            sslmode_values[0] == "verify-full",
+            "sslmode must be exactly 'verify-full'"
+        );
+
+        parsed.query_pairs_mut().clear().extend_pairs(driver_pairs);
+        Ok(ValidatedRdsUrl {
+            driver_url: parsed.into(),
+            dns_hostname,
+        })
+    }
+
+    /// Return the explicit records CA-file path.
+    pub fn root_cert_file(&self) -> Option<&Path> {
+        self.root_cert_file.as_deref()
+    }
 }
 
 /// Persistent secrets storage configuration.
@@ -303,7 +585,9 @@ impl SecretsConfig {
     /// `HyprConfig::resolve_secrets_dir_for()` so env/config/XDG precedence is
     /// applied uniformly for all secret material.
     pub fn resolve_dir(&self, config_dir: &Path) -> PathBuf {
-        self.path.clone().unwrap_or_else(|| config_dir.join("credentials"))
+        self.path
+            .clone()
+            .unwrap_or_else(|| config_dir.join("credentials"))
     }
 
     /// Return the default secrets directory when no config is available.
@@ -441,8 +725,12 @@ impl TlsConfig {
     }
 }
 
-fn default_tls_enabled() -> bool { true }
-fn default_tls_server_name() -> String { "localhost".to_owned() }
+fn default_tls_enabled() -> bool {
+    true
+}
+fn default_tls_server_name() -> String {
+    "localhost".to_owned()
+}
 
 /// QUIC/WebTransport transport configuration.
 ///
@@ -566,7 +854,9 @@ impl QuicConfig {
 
     /// Parse bind_addr into a SocketAddr.
     pub fn socket_addr(&self) -> anyhow::Result<std::net::SocketAddr> {
-        self.bind_addr.parse().map_err(|e| anyhow::anyhow!("invalid quic.bind_addr '{}': {}", self.bind_addr, e))
+        self.bind_addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid quic.bind_addr '{}': {}", self.bind_addr, e))
     }
 
     /// Check if self-signed certificate should be generated.
@@ -623,10 +913,12 @@ impl QuicConfig {
             Ok((vec![materials.cert_der], materials.key_der))
         } else {
             // Load from files
-            let cert_pem = std::fs::read(&self.cert_path)
-                .map_err(|e| anyhow::anyhow!("failed to read cert_path '{}': {}", self.cert_path, e))?;
-            let key_pem = std::fs::read(&self.key_path)
-                .map_err(|e| anyhow::anyhow!("failed to read key_path '{}': {}", self.key_path, e))?;
+            let cert_pem = std::fs::read(&self.cert_path).map_err(|e| {
+                anyhow::anyhow!("failed to read cert_path '{}': {}", self.cert_path, e)
+            })?;
+            let key_pem = std::fs::read(&self.key_path).map_err(|e| {
+                anyhow::anyhow!("failed to read key_path '{}': {}", self.key_path, e)
+            })?;
 
             // Parse ALL certs from PEM (leaf + intermediates + CA)
             let cert_chain: Vec<Vec<u8>> = rustls_pemfile::certs(&mut &cert_pem[..])
@@ -636,7 +928,10 @@ impl QuicConfig {
                 .map(|c| c.to_vec())
                 .collect();
             if cert_chain.is_empty() {
-                return Err(anyhow::anyhow!("no certificate found in {}", self.cert_path));
+                return Err(anyhow::anyhow!(
+                    "no certificate found in {}",
+                    self.cert_path
+                ));
             }
 
             let key_der = Zeroizing::new(
@@ -696,12 +991,20 @@ impl QuicConfig {
     }
 }
 
-fn default_quic_enabled() -> bool { true }
+fn default_quic_enabled() -> bool {
+    true
+}
 /// #410: iroh substrate is the PRIMARY production transport — on by default.
 /// The quinn-only baseline is the legacy path; opt out with `[quic] iroh = false`.
-fn default_iroh_enabled() -> bool { true }
-fn default_quic_bind_addr() -> String { "0.0.0.0:4433".to_owned() }
-fn default_quic_server_name() -> String { "localhost".to_owned() }
+fn default_iroh_enabled() -> bool {
+    true
+}
+fn default_quic_bind_addr() -> String {
+    "0.0.0.0:4433".to_owned()
+}
+fn default_quic_server_name() -> String {
+    "localhost".to_owned()
+}
 
 /// JWT token issuance configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -717,13 +1020,17 @@ impl Default for TokenConfig {
     fn default() -> Self {
         Self {
             default_ttl_seconds: 172_800, // 48 hours
-            max_ttl_seconds: 172_800,    // 48 hours
+            max_ttl_seconds: 172_800,     // 48 hours
         }
     }
 }
 
-fn default_token_ttl() -> u32 { 172_800 }    // 48 hours
-fn default_max_token_ttl() -> u32 { 172_800 } // 48 hours
+fn default_token_ttl() -> u32 {
+    172_800
+} // 48 hours
+fn default_max_token_ttl() -> u32 {
+    172_800
+} // 48 hours
 
 /// OpenAI-compatible HTTP API configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -803,9 +1110,15 @@ fn resource_url_host(bind_host: &str) -> &str {
     }
 }
 
-fn default_oai_host() -> String { "0.0.0.0".to_owned() }
-fn default_oai_port() -> u16 { 6789 }
-fn default_oai_timeout() -> u64 { 300 }
+fn default_oai_host() -> String {
+    "0.0.0.0".to_owned()
+}
+fn default_oai_port() -> u16 {
+    6789
+}
+fn default_oai_timeout() -> u64 {
+    300
+}
 
 /// XetService configuration — HuggingFace-XET CAS HTTP face.
 ///
@@ -862,14 +1175,22 @@ impl XetConfig {
             } else {
                 "http"
             };
-            let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
+            let host = if self.host == "0.0.0.0" {
+                "localhost"
+            } else {
+                &self.host
+            };
             format!("{scheme}://{host}:{}", self.port)
         }
     }
 }
 
-fn default_xet_host() -> String { "0.0.0.0".to_owned() }
-fn default_xet_port() -> u16 { 6792 }
+fn default_xet_host() -> String {
+    "0.0.0.0".to_owned()
+}
+fn default_xet_port() -> u16 {
+    6792
+}
 
 /// Credential-free HTTPS verification face for `did:at9p` login assertions
 /// (#1114). A distinct listener with no cookies, no `Authorization`, and no
@@ -925,10 +1246,18 @@ impl Default for At9pVerifyConfig {
     }
 }
 
-fn default_at9p_verify_host() -> String { "0.0.0.0".to_owned() }
-fn default_at9p_verify_port() -> u16 { 6793 }
-fn default_at9p_verify_skew() -> u64 { 300 }
-fn default_at9p_verify_challenge_bytes() -> usize { 256 }
+fn default_at9p_verify_host() -> String {
+    "0.0.0.0".to_owned()
+}
+fn default_at9p_verify_port() -> u16 {
+    6793
+}
+fn default_at9p_verify_skew() -> u64 {
+    300
+}
+fn default_at9p_verify_challenge_bytes() -> usize {
+    256
+}
 
 /// Arrow Flight SQL server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -992,8 +1321,12 @@ impl FlightConfig {
     }
 }
 
-fn default_flight_host() -> String { "0.0.0.0".to_owned() }
-fn default_flight_port() -> u16 { 50051 }
+fn default_flight_host() -> String {
+    "0.0.0.0".to_owned()
+}
+fn default_flight_port() -> u16 {
+    50051
+}
 
 /// MCP service configuration (Model Context Protocol)
 ///
@@ -1057,14 +1390,22 @@ impl MCPConfig {
             } else {
                 "http"
             };
-            let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
+            let host = if self.host == "0.0.0.0" {
+                "localhost"
+            } else {
+                &self.host
+            };
             format!("{scheme}://{host}:{}", self.http_port)
         }
     }
 }
 
-fn default_mcp_host() -> String { "0.0.0.0".to_owned() }
-fn default_mcp_port() -> u16 { 6790 }
+fn default_mcp_host() -> String {
+    "0.0.0.0".to_owned()
+}
+fn default_mcp_port() -> u16 {
+    6790
+}
 
 /// Configuration for a trusted external OIDC issuer.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1084,7 +1425,9 @@ pub struct TrustedIssuerConfig {
     pub allow_http: bool,
 }
 
-fn default_jwks_cache_ttl() -> u64 { 300 }
+fn default_jwks_cache_ttl() -> u64 {
+    300
+}
 
 /// Configuration for a trusted mesh peer's post-quantum signing identity (#157).
 ///
@@ -1158,10 +1501,18 @@ impl Default for ClaimMapping {
     }
 }
 
-fn default_claim_sub() -> String { "sub".into() }
-fn default_claim_name() -> Option<String> { Some("name".into()) }
-fn default_claim_email() -> Option<String> { Some("email".into()) }
-fn default_claim_email_verified() -> Option<String> { Some("email_verified".into()) }
+fn default_claim_sub() -> String {
+    "sub".into()
+}
+fn default_claim_name() -> Option<String> {
+    Some("name".into())
+}
+fn default_claim_email() -> Option<String> {
+    Some("email".into())
+}
+fn default_claim_email_verified() -> Option<String> {
+    Some("email_verified".into())
+}
 
 /// Configuration for an external OIDC provider (login delegation).
 ///
@@ -1225,7 +1576,9 @@ pub struct OidcProviderConfig {
     pub clock_skew_seconds: u64,
 }
 
-fn default_pkce_supported() -> bool { true }
+fn default_pkce_supported() -> bool {
+    true
+}
 
 impl OidcProviderConfig {
     pub fn effective_authorization_endpoint(&self) -> Option<&str> {
@@ -1262,7 +1615,9 @@ impl OidcProviderConfig {
 fn default_oidc_scopes() -> Vec<String> {
     vec!["openid".into(), "profile".into(), "email".into()]
 }
-fn default_clock_skew() -> u64 { 60 }
+fn default_clock_skew() -> u64 {
+    60
+}
 
 /// How to map an external OIDC identity to a local hyprstream subject.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1532,26 +1887,20 @@ impl Default for OAuthConfig {
 impl OAuthConfig {
     /// Active key lifetime in seconds (`_secs` override wins over `_days * 86400`).
     pub fn active_secs(&self) -> i64 {
-        self.jwt_key_active_secs.map_or_else(
-            || i64::from(self.jwt_key_active_days) * 86400,
-            i64::from,
-        )
+        self.jwt_key_active_secs
+            .map_or_else(|| i64::from(self.jwt_key_active_days) * 86400, i64::from)
     }
 
     /// Lead pre-generation window in seconds.
     pub fn lead_secs(&self) -> i64 {
-        self.jwt_key_lead_secs.map_or_else(
-            || i64::from(self.jwt_key_lead_days) * 86400,
-            i64::from,
-        )
+        self.jwt_key_lead_secs
+            .map_or_else(|| i64::from(self.jwt_key_lead_days) * 86400, i64::from)
     }
 
     /// Drain retention window in seconds.
     pub fn drain_secs(&self) -> i64 {
-        self.jwt_key_drain_secs.map_or_else(
-            || i64::from(self.jwt_key_drain_days) * 86400,
-            i64::from,
-        )
+        self.jwt_key_drain_secs
+            .map_or_else(|| i64::from(self.jwt_key_drain_days) * 86400, i64::from)
     }
 
     /// Rotation check interval (default 6 hours).
@@ -1571,14 +1920,22 @@ impl OAuthConfig {
             } else {
                 "http"
             };
-            let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
+            let host = if self.host == "0.0.0.0" {
+                "localhost"
+            } else {
+                &self.host
+            };
             format!("{scheme}://{host}:{}", self.port)
         }
     }
 }
 
-fn default_oauth_host() -> String { "0.0.0.0".to_owned() }
-fn default_oauth_port() -> u16 { 6791 }
+fn default_oauth_host() -> String {
+    "0.0.0.0".to_owned()
+}
+fn default_oauth_port() -> u16 {
+    6791
+}
 
 /// Which backend stores user credentials and refresh tokens.
 ///
@@ -1617,10 +1974,16 @@ pub struct ValkeyCredentialsConfig {
     pub url: String,
 }
 
-fn default_valkey_url() -> String { "redis://127.0.0.1:6379".to_owned() }
+fn default_valkey_url() -> String {
+    "redis://127.0.0.1:6379".to_owned()
+}
 
 impl Default for ValkeyCredentialsConfig {
-    fn default() -> Self { Self { url: default_valkey_url() } }
+    fn default() -> Self {
+        Self {
+            url: default_valkey_url(),
+        }
+    }
 }
 
 /// Credentials storage configuration.
@@ -1663,12 +2026,24 @@ fn default_oauth_scopes() -> Vec<String> {
         "write:*:*".to_owned(),
     ]
 }
-fn default_oauth_token_ttl() -> u32 { 3600 }
-fn default_refresh_token_ttl() -> u32 { 2_628_000 } // 730 hours (~30 days)
-fn default_client_jwks_uri_cache_ttl() -> u64 { 3600 } // 1 hour
-fn default_jwt_key_active_days() -> u32 { 14 }
-fn default_jwt_key_lead_days() -> u32 { 7 }
-fn default_jwt_key_drain_days() -> u32 { 30 }
+fn default_oauth_token_ttl() -> u32 {
+    3600
+}
+fn default_refresh_token_ttl() -> u32 {
+    2_628_000
+} // 730 hours (~30 days)
+fn default_client_jwks_uri_cache_ttl() -> u64 {
+    3600
+} // 1 hour
+fn default_jwt_key_active_days() -> u32 {
+    14
+}
+fn default_jwt_key_lead_days() -> u32 {
+    7
+}
+fn default_jwt_key_drain_days() -> u32 {
+    30
+}
 
 /// StreamService configuration
 ///
@@ -1710,12 +2085,24 @@ impl Default for RpcServerConfig {
     }
 }
 
-fn default_rpc_stream_limit() -> usize { hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT }
-fn default_rpc_connection_limit() -> usize { hyprstream_rpc::transport::rpc_session::DEFAULT_CONNECTION_LIMIT }
-fn default_rpc_request_read_timeout_secs() -> u64 { hyprstream_rpc::transport::rpc_session::REQUEST_READ_TIMEOUT.as_secs() }
-fn default_rpc_handshake_timeout_secs() -> u64 { hyprstream_rpc::transport::rpc_session::HANDSHAKE_TIMEOUT.as_secs() }
-fn default_rpc_stopped_grace_secs() -> u64 { hyprstream_rpc::transport::rpc_session::STOPPED_GRACE.as_secs() }
-fn default_rpc_drain_timeout_secs() -> u64 { hyprstream_rpc::transport::rpc_session::DRAIN_TIMEOUT.as_secs() }
+fn default_rpc_stream_limit() -> usize {
+    hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT
+}
+fn default_rpc_connection_limit() -> usize {
+    hyprstream_rpc::transport::rpc_session::DEFAULT_CONNECTION_LIMIT
+}
+fn default_rpc_request_read_timeout_secs() -> u64 {
+    hyprstream_rpc::transport::rpc_session::REQUEST_READ_TIMEOUT.as_secs()
+}
+fn default_rpc_handshake_timeout_secs() -> u64 {
+    hyprstream_rpc::transport::rpc_session::HANDSHAKE_TIMEOUT.as_secs()
+}
+fn default_rpc_stopped_grace_secs() -> u64 {
+    hyprstream_rpc::transport::rpc_session::STOPPED_GRACE.as_secs()
+}
+fn default_rpc_drain_timeout_secs() -> u64 {
+    hyprstream_rpc::transport::rpc_session::DRAIN_TIMEOUT.as_secs()
+}
 
 impl RpcServerConfig {
     /// Convert to the `hyprstream_rpc` wire type consumed by server builders.
@@ -1795,9 +2182,15 @@ impl Default for StreamingConfig {
     }
 }
 
-fn default_max_pending_per_topic() -> usize { 1000 }
-fn default_message_ttl_secs() -> u64 { 30 }
-fn default_compact_interval_secs() -> u64 { 5 }
+fn default_max_pending_per_topic() -> usize {
+    1000
+}
+fn default_message_ttl_secs() -> u64 {
+    30
+}
+fn default_compact_interval_secs() -> u64 {
+    5
+}
 fn default_broadcast_announce_timeout_secs() -> u64 {
     hyprstream_rpc::moq_stream::BROADCAST_ANNOUNCE_TIMEOUT.as_secs()
 }
@@ -1826,10 +2219,18 @@ impl Default for StorageConfig {
         // Try to get XDG-compliant paths, fall back to current directory
         let (models_dir, loras_dir, cache_dir, config_dir) = match StoragePaths::new() {
             Ok(storage_paths) => (
-                storage_paths.models_dir().unwrap_or_else(|_| PathBuf::from("./models")),
-                storage_paths.loras_dir().unwrap_or_else(|_| PathBuf::from("./loras")),
-                storage_paths.cache_dir().unwrap_or_else(|_| PathBuf::from("./cache")),
-                storage_paths.config_dir().unwrap_or_else(|_| PathBuf::from("./config")),
+                storage_paths
+                    .models_dir()
+                    .unwrap_or_else(|_| PathBuf::from("./models")),
+                storage_paths
+                    .loras_dir()
+                    .unwrap_or_else(|_| PathBuf::from("./loras")),
+                storage_paths
+                    .cache_dir()
+                    .unwrap_or_else(|_| PathBuf::from("./cache")),
+                storage_paths
+                    .config_dir()
+                    .unwrap_or_else(|_| PathBuf::from("./config")),
             ),
             Err(e) => {
                 tracing::warn!("XDG paths unavailable: {}, using local directories", e);
@@ -1904,9 +2305,15 @@ pub struct TuiServiceConfig {
     pub wt_cert_validity_days: u32,
 }
 
-fn default_tui_max_sessions() -> u32 { 16 }
-fn default_tui_scrollback() -> usize { 2000 }
-fn default_tui_wt_cert_days() -> u32 { 14 }
+fn default_tui_max_sessions() -> u32 {
+    16
+}
+fn default_tui_scrollback() -> usize {
+    2000
+}
+fn default_tui_wt_cert_days() -> u32 {
+    14
+}
 
 impl Default for TuiServiceConfig {
     fn default() -> Self {
@@ -2086,8 +2493,14 @@ impl InferenceServerConfig {
             "inference.model_path is not a directory: {}",
             self.model_path.display()
         );
-        anyhow::ensure!(!self.model_ref.trim().is_empty(), "inference.model_ref is required");
-        anyhow::ensure!(!self.tenant.trim().is_empty(), "inference.tenant is required");
+        anyhow::ensure!(
+            !self.model_ref.trim().is_empty(),
+            "inference.model_ref is required"
+        );
+        anyhow::ensure!(
+            !self.tenant.trim().is_empty(),
+            "inference.tenant is required"
+        );
         let advertise_addr = self.advertise_addr.ok_or_else(|| {
             anyhow::anyhow!(
                 "inference.advertise_addr is required for network-addressable browser MoQ"
@@ -2127,9 +2540,7 @@ impl InferenceServerConfig {
     pub fn verify_materialized_oid(&self) -> anyhow::Result<()> {
         let model_path = self.model_path.canonicalize()?;
         let repository = git2::Repository::discover(&model_path).map_err(|error| {
-            anyhow::anyhow!(
-                "inference.model_path is not in a Git checkout: {error}"
-            )
+            anyhow::anyhow!("inference.model_path is not in a Git checkout: {error}")
         })?;
         let checkout = repository
             .workdir()
@@ -2287,7 +2698,12 @@ pub struct RuntimeConfig {
 /// the batch=1 path is the verified reference.
 fn default_continuous_batching() -> bool {
     std::env::var("HYPRSTREAM_CONTINUOUS_BATCH")
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -2315,7 +2731,12 @@ fn default_fp8_dequant_load() -> bool {
 /// default for the multi-GPU path (#315).
 fn default_strict_device() -> bool {
     std::env::var("HYPRSTREAM_STRICT_DEVICE")
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(true)
 }
 
@@ -2528,7 +2949,6 @@ impl Default for LoraAppConfig {
     }
 }
 
-
 /// Builder for Hyprstream configuration
 pub struct HyprConfigBuilder {
     server_builder: ServerConfigBuilder,
@@ -2685,6 +3105,7 @@ impl HyprConfigBuilder {
             account: self.account,
             #[cfg(feature = "ledger")]
             ledger: Default::default(),
+            rds: Default::default(),
             #[cfg(feature = "postgres-ledger")]
             ledger_postgres_url: None,
             #[cfg(feature = "postgres-ledger")]
@@ -2964,7 +3385,8 @@ impl HyprConfig {
             if let Some(ref hex_key) = cfg.signing_key {
                 let mut bytes = hex::decode(hex_key)
                     .map_err(|e| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: invalid hex: {e}"))?;
-                let mut arr: [u8; 32] = bytes.as_slice()
+                let mut arr: [u8; 32] = bytes
+                    .as_slice()
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: expected 32 bytes"))?;
                 let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
@@ -2985,11 +3407,12 @@ impl HyprConfig {
     ) -> anyhow::Result<Option<(ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey)>> {
         if let Ok(cfg) = Self::load() {
             if let Some(ref hex_key) = cfg.oauth.user_signing_key {
-                let mut bytes = hex::decode(hex_key)
-                    .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: invalid hex: {e}"))?;
-                let mut arr: [u8; 32] = bytes.as_slice()
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: expected 32 bytes"))?;
+                let mut bytes = hex::decode(hex_key).map_err(|e| {
+                    anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: invalid hex: {e}")
+                })?;
+                let mut arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                    anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: expected 32 bytes")
+                })?;
                 let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
                 bytes.zeroize();
                 arr.zeroize();
@@ -3010,7 +3433,8 @@ impl HyprConfig {
         config.model.name = model_path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("unknown").to_owned();
+            .unwrap_or("unknown")
+            .to_owned();
         config.model.architecture = "auto".to_owned(); // Auto-detect from model
 
         // Update storage paths to use XDG directories
@@ -3098,7 +3522,9 @@ pub struct SamplingParams {
 
 impl SamplingParams {
     /// Load model-specific config from a model directory
-    pub async fn from_model_path(model_path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn from_model_path(
+        model_path: &std::path::Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let gen_config_path = model_path.join("generation_config.json");
         if gen_config_path.exists() {
             let content = tokio::fs::read_to_string(&gen_config_path).await?;
@@ -3121,23 +3547,60 @@ impl SamplingParams {
     /// Parse HuggingFace generation_config.json format
     fn from_generation_config(config: &serde_json::Value) -> Self {
         Self {
-            temperature: config.get("temperature").and_then(serde_json::Value::as_f64).map(|v| v as f32),
-            top_k: config.get("top_k").and_then(serde_json::Value::as_u64).map(|v| v as usize),
-            top_p: config.get("top_p").and_then(serde_json::Value::as_f64).map(|v| v as f32),
-            repeat_penalty: config.get("repetition_penalty").and_then(serde_json::Value::as_f64).map(|v| v as f32),
-            max_tokens: config.get("max_new_tokens").and_then(serde_json::Value::as_u64).map(|v| v as usize)
-                .or_else(|| config.get("max_length").and_then(serde_json::Value::as_u64).map(|v| v as usize)),
-            length_penalty: config.get("length_penalty").and_then(serde_json::Value::as_f64).map(|v| v as f32),
-            typical_p: config.get("typical_p").and_then(serde_json::Value::as_f64).map(|v| v as f32),
-            epsilon_cutoff: config.get("epsilon_cutoff").and_then(serde_json::Value::as_f64).map(|v| v as f32),
-            eta_cutoff: config.get("eta_cutoff").and_then(serde_json::Value::as_f64).map(|v| v as f32),
+            temperature: config
+                .get("temperature")
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32),
+            top_k: config
+                .get("top_k")
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as usize),
+            top_p: config
+                .get("top_p")
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32),
+            repeat_penalty: config
+                .get("repetition_penalty")
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32),
+            max_tokens: config
+                .get("max_new_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as usize)
+                .or_else(|| {
+                    config
+                        .get("max_length")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|v| v as usize)
+                }),
+            length_penalty: config
+                .get("length_penalty")
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32),
+            typical_p: config
+                .get("typical_p")
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32),
+            epsilon_cutoff: config
+                .get("epsilon_cutoff")
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32),
+            eta_cutoff: config
+                .get("eta_cutoff")
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32),
             do_sample: config.get("do_sample").and_then(serde_json::Value::as_bool),
             stop_tokens: config.get("eos_token_id").and_then(|v| {
                 if let Some(arr) = v.as_array() {
-                    let tokens: Vec<String> = arr.iter()
+                    let tokens: Vec<String> = arr
+                        .iter()
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect();
-                    if tokens.is_empty() { None } else { Some(tokens) }
+                    if tokens.is_empty() {
+                        None
+                    } else {
+                        Some(tokens)
+                    }
                 } else {
                     None
                 }
@@ -3173,7 +3636,10 @@ impl SamplingParams {
     ///
     /// Applies `SamplingParams` fields as `Option<T>` — `None` means "not specified",
     /// letting the engine use its defaults.
-    pub fn into_generation_request(self, prompt: String) -> crate::services::generated::inference_client::GenerationRequest {
+    pub fn into_generation_request(
+        self,
+        prompt: String,
+    ) -> crate::services::generated::inference_client::GenerationRequest {
         crate::services::generated::inference_client::GenerationRequest {
             prompt,
             max_tokens: self.max_tokens.map(|v| v as u32),
@@ -3251,9 +3717,314 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[cfg(feature = "pds-postgres")]
+    fn rds_fixture(url: &str) -> (tempfile::TempDir, RdsConfig) {
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        let url_file = dir.path().join("records-url");
+        let root_cert_file = dir.path().join("rds-ca.pem");
+        std::fs::write(&url_file, format!("{url}\n")).unwrap_or_else(|e| panic!("{e}"));
+        // RdsConfig validates readability; the connector performs PEM parsing.
+        std::fs::write(&root_cert_file, b"connector-validates-this-pem")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let config = RdsConfig {
+            url_file: Some(url_file),
+            root_cert_file: Some(root_cert_file),
+            cell_id: "test-cell".to_owned(),
+        };
+        (dir, config)
+    }
+
+    /// Empty env lookup for `resolve_with` tests.
+    fn no_env(_: &str) -> Option<std::ffi::OsString> {
+        None
+    }
+
+    #[test]
+    fn rds_resolution_leaves_local_backend_when_unbound() {
+        let config = RdsConfig::default();
+        let resolved = config
+            .resolve_with(no_env)
+            .unwrap_or_else(|e| panic!("unbound resolution must not fail: {e}"));
+        assert!(!resolved.is_configured());
+        assert_eq!(resolved.root_cert_file, None);
+    }
+
+    #[test]
+    fn rds_resolution_binds_role_scoped_env_files() {
+        let config = RdsConfig::default();
+        let resolved = config
+            .resolve_with(|key| match key {
+                "HYPRSTREAM_RECORDS_URL_FILE" => Some("/run/cred/records-url".into()),
+                "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE" => Some("/run/cred/rds-ca.pem".into()),
+                _ => None,
+            })
+            .unwrap_or_else(|e| panic!("scoped-env resolution must not fail: {e}"));
+        assert!(resolved.is_configured());
+        assert_eq!(resolved.url_file.as_deref(), Some(Path::new("/run/cred/records-url")));
+        assert_eq!(
+            resolved.root_cert_file.as_deref(),
+            Some(Path::new("/run/cred/rds-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn rds_resolution_toml_overrides_env() {
+        let config = RdsConfig {
+            url_file: Some(PathBuf::from("/toml/records-url")),
+            root_cert_file: Some(PathBuf::from("/toml/rds-ca.pem")),
+            cell_id: "toml-cell".to_owned(),
+        };
+        let resolved = config
+            .resolve_with(|key| match key {
+                "HYPRSTREAM_RECORDS_URL_FILE" => Some("/env/records-url".into()),
+                "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE" => Some("/env/rds-ca.pem".into()),
+                "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some("/env".into()),
+                _ => None,
+            })
+            .unwrap_or_else(|e| panic!("TOML-pinned resolution must not fail: {e}"));
+        assert_eq!(resolved.url_file.as_deref(), Some(Path::new("/toml/records-url")));
+        assert_eq!(
+            resolved.root_cert_file.as_deref(),
+            Some(Path::new("/toml/rds-ca.pem"))
+        );
+        assert_eq!(resolved.cell_id, "toml-cell");
+    }
+
+    #[test]
+    fn rds_resolution_uses_credentials_dir_only_when_records_url_exists() {
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        let env = |key: &str| match key {
+            "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some(dir.path().as_os_str().to_owned()),
+            _ => None,
+        };
+
+        // A credentials-role-only directory (no records-url) must NOT
+        // activate the records backend.
+        let config = RdsConfig::default();
+        let resolved = config
+            .resolve_with(env)
+            .unwrap_or_else(|e| panic!("absent records-url must resolve cleanly: {e}"));
+        assert!(
+            !resolved.is_configured(),
+            "a shared credentials dir without records-url stays on the local backend"
+        );
+
+        // Once metal renders the records role into the directory, the binding
+        // resolves — including the CA file at its rendered location.
+        std::fs::write(dir.path().join("records-url"), b"postgresql://x\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let resolved = config
+            .resolve_with(env)
+            .unwrap_or_else(|e| panic!("rendered records-url must resolve: {e}"));
+        assert!(resolved.is_configured());
+        assert_eq!(resolved.url_file.as_deref(), Some(dir.path().join("records-url").as_path()));
+        assert_eq!(
+            resolved.root_cert_file.as_deref(),
+            Some(dir.path().join("rds-ca.pem").as_path())
+        );
+    }
+
+    #[test]
+    fn rds_resolution_role_env_wins_over_credentials_dir() {
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(dir.path().join("records-url"), b"postgresql://x\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let config = RdsConfig::default();
+        let resolved = config
+            .resolve_with(|key| match key {
+                "HYPRSTREAM_RECORDS_URL_FILE" => Some("/scoped/records-url".into()),
+                "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some(dir.path().as_os_str().to_owned()),
+                _ => None,
+            })
+            .unwrap_or_else(|e| panic!("scoped-env resolution must not fail: {e}"));
+        assert_eq!(
+            resolved.url_file.as_deref(),
+            Some(Path::new("/scoped/records-url")),
+            "the role-scoped env binding takes precedence over the shared directory"
+        );
+        // The CA still falls through to the rendered directory default.
+        assert_eq!(
+            resolved.root_cert_file.as_deref(),
+            Some(dir.path().join("rds-ca.pem").as_path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rds_resolution_distinguishes_absent_dangling_and_unstatable_records_url() {
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        let env = |key: &str| match key {
+            "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some(dir.path().as_os_str().to_owned()),
+            _ => None,
+        };
+        let config = RdsConfig::default();
+
+        // Genuinely absent → unbound (local backend), no error.
+        let resolved = config
+            .resolve_with(env)
+            .unwrap_or_else(|e| panic!("absent records-url must resolve cleanly: {e}"));
+        assert!(!resolved.is_configured());
+
+        // Dangling symlink → the binding still resolves (lexical presence),
+        // so the later URL read fails closed instead of silently keeping the
+        // local backend while an AZ peer runs RDS.
+        let dangling = dir.path().join("records-url");
+        std::os::unix::fs::symlink(dir.path().join("missing-target"), &dangling)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let resolved = config
+            .resolve_with(env)
+            .unwrap_or_else(|e| panic!("dangling records-url must still resolve: {e}"));
+        assert!(
+            resolved.is_configured(),
+            "a dangling records-url is rendered-but-broken: it must bind so the read fails closed"
+        );
+
+        // A stat error other than NotFound (here ENOTDIR: the credentials
+        // path is a regular file) is fatal at resolution, never silently local.
+        let file_dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        let not_a_dir = file_dir.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, b"x").unwrap_or_else(|e| panic!("{e}"));
+        let err = config
+            .resolve_with(|key| match key {
+                "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some(not_a_dir.as_os_str().to_owned()),
+                _ => None,
+            })
+            .err()
+            .unwrap_or_else(|| panic!("an unstat-able records-url candidate must fail resolution"));
+        assert!(
+            err.to_string().contains("cannot be stat'ed"),
+            "the error must name the stat failure: {err}"
+        );
+    }
+
+    #[cfg(feature = "pds-postgres")]
+    #[test]
+    fn rds_contract_accepts_exact_verify_full_and_translates_for_driver() {
+        let (_dir, config) = rds_fixture(
+            "postgresql://records:secret@db.internal.example/records?application_name=pds&sslmode=verify-full",
+        );
+        let validated = config
+            .read_url()
+            .unwrap_or_else(|e| panic!("valid records URL rejected: {e}"));
+
+        assert_eq!(validated.dns_hostname, "db.internal.example");
+        let parsed = url::Url::parse(&validated.driver_url)
+            .unwrap_or_else(|e| panic!("translated URL is invalid: {e}"));
+        let sslmodes: Vec<_> = parsed
+            .query_pairs()
+            .filter(|(key, _)| key == "sslmode")
+            .map(|(_, value)| value.into_owned())
+            .collect();
+        assert_eq!(sslmodes, ["require"]);
+    }
+
+    #[cfg(feature = "pds-postgres")]
+    #[test]
+    fn rds_contract_matches_decoded_sslmode_query_keys() {
+        let (_dir, config) = rds_fixture(
+            "postgresql://records:secret@db.internal.example/records?ssl%6dode=verify-full",
+        );
+        assert!(config.read_url().is_ok());
+    }
+
+    #[cfg(feature = "pds-postgres")]
+    #[test]
+    fn rds_contract_rejects_nonconforming_urls() {
+        let rejected = [
+            ("malformed", "not a URL"),
+            (
+                "wrong-scheme",
+                "https://db.internal.example/records?sslmode=verify-full",
+            ),
+            ("absent-host", "postgresql:///records?sslmode=verify-full"),
+            (
+                "canonical-ipv4-loopback",
+                "postgresql://127.0.0.1/records?sslmode=verify-full",
+            ),
+            (
+                "canonical-ipv6-loopback",
+                "postgresql://[::1]/records?sslmode=verify-full",
+            ),
+            (
+                "localhost",
+                "postgresql://localhost/records?sslmode=verify-full",
+            ),
+            ("absent-sslmode", "postgresql://db.internal.example/records"),
+            (
+                "disable",
+                "postgresql://db.internal.example/records?sslmode=disable",
+            ),
+            (
+                "allow",
+                "postgresql://db.internal.example/records?sslmode=allow",
+            ),
+            (
+                "prefer",
+                "postgresql://db.internal.example/records?sslmode=prefer",
+            ),
+            (
+                "require",
+                "postgresql://db.internal.example/records?sslmode=require",
+            ),
+            (
+                "verify-ca",
+                "postgresql://db.internal.example/records?sslmode=verify-ca",
+            ),
+            (
+                "duplicate",
+                "postgresql://db.internal.example/records?sslmode=verify-full&sslmode=verify-full",
+            ),
+            (
+                "conflict",
+                "postgresql://db.internal.example/records?sslmode=verify-full&sslmode=require",
+            ),
+            (
+                "decoded-duplicate",
+                "postgresql://db.internal.example/records?sslmode=verify-full&ssl%6dode=verify-full",
+            ),
+            (
+                "userinfo-marker-bypass",
+                "postgresql://user:sslmode=verify-full@db.internal.example/records",
+            ),
+        ];
+
+        for (case, url) in rejected {
+            let (_dir, config) = rds_fixture(url);
+            assert!(
+                config.read_url().is_err(),
+                "nonconforming case {case} was accepted"
+            );
+        }
+    }
+
+    #[cfg(feature = "pds-postgres")]
+    #[test]
+    fn rds_contract_does_not_extend_loopback_rejection_to_other_ip_spellings() {
+        for url in [
+            "postgresql://192.0.2.10/records?sslmode=verify-full",
+            "postgresql://[2001:db8::10]/records?sslmode=verify-full",
+        ] {
+            let (_dir, config) = rds_fixture(url);
+            assert!(config.read_url().is_ok(), "relaxed contract rejected {url}");
+        }
+    }
+
+    #[cfg(feature = "pds-postgres")]
+    #[test]
+    fn rds_contract_requires_explicit_readable_ca_file() {
+        let (_dir, mut config) = rds_fixture(
+            "postgres://records:secret@db.internal.example/records?sslmode=verify-full",
+        );
+        config.root_cert_file = None;
+        assert!(config.read_url().is_err());
+
+        config.root_cert_file = Some(std::path::PathBuf::from("/missing/records-rds-ca.pem"));
+        assert!(config.read_url().is_err());
+    }
     #[test]
     fn default_startup_services_are_available_in_this_build() {
         let startup = super::default_startup_services();
@@ -3516,11 +4287,7 @@ mod tests {
             model_oid: "1".repeat(40),
             tenant: "demo.example".to_owned(),
             quic_port: Some(7440),
-            advertise_addr: Some(
-                "192.0.2.10:7440"
-                    .parse()
-                    .unwrap_or_else(|e| panic!("{e}")),
-            ),
+            advertise_addr: Some("192.0.2.10:7440".parse().unwrap_or_else(|e| panic!("{e}"))),
             stage_start: 8,
             stage_end: Some(16),
             ..InferenceServerConfig::default()
@@ -3556,11 +4323,7 @@ mod tests {
             model_oid: "1".repeat(40),
             tenant: "demo.example".to_owned(),
             quic_port: Some(7441),
-            advertise_addr: Some(
-                "192.0.2.10:7440"
-                    .parse()
-                    .unwrap_or_else(|e| panic!("{e}")),
-            ),
+            advertise_addr: Some("192.0.2.10:7440".parse().unwrap_or_else(|e| panic!("{e}"))),
             ..InferenceServerConfig::default()
         };
 
@@ -3574,10 +4337,8 @@ mod tests {
     #[test]
     fn standalone_inference_verifies_materialized_git_oid() {
         let model = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
-        let repository =
-            git2::Repository::init(model.path()).unwrap_or_else(|e| panic!("{e}"));
-        std::fs::write(model.path().join("config.json"), b"{}")
-            .unwrap_or_else(|e| panic!("{e}"));
+        let repository = git2::Repository::init(model.path()).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(model.path().join("config.json"), b"{}").unwrap_or_else(|e| panic!("{e}"));
         std::fs::write(model.path().join(".gitignore"), b"ignored.bin\n")
             .unwrap_or_else(|e| panic!("{e}"));
         let mut index = repository.index().unwrap_or_else(|e| panic!("{e}"));
@@ -3592,18 +4353,10 @@ mod tests {
         let tree = repository
             .find_tree(tree_oid)
             .unwrap_or_else(|e| panic!("{e}"));
-        let signature =
-            git2::Signature::now("hyprstream-test", "test@hyprstream.local")
-                .unwrap_or_else(|e| panic!("{e}"));
+        let signature = git2::Signature::now("hyprstream-test", "test@hyprstream.local")
+            .unwrap_or_else(|e| panic!("{e}"));
         let oid = repository
-            .commit(
-                Some("HEAD"),
-                &signature,
-                &signature,
-                "fixture",
-                &tree,
-                &[],
-            )
+            .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
             .unwrap_or_else(|e| panic!("{e}"));
 
         let mut config = InferenceServerConfig {
@@ -3612,11 +4365,7 @@ mod tests {
             model_oid: oid.to_string(),
             tenant: "demo.example".to_owned(),
             quic_port: Some(7440),
-            advertise_addr: Some(
-                "192.0.2.10:7440"
-                    .parse()
-                    .unwrap_or_else(|e| panic!("{e}")),
-            ),
+            advertise_addr: Some("192.0.2.10:7440".parse().unwrap_or_else(|e| panic!("{e}"))),
             ..InferenceServerConfig::default()
         };
         config
@@ -3632,8 +4381,7 @@ mod tests {
             config.verify_materialized_oid().is_err(),
             "dirty tracked model bytes must not inherit the HEAD identity"
         );
-        std::fs::write(model.path().join("config.json"), b"{}")
-            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(model.path().join("config.json"), b"{}").unwrap_or_else(|e| panic!("{e}"));
 
         std::fs::write(model.path().join("ignored.bin"), b"mutable weights")
             .unwrap_or_else(|e| panic!("{e}"));
@@ -3641,8 +4389,7 @@ mod tests {
             config.verify_materialized_oid().is_err(),
             "ignored model bytes must not inherit the HEAD identity"
         );
-        std::fs::remove_file(model.path().join("ignored.bin"))
-            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::remove_file(model.path().join("ignored.bin")).unwrap_or_else(|e| panic!("{e}"));
 
         config.model_oid = "f".repeat(40);
         assert!(config.verify_materialized_oid().is_err());
@@ -3658,23 +4405,30 @@ mod tests {
 
         c.cluster_at9p_did = Some("did:at9p:example".to_owned());
         c.cluster_did_web = None;
-        assert!(c.validate().is_err(), "at9p without did:web must be rejected");
+        assert!(
+            c.validate().is_err(),
+            "at9p without did:web must be rejected"
+        );
 
         c.cluster_at9p_did = None;
         c.cluster_did_web = Some("did:web:example.com".to_owned());
-        assert!(c.validate().is_err(), "did:web without at9p must be rejected");
+        assert!(
+            c.validate().is_err(),
+            "did:web without at9p must be rejected"
+        );
 
         // Both absent: anchors simply not configured — the OS-owned path applies.
         c.cluster_did_web = None;
-        assert!(c.validate().is_ok(), "no anchors configured must remain valid");
+        assert!(
+            c.validate().is_ok(),
+            "no anchors configured must remain valid"
+        );
 
         // Both present: the pairing the resolver expects.
         c.cluster_at9p_did = Some("did:at9p:example".to_owned());
         c.cluster_did_web = Some("did:web:example.com".to_owned());
         assert!(c.validate().is_ok(), "paired anchors must be accepted");
     }
-
-    use super::*;
 
     /// Serialize process-env mutations for secrets-dir resolver tests.
     static SECRETS_DIR_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
@@ -3766,8 +4520,7 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
 
         let toml_str = toml::to_string_pretty(&config)
             .expect("a default worker section must serialize to TOML (F3)");
-        let parsed: HyprConfig =
-            toml::from_str(&toml_str).expect("round-trip parse must succeed");
+        let parsed: HyprConfig = toml::from_str(&toml_str).expect("round-trip parse must succeed");
         let admission = parsed
             .worker
             .expect("worker section round-trips")
@@ -3782,11 +4535,17 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
         let config = GenerationConfig::default();
 
         // Verify max_tokens is set to 2048 (not 100)
-        assert_eq!(config.max_tokens, 2048, "Default max_tokens should be 2048 for thinking mode support");
+        assert_eq!(
+            config.max_tokens, 2048,
+            "Default max_tokens should be 2048 for thinking mode support"
+        );
 
         // Verify other reasonable defaults
         assert!(config.temperature > 0.0, "Temperature should be non-zero");
-        assert!(config.top_p > 0.0 && config.top_p <= 1.0, "top_p should be in valid range");
+        assert!(
+            config.top_p > 0.0 && config.top_p <= 1.0,
+            "top_p should be in valid range"
+        );
     }
 
     #[test]
@@ -3830,9 +4589,7 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
             ..Default::default()
         };
 
-        let final_config = server_defaults
-            .merge(model_defaults)
-            .merge(user_overrides);
+        let final_config = server_defaults.merge(model_defaults).merge(user_overrides);
 
         assert_eq!(final_config.temperature, Some(0.9));
         assert_eq!(final_config.max_tokens, Some(512));
@@ -3893,7 +4650,10 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
     #[test]
     fn test_oauth_secs_overrides() {
         let mut config = OAuthConfig::default();
-        assert_eq!(config.active_secs(), i64::from(config.jwt_key_active_days) * 86400);
+        assert_eq!(
+            config.active_secs(),
+            i64::from(config.jwt_key_active_days) * 86400
+        );
         config.jwt_key_active_secs = Some(30);
         config.jwt_key_lead_secs = Some(25);
         config.jwt_key_drain_secs = Some(20);
@@ -3901,7 +4661,10 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
         assert_eq!(config.active_secs(), 30);
         assert_eq!(config.lead_secs(), 25);
         assert_eq!(config.drain_secs(), 20);
-        assert_eq!(config.rotation_check_interval(), std::time::Duration::from_secs(3));
+        assert_eq!(
+            config.rotation_check_interval(),
+            std::time::Duration::from_secs(3)
+        );
     }
 
     #[test]
@@ -3919,7 +4682,9 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
             .insert("legacy".to_owned(), provider);
 
         let err = config.validate().unwrap_err();
-        assert!(err.to_string().contains("disabled user_mapping = \"didweb\""));
+        assert!(err
+            .to_string()
+            .contains("disabled user_mapping = \"didweb\""));
     }
 
     #[test]
@@ -3929,12 +4694,20 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
         std::env::set_var("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30");
         let result = config::Config::builder()
             .add_source(config::Config::try_from(&HyprConfig::default()).unwrap())
-            .add_source(config::Environment::with_prefix("HYPRSTREAM").separator("__").try_parsing(true))
+            .add_source(
+                config::Environment::with_prefix("HYPRSTREAM")
+                    .separator("__")
+                    .try_parsing(true),
+            )
             .build()
             .and_then(config::Config::try_deserialize::<HyprConfig>);
         std::env::remove_var("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS");
         let cfg = result.expect("config should parse with env var");
-        assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30), "jwt_key_active_secs should be 30 from env");
+        assert_eq!(
+            cfg.oauth.jwt_key_active_secs,
+            Some(30),
+            "jwt_key_active_secs should be 30 from env"
+        );
         assert_eq!(cfg.oauth.active_secs(), 30);
     }
 
@@ -3945,7 +4718,10 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
     fn parse_device_list_basic() {
         assert_eq!(RuntimeConfig::parse_device_list("0,1").unwrap(), vec![0, 1]);
         // Whitespace around entries is tolerated.
-        assert_eq!(RuntimeConfig::parse_device_list(" 0 , 2 ").unwrap(), vec![0, 2]);
+        assert_eq!(
+            RuntimeConfig::parse_device_list(" 0 , 2 ").unwrap(),
+            vec![0, 2]
+        );
         assert_eq!(RuntimeConfig::parse_device_list("3").unwrap(), vec![3]);
     }
 
@@ -3999,7 +4775,10 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
         let mut legacy = RuntimeConfig::default();
         legacy.devices = vec![];
         legacy.gpu_device_id = Some(3);
-        assert_eq!(legacy.resolve_explicit_multi_device_indices().unwrap(), None);
+        assert_eq!(
+            legacy.resolve_explicit_multi_device_indices().unwrap(),
+            None
+        );
         assert_eq!(legacy.resolve_device_indices().unwrap(), Some(vec![3]));
 
         // Nothing requested anywhere → None (auto-detect path preserved).
@@ -4083,12 +4862,18 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
         fn set(key: &str, val: &str) -> Self {
             let prev = std::env::var(key).ok();
             std::env::set_var(key, val);
-            Self { key: key.to_owned(), prev }
+            Self {
+                key: key.to_owned(),
+                prev,
+            }
         }
         fn unset(key: &str) -> Self {
             let prev = std::env::var(key).ok();
             std::env::remove_var(key);
-            Self { key: key.to_owned(), prev }
+            Self {
+                key: key.to_owned(),
+                prev,
+            }
         }
     }
     impl Drop for EnvVarGuard {
