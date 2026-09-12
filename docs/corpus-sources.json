@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "source_commit": "81574fe1c8ca106a5d7d93276b686c1ac3803542",
+  "source_tree": "b01c98f79a6072a16e18198c3e1cf3c2ffe890b1",
+  "source_input_digest": "635969d234e4706c3a1966c7fbc3d5538a4b8fc57cb2ae5d79ddf7e1d6b20cd0",
+  "authority": "docs/system-ontology.md",
+  "api_manifest": {"version": 1, "path": "api/v1/{service}/{scope}/{method}.json", "id": "api:{service}:{scope}:{method}", "integrity": "sha256 of canonical UTF-8 JSON", "limit_bytes": 1048576},
+  "corpus_manifest": {"version": 1, "path": "corpus/v1/{document_id}.md", "id": "doc:{repository-relative-path}", "integrity": "sha256 of source bytes", "limit_bytes": 2097152},
+  "public_prose": [
+    {"glob":"docs/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository prose"},
+    {"glob":"docs/adr/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository ADR"},
+    {"glob":"docs/contracts/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository contract"},
+    {"glob":"docs/deployment/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository deployment guide"},
+    {"glob":"docs/network/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository network guide"},
+    {"glob":"docs/security/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository security guide"},
+    {"glob":"docs/standards/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository standards guide"},
+    {"glob":"docs/standards/adr/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository standards ADR"},
+    {"glob":"docs/standards/analysis/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository analysis"},
+    {"glob":"docs/standards/runbooks/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository runbook"},
+    {"glob":"docs/standards/v16/**/*.md","license":"AGPL-3.0-only","provenance":"tracked first-party repository v16 specification"}
+  ],
+  "excluded": [
+    {"glob":".fleet-coord/**","reason":"local coordination and handoff state is not publication input"},
+    {"glob":"docs/plans/**","reason":"unpublished planning artifacts are not corpus material"},
+    {"glob":"docs/standards/rfc/**","reason":"third-party or separately licensed RFC renderings require their own release review"},
+    {"glob":"docs/.obsidian/**","reason":"editor-local state"},
+    {"glob":"**/.env*","reason":"secrets and local credentials are never publication input"},
+    {"glob":"codegen-out/**","reason":"ignored generated artifacts are not source corpus"},
+    {"glob":"dist/**","reason":"release output is not source corpus"}
+  ],
+  "package_contract": {
+    "name": "@hyprstream/docs",
+    "state": "declared-not-yet-published",
+    "exports": {"./manifest":"./manifest.json","./api/*":"./api/v1/*","./corpus/*":"./corpus/v1/*"},
+    "requirements": ["Publish only validated manifest entries.", "Preserve source license and provenance per document.", "Do not package excluded paths or generated output without a separate license review.", "Keep docs/system-ontology.md authoritative; projections may link to it but may not redefine canonical terms."]
+  }
+}

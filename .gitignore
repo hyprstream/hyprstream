@@ -25,3 +25,4 @@ docs/.obsidian/
 
 # CI browser-conformance runtime receipt (written by browser-wasm-test.sh)
 browser-wasm-receipt.txt
+__pycache__/
