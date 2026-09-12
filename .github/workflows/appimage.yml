@@ -147,6 +147,14 @@ jobs:
             test -d "appimage/build/universal-staging/lib/${variant}/libtorch/lib"
           done
 
+      - name: Restore backend executable bits
+        run: |
+          set -euo pipefail
+          chmod +x appimage/build/universal-staging/bin/hyprstream-*
+          for variant in cpu cuda128 cuda130 rocm71; do
+            test -x "appimage/build/universal-staging/bin/hyprstream-${variant}"
+          done
+
       - name: Package Universal AppImage
         run: |
           ./appimage/build-appimage.sh package-universal --version ${{ steps.version.outputs.version }}
