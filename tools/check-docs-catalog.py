@@ -404,12 +404,44 @@ def strip_capnp_noncode(source: str) -> str:
     return "".join(out)
 
 
+def js_code_and_strings(source: str) -> tuple[str, dict[int, str]]:
+    """Offset-preserving JS/TS lexer: blank comments, mask string bodies, and
+    record each string body keyed by its placeholder offset in the output."""
+    out: list[str] = []
+    strings: dict[int, str] = {}
+    cursor, index, length = 0, 0, len(source)
+    while index < length:
+        char = source[index]
+        pair = source[index:index + 2]
+        if pair == "//" or pair == "/*":
+            end = source.find("\n", index) if pair == "//" else source.find("*/", index + 2)
+            end = length if end < 0 else end if pair == "//" else end + 2
+            blank = "".join("\n" if c == "\n" else " " for c in source[index:end])
+            out.append(blank); cursor += len(blank); index = end; continue
+        if char in "'\"`":
+            end = index + 1
+            while end < length:
+                if source[end] == "\\":
+                    end += 2; continue
+                end += 1
+                if source[end - 1] == char:
+                    break
+            body = source[index + 1:end - 1] if source[end - 1:end] == char else source[index + 1:end]
+            out.append(char + "\0" * len(body) + char)
+            strings[cursor + 1] = body
+            cursor += len(body) + 2
+            index = end; continue
+        out.append(char); cursor += 1; index += 1
+    return "".join(out), strings
+
+
 def typescript_schema_sources(repo: Path, mutations: dict[str, str] | None = None,
                               candidates: list[str] | None = None) -> list[str]:
-    """Select only tracked frontend sources with an explicit schema/CGR dependency."""
+    """Select tracked frontend sources importing or requiring a schema dependency."""
     candidates = candidates if candidates is not None else tracked(repo, "*.ts", "*.tsx", "*.js", "*.jsx", "package.json")
     result = []
-    marker = re.compile(r"(?:@hyprstream/docs|codegen-out|\.capnp(?:[\"'`]|$))")
+    marker = re.compile(r"@hyprstream/docs|codegen-out|\.capnp$")
+    dependency = re.compile(r"(?:\brequire\s*\(\s*|\bimport\s*\(\s*|\bimport\s+|\bfrom\s+)(['\"]\0+['\"])")
     for path in candidates:
         source = text(repo, path, mutations)
         if path == "package.json":
@@ -420,8 +452,13 @@ def typescript_schema_sources(repo: Path, mutations: dict[str, str] | None = Non
             sections = (package.get("dependencies", {}), package.get("devDependencies", {}), package.get("peerDependencies", {}))
             if any("@hyprstream/docs" in section for section in sections if isinstance(section, dict)):
                 result.append(path)
-        elif marker.search(source):
-            result.append(path)
+            continue
+        code, strings = js_code_and_strings(source)
+        for match in dependency.finditer(code):
+            specifier = strings.get(match.start(1) + 1)
+            if specifier is not None and marker.search(specifier):
+                result.append(path)
+                break
     return sorted(result)
 
 
@@ -566,19 +603,27 @@ def capnp_only_inputs(build_file: str, source: str) -> list[str]:
             return None
         return base + "/" + joined
     inputs: list[str] = []
-    for match in re.finditer(r'\bcapnpc\s*::\s*CompilerCommand\s*::\s*new\s*\(\s*\)(?:(?!;).)*?\.file\s*\(\s*', code, re.DOTALL):
-        tail = source[match.end():]
-        binding = re.match(r'&?([A-Za-z_]\w*)', tail)
-        if binding is not None:
-            choices = [entry for entry in bindings.get(binding.group(1), []) if entry[0] < match.start()]
-            resolved = resolve(choices[-1]) if choices else None
-            required(resolved is not None,
-                     f"{build_file} capnp-only compiler input is unresolved")
-            raw = resolved[7:].replace("{manifest}", build_dir) if resolved.startswith("format:") else build_dir + "/" + resolved
-        else:
-            raw, _ = rust_literal(source, match.end(), "capnp-only compiler input")
-        raw = raw.replace("{manifest}", build_dir)
-        inputs.append(os.path.normpath(raw).replace("\\", "/"))
+    for match in re.finditer(r'\bcapnpc\s*::\s*CompilerCommand\s*::\s*new\s*\(\s*\)(?:(?!;).)*?;', code, re.DOTALL):
+        calls = list(re.finditer(r'\.file\s*\(\s*', code[match.start():match.end()]))
+        required(calls, f"{build_file} capnp-only compiler command lacks an input")
+        for call in calls:
+            at = match.start() + call.end()
+            argument = re.match(r'&([A-Za-z_]\w*)\s*[,)]', source[at:])
+            if argument is not None:
+                position = match.start() + call.start()
+                choices = [entry for entry in bindings.get(argument.group(1), []) if entry[0] < position]
+                resolved = resolve(choices[-1]) if choices else None
+                required(resolved is not None,
+                         f"{build_file} capnp-only compiler input is unresolved")
+                raw = resolved[7:].replace("{manifest}", build_dir) if resolved.startswith("format:") else build_dir + "/" + resolved
+            else:
+                try:
+                    raw, end = rust_literal(source, at, "capnp-only compiler input")
+                except CatalogError as error:
+                    raise CatalogError(f"{build_file} capnp-only compiler input is unparseable") from error
+                required(re.match(r'\s*[,)]', source[end:]) is not None,
+                         f"{build_file} capnp-only compiler input is unparseable")
+            inputs.append(os.path.normpath(raw.replace("{manifest}", build_dir)).replace("\\", "/"))
     return inputs
 
 
@@ -1029,6 +1074,12 @@ def self_test(repo: Path) -> None:
     )
     expect_failure("direct capnpc compiles uncompiled schema", repo, copy.deepcopy(catalog), corpus,
                    schemas, consumers, {discovery_build: direct_drift})
+    chained_drift = text(repo, discovery_build, None).replace(
+        "\n}",
+        '\n    capnpc::CompilerCommand::new().file("{manifest}/../hyprstream-rpc/schema/nine.capnp").file("../hyprstream-pay/schema/settlement.capnp").run().expect("chained");\n}', 1
+    )
+    expect_failure("chained capnpc supplies uncompiled schema", repo, copy.deepcopy(catalog), corpus,
+                   schemas, consumers, {discovery_build: chained_drift})
     shadowed = text(repo, discovery_build, None).replace(
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");\n    let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-workers/schema");',
@@ -1080,6 +1131,12 @@ def self_test(repo: Path) -> None:
              "unrelated tracked JavaScript is a schema consumer")
     required(set(typescript_schema_sources(repo)) <= set(provenance_paths(repo, corpus)),
              "TypeScript schema consumers are omitted from the provenance digest")
+    real_import = {"web/real.ts": 'import { manifest } from "@hyprstream/docs";\nexport const tree = require("./generated/catalog.capnp");\n'}
+    required(typescript_schema_sources(repo, real_import, ["web/real.ts"]) == ["web/real.ts"],
+             "valid schema import or require missed")
+    marked_comment = {"web/decoy.ts": '// import { manifest } from "@hyprstream/docs";\n/* const tree = require("./generated/echo.capnp"); */\nconst note = "loads codegen-out via @hyprstream/docs .capnp";\n'}
+    required(typescript_schema_sources(repo, marked_comment, ["web/decoy.ts"]) == [],
+             "commented or string-only schema marker counted as a consumer")
     mcp_path = "crates/hyprstream/src/services/mcp_service.rs"
     for label, needle in [("hidden policy", "if method.hidden {"),
                           ("streaming policy", "if method.is_streaming {")]:
