@@ -2682,6 +2682,119 @@ mod tests {
         }
     }
 
+    // ===== Session-cache recording vs cancellation-before-first-poll =====
+
+    /// Minimal `ArchitectureConfig` for the recording stub below: no model
+    /// math is exercised, only the configuration surface the trait requires.
+    struct StubArchConfig;
+    impl crate::runtime::architectures::ArchitectureConfig for StubArchConfig {
+        fn num_attention_heads(&self) -> usize { 4 }
+        fn num_key_value_heads(&self) -> usize { 4 }
+        fn hidden_size(&self) -> usize { 16 }
+        fn intermediate_size(&self) -> usize { 32 }
+        fn vocab_size(&self) -> usize { 16 }
+        fn max_position_embeddings(&self) -> usize { 64 }
+        fn rope_theta(&self) -> Option<f32> { None }
+        fn rope_dim(&self) -> Option<usize> { None }
+        fn layer_norm_eps(&self) -> f32 { 1e-5 }
+        fn use_rms_norm(&self) -> bool { true }
+    }
+
+    /// Model stub for cache-recording tests: holds a real (empty)
+    /// `KVCacheManager` and serves it to the engine's save path via
+    /// `get_kv_cache`. No forward is ever called — these tests exercise stream
+    /// construction, drop, and cache recording only, so every compute method
+    /// stays on the trait's `Err`/no-op defaults.
+    struct RecordingStubModel {
+        cache: Option<Arc<Mutex<crate::runtime::KVCacheManager>>>,
+    }
+    impl ModelOperations for RecordingStubModel {
+        fn architecture(&self) -> crate::runtime::architectures::ModelArchitecture {
+            crate::runtime::architectures::ModelArchitecture::Llama { version: 3 }
+        }
+        fn config(&self) -> &dyn crate::runtime::architectures::ArchitectureConfig {
+            &StubArchConfig
+        }
+        fn forward(&self, _input: &Tensor, _past_kv: Option<&Tensor>) -> Result<Tensor> {
+            Err(anyhow!("recording tests never poll the stream"))
+        }
+        fn reshape_for_attention(&self, tensor: &Tensor, _is_key_value: bool) -> Result<Tensor> {
+            Ok(tensor.shallow_clone())
+        }
+        fn apply_rope(&self, tensor: &Tensor, _position_ids: &Tensor) -> Result<Tensor> {
+            Ok(tensor.shallow_clone())
+        }
+        fn normalize(&self, tensor: &Tensor) -> Result<Tensor> {
+            Ok(tensor.shallow_clone())
+        }
+        fn get_attention_mask(&self, _seq_len: usize, _past_kv_len: usize) -> Result<Tensor> {
+            Err(anyhow!("recording tests never poll the stream"))
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn get_kv_cache(
+            &self,
+        ) -> Option<Arc<Mutex<crate::runtime::KVCacheManager>>> {
+            self.cache.clone()
+        }
+    }
+
+    /// Regression (cancellation before first poll): dropping a stream that was
+    /// never polled must NOT record its prompt IDs into the session cache.
+    /// Exact-hit/miss resolution in `TextStream::new` clears the cache at
+    /// generation setup, before any forward — recording IDs over that empty
+    /// state would let a later extending prompt claim a prefix_len against KV
+    /// that does not exist (the pure-attention hit path would partial-prefill
+    /// from mid-prompt with no history behind it). `prefill_time_ms` is Some
+    /// exactly when the first prefill forward completed, so it gates recording.
+    #[test]
+    fn drop_before_first_poll_does_not_record_session_cache() {
+        let mut engine = TorchEngine::new(RuntimeConfig {
+            use_gpu: false,
+            ..RuntimeConfig::default()
+        })
+        .expect("CPU engine should construct without a model");
+
+        // In-memory tokenizer (same pattern as the log-redaction tests);
+        // "hello world" → [0, 1].
+        *engine.tokenizer.lock() = Some(redact_test_tokenizer());
+
+        // A real empty KV cache served by the stub model — the recording target.
+        let cache: Arc<Mutex<crate::runtime::KVCacheManager>> =
+            Arc::new(Mutex::new(crate::runtime::KVCacheManager::new(
+            2,
+            64,
+            crate::runtime::KVQuantType::None,
+        )));
+        engine.persistent_model = Some(Arc::new(Mutex::new(Box::new(RecordingStubModel {
+            cache: Some(cache.clone()),
+        }))));
+
+        let request = GenerationRequest {
+            prompt: "hello world".to_owned(),
+            ..Default::default()
+        };
+        let stream = TextStream::new(&engine, request).expect("stream should construct");
+        // Cancellation: dropped before the first poll — no prefill ever ran.
+        drop(stream);
+
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            0,
+            "a drop before the first poll must not record prompt IDs over the cleared cache"
+        );
+
+        // The downstream hazard: a later extending prompt must not claim a
+        // reusable prefix over state that was never prefilled.
+        let extended = vec![0i64, 1, 5, 9];
+        assert_eq!(
+            cache.lock().prefix_match_len(&extended),
+            0,
+            "no prefix may be claimed over cache state that was never computed"
+        );
+    }
+
     /// Run `f` under a thread-local TRACE subscriber whose output is captured.
     /// TRACE is deliberate: #1253 forbids relocating prompt text to DEBUG, so
     /// the canary must be absent even at the lowest log level.
@@ -3685,6 +3798,20 @@ impl<'a> TextStream<'a> {
     /// captured in `sample_next_token` is stored alongside the tokens, making
     /// the next turn's prefix hit rewindable (`rewind_session_state`).
     fn save_cached_tokens(&mut self) {
+        // Session-cache recording describes the model's live KV/SSM state,
+        // which exists only once this stream's first prefill completed. A drop
+        // before the first poll (cancellation, client disconnect) reaches this
+        // Drop with the cache already cleared — exact-hit/miss resolution runs
+        // at generation setup, before any forward — and a failed first prefill
+        // can leave partial forward state matching no token count. Recording
+        // prompt IDs in either case lets a later extending prompt claim a
+        // prefix_len over missing or wrong state (a pure-attention partial
+        // prefill would then resume with no history behind it). `prefill_time_ms`
+        // is set exactly when the first prefill forward returned successfully
+        // (see `sample_next_token`), so it is the fail-safe recording gate.
+        if self.prefill_time_ms.is_none() {
+            return;
+        }
         if let Some(model_arc) = &self.engine.persistent_model {
             let model = model_arc.lock();
             if let Some(cache) = model.get_kv_cache() {
