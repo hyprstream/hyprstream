@@ -116,8 +116,9 @@ pub struct PublicCreateRequest {
     /// A validated AT record key, including singleton keys such as `self`.
     pub rkey: AtprotoRecordKey,
     pub value: DagCbor,
-    /// Required repo-head CAS value. None means this must create the genesis
-    /// record; retries use the request id and never silently fork a head.
+    /// Optional repo-head CAS value. Omitting it accepts the current empty
+    /// public genesis only; retries use the request id and never silently fork
+    /// a non-empty head.
     pub expected_prev: Option<Cid>,
 }
 
@@ -247,13 +248,15 @@ impl PublicRepoStore {
                 })?;
             records.insert((collection.to_owned(), rkey), record);
         }
-        if records.is_empty() {
-            return Ok(None);
-        }
-        let bytes = snapshot
+        let Some(bytes) = snapshot
             .get(commit_key(did))
             .context("public repo commit read failed")?
-            .ok_or_else(|| anyhow!("public repo has records but no signed commit"))?;
+        else {
+            if records.is_empty() {
+                return Ok(None);
+            }
+            return Err(anyhow!("public repo has records but no signed commit"));
+        };
         let commit = Commit::from_atproto_dag_cbor(&bytes)
             .context("public repo signed commit is invalid")?;
         ensure!(commit.did == did, "public repo commit DID mismatch");
@@ -274,6 +277,55 @@ impl PublicRepoStore {
             records,
             commit,
         }))
+    }
+
+    /// Seed the public store with the canonical dual-format genesis emitted
+    /// at hosted-account mint time. The native DID-bound commit is never
+    /// re-encoded here; this method accepts only a separately signed public
+    /// commit whose fields and empty MST root are verified under the same key.
+    pub fn seed_public_genesis(
+        &self,
+        did: &str,
+        commit: Commit,
+        verifying_key: &p256::ecdsa::VerifyingKey,
+    ) -> Result<()> {
+        validate_did(did)?;
+        ensure!(commit.did == did, "public genesis DID mismatch");
+        ensure!(commit.prev.is_none(), "public genesis must not have a parent");
+        commit.verify_atproto(verifying_key)?;
+        let empty = Node::empty();
+        let (root, _) = empty.to_node_data_with_blocks_atproto()?;
+        ensure!(
+            commit.data == root.cid_atproto()?,
+            "public genesis does not cover the canonical empty MST"
+        );
+        let bytes = commit.to_atproto_dag_cbor()?;
+        let cid = commit.cid_atproto()?;
+        let account = {
+            let mut accounts = self.accounts.lock();
+            Arc::clone(accounts.entry(did.to_owned()).or_default())
+        };
+        let _state = account.active_key.lock();
+        if let Some(existing) = self.snapshot(did)? {
+            ensure!(
+                existing.records.is_empty() && existing.commit.cid_atproto()? == cid,
+                "public repository already has a different genesis"
+            );
+            return Ok(());
+        }
+        ensure!(
+            self.db.get(commit_key(did))?.is_none(),
+            "public repository has a head without readable records"
+        );
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(commit_block_key(did, &cid.to_string()), &bytes);
+        batch.put(commit_key(did), bytes);
+        let mut options = rocksdb::WriteOptions::default();
+        options.set_sync(true);
+        self.db
+            .write_opt(batch, &options)
+            .context("public repo genesis transaction failed")?;
+        Ok(())
     }
 
     fn intent(&self, did: &str, request_id: &str) -> Result<Option<PublicationIntent>> {
@@ -509,7 +561,10 @@ impl PublicRepoWriter {
                 let previous = snapshot.commit.cid_atproto()?;
                 let previous_rev = snapshot.commit.rev;
                 ensure!(
-                    request.expected_prev == Some(previous),
+                    request.expected_prev == Some(previous)
+                        || (request.expected_prev.is_none()
+                            && snapshot.records.is_empty()
+                            && snapshot.commit.prev.is_none()),
                     "public repo head CAS conflict"
                 );
                 let keyed = snapshot
@@ -607,7 +662,10 @@ impl PublicRepoWriter {
                 let previous = snapshot.commit.cid_atproto()?;
                 ensure!(
                     preparation.unsigned.prev == Some(previous)
-                        && request.expected_prev == Some(previous),
+                        && (request.expected_prev == Some(previous)
+                            || (request.expected_prev.is_none()
+                                && snapshot.records.is_empty()
+                                && snapshot.commit.prev.is_none())),
                     "public repo head CAS conflict"
                 );
                 keyed = snapshot
@@ -951,6 +1009,40 @@ impl HostedAccountPublicRepoWriter {
             .await
             .context("resolve hosted account public signing authority")?
             .ok_or_else(|| anyhow!("hosted account is not locally owned"))?;
+        let (native_bytes, public_bytes) = self
+            .account_store
+            .hosted_repo_genesis_for_hosted_did(&self.authority, &request.did)
+            .await
+            .context("resolve hosted repository genesis bridge")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "hosted account has no dual-format repository genesis; public write is disabled"
+                )
+            })?;
+        let native = Commit::from_dag_cbor(&native_bytes)
+            .context("decode hosted native repository genesis")?;
+        native
+            .verify(&verifying_key)
+            .context("hosted native repository genesis signature is invalid")?;
+        ensure!(
+            native.did == request.did && native.prev.is_none(),
+            "hosted native repository genesis is not the requested empty account"
+        );
+        let public = Commit::from_atproto_dag_cbor(&public_bytes)
+            .context("decode hosted public repository genesis")?;
+        public
+            .verify_atproto(&verifying_key)
+            .context("hosted public repository genesis signature is invalid")?;
+        ensure!(
+            public.did == native.did
+                && public.data == native.data
+                && public.rev == native.rev
+                && public.prev == native.prev,
+            "hosted dual-format repository genesis state differs"
+        );
+        self.store
+            .seed_public_genesis(&request.did, public, &verifying_key)
+            .context("seed hosted public repository genesis")?;
         let writer = PublicRepoWriter::new_external(
             Arc::clone(&self.store),
             request.did.clone(),

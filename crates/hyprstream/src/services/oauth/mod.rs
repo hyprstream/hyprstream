@@ -2465,9 +2465,9 @@ mod tests {
             account_rotations,
         )?;
         let account_document = account_mint.seal_did_document(ISSUER)?;
-        let pending_account = account_mint.prepare_genesis(
+        let (pending_account, hosted_repo) = account_mint.prepare_pds_genesis(
             account_document,
-            hyprstream_pds::did_op::GenesisRepoHead::EmptyRepo,
+            hyprstream_pds::tid::Tid::from_micros(7, 1),
         )?;
         let account_signature = hyprstream_pds::did_op::sign_genesis(
             pending_account.unsigned_genesis(),
@@ -2496,6 +2496,20 @@ mod tests {
                         .with_child(
                             hyprstream_pds::ATPROTO_SIGNING_KEY_FILE,
                             SyntheticNode::file(atproto_signing_key.to_bytes().to_vec()),
+                        )
+                        .with_child(
+                            "repo",
+                            SyntheticNode::dir()
+                                .with_child(
+                                    "commit.cbor",
+                                    SyntheticNode::file(hosted_repo.commit_bytes().to_vec()),
+                                )
+                                .with_child(
+                                    "public-commit.cbor",
+                                    SyntheticNode::file(
+                                        hosted_repo.public_commit_bytes().to_vec(),
+                                    ),
+                                ),
                         ),
                 ),
             ),

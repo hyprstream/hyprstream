@@ -686,6 +686,24 @@ fn verify_resumable_signup_publication(
                 .is_ok_and(|head| head == commit_cid.to_string()),
         "published hosted signup repo genesis is incomplete or inconsistent"
     );
+    let public_commit_bytes = read_authority_artifact(
+        &account_dir.join("repo/public-commit.cbor"),
+    )
+    .context("reading published hosted public repo genesis")?;
+    let public_commit = hyprstream_pds::commit::Commit::from_atproto_dag_cbor(
+        &public_commit_bytes,
+    )
+    .context("verifying published hosted public repo genesis")?;
+    public_commit
+        .verify_atproto(&record.atproto_verifying_key()?)
+        .context("published hosted public repo signature is invalid")?;
+    ensure!(
+        public_commit.did == expected_name.did()
+            && public_commit.data == commit.data
+            && public_commit.rev == commit.rev
+            && public_commit.prev.is_none(),
+        "published hosted public repo genesis does not match native genesis state"
+    );
     Ok(())
 }
 
@@ -697,6 +715,10 @@ fn write_repo_genesis(account_dir: &Path, repo: &hyprstream_pds::HostedRepoGenes
         write_private_file(&blocks_dir.join(format!("{cid}.cbor")), bytes)?;
     }
     write_private_file(&repo_dir.join("commit.cbor"), repo.commit_bytes())?;
+    write_private_file(
+        &repo_dir.join("public-commit.cbor"),
+        repo.public_commit_bytes(),
+    )?;
     write_private_file(
         &repo_dir.join("head"),
         repo.commit_cid().to_string().as_bytes(),
@@ -1974,6 +1996,7 @@ mod tests {
         assert!(published.join("genesis.didop.cbor").is_file());
         assert!(published.join("did-document.json").is_file());
         assert!(published.join("repo/commit.cbor").is_file());
+        assert!(published.join("repo/public-commit.cbor").is_file());
     }
 
     #[test]
@@ -1999,6 +2022,7 @@ mod tests {
             .join("pds/accounts.example.com/accounts/alice");
         assert!(account.join("account-record.cbor").is_file());
         assert!(account.join("repo/commit.cbor").is_file());
+        assert!(account.join("repo/public-commit.cbor").is_file());
         let transaction: serde_json::Value =
             serde_json::from_slice(&std::fs::read(account.join(SIGNUP_TRANSACTION_FILE)).unwrap())
                 .unwrap();
