@@ -2738,6 +2738,18 @@ mod tests {
         ) -> Option<Arc<Mutex<crate::runtime::KVCacheManager>>> {
             self.cache.clone()
         }
+        fn set_kv_cache(&mut self, cache: Arc<Mutex<crate::runtime::KVCacheManager>>) {
+            self.cache = Some(cache);
+        }
+        fn clear_kv_cache(&self) {
+            // Same shape as the real architectures: route the clear through
+            // the installed KVCacheManager so the metadata contract under
+            // test is the production `clear_all` path.
+            if let Some(cache) = &self.cache {
+                let mut guard = cache.lock();
+                guard.clear_all();
+            }
+        }
     }
 
     /// Regression (cancellation before first poll): dropping a stream that was
@@ -2792,6 +2804,88 @@ mod tests {
             cache.lock().prefix_match_len(&extended),
             0,
             "no prefix may be claimed over cache state that was never computed"
+        );
+    }
+
+    /// Regression (prior-session metadata vs cancellation): a cache populated
+    /// by an earlier turn (prompt IDs + end-of-prefill SSM snapshot) must not
+    /// retain that metadata after the set-up clear that a later turn's exact
+    /// hit or miss performs at generation setup. That clear runs before any
+    /// forward; if the turn is then cancelled before its first poll, nothing
+    /// new is recorded — so a subsequent extending prompt would otherwise
+    /// claim a prefix (and, for hybrid models, restore a stale snapshot)
+    /// against KV that no longer exists.
+    #[test]
+    fn setup_clear_drops_prior_session_metadata_on_cancelled_turn() {
+        let mut engine = TorchEngine::new(RuntimeConfig {
+            use_gpu: false,
+            ..RuntimeConfig::default()
+        })
+        .expect("CPU engine should construct without a model");
+        *engine.tokenizer.lock() = Some(redact_test_tokenizer());
+
+        // Registry + session owner so the swap path engages: the set-up clear
+        // then runs through resolve_session_prefill_start exactly as the
+        // production prefix-detection branch drives it.
+        let registry = Arc::new(crate::runtime::kv_cache::KVCacheRegistry::new(
+            crate::runtime::kv_cache::CacheConfig {
+                num_layers: 2,
+                max_seq_len: 64,
+                quant_type: crate::runtime::KVQuantType::None,
+                paged: false,
+            },
+            None,
+        ));
+        let owner = crate::runtime::kv_cache::CacheOwner::Session("s1".to_owned());
+        let prior = registry.get_or_create(owner.clone());
+        // Stamp the cache compatibly so the #1277 reuse policy keeps it and
+        // prefix detection actually sees the prior metadata.
+        let mut desc = crate::runtime::kv_compat::KvCompatDescriptor::default();
+        desc.weights.base_revision = "test-base".to_owned();
+        desc.set_tokenizer(16, Some("test-tok-hash".to_owned()));
+        *engine.kv_compat.lock() = Some(desc);
+        {
+            let mut prior_guard = prior.lock();
+            prior_guard.set_compat_fingerprint(engine.kv_compat_fingerprint_for(0).unwrap());
+            let opt = (tch::Kind::Float, Device::Cpu);
+            let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
+            let rec = vec![Some(Tensor::zeros([4], opt)), None];
+            // Prior turn's prompt [0, 1, 7] strictly extends this turn's
+            // ("hello world" → [0, 1]): the request is an exact hit, whose
+            // set-up clear routes through resolve_session_prefill_start →
+            // model.clear_kv_cache() — the production boundary under test.
+            prior_guard.set_cached_tokens_with_ssm(vec![0, 1, 7], Some((conv, rec)));
+        }
+        engine.kv_cache_registry = Some(registry);
+        *engine.active_cache_owner.lock() = Some(owner);
+        engine.persistent_model = Some(Arc::new(Mutex::new(Box::new(RecordingStubModel {
+            cache: None,
+        }))));
+
+        let request = GenerationRequest {
+            prompt: "hello world".to_owned(),
+            ..Default::default()
+        };
+        let stream = TextStream::new(&engine, request).expect("stream should construct");
+        // Cancelled before the first poll: the set-up clear has run, and no
+        // new recording can happen.
+        drop(stream);
+
+        // `prior` is the same Arc the swap installed into the model.
+        let guard = prior.lock();
+        assert_eq!(
+            guard.cached_token_count(),
+            0,
+            "prior prompt IDs must not survive the set-up clear"
+        );
+        assert!(
+            guard.ssm_snapshot().is_none(),
+            "prior end-of-prefill SSM snapshot must not survive the set-up clear"
+        );
+        assert_eq!(
+            guard.prefix_match_len(&[0, 1, 7, 4]),
+            0,
+            "an extending prompt must not claim a prefix over cleared KV"
         );
     }
 

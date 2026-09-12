@@ -2061,8 +2061,19 @@ impl KVCacheManager {
         self.layer_caches.contains_key(&layer_idx).then_some(())
     }
 
-    /// Clear all caches
-    pub fn clear_all(&self) {
+    /// Clear all KV tensors together with the metadata that describes them.
+    ///
+    /// `cached_token_ids`, the SSM snapshot, and its slot-device record only
+    /// have meaning alongside the layer tensors they were computed with. A
+    /// cleared cache that retained them would let a later extending prompt
+    /// claim a `prefix_len` — or restore a stale snapshot — against KV that
+    /// no longer exists (e.g. a session turn cancelled before its first
+    /// prefill: the set-up clear runs at generation setup, and the drop
+    /// records nothing new).
+    pub fn clear_all(&mut self) {
+        self.cached_token_ids = Vec::new();
+        self.ssm_snapshot = None;
+        self.ssm_slot_devices = Vec::new();
         for mut cache_ref in self.layer_caches.iter_mut() {
             cache_ref.clear();
         }
@@ -2572,6 +2583,34 @@ mod tests {
         assert_eq!(conv_restored[1].as_ref().unwrap().double_value(&[1, 2]), 9.0);
         assert_eq!(rec_restored[0].as_ref().unwrap().double_value(&[3]), 11.0);
         assert_eq!(rec_restored[1].as_ref().unwrap().double_value(&[3]), 13.0);
+    }
+
+    /// `clear_all` must drop the cached token IDs, the SSM snapshot, and its
+    /// slot-device record together with the layer tensors: metadata that
+    /// survives a tensor clear lets a later extending prompt claim a prefix
+    /// — or restore a stale snapshot — against KV that no longer exists
+    /// (set-up clear on an exact hit/miss, then cancellation before the
+    /// first poll leaves nothing to re-record over it).
+    #[test]
+    fn clear_all_drops_cached_token_and_ssm_metadata() {
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+        let opt = (DType::Float, Device::Cpu);
+        let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
+        let rec = vec![Some(Tensor::zeros([4], opt)), None];
+        manager.set_cached_tokens_with_ssm(vec![9, 9, 9], Some((conv, rec)));
+        assert_eq!(manager.cached_token_count(), 3);
+        assert!(manager.ssm_snapshot().is_some());
+
+        manager.clear_all();
+
+        assert_eq!(manager.cached_token_count(), 0, "token IDs must go with the tensors");
+        assert!(manager.ssm_snapshot().is_none(), "stale snapshot must not survive a clear");
+        assert!(manager.ssm_slot_devices.is_empty(), "slot-device record must go with the snapshot");
+        assert_eq!(
+            manager.prefix_match_len(&[9, 9, 9, 4]),
+            0,
+            "an extending prompt must not claim a prefix over cleared KV"
+        );
     }
 
     #[test]
