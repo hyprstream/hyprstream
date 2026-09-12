@@ -27,11 +27,16 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # Build all supported x86_64 variants sequentially on a single runner. This
-  # keeps the large libtorch payloads and Cargo target on one disk.
+  # Build each x86_64 backend independently. Every matrix leg receives a fresh
+  # OIDC session and can run concurrently, so a long variant cannot expire the
+  # cache credentials for the others.
   build-x86_64:
-    name: Build x86_64 AppImages (sequential)
+    name: Build x86_64 AppImage (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cpu, cuda128, cuda130, rocm71]
 
     steps:
       - name: Checkout code
@@ -80,10 +85,52 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: cargo-${{ runner.os }}-sequential-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ matrix.variant }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-sequential-
+            cargo-${{ runner.os }}-${{ matrix.variant }}-
             cargo-${{ runner.os }}-
+      - name: Extract version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [[ "$VERSION" == "$GITHUB_REF_NAME" ]] && VERSION="dev"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build and stage backend
+        run: |
+          ./appimage/build-appimage.sh build ${{ matrix.variant }} --version ${{ steps.version.outputs.version }}
+          ./appimage/build-appimage.sh stage ${{ matrix.variant }}
+
+      - name: Upload backend AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage-${{ matrix.variant }}
+          path: appimage/output/*-${{ matrix.variant }}-*.AppImage
+          retention-days: 5
+
+      - name: Upload universal staging payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage-staging-${{ matrix.variant }}
+          path: appimage/build/universal-staging
+          retention-days: 2
+
+  # Assemble the universal image from the four matrix payloads. This job has
+  # no compiler or libtorch dependency and cannot silently rebuild a backend.
+  package-universal-x86_64:
+    name: Package universal x86_64 AppImage
+    needs: build-x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download staged backend payloads
+        uses: actions/download-artifact@v4
+        with:
+          pattern: appimage-staging-*
+          path: appimage/build/universal-staging
+          merge-multiple: true
 
       - name: Extract version
         id: version
@@ -92,73 +139,15 @@ jobs:
           [[ "$VERSION" == "$GITHUB_REF_NAME" ]] && VERSION="dev"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Build CPU AppImage
+      - name: Verify staged backend payloads
         run: |
-          ./appimage/build-appimage.sh build cpu --version ${{ steps.version.outputs.version }}
-          ./appimage/build-appimage.sh stage cpu
-          ./appimage/build-appimage.sh clean cpu
+          set -euo pipefail
+          test -s appimage/build/universal-staging/bin/hyprstream-cpu
+          for variant in cpu cuda128 cuda130 rocm71; do
+            test -d "appimage/build/universal-staging/lib/${variant}/libtorch/lib"
+          done
 
-      - name: Upload CPU AppImage
-        uses: actions/upload-artifact@v4
-        with:
-          name: appimage-cpu
-          path: appimage/output/*-cpu-*.AppImage
-          retention-days: 5
-
-      - name: Build CUDA 12.8 AppImage
-        run: |
-          ./appimage/build-appimage.sh build cuda128 --version ${{ steps.version.outputs.version }}
-          ./appimage/build-appimage.sh stage cuda128
-          ./appimage/build-appimage.sh clean cuda128
-
-      - name: Upload CUDA 12.8 AppImage
-        uses: actions/upload-artifact@v4
-        with:
-          name: appimage-cuda128
-          path: appimage/output/*-cuda128-*.AppImage
-          retention-days: 5
-
-      # The x86 variants are intentionally kept on one runner so they share
-      # Cargo and libtorch downloads. Refresh the short-lived OIDC session
-      # before the remaining builds can cross the default one-hour boundary.
-      - name: Refresh cache credentials before CUDA 13.0 and ROCm
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_SCCACHE_REGION }}
-
-      - name: Restart sccache with refreshed credentials
-        run: |
-          sccache --stop-server || true
-          aws sts get-caller-identity
-
-      - name: Build CUDA 13.0 AppImage
-        run: |
-          ./appimage/build-appimage.sh build cuda130 --version ${{ steps.version.outputs.version }}
-          ./appimage/build-appimage.sh stage cuda130
-          ./appimage/build-appimage.sh clean cuda130
-
-      - name: Upload CUDA 13.0 AppImage
-        uses: actions/upload-artifact@v4
-        with:
-          name: appimage-cuda130
-          path: appimage/output/*-cuda130-*.AppImage
-          retention-days: 5
-
-      - name: Build ROCm 7.1 AppImage
-        run: |
-          ./appimage/build-appimage.sh build rocm71 --version ${{ steps.version.outputs.version }}
-          ./appimage/build-appimage.sh stage rocm71
-          ./appimage/build-appimage.sh clean rocm71
-
-      - name: Upload ROCm 7.1 AppImage
-        uses: actions/upload-artifact@v4
-        with:
-          name: appimage-rocm71
-          path: appimage/output/*-rocm71-*.AppImage
-          retention-days: 5
-
-      - name: Build Universal AppImage
+      - name: Package Universal AppImage
         run: |
           ./appimage/build-appimage.sh package-universal --version ${{ steps.version.outputs.version }}
 
@@ -168,9 +157,6 @@ jobs:
           name: appimage-universal
           path: appimage/output/hyprstream-${{ steps.version.outputs.version }}-x86_64.AppImage
           retention-days: 5
-
-      - name: Show sccache stats
-        run: sccache --show-stats
 
   # Native arm64 packaging. Upstream publishes arm64 CPU libtorch through the
   # PyTorch wheel, but not CUDA/ROCm archives; build the supported CPU image in
@@ -222,7 +208,7 @@ jobs:
   release:
     name: Create Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-x86_64, build-arm64-cpu]
+    needs: [build-x86_64, package-universal-x86_64, build-arm64-cpu]
     runs-on: ubuntu-latest
     permissions:
       contents: write
