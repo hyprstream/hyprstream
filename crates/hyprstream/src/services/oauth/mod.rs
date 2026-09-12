@@ -30,6 +30,7 @@ mod account_worker;
 mod account_tls;
 
 pub mod auth;
+pub(crate) mod atproto_session;
 pub mod authorize;
 pub mod browser_session;
 pub mod challenge;
@@ -1089,12 +1090,26 @@ impl Spawnable for OAuthService {
             if let Some(api) = &self.identity_registration_api {
                 oauth_state = oauth_state.with_identity_registration_api(Arc::clone(api));
             }
-            match self.account_config.resolve_zone() {
-                Ok(zone) => oauth_state = oauth_state.with_hosted_account_zone(zone),
-                Err(error) => tracing::warn!(
-                    %error,
-                    "OAuth user-token minting disabled: no deployment account zone"
-                ),
+            let account_zone = match self.account_config.resolve_zone() {
+                Ok(zone) => {
+                    oauth_state = oauth_state.with_hosted_account_zone(zone.clone());
+                    Some(zone)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "OAuth user-token minting disabled: no deployment account zone"
+                    );
+                    None
+                }
+            };
+            if let (Some(store), Some(zone)) = (&hosted_account_store, &account_zone) {
+                let resolver = Arc::new(crate::services::oauth::atproto_session::NativeAtprotoSessionResolver::new(
+                    user_store.clone_inner(),
+                    Arc::clone(store),
+                    zone.clone(),
+                ));
+                oauth_state = oauth_state.with_atproto_session_resolver(resolver);
             }
             oauth_state = oauth_state.with_user_store(user_store);
             if let Some(ds) = device_store_opt {
