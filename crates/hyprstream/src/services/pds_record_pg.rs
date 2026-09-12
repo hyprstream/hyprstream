@@ -31,8 +31,9 @@
 //! publishers, the loser's compare matches zero rows after the winner
 //! commits, and the loser reports a conflict instead of silently
 //! overwriting. Snapshot-consistent multi-reads go through
-//! [`PgKv::read_snapshot`] (one read-only transaction on one pooled
-//! connection), mirroring `rocksdb::DB::snapshot()`.
+//! [`PgKv::read_snapshot`] (one read-only REPEATABLE READ transaction on one
+//! pooled connection — a single MVCC snapshot for every statement, never a
+//! new snapshot per statement), mirroring `rocksdb::DB::snapshot()`.
 //!
 //! ## Failover bounds
 //!
@@ -85,8 +86,9 @@ enum PgCmd {
         key: Vec<u8>,
         reply: mpsc::Sender<AnyResult<Option<Vec<u8>>>>,
     },
-    /// Fetch multiple keys in one READ-ONLY transaction (snapshot consistency,
-    /// matching `rocksdb::DB::snapshot().get()` in `load_at9p_state_from_db`).
+    /// Fetch multiple keys in one READ-ONLY REPEATABLE READ transaction
+    /// (snapshot consistency, matching `rocksdb::DB::snapshot().get()` in
+    /// `load_at9p_state_from_db`).
     GetBatch {
         keys: Vec<Vec<u8>>,
         reply: mpsc::Sender<AnyResult<Vec<Option<Vec<u8>>>>>,
@@ -118,10 +120,10 @@ enum PgCmd {
         reply: mpsc::Sender<AnyResult<Vec<(Vec<u8>, Vec<u8>)>>>,
     },
     /// Snapshot-consistent multi-read: every range scan and point get runs in
-    /// ONE read-only transaction on ONE pooled connection, so a concurrent
-    /// writer cannot interleave between the scans (the Postgres counterpart of
-    /// reading a repo's records and its signed commit from one RocksDB
-    /// snapshot).
+    /// ONE read-only REPEATABLE READ transaction on ONE pooled connection, so
+    /// a concurrent writer cannot interleave between the scans (the Postgres
+    /// counterpart of reading a repo's records and its signed commit from one
+    /// RocksDB snapshot).
     ReadSnapshot {
         ranges: Vec<(Vec<u8>, Vec<u8>)>,
         keys: Vec<Vec<u8>>,
@@ -253,9 +255,10 @@ impl PgKv {
         self.round_trip(|reply| PgCmd::AllPairs { reply })
     }
 
-    /// Run every range scan and point get in one read-only transaction, so a
-    /// reader never observes a record scan from before a write paired with a
-    /// commit from after it (or any other torn combination).
+    /// Run every range scan and point get in one read-only REPEATABLE READ
+    /// transaction, so a reader never observes a record scan from before a
+    /// write paired with a commit from after it (or any other torn
+    /// combination).
     pub(crate) fn read_snapshot(
         &self,
         ranges: &[(Vec<u8>, Vec<u8>)],
@@ -417,8 +420,17 @@ fn build_driver_config(driver_url: &str, dns_hostname: &str) -> AnyResult<tokio_
     // validated endpoint or SNI name.
     let url = url::Url::parse(driver_url)
         .map_err(|e| anyhow::anyhow!("failed to reparse validated RDS URL: {e}"))?;
+    // Mirror `validate_url`'s arms exactly: domain verbatim, IP literals in
+    // BARE form. (`Host`'s own `Display` adds brackets for IPv6 — comparing
+    // against it rejected every contract-valid IPv6 endpoint.)
+    let reparsed_host = match url.host() {
+        Some(url::Host::Domain(domain)) => domain.to_owned(),
+        Some(url::Host::Ipv4(addr)) => addr.to_string(),
+        Some(url::Host::Ipv6(addr)) => addr.to_string(),
+        None => anyhow::bail!("validated RDS URL lost its host"),
+    };
     anyhow::ensure!(
-        url.host_str() == Some(dns_hostname),
+        reparsed_host == dns_hostname,
         "validated RDS URL changed the contract hostname"
     );
 
@@ -603,6 +615,26 @@ async fn cmd_get(pool: &deadpool_postgres::Pool, key: &[u8]) -> AnyResult<Option
     Ok(row.map(|r| r.get::<_, Vec<u8>>(0)))
 }
 
+/// Begin the single read-only transaction every multi-statement read runs in.
+///
+/// REPEATABLE READ is the load-bearing part: READ COMMITTED (the Postgres
+/// default) takes a **new MVCC snapshot per statement**, so a record range
+/// scan and a subsequent commit point-get could observe different commits —
+/// a torn read that would let a publisher CAS a head that does not cover a
+/// competitor's concurrently-committed record. One snapshot per transaction
+/// is the exact counterpart of `rocksdb::DB::snapshot()`.
+async fn begin_snapshot_tx<'a>(
+    conn: &'a mut deadpool_postgres::Object,
+    op: &str,
+) -> AnyResult<deadpool_postgres::Transaction<'a>> {
+    conn.build_transaction()
+        .read_only(true)
+        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+        .start()
+        .await
+        .map_err(|e| anyhow::anyhow!("RDS {op}: begin snapshot transaction failed: {e}"))
+}
+
 async fn cmd_get_batch(
     pool: &deadpool_postgres::Pool,
     keys: &[Vec<u8>],
@@ -611,12 +643,9 @@ async fn cmd_get_batch(
         .get()
         .await
         .map_err(|e| anyhow::anyhow!("RDS get_batch: connection acquisition failed: {e}"))?;
-    // Single READ-ONLY transaction for snapshot consistency (mirrors
-    // rocksdb::DB::snapshot().get() in load_at9p_state_from_db).
-    let tx = conn
-        .transaction()
-        .await
-        .map_err(|e| anyhow::anyhow!("RDS get_batch: begin transaction failed: {e}"))?;
+    // Single READ-ONLY, REPEATABLE READ transaction for snapshot consistency
+    // (mirrors rocksdb::DB::snapshot().get() in load_at9p_state_from_db).
+    let tx = begin_snapshot_tx(&mut conn, "get_batch").await?;
     let mut results = Vec::with_capacity(keys.len());
     for key in keys {
         let row = tx
@@ -742,12 +771,7 @@ async fn cmd_read_snapshot(
         .get()
         .await
         .map_err(|e| anyhow::anyhow!("RDS read_snapshot: connection acquisition failed: {e}"))?;
-    let tx = conn
-        .build_transaction()
-        .read_only(true)
-        .start()
-        .await
-        .map_err(|e| anyhow::anyhow!("RDS read_snapshot: begin transaction failed: {e}"))?;
+    let tx = begin_snapshot_tx(&mut conn, "read_snapshot").await?;
     let mut range_results = Vec::with_capacity(ranges.len());
     for (start, end) in ranges {
         let rows = tx
@@ -911,6 +935,36 @@ mod tests {
                 [tokio_postgres::config::Host::Tcp(
                     "db.internal.example".to_owned()
                 )]
+            );
+            assert!(config.get_hostaddrs().is_empty());
+        }
+    }
+
+    /// Contract and driver must agree on non-loopback IP endpoints
+    /// (review P2-7): `validate_url` accepts them and stores the BARE host,
+    /// so `build_driver_config` must not reject them on a bracketed
+    /// `host_str()` comparison, and the connector must target the bare host
+    /// (DNS/SNI form for IPs).
+    #[test]
+    fn contract_ip_endpoints_build_driver_config_on_the_bare_host() {
+        for (url, bare_host) in [
+            (
+                "postgresql://records:secret@192.0.2.10:5432/records?sslmode=verify-full",
+                "192.0.2.10",
+            ),
+            (
+                "postgresql://records:secret@[2001:db8::10]:5432/records?sslmode=verify-full",
+                "2001:db8::10",
+            ),
+        ] {
+            let validated = translated_url(url);
+            assert_eq!(validated.dns_hostname(), bare_host);
+            let config = build_driver_config(validated.driver_url(), validated.dns_hostname())
+                .unwrap_or_else(|e| panic!("driver config rejected contract IP URL {url}: {e}"));
+            assert_eq!(
+                config.get_hosts(),
+                [tokio_postgres::config::Host::Tcp(bare_host.to_owned())],
+                "the connector must target the validated bare host for {url}"
             );
             assert!(config.get_hostaddrs().is_empty());
         }
@@ -1178,6 +1232,120 @@ mod tests {
             .unwrap_or_else(|e| panic!("read_snapshot empty: {e}"));
         assert!(snap.ranges.first().unwrap_or(&Vec::new()).is_empty());
         assert_eq!(snap.values, vec![None]);
+    }
+
+    /// Deterministic isolation pin: inside one `begin_snapshot_tx`
+    /// transaction, a commit from another connection landing BETWEEN two
+    /// identical reads must not change the second read. READ COMMITTED (the
+    /// Postgres default) fails this test — it takes a new snapshot per
+    /// statement. This is the seam every multi-statement read
+    /// (`cmd_get_batch`, `cmd_read_snapshot`) shares.
+    #[tokio::test]
+    async fn live_snapshot_transaction_is_repeatable_read() {
+        let url = require_db!();
+        // The writer handle also guarantees the schema exists.
+        let writer = PgKv::connect_test(&url, "test-cell")
+            .unwrap_or_else(|e| panic!("connect writer: {e}"));
+        let key = run_unique_key("rr-tx");
+        writer
+            .put(&key, b"v1")
+            .unwrap_or_else(|e| panic!("seed: {e}"));
+
+        let pg_config: tokio_postgres::Config = url
+            .parse()
+            .unwrap_or_else(|e| panic!("test Postgres URL did not parse: {e}"));
+        let pool = build_bounded_pool(deadpool_postgres::Manager::new(
+            pg_config,
+            tokio_postgres::NoTls,
+        ))
+        .unwrap_or_else(|e| panic!("pool: {e}"));
+        let mut conn = pool
+            .get()
+            .await
+            .unwrap_or_else(|e| panic!("pool get: {e}"));
+        let tx = begin_snapshot_tx(&mut conn, "test")
+            .await
+            .unwrap_or_else(|e| panic!("begin snapshot tx: {e}"));
+        let first = tx
+            .query_opt("SELECT value FROM pds_kv WHERE key = $1", &[&key])
+            .await
+            .unwrap_or_else(|e| panic!("first read: {e}"));
+        // A writer on another connection commits a new value mid-transaction.
+        writer
+            .put(&key, b"v2")
+            .unwrap_or_else(|e| panic!("concurrent put: {e}"));
+        let second = tx
+            .query_opt("SELECT value FROM pds_kv WHERE key = $1", &[&key])
+            .await
+            .unwrap_or_else(|e| panic!("second read: {e}"));
+        assert_eq!(
+            first.as_ref().map(|r| r.get::<_, Vec<u8>>(0)),
+            Some(b"v1".to_vec()),
+            "the snapshot must start from the pre-write value"
+        );
+        let second = second.map(|r| r.get::<_, Vec<u8>>(0));
+        assert_eq!(
+            second,
+            Some(b"v1".to_vec()),
+            "REPEATABLE READ must not observe a mid-transaction commit; \
+             READ COMMITTED would return v2 here (a torn read)"
+        );
+        tx.commit().await.unwrap_or_else(|e| panic!("commit: {e}"));
+    }
+
+    /// Command-level pin: `get_batch` repeats the same key 32 times inside
+    /// ONE snapshot transaction while a second handle flips the value as fast
+    /// as the wire allows. Every copy within a single batch response must be
+    /// identical. This can never fail spuriously under REPEATABLE READ; under
+    /// READ COMMITTED a flip lands mid-batch with overwhelming probability.
+    #[test]
+    fn live_get_batch_never_tears_under_a_concurrent_writer() {
+        let url = require_db!();
+        let reader = PgKv::connect_test(&url, "test-cell")
+            .unwrap_or_else(|e| panic!("connect reader: {e}"));
+        let writer = PgKv::connect_test(&url, "test-cell")
+            .unwrap_or_else(|e| panic!("connect writer: {e}"));
+        let key = run_unique_key("rr-batch");
+        writer
+            .put(&key, b"v1")
+            .unwrap_or_else(|e| panic!("seed: {e}"));
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_thread = {
+            let stop = std::sync::Arc::clone(&stop);
+            let key = key.clone();
+            std::thread::spawn(move || {
+                let mut flip = false;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let value: &[u8] = if flip { b"v1" } else { b"v2" };
+                    writer
+                        .put(&key, value)
+                        .unwrap_or_else(|e| panic!("flip write: {e}"));
+                    flip = !flip;
+                }
+            })
+        };
+        let keys: Vec<Vec<u8>> = std::iter::repeat_with(|| key.clone()).take(32).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for round in 0..50 {
+            let batch = reader
+                .get_batch(&keys)
+                .unwrap_or_else(|e| panic!("get_batch round {round}: {e}"));
+            assert!(
+                batch.windows(2).all(|pair| pair[0] == pair[1]),
+                "torn read in round {round}: one batch observed both sides of \
+                 a concurrent commit: {batch:?}"
+            );
+            seen.insert(batch.into_iter().next().flatten());
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer_thread
+            .join()
+            .unwrap_or_else(|_| panic!("writer thread panicked"));
+        assert!(
+            seen.len() > 1,
+            "the concurrent writer never became visible — the race was not exercised"
+        );
     }
 
     #[test]

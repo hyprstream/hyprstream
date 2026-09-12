@@ -389,35 +389,66 @@ impl RdsConfig {
     /// credentials directory — consulted only when `records-url` actually
     /// exists there, so a credentials-role-only deployment does not activate
     /// the records backend. The `cell_id` is preserved as configured.
-    pub fn resolved_from_env(&self) -> Self {
+    ///
+    /// Fails closed when the directory fallback's `records-url` candidate is
+    /// rendered-but-broken: a stat failure other than `NotFound` (e.g. an
+    /// unreadable parent) is itself an error, and a dangling symlink still
+    /// binds so the later URL read fails loudly. Only a genuinely absent
+    /// candidate leaves the local backend selected — a broken binding must
+    /// never silently become "not rendered".
+    pub fn resolved_from_env(&self) -> anyhow::Result<Self> {
         self.resolve_with(|key| std::env::var_os(key))
     }
 
     /// The testable core of [`Self::resolved_from_env`]: the environment is
     /// injected so resolution is exercised without mutating process state.
-    fn resolve_with(&self, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
+    fn resolve_with(
+        &self,
+        env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> anyhow::Result<Self> {
         let credentials_dir = || env(Self::POSTGRES_CREDENTIALS_PATH_ENV).map(PathBuf::from);
-        let url_file = self
+        let url_file = match self
             .url_file
             .clone()
             .or_else(|| env(Self::RECORDS_URL_FILE_ENV).map(PathBuf::from))
-            .or_else(|| {
-                // Directory fallback is opt-in by file presence: a shared
-                // credentials dir that holds no records role must not turn
-                // the records store Postgres-bound.
-                let candidate = credentials_dir()?.join(Self::RECORDS_URL_FILE_NAME);
-                candidate.is_file().then_some(candidate)
-            });
+        {
+            Some(explicit) => Some(explicit),
+            None => match credentials_dir() {
+                Some(dir) => {
+                    let candidate = dir.join(Self::RECORDS_URL_FILE_NAME);
+                    // Directory fallback is opt-in by file presence: a shared
+                    // credentials dir that holds no records role must not turn
+                    // the records store Postgres-bound. Presence is lexical
+                    // (symlink_metadata, not is_file): a dangling symlink
+                    // still binds so the subsequent read fails closed, and a
+                    // stat error other than NotFound (ENOTDIR/EACCES on a
+                    // parent) is itself fatal — both are "rendered but
+                    // broken", never "not rendered".
+                    match std::fs::symlink_metadata(&candidate) {
+                        Ok(_) => Some(candidate),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "records-role URL candidate at {} cannot be stat'ed ({e}); \
+                                 refusing to silently select the local backend",
+                                candidate.display()
+                            ));
+                        }
+                    }
+                }
+                None => None,
+            },
+        };
         let root_cert_file = self
             .root_cert_file
             .clone()
             .or_else(|| env(Self::RECORDS_SSLROOTCERT_FILE_ENV).map(PathBuf::from))
             .or_else(|| credentials_dir().map(|dir| dir.join(Self::RDS_CA_FILE_NAME)));
-        Self {
+        Ok(Self {
             url_file,
             root_cert_file,
             cell_id: self.cell_id.clone(),
-        }
+        })
     }
 
     /// Read and validate the records role's URL and CA-file bindings.
@@ -3715,7 +3746,9 @@ mod tests {
     #[test]
     fn rds_resolution_leaves_local_backend_when_unbound() {
         let config = RdsConfig::default();
-        let resolved = config.resolve_with(no_env);
+        let resolved = config
+            .resolve_with(no_env)
+            .unwrap_or_else(|e| panic!("unbound resolution must not fail: {e}"));
         assert!(!resolved.is_configured());
         assert_eq!(resolved.root_cert_file, None);
     }
@@ -3723,11 +3756,13 @@ mod tests {
     #[test]
     fn rds_resolution_binds_role_scoped_env_files() {
         let config = RdsConfig::default();
-        let resolved = config.resolve_with(|key| match key {
-            "HYPRSTREAM_RECORDS_URL_FILE" => Some("/run/cred/records-url".into()),
-            "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE" => Some("/run/cred/rds-ca.pem".into()),
-            _ => None,
-        });
+        let resolved = config
+            .resolve_with(|key| match key {
+                "HYPRSTREAM_RECORDS_URL_FILE" => Some("/run/cred/records-url".into()),
+                "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE" => Some("/run/cred/rds-ca.pem".into()),
+                _ => None,
+            })
+            .unwrap_or_else(|e| panic!("scoped-env resolution must not fail: {e}"));
         assert!(resolved.is_configured());
         assert_eq!(resolved.url_file.as_deref(), Some(Path::new("/run/cred/records-url")));
         assert_eq!(
@@ -3743,12 +3778,14 @@ mod tests {
             root_cert_file: Some(PathBuf::from("/toml/rds-ca.pem")),
             cell_id: "toml-cell".to_owned(),
         };
-        let resolved = config.resolve_with(|key| match key {
-            "HYPRSTREAM_RECORDS_URL_FILE" => Some("/env/records-url".into()),
-            "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE" => Some("/env/rds-ca.pem".into()),
-            "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some("/env".into()),
-            _ => None,
-        });
+        let resolved = config
+            .resolve_with(|key| match key {
+                "HYPRSTREAM_RECORDS_URL_FILE" => Some("/env/records-url".into()),
+                "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE" => Some("/env/rds-ca.pem".into()),
+                "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some("/env".into()),
+                _ => None,
+            })
+            .unwrap_or_else(|e| panic!("TOML-pinned resolution must not fail: {e}"));
         assert_eq!(resolved.url_file.as_deref(), Some(Path::new("/toml/records-url")));
         assert_eq!(
             resolved.root_cert_file.as_deref(),
@@ -3768,7 +3805,9 @@ mod tests {
         // A credentials-role-only directory (no records-url) must NOT
         // activate the records backend.
         let config = RdsConfig::default();
-        let resolved = config.resolve_with(env);
+        let resolved = config
+            .resolve_with(env)
+            .unwrap_or_else(|e| panic!("absent records-url must resolve cleanly: {e}"));
         assert!(
             !resolved.is_configured(),
             "a shared credentials dir without records-url stays on the local backend"
@@ -3778,7 +3817,9 @@ mod tests {
         // resolves — including the CA file at its rendered location.
         std::fs::write(dir.path().join("records-url"), b"postgresql://x\n")
             .unwrap_or_else(|e| panic!("{e}"));
-        let resolved = config.resolve_with(env);
+        let resolved = config
+            .resolve_with(env)
+            .unwrap_or_else(|e| panic!("rendered records-url must resolve: {e}"));
         assert!(resolved.is_configured());
         assert_eq!(resolved.url_file.as_deref(), Some(dir.path().join("records-url").as_path()));
         assert_eq!(
@@ -3793,11 +3834,13 @@ mod tests {
         std::fs::write(dir.path().join("records-url"), b"postgresql://x\n")
             .unwrap_or_else(|e| panic!("{e}"));
         let config = RdsConfig::default();
-        let resolved = config.resolve_with(|key| match key {
-            "HYPRSTREAM_RECORDS_URL_FILE" => Some("/scoped/records-url".into()),
-            "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some(dir.path().as_os_str().to_owned()),
-            _ => None,
-        });
+        let resolved = config
+            .resolve_with(|key| match key {
+                "HYPRSTREAM_RECORDS_URL_FILE" => Some("/scoped/records-url".into()),
+                "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some(dir.path().as_os_str().to_owned()),
+                _ => None,
+            })
+            .unwrap_or_else(|e| panic!("scoped-env resolution must not fail: {e}"));
         assert_eq!(
             resolved.url_file.as_deref(),
             Some(Path::new("/scoped/records-url")),
@@ -3807,6 +3850,54 @@ mod tests {
         assert_eq!(
             resolved.root_cert_file.as_deref(),
             Some(dir.path().join("rds-ca.pem").as_path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rds_resolution_distinguishes_absent_dangling_and_unstatable_records_url() {
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        let env = |key: &str| match key {
+            "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some(dir.path().as_os_str().to_owned()),
+            _ => None,
+        };
+        let config = RdsConfig::default();
+
+        // Genuinely absent → unbound (local backend), no error.
+        let resolved = config
+            .resolve_with(env)
+            .unwrap_or_else(|e| panic!("absent records-url must resolve cleanly: {e}"));
+        assert!(!resolved.is_configured());
+
+        // Dangling symlink → the binding still resolves (lexical presence),
+        // so the later URL read fails closed instead of silently keeping the
+        // local backend while an AZ peer runs RDS.
+        let dangling = dir.path().join("records-url");
+        std::os::unix::fs::symlink(dir.path().join("missing-target"), &dangling)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let resolved = config
+            .resolve_with(env)
+            .unwrap_or_else(|e| panic!("dangling records-url must still resolve: {e}"));
+        assert!(
+            resolved.is_configured(),
+            "a dangling records-url is rendered-but-broken: it must bind so the read fails closed"
+        );
+
+        // A stat error other than NotFound (here ENOTDIR: the credentials
+        // path is a regular file) is fatal at resolution, never silently local.
+        let file_dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        let not_a_dir = file_dir.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, b"x").unwrap_or_else(|e| panic!("{e}"));
+        let err = config
+            .resolve_with(|key| match key {
+                "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some(not_a_dir.as_os_str().to_owned()),
+                _ => None,
+            })
+            .err()
+            .unwrap_or_else(|| panic!("an unstat-able records-url candidate must fail resolution"));
+        assert!(
+            err.to_string().contains("cannot be stat'ed"),
+            "the error must name the stat failure: {err}"
         );
     }
 
