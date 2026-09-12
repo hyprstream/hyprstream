@@ -30,6 +30,7 @@ mod account_worker;
 mod account_tls;
 
 pub mod auth;
+pub(crate) mod atproto_session;
 pub mod authorize;
 pub mod browser_session;
 pub mod challenge;
@@ -240,8 +241,13 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(userinfo::userinfo).post(userinfo::userinfo),
         )
         .merge(authority_router)
-        .merge(if state.public_repo_writer.is_some() {
+        .merge(if state.public_repo_writer.is_some() || state.hosted_public_repo_writer.is_some() {
             xrpc::xrpc_write_routes()
+        } else {
+            Router::new()
+        })
+        .merge(if state.atproto_session_resolver.is_some() {
+            xrpc::xrpc_session_routes()
         } else {
             Router::new()
         });
@@ -1083,12 +1089,43 @@ impl Spawnable for OAuthService {
             if let Some(api) = &self.identity_registration_api {
                 oauth_state = oauth_state.with_identity_registration_api(Arc::clone(api));
             }
-            match self.account_config.resolve_zone() {
-                Ok(zone) => oauth_state = oauth_state.with_hosted_account_zone(zone),
-                Err(error) => tracing::warn!(
-                    %error,
-                    "OAuth user-token minting disabled: no deployment account zone"
-                ),
+            if self.config.xrpc_read_slice {
+                if let (Some(store), Some(root)) = (&hosted_account_store, &self.pds_root) {
+                    let public_root = root.join("public-repositories");
+                    let public_store = crate::services::public_repo::PublicRepoStore::open(&public_root)
+                        .map_err(|error| hyprstream_rpc::error::RpcError::SpawnFailed(format!("open public repository store {}: {error}", public_root.display())))?;
+                    oauth_state = oauth_state.with_hosted_public_repo_writer(Arc::new(
+                        crate::services::public_repo::HostedAccountPublicRepoWriter::new(
+                            Arc::new(public_store),
+                            Arc::clone(store),
+                            hyprstream_rpc::Subject::new(hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT),
+                            Arc::new(crate::services::public_repo::HostedAccountSelfAuthorizer),
+                        ),
+                    ));
+                }
+            }
+            let account_zone = match self.account_config.resolve_zone() {
+                Ok(zone) => {
+                    oauth_state = oauth_state.with_hosted_account_zone(zone.clone());
+                    Some(zone)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "OAuth user-token minting disabled: no deployment account zone"
+                    );
+                    None
+                }
+            };
+            if let (Some(store), Some(zone)) = (&hosted_account_store, &account_zone) {
+                let resolver = Arc::new(
+                    crate::services::oauth::atproto_session::NativeAtprotoSessionResolver::new(
+                        user_store.clone_inner(),
+                        Arc::clone(store),
+                        zone.clone(),
+                    ),
+                );
+                oauth_state = oauth_state.with_atproto_session_resolver(resolver);
             }
             oauth_state = oauth_state.with_user_store(user_store);
             if let Some(ds) = device_store_opt {

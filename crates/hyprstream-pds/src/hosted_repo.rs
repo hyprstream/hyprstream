@@ -18,8 +18,15 @@ use crate::tid::Tid;
 pub struct HostedRepoGenesis {
     mst_root: Cid,
     mst_blocks: Vec<(Cid, Vec<u8>)>,
+    /// Native commit retained for the Hyprstream repository and DID-log
+    /// binding. Its signature covers the native DAG-CBOR ordering.
     commit: Commit,
     commit_bytes: Vec<u8>,
+    /// Canonical AT Protocol representation of the same empty repository
+    /// state. This is an explicit dual-format bridge; it is never substituted
+    /// for the native commit or its DID-log binding.
+    public_commit: Commit,
+    public_commit_bytes: Vec<u8>,
 }
 
 impl HostedRepoGenesis {
@@ -44,12 +51,17 @@ impl HostedRepoGenesis {
             "initial hosted repo commit does not describe the requested empty repo"
         );
         let commit_bytes = commit.to_dag_cbor();
+        let public_commit = Commit::sign_atproto(&unsigned, signing_key)?;
+        public_commit.verify_atproto(signing_key.verifying_key())?;
+        let public_commit_bytes = public_commit.to_atproto_dag_cbor()?;
 
         Ok(Self {
             mst_root,
             mst_blocks,
             commit,
             commit_bytes,
+            public_commit,
+            public_commit_bytes,
         })
     }
 
@@ -83,6 +95,24 @@ impl HostedRepoGenesis {
         self.commit.cid()
     }
 
+    /// Canonical AT Protocol commit for the same empty repository state.
+    #[must_use]
+    pub fn public_commit(&self) -> &Commit {
+        &self.public_commit
+    }
+
+    /// Canonical AT Protocol bytes for the dual-format public genesis.
+    #[must_use]
+    pub fn public_commit_bytes(&self) -> &[u8] {
+        &self.public_commit_bytes
+    }
+
+    /// CID of the canonical public genesis. The native CID remains the DID
+    /// operation's bound head; callers must not conflate the two.
+    pub fn public_commit_cid(&self) -> Result<Cid> {
+        self.public_commit.cid_atproto()
+    }
+
     /// Re-verify the stored block linkage and commit signature.
     pub fn verify(&self, verifying_key: &VerifyingKey) -> Result<()> {
         ensure!(
@@ -99,7 +129,16 @@ impl HostedRepoGenesis {
             self.commit.to_dag_cbor() == self.commit_bytes,
             "initial hosted repo commit bytes are not canonical"
         );
-        self.commit.verify(verifying_key)
+        self.commit.verify(verifying_key)?;
+        ensure!(
+            self.public_commit.did == self.commit.did
+                && self.public_commit.data == self.commit.data
+                && self.public_commit.rev == self.commit.rev
+                && self.public_commit.prev == self.commit.prev
+                && self.public_commit.to_atproto_dag_cbor()? == self.public_commit_bytes,
+            "dual-format public genesis does not match native repository state"
+        );
+        self.public_commit.verify_atproto(verifying_key)
     }
 }
 
@@ -126,5 +165,10 @@ mod tests {
         assert_eq!(repo.commit().data, repo.mst_root());
         assert_eq!(repo.mst_blocks().len(), 1);
         assert_eq!(repo.commit_cid(), Cid::from_dag_cbor(repo.commit_bytes()));
+        assert_eq!(
+            repo.public_commit_cid().unwrap(),
+            Cid::from_dag_cbor(repo.public_commit_bytes())
+        );
+        repo.verify(key.verifying_key()).unwrap();
     }
 }

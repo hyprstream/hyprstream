@@ -111,6 +111,27 @@ pub fn xrpc_write_routes() -> axum::Router<Arc<OAuthState>> {
     axum::Router::new().route("/xrpc/com.atproto.repo.createRecord", post(create_record))
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct AtprotoSessionInfo {
+    pub handle: String,
+    pub did_doc: Option<Value>,
+    pub email: Option<String>,
+    pub email_confirmed: Option<bool>,
+    pub email_auth_factor: Option<bool>,
+    pub active: bool,
+    pub status: Option<String>,
+}
+
+#[async_trait::async_trait]
+pub trait AtprotoSessionResolver: Send + Sync {
+    async fn resolve_session(&self, did: &str) -> anyhow::Result<Option<AtprotoSessionInfo>>;
+}
+
+pub fn xrpc_session_routes() -> axum::Router<Arc<OAuthState>> {
+    use axum::routing::get;
+    axum::Router::new().route("/xrpc/com.atproto.server.getSession", get(get_session))
+}
+
 /// An in-memory snapshot of one repo's signed state — enough to answer the
 /// public read slice (`describeRepo` / `getRecord` / `sync.getRepo`).
 #[derive(Clone, Debug)]
@@ -877,6 +898,37 @@ async fn lookup_public_snapshot(store: &XrpcRepoStore, key: &str) -> Option<Arc<
 // Axum handler wrappers
 // ─────────────────────────────────────────────────────────────────────────────
 
+pub async fn get_session(
+    State(state): State<Arc<OAuthState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Response {
+    let Some(token) = user.token.as_deref() else {
+        return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "verified OAuth access token is required");
+    };
+    let claims = match auth::validate_oauth_access_token(&state, token).await {
+        Ok(claims) => claims,
+        Err(_) => return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "OAuth access token is invalid or expired"),
+    };
+    if !claims.has_scope("atproto") { return xrpc_error(StatusCode::FORBIDDEN, "InsufficientScope", "the atproto scope is required"); }
+    if claims.sub != user.user || claims.tenant != user.verified_tenant { return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "OAuth identity binding is invalid"); }
+    let Some(resolver) = state.atproto_session_resolver.as_ref() else { return xrpc_error(StatusCode::SERVICE_UNAVAILABLE, errors::INTERNAL_SERVER_ERROR, "native ATProto session resolver is not configured"); };
+    let info = match resolver.resolve_session(&claims.sub).await {
+        Ok(Some(info)) => info,
+        Ok(None) => return xrpc_error(StatusCode::BAD_REQUEST, errors::ACCOUNT_NOT_FOUND, "account is not hosted by this PDS"),
+        Err(error) => { tracing::error!(%error, did = %claims.sub, "ATProto session resolver failed"); return xrpc_error(StatusCode::SERVICE_UNAVAILABLE, errors::INTERNAL_SERVER_ERROR, "native account state is unavailable"); }
+    };
+    if info.handle.is_empty() || info.handle.chars().any(char::is_whitespace) { return xrpc_error(StatusCode::INTERNAL_SERVER_ERROR, errors::INTERNAL_SERVER_ERROR, "native account returned an invalid handle"); }
+    if let Some(status) = info.status.as_deref() { if !matches!(status, "takendown" | "suspended" | "deactivated") { return xrpc_error(StatusCode::INTERNAL_SERVER_ERROR, errors::INTERNAL_SERVER_ERROR, "native account returned an invalid status"); } }
+    let mut body = json!({"handle": info.handle, "did": claims.sub, "active": info.active});
+    let Some(object) = body.as_object_mut() else { return xrpc_error(StatusCode::INTERNAL_SERVER_ERROR, errors::INTERNAL_SERVER_ERROR, "session response construction failed"); };
+    if let Some(value) = info.did_doc { object.insert("didDoc".to_owned(), value); }
+    if let Some(value) = info.email { object.insert("email".to_owned(), Value::String(value)); }
+    if let Some(value) = info.email_confirmed { object.insert("emailConfirmed".to_owned(), Value::Bool(value)); }
+    if let Some(value) = info.email_auth_factor { object.insert("emailAuthFactor".to_owned(), Value::Bool(value)); }
+    if let Some(value) = info.status { object.insert("status".to_owned(), Value::String(value)); }
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
 pub async fn resolve_handle(
     State(state): State<Arc<OAuthState>>,
     RawQuery(raw): RawQuery,
@@ -985,13 +1037,13 @@ pub async fn create_record(
             "record body exceeds 1 MiB",
         );
     }
-    let Some(writer) = state.public_repo_writer.as_ref() else {
+    if state.public_repo_writer.is_none() && state.hosted_public_repo_writer.is_none() {
         return xrpc_error(
             StatusCode::SERVICE_UNAVAILABLE,
             errors::INTERNAL_SERVER_ERROR,
             "public repository writer is not configured",
         );
-    };
+    }
     let Some(token) = user.token.as_deref() else {
         return xrpc_error(
             StatusCode::UNAUTHORIZED,
@@ -1127,12 +1179,16 @@ pub async fn create_record(
     } else {
         resolve_handle_did(&state.xrpc_repos, &state.issuer_url, repo).await
     };
-    if repo.as_deref() != Some(writer.did()) {
-        return xrpc_error(
-            StatusCode::FORBIDDEN,
-            "AuthRequired",
-            "the request repo is not owned by this writer",
-        );
+    if state.hosted_public_repo_writer.is_none() {
+        if let Some(writer) = state.public_repo_writer.as_ref() {
+            if repo.as_deref() != Some(writer.did()) {
+                return xrpc_error(
+                    StatusCode::FORBIDDEN,
+                    "AuthRequired",
+                    "the request repo is not owned by this writer",
+                );
+            }
+        }
     }
     let collection = match object.get("collection").and_then(Value::as_str) {
         Some(collection)
@@ -1230,12 +1286,11 @@ pub async fn create_record(
         // create distinct records. Key allocation itself stays in the writer.
         None => format!("create-{}", uuid::Uuid::new_v4()),
     });
-    let writer = Arc::clone(writer);
     let expected_prev = expected_prev.map(str::to_owned);
     let request = crate::services::public_repo::PublicCreateRequest {
         request_id,
         principal: user.user,
-        did: writer.did().to_owned(),
+        did: repo.clone().unwrap_or_default(),
         collection: collection.to_owned(),
         rkey,
         value: record,
@@ -1243,13 +1298,23 @@ pub async fn create_record(
     };
     // Authorization remains inside the transaction before any store access.
     // Native locks, RocksDB, signing and sync writes must not occupy Tokio workers.
-    let result = tokio::task::spawn_blocking(move || {
-        writer.create_record_with_expected_prev_text(request, expected_prev.as_deref())
-    })
-    .await
-    .unwrap_or_else(|error| {
-        Err(crate::services::public_repo::PublicRepoWriteError::Internal(error.into()))
-    });
+    let result = if let Some(writer) = state.hosted_public_repo_writer.as_ref() {
+        writer.create_record(request, expected_prev.as_deref()).await
+    } else {
+        let Some(writer) = state.public_repo_writer.as_ref() else {
+            return xrpc_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                errors::INTERNAL_SERVER_ERROR,
+                "public repository writer is not configured",
+            );
+        };
+        let writer = Arc::clone(writer);
+        tokio::task::spawn_blocking(move || {
+            writer.create_record_with_expected_prev_text(request, expected_prev.as_deref())
+        })
+        .await
+        .unwrap_or_else(|error| Err(crate::services::public_repo::PublicRepoWriteError::Internal(error.into())))
+    };
     use crate::services::public_repo::PublicRepoWriteError;
     let result = match result {
         Ok(result) => result,
