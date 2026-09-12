@@ -6,8 +6,9 @@
 //! TypeScript.  It therefore catches a schema that is present in Rust but not
 //! consumable by the published TypeScript surface.
 //!
-//! Node/TypeScript are optional for the normal Rust test suite.  The dedicated
-//! SDK/interop CI job sets `HYPRSTREAM_TS_CONSUMER_REQUIRE=1` so a missing
+//! Node/TypeScript are optional for the normal Rust test suite.  The
+//! TypeScript codegen CI job (`.github/workflows/ts-codegen-roundtrip.yml`)
+//! runs this test with `HYPRSTREAM_TS_CONSUMER_REQUIRE=1` so a missing
 //! toolchain fails closed there instead of silently skipping the check.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stderr)]
@@ -51,11 +52,14 @@ fn tsc_command() -> Option<Vec<String>> {
         return Some(vec!["tsc".to_owned()]);
     }
     if required() && which("npx").is_some() {
+        // Pin the same major as the CI job (`npm install -g typescript@5`):
+        // TypeScript 7 removed `moduleResolution=node`, so an unpinned fallback
+        // would check against a different compiler contract than the gate.
         return Some(vec![
             "npx".to_owned(),
             "--yes".to_owned(),
             "-p".to_owned(),
-            "typescript".to_owned(),
+            "typescript@5".to_owned(),
             "tsc".to_owned(),
         ]);
     }
@@ -63,7 +67,7 @@ fn tsc_command() -> Option<Vec<String>> {
 }
 
 fn codegen_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_hyprstream_ts_codegen") {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_hyprstream-ts-codegen") {
         return PathBuf::from(path);
     }
     let current = std::env::current_exe().expect("integration test executable path");
@@ -154,8 +158,13 @@ fn canonical_rpc_schemas_are_consumable_by_typescript() {
             "node",
             "--target",
             "es2020",
+            // The generated streaming-client interfaces intentionally expose
+            // `[Symbol.dispose]()` (explicit resource management) alongside
+            // `free()`; its typings live in `esnext.disposable`. The es2020
+            // target is unchanged — the symbol is a computed property key,
+            // supported at runtime since Node 18.18 and all current browsers.
             "--lib",
-            "es2020,dom",
+            "es2020,dom,esnext.disposable",
             "--skipLibCheck",
         ])
         .args(&sources)

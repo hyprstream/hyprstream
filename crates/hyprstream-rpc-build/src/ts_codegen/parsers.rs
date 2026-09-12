@@ -60,7 +60,7 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
                 (v.name.clone(), data_ty)
             })
             .collect();
-        emit_result_union_alias(
+        super::emit_union_alias(
             out,
             &format!("{pascal}ResponseResult"),
             &shared_fields,
@@ -294,29 +294,12 @@ pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
         // Result type — typed discriminated union so callers narrow on `.variant`.
         // One arm per union variant (data type mirroring the parser output) plus a
         // shared block of non-union fields and the parser's `unknown` default arm.
-        let shared_fields: Vec<String> = non_union_fields
-            .iter()
-            .map(|f| {
-                let ts_type = capnp_to_ts_type(&f.type_name);
-                // Struct pointer fields may be null when the capnp pointer is null.
-                let ts_type = if f.section == FieldSection::Pointer
-                    && !f.type_name.starts_with("List(")
-                    && f.type_name != "Text"
-                    && f.type_name != "Data"
-                    && !super::is_primitive(&f.type_name)
-                {
-                    format!("{ts_type} | null")
-                } else {
-                    ts_type
-                };
-                format!("{}: {}", to_camel_case(&f.name), ts_type)
-            })
-            .collect();
+        let shared_fields = super::shared_union_fields(sd);
         let arms: Vec<(String, String)> = union_fields
             .iter()
             .map(|f| (f.name.clone(), super::union_arm_data_type(sd, f)))
             .collect();
-        emit_result_union_alias(out, &format!("{}Result", sd.name), &shared_fields, &arms);
+        super::emit_union_alias(out, &format!("{}Result", sd.name), &shared_fields, &arms);
 
         // Parser function
         out.push_str(&format!(
@@ -1180,41 +1163,6 @@ fn emit_return(
     ));
 }
 
-/// Emit a typed discriminated-union `type` alias for a parser result.
-///
-/// Shape (one arm per union variant plus the parser's `unknown` default case):
-/// ```text
-/// export type {name} =
-///   | { {shared}variant: '{v}'; data: {ty} }
-///   | { {shared}variant: 'unknown'; data: null };
-/// ```
-/// `shared_fields` are the non-union field declarations (`name: type`) repeated in
-/// every arm — matching what every parser `return` carries alongside `variant`/`data`.
-/// Keeping the arm `data` types aligned with the parser's per-variant output lets
-/// callers narrow on `result.variant`.
-fn emit_result_union_alias(
-    out: &mut String,
-    name: &str,
-    shared_fields: &[String],
-    arms: &[(String, String)],
-) {
-    let shared = shared_fields.join("; ");
-    let shared_prefix = if shared.is_empty() {
-        String::new()
-    } else {
-        format!("{shared}; ")
-    };
-    out.push_str(&format!("export type {name} =\n"));
-    for (variant, data_ty) in arms {
-        out.push_str(&format!(
-            "  | {{ {shared_prefix}variant: '{variant}'; data: {data_ty} }}\n"
-        ));
-    }
-    out.push_str(&format!(
-        "  | {{ {shared_prefix}variant: 'unknown'; data: null }};\n\n"
-    ));
-}
-
 fn emit_struct_read(
     out: &mut String,
     reader_var: &str,
@@ -1224,20 +1172,33 @@ fn emit_struct_read(
     variant_name: &str,
     schema: &ParsedSchema,
 ) {
-    out.push_str(&format!(
-        "    {{\n      const _s = {reader_var}.getStruct({}, {}, {});\n",
-        ptr_field.slot_offset, struct_def.data_words, struct_def.pointer_words
-    ));
+    out.push_str("    {\n");
 
-    let visible_fields: Vec<&FieldDef> = struct_def.non_union_fields().collect();
+    if super::emits_union_alias(schema, struct_def) {
+        // Union-having payload: parse the discriminated union (shared named
+        // fields + per-variant data + unknown fallback) via the same IIFE the
+        // scoped parsers use. A named-fields-only read would silently drop the
+        // inner union — emitting `{}` for pure union envelopes — and fail the
+        // declared alias type (#1616).
+        let expr =
+            emit_struct_pointer_expr(reader_var, ptr_field.slot_offset, struct_def, schema, 0);
+        out.push_str(&format!("      const _data = {expr};\n"));
+    } else {
+        out.push_str(&format!(
+            "      const _s = {reader_var}.getStruct({}, {}, {});\n",
+            ptr_field.slot_offset, struct_def.data_words, struct_def.pointer_words
+        ));
 
-    out.push_str("      const _data = _s ? {\n");
-    for sf in &visible_fields {
-        let camel = to_camel_case(&sf.name);
-        let read_expr = emit_struct_element_field_read("_s", sf, schema);
-        out.push_str(&format!("        {camel}: {read_expr},\n"));
+        let visible_fields: Vec<&FieldDef> = struct_def.non_union_fields().collect();
+
+        out.push_str("      const _data = _s ? {\n");
+        for sf in &visible_fields {
+            let camel = to_camel_case(&sf.name);
+            let read_expr = emit_struct_element_field_read("_s", sf, schema);
+            out.push_str(&format!("        {camel}: {read_expr},\n"));
+        }
+        out.push_str("      } : null;\n");
     }
-    out.push_str("      } : null;\n");
 
     let response_fields: Vec<String> = non_union_fields
         .iter()
