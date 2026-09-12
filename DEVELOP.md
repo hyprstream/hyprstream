@@ -29,20 +29,20 @@ cargo build --release
 **Option B: Download from PyTorch**
 ```bash
 # CUDA 12.8
-wget https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-2.10.0%2Bcu128.zip
-unzip libtorch-shared-with-deps-2.10.0+cu128.zip
+wget https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-2.11.0%2Bcu128.zip
+unzip libtorch-shared-with-deps-2.11.0+cu128.zip
 
 # CUDA 13.0
-wget https://download.pytorch.org/libtorch/cu130/libtorch-shared-with-deps-2.10.0%2Bcu130.zip
-unzip libtorch-shared-with-deps-2.10.0+cu130.zip
+wget https://download.pytorch.org/libtorch/cu130/libtorch-shared-with-deps-2.11.0%2Bcu130.zip
+unzip libtorch-shared-with-deps-2.11.0+cu130.zip
 
 # ROCm 7.1
-wget https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-2.10.0%2Brocm7.1.zip
-unzip libtorch-shared-with-deps-2.10.0+rocm7.1.zip
+wget https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-2.11.0%2Brocm7.1.zip
+unzip libtorch-shared-with-deps-2.11.0+rocm7.1.zip
 
 # CPU
-wget https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.10.0%2Bcpu.zip
-unzip libtorch-shared-with-deps-2.10.0+cpu.zip
+wget https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.11.0%2Bcpu.zip
+unzip libtorch-shared-with-deps-2.11.0+cpu.zip
 ```
 
 **Option C: Use Existing PyTorch Installation**

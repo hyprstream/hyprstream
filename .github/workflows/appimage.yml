@@ -15,7 +15,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  LIBTORCH_VERSION: "2.10.0"
+  LIBTORCH_VERSION: "2.11.0"
   # sccache S3 backend (OIDC role assumed per-run). Replaces SCCACHE_GHA_ENABLED,
   # which spammed the 10GB repo cache with thousands of tiny objects for no
   # cross-run gain (fresh runner each run). Intra-run variant reuse still works

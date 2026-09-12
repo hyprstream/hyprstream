@@ -177,20 +177,29 @@ fn cat_projs(projs: Vec<LinearProjection>) -> LinearProjection {
     let any_fp8 = projs.iter().any(|p| is_fp8(p.weight.kind()));
 
     if all_fp8 {
-        // All FP8: cat weights + scales directly, lazy dequant via apply().
-        let weight_refs: Vec<&Tensor> = projs.iter().map(|p| &p.weight).collect();
+        // Consume sources before rebuilding derived metadata, dropping each
+        // source rowwise copy before the fused copy is allocated.
+        let mut weights = Vec::with_capacity(projs.len());
+        let mut scales = Vec::with_capacity(projs.len());
+        for LinearProjection { weight, scale, .. } in projs {
+            weights.push(weight);
+            scales.push(scale);
+        }
+        let weight_refs: Vec<&Tensor> = weights.iter().collect();
         let fused_weight = Tensor::cat(&weight_refs, 1);
-        let has_scale = projs.iter().any(|p| p.scale.is_some());
-        let scale = if has_scale {
+        let scale = if scales.iter().any(Option::is_some) {
             #[allow(clippy::expect_used)] // all_fp8 invariant: every proj has a scale
-            let scale_refs: Vec<&Tensor> = projs.iter()
-                .map(|p| p.scale.as_ref().expect("FP8 projection missing scale"))
+            let scale_refs: Vec<&Tensor> = scales.iter()
+                .map(|scale| scale.as_ref().expect("FP8 projection missing scale"))
                 .collect();
             Some(Tensor::cat(&scale_refs, 1))
         } else {
             None
         };
-        LinearProjection { weight: fused_weight, bias: None, scale }
+        match scale {
+            Some(s) => LinearProjection::with_scale(fused_weight, s),
+            None => LinearProjection::new(fused_weight),
+        }
     } else if any_fp8 {
         // Mixed FP8/BF16: dequantize FP8 projections to BF16 before catting.
         // Occurs for small gating projections in hybrid layers; memory impact is minor.
@@ -2490,6 +2499,37 @@ mod pipeline_tests {
     const LIN_K_DIM: usize = 4;
     const LIN_V_DIM: usize = 4;
     const CONV_KERNEL: usize = 4;
+
+    /// Child-process probe for the FP8 causal gate test. Starting with
+    /// `HYPRSTREAM_FP8_GEMM=1` is essential because `with_scale` caches that
+    /// env decision for the process. This is an ownership/allocation probe:
+    /// it verifies source rowwise pairs are released before fusion builds the
+    /// fused pair, rather than merely checking a field exists afterwards.
+    #[test]
+    #[allow(clippy::print_stderr)]
+    fn fp8_fused_projection_metadata_probe() {
+        if std::env::var_os("HYPRSTREAM_QWEN_FP8_PROBE").is_none() {
+            return;
+        }
+        assert!(crate::config::default_fp8_gemm());
+        let w1 = Tensor::zeros([256, 256], (Kind::Float, Device::Cpu)).to_kind(Kind::Float8e4m3fn);
+        let w2 = Tensor::zeros([256, 256], (Kind::Float, Device::Cpu)).to_kind(Kind::Float8e4m3fn);
+        let s1 = Tensor::ones([2, 2], (Kind::Float, Device::Cpu));
+        let s2 = Tensor::ones([2, 2], (Kind::Float, Device::Cpu));
+        crate::runtime::architectures::llama::reset_rowwise_requant_peak();
+        let fused = cat_projs(vec![
+            LinearProjection::with_scale(w1, s1),
+            LinearProjection::with_scale(w2, s2),
+        ]);
+        assert_eq!(fused.weight.size(), [256, 512]);
+        assert_eq!(fused.scale.as_ref().expect("fused FP8 scale").size(), [2, 4]);
+        assert_eq!(fused.scale_v2.as_ref().expect("fused packed scale").size(), [4, 4]);
+        assert_eq!(crate::runtime::architectures::llama::rowwise_requant_live(), 1,
+            "fusion did not leave exactly its one derived rowwise allocation alive");
+        assert_eq!(crate::runtime::architectures::llama::rowwise_requant_peak(), 2,
+            "source rowwise allocations overlapped with fused rowwise construction");
+        eprintln!("Qwen fused FP8 allocation probe: source rowwise copies dropped before fused allocation");
+    }
 
     fn tiny_config() -> Qwen3_5TextConfig {
         // Default hybrid pattern: layer (i+1)%4==0 is full attention, rest GDN.
