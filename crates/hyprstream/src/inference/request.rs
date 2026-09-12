@@ -4,8 +4,8 @@
 //! LocalInferenceClient and LocalInferenceService via channels.
 
 use crate::config::GenerationResult;
-use crate::runtime::GenerationRequest;
-use crate::runtime::ModelInfo;
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::inference_client::ModelInfo;
 use crate::training::TenantDeltaConfig;
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};

@@ -13,11 +13,12 @@ use hyprstream_rpc::service::{Continuation, EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 
 use crate::auth::{UserFilter, decode_pubkey_base64};
-use crate::services::generated::oauth_client::{
-    AddPubkey, dispatch_oauth, serialize_response, ErrorInfo, ListUsers, OauthHandler,
+use hyprstream_rpc_std::oauth_client::{
+    AddPubkey, ErrorInfo, ListUsers,
     OauthResponseVariant, PubkeyEntry as RpcPubkeyEntry, RemovePubkey, RegisterUser, UpdateUser,
     UserInfo as RpcUserInfo, UserListResult,
 };
+use crate::services::generated::oauth_client::{OauthHandler, dispatch_oauth, serialize_response};
 
 use super::user_service::{self, UserUpdate};
 use super::state::OAuthState;
@@ -64,7 +65,7 @@ impl OAuthRpcHandler {
             active: info.active,
             external_id: info.external_id.clone().unwrap_or_default(),
             atproto_did: info.atproto_did.clone(),
-            pubkeys: info.pubkeys.iter().map(|pk| crate::services::generated::oauth_client::PubkeyEntry {
+            pubkeys: info.pubkeys.iter().map(|pk| hyprstream_rpc_std::oauth_client::PubkeyEntry {
                 fingerprint: pk.fingerprint.clone(),
                 pubkey_base64: pk.pubkey_base64.clone(),
                 label: pk.label.clone().unwrap_or_default(),

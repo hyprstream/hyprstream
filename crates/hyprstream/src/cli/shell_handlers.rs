@@ -109,7 +109,7 @@ impl ActiveApp {
 
 }
 
-use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayMode, SpawnChromeShellRequest, ResizeRequest, SendInputRequest};
+use hyprstream_rpc_std::tui_client::{TuiClient, ConnectRequest, DisplayMode, SpawnChromeShellRequest, ResizeRequest, SendInputRequest};
 use crate::tui::shell_client::{
     close_window_rpc, focus_window_rpc, spawn_chat_app_rpc,
     spawn_shell_rpc,
@@ -163,14 +163,14 @@ pub async fn handle_shell_tui(
     let models = fetch_models(signing_key, models_dir).await;
 
     // Model load-status channel (background polling → event loop).
-    let model_client = crate::services::generated::model_client::ModelClient::from_resolver(
+    let model_client = hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
         signing_key.clone(), None,
     )?;
     // Worker client for sandbox/container/image management.
     let worker_client = {
-        hyprstream_workers::runtime::WorkerClient::from_resolver(signing_key.clone(), None)?
+        hyprstream_rpc_std::worker_client::WorkerClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), None)?
     };
-    let registry = crate::services::RegistryClient::from_resolver(signing_key.clone(), None)?;
+    let registry = hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), None)?;
 
     let (model_status_tx, mut model_status_rx) =
         tokio::sync::mpsc::channel::<ModelStatusUpdate>(32);
@@ -505,13 +505,13 @@ pub async fn handle_shell_tui(
 
             _ = worker_refresh.tick() => {
                 if matches!(compositor.chrome.mode, hyprstream_compositor::ShellMode::WorkerManager { .. }) {
-                    
+
                     // Poll sandboxes + containers
-                    if let Ok(sandbox_infos) = worker_client.sandbox().list(&crate::services::worker::PodSandboxFilter::default()).await {
+                    if let Ok(sandbox_infos) = worker_client.sandbox().list(&hyprstream_rpc_std::worker_client::PodSandboxFilter::default()).await {
                         let mut entries = Vec::new();
                         for sb in &sandbox_infos {
                             let short_id = if sb.id.len() > 8 { sb.id[..8].to_owned() } else { sb.id.clone() };
-                            let containers = match worker_client.container().list(&crate::services::worker::ContainerFilter {
+                            let containers = match worker_client.container().list(&hyprstream_rpc_std::worker_client::ContainerFilter {
                                 pod_sandbox_id: sb.id.clone(),
                                 ..Default::default()
                             }).await {
@@ -548,7 +548,7 @@ pub async fn handle_shell_tui(
                         ).await { break; }
                     }
                     // Poll images
-                    if let Ok(images) = worker_client.image().list(&crate::services::worker::ImageFilter { image: crate::services::worker::ImageSpec::default() }).await {
+                    if let Ok(images) = worker_client.image().list(&hyprstream_rpc_std::worker_client::ImageFilter { image: hyprstream_rpc_std::worker_client::ImageSpec::default() }).await {
                         let entries: Vec<hyprstream_compositor::ImageEntry> = images.into_iter().map(|img| {
                             let repo_tag = img.repo_tags.first().cloned().unwrap_or_else(|| "<none>".to_owned());
                             let id = if img.id.len() > 12 { img.id[..12].to_owned() } else { img.id.clone() };
@@ -615,7 +615,7 @@ pub async fn handle_shell_tui(
                         format!("Reloading {model_ref} with context {ctx_label}…"),
                         ToastLevel::Info,
                     );
-                    let _ = model_client.load(&crate::services::generated::model_client::LoadModelRequest {
+                    let _ = model_client.load(&hyprstream_rpc_std::model_client::LoadModelRequest {
                         model_ref: model_ref.clone(),
                         max_context: reload_max_context,
                         kv_quant: None,
@@ -766,8 +766,8 @@ fn composite_draw(
 async fn dispatch_outputs(
     compositor: &mut Compositor,
     client: &TuiClient,
-    model_client: &crate::services::generated::model_client::ModelClient,
-    worker_client: &hyprstream_workers::runtime::WorkerClient,
+    model_client: &hyprstream_rpc_std::model_client::ModelClient,
+    worker_client: &hyprstream_rpc_std::worker_client::WorkerClient,
     model_status_tx: &tokio::sync::mpsc::Sender<ModelStatusUpdate>,
     terminal: &mut ratatui::Terminal<AnsiBackend<AnsiWriter>>,
     console_app: &mut ConsoleApp,
@@ -775,7 +775,7 @@ async fn dispatch_outputs(
     next_local_id: &mut u32,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
-    registry: &crate::services::RegistryClient,
+    registry: &hyprstream_rpc_std::registry_client::RegistryClient,
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
     vfs_proxy_tx: &tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
@@ -830,14 +830,14 @@ async fn dispatch_outputs(
 async fn handle_rpc(
     compositor: &mut Compositor,
     client: &TuiClient,
-    model_client: &crate::services::generated::model_client::ModelClient,
-    worker_client: &hyprstream_workers::runtime::WorkerClient,
+    model_client: &hyprstream_rpc_std::model_client::ModelClient,
+    worker_client: &hyprstream_rpc_std::worker_client::WorkerClient,
     model_status_tx: &tokio::sync::mpsc::Sender<ModelStatusUpdate>,
     active_apps: &mut HashMap<u32, ActiveApp>,
     next_local_id: &mut u32,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
-    registry: &crate::services::RegistryClient,
+    registry: &hyprstream_rpc_std::registry_client::RegistryClient,
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
     vfs_proxy_tx: &tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
@@ -944,7 +944,7 @@ async fn handle_rpc(
         }
 
         RpcRequest::LoadModel { model_ref } => {
-            let _ = model_client.load(&crate::services::generated::model_client::LoadModelRequest {
+            let _ = model_client.load(&hyprstream_rpc_std::model_client::LoadModelRequest {
                 model_ref: model_ref.clone(),
                 max_context: None,
                 kv_quant: None,
@@ -954,7 +954,7 @@ async fn handle_rpc(
         }
 
         RpcRequest::UnloadModel { model_ref } => {
-            let ok = model_client.unload(&crate::services::generated::model_client::UnloadModelRequest { model_ref: model_ref.clone() }).await.is_ok();
+            let ok = model_client.unload(&hyprstream_rpc_std::model_client::UnloadModelRequest { model_ref: model_ref.clone() }).await.is_ok();
             if ok {
                 compositor.chrome.update_model_status(&model_ref, false);
             }
@@ -1179,7 +1179,7 @@ async fn handle_rpc(
         RpcRequest::WorkerExecSync { sandbox_id: _, container_id, cmd } => {
             let short = &container_id[..container_id.len().min(8)];
             compositor.chrome.push_toast(format!("Exec in {short}: {:?}", cmd), ToastLevel::Info);
-            match worker_client.container().exec(&crate::services::worker::ExecSyncRequest {
+            match worker_client.container().exec(&hyprstream_rpc_std::worker_client::ExecSyncRequest {
                 container_id: container_id.clone(),
                 cmd: cmd.clone(),
                 timeout: 30,
@@ -1196,7 +1196,7 @@ async fn handle_rpc(
             vec![]
         }
         RpcRequest::WorkerImageList => {
-            match worker_client.image().list(&crate::services::worker::ImageFilter { image: crate::services::worker::ImageSpec::default() }).await {
+            match worker_client.image().list(&hyprstream_rpc_std::worker_client::ImageFilter { image: hyprstream_rpc_std::worker_client::ImageSpec::default() }).await {
                 Ok(images) => {
                     let entries: Vec<hyprstream_compositor::ImageEntry> = images.into_iter().map(|img| {
                         let repo_tag = img.repo_tags.first().cloned().unwrap_or_else(|| "<none>".to_owned());
@@ -1219,13 +1219,13 @@ async fn handle_rpc(
             }
         }
         RpcRequest::WorkerImagePull { image } => {
-            use crate::services::worker::ImageSpec;
+            use hyprstream_rpc_std::worker_client::ImageSpec;
             compositor.chrome.push_toast(format!("Pulling {image}..."), ToastLevel::Info);
             let spec = ImageSpec { image: image.clone(), annotations: Default::default(), runtime_handler: Default::default() };
-            match worker_client.image().pull(&crate::services::worker::PullImageRequest {
+            match worker_client.image().pull(&hyprstream_rpc_std::worker_client::PullImageRequest {
                 image: spec,
-                auth: crate::services::worker::AuthConfig::default(),
-                sandbox_config: crate::services::worker::PodSandboxConfig::default(),
+                auth: hyprstream_rpc_std::worker_client::AuthConfig::default(),
+                sandbox_config: hyprstream_rpc_std::worker_client::PodSandboxConfig::default(),
             }).await {
                 Ok(ref_id) => {
                     compositor.chrome.push_toast(format!("Pulled: {}", &ref_id[..ref_id.len().min(20)]), ToastLevel::Info);
@@ -1237,7 +1237,7 @@ async fn handle_rpc(
             vec![]
         }
         RpcRequest::WorkerImageRemove { image } => {
-            use crate::services::worker::ImageSpec;
+            use hyprstream_rpc_std::worker_client::ImageSpec;
             let spec = ImageSpec { image: image.clone(), annotations: Default::default(), runtime_handler: Default::default() };
             match worker_client.image().remove(&spec).await {
                 Ok(()) => {
@@ -1250,7 +1250,7 @@ async fn handle_rpc(
             vec![]
         }
         RpcRequest::WorkerCreateSandbox { hostname, backend, gpu } => {
-            use crate::services::worker::{PodSandboxConfig, KeyValue};
+            use hyprstream_rpc_std::worker_client::{PodSandboxConfig, KeyValue};
             let mut annotations = vec![];
             annotations.push(KeyValue { key: "io.hyprstream/runtime-handler".to_owned(), value: backend });
             if gpu {
@@ -1273,7 +1273,7 @@ async fn handle_rpc(
             vec![]
         }
         RpcRequest::WorkerCreateContainer { sandbox_id, image, cmd, tty } => {
-            use crate::services::worker::{ContainerConfig, ImageSpec, PodSandboxConfig};
+            use hyprstream_rpc_std::worker_client::{ContainerConfig, ImageSpec, PodSandboxConfig};
             let short_sb = &sandbox_id[..sandbox_id.len().min(8)];
             // PodSandboxStatusResponse has no config field — use default
             let sandbox_config = PodSandboxConfig::default();
@@ -1283,7 +1283,7 @@ async fn handle_rpc(
                 tty,
                 ..Default::default()
             };
-            match worker_client.container().create(&crate::services::worker::CreateContainerRequest {
+            match worker_client.container().create(&hyprstream_rpc_std::worker_client::CreateContainerRequest {
                 pod_sandbox_id: sandbox_id.clone(),
                 config: container_config,
                 sandbox_config,
@@ -1312,7 +1312,7 @@ async fn handle_rpc(
         }
         RpcRequest::WorkerStopContainer { container_id } => {
             let short = &container_id[..container_id.len().min(8)];
-            match worker_client.container().stop(&crate::services::worker::StopContainerRequest {
+            match worker_client.container().stop(&hyprstream_rpc_std::worker_client::StopContainerRequest {
                 container_id: container_id.clone(),
                 timeout: 10,
             }).await {
@@ -1336,8 +1336,8 @@ async fn handle_rpc(
             let short_s = sandbox_id[..sandbox_id.len().min(8)].to_owned();
 
             // Attach RPC → returns ready-to-use StreamHandle (DH + SUB + HMAC managed internally).
-            use hyprstream_workers::generated::worker_client::ContainerRpc;
-            let mut stream_handle = match ContainerRpc::attach(&worker_client.container(), &crate::services::worker::AttachRequest {
+            use hyprstream_rpc_std::worker_client::ContainerRpc;
+            let mut stream_handle = match ContainerRpc::attach(&worker_client.container(), &hyprstream_rpc_std::worker_client::AttachRequest {
                 container_id: container_id.clone(),
                 fds: vec![],
             }).await {
@@ -1422,7 +1422,7 @@ async fn handle_rpc(
             vec![]
         }
         RpcRequest::CloneModel { url, name } => {
-            use crate::services::generated::registry_client::CloneRequest;
+            use hyprstream_rpc_std::registry_client::CloneRequest;
             compositor.chrome.push_toast(format!("Cloning {name}…"), ToastLevel::Info);
             match registry.clone(&CloneRequest {
                 url,
@@ -1444,7 +1444,7 @@ async fn handle_rpc(
         }
 
         RpcRequest::PullModel { model_ref } => {
-            use crate::services::generated::registry_client::UpdateRequest;
+            use hyprstream_rpc_std::registry_client::UpdateRequest;
             let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
             let branch = model_ref.split(':').nth(1).unwrap_or("main");
             match registry.get_by_name(model_name).await {
@@ -1472,7 +1472,7 @@ async fn handle_rpc(
         }
 
         RpcRequest::PushModel { model_ref } => {
-            use crate::services::generated::registry_client::PushRequest;
+            use hyprstream_rpc_std::registry_client::PushRequest;
             let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
             let branch = model_ref.split(':').nth(1).unwrap_or("main");
             match registry.get_by_name(model_name).await {
@@ -1565,7 +1565,7 @@ async fn fetch_models(
     models_dir: &std::path::Path,
 ) -> Vec<ModelEntry> {
 
-    let registry: crate::services::RegistryClient = match crate::services::RegistryClient::from_resolver(
+    let registry: hyprstream_rpc_std::registry_client::RegistryClient = match hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
         signing_key.clone(),
         None,
     ) {
@@ -1575,7 +1575,7 @@ async fn fetch_models(
             return Vec::new();
         }
     };
-    let model_client_for_status = match crate::services::generated::model_client::ModelClient::from_resolver(
+    let model_client_for_status = match hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
         signing_key.clone(),
         None,
     ) {
@@ -1588,7 +1588,7 @@ async fn fetch_models(
     let registry_models_dir = models_dir.to_path_buf();
     let status_timeout = std::time::Duration::from_millis(500);
 
-    let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
+    let all_status_req = hyprstream_rpc_std::model_client::StatusRequest { model_ref: String::new() };
     let (repos_result, status_result) = tokio::join!(
         registry.list(),
         tokio::time::timeout(status_timeout, model_client_for_status.status(&all_status_req)),
@@ -1727,7 +1727,7 @@ fn tab_index_at_col(windows: &[WindowSummary], col: u16) -> Option<usize> {
 /// `context_window` is set to `None` because it is a load-time parameter
 /// configured via `LoadModelRequest.maxContext`, not a generation default.
 fn wire_gen_defaults_to_compositor(
-    wire: &crate::services::generated::model_client::GenerationDefaults,
+    wire: &hyprstream_rpc_std::model_client::GenerationDefaults,
 ) -> GenerationDefaults {
     GenerationDefaults {
         temperature: wire.temperature,
@@ -1741,7 +1741,7 @@ fn wire_gen_defaults_to_compositor(
 /// Spawn a background task that polls model status every 2s until loaded (or timeout).
 /// Sends a `ModelStatusUpdate` through `tx` when the model loads or after 120s timeout.
 fn spawn_model_load_poll(
-    poll_client: crate::services::generated::model_client::ModelClient,
+    poll_client: hyprstream_rpc_std::model_client::ModelClient,
     model_ref: String,
     tx: tokio::sync::mpsc::Sender<ModelStatusUpdate>,
 ) {
@@ -1749,7 +1749,7 @@ fn spawn_model_load_poll(
         for _ in 0..60u32 {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             if let Ok(entries) = poll_client.status(
-                &crate::services::generated::model_client::StatusRequest {
+                &hyprstream_rpc_std::model_client::StatusRequest {
                     model_ref: model_ref.clone(),
                 },
             ).await {
@@ -1814,7 +1814,7 @@ fn render_app_to_ansi(app: &ActiveApp) -> Vec<u8> {
 /// The resulting `FrameUpdate` is passed to `CompositorInput::ServerFrameCapnp`.
 fn decode_tui_frame(data: &[u8]) -> anyhow::Result<FrameUpdate> {
     use capnp::serialize;
-    use crate::tui_capnp;
+    use hyprstream_rpc_std::tui_capnp;
 
     let reader = serialize::read_message_from_flat_slice(
         &mut &data[..],

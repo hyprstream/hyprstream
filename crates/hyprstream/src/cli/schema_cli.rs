@@ -12,12 +12,15 @@ use ed25519_dalek::SigningKey;
 use hyprstream_service::ScopedClientTreeNode;
 use serde_json::Value;
 
-use crate::services::generated::inference_client::InferenceClient;
-use crate::services::generated::model_client::ModelClient;
-use crate::services::generated::{inference_client, model_client, policy_client, registry_client};
-use crate::services::{DiscoveryClient, RegistryClient};
-use hyprstream_workers::generated::{worker_client, workflow_client};
-use hyprstream_workers::runtime::WorkerClient;
+use hyprstream_rpc_std::inference_client::InferenceClient;
+use hyprstream_rpc_std::model_client::ModelClient;
+use hyprstream_rpc_std::{
+    inference_client, model_client, policy_client, registry_client,
+    worker_client, workflow_client,
+};
+use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+use hyprstream_rpc_std::registry_client::RegistryClient;
+use hyprstream_rpc_std::worker_client::WorkerClient;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MethodSchemaLike trait — unifies per-module MethodSchema types
@@ -398,15 +401,15 @@ async fn dispatch_top_level(
 ) -> Result<Value> {
     match service {
         "registry" => {
-            let client: RegistryClient = RegistryClient::from_resolver(signing_key, None)?;
+            let client: RegistryClient = RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
             client.call_method(method, args).await
         }
         "model" => {
-            let client = ModelClient::from_resolver(signing_key, None)?;
+            let client = ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
             client.call_method(method, args).await
         }
         "inference" => {
-            let client = InferenceClient::from_resolver(signing_key, None)?;
+            let client = InferenceClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
             client.call_method(method, args).await
         }
         "policy" => {
@@ -426,9 +429,9 @@ async fn dispatch_top_level(
         "workflow" => {
             // #989: WorkflowService factory is registered (default-off). The
             // factory still has to be started (`[worker.workflow] enabled = true`)
-            // for this dispatch to reach a live service; `from_resolver` dials
-            // the registered endpoint and errors clearly if nothing is listening.
-            let client = workflow_client::WorkflowClient::from_resolver(signing_key, None)?;
+            // for this dispatch to reach a live service; the explicit provider
+            // resolves the registered endpoint and errors clearly if nothing is listening.
+            let client = workflow_client::WorkflowClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
             client.call_method(method, args).await
         }
         _ => bail!("Unknown service: {}", service),
@@ -462,7 +465,7 @@ fn create_discovery_client_for_profile(
     }
 
     if network_required {
-        return DiscoveryClient::from_resolver(signing_key.clone(), None);
+        return DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), None);
     }
 
     let discovery_key = hyprstream_service::global_trust_store()
@@ -491,15 +494,15 @@ async fn dispatch_scoped_dynamic(
 ) -> Result<Value> {
     match service {
         "registry" => {
-            let client: RegistryClient = RegistryClient::from_resolver(signing_key, None)?;
+            let client: RegistryClient = RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         "model" => {
-            let client = ModelClient::from_resolver(signing_key, None)?;
+            let client = ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         "worker" => {
-            let client = WorkerClient::from_resolver(signing_key, None)?;
+            let client = WorkerClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         // "workflow" has no scoped sub-resources (unlike worker's
@@ -926,7 +929,7 @@ mod tests {
 
         // The client bootstrap installed (authenticated: pinned discovery key)
         // — in production this is the DID-anchored remote-node network client.
-        let installed = hyprstream_discovery::DiscoveryClient::for_local_transport_bootstrap(
+        let installed = hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_transport_bootstrap(
             &reach_transport,
             caller_key.clone(),
             service_vk,

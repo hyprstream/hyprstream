@@ -27,8 +27,8 @@ use dashmap::DashMap;
 use hyprstream_9p::backend::{Backend, OpenResult, StatResult, WalkResult};
 use hyprstream_9p::msg::Qid;
 
-use crate::services::generated::model_client::{ModelClient, ModelFsClient};
-use crate::services::generated::model_client::{
+use hyprstream_rpc_std::model_client::{ModelClient, ModelFsClient};
+use hyprstream_rpc_std::model_client::{
     NpClunk, NpOpen, NpRead, NpStatReq, NpWalk, NpWrite, ROpen, RStat, RWalk,
 };
 
@@ -79,7 +79,7 @@ impl ModelBackend {
     }
 }
 
-fn qid_from_rpc(q: &crate::services::generated::model_client::Qid) -> Qid {
+fn qid_from_rpc(q: &hyprstream_rpc_std::model_client::Qid) -> Qid {
     Qid { qtype: q.qtype, version: q.version, path: q.path }
 }
 

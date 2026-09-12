@@ -99,7 +99,7 @@ pub fn build_chat_vfs_namespace(
         Subject::new(pubkey_hex)
     };
 
-    let model_client = crate::services::generated::model_client::ModelClient::from_resolver(
+    let model_client = hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
         signing_key.clone(),
         None,
     )?;

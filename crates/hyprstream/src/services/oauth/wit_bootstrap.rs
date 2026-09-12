@@ -62,7 +62,8 @@ pub async fn issue_browser_wit(
 mod tests {
     use super::*;
     use crate::config::OAuthConfig;
-    use crate::services::{DiscoveryClient, PolicyClient};
+    use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+    use hyprstream_rpc_std::policy_client::PolicyClient;
     use axum::extract::Extension;
     use hyprstream_rpc::rpc_client::RpcClientImpl;
     use hyprstream_rpc::signer::LocalSigner;

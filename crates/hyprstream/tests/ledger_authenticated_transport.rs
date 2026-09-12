@@ -279,7 +279,7 @@ async fn verified_user_transport_did_admits_its_grant_and_refuses_another_signer
         .expect("hybrid request envelope");
         let mut message = capnp::message::Builder::new_default();
         signed.write_to(
-            &mut message.init_root::<hyprstream_core::common_capnp::signed_envelope::Builder>(),
+            &mut message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>(),
         );
         let mut wire = Vec::new();
         capnp::serialize::write_message(&mut wire, &message).expect("serialize request");

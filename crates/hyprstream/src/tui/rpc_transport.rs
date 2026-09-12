@@ -24,9 +24,9 @@ pub fn make_chat_spawner(
 ) -> hyprstream_tui::chat_app::StreamSpawner {
     use hyprstream_rpc::streaming::StreamPayload;
 
-    use crate::runtime::GenerationRequest;
-    use crate::services::generated::inference_client::{ChatMessage, ToolCall, ToolCallFunction};
-    use crate::services::generated::model_client::ModelClient;
+    use hyprstream_rpc_std::inference_client::GenerationRequest;
+    use hyprstream_rpc_std::inference_client::{ChatMessage, ToolCall, ToolCallFunction};
+    use hyprstream_rpc_std::model_client::ModelClient;
     use hyprstream_tui::chat_app::{ChatEvent, ChatHistoryEntry, ChatRole};
 
     let sk = signing_key.clone();
@@ -59,7 +59,7 @@ pub fn make_chat_spawner(
             };
 
             rt.block_on(async move {
-                let model_client = match ModelClient::from_resolver(sk_inner.clone(), None) {
+                let model_client = match ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk_inner.clone(), None) {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = tx.send(ChatEvent::StreamError(format!(
@@ -134,7 +134,7 @@ pub fn make_chat_spawner(
                 let template_result = tokio::time::timeout(
                     std::time::Duration::from_secs(15),
                     model_client.infer(&mr_inner).apply_chat_template(
-                        &crate::services::generated::model_client::ChatTemplateRequest {
+                        &hyprstream_rpc_std::model_client::ChatTemplateRequest {
                             messages: messages.clone(),
                             add_generation_prompt: true,
                             tools_json: Some(tools_json.clone()).filter(|s| !s.is_empty()),
@@ -169,7 +169,7 @@ pub fn make_chat_spawner(
                     ..Default::default()
                 };
 
-                use crate::services::generated::model_client::InferRpc;
+                use hyprstream_rpc_std::model_client::InferRpc;
                 let mut handle =
                     match InferRpc::generate_stream(&model_client.infer(&mr_inner), &req).await {
                         Ok(h) => h,
@@ -240,7 +240,7 @@ pub fn make_tool_caller(
     HashMap<String, String>,
     Vec<serde_json::Value>,
 ) {
-    use crate::services::generated::mcp_client::McpClient as GenMcpClient;
+    use hyprstream_rpc_std::mcp_client::McpClient as GenMcpClient;
     use hyprstream_tui::chat_app::ChatEvent;
 
     let sk = signing_key.clone();
@@ -256,7 +256,7 @@ pub fn make_tool_caller(
                 .build()
                 .ok()?;
             rt.block_on(async move {
-                let gen: GenMcpClient = GenMcpClient::from_resolver(sk_fetch, None).ok()?;
+                let gen: GenMcpClient = GenMcpClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk_fetch, None).ok()?;
                 let tool_list = gen.list_tools().await.ok()?;
                 let mut descs = HashMap::new();
                 let mut tools = Vec::new();
@@ -300,12 +300,12 @@ pub fn make_tool_caller(
                         Err(e) => return format!("error: {e}"),
                     };
                     rt.block_on(async move {
-                        let mcp_client = match GenMcpClient::from_resolver(sk_c, None) {
+                        let mcp_client = match GenMcpClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk_c, None) {
                             Ok(c) => c,
                             Err(e) => return format!("error: failed to create McpClient: {e}"),
                         };
                         match mcp_client
-                            .call_tool(&crate::services::generated::mcp_client::CallTool {
+                            .call_tool(&hyprstream_rpc_std::mcp_client::CallTool {
                                 tool_name: uuid_c,
                                 arguments,
                                 caller_identity: hyprstream_rpc::identity::Did::new(String::new()),

@@ -33,16 +33,17 @@
 //! Uses `InferenceHandler::authorize()` via generated dispatch for policy-backed
 //! authorization on all requests. The handler delegates to PolicyClient.
 
-use crate::services::PolicyClient;
+use hyprstream_rpc_std::policy_client::PolicyClient;
 use crate::config::TrainingMode;
-use crate::runtime::GenerationRequest;
-use crate::runtime::ModelInfo;
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::inference_client::ModelInfo;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
 
 use crate::services::EnvelopeContext;
-use crate::services::WorktreeClient;
+use hyprstream_rpc_std::registry_client::WorktreeClient;
+use crate::services::WorktreeClientExt;
 use crate::training::{DeltaPool, TenantDeltaConfig, TTTConfig, TestTimeTrainer};
 use hyprstream_rpc::Subject;
 use crate::training::serialize_state_dict_to_bytes;
@@ -1435,7 +1436,7 @@ impl InferenceService {
     async fn setup_stream(
         &self,
         ctx: &EnvelopeContext,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::streaming::StreamContext)> {
+    ) -> Result<(hyprstream_rpc_std::inference_client::StreamInfo, hyprstream_rpc::streaming::StreamContext)> {
         let client_pub_bytes = ctx.ephemeral_pubkey()
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
         let client_pub_ref: &[u8] = &client_pub_bytes;
@@ -1459,7 +1460,7 @@ impl InferenceService {
             .map(|o| o.broadcast_path(stream_ctx.topic()))
             .unwrap_or_default();
 
-        let stream_info = crate::services::generated::inference_client::StreamInfo {
+        let stream_info = hyprstream_rpc_std::inference_client::StreamInfo {
             stream_id,
             dh_public: server_pubkey,
             qos: stream_ctx.qos().clone(),
@@ -2232,8 +2233,7 @@ fn sanitize_adapter_name(name: &str) -> Result<String> {
 // InferenceHandler Implementation — generated dispatch for typed handler trait
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use crate::services::generated::inference_client::{
-    InferenceHandler, dispatch_inference, serialize_response,
+use hyprstream_rpc_std::inference_client::{
     InferenceResponseVariant, ErrorInfo,
     HealthStatus, DeltaStatusResult, ModuleNormRatio,
     SaveAdaptationResult, SnapshotDeltaResult, ExportPeftResult,
@@ -2241,7 +2241,10 @@ use crate::services::generated::inference_client::{
     MergeLoraRequest, EmbedImagesRequest, EmbedImagesResponse,
     AdaptationStrategy as AdaptationStrategyEnum,
 };
-use crate::services::generated::policy_client::PolicyCheck;
+use crate::services::generated::inference_client::{
+    InferenceHandler, dispatch_inference, serialize_response,
+};
+use hyprstream_rpc_std::policy_client::PolicyCheck;
 // Conflicting names — use canonical path at usage sites:
 //   inference_client::GenerationResult, inference_client::ModelInfo, inference_client::StreamInfo
 
@@ -2300,8 +2303,8 @@ impl InferenceHandler for InferenceService {
 
     async fn handle_generate_stream(
         &self, ctx: &EnvelopeContext, _request_id: u64,
-        data: &crate::services::generated::inference_client::GenerationRequest,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+        data: &hyprstream_rpc_std::inference_client::GenerationRequest,
+    ) -> Result<(hyprstream_rpc_std::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let subject = ctx.subject();
         let request = data.clone();
 
@@ -2334,7 +2337,7 @@ impl InferenceHandler for InferenceService {
         let (stream_id, server_pubkey, broadcast_path, reach, pending) =
             self.prepare_stream(request, client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice), claims, expiry_secs, &subject, ttt_overrides, owner_did).await?;
 
-        let stream_info = crate::services::generated::inference_client::StreamInfo {
+        let stream_info = hyprstream_rpc_std::inference_client::StreamInfo {
             stream_id,
             dh_public: server_pubkey,
             qos: <hyprstream_rpc::stream_info::Job as hyprstream_rpc::stream_info::StreamOptPreset>::stream_opt(),
@@ -2368,7 +2371,7 @@ impl InferenceHandler for InferenceService {
 
     async fn handle_get_layer_profile(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         use crate::runtime::ttn_profile;
-        use crate::services::generated::inference_client::LayerProfileResult;
+        use hyprstream_rpc_std::inference_client::LayerProfileResult;
 
         let model_config = crate::runtime::model_config::ModelConfig::load(
             &self.model_path,
@@ -2537,7 +2540,7 @@ impl InferenceHandler for InferenceService {
     async fn handle_train_step_stream(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         data: &TrainStepRequest,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(hyprstream_rpc_std::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let subject = ctx.subject();
 
         // DH key derivation
@@ -2564,7 +2567,7 @@ impl InferenceHandler for InferenceService {
             .map(|o| o.broadcast_path(stream_ctx.topic()))
             .unwrap_or_default();
 
-        let stream_info = crate::services::generated::inference_client::StreamInfo {
+        let stream_info = hyprstream_rpc_std::inference_client::StreamInfo {
             stream_id,
             dh_public: server_pubkey,
             qos: stream_ctx.qos().clone(),
@@ -2650,7 +2653,7 @@ impl InferenceHandler for InferenceService {
     async fn handle_create_lora_stream(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         data: &LoraConfig,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(hyprstream_rpc_std::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let defaults = crate::training::TenantDeltaConfig::default();
@@ -2671,7 +2674,7 @@ impl InferenceHandler for InferenceService {
     async fn handle_load_lora_stream(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         value: &str,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(hyprstream_rpc_std::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let path = value.to_owned();
@@ -2684,7 +2687,7 @@ impl InferenceHandler for InferenceService {
     async fn handle_save_lora_stream(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         value: &str,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(hyprstream_rpc_std::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let name = value.to_owned();
@@ -2697,7 +2700,7 @@ impl InferenceHandler for InferenceService {
     async fn handle_save_adaptation_stream(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         data: &SaveAdaptationRequest,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(hyprstream_rpc_std::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let subject = ctx.subject();
@@ -2712,7 +2715,7 @@ impl InferenceHandler for InferenceService {
 
     async fn handle_snapshot_delta_stream(
         &self, ctx: &EnvelopeContext, _request_id: u64,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(hyprstream_rpc_std::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let subject = ctx.subject();
@@ -2725,7 +2728,7 @@ impl InferenceHandler for InferenceService {
     async fn handle_export_peft_adapter_stream(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         data: &ExportPeftRequest,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(hyprstream_rpc_std::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let subject = ctx.subject();
@@ -2740,7 +2743,7 @@ impl InferenceHandler for InferenceService {
     async fn handle_merge_lora_stream(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         data: &MergeLoraRequest,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(hyprstream_rpc_std::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let adapter_path = data.adapter_path.clone();
@@ -3455,7 +3458,7 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                     // discovery resolver; compatibility dials the factory-
                     // resolved deterministic IPC transport.
                     let policy_client = if hyprstream_discovery::native_network_required() {
-                        PolicyClient::from_resolver(policy_signing_key, None)?
+                        PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, policy_signing_key, None)?
                     } else {
                         PolicyClient::for_local_transport_bootstrap(
                             &policy_transport,
@@ -3917,7 +3920,7 @@ mod quinn_drain_tests {
         let mut message = capnp::message::Builder::new_default();
         {
             let mut request = message
-                .init_root::<crate::inference_capnp::inference_request::Builder>();
+                .init_root::<hyprstream_rpc_std::inference_capnp::inference_request::Builder>();
             request.set_id(7);
             request.set_is_ready(());
         }

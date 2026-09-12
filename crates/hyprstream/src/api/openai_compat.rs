@@ -1,6 +1,7 @@
 //! OpenAI API compatibility layer
 
 use serde::{Deserialize, Serialize};
+use hyprstream_rpc_std::inference_client::ToolCall;
 
 // Type aliases for API compatibility
 pub use ChatCompletionRequest as OpenAIRequest;
@@ -94,9 +95,6 @@ pub enum ToolChoice {
 pub struct ToolChoiceFunction {
     pub name: String,
 }
-
-/// Tool call made by the model (in response), re-exported from generated inference schema.
-pub use crate::services::generated::inference_client::{ToolCall, ToolCallFunction};
 
 /// Chat Completion Response
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,4 +420,3 @@ mod tests {
         assert_eq!(tools[0].function.name, "get_weather");
     }
 }
-

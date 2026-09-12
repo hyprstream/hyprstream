@@ -352,10 +352,10 @@ impl TransportConfig {
             // Unknown scheme — fail-closed: misrouting to inproc would yield a
             // cryptic "no in-process service registered" error at dial time.
             // Networked transports (quic://, iroh://, tcp://) are obtained via
-            // TransportConfig::from_resolver(), not from_endpoint().
+            // the application-owned RpcClientProvider, not from_endpoint().
             panic!(
                 "TransportConfig::from_endpoint: unknown scheme in '{endpoint}'; \
-                 use from_resolver() for networked transports"
+                 use an RpcClientProvider for networked transports"
             );
         } else {
             // Bare name (no scheme) — defaults to inproc

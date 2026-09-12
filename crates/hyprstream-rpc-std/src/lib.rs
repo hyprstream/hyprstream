@@ -4,8 +4,10 @@
 //! generated client types for all standard hyprstream services (model,
 //! registry, inference, policy, mcp, etc.).
 //!
-//! Apache-2.0 licensed. Depends only on hyprstream-rpc (also Apache-2.0).
-//! Compiles to native and wasm32.
+//! The generated service client/data surface is Apache-2.0.  The
+//! `pay_client` module is a license-preserving re-export of the separately
+//! MIT-licensed `hyprstream-pay` protocol.  No AGPL service implementation is
+//! in this dependency graph. Compiles to native and wasm32.
 
 #![allow(dead_code, unused_imports)]
 
@@ -89,6 +91,41 @@ pub mod oauth_capnp {
     include!(concat!(env!("OUT_DIR"), "/oauth_capnp.rs"));
 }
 
+pub mod worker_capnp {
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/worker_capnp.rs"));
+}
+
+pub mod workflow_capnp {
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/workflow_capnp.rs"));
+}
+
+pub mod discovery_capnp {
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/discovery_capnp.rs"));
+}
+
+pub mod tui_capnp {
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/tui_capnp.rs"));
+}
+
+pub mod compositor_ipc_capnp {
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/compositor_ipc_capnp.rs"));
+}
+
 // ============================================================================
 // Generated client types (from proc macro)
 // Client-only: data structs, response enums, metadata. No server handlers.
@@ -143,6 +180,111 @@ pub mod oauth_client {
     #![allow(clippy::all)]
     extern crate self as hyprstream_rpc_std;
     hyprstream_rpc_derive::generate_rpc_client!("oauth");
+}
+
+pub mod worker_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    extern crate self as hyprstream_rpc_std;
+    hyprstream_rpc_derive::generate_rpc_client!("worker");
+}
+
+pub mod workflow_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    extern crate self as hyprstream_rpc_std;
+    hyprstream_rpc_derive::generate_rpc_client!("workflow");
+}
+
+pub mod discovery_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    extern crate self as hyprstream_rpc_std;
+    hyprstream_rpc_derive::generate_rpc_client!("discovery");
+}
+
+pub mod tui_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    extern crate self as hyprstream_rpc_std;
+    hyprstream_rpc_derive::generate_rpc_client!("tui");
+}
+
+/// Data contracts for compositor/ChatApp IPC. This schema has no RPC request
+/// union, so the generated module contains only serializable data types.
+pub mod compositor_ipc_types {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    extern crate self as hyprstream_rpc_std;
+    hyprstream_rpc_derive::generate_rpc_client!("compositor_ipc");
+}
+
+/// MIT settlement/tariff protocol surface.
+///
+/// This is a license-preserving re-export of `hyprstream-pay`; the AGPL
+/// settlement service remains in `hyprstream::services::pay` and is not a
+/// dependency of this SDK crate.
+pub mod pay_client {
+    pub use hyprstream_pay::{
+        attestation, capability, types, ATTESTATION_V1_TAG, ALL_SCOPES, IssueRequest,
+        IssueResponse, PayError, SettlementAttestation, SettlementIssuer, TariffProvider,
+        TariffQuote, TariffRequest, UnitRef,
+    };
+}
+
+/// Stable, discoverable imports for third-party Rust consumers. Service
+/// implementations intentionally do not re-export these client/data modules;
+/// this Apache-2.0 crate is the single public SDK surface.
+pub mod prelude {
+    pub use crate::{
+        discovery_client, inference_client, mcp_client, metrics_client, model_client,
+        oauth_client, pay_client, policy_client, registry_client, tui_client, worker_client,
+        workflow_client, compositor_ipc_types,
+    };
+    pub use hyprstream_rpc::{CallOptions, FromCapnp, RpcClient, RpcClientProvider, ToCapnp};
+}
+
+// Compile-time smoke test for the split codegen boundary.  The test module
+// deliberately generates a server surface for an existing standard schema
+// while importing its contracts from this crate; it ensures the server macro
+// cannot accidentally grow a second client/data implementation.
+#[cfg(test)]
+mod server_codegen_smoke {
+    pub mod model_server {
+        hyprstream_rpc_derive::generate_rpc_server!("model", types_crate = crate, scope_handlers);
+    }
+}
+
+#[cfg(test)]
+mod contract_compat_tests {
+    /// Schema IDs are wire identities. Keeping these assertions next to the
+    /// canonical generated modules catches an accidental schema replacement
+    /// before a client/service release can drift apart.
+    #[test]
+    fn first_party_schema_ids_are_stable() {
+        use capnp::traits::HasTypeId;
+
+        assert_eq!(
+            <crate::worker_capnp::worker_request::Reader<'static> as HasTypeId>::TYPE_ID,
+            0xbd3a_6a4e_7920_5f9c
+        );
+        assert_eq!(
+            <crate::workflow_capnp::workflow_request::Reader<'static> as HasTypeId>::TYPE_ID,
+            0x90a9_1c80_c0f0_7c3d
+        );
+        assert_eq!(
+            <crate::discovery_capnp::discovery_request::Reader<'static> as HasTypeId>::TYPE_ID,
+            0xecbd_7dea_6f0a_0715
+        );
+        assert_eq!(
+            <crate::tui_capnp::tui_request::Reader<'static> as HasTypeId>::TYPE_ID,
+            0x9e27_3fdc_e270_b381
+        );
+        assert_eq!(
+            <crate::compositor_ipc_capnp::compositor_ipc_in::Reader<'static> as HasTypeId>::TYPE_ID,
+            0x8c6b_4203_2547_6ee5
+        );
+    }
 }
 
 // ============================================================================

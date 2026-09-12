@@ -1097,8 +1097,8 @@ mod tests {
         config.external_url = Some(issuer_url.to_owned());
         OAuthState::new(
             &config,
-            crate::services::PolicyClient::new(make_client()),
-            crate::services::DiscoveryClient::new(make_client()),
+            hyprstream_rpc_std::policy_client::PolicyClient::new(make_client()),
+            hyprstream_rpc_std::discovery_client::DiscoveryClient::new(make_client()),
             local.verifying_key().to_bytes(),
         )
         .with_signing_key(local, CryptoPolicy::Hybrid)
@@ -1214,7 +1214,8 @@ mod tests {
         use crate::config::OAuthConfig;
         use crate::config::server::CorsConfig;
         use crate::services::oauth::create_app;
-        use crate::services::{DiscoveryClient, PolicyClient};
+        use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+        use hyprstream_rpc_std::policy_client::PolicyClient;
         use async_trait::async_trait;
         use axum::body::Body;
         use axum::http::Request as HttpRequest;

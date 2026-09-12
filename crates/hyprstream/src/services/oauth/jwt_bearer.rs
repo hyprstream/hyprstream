@@ -17,7 +17,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
 
 use super::state::OAuthState;
-use crate::services::generated::policy_client::{IssueToken, IssueTokenProfile};
+use hyprstream_rpc_std::policy_client::{IssueToken, IssueTokenProfile};
 
 /// Exchange a JWT bearer assertion for an access token (RFC 7523).
 pub async fn exchange_jwt_bearer(

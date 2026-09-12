@@ -5,12 +5,12 @@
 
 use chrono::{DateTime, Utc};
 
-use super::client::{KeyValue, ContainerState};
+use hyprstream_rpc_std::worker_client::{KeyValue, ContainerState};
 // Use generated ContainerMetadata (matches what's in generated ContainerConfig/ContainerStatus)
-use crate::generated::worker_client::ContainerMetadata;
+use hyprstream_rpc_std::worker_client::ContainerMetadata;
 
 // DTO types (ContainerConfig, ImageSpec, Mount, Device, ContainerStatus, etc.)
-// are now imported from generated types via super::client
+// are imported directly from the canonical rpc-std client module.
 
 /// Runtime representation of a container
 #[derive(Debug, Clone)]
@@ -31,7 +31,7 @@ pub struct Container {
     pub created_at: DateTime<Utc>,
 
     /// Image reference (uses generated ImageSpec type)
-    pub image: super::client::ImageSpec,
+    pub image: hyprstream_rpc_std::worker_client::ImageSpec,
 
     /// Labels
     pub labels: Vec<KeyValue>,
@@ -49,7 +49,7 @@ pub struct Container {
 
 impl Container {
     /// Create a new container from configuration (uses generated ContainerConfig)
-    pub fn new(id: String, pod_sandbox_id: String, config: &super::client::ContainerConfig) -> Self {
+    pub fn new(id: String, pod_sandbox_id: String, config: &hyprstream_rpc_std::worker_client::ContainerConfig) -> Self {
         Self {
             id,
             pod_sandbox_id,
@@ -72,7 +72,7 @@ impl Container {
         id: String,
         pod_sandbox_id: String,
         metadata: ContainerMetadata,
-        image: super::client::ImageSpec,
+        image: hyprstream_rpc_std::worker_client::ImageSpec,
         state: ContainerState,
         created_at: DateTime<Utc>,
         labels: Vec<KeyValue>,

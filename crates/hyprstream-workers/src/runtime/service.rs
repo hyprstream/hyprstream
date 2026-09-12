@@ -1,4 +1,4 @@
-//! WorkerService — CRI RuntimeClient + ImageClient control plane.
+//! WorkerService — AGPL implementation of the canonical worker control plane.
 //!
 //! Implements the `RequestService` trait for handling CRI-aligned requests.
 //!
@@ -6,7 +6,7 @@
 //!
 //! This is the worker **control plane**. It is transport-agnostic: the service
 //! only implements `RequestService` (Cap'n Proto wire format via
-//! `generate_rpc_service!("worker")`) and carries a `TransportConfig`. The
+//! `generate_rpc_server!("worker")`) and carries a `TransportConfig`. The
 //! legacy ZMQ ROUTER/DEALER stack was removed workspace-wide (#138/#167 —
 //! ZMQ/ZeroMQ is gone); the blanket `Spawnable` impl bridges this service and
 //! serves it over its *registered* transport (`serve_bridged`: Inproc / IPC-UDS
@@ -15,7 +15,7 @@
 //!
 //! The **asynchronous** surfaces of the worker already ride the moq-lite
 //! streaming plane, mirroring the event-bus migration (#167): lifecycle events
-//! publish via [`EventPublisher`] (moq-backed — see `crate::events`) and
+//! publish via [`EventPublisher`] (moq-backed — see `hyprstream_rpc::events`) and
 //! terminal attach/detach FD data streams via `StreamChannel` /
 //! `AnyStreamPublisher` (moq). moq is a pub/sub fan-out plane, not a
 //! request/response RPC transport, so the synchronous CRI req/rep control plane
@@ -35,6 +35,7 @@ use tracing::{debug, info, warn};
 // bridged transport (inproc/UDS/QUIC/iroh) + the moq streaming plane. ZMQ is
 // gone (#138/#167) — this is not a ZMQ socket API.
 use hyprstream_rpc::moq_stream::AnyStreamPublisher;
+use hyprstream_rpc::events::EventPublisher;
 use hyprstream_rpc::prelude::SigningKey;
 use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, RequestService};
 use hyprstream_rpc::streaming::StreamChannel;
@@ -43,7 +44,6 @@ use hyprstream_rpc::transport::TransportConfig;
 use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 use crate::events::{
-    EventPublisher,
     // Event types and serialization helpers
     ContainerStarted, ContainerStopped, SandboxStarted, SandboxStopped,
     serialize_container_started, serialize_container_stopped,
@@ -55,16 +55,13 @@ use crate::events::{
 // it, with no cfg mirror (#646).
 use crate::image::ImageStore;
 // Import generated wire types (canonical OCI-aligned names)
-use crate::generated::worker_client::{
+use hyprstream_rpc_std::worker_client::{
     // Filter + request types for handler signatures
     PodSandboxFilter, PodSandboxStatsFilter,
     ContainerFilter, ContainerStatsFilter,
     StatusRequest, PodSandboxStatusRequest, StopContainerRequest,
     ContainerStatusRequest, AttachRequest, ImageFilter, ImageStatusRequest,
-};
-use super::client::{
-    StatusResponse, KeyValue,
-    VersionInfo, RuntimeStatus, RuntimeCondition,
+    KeyValue, VersionInfo, RuntimeStatus, RuntimeCondition,
     ExecSyncResult,
     PodSandboxStats, PodSandboxAttributes, LinuxPodSandboxStats,
     ContainerStats, ContainerAttributes,
@@ -73,6 +70,14 @@ use super::client::{
     PodSandboxConfig, PodSandboxStatus,
     ContainerConfig, ContainerStatus,
     StreamInfo,
+    PodSandboxStatusResponse, ContainerStatusResponse,
+    ImageInfo, ImageStatusResult,
+    FilesystemUsage, AuthConfig,
+};
+use super::status::StatusResponse;
+use crate::generated::worker_client::{
+    WorkerHandler, dispatch_worker,
+    RuntimeHandler, SandboxHandler, ContainerHandler, ImageHandler,
 };
 // Domain entities (business logic)
 use super::container::Container;
@@ -84,7 +89,7 @@ use super::{RUNTIME_NAME, RUNTIME_VERSION};
 /// Service name for endpoint registry
 const SERVICE_NAME: &str = "worker";
 
-/// WorkerService handles CRI RuntimeClient and ImageClient requests
+/// WorkerService handles requests from the canonical worker contract.
 ///
 /// Implements the RequestService trait for integration with hyprstream's
 /// Cap'n Proto bridged RPC transport (inproc/UDS/systemd-fd + QUIC/Iroh); ZMQ is gone.
@@ -1216,21 +1221,11 @@ impl From<&Container> for ContainerStats {
 // Generated scope handler traits (typed inner dispatch)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use crate::generated::worker_client::{
-    WorkerHandler, dispatch_worker,
-    RuntimeHandler, SandboxHandler, ContainerHandler, ImageHandler,
-};
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Typed Scope Handler Implementations
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use super::client::{
-    PodSandboxStatusResponse, ContainerStatusResponse,
-    ImageInfo, ImageStatusResult,
-    FilesystemUsage,
-};
-use crate::generated::worker_client::{
+use hyprstream_rpc_std::worker_client::{
     CreateContainerRequest,
     ExecSyncRequest, PullImageRequest,
 };
@@ -1377,7 +1372,7 @@ impl ImageHandler for WorkerService {
     async fn handle_pull(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &PullImageRequest) -> AnyhowResult<String> {
         let store = self.image_store.as_ref().ok_or_else(image_store_missing)?;
         let auth = if !data.auth.username.is_empty() {
-            Some(crate::image::AuthConfig {
+            Some(AuthConfig {
                 username: data.auth.username.clone(),
                 password: data.auth.password.clone(),
                 auth: String::new(),
@@ -1496,7 +1491,7 @@ mod tests {
     use super::*;
     use crate::config::ImageConfig;
     use crate::image::RafsStore;
-    use crate::runtime::{PodSandboxConfig, PodSandboxState, ContainerConfig};
+    use hyprstream_rpc_std::worker_client::{ContainerConfig, PodSandboxConfig, PodSandboxState};
     use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::transport::TransportConfig;

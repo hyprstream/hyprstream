@@ -394,3 +394,4 @@ struct NodeLiveness {
   loadFraction @2 :Float32;         # [0,1], live
   ts           @3 :Int64;           # unix millis this snapshot was taken (0 = use receipt time)
 }
+

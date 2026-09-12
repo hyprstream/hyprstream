@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use hyprstream_rpc::admission::{FederationAdmissionGate, OriginAdmission};
 use hyprstream_rpc::did_web::{DidWebResolver, HttpDidDocFetcher};
 
-use crate::services::PolicyClient;
+use hyprstream_rpc_std::policy_client::PolicyClient;
 
 /// Stage-1 origin admission over `PolicyService` `federation:register`.
 ///
@@ -55,7 +55,7 @@ impl PolicyOriginAdmission {
 #[async_trait]
 impl OriginAdmission for PolicyOriginAdmission {
     async fn admit_origin(&self, origin: &str) -> Result<()> {
-        use crate::services::generated::policy_client::PolicyCheck;
+        use hyprstream_rpc_std::policy_client::PolicyCheck;
         let resource = crate::auth::federation_registration_resource(origin)?;
         match self
             .policy_client

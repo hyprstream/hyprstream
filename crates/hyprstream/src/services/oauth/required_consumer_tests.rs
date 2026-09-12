@@ -81,11 +81,11 @@ impl hyprstream_rpc::service::RequestService for ModelReadinessResponder {
             ctx.subject().name() == Some("service:oai"),
             "readiness caller is not authenticated as service:oai"
         );
-        let request = body.root::<crate::model_capnp::model_request::Reader<'_>>()?;
+        let request = body.root::<hyprstream_rpc_std::model_capnp::model_request::Reader<'_>>()?;
         anyhow::ensure!(
             matches!(
                 request.which()?,
-                crate::model_capnp::model_request::Which::HealthCheck(())
+                hyprstream_rpc_std::model_capnp::model_request::Which::HealthCheck(())
             ),
             "readiness responder received a non-health Model request"
         );
@@ -104,8 +104,8 @@ impl hyprstream_rpc::service::RequestService for ModelReadinessResponder {
                     denial.to_string() == "authorization denied: no verified tenant domain",
                     "unexpected Model tenant denial: {denial}"
                 );
-                crate::services::generated::model_client::ModelResponseVariant::Error(
-                    crate::services::generated::model_client::ErrorInfo {
+                hyprstream_rpc_std::model_client::ModelResponseVariant::Error(
+                    hyprstream_rpc_std::model_client::ErrorInfo {
                         code: "INTERNAL".to_owned(),
                         message: denial.to_string(),
                         details: String::new(),
@@ -116,16 +116,16 @@ impl hyprstream_rpc::service::RequestService for ModelReadinessResponder {
                 code,
                 message,
                 details,
-            } => crate::services::generated::model_client::ModelResponseVariant::Error(
-                crate::services::generated::model_client::ErrorInfo {
+            } => hyprstream_rpc_std::model_client::ModelResponseVariant::Error(
+                hyprstream_rpc_std::model_client::ErrorInfo {
                     code,
                     message,
                     details,
                 },
             ),
             ModelReadinessResponse::Healthy => {
-                crate::services::generated::model_client::ModelResponseVariant::HealthCheckResult(
-                    crate::services::generated::model_client::ModelHealthStatus {
+                hyprstream_rpc_std::model_client::ModelResponseVariant::HealthCheckResult(
+                    hyprstream_rpc_std::model_client::ModelHealthStatus {
                         status: "healthy".to_owned(),
                         loaded_model_count: 0,
                         max_models: 0,
@@ -134,8 +134,8 @@ impl hyprstream_rpc::service::RequestService for ModelReadinessResponder {
                 )
             }
             ModelReadinessResponse::Block => {
-                crate::services::generated::model_client::ModelResponseVariant::Error(
-                    crate::services::generated::model_client::ErrorInfo {
+                hyprstream_rpc_std::model_client::ModelResponseVariant::Error(
+                    hyprstream_rpc_std::model_client::ErrorInfo {
                         code: "INTERNAL".to_owned(),
                         message: "authorization denied: no verified tenant domain".to_owned(),
                         details: String::new(),
@@ -196,19 +196,19 @@ impl hyprstream_rpc::service::RequestService for RegistryReadinessResponder {
             ctx.subject().name() == Some("service:oai"),
             "readiness caller is not authenticated as service:oai"
         );
-        let request = body.root::<crate::registry_capnp::registry_request::Reader<'_>>()?;
+        let request = body.root::<hyprstream_rpc_std::registry_capnp::registry_request::Reader<'_>>()?;
         anyhow::ensure!(
             matches!(
                 request.which()?,
-                crate::registry_capnp::registry_request::Which::HealthCheck(())
+                hyprstream_rpc_std::registry_capnp::registry_request::Which::HealthCheck(())
             ),
             "readiness responder received a non-health Registry request"
         );
         let status = self.status.lock().clone();
         let response = crate::services::generated::registry_client::serialize_response(
             request.get_id(),
-            &crate::services::generated::registry_client::RegistryResponseVariant::HealthCheckResult(
-                crate::services::generated::registry_client::HealthStatus {
+            &hyprstream_rpc_std::registry_client::RegistryResponseVariant::HealthCheckResult(
+                hyprstream_rpc_std::registry_client::HealthStatus {
                     status,
                     repository_count: 0,
                     worktree_count: 0,
@@ -242,7 +242,7 @@ fn service_announcement(
     state: &hyprstream_pds::at9p_duplicity::AcceptedAt9pState,
     signer: &SigningKey,
     jwt_signer: &SigningKey,
-) -> hyprstream_discovery::ServiceAnnouncement {
+) -> hyprstream_rpc_std::discovery_client::ServiceAnnouncement {
     let entry = state
         .current
         .services
@@ -255,7 +255,7 @@ fn service_announcement(
         chrono::Utc::now().timestamp() + 3600,
     )
     .with_cnf_jwk(signer.verifying_key().as_bytes());
-    hyprstream_discovery::ServiceAnnouncement {
+    hyprstream_rpc_std::discovery_client::ServiceAnnouncement {
         service_name: name.to_owned(),
         socket_kind: "iroh".to_owned(),
         endpoint: entry.endpoint.address.clone(),
@@ -583,8 +583,8 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
         let model_service = crate::services::ModelService::new(
             crate::services::ModelServiceConfig::default(),
             model.clone(),
-            crate::services::PolicyClient::from_resolver(model.clone(), None)?,
-            crate::services::RegistryClient::from_resolver(model.clone(), None)?,
+            hyprstream_rpc_std::policy_client::PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, model.clone(), None)?,
+            hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, model.clone(), None)?,
             TransportConfig::ipc(directory.path().join("model-must-not-exist.sock")),
             TransportConfig::ipc(&policy_socket),
         )
@@ -603,7 +603,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
         .await?;
         let registry_service = crate::services::RegistryService::new(
             directory.path().join("registry-data"),
-            crate::services::PolicyClient::from_resolver(
+            hyprstream_rpc_std::policy_client::PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
                 registry.clone(),
                 Some(registry_jwt),
             )?,
@@ -639,13 +639,13 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
             ));
         }
         assert_no_local_peers();
-        assert!(crate::services::PolicyClient::for_local_bootstrap(
+        assert!(hyprstream_rpc_std::policy_client::PolicyClient::for_local_bootstrap(
             oauth.clone(),
             policy.verifying_key(),
             None
         )
         .is_err());
-        assert!(crate::services::DiscoveryClient::for_local_bootstrap(
+        assert!(hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_bootstrap(
             oauth.clone(),
             discovery.verifying_key(),
             None
@@ -679,7 +679,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
             })
             .expect("checkpoint-accepted Model state");
         let registry_announcer =
-            crate::services::DiscoveryClient::from_resolver(registry.clone(), None)?;
+            hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, registry.clone(), None)?;
         registry_announcer
             .announce(&service_announcement(
                 "registry",
@@ -688,7 +688,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
                 &policy,
             ))
             .await?;
-        let model_announcer = crate::services::DiscoveryClient::from_resolver(model.clone(), None)?;
+        let model_announcer = hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, model.clone(), None)?;
         model_announcer
             .announce(&service_announcement(
                 "model",
@@ -697,11 +697,11 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
                 &policy,
             ))
             .await?;
-        let registry_client = crate::services::RegistryClient::from_resolver(
+        let registry_client = hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
             oai.clone(),
             Some(oai_jwt.clone()),
         )?;
-        let model_client = crate::services::generated::model_client::ModelClient::from_resolver(
+        let model_client = hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
             oai.clone(),
             Some(oai_jwt),
         )?;
@@ -720,7 +720,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
         )
         .await?;
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            let check = |resource: &str| crate::services::generated::policy_client::PolicyCheck {
+            let check = |resource: &str| hyprstream_rpc_std::policy_client::PolicyCheck {
                 subject: "forged-caller".to_owned(),
                 domain: "forged-domain".to_owned(),
                 resource: resource.to_owned(),
@@ -1011,7 +1011,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
             .expect_err("non-healthy Registry response must withhold OAI readiness");
         assert!(unhealthy.to_string().contains("degraded"));
         *registry_status.lock() = "healthy".to_owned();
-        let unauthenticated = crate::services::RegistryClient::from_resolver(
+        let unauthenticated = hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
             SigningKey::from_bytes(&[0x7f; 32]),
             None,
         )?;
@@ -1024,7 +1024,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
         // the OAuth inbound substrate must not disturb the process-global
         // outbound carrier — a subsequent real dial still succeeds.
         oauth_substrate.shutdown().await?;
-        let post_shutdown = crate::services::generated::policy_client::PolicyCheck {
+        let post_shutdown = hyprstream_rpc_std::policy_client::PolicyCheck {
             subject: "forged-caller".to_owned(),
             domain: "forged-domain".to_owned(),
             resource: "model:allowed".to_owned(),

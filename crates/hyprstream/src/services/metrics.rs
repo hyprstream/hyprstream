@@ -21,10 +21,11 @@ use hyprstream_rpc::streaming::StreamChannel;
 use hyprstream_rpc::transport::TransportConfig;
 use tracing::{error, trace};
 
-use crate::services::{Continuation, EnvelopeContext, PolicyClient, RequestService};
-use crate::services::generated::policy_client::PolicyCheck;
-use crate::services::generated::metrics_client::{
-    MetricsHandler, MetricsResponseVariant,
+use crate::services::{Continuation, EnvelopeContext, RequestService};
+use hyprstream_rpc_std::policy_client::PolicyClient;
+use hyprstream_rpc_std::policy_client::PolicyCheck;
+use hyprstream_rpc_std::metrics_client::{
+    MetricsResponseVariant,
     ErrorInfo,
     AggregateRow, GroupEntry,
     HealthInfo, ViewInfo,
@@ -33,7 +34,9 @@ use crate::services::generated::metrics_client::{
     ViewSpec,
     AggregationFunc,
     StreamInfo,
-    dispatch_metrics, serialize_response,
+};
+use crate::services::generated::metrics_client::{
+    MetricsHandler, dispatch_metrics, serialize_response,
 };
 
 // ============================================================================
@@ -687,11 +690,12 @@ mod tests {
     use hyprstream_service::{InprocManager, ServiceManager};
 
     use crate::auth::PolicyManager;
-    use crate::services::generated::metrics_client::{
+    use hyprstream_rpc_std::metrics_client::{
         AggregationFunc, IngestRequest, MetricQuery, MetricRecord as CMetricRecord, MetricsClient,
         ViewSpec,
     };
-    use crate::services::{PolicyClient, PolicyService};
+        use hyprstream_rpc_std::policy_client::PolicyClient;
+    use crate::services::PolicyService;
     /// Spin up an in-memory MetricsService and return its typed client, manager, and backend.
     async fn start_metrics_service(
         tag: &str,

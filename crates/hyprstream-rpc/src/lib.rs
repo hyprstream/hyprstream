@@ -254,7 +254,9 @@ pub mod iroh_peer;
 // ============================================================================
 
 pub use capnp::{serialize_message, FromCapnp, ToCapnp};
-pub use rpc_client::{CallOptions, PreSealGuard, RequestBuilder, RpcClient, RpcClientImpl};
+pub use rpc_client::{
+    CallOptions, PreSealGuard, RequestBuilder, RpcClient, RpcClientImpl, RpcClientProvider,
+};
 pub use transport_traits::{PublishSink, Signer, Transport};
 pub mod identity;
 pub mod node_identity;

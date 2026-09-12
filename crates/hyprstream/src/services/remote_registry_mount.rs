@@ -48,7 +48,7 @@ use async_trait::async_trait;
 use hyprstream_rpc::Subject;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 
-use crate::services::generated::registry_client::{
+use hyprstream_rpc_std::registry_client::{
     NpClunk, NpCreate, NpOpen, NpRead, NpStatReq, NpWalk, NpWrite, RegistryClient, WorktreeClient,
 };
 use crate::services::ninep_bridge::{fid_key, map_err, NinePBridge, RemoteFidKey};

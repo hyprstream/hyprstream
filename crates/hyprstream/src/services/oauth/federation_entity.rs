@@ -156,7 +156,7 @@ pub async fn publish_entity_statement_to_discovery(state: Arc<OAuthState>) {
         }
     };
 
-    let req = crate::services::generated::discovery_client::RegisterEntityStatementRequest {
+    let req = hyprstream_rpc_std::discovery_client::RegisterEntityStatementRequest {
         issuer: state.issuer_url.clone(),
         jwt,
     };

@@ -10,15 +10,22 @@ name: ts codegen round-trip
 # Node is preinstalled on the runner; `typescript` is installed globally so the
 # `tsc` global is found (the test skips without `HYPRSTREAM_TS_ROUNDTRIP_REQUIRE=1`
 # to keep the merge-gate `cargo nextest run` network-free). Torch-free.
+#
+# The same job runs the canonical TypeScript consumer check
+# (`public_ts_consumer`): every public RPC schema in `hyprstream-rpc-std` must
+# generate TypeScript that type-checks under the declared lib contract, with
+# `HYPRSTREAM_TS_CONSUMER_REQUIRE=1` so a missing toolchain fails closed here.
 on:
   push:
     branches: [ "main" ]
     paths:
       - 'crates/hyprstream-rpc-build/**'
+      - 'crates/hyprstream-rpc-std/**'
       - '.github/workflows/ts-codegen-roundtrip.yml'
   pull_request:
     paths:
       - 'crates/hyprstream-rpc-build/**'
+      - 'crates/hyprstream-rpc-std/**'
       - '.github/workflows/ts-codegen-roundtrip.yml'
 
 permissions:
@@ -52,3 +59,11 @@ jobs:
         run: cargo test -p hyprstream-rpc-build --test wire_roundtrip
         env:
           HYPRSTREAM_TS_ROUNDTRIP_REQUIRE: "1"
+
+      # Fail-closed canonical-surface check: every public RPC schema must
+      # generate TypeScript that type-checks under the declared lib contract
+      # (generation + `tsc` against `es2020,dom,esnext.disposable`).
+      - name: Run the canonical TypeScript consumer check
+        run: cargo test -p hyprstream-rpc-build --test public_ts_consumer
+        env:
+          HYPRSTREAM_TS_CONSUMER_REQUIRE: "1"

@@ -47,7 +47,7 @@ use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
 // Registry and policy services
-use hyprstream_core::services::RegistryClient;
+use hyprstream_rpc_std::registry_client::RegistryClient;
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
 #[cfg(feature = "oci-image")]
@@ -58,6 +58,7 @@ use std::sync::Arc;
 use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::registry::SocketKind;
+use hyprstream_rpc::events::EventPublisher;
 use hyprstream_rpc::{SigningKey, VerifyingKey};
 
 fn supports_tui() -> bool {
@@ -639,7 +640,7 @@ fn handle_quick_command(
             || async move {
                 let keys_dir = ctx.models_dir().join(".registry").join("keys");
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                let model_client = hyprstream_core::services::generated::model_client::ModelClient::from_resolver(
+                let model_client = hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
                     signing_key,
                     None,
                 )?;
@@ -1352,9 +1353,9 @@ fn handle_quick_command(
                         None
                     };
 
-                    use hyprstream_workers::runtime::WorkerClient;
+                    use hyprstream_rpc_std::worker_client::WorkerClient;
                     let worker_client = if worker_already_running {
-                        WorkerClient::from_resolver(signing_key, None)?
+                        WorkerClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?
                     } else {
                         let destination = signing_key.verifying_key();
                         WorkerClient::for_local_bootstrap(signing_key, destination, None)?
@@ -2256,7 +2257,7 @@ fn install_session_pq_overlay() {
 ///
 /// The operation is injected so the production cadence and terminal-expiry
 /// behavior can be exercised without a live Discovery service. The production
-/// caller still supplies [`hyprstream_discovery::DiscoveryClient::announce`].
+/// caller still supplies [`hyprstream_rpc_std::discovery_client::DiscoveryClient::announce`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeAnnouncementRefreshCompletion {
     Expired,
@@ -2340,12 +2341,12 @@ type NativeAnnouncementFirstTx =
 /// The required first result covers both fresh-authority projection and the
 /// Discovery publication. An authority error must not bypass the handshake.
 async fn publish_native_announcement_attempt<F, Fut>(
-    announcement: anyhow::Result<hyprstream_discovery::ServiceAnnouncement>,
+    announcement: anyhow::Result<hyprstream_rpc_std::discovery_client::ServiceAnnouncement>,
     announce_tx: NativeAnnouncementFirstTx,
     publish: F,
 ) -> anyhow::Result<()>
 where
-    F: FnOnce(hyprstream_discovery::ServiceAnnouncement) -> Fut,
+    F: FnOnce(hyprstream_rpc_std::discovery_client::ServiceAnnouncement) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
     let result = match announcement {
@@ -3043,7 +3044,7 @@ fn main() -> Result<()> {
 
             let is_os_owned_bootstrap = install_process_production_resolver(&signing_key, &config).await
                 .context("Failed to install checkpoint-backed production resolver")?;
-            let client = hyprstream_core::services::RegistryClient::from_resolver(
+            let client = hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
                 signing_key.clone(),
                 None,
             )?;
@@ -3603,9 +3604,9 @@ fn main() -> Result<()> {
                                                         let endpoint = request.reach.endpoint();
                                                         let service_name = request.service_name.clone();
                                                         let client = match if hyprstream_discovery::native_network_required() {
-                                                            hyprstream_discovery::DiscoveryClient::from_resolver(request.signing_key.clone(), None)
+                                                            hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, request.signing_key.clone(), None)
                                                         } else {
-                                                            hyprstream_discovery::DiscoveryClient::for_local_transport_bootstrap(
+                                                            hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_transport_bootstrap(
                                                                 &discovery_transport,
                                                                 request.signing_key.clone(),
                                                                 request.discovery_verifying_key,
@@ -3964,7 +3965,7 @@ fn main() -> Result<()> {
                                     // Publish ready events for this stage before starting the next.
                                     for svc_name in stage {
                                         if let Ok(publisher) =
-                                            hyprstream_workers::EventPublisher::new("system")
+                                            EventPublisher::new("system")
                                         {
                                             let _ = publisher
                                                 .publish_raw(
@@ -3991,7 +3992,7 @@ fn main() -> Result<()> {
                                 // Stop all services
                                 for (svc_name, mut handle) in handles {
                                     if let Ok(publisher) =
-                                        hyprstream_workers::EventPublisher::new("system")
+                                        EventPublisher::new("system")
                                     {
                                         let _ = publisher
                                             .publish_raw(
@@ -4800,7 +4801,7 @@ mod resolver_startup_controls {
             .find("install_process_production_resolver(&signing_key, &config).await")
             .expect("process resolver install");
         let first_generated = production[startup..]
-            .find("RegistryClient::from_resolver(")
+            .find("RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, ")
             .expect("first generated client");
         let command_dispatch = production[startup..]
             .find("match matches.subcommand()")
@@ -4881,11 +4882,11 @@ mod resolver_startup_controls {
             .find("let worker_client = if worker_already_running")
             .expect("worker client selection");
         let worker_selection = &source[worker..worker + 500];
-        assert!(worker_selection.contains("WorkerClient::from_resolver"));
+        assert!(worker_selection.contains("WorkerClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider"));
         assert!(worker_selection.contains("WorkerClient::for_local_bootstrap"));
 
         let training = include_str!("../cli/training_handlers.rs");
-        assert_eq!(training.matches("InferenceClient::from_resolver").count(), 0);
+        assert_eq!(training.matches("InferenceClient::from_provider").count(), 0);
         assert_eq!(
             training
                 .matches("InferenceClient::for_local_bootstrap")
@@ -5224,7 +5225,7 @@ mod native_announcement_wiring {
             let cycle_tx = cycle_tx.clone();
             async move {
                 for i in 0..3 {
-                    let announcement = hyprstream_discovery::ServiceAnnouncement {
+                    let announcement = hyprstream_rpc_std::discovery_client::ServiceAnnouncement {
                         service_name: "model".to_owned(),
                         socket_kind: "iroh".to_owned(),
                         endpoint: "iroh://bound-node".to_owned(),

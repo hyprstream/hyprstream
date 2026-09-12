@@ -15,9 +15,9 @@
 //! ```
 //!
 //! `EventPublisher`/`EventSubscriber` are the canonical broadcast types
-//! (EV1, EventService consolidation epic #600) — they now live in
+//! (EV1, EventService consolidation epic #600) and live in
 //! `hyprstream-rpc::events` alongside the moq transport and crypto they wire
-//! together, and are re-exported here for back-compat with existing callers.
+//! together. Import them from that canonical module.
 //! Default privacy mode is `EventPrivacy::Public` (plaintext, wire-identical
 //! to the pre-EV1 behavior of this crate's old standalone wrapper);
 //! `EventPrivacy::ZeroKnowledge`/`LimitedKnowledge` group-key encrypted modes
@@ -26,7 +26,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! use hyprstream_workers::events::{EventPublisher, EventSubscriber};
+//! use hyprstream_rpc::events::{EventPublisher, EventSubscriber};
 //!
 //! // Create a publisher (no ZMQ context needed)
 //! let publisher = EventPublisher::new("worker")?;
@@ -42,21 +42,6 @@
 
 pub mod token_manager;
 mod types;
-
-pub use hyprstream_rpc::events::{
-    EncryptedEvent, EventPublisher, EventSubscriber, RekeyEvent, RekeyPolicy, RotationResult,
-    WrappedKeyEntry,
-};
-
-// The generic keyable-group primitive (GroupKeyRegistry, GroupRef,
-// MembershipResolver, GroupMembership, DenyAllResolver) lives in
-// `hyprstream_rpc::crypto::group_key` — re-exported here for consumers that
-// historically imported event primitives via this module. (EncryptedEvent /
-// RekeyPolicy / RotationResult / WrappedKeyEntry are canonical there too, and
-// are also reachable via the `hyprstream_rpc::events` re-export above.)
-pub use hyprstream_rpc::crypto::group_key::{
-    DenyAllResolver, GroupKeyRegistry, GroupMembership, GroupRef, MembershipResolver,
-};
 
 // Re-export event types
 pub use types::{

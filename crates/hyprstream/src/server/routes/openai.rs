@@ -12,6 +12,8 @@ use std::convert::Infallible;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, trace};
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::model_client::ModelClient;
 
 use crate::{
     api::{
@@ -25,9 +27,7 @@ use crate::{
     archetypes::capabilities::Infer,
     auth::Operation,
     runtime::CacheOwner,
-    runtime::GenerationRequest,
     server::{state::ServerState, AuthenticatedUser},
-    services::generated::model_client::ModelClient,
 };
 
 /// RAII guard for metrics cleanup
@@ -101,7 +101,7 @@ async fn collect_stream_to_result(
     model_ref: &str,
     request: &GenerationRequest,
 ) -> anyhow::Result<CollectedResult> {
-    use crate::services::generated::model_client::InferRpc;
+    use hyprstream_rpc_std::model_client::InferRpc;
     let mut handle = InferRpc::generate_stream(&model_client.infer(model_ref), request).await?;
 
     use futures::StreamExt;
@@ -216,7 +216,7 @@ fn model_client_for_request(
     state: &ServerState,
     jwt_token: Option<&str>,
 ) -> anyhow::Result<ModelClient> {
-    ModelClient::from_resolver(
+    ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
         (*state.signing_key).clone(),
         jwt_token.map(str::to_owned),
     )
@@ -343,7 +343,7 @@ async fn chat_completions(
 
     // Check permission for inference on this model via ZMQ
     let resource = format!("model:{}", request.model);
-    let policy_request = crate::services::generated::policy_client::PolicyCheck {
+    let policy_request = hyprstream_rpc_std::policy_client::PolicyCheck {
         subject: user.clone(),
         domain: domain.clone(),
         resource: resource.clone(),
@@ -464,7 +464,7 @@ async fn chat_completions(
     let templated_prompt = match model_client
         .infer(&request.model)
         .apply_chat_template(
-            &crate::services::generated::model_client::ChatTemplateRequest {
+            &hyprstream_rpc_std::model_client::ChatTemplateRequest {
                 messages: rpc_messages.clone(),
                 add_generation_prompt: true,
                 tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
@@ -723,7 +723,7 @@ async fn stream_chat(
         let templated_prompt = match model_client
             .infer(&model_name)
             .apply_chat_template(
-                &crate::services::generated::model_client::ChatTemplateRequest {
+                &hyprstream_rpc_std::model_client::ChatTemplateRequest {
                     messages: rpc_messages.clone(),
                     add_generation_prompt: true,
                     tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
@@ -774,7 +774,7 @@ async fn stream_chat(
         );
 
         let _claims = claims_from_auth(&user, &domain, jwt_token.as_deref(), jwt_exp);
-        use crate::services::generated::model_client::InferRpc;
+        use hyprstream_rpc_std::model_client::InferRpc;
         let mut stream_handle =
             match InferRpc::generate_stream(&model_client.infer(&model_name), &gen_request).await {
                 Ok(h) => h,
@@ -1009,7 +1009,7 @@ async fn completions(
 
     // Check permission for inference on this model
     let resource = format!("model:{}", request.model);
-    let policy_request = crate::services::generated::policy_client::PolicyCheck {
+    let policy_request = hyprstream_rpc_std::policy_client::PolicyCheck {
         subject: user.clone(),
         domain: domain.clone(),
         resource: resource.clone(),
@@ -1078,7 +1078,7 @@ async fn completions(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Client creation failed").into_response();
         }
     };
-    let rpc_messages = vec![crate::services::generated::inference_client::ChatMessage {
+    let rpc_messages = vec![hyprstream_rpc_std::inference_client::ChatMessage {
         role: "user".to_owned(),
         content: request.prompt.clone(),
         tool_calls: vec![],
@@ -1088,7 +1088,7 @@ async fn completions(
     let templated_prompt = match model_client
         .infer(&request.model)
         .apply_chat_template(
-            &crate::services::generated::model_client::ChatTemplateRequest {
+            &hyprstream_rpc_std::model_client::ChatTemplateRequest {
                 messages: rpc_messages.clone(),
                 add_generation_prompt: true,
                 tools_json: None,
@@ -1227,7 +1227,7 @@ async fn list_models(
                 .into_response();
         }
     };
-    let policy_request = crate::services::generated::policy_client::PolicyCheck {
+    let policy_request = hyprstream_rpc_std::policy_client::PolicyCheck {
         subject: user.clone(),
         domain,
         resource: "registry:*".to_owned(),
@@ -1307,8 +1307,8 @@ async fn list_models(
 /// (re-exported via `pub use`), so only `content` and `tool_call_id` need unwrapping.
 fn to_rpc_messages(
     msgs: &[ChatMessage],
-) -> Vec<crate::services::generated::inference_client::ChatMessage> {
-    use crate::services::generated::inference_client::ChatMessage as RpcMsg;
+) -> Vec<hyprstream_rpc_std::inference_client::ChatMessage> {
+    use hyprstream_rpc_std::inference_client::ChatMessage as RpcMsg;
     msgs.iter()
         .map(|m| RpcMsg {
             role: m.role.clone(),

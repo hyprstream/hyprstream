@@ -29,9 +29,10 @@ use hyprstream_rpc::stream_consumer::StreamHandle;
 use hyprstream_rpc::transport::{EndpointType, TransportConfig};
 use hyprstream_rpc::{SigningKey, VerifyingKey};
 
-use crate::generated::discovery_client::{
-    dispatch_discovery, serialize_response, AuthMetadata, AuthMetadataList, DiscoveryHandler,
-    DiscoveryResponseVariant, EndpointInfo, EntityStatement, EnvelopeKeyset, ErrorInfo,
+use crate::generated::discovery_client::{dispatch_discovery, serialize_response, DiscoveryHandler};
+use hyprstream_rpc_std::discovery_client::{
+    AuthMetadata, AuthMetadataList, DiscoveryResponseVariant, EndpointInfo, EntityStatement,
+    EnvelopeKeyset, ErrorInfo,
     GetRecordRequest, IssuerList, NodeLiveness, PingInfo, PlacementCandidate,
     PlacementCandidateSet, QueryCandidatesRequest, RecordCar, RegisterEntityStatementRequest,
     RegisterEnvelopeKeysetRequest, Resource, ServiceAnnouncement, ServiceEndpoints, ServiceList,
@@ -504,8 +505,8 @@ fn select_service_candidates(
 /// shared scheduling-substrate `SelectorOp` (`crate::scheduling`, #628).
 /// Deliberately exhaustive (no catch-all) so a future wire variant fails to
 /// compile here instead of silently matching nothing.
-fn to_scheduling_op(op: crate::generated::discovery_client::SelectorOp) -> scheduling::SelectorOp {
-    use crate::generated::discovery_client::SelectorOp as Wire;
+fn to_scheduling_op(op: hyprstream_rpc_std::discovery_client::SelectorOp) -> scheduling::SelectorOp {
+    use hyprstream_rpc_std::discovery_client::SelectorOp as Wire;
     match op {
         Wire::In => scheduling::SelectorOp::In,
         Wire::NotIn => scheduling::SelectorOp::NotIn,
@@ -740,7 +741,7 @@ impl StreamHandle for CurrentStreamHandle {
 struct DiscoveryServiceResolver {
     state_store: Arc<dyn DiscoveryStateStore>,
     accepted_state_source: Arc<dyn AcceptedStateSource>,
-    discovery_client: Option<crate::DiscoveryClient>,
+    discovery_client: Option<hyprstream_rpc_std::discovery_client::DiscoveryClient>,
 }
 
 /// Parse an `at://<did>/<collection>/<rkey>` URI into its three components.
@@ -1284,7 +1285,7 @@ impl DiscoveryService {
     /// ```compile_fail
     /// fn old_discovery_chain(
     ///     identity: hyprstream_service::AuthenticatedRegistryDeploymentIdentity,
-    ///     client: hyprstream_discovery::DiscoveryClient,
+    ///     client: hyprstream_rpc_std::discovery_client::DiscoveryClient,
     /// ) {
     ///     let authority = hyprstream_discovery::authenticate_discovery_bootstrap(identity).unwrap();
     ///     hyprstream_discovery::DiscoveryService::bootstrap_authenticated_process(authority, client).unwrap();
@@ -1309,7 +1310,7 @@ impl DiscoveryService {
     /// ```compile_fail
     /// use hyprstream_discovery::DiscoveryService;
     /// use hyprstream_service::ServiceContext;
-    /// fn inject(context: ServiceContext, client: hyprstream_discovery::DiscoveryClient) {
+    /// fn inject(context: ServiceContext, client: hyprstream_rpc_std::discovery_client::DiscoveryClient) {
     ///     context.seal_discovery_bootstrap_authority().unwrap();
     ///     let authority = context
     ///         .consume_discovery_bootstrap_authority(|path, key| Ok((path.to_owned(), key)))
@@ -1321,7 +1322,7 @@ impl DiscoveryService {
     #[cfg(not(target_arch = "wasm32"))]
     fn bootstrap_authenticated_process(
         authority: ProcessBootstrapAuthority,
-        discovery_client: crate::DiscoveryClient,
+        discovery_client: hyprstream_rpc_std::discovery_client::DiscoveryClient,
     ) -> Result<()> {
         let authority = {
             let mut state = PROCESS_BOOTSTRAP_AUTHORITY.lock();
@@ -1370,7 +1371,9 @@ impl DiscoveryService {
                 accepted_state_source: source,
                 discovery_client: Some(discovery_client),
             }))
-            .map_err(|_| anyhow::anyhow!("production service resolver is already installed"))
+            .map_err(|_| anyhow::anyhow!("production service resolver is already installed"))?;
+
+        Ok(())
     }
 
     /// Attach the process-pinned source to the Discovery daemon. The source
@@ -3528,11 +3531,11 @@ fn resolve_local_discovery_transport(
 fn install_local_discovery_client(
     signing_key: SigningKey,
     discovery_vk: VerifyingKey,
-) -> Result<crate::DiscoveryClient> {
+) -> Result<hyprstream_rpc_std::discovery_client::DiscoveryClient> {
     let transport = resolve_local_discovery_transport()?;
     let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
     let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), None)?;
-    Ok(crate::DiscoveryClient::new(rpc))
+    Ok(hyprstream_rpc_std::discovery_client::DiscoveryClient::new(rpc))
 }
 
 /// Atomically consume the explicitly selected deployment witness and install
@@ -3604,7 +3607,7 @@ pub async fn bootstrap_deployment_process(
                     accepted_state_source: source,
                     discovery_client: None,
                 });
-                crate::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
                     "discovery", "discovery", None, signing_key, None, resolver,
                 )?))
             } else {
@@ -3652,7 +3655,7 @@ pub async fn bootstrap_deployment_process(
                     Some(Arc::new(kem_store)),
                     Some(Arc::new(pq_store)),
                 )?;
-                let client = crate::DiscoveryClient::new(rpc);
+                let client = hyprstream_rpc_std::discovery_client::DiscoveryClient::new(rpc);
                 let health = client
                     .ping()
                     .await
@@ -3678,7 +3681,7 @@ pub async fn bootstrap_deployment_process(
                     })?
                     .try_endpoint("discovery", hyprstream_rpc::registry::SocketKind::Rep)?;
                 let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), None)?;
-                (authority, crate::DiscoveryClient::new(rpc))
+                (authority, hyprstream_rpc_std::discovery_client::DiscoveryClient::new(rpc))
             }
         }
     };
@@ -3840,7 +3843,7 @@ pub fn production_rpc_client(
 /// Discovery reach a remote node has. The client is authenticated per its
 /// installing arm (pinned discovery key; remote-node additionally KEM/PQ-bound
 /// and liveness-verified before install).
-pub fn installed_bootstrap_discovery_client() -> Option<crate::DiscoveryClient> {
+pub fn installed_bootstrap_discovery_client() -> Option<hyprstream_rpc_std::discovery_client::DiscoveryClient> {
     PRODUCTION_RESOLVER
         .get()
         .cloned()?
@@ -4375,7 +4378,7 @@ pub mod test_fixtures {
     /// about deployed Policy/MAC acceptance or the deployment-credential
     /// chain (candidates are served by the installed client itself).
     pub fn install_bootstrap_discovery_client_fixture(
-        discovery_client: crate::DiscoveryClient,
+        discovery_client: hyprstream_rpc_std::discovery_client::DiscoveryClient,
     ) -> Result<()> {
         anyhow::ensure!(
             PRODUCTION_RESOLVER.get().is_none(),
@@ -6378,7 +6381,7 @@ mod resolver_tests {
         let resolver = Arc::new(resolver);
         let _ = PRODUCTION_RESOLVER.set(resolver);
         let client_signing = SigningKey::from_bytes(&[0x44; 32]);
-        let _client = crate::DiscoveryClient::from_resolver(client_signing, None)
+        let _client = hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&crate::ProductionRpcClientProvider, client_signing, None)
             .unwrap_or_else(|e| panic!("generated resolver path failed: {e}"));
     }
 
@@ -6894,7 +6897,7 @@ mod resolver_tests {
                     .expect("authenticate process resolver");
             DiscoveryService::bootstrap_authenticated_process(
                 authority,
-                crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
             )
             .expect("install process resolver");
             assert!(production_rpc_client("model", signing, None).is_ok());
@@ -6953,7 +6956,7 @@ mod resolver_tests {
                         .and_then(|authority| {
                             DiscoveryService::bootstrap_authenticated_process(
                                 authority,
-                                crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+                                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
                             )
                         })
                         .is_ok()
@@ -6993,7 +6996,7 @@ mod resolver_tests {
                     .unwrap();
             let first = DiscoveryService::bootstrap_authenticated_process(
                 authority,
-                crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
             )
             .expect_err("missing checkpoint store unexpectedly installed");
             assert!(first.to_string().contains("failed to open"));
@@ -8435,7 +8438,7 @@ mod query_candidates_tests {
 
     use std::collections::BTreeMap;
 
-    use crate::generated::discovery_client::{LabelSelector, ResourceRequest, SelectorOp};
+    use hyprstream_rpc_std::discovery_client::{LabelSelector, ResourceRequest, SelectorOp};
     use hyprstream_pds::car::build_car_v1;
     use hyprstream_pds::cid::Cid;
     use hyprstream_pds::commit::{Commit, UnsignedCommit};

@@ -775,12 +775,12 @@ fn generate_dispatch_fn(
     quote! {
         #[doc = #doc]
         pub async fn #fn_name<H: #trait_name>(handler: &H, ctx: &hyprstream_rpc::service::EnvelopeContext, body: &hyprstream_rpc::service::DecodedRequestBody) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
-            use crate::#capnp_mod::#req_snake::Which;
+            use #capnp_mod::#req_snake::Which;
             // Read the typed request from the ONE decoded message (v16 §5.2):
             // pointer traversal over the body whose derived leaf the policy
             // and MAC gates already consumed — never a second decode of the
             // signed bytes.
-            let req = body.root::<crate::#capnp_mod::#req_snake::Reader>()?;
+            let req = body.root::<#capnp_mod::#req_snake::Reader>()?;
             let request_id = req.get_id();
             let __decoded_method_discriminator = match req.which()? {
                 #(#method_discriminator_arms)*
@@ -816,7 +816,7 @@ fn generate_response_serializer(
         #[doc = #doc]
         pub fn serialize_response(request_id: u64, variant: &#response_type) -> anyhow::Result<Vec<u8>> {
             hyprstream_rpc::serialize_message(|msg| {
-                let mut resp = msg.init_root::<crate::#capnp_mod::#resp_snake::Builder>();
+                let mut resp = msg.init_root::<#capnp_mod::#resp_snake::Builder>();
                 resp.set_request_id(request_id);
                 match variant {
                     #(#match_arms)*
@@ -1399,7 +1399,7 @@ fn generate_scope_response_serializer(
         #[doc = #doc]
         fn #fn_name(request_id: u64, variant: &#response_type) -> anyhow::Result<Vec<u8>> {
             hyprstream_rpc::serialize_message(|msg| {
-                let mut resp = msg.init_root::<crate::#capnp_mod::#resp_snake::Builder>();
+                let mut resp = msg.init_root::<#capnp_mod::#resp_snake::Builder>();
                 resp.set_request_id(request_id);
                 let mut inner = resp.#scope_result_init();
                 match variant {
@@ -1539,7 +1539,7 @@ fn generate_nested_scope_response_serializer(
         #[doc = #doc]
         fn #fn_name(request_id: u64, variant: &#response_type) -> anyhow::Result<Vec<u8>> {
             hyprstream_rpc::serialize_message(|msg| {
-                let mut resp = msg.init_root::<crate::#capnp_mod::#resp_snake::Builder>();
+                let mut resp = msg.init_root::<#capnp_mod::#resp_snake::Builder>();
                 resp.set_request_id(request_id);
                 #(#init_stmts)*
                 match variant {
@@ -1770,16 +1770,16 @@ fn generate_scope_extraction_phase(
     quote! {
         let (variant_tag, scope_fields, params) = {
             // Navigate the ONE decoded message (v16 §5.2) — no re-decode.
-            let req = body.root::<crate::#capnp_mod::#outer_req_snake::Reader>()?;
+            let req = body.root::<#capnp_mod::#outer_req_snake::Reader>()?;
 
             let inner = match req.which()? {
-                crate::#capnp_mod::#outer_req_snake::Which::#scope_variant_pascal(r) => r?,
+                #capnp_mod::#outer_req_snake::Which::#scope_variant_pascal(r) => r?,
                 _ => anyhow::bail!(#bail_msg),
             };
 
             #(#scope_field_extractions)*
 
-            use crate::#capnp_mod::#inner_req_mod::Which;
+            use #capnp_mod::#inner_req_mod::Which;
             let (tag, params) = match inner.which()? {
                 #(#extraction_arms)*
                 #(#nested_extraction_arms)*
@@ -2023,7 +2023,7 @@ fn generate_nested_scope_extraction_phase(
             let bail_msg = format!("expected {} scope in request", scope.factory_name);
             nav_stmts.push(quote! {
                 let __nav = match req.which()? {
-                    crate::#capnp_mod::#outer_req_snake::Which::#variant_pascal(r) => r?,
+                    #capnp_mod::#outer_req_snake::Which::#variant_pascal(r) => r?,
                     _ => anyhow::bail!(#bail_msg),
                 };
             });
@@ -2035,7 +2035,7 @@ fn generate_nested_scope_extraction_phase(
             let which_alias = format_ident!("__NavW{}", i);
             let bail_msg = format!("expected {} scope in {} request", scope.factory_name, prev.factory_name);
             nav_stmts.push(quote! {
-                use crate::#capnp_mod::#prev_req_mod::Which as #which_alias;
+                use #capnp_mod::#prev_req_mod::Which as #which_alias;
                 let __nav = match __nav.which()? {
                     #which_alias::#variant_pascal(r) => r?,
                     _ => anyhow::bail!(#bail_msg),
@@ -2049,7 +2049,7 @@ fn generate_nested_scope_extraction_phase(
             let which_alias = format_ident!("__NavW{}", i);
             let bail_msg = format!("expected {} scope in {} request", scope.factory_name, prev.factory_name);
             nav_stmts.push(quote! {
-                use crate::#capnp_mod::#prev_req_mod::Which as #which_alias;
+                use #capnp_mod::#prev_req_mod::Which as #which_alias;
                 let nested_inner = match __nav.which()? {
                     #which_alias::#variant_pascal(r) => r?,
                     _ => anyhow::bail!(#bail_msg),
@@ -2165,7 +2165,7 @@ fn generate_nested_scope_extraction_phase(
     quote! {
         let (variant_tag, nested_scope_fields, params) = {
             // Navigate the ONE decoded message (v16 §5.2) — no re-decode.
-            let req = body.root::<crate::#capnp_mod::#outer_req_snake::Reader>()?;
+            let req = body.root::<#capnp_mod::#outer_req_snake::Reader>()?;
 
             // Navigate through ancestor scopes to reach nc
             #(#nav_stmts)*
@@ -2174,7 +2174,7 @@ fn generate_nested_scope_extraction_phase(
             #(#nested_scope_extractions)*
 
             // Dispatch the nested inner union
-            use crate::#capnp_mod::#nested_inner_req_mod::Which;
+            use #capnp_mod::#nested_inner_req_mod::Which;
             let (tag, params) = match nested_inner.which()? {
                 #(#extraction_arms)*
                 #(#nested_extraction_arms)*

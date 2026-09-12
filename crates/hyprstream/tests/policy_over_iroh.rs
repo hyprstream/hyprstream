@@ -28,7 +28,7 @@ use git2db::Git2DB;
 use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::config::TokenConfig;
 use hyprstream_core::services::PolicyService;
-use hyprstream_core::services::generated::policy_client::{
+use hyprstream_rpc_std::policy_client::{
     PolicyCheck, PolicyClient, RegisterEventPrefix, SubscribeEventPrefix,
 };
 

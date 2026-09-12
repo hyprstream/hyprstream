@@ -262,7 +262,8 @@ impl Default for WorkflowConfig {
 /// Configuration for the worker event bus.
 ///
 /// The worker publishes lifecycle events over the moq-lite streaming plane
-/// (#167) via `crate::events::EventPublisher`; there is no ZMQ socket to tune.
+/// (#167) via `hyprstream_rpc::events::EventPublisher`; there is no ZMQ socket
+/// to tune.
 /// The former ZMQ high-water-mark knobs (`publisher_hwm`/`subscriber_hwm`) were
 /// removed with the ZMQ stack (#138/#167) — moq back-pressure/QoS is governed by
 /// `hyprstream_rpc::moq_stream` `StreamOpt`, not per-socket HWMs here.

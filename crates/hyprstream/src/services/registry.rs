@@ -3,7 +3,7 @@
 //! This service wraps git2db and provides a ZMQ REQ/REP interface for
 //! repository operations. It uses Cap'n Proto for serialization.
 
-use crate::services::PolicyClient;
+use hyprstream_rpc_std::policy_client::PolicyClient;
 use crate::services::types::{MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT};
 use crate::services::xet_provenance::XetProvenanceStore;
 use hyprstream_containedfs::{ContainedFs, FsError, FsHandle};
@@ -29,10 +29,8 @@ use uuid::Uuid;
 
 // Generated client types (RegistryClient is used in test and metrics-impl code)
 #[allow(unused_imports)]
-use crate::services::generated::registry_client::{
+use hyprstream_rpc_std::registry_client::{
     RegistryClient, RegistryResponseVariant,
-    RegistryHandler, RepoHandler, WorktreeHandler, CtlHandler,
-    dispatch_registry, serialize_response,
     StreamInfo, ErrorInfo, HealthStatus, DetailedStatusInfo, RemoteInfo,
     CloneRequest, RegisterRequest,
     GetBlobRequest, GetBlobRequestContent,
@@ -54,8 +52,12 @@ use crate::services::generated::registry_client::{
     EditOpenRequest, EditApplyRequest,
     DocFormat,
 };
+use crate::services::generated::registry_client::{
+    CtlHandler, RegistryHandler, RepoHandler, WorktreeHandler, dispatch_registry,
+    serialize_response,
+};
 use crate::services::editing::{self, EditingTable};
-use crate::services::generated::policy_client::PolicyCheck;
+use hyprstream_rpc_std::policy_client::PolicyCheck;
 use automerge::ReadDoc as _;
 // Conflicting names — use canonical path at usage sites:
 //   registry_client::TrackedRepository, registry_client::RepositoryStatus, registry_client::WorktreeInfo
@@ -1186,7 +1188,7 @@ impl RegistryService {
     }
 
     /// Handle list worktrees
-    async fn handle_list_worktrees(&self, repo_id: &str) -> Result<Vec<crate::services::generated::registry_client::WorktreeInfo>> {
+    async fn handle_list_worktrees(&self, repo_id: &str) -> Result<Vec<hyprstream_rpc_std::registry_client::WorktreeInfo>> {
         let id = Self::parse_repo_id(repo_id)?;
         let registry = self.registry.read().await;
         let handle = registry.repo(&id)?;
@@ -1220,7 +1222,7 @@ impl RegistryService {
                 .map(std::borrow::ToOwned::to_owned)
                 .collect();
 
-            result.push(crate::services::generated::registry_client::WorktreeInfo {
+            result.push(hyprstream_rpc_std::registry_client::WorktreeInfo {
                 path_removed: (), // field removed from schema
                 branch_name,
                 head_oid,
@@ -1732,15 +1734,15 @@ impl RegistryService {
 // Generated Handler Helpers
 // ============================================================================
 
-fn tracked_repo_to_data(repo: &TrackedRepository) -> crate::services::generated::registry_client::TrackedRepository {
+fn tracked_repo_to_data(repo: &TrackedRepository) -> hyprstream_rpc_std::registry_client::TrackedRepository {
     tracked_repo_to_data_with_worktrees(repo, vec![])
 }
 
 fn tracked_repo_to_data_with_worktrees(
     repo: &TrackedRepository,
-    worktrees: Vec<crate::services::generated::registry_client::WorktreeInfo>,
-) -> crate::services::generated::registry_client::TrackedRepository {
-    crate::services::generated::registry_client::TrackedRepository {
+    worktrees: Vec<hyprstream_rpc_std::registry_client::WorktreeInfo>,
+) -> hyprstream_rpc_std::registry_client::TrackedRepository {
+    hyprstream_rpc_std::registry_client::TrackedRepository {
         id: repo.id.to_string(),
         name: repo.name.clone().unwrap_or_default(),
         url: repo.url.clone(),
@@ -2093,7 +2095,7 @@ impl RepoHandler for RegistryService {
 
     async fn handle_list_worktrees(&self, _ctx: &EnvelopeContext, _request_id: u64,
         repo_id: &str,
-    ) -> Result<Vec<crate::services::generated::registry_client::WorktreeInfo>> {
+    ) -> Result<Vec<hyprstream_rpc_std::registry_client::WorktreeInfo>> {
         self.handle_list_worktrees(repo_id).await
     }
 
@@ -2180,9 +2182,9 @@ impl RepoHandler for RegistryService {
 
     async fn handle_status(&self, _ctx: &EnvelopeContext, _request_id: u64,
         repo_id: &str,
-    ) -> Result<crate::services::generated::registry_client::RepositoryStatus> {
+    ) -> Result<hyprstream_rpc_std::registry_client::RepositoryStatus> {
         let status = self.handle_status(repo_id).await?;
-        Ok(crate::services::generated::registry_client::RepositoryStatus {
+        Ok(hyprstream_rpc_std::registry_client::RepositoryStatus {
             branch: status.branch.unwrap_or_default(),
             head_oid: status.head.map(|h| h.to_string()).unwrap_or_default(),
             ahead: status.ahead as u32,
@@ -3547,7 +3549,8 @@ mod xet_pointer_tests {
 mod tests {
     use super::*;
     use crate::auth::PolicyManager;
-    use crate::services::{PolicyService, PolicyClient};
+    use crate::services::PolicyService;
+        use hyprstream_rpc_std::policy_client::PolicyClient;
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_service::ServiceManager;
     use tempfile::TempDir;

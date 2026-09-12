@@ -179,3 +179,4 @@ struct StepRun {
   status @1 :RunStatus;
   exitCode @2 :Int32;
 }
+

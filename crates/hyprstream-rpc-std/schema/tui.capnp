@@ -467,3 +467,4 @@ struct TuiControlMessage {
     resize @2 :ResizeRequest;
   }
 }
+
