@@ -208,7 +208,11 @@ reuse for these models therefore works differently:
 
 One snapshot is kept per session cache (overwritten each turn) and travels
 with the cache across `offload_to_cpu` / `restore_to_gpu`; eviction drops it
-with the cache.
+with the cache. Each slot's owning device is recorded when the snapshot is
+stored, and restore sends the slot back to that device rather than the
+single device `restore_to_gpu` is called with — under a multi-GPU
+`LayerDeviceMap` the recurrent state belongs to its layer's device, and
+restoring it elsewhere breaks the next GDN forward on a device mismatch.
 
 ## TTT Delta-Dependency Invalidation
 

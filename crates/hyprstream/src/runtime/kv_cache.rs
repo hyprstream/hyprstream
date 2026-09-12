@@ -1941,6 +1941,15 @@ pub struct KVCacheManager {
     /// `None` for pure-attention models. Tensors are deep copies, independent
     /// of subsequent forward-pass mutations of the live model state.
     ssm_snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>,
+    /// Owning device per snapshot slot (per layer, index-aligned with the
+    /// conv/rec lists), recorded from the slots' own tensors when the
+    /// snapshot is stored. A CPU-offloaded cache restores each slot to this
+    /// device instead of `restore_to_gpu`'s single argument: under a multi-GPU
+    /// `LayerDeviceMap` the recurrent state belongs to its layer's device,
+    /// and moving every slot to one device (normally CUDA 0) makes the next
+    /// GDN forward fail on a device mismatch. Layers without slots record the
+    /// CPU fallback; a snapshot-less cache records nothing.
+    ssm_slot_devices: Vec<tch::Device>,
     /// Where this cache's tensors currently reside
     location: CacheLocation,
     /// Compatibility fingerprint under which this cache's KV was produced
@@ -1974,6 +1983,7 @@ impl KVCacheManager {
             access_count: AtomicU64::new(0),
             cached_token_ids: Vec::new(),
             ssm_snapshot: None,
+            ssm_slot_devices: Vec::new(),
             location: CacheLocation::Gpu,
             compat_fingerprint: None,
         }
@@ -2010,6 +2020,7 @@ impl KVCacheManager {
             access_count: AtomicU64::new(0),
             cached_token_ids: Vec::new(),
             ssm_snapshot: None,
+            ssm_slot_devices: Vec::new(),
             location: CacheLocation::Gpu,
             compat_fingerprint: None,
         }
@@ -2214,6 +2225,24 @@ impl KVCacheManager {
         ssm_snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>,
     ) {
         self.cached_token_ids = tokens;
+        // Record each slot's owning device from its own tensor: the snapshot
+        // is what a later CPU-offload/restore round trip must reproduce
+        // device-wise (per-layer under a multi-GPU LayerDeviceMap). Layers
+        // with no slots record the CPU fallback (irrelevant — nothing to
+        // move); a snapshot-less recording clears the devices with it.
+        self.ssm_slot_devices = match &ssm_snapshot {
+            Some((conv, rec)) => conv
+                .iter()
+                .zip(rec.iter())
+                .map(|(c, r)| {
+                    c.as_ref()
+                        .or(r.as_ref())
+                        .map(Tensor::device)
+                        .unwrap_or(tch::Device::Cpu)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         self.ssm_snapshot = ssm_snapshot;
     }
 
@@ -2290,8 +2319,23 @@ impl KVCacheManager {
             cache_ref.to_device(device);
         }
         if let Some((conv, rec)) = &mut self.ssm_snapshot {
-            for t in conv.iter_mut().chain(rec.iter_mut()).flatten() {
-                *t = t.to_device(device);
+            // Each slot returns to its recorded owning device (its layer's
+            // device under a multi-GPU LayerDeviceMap), falling back to the
+            // argument only when a snapshot predates recording. Restoring
+            // every slot to one device would leave states on the wrong side
+            // of a device boundary and break the next GDN forward.
+            let slot_devices = self.ssm_slot_devices.clone();
+            let restore_slot = |t: &mut Option<Tensor>, i: usize| {
+                if let Some(t) = t {
+                    let dst = slot_devices.get(i).copied().unwrap_or(device);
+                    *t = t.to_device(dst);
+                }
+            };
+            for (i, t) in conv.iter_mut().enumerate() {
+                restore_slot(t, i);
+            }
+            for (i, t) in rec.iter_mut().enumerate() {
+                restore_slot(t, i);
             }
         }
         self.location = CacheLocation::Gpu;
@@ -2448,6 +2492,86 @@ mod tests {
         // the budget accounting shrinks back.
         manager.set_cached_tokens(vec![1, 2, 3, 4]);
         assert_eq!(manager.memory_usage(), baseline);
+    }
+
+    /// Storing an SSM snapshot must record each slot's owning device from its
+    /// own tensor — the record a later CPU-offload/restore round trip uses to
+    /// put slots back on their layer devices (multi-GPU LayerDeviceMap).
+    /// Token-only recording drops the snapshot and its device record with it.
+    #[test]
+    fn test_ssm_snapshot_records_owning_devices() {
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+        assert!(manager.ssm_slot_devices.is_empty(), "fresh cache records nothing");
+
+        let opt = (DType::Float, Device::Cpu);
+        let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
+        let rec = vec![Some(Tensor::zeros([4], opt)), None];
+        manager.set_cached_tokens_with_ssm(vec![1, 2], Some((conv, rec)));
+        // One record per layer; layers without slots record the fallback.
+        assert_eq!(manager.ssm_slot_devices.len(), 2);
+        assert_eq!(manager.ssm_slot_devices, vec![Device::Cpu, Device::Cpu]);
+
+        // Token-only recording clears the device record with the snapshot.
+        manager.set_cached_tokens(vec![3]);
+        assert!(manager.ssm_slot_devices.is_empty());
+    }
+
+    /// Restore must send each SSM snapshot slot back to its recorded owning
+    /// device — NOT `restore_to_gpu`'s single argument. Mixed Cuda(0)/Cpu
+    /// owning devices reproduce the multi-GPU LayerDeviceMap hazard: the
+    /// registry restores an offloaded cache with one device (normally CUDA 0),
+    /// and moving every slot there leaves layer-1 recurrent state on the wrong
+    /// device for the next GDN forward. Gated on a CUDA build (a CPU-only host
+    /// has no second device to discriminate).
+    #[test]
+    fn test_restore_moves_snapshot_slots_to_owning_devices() {
+        let cuda = Device::cuda_if_available();
+        if cuda == Device::Cpu {
+            // No CUDA on this host: single-device restore is trivially
+            // correct, and the mixed-device fixture cannot be constructed.
+            return;
+        }
+
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+        // Layer 0 owns CUDA state, layer 1 owns CPU state (as a pipeline
+        // split places each layer's stage-local state on its own device).
+        let conv = vec![
+            Some(Tensor::ones([2, 3], (DType::Float, cuda)) * 7.0),
+            Some(Tensor::ones([2, 3], (DType::Float, Device::Cpu)) * 9.0),
+        ];
+        let rec = vec![
+            Some(Tensor::ones([4], (DType::Float, cuda)) * 11.0),
+            Some(Tensor::ones([4], (DType::Float, Device::Cpu)) * 13.0),
+        ];
+        manager.set_cached_tokens_with_ssm(vec![1, 2, 3], Some((conv, rec)));
+
+        manager.offload_to_cpu();
+        // The registry's single-device restore call (`cuda_if_available`,
+        // normally CUDA 0) — the exact pre-fix call shape.
+        manager.restore_to_gpu(cuda);
+
+        let (conv_restored, rec_restored) = manager.ssm_snapshot().unwrap();
+        for (layer, expected) in [(0usize, cuda), (1, Device::Cpu)] {
+            if let Some(c) = &conv_restored[layer] {
+                assert_eq!(
+                    c.device(),
+                    expected,
+                    "conv slot {layer} must return to its owning device"
+                );
+            }
+            if let Some(r) = &rec_restored[layer] {
+                assert_eq!(
+                    r.device(),
+                    expected,
+                    "rec slot {layer} must return to its owning device"
+                );
+            }
+        }
+        // Values survived the offload/restore round trip.
+        assert_eq!(conv_restored[0].as_ref().unwrap().double_value(&[1, 2]), 7.0);
+        assert_eq!(conv_restored[1].as_ref().unwrap().double_value(&[1, 2]), 9.0);
+        assert_eq!(rec_restored[0].as_ref().unwrap().double_value(&[3]), 11.0);
+        assert_eq!(rec_restored[1].as_ref().unwrap().double_value(&[3]), 13.0);
     }
 
     #[test]
