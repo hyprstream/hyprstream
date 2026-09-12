@@ -310,6 +310,8 @@ WORKDIR /build
 COPY Cargo.toml ./
 COPY Cargo.lock ./
 COPY crates ./crates
+# Compile-time include_str! inputs for the pinned AT Protocol schema validator.
+COPY lexicons/upstream/atproto ./lexicons/upstream/atproto
 
 ENV LIBTORCH=/opt/libtorch
 ENV LD_LIBRARY_PATH=/opt/libtorch/lib

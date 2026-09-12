@@ -1,24 +1,22 @@
 //! atproto TID (Timestamp Identifier) — lexicographically-sortable record keys.
 //!
-//! A TID is a 13-character base32-sorted string encoding a 64-bit integer whose
-//! high 53 bits are a microsecond timestamp and low 10 bits are a per-actor
-//! "clock id" (random, to break ties within the same microsecond). Because the
-//! base32 alphabet is sorted (`2..7`, then `a..z`) and the timestamp occupies
-//! the high bits, string comparison of TIDs matches chronological order — which
-//! is exactly what the MST relies on to keep record keys in order.
+//! A TID is a 13-character base32-sortable integer. A timestamp constructor
+//! packs 53 microsecond-timestamp bits above a 10-bit per-actor clock id.
+//! The sorted alphabet makes string order agree with numeric order.
 //!
 //! # Format
 //!
-//! The 64-bit integer is big-endian base32-encoded with the 13-symbol alphabet
-//! `234567abcdefghijklmnopqrstuvwxyz` (RFC 4648 base32 without padding, but
-//! using lowercase). The leading bit is always 0 (the timestamp is capped at
-//! 2^53), giving 53 bits of timestamp headroom until ~2242 CE.
+//! The alphabet is `234567abcdefghijklmnopqrstuvwxyz` (32 symbols). The raw
+//! 64-bit integer is represented by 13 radix-32 digits, with a zero 65th bit
+//! at the LEFT. Thus the first digit is restricted to `2..7` or `a..j`, while
+//! the final digit carries all five low bits. This is integer encoding, not
+//! byte-oriented base32 with right-side padding bits.
 
 use std::fmt;
 
 use anyhow::{bail, Result};
 
-/// The 13-symbol TID base32 alphabet (sorted: '2' < ... < 'z').
+/// The 32-symbol TID base32 alphabet (sorted: '2' < ... < 'z').
 const TID_ALPHABET: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
 const TID_LEN: usize = 13;
 
@@ -69,22 +67,14 @@ impl Tid {
     /// (Named `encode` rather than `to_string` to avoid shadowing the
     /// `ToString` blanket impl that `Display` would otherwise recurse through.)
     pub fn encode(self) -> String {
-        // 13 base32 symbols carry 65 bits. The 64-bit TID value occupies the
-        // low 64 bits of that 65-bit space; the top (65th) bit is always 0
-        // (the timestamp is capped at 2^53, so bit 63 is 0 in practice too).
-        // We emit big-endian, 5 bits per symbol, MSB first: symbol 0 carries
-        // bits [64..60], symbol 1 carries bits [59..55], …, symbol 12 carries
-        // bits [4..0].
-        //
-        // Concretely: shift the value left by 1 to place it in a 65-bit field,
-        // then extract 5-bit groups from the top.
-        let val65 = (self.0 as u128) << 1; // 65-bit quantity (top bit 0)
+        // Zero-extend the raw integer on the left: digits carry bits
+        // [64..60], [59..55], ..., [4..0]. Never shift the value left.
         let mut out = vec![TID_ALPHABET[0]; TID_LEN];
         for (i, slot) in out.iter_mut().enumerate() {
             // Symbol i carries bits [64-5i .. 60-5i] of the 65-bit field.
-            // Extract by shifting the *upper* bit position down to 0.
+            // Shift the group's least significant bit down to bit zero.
             let shift = 60 - 5 * i;
-            let idx = ((val65 >> shift) & 0x1f) as usize;
+            let idx = ((self.0 >> shift) & 0x1f) as usize;
             *slot = TID_ALPHABET[idx];
         }
         // TID_ALPHABET is ASCII, so from_utf8 is infallible in practice; use
@@ -102,20 +92,21 @@ impl Tid {
         if s.len() != TID_LEN {
             bail!("TID must be {TID_LEN} chars, got {}", s.len());
         }
-        // Inverse of encode: accumulate 13 symbols × 5 bits = 65 bits into a
-        // u128 (big-endian), then drop the top padding bit and take the low 64.
-        let mut val65: u128 = 0;
-        for &byte in s.as_bytes().iter() {
-            let idx = match TID_ALPHABET.iter().position(|&a| a == byte) {
-                Some(i) => i as u128,
+        let mut value = 0u64;
+        for (position, &byte) in s.as_bytes().iter().enumerate() {
+            let digit = match TID_ALPHABET.iter().position(|&a| a == byte) {
+                Some(i) => i as u64,
                 None => bail!("invalid TID char {byte:?}"),
             };
-            val65 = val65
-                .checked_shl(5)
+            if position == 0 && digit >= 16 {
+                bail!("TID leading digit exceeds the 64-bit range");
+            }
+            value = value
+                .checked_mul(32)
+                .and_then(|value| value.checked_add(digit))
                 .ok_or_else(|| anyhow::anyhow!("TID overflow"))?;
-            val65 |= idx;
         }
-        Ok(Tid((val65 >> 1) as u64))
+        Ok(Tid(value))
     }
 }
 
@@ -136,8 +127,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tid_raw_integer_vectors_cover_low_bits_and_full_range() {
+        for (raw, text) in [
+            (0, "2222222222222"),
+            (1, "2222222222223"),
+            (31, "222222222222z"),
+            (32, "2222222222232"),
+            (1u64 << 60, "3222222222222"),
+            ((1u64 << 63) - 1, "bzzzzzzzzzzzz"),
+            (1u64 << 63, "c222222222222"),
+            (u64::MAX, "jzzzzzzzzzzzz"),
+        ] {
+            assert_eq!(Tid::from_raw(raw).encode(), text);
+            assert_eq!(Tid::parse(text).unwrap().to_raw(), raw);
+        }
+        let maximum_timestamp = Tid::from_micros((1u64 << 53) - 1, 1023);
+        assert_eq!(maximum_timestamp.to_raw(), (1u64 << 63) - 1);
+        assert_eq!(maximum_timestamp.encode(), "bzzzzzzzzzzzz");
+    }
+
+    #[test]
+    fn tid_preserves_every_final_digit_and_valid_odd_low_bit() {
+        let even = Tid::parse("3jzfcijpj2z2a").unwrap();
+        let odd = Tid::parse("3jzfcijpj2z2b").unwrap();
+        assert_eq!(odd.to_raw(), even.to_raw() + 1);
+        assert_eq!(odd.encode(), "3jzfcijpj2z2b");
+        for &digit in TID_ALPHABET {
+            let text = format!("3jzfcijpj2z2{}", digit as char);
+            assert_eq!(Tid::parse(&text).unwrap().encode(), text);
+        }
+    }
+
+    #[test]
+    fn tid_rejects_out_of_range_leading_digits_and_noncanonical_text() {
+        for (index, &digit) in TID_ALPHABET.iter().enumerate() {
+            let text = format!("{}jzfcijpj2z2a", digit as char);
+            assert_eq!(Tid::parse(&text).is_ok(), index < 16, "{text}");
+        }
+        for text in [
+            "kjzfcijpj2z2a",
+            "KJZFCIJPJ2Z2A",
+            "3JZFCIJPJ2Z2B",
+            "3jzfcijpj2z2b=",
+            "3jzfcijpj2z2",
+            "3jzfcijpj2z21",
+        ] {
+            assert!(Tid::parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
     fn tid_string_round_trip() {
-        for raw in [0u64, 1, 0x1234_5678, 0x7fff_ffff_ffff] {
+        for raw in [0u64, 1, 0x1234_5678, 0x7fff_ffff_ffff, 1u64 << 63, u64::MAX] {
             let tid = Tid::from_raw(raw);
             let s = tid.encode();
             assert_eq!(s.len(), TID_LEN, "tid {raw}");

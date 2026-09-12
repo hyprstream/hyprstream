@@ -32,6 +32,9 @@
 //! - Write path (`repo.createRecord` etc.) — sequenced with #910.
 //! - `createSession`/`getSession` — sequenced with #1113/#948.
 
+mod durable_reads;
+mod record_validation;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -48,6 +51,7 @@ use rand::RngCore as _;
 use serde_json::{json, Value};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
+use hyprstream_pds::atproto_cbor::AtprotoRecordKey;
 use hyprstream_pds::car::{build_record_proof_car, car_block_bytes, car_header_bytes};
 use hyprstream_pds::commit::Commit;
 use hyprstream_pds::mst::{Node, NodeData};
@@ -56,7 +60,7 @@ use hyprstream_pds::repo_authority::accept_repo_authority;
 use hyprstream_pds::tid::Tid;
 use hyprstream_pds::Cid;
 
-use super::did_document::{build_did_document, issuer_authority, AtprotoIdentity};
+use super::did_document::{build_did_document, AtprotoIdentity};
 use super::state::OAuthState;
 use super::{
     auth::{self, AuthenticatedUser},
@@ -76,6 +80,8 @@ const MAX_SERVICE_AUTH_PARAMETER_BYTES: usize = 2_048;
 /// Each request streams the entire repo; bounding concurrency prevents
 /// memory/CPU exhaustion from parallel full-repo exports.
 pub const GET_REPO_CONCURRENCY: usize = 4;
+/// Snapshot/encoding work has its own bound; slow CAR bodies cannot hold it.
+const DURABLE_SNAPSHOT_CONCURRENCY: usize = 4;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RepoSnapshot + XrpcRepoStore
@@ -102,10 +108,7 @@ pub fn xrpc_routes() -> axum::Router<Arc<OAuthState>> {
 /// read-only until account/session authorization is configured.
 pub fn xrpc_write_routes() -> axum::Router<Arc<OAuthState>> {
     use axum::routing::post;
-    axum::Router::new().route(
-        "/xrpc/com.atproto.repo.createRecord",
-        post(create_record),
-    )
+    axum::Router::new().route("/xrpc/com.atproto.repo.createRecord", post(create_record))
 }
 
 /// An in-memory snapshot of one repo's signed state — enough to answer the
@@ -179,6 +182,7 @@ impl RepoSnapshot {
 pub struct XrpcRepoStore {
     by_did: RwLock<BTreeMap<String, Arc<RepoSnapshot>>>,
     get_repo_sema: Arc<Semaphore>,
+    snapshot_work_sema: Arc<Semaphore>,
 }
 
 impl Default for XrpcRepoStore {
@@ -186,6 +190,7 @@ impl Default for XrpcRepoStore {
         Self {
             by_did: RwLock::new(BTreeMap::new()),
             get_repo_sema: Arc::new(Semaphore::new(GET_REPO_CONCURRENCY)),
+            snapshot_work_sema: Arc::new(Semaphore::new(DURABLE_SNAPSHOT_CONCURRENCY)),
         }
     }
 }
@@ -225,6 +230,15 @@ impl XrpcRepoStore {
             return None; // ambiguous — refuse
         }
         Some(Arc::clone(first))
+    }
+
+    /// Bound durable snapshot/encoding work independently of response bodies.
+    /// Move ownership into the blocking task so cancellation cannot release
+    /// admission while that work is still running.
+    async fn acquire_snapshot_work_owned(
+        &self,
+    ) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        self.snapshot_work_sema.clone().acquire_owned().await
     }
 
     /// Acquire an **owned** concurrency permit for full-CAR export. The permit
@@ -690,17 +704,43 @@ fn hex_val(b: u8) -> Option<u8> {
 // Core handler logic (testable without OAuthState)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Resolve a handle to a DID via the store + issuer-derived self-handle.
-async fn resolve_handle_core(store: &XrpcRepoStore, issuer_url: &str, handle: &str) -> Response {
-    if let Some(snap) = store.by_handle_public(handle).await {
-        return axum::Json(json!({ "did": snap.did })).into_response();
+/// Trusted public registry/issuer resolution, shared by reads and owned writes.
+async fn resolve_handle_did(
+    store: &XrpcRepoStore,
+    issuer_url: &str,
+    handle: &str,
+) -> Option<String> {
+    let handle = handle.to_ascii_lowercase();
+    if !record_validation::valid_handle(&handle) {
+        return None;
     }
-    if let Some(authority) = issuer_authority(issuer_url) {
-        let self_handle = authority.split(':').next().unwrap_or(&authority);
-        if handle == self_handle {
-            let did = format!("did:web:{authority}");
-            return axum::Json(json!({ "did": did })).into_response();
+    if let Some(snap) = store.by_handle_public(&handle).await {
+        return Some(snap.did.clone());
+    }
+    if let Ok(origin) = url::Url::parse(issuer_url) {
+        if origin.host_str() == Some(handle.as_str()) {
+            return super::state::atproto_service_did_for_origin(issuer_url);
         }
+    }
+    None
+}
+
+async fn owned_public_writer(
+    state: &OAuthState,
+    repo: &str,
+) -> Option<Arc<crate::services::public_repo::PublicRepoWriter>> {
+    let writer = state.public_repo_writer.as_ref()?;
+    let did = if repo.starts_with("did:") {
+        repo.to_owned()
+    } else {
+        resolve_handle_did(&state.xrpc_repos, &state.issuer_url, repo).await?
+    };
+    (did == writer.did()).then(|| Arc::clone(writer))
+}
+
+async fn resolve_handle_core(store: &XrpcRepoStore, issuer_url: &str, handle: &str) -> Response {
+    if let Some(did) = resolve_handle_did(store, issuer_url, handle).await {
+        return axum::Json(json!({ "did": did })).into_response();
     }
     xrpc_error(
         StatusCode::BAD_REQUEST,
@@ -870,6 +910,9 @@ pub async fn describe_repo(
             );
         }
     };
+    if let Some(writer) = owned_public_writer(&state, key).await {
+        return durable_reads::describe_repo(&state, writer).await;
+    }
     describe_repo_core(&state.xrpc_repos, &state.issuer_url, key).await
 }
 
@@ -894,6 +937,9 @@ pub async fn get_record(State(state): State<Arc<OAuthState>>, RawQuery(raw): Raw
         }
     };
     let cid = params.get("cid").map(|c| c.trim());
+    if let Some(writer) = owned_public_writer(&state, repo).await {
+        return durable_reads::get_record(&state.xrpc_repos, writer, collection, rkey, cid).await;
+    }
     get_record_core(&state.xrpc_repos, repo, collection, rkey, cid).await
 }
 
@@ -911,6 +957,13 @@ pub async fn get_repo(State(state): State<Arc<OAuthState>>, RawQuery(raw): RawQu
     };
     // Reject since by PRESENCE (not just non-empty) — ?since= and ?since=x both 400.
     let since_present = params.contains_key("since");
+    if let Some(writer) = state
+        .public_repo_writer
+        .as_ref()
+        .filter(|writer| writer.did() == did)
+    {
+        return durable_reads::get_repo(&state.xrpc_repos, Arc::clone(writer), since_present).await;
+    }
     get_repo_core(&state.xrpc_repos, did, since_present).await
 }
 
@@ -926,90 +979,299 @@ pub async fn create_record(
 ) -> Response {
     const MAX_BODY_BYTES: usize = 1_048_576;
     if body.len() > MAX_BODY_BYTES {
-        return xrpc_error(StatusCode::PAYLOAD_TOO_LARGE, errors::INVALID_REQUEST, "record body exceeds 1 MiB");
+        return xrpc_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            errors::INVALID_REQUEST,
+            "record body exceeds 1 MiB",
+        );
     }
     let Some(writer) = state.public_repo_writer.as_ref() else {
-        return xrpc_error(StatusCode::SERVICE_UNAVAILABLE, errors::INTERNAL_SERVER_ERROR, "public repository writer is not configured");
+        return xrpc_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            errors::INTERNAL_SERVER_ERROR,
+            "public repository writer is not configured",
+        );
     };
     let Some(token) = user.token.as_deref() else {
-        return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "verified OAuth access token is required");
+        return xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            errors::INVALID_REQUEST,
+            "verified OAuth access token is required",
+        );
     };
     let claims = match auth::validate_oauth_access_token(&state, token).await {
         Ok(claims) => claims,
-        Err(_) => return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "OAuth access token is invalid or expired"),
+        Err(_) => {
+            return xrpc_error(
+                StatusCode::UNAUTHORIZED,
+                errors::INVALID_REQUEST,
+                "OAuth access token is invalid or expired",
+            )
+        }
     };
     if !claims.has_scope("atproto") {
-        return xrpc_error(StatusCode::FORBIDDEN, "InsufficientScope", "the atproto scope is required");
+        return xrpc_error(
+            StatusCode::FORBIDDEN,
+            "InsufficientScope",
+            "the atproto scope is required",
+        );
     }
     if claims.sub != user.user || claims.tenant != user.verified_tenant {
-        return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "OAuth identity binding is invalid");
+        return xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            errors::INVALID_REQUEST,
+            "OAuth identity binding is invalid",
+        );
+    }
+    // The protected router has verified the matching proof, ath, nonce, and
+    // replay state for bound tokens. Unbound Bearer tokens remain valid for
+    // other OAuth routes, but cannot authorize this atproto write endpoint.
+    if claims.cnf_jkt().is_none() {
+        return xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            errors::INVALID_REQUEST,
+            "a DPoP-bound OAuth access token is required",
+        );
     }
     let input: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
-        Err(_) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "request body must be valid JSON"),
+        Err(_) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "request body must be valid JSON",
+            )
+        }
     };
     let object = match input.as_object() {
         Some(object) => object,
-        None => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "request body must be an object"),
+        None => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "request body must be an object",
+            )
+        }
     };
-    let repo = match object.get("repo").and_then(Value::as_str) {
-        Some(repo) if !repo.is_empty() => repo,
-        _ => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "repo is required"),
-    };
-    if repo != writer.did() {
-        return xrpc_error(StatusCode::FORBIDDEN, "AuthRequired", "the request repo is not owned by this writer");
-    }
-    let collection = match object.get("collection").and_then(Value::as_str) {
-        Some(collection) if matches!(collection, "app.bsky.feed.post" | "app.bsky.actor.profile") => collection,
-        Some(_) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "collection is outside the enabled posting slice"),
-        None => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "collection is required"),
-    };
-    if let Err(message) = validate_flag(object.get("validate")) {
-        return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message);
-    }
-    let rkey = match object.get("rkey").and_then(Value::as_str).and_then(|value| Tid::parse(value).ok()) {
-        Some(rkey) => rkey,
-        None => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "a valid TID rkey is required"),
-    };
-    let record_value = match object.get("record") {
-        Some(record) => record,
-        None => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "record is required"),
-    };
-    let record = match crate::services::public_repo::json_to_dag_cbor(record_value) {
-        Ok(record) => record,
-        Err(_) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "record contains unsupported data"),
-    };
-    let request_id = headers
-        .get("Idempotency-Key")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("create-{}-{}", collection.replace('.', "_"), rkey.encode()));
     let expected_prev = match parse_swap_commit(object.get("swapCommit")) {
         Ok(value) => value,
         Err(message) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message),
+    };
+    let validate = match object.get("validate") {
+        None => true, // Both collections in this posting slice have known schemas.
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "validate must be a boolean when present",
+            )
+        }
     };
     let return_record = match parse_return_record(object.get("returnRecord")) {
         Ok(value) => value,
         Err(message) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message),
     };
-    let result = writer.create_record_with_expected_prev_text(
-        crate::services::public_repo::PublicCreateRequest {
-            request_id,
-            principal: user.user,
-            did: repo.to_owned(),
-            collection: collection.to_owned(),
-            rkey,
-            value: record,
-            expected_prev: None,
-        },
-        expected_prev,
-    );
+    let mut idempotency_keys = headers.get_all("Idempotency-Key").iter();
+    let request_id = match idempotency_keys.next() {
+        None => None,
+        Some(value) => {
+            let value = match value.to_str() {
+                Ok(value) if !value.is_empty() => value,
+                _ => {
+                    return xrpc_error(
+                        StatusCode::BAD_REQUEST,
+                        errors::INVALID_REQUEST,
+                        "Idempotency-Key must be a non-empty ASCII string",
+                    )
+                }
+            };
+            if idempotency_keys.next().is_some() {
+                return xrpc_error(
+                    StatusCode::BAD_REQUEST,
+                    errors::INVALID_REQUEST,
+                    "only one Idempotency-Key may be supplied",
+                );
+            }
+            // The native writer validates the publication request ID's length
+            // and alphabet before authorization or any repository access.
+            Some(value.to_owned())
+        }
+    };
+    let repo = match object.get("repo").and_then(Value::as_str) {
+        Some(repo) if !repo.is_empty() => repo,
+        _ => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "repo is required",
+            )
+        }
+    };
+    let repo = if repo.starts_with("did:") {
+        Some(repo.to_owned())
+    } else {
+        resolve_handle_did(&state.xrpc_repos, &state.issuer_url, repo).await
+    };
+    if repo.as_deref() != Some(writer.did()) {
+        return xrpc_error(
+            StatusCode::FORBIDDEN,
+            "AuthRequired",
+            "the request repo is not owned by this writer",
+        );
+    }
+    let collection = match object.get("collection").and_then(Value::as_str) {
+        Some(collection)
+            if matches!(collection, "app.bsky.feed.post" | "app.bsky.actor.profile") =>
+        {
+            collection
+        }
+        Some(_) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "collection is outside the enabled posting slice",
+            )
+        }
+        None => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "collection is required",
+            )
+        }
+    };
+    if let Err(message) = validate_flag(object.get("validate")) {
+        return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message);
+    }
+    let rkey = match (collection, object.get("rkey")) {
+        ("app.bsky.actor.profile", None) => AtprotoRecordKey::new("self").map(Some),
+        ("app.bsky.actor.profile", Some(Value::String(value))) if value == "self" => {
+            AtprotoRecordKey::new(value.clone()).map(Some)
+        }
+        ("app.bsky.actor.profile", _) => Err(anyhow::anyhow!("profile rkey must be self")),
+        (_, None) => Ok(None),
+        (_, Some(Value::String(value)))
+            if Tid::parse(value).is_ok_and(|tid| tid.encode() == *value) =>
+        {
+            // Reject alternate encodings instead of changing the record path.
+            AtprotoRecordKey::new(value.clone()).map(Some)
+        }
+        _ => Err(anyhow::anyhow!("a valid TID rkey is required when present")),
+    };
+    let rkey = match rkey {
+        Ok(rkey) => rkey,
+        Err(error) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                error.to_string(),
+            )
+        }
+    };
+    let record_value = match object.get("record") {
+        Some(record) => record,
+        None => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "record is required",
+            )
+        }
+    };
+    if validate {
+        if let Err(error) = record_validation::validate(collection, record_value) {
+            let (status, code, message) = match error {
+                record_validation::Error::Invalid => (
+                    StatusCode::BAD_REQUEST,
+                    errors::INVALID_REQUEST,
+                    "record does not match its known schema",
+                ),
+                record_validation::Error::SchemaUnavailable => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    errors::INTERNAL_SERVER_ERROR,
+                    "record schema validation is unavailable",
+                ),
+            };
+            return xrpc_error(status, code, message);
+        }
+    }
+    let record = match crate::services::public_repo::json_to_dag_cbor(record_value) {
+        Ok(record) => record,
+        Err(_) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::INVALID_REQUEST,
+                "record contains unsupported data",
+            )
+        }
+    };
+    if crate::services::public_repo::reject_unverified_blobs(&record).is_err() {
+        return xrpc_error(
+            StatusCode::BAD_REQUEST,
+            errors::INVALID_REQUEST,
+            "blob storage verification is unavailable",
+        );
+    }
+    let request_id = request_id.unwrap_or_else(|| match rkey.as_ref() {
+        Some(rkey) => format!("create-{}-{}", collection.replace('.', "_"), rkey.as_str()),
+        // Without a client idempotency key, distinct omitted-key requests
+        // create distinct records. Key allocation itself stays in the writer.
+        None => format!("create-{}", uuid::Uuid::new_v4()),
+    });
+    let writer = Arc::clone(writer);
+    let expected_prev = expected_prev.map(str::to_owned);
+    let request = crate::services::public_repo::PublicCreateRequest {
+        request_id,
+        principal: user.user,
+        did: writer.did().to_owned(),
+        collection: collection.to_owned(),
+        rkey,
+        value: record,
+        expected_prev: None,
+    };
+    // Authorization remains inside the transaction before any store access.
+    // Native locks, RocksDB, signing and sync writes must not occupy Tokio workers.
+    let result = tokio::task::spawn_blocking(move || {
+        writer.create_record_with_expected_prev_text(request, expected_prev.as_deref())
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(crate::services::public_repo::PublicRepoWriteError::Internal(error.into()))
+    });
+    use crate::services::public_repo::PublicRepoWriteError;
     let result = match result {
         Ok(result) => result,
-        Err(error) if error.to_string().contains("authorization") || error.to_string().contains("denied") => return xrpc_error(StatusCode::FORBIDDEN, "AuthRequired", error.to_string()),
-        Err(error) if error.to_string().contains("CAS conflict") || error.to_string().contains("already exists") => return xrpc_error(StatusCode::CONFLICT, "InvalidSwap", error.to_string()),
-        Err(error) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, error.to_string()),
+        Err(error) => {
+            let (status, code, message) = match error {
+                PublicRepoWriteError::InvalidRequest(_) => (
+                    StatusCode::BAD_REQUEST,
+                    errors::INVALID_REQUEST,
+                    "record or request parameters are invalid",
+                ),
+                PublicRepoWriteError::Authorization(_) => (
+                    StatusCode::FORBIDDEN,
+                    "AuthRequired",
+                    "public repository publication is not authorized",
+                ),
+                PublicRepoWriteError::RecordAlreadyExists => (
+                    StatusCode::CONFLICT,
+                    "RecordAlreadyExists",
+                    "record key already exists",
+                ),
+                PublicRepoWriteError::InvalidSwap => (
+                    StatusCode::CONFLICT,
+                    "InvalidSwap",
+                    "swapCommit does not match the repository head",
+                ),
+                PublicRepoWriteError::Internal(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    "public repository operation failed",
+                ),
+            };
+            return xrpc_error(status, code, message);
+        }
     };
     let mut response = json!({"uri": result.uri, "cid": result.cid.to_string()});
     if return_record {
@@ -1113,20 +1375,11 @@ mod tests {
     fn create_record_optional_fields_reject_wrong_types() {
         assert_eq!(parse_swap_commit(None).unwrap(), None);
         assert_eq!(parse_swap_commit(Some(&json!("bafyhead"))).unwrap(), Some("bafyhead"));
-        assert_eq!(
-            parse_swap_commit(Some(&json!(""))).unwrap_err(),
-            "swapCommit must be a non-empty CID"
-        );
-        assert_eq!(
-            parse_swap_commit(Some(&json!(42))).unwrap_err(),
-            "swapCommit must be a string"
-        );
+        assert_eq!(parse_swap_commit(Some(&json!(""))).unwrap_err(), "swapCommit must be a non-empty CID");
+        assert_eq!(parse_swap_commit(Some(&json!(42))).unwrap_err(), "swapCommit must be a string");
         assert!(!parse_return_record(None).unwrap());
         assert!(parse_return_record(Some(&Value::Bool(true))).unwrap());
-        assert_eq!(
-            parse_return_record(Some(&json!("yes"))).unwrap_err(),
-            "returnRecord must be a boolean"
-        );
+        assert_eq!(parse_return_record(Some(&json!("yes"))).unwrap_err(), "returnRecord must be a boolean");
     }
 
     // ── Finding 1: lazy CAR + owned permit held until EOF ───────────────────
@@ -1640,6 +1893,1583 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[derive(Default)]
+    struct WriteInputGate(
+        std::sync::atomic::AtomicUsize,
+        parking_lot::Mutex<Option<String>>,
+    );
+
+    impl crate::services::public_repo::PublicPublicationAuthorizer for WriteInputGate {
+        fn authorize(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(message) = self.1.lock().as_ref() {
+                anyhow::bail!(message.clone());
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct WriteAccess {
+        token: String,
+        claims: hyprstream_rpc::auth::Claims,
+        key: SigningKey,
+        htu: String,
+        nonce: String,
+    }
+
+    impl WriteAccess {
+        fn proof_payload(&self) -> Value {
+            use sha2::{Digest as _, Sha256};
+            json!({
+                "jti": uuid::Uuid::new_v4().to_string(),
+                "htm": "POST",
+                "htu": self.htu,
+                "iat": chrono::Utc::now().timestamp(),
+                "ath": URL_SAFE_NO_PAD.encode(Sha256::digest(self.token.as_bytes())),
+                "nonce": self.nonce,
+            })
+        }
+    }
+
+    fn sign_write_proof(key: &SigningKey, payload: &Value) -> String {
+        use p256::ecdsa::signature::Signer as _;
+        let point = key.verifying_key().to_encoded_point(false);
+        let header = json!({
+            "typ": "dpop+jwt",
+            "alg": "ES256",
+            "jwk": {
+                "kty": "EC", "crv": "P-256",
+                "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+                "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+            }
+        });
+        let signing_input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap())
+        );
+        let signature: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
+    }
+
+    async fn build_write_input_fixture() -> (
+        tempfile::TempDir,
+        Arc<crate::services::public_repo::PublicRepoStore>,
+        Arc<WriteInputGate>,
+        Router,
+        WriteAccess,
+    ) {
+        build_write_input_fixture_for("did:web:pub.example.com", "https://h.example.com").await
+    }
+
+    async fn build_write_input_fixture_for(
+        did: &str,
+        issuer_url: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::services::public_repo::PublicRepoStore>,
+        Arc<WriteInputGate>,
+        Router,
+        WriteAccess,
+    ) {
+        let (dir, store, gate, app, token, _) =
+            build_write_input_fixture_with_admission(did, issuer_url).await;
+        (dir, store, gate, app, token)
+    }
+
+    async fn build_write_input_fixture_with_admission(
+        did: &str,
+        issuer_url: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::services::public_repo::PublicRepoStore>,
+        Arc<WriteInputGate>,
+        Router,
+        WriteAccess,
+        Arc<XrpcRepoStore>,
+    ) {
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(crate::services::public_repo::PublicRepoStore::open(dir.path()).unwrap());
+        let gate = Arc::new(WriteInputGate::default());
+        let writer = crate::services::public_repo::PublicRepoWriter::new(
+            store.clone(),
+            did,
+            SigningKey::random(&mut OsRng),
+            gate.clone(),
+        )
+        .unwrap();
+        let mut state = build_test_state(true).await;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x19; 32]);
+        let writable_state = Arc::get_mut(&mut state).unwrap();
+        writable_state.issuer_url = issuer_url.to_owned();
+        writable_state.verifying_key_bytes = signing_key.verifying_key().to_bytes();
+        writable_state.public_repo_writer = Some(Arc::new(writer));
+        let issuer = state.atproto_issuer_url();
+        let now = chrono::Utc::now().timestamp();
+        let key = SigningKey::random(&mut OsRng);
+        let point = key.verifying_key().to_encoded_point(false);
+        let jkt = super::super::dpop::DpopKey::Es256 {
+            x: (*point.x().unwrap()).into(),
+            y: (*point.y().unwrap()).into(),
+        }
+        .jkt();
+        let nonce = state.issue_dpop_nonce().await;
+        state.mark_dpop_client_nonced(&jkt).await;
+        let htu = format!("{issuer}/xrpc/com.atproto.repo.createRecord");
+        let claims = hyprstream_rpc::auth::Claims::new("xrpc-writer".to_owned(), now, now + 3600)
+            .with_issuer(issuer.clone())
+            .with_audience(Some(issuer))
+            .with_tenant("xrpc-input-tests".to_owned())
+            .with_client_id("xrpc-input-tests")
+            .with_scope(Some("atproto".to_owned()))
+            .with_cnf_jkt_thumbprint(jkt)
+            .with_jti();
+        let token = hyprstream_rpc::auth::jwt::encode(&claims, &signing_key);
+        let token = WriteAccess {
+            token,
+            claims,
+            key,
+            htu,
+            nonce,
+        };
+        let reads = state.xrpc_repos.clone();
+        let app = build_production_app_from_state(state).await;
+        (dir, store, gate, app, token, reads)
+    }
+
+    fn write_input(id: u64) -> Value {
+        json!({
+            "repo": "did:web:pub.example.com",
+            "collection": "app.bsky.feed.post",
+            "rkey": Tid::from_raw(id).encode(),
+            "record": {
+                "$type": "app.bsky.feed.post",
+                "text": "input validation",
+                "createdAt": "2026-09-10T00:00:00Z"
+            }
+        })
+    }
+
+    fn write_http_request(
+        token: &WriteAccess,
+        input: &Value,
+        headers: HeaderMap,
+    ) -> HttpRequest<Body> {
+        let mut request = HttpRequest::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.repo.createRecord")
+            .header(header::AUTHORIZATION, format!("DPoP {}", token.token))
+            .header("DPoP", sign_write_proof(&token.key, &token.proof_payload()))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(input).unwrap()))
+            .unwrap();
+        request.headers_mut().extend(headers);
+        request
+    }
+
+    #[tokio::test]
+    async fn router_create_record_requires_bound_token_and_proof_before_native_calls() {
+        let (_dir, store, gate, app, access) = build_write_input_fixture().await;
+        let mut unbound = access.clone();
+        unbound.claims.cnf = None;
+        unbound.token = hyprstream_rpc::auth::jwt::encode(
+            &unbound.claims,
+            &ed25519_dalek::SigningKey::from_bytes(&[0x19; 32]),
+        );
+        for (token, scheme, include_proof, error) in [
+            (&unbound, "Bearer", false, errors::INVALID_REQUEST),
+            (&unbound, "DPoP", true, errors::INVALID_REQUEST),
+            (&access, "Bearer", false, "invalid_token"),
+            (&access, "Bearer", true, "invalid_token"),
+            (&access, "DPoP", false, "invalid_token"),
+        ] {
+            let mut request = write_http_request(token, &write_input(7), HeaderMap::new());
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("{scheme} {}", token.token).parse().unwrap(),
+            );
+            if !include_proof {
+                request.headers_mut().remove("DPoP");
+            }
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let body = body_json(response).await;
+            assert_eq!(body["error"], error);
+            if error == errors::INVALID_REQUEST {
+                assert_eq!(
+                    body["message"],
+                    "a DPoP-bound OAuth access token is required"
+                );
+            }
+            assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn router_create_record_rejects_wrong_dpop_proofs_before_native_calls() {
+        let (_dir, store, gate, app, access) = build_write_input_fixture().await;
+        for case in [
+            "key",
+            "method",
+            "uri",
+            "ath",
+            "missing_ath",
+            "nonce",
+            "missing_nonce",
+        ] {
+            let mut payload = access.proof_payload();
+            let wrong_key = SigningKey::random(&mut OsRng);
+            let key = if case == "key" {
+                &wrong_key
+            } else {
+                &access.key
+            };
+            let error = match case {
+                "key" => "invalid_token",
+                "method" => {
+                    payload["htm"] = json!("GET");
+                    "invalid_dpop_proof"
+                }
+                "uri" => {
+                    payload["htu"] =
+                        json!("https://other.example/xrpc/com.atproto.repo.createRecord");
+                    "invalid_dpop_proof"
+                }
+                "ath" => {
+                    payload["ath"] = json!("wrong-token-hash");
+                    "invalid_dpop_proof"
+                }
+                "missing_ath" => {
+                    payload.as_object_mut().unwrap().remove("ath");
+                    "invalid_dpop_proof"
+                }
+                "nonce" => {
+                    payload["nonce"] = json!("invalid-server-nonce");
+                    "use_dpop_nonce"
+                }
+                "missing_nonce" => {
+                    payload.as_object_mut().unwrap().remove("nonce");
+                    "use_dpop_nonce"
+                }
+                _ => unreachable!(),
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert("DPoP", sign_write_proof(key, &payload).parse().unwrap());
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&access, &write_input(7), headers))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{case}");
+            assert_eq!(body_json(response).await["error"], error, "{case}");
+            assert_eq!(
+                gate.0.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "{case}"
+            );
+            assert!(
+                store.snapshot("did:web:pub.example.com").unwrap().is_none(),
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn router_create_record_dpop_replay_rejected_but_fresh_retry_succeeds() {
+        let (_dir, store, gate, app, access) = build_write_input_fixture().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "DPoP",
+            sign_write_proof(&access.key, &access.proof_payload())
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("Idempotency-Key", "dpop-retry".parse().unwrap());
+        let response = app
+            .clone()
+            .oneshot(write_http_request(
+                &access,
+                &write_input(7),
+                headers.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = body_json(response).await;
+        let head = store
+            .snapshot("did:web:pub.example.com")
+            .unwrap()
+            .unwrap()
+            .commit
+            .cid();
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // Replay cannot reach the authorizer, even when the body/idempotency
+        // request changes. A fresh proof can retry the original operation.
+        for input in [write_input(7), write_input(8)] {
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&access, &input, headers.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(body_json(response).await["error"], "invalid_dpop_proof");
+            assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+            let snapshot = store.snapshot("did:web:pub.example.com").unwrap().unwrap();
+            assert_eq!(snapshot.commit.cid(), head);
+            assert_eq!(snapshot.records.len(), 1);
+        }
+        headers.remove("DPoP");
+        let response = app
+            .oneshot(write_http_request(&access, &write_input(7), headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await, created);
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let snapshot = store.snapshot("did:web:pub.example.com").unwrap().unwrap();
+        assert_eq!(snapshot.commit.cid(), head);
+        assert_eq!(snapshot.records.len(), 1);
+    }
+
+    fn read_request(uri: &str) -> HttpRequest<Body> {
+        HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn router_durable_reads_enforce_aggregate_snapshot_budget() {
+        for (count, bytes) in [(257, 1), (18, 60_000)] {
+            let (_dir, store, _gate, app, _token) = build_write_input_fixture().await;
+            store
+                .insert_snapshot_budget_fixture_for_test("did:web:pub.example.com", count, bytes)
+                .unwrap();
+            for uri in [
+                "/xrpc/com.atproto.repo.getRecord?repo=pub.example.com&collection=app.bsky.feed.post&rkey=0000",
+                "/xrpc/com.atproto.repo.describeRepo?repo=pub.example.com",
+                "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com",
+            ] {
+                let response = app.clone().oneshot(read_request(uri)).await.unwrap();
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(body_json(response).await, json!({"error":"InternalServerError","message":"public repository read failed"}));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn router_point_reads_remain_available_with_four_held_car_bodies() {
+        let (_dir, _store, _gate, app, token) = build_write_input_fixture().await;
+        let created = app
+            .clone()
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let mut held = Vec::new();
+        for _ in 0..GET_REPO_CONCURRENCY {
+            held.push(
+                app.clone()
+                    .oneshot(read_request(
+                        "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com",
+                    ))
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(held
+            .iter()
+            .all(|response| response.status() == StatusCode::OK));
+        // Waiting exports must acquire body admission before snapshot work.
+        let mut queued_exports = Vec::new();
+        for _ in 0..DURABLE_SNAPSHOT_CONCURRENCY {
+            let app = app.clone();
+            queued_exports.push(tokio::spawn(async move {
+                app.oneshot(read_request(
+                    "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com",
+                ))
+                .await
+                .unwrap()
+            }));
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut queued_exports[0])
+                .await
+                .is_err()
+        );
+        let mut pending = Vec::new();
+        for uri in [
+            format!("/xrpc/com.atproto.repo.getRecord?repo=pub.example.com&collection=app.bsky.feed.post&rkey={}", Tid::from_raw(7).encode()),
+            "/xrpc/com.atproto.repo.describeRepo?repo=pub.example.com".to_owned(),
+        ] {
+            let app = app.clone();
+            pending.push(tokio::spawn(async move { app.oneshot(read_request(&uri)).await.unwrap() }));
+        }
+        for request in pending {
+            let response = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(held.len(), GET_REPO_CONCURRENCY);
+        for export in queued_exports {
+            export.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn router_snapshot_work_admission_bounds_every_durable_reader() {
+        let (_dir, _store, _gate, app, token, reads) = build_write_input_fixture_with_admission(
+            "did:web:pub.example.com",
+            "https://h.example.com",
+        )
+        .await;
+        let created = app
+            .clone()
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let mut held = Vec::new();
+        for _ in 0..DURABLE_SNAPSHOT_CONCURRENCY {
+            held.push(reads.acquire_snapshot_work_owned().await.unwrap());
+        }
+        let mut pending = Vec::new();
+        for uri in [
+            format!("/xrpc/com.atproto.repo.getRecord?repo=pub.example.com&collection=app.bsky.feed.post&rkey={}", Tid::from_raw(7).encode()),
+            "/xrpc/com.atproto.repo.describeRepo?repo=pub.example.com".to_owned(),
+            "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com".to_owned(),
+        ] {
+            let app = app.clone();
+            pending.push(tokio::spawn(async move { app.oneshot(read_request(&uri)).await.unwrap() }));
+        }
+        for request in &mut pending {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), request)
+                    .await
+                    .is_err()
+            );
+        }
+        drop(held.pop());
+        let mut responses = Vec::new();
+        for request in pending {
+            let response = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            responses.push(response);
+        }
+        // CAR body retains only export admission, not snapshot-work admission.
+        assert_eq!(reads.snapshot_work_sema.available_permits(), 1);
+        assert_eq!(
+            reads.get_repo_sema.available_permits(),
+            GET_REPO_CONCURRENCY - 1
+        );
+        drop(responses);
+        assert_eq!(
+            reads.get_repo_sema.available_permits(),
+            GET_REPO_CONCURRENCY
+        );
+    }
+
+    #[tokio::test]
+    async fn router_describes_nonissuer_writers_without_legacy_handle_metadata() {
+        for did in [
+            "did:plc:abcdefghijklmnopqrstuvwx",
+            "did:web:account.example.com",
+        ] {
+            let (_dir, _store, _gate, app, token) =
+                build_write_input_fixture_for(did, "https://pds.example.com").await;
+            let mut input = write_input(7);
+            input["repo"] = json!(did);
+            let created = app
+                .clone()
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(created.status(), StatusCode::OK);
+            let response = app
+                .clone()
+                .oneshot(read_request(&format!(
+                    "/xrpc/com.atproto.repo.describeRepo?repo={did}"
+                )))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            assert_eq!(body["did"], did);
+            assert_eq!(body["didDoc"]["id"], did);
+            assert_eq!(body["handle"], "handle.invalid");
+            assert_eq!(body["handleIsCorrect"], false);
+            assert!(body["didDoc"].get("alsoKnownAs").is_none());
+            assert_eq!(body["collections"], json!(["app.bsky.feed.post"]));
+            // The unknown account handle must not claim the PDS issuer handle.
+            input["repo"] = json!("pds.example.com");
+            let foreign = app
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn router_rejects_unverified_blobs_in_every_validation_mode_and_read_path() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        let blob = json!({"$type":"blob","ref":{"$link":Cid::from_raw(b"missing").to_string()},"mimeType":"image/png","size":7});
+        for mode in [None, Some(true), Some(false)] {
+            for extension in [
+                blob.clone(),
+                json!([{"nested":[blob.clone()]}]),
+                json!({"$type":"com.example.future","media":blob}),
+                json!({"cid":Cid::from_raw(b"missing").to_string(),"mimeType":"image/png"}),
+            ] {
+                let mut input = write_input(7);
+                input["record"]["extension"] = extension;
+                if let Some(mode) = mode {
+                    input["validate"] = json!(mode);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(
+                    body_json(response).await,
+                    json!({"error":"InvalidRequest","message":"blob storage verification is unavailable"})
+                );
+                assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+                assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+            }
+        }
+        // Model an otherwise correctly signed repository from before blob enforcement.
+        store
+            .insert_unverified_blob_for_test("did:web:pub.example.com")
+            .unwrap();
+        assert!(store
+            .snapshot("did:web:pub.example.com")
+            .unwrap_err()
+            .to_string()
+            .contains("blob storage verification"));
+        for uri in [
+            "/xrpc/com.atproto.repo.getRecord?repo=pub.example.com&collection=app.bsky.feed.post&rkey=legacy",
+            "/xrpc/com.atproto.repo.describeRepo?repo=pub.example.com",
+            "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com",
+        ] {
+            let response = app.clone().oneshot(read_request(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(body_json(response).await, json!({"error":"InternalServerError","message":"public repository read failed"}));
+        }
+    }
+
+    #[tokio::test]
+    async fn router_retry_rejects_substituted_swap_without_rechecking_latest_head() {
+        let (_dir, store, _gate, app, token) = build_write_input_fixture().await;
+        let first = app
+            .clone()
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let previous = store
+            .snapshot("did:web:pub.example.com")
+            .unwrap()
+            .unwrap()
+            .commit
+            .cid_atproto()
+            .unwrap()
+            .to_string();
+        let mut input = write_input(8);
+        input["swapCommit"] = json!(previous);
+        let second = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second = body_json(second).await;
+        let third = app
+            .clone()
+            .oneshot(write_http_request(
+                &token,
+                &write_input(9),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(third.status(), StatusCode::OK);
+        let head = store
+            .snapshot("did:web:pub.example.com")
+            .unwrap()
+            .unwrap()
+            .commit
+            .cid_atproto()
+            .unwrap();
+        let retry = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(body_json(retry).await, second);
+        for changed in [
+            Some(head.to_string()),
+            Some(Cid::from_dag_cbor(b"substituted").to_string()),
+            None,
+        ] {
+            let mut input = input.clone();
+            match changed {
+                Some(cid) => {
+                    input["swapCommit"] = json!(cid);
+                }
+                None => {
+                    input.as_object_mut().unwrap().remove("swapCommit");
+                }
+            }
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                body_json(response).await,
+                json!({"error":"InvalidRequest","message":"record or request parameters are invalid"})
+            );
+            assert_eq!(
+                store
+                    .snapshot("did:web:pub.example.com")
+                    .unwrap()
+                    .unwrap()
+                    .commit
+                    .cid_atproto()
+                    .unwrap(),
+                head
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn router_issuer_port_handle_uses_canonical_did_without_registry_entry() {
+        let did = "did:web:pds.example.test%3A8443";
+        let (_dir, store, gate, app, token) =
+            build_write_input_fixture_for(did, "https://pds.example.test:8443").await;
+        let resolve = app
+            .clone()
+            .oneshot(read_request(
+                "/xrpc/com.atproto.identity.resolveHandle?handle=pds.example.test",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resolve.status(), StatusCode::OK);
+        assert_eq!(body_json(resolve).await, json!({"did":did}));
+        let mut input = write_input(7);
+        input["repo"] = json!("pds.example.test");
+        let created = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = body_json(created).await;
+        input["repo"] = json!(did);
+        let retry = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(body_json(retry).await, created);
+        for repo in [
+            "pds.example.test".to_owned(),
+            urlencoding::encode(did).into_owned(),
+        ] {
+            let read = app.clone().oneshot(read_request(&format!("/xrpc/com.atproto.repo.getRecord?repo={repo}&collection=app.bsky.feed.post&rkey={}", input["rkey"].as_str().unwrap()))).await.unwrap();
+            assert_eq!(read.status(), StatusCode::OK);
+            assert_eq!(body_json(read).await["uri"], created["uri"]);
+            let describe = app
+                .clone()
+                .oneshot(read_request(&format!(
+                    "/xrpc/com.atproto.repo.describeRepo?repo={repo}"
+                )))
+                .await
+                .unwrap();
+            assert_eq!(describe.status(), StatusCode::OK);
+            let describe = body_json(describe).await;
+            assert_eq!(describe["did"], did);
+            assert_eq!(describe["handle"], "pds.example.test");
+            assert_eq!(describe["didDoc"]["id"], did);
+        }
+        assert_eq!(store.snapshot(did).unwrap().unwrap().records.len(), 1);
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn router_writes_release_tokio_worker_and_serialize_same_did() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        let response = app
+            .clone()
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let head = store
+            .snapshot("did:web:pub.example.com")
+            .unwrap()
+            .unwrap()
+            .commit
+            .cid_atproto()
+            .unwrap()
+            .to_string();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let locked_store = store.clone();
+        let owner = std::thread::spawn(move || {
+            locked_store
+                .with_account_lock_for_test("did:web:pub.example.com", || {
+                    held_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+                })
+                .unwrap();
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut writes = Vec::new();
+        for id in [8, 9] {
+            let mut input = write_input(id);
+            input["swapCommit"] = json!(head);
+            let request = write_http_request(&token, &input, HeaderMap::new());
+            let app = app.clone();
+            writes.push(tokio::spawn(
+                async move { app.oneshot(request).await.unwrap() },
+            ));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while gate.0.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let response = app
+            .oneshot(read_request(
+                "/xrpc/com.atproto.identity.resolveHandle?handle=pub.example.com",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(writes.iter().all(|write| !write.is_finished()));
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+        let mut statuses = Vec::new();
+        for write in writes {
+            statuses.push(write.await.unwrap().status().as_u16());
+        }
+        statuses.sort();
+        assert_eq!(statuses, vec![200, 409]);
+        assert_eq!(
+            store
+                .snapshot("did:web:pub.example.com")
+                .unwrap()
+                .unwrap()
+                .records
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn router_create_accepts_owned_handle_and_rejects_foreign_handles() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        for repo in [
+            "priv.example.com",
+            "h.example.com",
+            "unknown.example.com",
+            "did:web:priv.example.com",
+        ] {
+            let mut input = write_input(7);
+            input["repo"] = json!(repo);
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{repo}");
+            assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+            assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        let mut input = write_input(7);
+        input["repo"] = json!("PUB.EXAMPLE.COM");
+        let mut headers = HeaderMap::new();
+        headers.insert("Idempotency-Key", "owned-handle-retry".parse().unwrap());
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, headers.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = body_json(response).await;
+        assert!(created["uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("at://did:web:pub.example.com/"));
+        let retry = app
+            .oneshot(write_http_request(&token, &write_input(7), headers))
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(body_json(retry).await, created);
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(
+            store
+                .snapshot("did:web:pub.example.com")
+                .unwrap()
+                .unwrap()
+                .records
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn router_durable_creates_are_readable_without_stale_snapshot_fallback() {
+        let (_dir, store, _gate, app, token) = build_write_input_fixture().await;
+        let repo_uri = "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com";
+        // The fixture already contains a legacy model snapshot for this DID.
+        let missing = app.clone().oneshot(read_request(repo_uri)).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(missing).await["error"], "RepoNotFound");
+        let mut input = write_input(7);
+        input["record"]["extension"] = json!({"bytes":{"$bytes":"AQI="},"link":{"$link":Cid::from_dag_cbor(b"extension").to_string()}});
+        let created = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = body_json(created).await;
+        for repo in ["did:web:pub.example.com", "pub.example.com"] {
+            let uri = format!("/xrpc/com.atproto.repo.getRecord?repo={repo}&collection=app.bsky.feed.post&rkey={}", input["rkey"].as_str().unwrap());
+            let read = app.clone().oneshot(read_request(&uri)).await.unwrap();
+            assert_eq!(read.status(), StatusCode::OK);
+            let read = body_json(read).await;
+            assert_eq!(read["uri"], created["uri"]);
+            assert_eq!(read["cid"], created["cid"]);
+            assert_eq!(read["value"], input["record"]);
+        }
+        let profile = json!({"repo":"pub.example.com","collection":"app.bsky.actor.profile","rkey":"self","record":{"$type":"app.bsky.actor.profile","displayName":"Durable"}});
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &profile, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let profile_read = app.clone().oneshot(read_request("/xrpc/com.atproto.repo.getRecord?repo=pub.example.com&collection=app.bsky.actor.profile&rkey=self")).await.unwrap();
+        assert_eq!(profile_read.status(), StatusCode::OK);
+        assert_eq!(body_json(profile_read).await["value"], profile["record"]);
+        let describe_uri = "/xrpc/com.atproto.repo.describeRepo?repo=pub.example.com";
+        let describe = app
+            .clone()
+            .oneshot(read_request(describe_uri))
+            .await
+            .unwrap();
+        assert_eq!(describe.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(describe).await["collections"],
+            json!(["app.bsky.actor.profile", "app.bsky.feed.post"])
+        );
+        let exported = app.clone().oneshot(read_request(repo_uri)).await.unwrap();
+        assert_eq!(exported.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(exported.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let (roots, blocks) = hyprstream_pds::car::parse_car_v1_atproto(&bytes).unwrap();
+        let snapshot = store.snapshot("did:web:pub.example.com").unwrap().unwrap();
+        assert_eq!(roots, vec![snapshot.commit.cid_atproto().unwrap()]);
+        for (cid, bytes) in &blocks {
+            assert_eq!(*cid, Cid::from_dag_cbor(bytes));
+        }
+        for record in snapshot.records.values() {
+            assert!(blocks
+                .iter()
+                .any(|(cid, bytes)| *cid == record.cid() && bytes == record.bytes()));
+        }
+        store
+            .insert_malformed_record_for_test(
+                "did:web:pub.example.com",
+                "app.bsky.feed.post",
+                "private-storage-context",
+            )
+            .unwrap();
+        for uri in [repo_uri, describe_uri, "/xrpc/com.atproto.repo.getRecord?repo=pub.example.com&collection=app.bsky.actor.profile&rkey=self"] {
+            let response = app.clone().oneshot(read_request(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(body_json(response).await, json!({"error":"InternalServerError","message":"public repository read failed"}));
+        }
+    }
+
+    #[tokio::test]
+    async fn router_durable_export_holds_permit_until_body_drop() {
+        let (_dir, _store, _gate, app, token) = build_write_input_fixture().await;
+        let created = app
+            .clone()
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let uri = "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com";
+        let mut responses = Vec::new();
+        for _ in 0..GET_REPO_CONCURRENCY {
+            let response = app.clone().oneshot(read_request(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            responses.push(response);
+        }
+        let mut pending =
+            tokio::spawn(async move { app.oneshot(read_request(uri)).await.unwrap() });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut pending)
+                .await
+                .is_err()
+        );
+        drop(responses.pop());
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn router_create_record_maps_input_and_conflicts_without_mutation() {
+        let (_dir, store, _gate, app, token) = build_write_input_fixture().await;
+        let mut invalid = write_input(7);
+        invalid["record"]["$type"] = json!("private.authorization.denied");
+        invalid["validate"] = json!(false); // Exercise the writer's typed input failure.
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &invalid, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await,
+            json!({
+                "error": "InvalidRequest", "message": "record or request parameters are invalid"
+            })
+        );
+        assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+
+        let response = app
+            .clone()
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let original = body_json(response).await;
+        let head = store
+            .snapshot("did:web:pub.example.com")
+            .unwrap()
+            .unwrap()
+            .commit
+            .cid_atproto()
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Idempotency-Key", "another-request".parse().unwrap());
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &write_input(7), headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(response).await,
+            json!({
+                "error": "RecordAlreadyExists", "message": "record key already exists"
+            })
+        );
+        let mut stale = write_input(8);
+        stale["swapCommit"] = json!(hyprstream_pds::Cid::from_dag_cbor(b"stale").to_string());
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &stale, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(response).await,
+            json!({
+                "error": "InvalidSwap", "message": "swapCommit does not match the repository head"
+            })
+        );
+        let snapshot = store.snapshot("did:web:pub.example.com").unwrap().unwrap();
+        assert_eq!(snapshot.commit.cid_atproto().unwrap(), head);
+        assert_eq!(snapshot.records.len(), 1);
+        let response = app
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await, original);
+    }
+
+    #[tokio::test]
+    async fn router_create_record_authorization_errors_ignore_source_text() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        // Deliberately use words that formerly selected conflict or input status.
+        for detail in [
+            "private credential: CAS conflict",
+            "private credential: already exists",
+            "private credential",
+        ] {
+            *gate.1.lock() = Some(detail.to_owned());
+            let response = app
+                .clone()
+                .oneshot(write_http_request(
+                    &token,
+                    &write_input(7),
+                    HeaderMap::new(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                body_json(response).await,
+                json!({
+                    "error": "AuthRequired", "message": "public repository publication is not authorized"
+                })
+            );
+            assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+        }
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn router_create_record_internal_errors_are_sanitized() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        let private_key = "private-authorization-denied-CAS-conflict";
+        store
+            .insert_malformed_record_for_test(
+                "did:web:pub.example.com",
+                "app.bsky.feed.post",
+                private_key,
+            )
+            .unwrap();
+        let source = store
+            .snapshot("did:web:pub.example.com")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            source.contains(private_key),
+            "fixture must exercise sensitive internal context"
+        );
+        let response = app
+            .oneshot(write_http_request(
+                &token,
+                &write_input(7),
+                HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body_json(response).await,
+            json!({
+                "error": "InternalServerError", "message": "public repository operation failed"
+            })
+        );
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn router_create_record_rejects_malformed_optional_fields_without_writes() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        for field in ["swapCommit", "validate", "returnRecord"] {
+            let mut invalid = vec![Value::Null, json!(1), json!(""), json!([]), json!({})];
+            if field == "swapCommit" {
+                invalid.extend([json!(false), json!(true), json!("not-a-cid")]);
+            }
+            for value in invalid {
+                let mut input = write_input(7);
+                input[field] = value.clone();
+                let response = app
+                    .clone()
+                    .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{field}={value}"
+                );
+                assert_eq!(body_json(response).await["error"], errors::INVALID_REQUEST);
+                assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+                assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn router_create_record_rejects_invalid_idempotency_headers_without_writes() {
+        use axum::http::HeaderValue;
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        for value in [
+            HeaderValue::from_static(""),
+            HeaderValue::from_static(" "),
+            HeaderValue::from_static("bad/key"),
+            HeaderValue::from_static("first,second"),
+            HeaderValue::from_str(&"a".repeat(129)).unwrap(),
+            HeaderValue::from_bytes(&[0xff]).unwrap(),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("Idempotency-Key", value);
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&token, &write_input(7), headers))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(body_json(response).await["error"], errors::INVALID_REQUEST);
+            assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+            assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        let mut headers = HeaderMap::new();
+        headers.append("Idempotency-Key", HeaderValue::from_static("first"));
+        headers.append("Idempotency-Key", HeaderValue::from_static("second"));
+        let response = app
+            .oneshot(write_http_request(&token, &write_input(7), headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["error"], errors::INVALID_REQUEST);
+        assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn router_create_record_false_skips_schema_but_not_structural_checks() {
+        let (_dir, store, _gate, app, token) = build_write_input_fixture().await;
+        let mut input = write_input(7);
+        input["validate"] = json!(false);
+        input["returnRecord"] = json!(true);
+        input["record"].as_object_mut().unwrap().remove("text");
+        input["record"].as_object_mut().unwrap().remove("createdAt");
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["value"], input["record"]);
+        let head = store
+            .snapshot("did:web:pub.example.com")
+            .unwrap()
+            .unwrap()
+            .commit
+            .cid_atproto()
+            .unwrap();
+        input["record"]["unsupported"] = json!(1.5);
+        let response = app
+            .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let snapshot = store.snapshot("did:web:pub.example.com").unwrap().unwrap();
+        assert_eq!(snapshot.records.len(), 1);
+        assert_eq!(snapshot.commit.cid_atproto().unwrap(), head);
+    }
+
+    #[tokio::test]
+    async fn router_create_record_known_schemas_validate_omitted_and_true() {
+        for mode in [None, Some(true)] {
+            let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+            let blob = json!({"$type":"blob", "ref":{"$link":hyprstream_pds::Cid::from_raw(b"image").to_string()}, "mimeType":"image/png", "size":5});
+            let strong = json!({"uri":"at://did:plc:abc/app.bsky.feed.post/custom-key", "cid":hyprstream_pds::Cid::from_dag_cbor(b"record").to_string()});
+            let mut post = write_input(7);
+            post["record"]["text"] = json!("e\u{301}".repeat(300)); // 300 graphemes, 600 code points.
+            post["record"]["langs"] = json!(["en", "i-klingon", "qaa-Zzzz-419"]);
+            post["record"]["reply"] = json!({"root":strong.clone(), "parent":strong.clone()});
+            post["record"]["facets"] = json!([{"index":{"byteStart":0,"byteEnd":1}, "features":[
+                {"$type":"app.bsky.richtext.facet#mention", "did":"did:key:zExample"},
+                {"$type":"app.bsky.richtext.facet#link", "uri":"https://example.com/path"}
+            ]}]);
+            post["record"]["embed"] = json!({"$type":"app.bsky.embed.images","images":[{"image":blob.clone(),"alt":"image","aspectRatio":{"width":1,"height":1}}]});
+            let profile = json!({"repo":"did:web:pub.example.com", "collection":"app.bsky.actor.profile", "record":{
+                "$type":"app.bsky.actor.profile", "displayName":"Profile", "pronouns":"they/them", "website":"https://example.com", "avatar":blob, "pinnedPost":strong,
+                "createdAt":"1985-04-12T23:20:50.12345678912345Z"
+            }});
+            let mut invalid = Vec::new();
+            for field in ["text", "createdAt"] {
+                let mut missing = post.clone();
+                missing["record"].as_object_mut().unwrap().remove(field);
+                invalid.push(missing);
+                for bad in [Value::Null, json!(5), json!([])] {
+                    let mut bad_type = post.clone();
+                    bad_type["record"][field] = bad;
+                    invalid.push(bad_type);
+                }
+            }
+            for (pointer, bad) in [
+                ("/record/text", json!("x".repeat(301))),
+                (
+                    "/record/text",
+                    json!(format!("x{}", "\u{301}".repeat(1600))),
+                ),
+                ("/record/createdAt", json!("2026-02-30T00:00:00Z")),
+                ("/record/createdAt", json!("2026-01-01t00:00:00z")),
+                ("/record/createdAt", json!("2026-01-01T00:00:00-00:00")),
+                ("/record/langs", json!(["en_US"])),
+                ("/record/langs", json!(["en", "en", "en", "en"])),
+                ("/record/reply/root/cid", json!("private-not-a-cid")),
+                (
+                    "/record/reply/root/uri",
+                    json!("at://invalid/app.bsky.feed.post/key"),
+                ),
+                ("/record/facets/0/index/byteStart", json!(-1)),
+                ("/record/facets/0/features/0/did", json!("did::private")),
+                (
+                    "/record/facets/0/features/0/did",
+                    json!("did:key:zExample%"),
+                ),
+                (
+                    "/record/reply/root/uri",
+                    json!("at://did:key:zExample%/app.bsky.feed.post/key"),
+                ),
+                (
+                    "/record/facets/0/features/1/uri",
+                    json!("https://example.com/invalid space"),
+                ),
+                ("/record/embed/images/0/image/mimeType", json!("text/plain")),
+                ("/record/embed/images/0/image/size", json!(2000001)),
+                ("/record/embed/images/0/aspectRatio/width", json!(0)),
+            ] {
+                let mut bad_input = post.clone();
+                *bad_input.pointer_mut(pointer).unwrap() = bad;
+                invalid.push(bad_input);
+            }
+            for (field, bad) in [
+                ("displayName", json!("x".repeat(65))),
+                ("description", json!("x".repeat(257))),
+                ("pronouns", json!("x".repeat(21))),
+                ("avatar", Value::Null),
+                ("website", json!("relative/path")),
+                ("displayName", json!(false)),
+                ("pinnedPost", json!({})),
+                (
+                    "labels",
+                    json!({"$type":"com.atproto.label.defs#selfLabels","values":[{}]}),
+                ),
+            ] {
+                let mut bad_input = profile.clone();
+                bad_input["record"][field] = bad;
+                invalid.push(bad_input);
+            }
+            for mut input in invalid {
+                if let Some(mode) = mode {
+                    input["validate"] = json!(mode);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{input}");
+                assert_eq!(
+                    body_json(response).await,
+                    json!({"error":"InvalidRequest","message":"record does not match its known schema"})
+                );
+                assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+                assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+            }
+            for mut input in [post, profile] {
+                record_validation::validate(
+                    input["collection"].as_str().unwrap(),
+                    &input["record"],
+                )
+                .unwrap();
+                input["record"].as_object_mut().unwrap().remove("embed");
+                input["record"].as_object_mut().unwrap().remove("avatar");
+                if let Some(mode) = mode {
+                    input["validate"] = json!(mode);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{}",
+                    body_json(response).await
+                );
+            }
+            assert_eq!(
+                store
+                    .snapshot("did:web:pub.example.com")
+                    .unwrap()
+                    .unwrap()
+                    .records
+                    .len(),
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn router_explicit_tids_preserve_odd_low_bits_in_all_validation_modes() {
+        for mode in [None, Some(true), Some(false)] {
+            let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+            for rkey in ["3jzfcijpj2z2b", "2222222222223"] {
+                let mut input = write_input(7);
+                input["rkey"] = json!(rkey);
+                if let Some(mode) = mode {
+                    input["validate"] = json!(mode);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let created = body_json(response).await;
+                assert!(created["uri"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!("/{rkey}")));
+                let read = app.clone().oneshot(read_request(&format!("/xrpc/com.atproto.repo.getRecord?repo=pub.example.com&collection=app.bsky.feed.post&rkey={rkey}"))).await.unwrap();
+                assert_eq!(read.status(), StatusCode::OK);
+                assert_eq!(body_json(read).await["uri"], created["uri"]);
+            }
+            assert_eq!(
+                store
+                    .snapshot("did:web:pub.example.com")
+                    .unwrap()
+                    .unwrap()
+                    .records
+                    .len(),
+                2
+            );
+            assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn router_create_record_canonical_keys_and_unknown_collections() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        let noncanonical = "kjzfcijpj2z2a";
+        assert!(Tid::parse(noncanonical).is_err());
+        for mode in [None, Some(true), Some(false)] {
+            let mut input = write_input(7);
+            if let Some(mode) = mode {
+                input["validate"] = json!(mode);
+            }
+            let mut unknown = input.clone();
+            unknown["collection"] = json!("com.example.unknown");
+            unknown["record"]["$type"] = unknown["collection"].clone();
+            input["rkey"] = json!(noncanonical);
+            for invalid in [input, unknown] {
+                let response = app
+                    .clone()
+                    .oneshot(write_http_request(&token, &invalid, HeaderMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(body_json(response).await["error"], errors::INVALID_REQUEST);
+                assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+                assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+            }
+        }
+        let mut input = write_input(7);
+        input["record"]["embed"] = json!({"$type":"com.example.futureEmbed","extension":true});
+        input["record"]["extension"] = json!({"value":true});
+        let response = app
+            .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK); // Open unions and extra properties stay extensible.
+    }
+
+    #[tokio::test]
+    async fn router_create_record_profiles_use_self_for_explicit_and_omitted_keys() {
+        for omit_key in [false, true] {
+            let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+            let mut input = json!({
+                "repo": "did:web:pub.example.com",
+                "collection": "app.bsky.actor.profile",
+                "record": {"$type": "app.bsky.actor.profile", "displayName": "Profile"},
+                "validate": false
+            });
+            for invalid in [
+                Value::Null,
+                json!(false),
+                json!(1),
+                json!(""),
+                json!("other"),
+                json!(Tid::from_raw(7).encode()),
+            ] {
+                let mut malformed = input.clone();
+                malformed["rkey"] = invalid;
+                let response = app
+                    .clone()
+                    .oneshot(write_http_request(&token, &malformed, HeaderMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+                assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+            }
+            if !omit_key {
+                input["rkey"] = json!("self");
+            }
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let created = body_json(response).await;
+            assert_eq!(
+                created["uri"],
+                "at://did:web:pub.example.com/app.bsky.actor.profile/self"
+            );
+            let response = app
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_json(response).await, created);
+            let snapshot = store.snapshot("did:web:pub.example.com").unwrap().unwrap();
+            assert_eq!(snapshot.records.len(), 1);
+            assert!(snapshot.records.contains_key(&(
+                "app.bsky.actor.profile".into(),
+                AtprotoRecordKey::new("self").unwrap()
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn router_create_record_generates_post_keys_and_recovers_idempotent_results() {
+        let (_dir, store, gate, app, token) = build_write_input_fixture().await;
+        let mut input = write_input(7);
+        input.as_object_mut().unwrap().remove("rkey");
+        for invalid in [
+            Value::Null,
+            json!(false),
+            json!(1),
+            json!(""),
+            json!("self"),
+            json!("bad/key"),
+        ] {
+            let mut malformed = input.clone();
+            malformed["rkey"] = invalid;
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&token, &malformed, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(store.snapshot("did:web:pub.example.com").unwrap().is_none());
+            assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("Idempotency-Key", "generated-post".parse().unwrap());
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, headers.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = body_json(response).await;
+        let generated_key = created["uri"].as_str().unwrap().rsplit('/').next().unwrap();
+        assert!(Tid::parse(generated_key).is_ok());
+        let mut uris = std::collections::BTreeSet::new();
+        uris.insert(created["uri"].as_str().unwrap().to_owned());
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let created = body_json(response).await;
+            assert!(uris.insert(created["uri"].as_str().unwrap().to_owned()));
+        }
+        let latest = store
+            .snapshot("did:web:pub.example.com")
+            .unwrap()
+            .unwrap()
+            .commit
+            .cid_atproto()
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, headers.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await, created);
+        let mut explicit_retry = input.clone();
+        explicit_retry["rkey"] = json!(generated_key);
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &explicit_retry, headers.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        input["record"]["text"] = json!("changed content");
+        let response = app
+            .oneshot(write_http_request(&token, &input, headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let snapshot = store.snapshot("did:web:pub.example.com").unwrap().unwrap();
+        assert_eq!(snapshot.records.len(), 3);
+        assert_eq!(snapshot.commit.cid_atproto().unwrap(), latest);
     }
 
     // ── Finding 1: real capacity test through the mounted router ──────────────

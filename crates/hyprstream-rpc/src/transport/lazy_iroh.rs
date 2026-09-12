@@ -79,7 +79,10 @@ static IROH_CLIENT_ENDPOINT: OnceLock<iroh::Endpoint> = OnceLock::new();
 /// response-signing key, or authorization authority. The capability can only
 /// be obtained from
 /// [`crate::transport::iroh_substrate::IrohSubstrate::owned_client_endpoint`],
-/// which proves the endpoint was bound with the exact hybrid-only provider.
+/// which proves the endpoint was bound with the provider configured for N0
+/// interoperability. Owned Hyprstream ALPNs still require the hybrid group at
+/// the completed-carrier admission hook, while public relay/pkarr HTTPS needs
+/// the provider's X25519 fallback.
 ///
 /// Arbitrary already-bound endpoints are rejected by the type system:
 ///
