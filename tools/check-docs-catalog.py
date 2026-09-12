@@ -1005,8 +1005,13 @@ def self_test(repo: Path) -> None:
         expect_event_failure("schema provenance", repo, bad, corpus, schemas, consumers, "pull_request", pr_base)
         bad = copy.deepcopy(catalog); bad["source_commit"] = "f" * 40
         expect_event_failure("fabricated provenance commit", repo, bad, corpus, schemas, consumers, "pull_request", pr_base)
+    # A committed catalog may not self-reference; during staged authoring the
+    # transient HEAD-referencing pair is the sanctioned authoring state.
+    committed = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--quiet", "--",
+                                "docs/schema-catalog.json", "docs/corpus-sources.json"]).returncode == 0
     bad = copy.deepcopy(catalog); bad["source_commit"] = git(repo, "rev-parse", "HEAD"); bad["source_tree"] = git(repo, "rev-parse", "HEAD^{tree}")
-    expect_failure("stale base provenance commit", repo, bad, corpus, schemas, consumers)
+    if committed:
+        expect_failure("stale base provenance commit", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(corpus); bad["source_tree"] = "0" * 40
     expect_failure("corpus provenance", repo, catalog, bad, schemas, consumers)
     stale = git(repo, "rev-parse", "HEAD")
@@ -1269,15 +1274,16 @@ def self_test(repo: Path) -> None:
     squashed["source_commit"], squashed["source_tree"] = "f" * 40, "f" * 40
     validate(repo, squashed, corpus, schemas, consumers, event="push", revision=landing_boundary)
     # A landing commit cannot attest itself.
-    bad = copy.deepcopy(catalog)
-    bad["source_commit"] = git(repo, "rev-parse", "HEAD")
-    bad["source_tree"] = git(repo, "rev-parse", "HEAD^{tree}")
-    try:
-        validate(repo, bad, corpus, schemas, consumers, event="push", revision=landing_boundary)
-    except CatalogError:
-        pass
-    else:
-        raise AssertionError("mutation probe modeled landing push provenance unexpectedly passed")
+    if committed:
+        bad = copy.deepcopy(catalog)
+        bad["source_commit"] = git(repo, "rev-parse", "HEAD")
+        bad["source_tree"] = git(repo, "rev-parse", "HEAD^{tree}")
+        try:
+            validate(repo, bad, corpus, schemas, consumers, event="push", revision=landing_boundary)
+        except CatalogError:
+            pass
+        else:
+            raise AssertionError("mutation probe modeled landing push provenance unexpectedly passed")
     print("docs catalog mutation probes: passed (all expected failures plus modeled merge/squash/rebase main push)")
 
 
