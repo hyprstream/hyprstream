@@ -602,9 +602,32 @@ def capnp_only_inputs(build_file: str, source: str) -> list[str]:
         if base is None or base.startswith("format:"):
             return None
         return base + "/" + joined
+    # Resolve `use capnpc::CompilerCommand` (optionally aliased, plain or grouped)
+    # exactly as the persisted-CGR extractor resolves compile_schemas imports.
+    constructors: set[str] = set()
+    for match in re.finditer(r"\buse\s+capnpc\s*::\s*CompilerCommand(?:\s+as\s+([A-Za-z_]\w*))?\s*;", code):
+        constructors.add(match.group(1) or "CompilerCommand")
+    for group in re.finditer(r"\buse\s+capnpc\s*::\s*\{", code):
+        start = index = group.end(); depth = 1
+        while index < len(code) and depth:
+            depth += (code[index] == "{") - (code[index] == "}"); index += 1
+        required(depth == 0, f"{build_file} has unterminated capnpc grouped import")
+        for found in re.finditer(r"(?:^|[,{]\s*)CompilerCommand(?:\s+as\s+([A-Za-z_]\w*))?\s*(?=,|})", code[start:index - 1]):
+            constructors.add(found.group(1) or "CompilerCommand")
+    for name in constructors:
+        required(not re.search(rf"\blet\s+(?:mut\s+)?{re.escape(name)}\b|\b{re.escape(name)}\s*=", code),
+                 f"{build_file} shadows the imported CompilerCommand alias {name}")
+    patterns = [r"capnpc\s*::\s*CompilerCommand\s*::\s*new\s*\(\s*\)"]
+    patterns += [rf"(?<![:\w]){re.escape(name)}\s*::\s*new\s*\(\s*\)" for name in sorted(constructors)]
+    recognized = re.compile("|".join(f"(?:{pattern})" for pattern in patterns))
+    constructor = re.compile(r"(?:capnpc\s*::\s*|(?<![:\w]))CompilerCommand\s*::\s*new\s*\(")
     inputs: list[str] = []
-    for match in re.finditer(r'\bcapnpc\s*::\s*CompilerCommand\s*::\s*new\s*\(\s*\)(?:(?!;).)*?;', code, re.DOTALL):
-        calls = list(re.finditer(r'\.file\s*\(\s*', code[match.start():match.end()]))
+    statement_starts: set[int] = set()
+    for match in recognized.finditer(code):
+        statement_starts.add(match.start())
+        end = code.find(";", match.end())
+        required(end >= 0, f"{build_file} has unterminated capnp-only compiler command")
+        calls = list(re.finditer(r'\.file\s*\(\s*', code[match.start():end]))
         required(calls, f"{build_file} capnp-only compiler command lacks an input")
         for call in calls:
             at = match.start() + call.end()
@@ -624,6 +647,9 @@ def capnp_only_inputs(build_file: str, source: str) -> list[str]:
                 required(re.match(r'\s*[,)]', source[end:]) is not None,
                          f"{build_file} capnp-only compiler input is unparseable")
             inputs.append(os.path.normpath(raw.replace("{manifest}", build_dir)).replace("\\", "/"))
+    for stray in constructor.finditer(code):
+        required(stray.start() in statement_starts,
+                 f"{build_file} has an unrecognized or ambiguous CompilerCommand constructor")
     return inputs
 
 
@@ -1080,6 +1106,12 @@ def self_test(repo: Path) -> None:
     )
     expect_failure("chained capnpc supplies uncompiled schema", repo, copy.deepcopy(catalog), corpus,
                    schemas, consumers, {discovery_build: chained_drift})
+    aliased_drift = text(repo, discovery_build, None).replace(
+        "\n}",
+        '\n}\n\nuse capnpc::CompilerCommand as CapnpCmd;\n\nfn extra() {\n    CapnpCmd::new().file("../hyprstream-pay/schema/settlement.capnp").run().expect("aliased");\n}', 1
+    )
+    expect_failure("imported capnpc compiles uncompiled schema", repo, copy.deepcopy(catalog), corpus,
+                   schemas, consumers, {discovery_build: aliased_drift})
     shadowed = text(repo, discovery_build, None).replace(
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");\n    let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-workers/schema");',
@@ -1178,20 +1210,28 @@ def self_test(repo: Path) -> None:
     top_level = "docs/KV-CACHE-ARCHITECTURE.md"
     changed_top_level = text(repo, top_level, None) + "\nprovenance mutation\n"
     expect_failure("top-level corpus provenance", repo, catalog, corpus, schemas, consumers, {top_level: changed_top_level}, False)
-    # Model a hosted push boundary with objects reachable from this checkout.
-    push_commit = git(repo, "rev-parse", "HEAD~1")
-    push_catalog, push_corpus = copy.deepcopy(catalog), copy.deepcopy(corpus)
-    for record in (push_catalog, push_corpus):
-        record["source_commit"] = push_commit
-        record["source_tree"] = git(repo, "rev-parse", f"{push_commit}^{{tree}}")
-    validate(repo, push_catalog, push_corpus, schemas, consumers, event="push", revision=push_commit)
-    bad = copy.deepcopy(push_catalog); bad["source_commit"] = stale; bad["source_tree"] = git(repo, "rev-parse", f"{stale}^{{tree}}")
+    # Model a real landing push: the pushed head carries every attested path at
+    # the declared digest while the pre-feature boundary (the merge-base, whose
+    # tree predates this PR's new docs files) supplies only ancestry. The
+    # declared pair — not the boundary tree — carries the attestation, so the
+    # landing validates even though the boundary omits attested paths.
+    landing_boundary = pr_base if has_pr_boundary else git(repo, "rev-parse", "HEAD~1")
+    validate(repo, catalog, corpus, schemas, consumers, event="push", revision=landing_boundary)
+    # A squash landing discards the branch's commits: the declared pair no
+    # longer exists and only the durable digest attestation remains.
+    squashed = copy.deepcopy(catalog)
+    squashed["source_commit"], squashed["source_tree"] = "f" * 40, "f" * 40
+    validate(repo, squashed, corpus, schemas, consumers, event="push", revision=landing_boundary)
+    # A landing commit cannot attest itself.
+    bad = copy.deepcopy(catalog)
+    bad["source_commit"] = git(repo, "rev-parse", "HEAD")
+    bad["source_tree"] = git(repo, "rev-parse", "HEAD^{tree}")
     try:
-        validate(repo, bad, push_corpus, schemas, consumers, event="push", revision=push_commit)
+        validate(repo, bad, corpus, schemas, consumers, event="push", revision=landing_boundary)
     except CatalogError:
         pass
     else:
-        raise AssertionError("mutation probe modeled main push provenance unexpectedly passed")
+        raise AssertionError("mutation probe modeled landing push provenance unexpectedly passed")
     print("docs catalog mutation probes: passed (all expected failures plus modeled merge/squash/rebase main push)")
 
 
