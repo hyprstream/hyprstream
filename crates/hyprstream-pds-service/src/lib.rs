@@ -536,6 +536,58 @@ impl AccountRecordStore {
         Ok(Some(signature.to_bytes().to_vec()))
     }
 
+    /// Read the public `#atproto` verification key for one authority-owned
+    /// hosted DID without exposing its private signing material. The same
+    /// bounded index, exact account-record checks, and fixed OAuth authority
+    /// used by [`Self::sign_for_hosted_did`] are applied.
+    pub async fn verifying_key_for_hosted_did(
+        &self,
+        authority: &Subject,
+        did: &str,
+    ) -> Result<Option<p256::ecdsa::VerifyingKey>, AccountReadError> {
+        let resolved = self.resolve_tenant_for_hosted_did(authority, did).await?;
+        let Some(tenant) = resolved else {
+            return Ok(None);
+        };
+        let Some(label) = hosted_account_label(did)? else {
+            return Ok(None);
+        };
+        let record_components = [
+            tenant.as_str(),
+            PDS_ACCOUNTS_DIRECTORY,
+            label,
+            PDS_ACCOUNT_RECORD_FILE,
+        ];
+        let record_bytes = read_file(
+            self.pds_mount.as_ref(),
+            self.read_authorizer.as_ref(),
+            &record_components,
+            authority,
+            Some(tenant.as_str()),
+            None,
+            self.max_record_bytes,
+        )
+        .await?;
+        let record =
+            AccountRecord::from_dag_cbor(&record_bytes).map_err(AccountReadError::InvalidRecord)?;
+        if record.name().label() != label {
+            return Err(AccountReadError::RecordLabelMismatch {
+                requested: label.to_owned(),
+                stored: record.name().label().to_owned(),
+            });
+        }
+        if record.name().did() != did {
+            return Err(AccountReadError::RecordDidMismatch {
+                requested: did.to_owned(),
+                stored: record.name().did().to_owned(),
+            });
+        }
+        record
+            .atproto_verifying_key()
+            .map(Some)
+            .map_err(AccountReadError::InvalidRecord)
+    }
+
     #[cfg(test)]
     fn with_max_record_bytes(mut self, max_record_bytes: usize) -> Self {
         self.max_record_bytes = max_record_bytes;

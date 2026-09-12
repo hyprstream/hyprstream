@@ -1114,9 +1114,6 @@ pub async fn create_record(
     if body.len() > MAX_BODY_BYTES {
         return xrpc_error(StatusCode::PAYLOAD_TOO_LARGE, errors::INVALID_REQUEST, "record body exceeds 1 MiB");
     }
-    let Some(writer) = state.public_repo_writer.as_ref() else {
-        return xrpc_error(StatusCode::SERVICE_UNAVAILABLE, errors::INTERNAL_SERVER_ERROR, "public repository writer is not configured");
-    };
     let Some(token) = user.token.as_deref() else {
         return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "verified OAuth access token is required");
     };
@@ -1142,8 +1139,10 @@ pub async fn create_record(
         Some(repo) if !repo.is_empty() => repo,
         _ => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, "repo is required"),
     };
-    if repo != writer.did() {
-        return xrpc_error(StatusCode::FORBIDDEN, "AuthRequired", "the request repo is not owned by this writer");
+    if let Some(writer) = state.public_repo_writer.as_ref() {
+        if repo != writer.did() {
+            return xrpc_error(StatusCode::FORBIDDEN, "AuthRequired", "the request repo is not owned by this writer");
+        }
     }
     let collection = match object.get("collection").and_then(Value::as_str) {
         Some(collection) if matches!(collection, "app.bsky.feed.post" | "app.bsky.actor.profile") => collection,
@@ -1169,18 +1168,26 @@ pub async fn create_record(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("create-{}-{}", collection.replace('.', "_"), rkey.encode()));
     let expected_prev = object.get("swapCommit").and_then(Value::as_str);
-    let result = writer.create_record_with_expected_prev_text(
-        crate::services::public_repo::PublicCreateRequest {
-            request_id,
-            principal: user.user,
-            did: repo.to_owned(),
-            collection: collection.to_owned(),
-            rkey: rkey.into(),
-            value: record,
-            expected_prev: None,
-        },
-        expected_prev,
-    );
+    let request = crate::services::public_repo::PublicCreateRequest {
+        request_id,
+        principal: user.user,
+        did: repo.to_owned(),
+        collection: collection.to_owned(),
+        rkey: rkey.into(),
+        value: record,
+        expected_prev: None,
+    };
+    let result = if let Some(writer) = state.hosted_public_repo_writer.as_ref() {
+        writer.create_record(request, expected_prev).await
+    } else if let Some(writer) = state.public_repo_writer.as_ref() {
+        writer.create_record_with_expected_prev_text(request, expected_prev)
+    } else {
+        return xrpc_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            errors::INTERNAL_SERVER_ERROR,
+            "public repository writer is not configured",
+        );
+    };
     let result = match result {
         Ok(result) => result,
         Err(error) if error.to_string().contains("authorization") || error.to_string().contains("denied") => return xrpc_error(StatusCode::FORBIDDEN, "AuthRequired", error.to_string()),

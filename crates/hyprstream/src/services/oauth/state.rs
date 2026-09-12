@@ -1168,6 +1168,10 @@ pub struct OAuthState {
     /// Optional native-authorized public repository writer. No public write
     /// routes are mounted while this is absent.
     pub public_repo_writer: Option<Arc<crate::services::public_repo::PublicRepoWriter>>,
+    /// Production hosted-account writer. It resolves the requested DID and
+    /// signs through AccountRecordStore without exposing private key bytes.
+    pub hosted_public_repo_writer:
+        Option<Arc<crate::services::public_repo::HostedAccountPublicRepoWriter>>,
     /// Optional native account resolver for the protected standard
     /// `com.atproto.server.getSession` route. No session route is mounted
     /// while this is absent.
@@ -1366,6 +1370,7 @@ impl OAuthState {
             sessions: super::session::SessionStore::default(),
             xrpc_repos: Arc::new(super::xrpc::XrpcRepoStore::new()),
             public_repo_writer: None,
+            hosted_public_repo_writer: None,
             atproto_session_resolver: None,
             xrpc_read_slice: config.xrpc_read_slice,
             deployment_well_known_dir: config.deployment_well_known_dir.clone(),
@@ -1443,6 +1448,17 @@ impl OAuthState {
         writer: Arc<crate::services::public_repo::PublicRepoWriter>,
     ) -> Self {
         self.public_repo_writer = Some(writer);
+        self
+    }
+
+    /// Install the production hosted-account writer. This remains explicit at
+    /// composition time and stays absent when the account authority or public
+    /// repository root is not configured.
+    pub fn with_hosted_public_repo_writer(
+        mut self,
+        writer: Arc<crate::services::public_repo::HostedAccountPublicRepoWriter>,
+    ) -> Self {
+        self.hosted_public_repo_writer = Some(writer);
         self
     }
 

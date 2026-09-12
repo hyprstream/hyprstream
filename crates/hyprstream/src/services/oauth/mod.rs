@@ -242,7 +242,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(userinfo::userinfo).post(userinfo::userinfo),
         )
         .merge(authority_router)
-        .merge(if state.public_repo_writer.is_some() {
+        .merge(if state.public_repo_writer.is_some() || state.hosted_public_repo_writer.is_some() {
             xrpc::xrpc_write_routes()
         } else {
             Router::new()
@@ -1110,6 +1110,39 @@ impl Spawnable for OAuthService {
                     zone.clone(),
                 ));
                 oauth_state = oauth_state.with_atproto_session_resolver(resolver);
+            }
+            if self.config.xrpc_read_slice {
+                if let (Some(store), Some(root)) = (&hosted_account_store, &self.pds_root) {
+                    let public_root = root.join("public-repositories");
+                    match crate::services::public_repo::PublicRepoStore::open(&public_root) {
+                        Ok(public_store) => {
+                            let writer = Arc::new(
+                                crate::services::public_repo::HostedAccountPublicRepoWriter::new(
+                                    Arc::new(public_store),
+                                    Arc::clone(store),
+                                    hyprstream_rpc::Subject::new(
+                                        hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                                    ),
+                                    Arc::new(
+                                        crate::services::public_repo::HostedAccountSelfAuthorizer,
+                                    ),
+                                ),
+                            );
+                            oauth_state = oauth_state.with_hosted_public_repo_writer(writer);
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                path = %public_root.display(),
+                                "public repository writer remains disabled because its durable store could not open"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "ATProto public writes remain disabled: hosted account store and PDS root are both required"
+                    );
+                }
             }
             oauth_state = oauth_state.with_user_store(user_store);
             if let Some(ds) = device_store_opt {
@@ -2264,25 +2297,6 @@ mod tests {
             }
         }
 
-        struct DirectSelfPublicationAuthorizer;
-
-        impl crate::services::public_repo::PublicPublicationAuthorizer
-            for DirectSelfPublicationAuthorizer
-        {
-            fn authorize(&self, principal: &str, account: &str, collection: &str) -> anyhow::Result<()> {
-                anyhow::ensure!(principal == account, "direct-self principal/account mismatch");
-                anyhow::ensure!(
-                    matches!(collection, "app.bsky.feed.post" | "app.bsky.actor.profile"),
-                    "collection is outside the direct-self slice"
-                );
-                Ok(())
-            }
-
-            fn authorize_key_promotion(&self, _principal: &str, _account: &str) -> anyhow::Result<()> {
-                anyhow::bail!("key promotion is outside the direct-self conformance slice")
-            }
-        }
-
         const PKCE_VERIFIER: &str = "r5-handler-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
         const GENERIC_PKCE_VERIFIER: &str =
             "r7-generic-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
@@ -2468,12 +2482,6 @@ mod tests {
         let public_repo_store = Arc::new(crate::services::public_repo::PublicRepoStore::open(
             public_repo_dir.path(),
         )?);
-        let public_repo_writer = Arc::new(crate::services::public_repo::PublicRepoWriter::new(
-            Arc::clone(&public_repo_store),
-            MAPPED_DID,
-            atproto_signing_key.clone(),
-            Arc::new(DirectSelfPublicationAuthorizer),
-        )?);
         let pds_root = SyntheticNode::dir().with_child(
             HOSTED_TENANT,
             SyntheticNode::dir().with_child(
@@ -2501,6 +2509,16 @@ mod tests {
                 hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
             ))
             .await?;
+        let hosted_public_repo_writer = Arc::new(
+            crate::services::public_repo::HostedAccountPublicRepoWriter::new(
+                Arc::clone(&public_repo_store),
+                Arc::clone(&hosted_account_store),
+                hyprstream_rpc::Subject::new(
+                    hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                ),
+                Arc::new(crate::services::public_repo::HostedAccountSelfAuthorizer),
+            ),
+        );
         let account_zone = crate::account::AccountZone::new("acct.example.com")?;
         let resolver_user_store: Arc<dyn UserStore> = user_store.clone();
         let resolver_account_store = Arc::clone(&hosted_account_store);
@@ -2523,7 +2541,7 @@ mod tests {
             atproto_document,
         )))
         .with_atproto_session_resolver(native_session_resolver)
-        .with_public_repo_writer(public_repo_writer)
+        .with_hosted_public_repo_writer(hosted_public_repo_writer)
         .with_hosted_account_zone(account_zone);
         let token_dir = tempfile::TempDir::new()?;
         oauth_state.with_token_store_impl(Arc::new(RocksDbTokenStore::open(
