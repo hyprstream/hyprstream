@@ -746,17 +746,43 @@ async fn resolve_handle_did(
     None
 }
 
+// The configured zone is authoritative for hosted handles. Do not synthesize
+// identities from arbitrary DNS names or from the independent snapshot cache.
+fn hosted_repo_did(state: &OAuthState, repo: &str) -> Option<String> {
+    state.hosted_public_repo_writer.as_ref()?;
+    let zone = state.hosted_account_zone.as_ref()?;
+    let did = if repo.starts_with("did:") {
+        repo.to_owned()
+    } else {
+        format!("did:web:{repo}")
+    };
+    super::atproto_session::hosted_label_for_did(zone, &did)
+        .ok()
+        .flatten()?;
+    Some(did)
+}
+
 async fn owned_public_writer(
     state: &OAuthState,
     repo: &str,
-) -> Option<Arc<crate::services::public_repo::PublicRepoWriter>> {
+) -> Option<crate::services::public_repo::PublicRepoReader> {
+    use crate::services::public_repo::PublicRepoReader;
+    if let (Some(did), Some(writer)) = (
+        hosted_repo_did(state, repo),
+        &state.hosted_public_repo_writer,
+    ) {
+        return Some(PublicRepoReader::Hosted {
+            writer: Arc::clone(writer),
+            did,
+        });
+    }
     let writer = state.public_repo_writer.as_ref()?;
     let did = if repo.starts_with("did:") {
         repo.to_owned()
     } else {
         resolve_handle_did(&state.xrpc_repos, &state.issuer_url, repo).await?
     };
-    (did == writer.did()).then(|| Arc::clone(writer))
+    (did == writer.did()).then(|| PublicRepoReader::Local(Arc::clone(writer)))
 }
 
 async fn resolve_handle_core(store: &XrpcRepoStore, issuer_url: &str, handle: &str) -> Response {
@@ -903,29 +929,100 @@ pub async fn get_session(
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Response {
     let Some(token) = user.token.as_deref() else {
-        return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "verified OAuth access token is required");
+        return xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            errors::INVALID_REQUEST,
+            "verified OAuth access token is required",
+        );
     };
     let claims = match auth::validate_oauth_access_token(&state, token).await {
         Ok(claims) => claims,
-        Err(_) => return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "OAuth access token is invalid or expired"),
+        Err(_) => {
+            return xrpc_error(
+                StatusCode::UNAUTHORIZED,
+                errors::INVALID_REQUEST,
+                "OAuth access token is invalid or expired",
+            )
+        }
     };
-    if !claims.has_scope("atproto") { return xrpc_error(StatusCode::FORBIDDEN, "InsufficientScope", "the atproto scope is required"); }
-    if claims.sub != user.user || claims.tenant != user.verified_tenant { return xrpc_error(StatusCode::UNAUTHORIZED, errors::INVALID_REQUEST, "OAuth identity binding is invalid"); }
-    let Some(resolver) = state.atproto_session_resolver.as_ref() else { return xrpc_error(StatusCode::SERVICE_UNAVAILABLE, errors::INTERNAL_SERVER_ERROR, "native ATProto session resolver is not configured"); };
+    if !claims.has_scope("atproto") {
+        return xrpc_error(
+            StatusCode::FORBIDDEN,
+            "InsufficientScope",
+            "the atproto scope is required",
+        );
+    }
+    if claims.sub != user.user || claims.tenant != user.verified_tenant {
+        return xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            errors::INVALID_REQUEST,
+            "OAuth identity binding is invalid",
+        );
+    }
+    let Some(resolver) = state.atproto_session_resolver.as_ref() else {
+        return xrpc_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            errors::INTERNAL_SERVER_ERROR,
+            "native ATProto session resolver is not configured",
+        );
+    };
     let info = match resolver.resolve_session(&claims.sub).await {
         Ok(Some(info)) => info,
-        Ok(None) => return xrpc_error(StatusCode::BAD_REQUEST, errors::ACCOUNT_NOT_FOUND, "account is not hosted by this PDS"),
-        Err(error) => { tracing::error!(%error, did = %claims.sub, "ATProto session resolver failed"); return xrpc_error(StatusCode::SERVICE_UNAVAILABLE, errors::INTERNAL_SERVER_ERROR, "native account state is unavailable"); }
+        Ok(None) => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::ACCOUNT_NOT_FOUND,
+                "account is not hosted by this PDS",
+            )
+        }
+        Err(error) => {
+            tracing::error!(%error, did = %claims.sub, "ATProto session resolver failed");
+            return xrpc_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                errors::INTERNAL_SERVER_ERROR,
+                "native account state is unavailable",
+            );
+        }
     };
-    if info.handle.is_empty() || info.handle.chars().any(char::is_whitespace) { return xrpc_error(StatusCode::INTERNAL_SERVER_ERROR, errors::INTERNAL_SERVER_ERROR, "native account returned an invalid handle"); }
-    if let Some(status) = info.status.as_deref() { if !matches!(status, "takendown" | "suspended" | "deactivated") { return xrpc_error(StatusCode::INTERNAL_SERVER_ERROR, errors::INTERNAL_SERVER_ERROR, "native account returned an invalid status"); } }
+    if info.handle.is_empty() || info.handle.chars().any(char::is_whitespace) {
+        return xrpc_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            errors::INTERNAL_SERVER_ERROR,
+            "native account returned an invalid handle",
+        );
+    }
+    if let Some(status) = info.status.as_deref() {
+        if !matches!(status, "takendown" | "suspended" | "deactivated") {
+            return xrpc_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                errors::INTERNAL_SERVER_ERROR,
+                "native account returned an invalid status",
+            );
+        }
+    }
     let mut body = json!({"handle": info.handle, "did": claims.sub, "active": info.active});
-    let Some(object) = body.as_object_mut() else { return xrpc_error(StatusCode::INTERNAL_SERVER_ERROR, errors::INTERNAL_SERVER_ERROR, "session response construction failed"); };
-    if let Some(value) = info.did_doc { object.insert("didDoc".to_owned(), value); }
-    if let Some(value) = info.email { object.insert("email".to_owned(), Value::String(value)); }
-    if let Some(value) = info.email_confirmed { object.insert("emailConfirmed".to_owned(), Value::Bool(value)); }
-    if let Some(value) = info.email_auth_factor { object.insert("emailAuthFactor".to_owned(), Value::Bool(value)); }
-    if let Some(value) = info.status { object.insert("status".to_owned(), Value::String(value)); }
+    let Some(object) = body.as_object_mut() else {
+        return xrpc_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            errors::INTERNAL_SERVER_ERROR,
+            "session response construction failed",
+        );
+    };
+    if let Some(value) = info.did_doc {
+        object.insert("didDoc".to_owned(), value);
+    }
+    if let Some(value) = info.email {
+        object.insert("email".to_owned(), Value::String(value));
+    }
+    if let Some(value) = info.email_confirmed {
+        object.insert("emailConfirmed".to_owned(), Value::Bool(value));
+    }
+    if let Some(value) = info.email_auth_factor {
+        object.insert("emailAuthFactor".to_owned(), Value::Bool(value));
+    }
+    if let Some(value) = info.status {
+        object.insert("status".to_owned(), Value::String(value));
+    }
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
@@ -944,6 +1041,31 @@ pub async fn resolve_handle(
             );
         }
     };
+    if let (Some(did), Some(writer)) = (
+        hosted_repo_did(&state, handle),
+        &state.hosted_public_repo_writer,
+    ) {
+        let Ok(_permit) = state.xrpc_repos.acquire_snapshot_work_owned().await else {
+            return xrpc_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                errors::INTERNAL_SERVER_ERROR,
+                "public identity lookup unavailable",
+            );
+        };
+        return match writer.has_account(&did).await {
+            Ok(true) => axum::Json(json!({"did":did})).into_response(),
+            Ok(false) => xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::HANDLE_NOT_FOUND,
+                "hosted handle not found",
+            ),
+            Err(_) => xrpc_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                errors::INTERNAL_SERVER_ERROR,
+                "public identity lookup unavailable",
+            ),
+        };
+    }
     resolve_handle_core(&state.xrpc_repos, &state.issuer_url, handle).await
 }
 
@@ -1009,12 +1131,8 @@ pub async fn get_repo(State(state): State<Arc<OAuthState>>, RawQuery(raw): RawQu
     };
     // Reject since by PRESENCE (not just non-empty) — ?since= and ?since=x both 400.
     let since_present = params.contains_key("since");
-    if let Some(writer) = state
-        .public_repo_writer
-        .as_ref()
-        .filter(|writer| writer.did() == did)
-    {
-        return durable_reads::get_repo(&state.xrpc_repos, Arc::clone(writer), since_present).await;
+    if let Some(writer) = owned_public_writer(&state, did).await {
+        return durable_reads::get_repo(&state.xrpc_repos, writer, since_present).await;
     }
     get_repo_core(&state.xrpc_repos, did, since_present).await
 }
@@ -1174,7 +1292,9 @@ pub async fn create_record(
             )
         }
     };
-    let repo = if repo.starts_with("did:") {
+    let repo = if let Some(did) = hosted_repo_did(&state, repo) {
+        Some(did)
+    } else if repo.starts_with("did:") {
         Some(repo.to_owned())
     } else {
         resolve_handle_did(&state.xrpc_repos, &state.issuer_url, repo).await
@@ -1299,7 +1419,9 @@ pub async fn create_record(
     // Authorization remains inside the transaction before any store access.
     // Native locks, RocksDB, signing and sync writes must not occupy Tokio workers.
     let result = if let Some(writer) = state.hosted_public_repo_writer.as_ref() {
-        writer.create_record(request, expected_prev.as_deref()).await
+        writer
+            .create_record(request, expected_prev.as_deref())
+            .await
     } else {
         let Some(writer) = state.public_repo_writer.as_ref() else {
             return xrpc_error(
@@ -1313,7 +1435,9 @@ pub async fn create_record(
             writer.create_record_with_expected_prev_text(request, expected_prev.as_deref())
         })
         .await
-        .unwrap_or_else(|error| Err(crate::services::public_repo::PublicRepoWriteError::Internal(error.into())))
+        .unwrap_or_else(|error| {
+            Err(crate::services::public_repo::PublicRepoWriteError::Internal(error.into()))
+        })
     };
     use crate::services::public_repo::PublicRepoWriteError;
     let result = match result {
@@ -2073,6 +2197,180 @@ mod tests {
         let reads = state.xrpc_repos.clone();
         let app = build_production_app_from_state(state).await;
         (dir, store, gate, app, token, reads)
+    }
+
+    #[tokio::test]
+    async fn hosted_router_writes_reads_retries_and_fails_closed() {
+        use crate::services::public_repo::{hosted_tests, PublicRepoStore};
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let (accounts, native_reads) = hosted_tests::authority_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+        let mut state = build_test_state(true).await;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x19; 32]);
+        let writable = Arc::get_mut(&mut state).unwrap();
+        writable.verifying_key_bytes = signing_key.verifying_key().to_bytes();
+        writable.hosted_account_zone =
+            Some(crate::account::AccountZone::new("accounts.example.com").unwrap());
+        writable.hosted_public_repo_writer =
+            Some(Arc::new(hosted_tests::hosted(store.clone(), accounts)));
+        let issuer = state.atproto_issuer_url();
+        let now = chrono::Utc::now().timestamp();
+        let key = SigningKey::random(&mut OsRng);
+        let point = key.verifying_key().to_encoded_point(false);
+        let jkt = super::super::dpop::DpopKey::Es256 {
+            x: (*point.x().unwrap()).into(),
+            y: (*point.y().unwrap()).into(),
+        }
+        .jkt();
+        let nonce = state.issue_dpop_nonce().await;
+        state.mark_dpop_client_nonced(&jkt).await;
+        let claims =
+            hyprstream_rpc::auth::Claims::new(hosted_tests::DID.to_owned(), now, now + 3600)
+                .with_issuer(issuer.clone())
+                .with_audience(Some(issuer.clone()))
+                .with_tenant("tenant".to_owned())
+                .with_client_id("hosted-tests")
+                .with_scope(Some("atproto".to_owned()))
+                .with_cnf_jkt_thumbprint(jkt)
+                .with_jti();
+        let token = WriteAccess {
+            token: hyprstream_rpc::auth::jwt::encode(&claims, &signing_key),
+            claims,
+            key,
+            htu: format!("{issuer}/xrpc/com.atproto.repo.createRecord"),
+            nonce,
+        };
+        let snapshots = state.xrpc_repos.clone();
+        let app = build_production_app_from_state(state).await;
+        let mut input = write_input(1);
+        input["repo"] = json!("did:web:bob.accounts.example.com");
+        let response = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(native_reads.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(store
+            .snapshot("did:web:bob.accounts.example.com")
+            .unwrap()
+            .is_none());
+        input["repo"] = json!("alice.accounts.example.com");
+        let mut headers = HeaderMap::new();
+        headers.insert("Idempotency-Key", "first".parse().unwrap());
+        let first = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, headers.clone()))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = body_json(first).await;
+        let retry = app
+            .clone()
+            .oneshot(write_http_request(&token, &input, headers))
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(body_json(retry).await, first);
+        input["rkey"] = json!(Tid::from_raw(2).encode());
+        assert_eq!(
+            app.clone()
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        for repo in [hosted_tests::DID, "alice.accounts.example.com"] {
+            let uri = format!("/xrpc/com.atproto.repo.getRecord?repo={repo}&collection=app.bsky.feed.post&rkey={}", Tid::from_raw(1).encode());
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(&uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_json(response).await["cid"], first["cid"]);
+        }
+        let resolved = app.clone().oneshot(HttpRequest::builder().uri("/xrpc/com.atproto.identity.resolveHandle?handle=alice.accounts.example.com").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resolved.status(), StatusCode::OK);
+        assert_eq!(body_json(resolved).await["did"], hosted_tests::DID);
+        let description = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!(
+                        "/xrpc/com.atproto.repo.describeRepo?repo={}",
+                        hosted_tests::DID
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(description.status(), StatusCode::OK);
+        let description = body_json(description).await;
+        assert_eq!(description["handle"], "alice.accounts.example.com");
+        assert_eq!(description["did"], hosted_tests::DID);
+        let export = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!(
+                        "/xrpc/com.atproto.sync.getRepo?did={}",
+                        hosted_tests::DID
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(export.status(), StatusCode::OK);
+        assert!(!axum::body::to_bytes(export.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap()
+            .is_empty());
+        snapshots
+            .put(sample_snapshot(
+                hosted_tests::DID,
+                "alice.accounts.example.com",
+                true,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_snapshot_budget_fixture_for_test(hosted_tests::DID, 257, 1)
+            .unwrap();
+        for uri in [
+            format!(
+                "/xrpc/com.atproto.repo.describeRepo?repo={}",
+                hosted_tests::DID
+            ),
+            format!(
+                "/xrpc/com.atproto.repo.getRecord?repo={}&collection=app.bsky.feed.post&rkey={}",
+                hosted_tests::DID,
+                Tid::from_raw(1).encode()
+            ),
+            format!("/xrpc/com.atproto.sync.getRepo?did={}", hosted_tests::DID),
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
     }
 
     fn write_input(id: u64) -> Value {

@@ -52,7 +52,7 @@ impl NativeAtprotoSessionResolver {
     }
 }
 
-fn hosted_label_for_did(zone: &AccountZone, did: &str) -> Result<Option<String>> {
+pub(crate) fn hosted_label_for_did(zone: &AccountZone, did: &str) -> Result<Option<String>> {
     let Some(host) = did.strip_prefix("did:web:") else {
         return Ok(None);
     };

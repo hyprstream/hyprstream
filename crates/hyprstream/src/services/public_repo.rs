@@ -222,8 +222,13 @@ struct PublicationIntent {
 
 #[derive(Default)]
 struct AccountSigningState {
-    // Held through snapshot/rebuild/sign/persist and through promotion. All
-    // handles for exactly one DID share this guard and its active authority.
+    // Owned async admission spans hosted prepare/sign/finish. Cancellation
+    // releases it; the synchronous guard below still protects detached work.
+    external_write: Arc<tokio::sync::Mutex<()>>,
+    // Shared transaction guard for BOTH local and external authority modes,
+    // genesis initialization, snapshots, commit preparation/finalization and
+    // promotion. External signing releases it across the await and checks the
+    // exact prepared head again before commit. Always lock before external_key.
     active_key: Mutex<Option<p256::ecdsa::SigningKey>>,
     // External hosted-account authority. It is mutually exclusive with the
     // local key so local and keyless writers cannot silently share a DID.
@@ -236,6 +241,7 @@ pub enum PublicCreatePreparation {
 }
 
 pub struct PublicPendingCreate {
+    account: Arc<AccountSigningState>,
     request: PublicCreateRequest,
     record: AtprotoRecord,
     unsigned: UnsignedCommit,
@@ -251,6 +257,7 @@ impl PublicPendingCreate {
 }
 
 /// Native callers retain genesis-or-exact CAS; XRPC may omit its condition.
+#[derive(Clone)]
 enum PublicHeadCondition {
     Unconditional,
     Exact(Option<Cid>),
@@ -444,7 +451,10 @@ impl PublicRepoStore {
             .get_pinned(commit_key(did))
             .context("public repo commit read failed")?;
         let Some(bytes) = bytes else {
-            ensure!(records.is_empty(), "public repo has records but no signed commit");
+            ensure!(
+                records.is_empty(),
+                "public repo has records but no signed commit"
+            );
             return Ok(None);
         };
         ensure!(
@@ -479,27 +489,58 @@ impl PublicRepoStore {
         commit: Commit,
         verifying_key: &p256::ecdsa::VerifyingKey,
     ) -> Result<()> {
+        let account = {
+            let mut accounts = self.accounts.lock();
+            Arc::clone(accounts.entry(did.to_owned()).or_default())
+        };
+        let transaction = account.active_key.lock();
+        if let Some(local) = transaction.as_ref() {
+            ensure!(
+                local.verifying_key() == verifying_key,
+                "genesis differs from local authority"
+            );
+        }
+        if let Some(external) = account.external_key.lock().as_ref() {
+            ensure!(
+                external == verifying_key,
+                "genesis differs from external authority"
+            );
+        }
         validate_did(did)?;
-        ensure!(commit.did == did && commit.prev.is_none(), "public genesis identity is invalid");
+        ensure!(
+            commit.did == did && commit.prev.is_none(),
+            "public genesis identity is invalid"
+        );
         commit.verify_atproto(verifying_key)?;
         let empty = Node::empty();
         let (root, _) = empty.to_node_data_with_blocks_atproto()?;
-        ensure!(commit.data == root.cid_atproto()?, "public genesis root is not empty");
+        ensure!(
+            commit.data == root.cid_atproto()?,
+            "public genesis root is not empty"
+        );
         let bytes = commit.to_atproto_dag_cbor()?;
         let cid = commit.cid_atproto()?;
         if let Some(existing) = self.snapshot(did)? {
-            ensure!(existing.records.is_empty() && existing.commit.cid_atproto()? == cid,
-                "public repository already has a different genesis");
+            existing.commit.verify_atproto(verifying_key)?;
+            let archived = self.db.get(commit_block_key(did, &cid.to_string()))?;
+            ensure!(
+                archived.as_deref() == Some(bytes.as_slice()),
+                "public repository has no matching immutable genesis"
+            );
             return Ok(());
         }
-        ensure!(self.db.get(commit_key(did))?.is_none(),
-            "public repository has an unreadable head");
+        ensure!(
+            self.db.get(commit_key(did))?.is_none(),
+            "public repository has an unreadable head"
+        );
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(commit_block_key(did, &cid.to_string()), &bytes);
         batch.put(commit_key(did), bytes);
         let mut options = rocksdb::WriteOptions::default();
         options.set_sync(true);
-        self.db.write_opt(batch, &options).context("public repo genesis transaction failed")?;
+        self.db
+            .write_opt(batch, &options)
+            .context("public repo genesis transaction failed")?;
         Ok(())
     }
 
@@ -587,14 +628,17 @@ impl PublicRepoWriter {
         &self,
     ) -> Result<Option<(PublicRepoSnapshot, p256::ecdsa::VerifyingKey)>> {
         let state = self.account.active_key.lock();
-        let key = state
-            .as_ref()
-            .ok_or_else(|| anyhow!("public signing authority is unavailable"))?;
+        let key = if self.external {
+            self.account.external_key.lock().as_ref().copied()
+        } else {
+            state.as_ref().map(|key| *key.verifying_key())
+        }
+        .ok_or_else(|| anyhow!("public signing authority is unavailable"))?;
         let Some(snapshot) = self.store.snapshot(&self.did)? else {
             return Ok(None);
         };
-        snapshot.commit.verify_atproto(key.verifying_key())?;
-        Ok(Some((snapshot, *key.verifying_key())))
+        snapshot.commit.verify_atproto(&key)?;
+        Ok(Some((snapshot, key)))
     }
 
     /// Bind a trusted account key to this store. All writer handles for the
@@ -612,11 +656,11 @@ impl PublicRepoWriter {
             Arc::clone(accounts.entry(did.clone()).or_default())
         };
         {
+            let mut state = account.active_key.lock();
             ensure!(
                 account.external_key.lock().is_none(),
                 "repo already has an external signing authority"
             );
-            let mut state = account.active_key.lock();
             if let Some(active) = state.as_ref() {
                 ensure!(
                     active.verifying_key() == signing_key.verifying_key(),
@@ -658,10 +702,16 @@ impl PublicRepoWriter {
         };
         {
             let local = account.active_key.lock();
-            ensure!(local.is_none(), "repo already has a local signing authority");
+            ensure!(
+                local.is_none(),
+                "repo already has a local signing authority"
+            );
             let mut external = account.external_key.lock();
             if let Some(active) = external.as_ref() {
-                ensure!(*active == verifying_key, "repo verifying key differs from active authority");
+                ensure!(
+                    *active == verifying_key,
+                    "repo verifying key differs from active authority"
+                );
             } else if let Some(repo) = store.snapshot(&did)? {
                 repo.commit
                     .verify_atproto(&verifying_key)
@@ -700,17 +750,30 @@ impl PublicRepoWriter {
 
     pub fn prepare_external_record_with_expected_prev_text(
         &self,
-        mut request: PublicCreateRequest,
+        request: PublicCreateRequest,
         expected_prev: Option<&str>,
     ) -> Result<PublicCreatePreparation, PublicRepoWriteError> {
-        if !self.external { return Err(PublicRepoWriteError::InvalidRequest(anyhow!("external preparation requires an external writer"))); }
+        if !self.external {
+            return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                "external preparation requires an external writer"
+            )));
+        }
         let condition = match expected_prev {
             None => PublicHeadCondition::Unconditional,
             Some(value) => PublicHeadCondition::Exact(Some(
-                parse_atproto_json_cid(value)
-                    .map_err(PublicRepoWriteError::InvalidRequest)?,
+                parse_atproto_json_cid(value).map_err(PublicRepoWriteError::InvalidRequest)?,
             )),
         };
+        let _transaction = self.account.active_key.lock();
+        self.prepare_external_record_locked(request, condition, None)
+    }
+
+    fn prepare_external_record_locked(
+        &self,
+        request: PublicCreateRequest,
+        condition: PublicHeadCondition,
+        proposed_rkey: Option<AtprotoRecordKey>,
+    ) -> Result<PublicCreatePreparation, PublicRepoWriteError> {
         if request.did != self.did {
             return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
                 "public request account does not match writer"
@@ -722,50 +785,174 @@ impl PublicRepoWriter {
             .authorize(&request.principal, &self.did, &request.collection)
             .map_err(PublicRepoWriteError::Authorization)?;
         reject_unverified_blobs(&request.value).map_err(PublicRepoWriteError::InvalidRequest)?;
-        let verifying_key = self.active_verifying_key().map_err(PublicRepoWriteError::Internal)?;
+        let verifying_key = self
+            .active_verifying_key()
+            .map_err(PublicRepoWriteError::Internal)?;
         let state = self.account.external_key.lock();
-        if state.as_ref() != Some(&verifying_key) { return Err(PublicRepoWriteError::Internal(anyhow!("external signing authority changed"))); }
-        if let Some(intent) = self.store.intent(&self.did, &request.request_id).map_err(PublicRepoWriteError::Internal)? {
-            let rkey = request.rkey.clone().or_else(|| AtprotoRecordKey::new(intent.rkey.clone()).ok());
-            let Some(rkey) = rkey else { return Err(PublicRepoWriteError::InvalidRequest(anyhow!("stored record key is invalid"))); };
-            let record = AtprotoRecord::new(request.collection.clone(), &rkey, request.value.clone())
-                .map_err(PublicRepoWriteError::InvalidRequest)?;
-            if intent.head_condition.as_deref() != Some(&condition.identity()) { return Err(PublicRepoWriteError::InvalidRequest(anyhow!("publication request condition changed"))); }
-            if intent.cid != record.cid().to_string() || intent.did != self.did || intent.collection != record.collection() || intent.rkey != record.rkey().as_str() { return Err(PublicRepoWriteError::InvalidRequest(anyhow!("publication request id was reused with different content"))); }
-            let snapshot = self.store.snapshot(&self.did).map_err(PublicRepoWriteError::Internal)?.ok_or_else(|| anyhow!("publication intent exists without a repository"))?;
-            if !snapshot.records.get(&(record.collection().to_owned(), record.rkey().clone())).is_some_and(|stored| stored.bytes() == record.bytes()) { return Err(PublicRepoWriteError::InvalidRequest(anyhow!("publication intent record does not match repository"))); }
-            let bytes = self.store.db.get(commit_block_key(&self.did, &intent.commit_cid)).map_err(|error| PublicRepoWriteError::Internal(error.into()))?.ok_or_else(|| anyhow!("publication intent commit block is missing"))?;
-            let commit = Commit::from_atproto_dag_cbor(&bytes).map_err(PublicRepoWriteError::Internal)?;
-            let commit_cid = commit.cid_atproto().map_err(PublicRepoWriteError::Internal)?;
-            if commit.did != self.did || intent.commit_cid != commit_cid.to_string() { return Err(PublicRepoWriteError::InvalidRequest(anyhow!("publication intent commit does not match stored block"))); }
-            return Ok(PublicCreatePreparation::Existing(PublicCommitResult { uri: record.uri(&self.did), cid: record.cid(), commit_cid }));
+        if state.as_ref() != Some(&verifying_key) {
+            return Err(PublicRepoWriteError::Internal(anyhow!(
+                "external signing authority changed"
+            )));
         }
-        let existing = self.store.snapshot(&self.did).map_err(PublicRepoWriteError::Internal)?;
+        if let Some(intent) = self
+            .store
+            .intent(&self.did, &request.request_id)
+            .map_err(PublicRepoWriteError::Internal)?
+        {
+            if intent.request_id != request.request_id
+                || intent.principal != request.principal
+                || intent.generated_rkey != request.rkey.is_none()
+            {
+                return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                    "publication request identity or key mode changed"
+                )));
+            }
+            let rkey = request
+                .rkey
+                .clone()
+                .or_else(|| AtprotoRecordKey::new(intent.rkey.clone()).ok());
+            let Some(rkey) = rkey else {
+                return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                    "stored record key is invalid"
+                )));
+            };
+            let record =
+                AtprotoRecord::new(request.collection.clone(), &rkey, request.value.clone())
+                    .map_err(PublicRepoWriteError::InvalidRequest)?;
+            if intent.head_condition.as_deref() != Some(&condition.identity()) {
+                return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                    "publication request condition changed"
+                )));
+            }
+            if intent.cid != record.cid().to_string()
+                || intent.did != self.did
+                || intent.collection != record.collection()
+                || intent.rkey != record.rkey().as_str()
+            {
+                return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                    "publication request id was reused with different content"
+                )));
+            }
+            let snapshot = self
+                .store
+                .snapshot(&self.did)
+                .map_err(PublicRepoWriteError::Internal)?
+                .ok_or_else(|| anyhow!("publication intent exists without a repository"))?;
+            if !snapshot
+                .records
+                .get(&(record.collection().to_owned(), record.rkey().clone()))
+                .is_some_and(|stored| stored.bytes() == record.bytes())
+            {
+                return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                    "publication intent record does not match repository"
+                )));
+            }
+            let bytes = self
+                .store
+                .db
+                .get(commit_block_key(&self.did, &intent.commit_cid))
+                .map_err(|error| PublicRepoWriteError::Internal(error.into()))?
+                .ok_or_else(|| anyhow!("publication intent commit block is missing"))?;
+            let commit =
+                Commit::from_atproto_dag_cbor(&bytes).map_err(PublicRepoWriteError::Internal)?;
+            let commit_cid = commit
+                .cid_atproto()
+                .map_err(PublicRepoWriteError::Internal)?;
+            if commit.did != self.did || intent.commit_cid != commit_cid.to_string() {
+                return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                    "publication intent commit does not match stored block"
+                )));
+            }
+            return Ok(PublicCreatePreparation::Existing(PublicCommitResult {
+                uri: record.uri(&self.did),
+                cid: record.cid(),
+                commit_cid,
+            }));
+        }
+        let existing = self
+            .store
+            .snapshot(&self.did)
+            .map_err(PublicRepoWriteError::Internal)?;
+        let mut budget = SnapshotBudget::default();
         let (mut keyed, previous, previous_rev) = match existing {
             Some(snapshot) => {
-                let previous = snapshot.commit.cid_atproto().map_err(PublicRepoWriteError::Internal)?;
-                if !condition.matches(Some(previous)) { return Err(PublicRepoWriteError::InvalidSwap); }
+                let previous = snapshot
+                    .commit
+                    .cid_atproto()
+                    .map_err(PublicRepoWriteError::Internal)?;
+                if !condition.matches(Some(previous)) {
+                    return Err(PublicRepoWriteError::InvalidSwap);
+                }
                 let previous_rev = snapshot.commit.rev;
-                let keyed = snapshot.records.into_iter().map(|((collection, rkey), record)| (format!("{collection}/{}", rkey.as_str()), record.cid())).collect();
+                for ((collection, rkey), record) in &snapshot.records {
+                    budget
+                        .charge(
+                            record_key(&self.did, collection, rkey.as_str()).len(),
+                            record.bytes().len(),
+                        )
+                        .map_err(PublicRepoWriteError::InvalidRequest)?;
+                }
+                let keyed = snapshot
+                    .records
+                    .into_iter()
+                    .map(|((collection, rkey), record)| {
+                        (format!("{collection}/{}", rkey.as_str()), record.cid())
+                    })
+                    .collect();
                 (keyed, Some(previous), Some(previous_rev))
             }
             None => {
-                if !condition.matches(None) { return Err(PublicRepoWriteError::InvalidSwap); }
+                if !condition.matches(None) {
+                    return Err(PublicRepoWriteError::InvalidSwap);
+                }
                 (BTreeMap::new(), None, None)
             }
         };
         let generated_rkey = request.rkey.is_none();
-        let rkey = request.rkey.take().unwrap_or(allocate_record_key(&request.collection, &keyed, previous_rev).map_err(PublicRepoWriteError::InvalidRequest)?);
-        let record = AtprotoRecord::new(request.collection.clone(), &rkey, request.value.clone()).map_err(PublicRepoWriteError::InvalidRequest)?;
-        if record.bytes().len() > MAX_PUBLIC_RECORD_BYTES { return Err(PublicRepoWriteError::InvalidRequest(anyhow!("public record exceeds {MAX_PUBLIC_RECORD_BYTES}-byte canonical encoded limit"))); }
+        let rkey = match request.rkey.clone().or(proposed_rkey) {
+            Some(key) => key,
+            None => allocate_record_key(&request.collection, &keyed, previous_rev)
+                .map_err(PublicRepoWriteError::InvalidRequest)?,
+        };
+        let record = AtprotoRecord::new(request.collection.clone(), &rkey, request.value.clone())
+            .map_err(PublicRepoWriteError::InvalidRequest)?;
+        if record.bytes().len() > MAX_PUBLIC_RECORD_BYTES {
+            return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                "public record exceeds {MAX_PUBLIC_RECORD_BYTES}-byte canonical encoded limit"
+            )));
+        }
         let key = format!("{}/{}", record.collection(), record.rkey().as_str());
-        if keyed.contains_key(&key) { return Err(PublicRepoWriteError::RecordAlreadyExists); }
+        if keyed.contains_key(&key) {
+            return Err(PublicRepoWriteError::RecordAlreadyExists);
+        }
+        budget
+            .charge(
+                record_key(&self.did, record.collection(), record.rkey().as_str()).len(),
+                record.bytes().len(),
+            )
+            .map_err(PublicRepoWriteError::InvalidRequest)?;
         keyed.insert(key, record.cid());
         let tree = Node::from_keyed_records(&keyed);
-        let (root, _) = tree.to_node_data_with_blocks_atproto().map_err(PublicRepoWriteError::Internal)?;
-        let unsigned = UnsignedCommit::new(self.did.clone(), root.cid_atproto().map_err(PublicRepoWriteError::Internal)?, next_revision(previous_rev), previous);
-        request.rkey = Some(record.rkey().clone());
-        Ok(PublicCreatePreparation::Pending(Box::new(PublicPendingCreate { request, record, unsigned, active_verifying_key: verifying_key, head_condition: condition, generated_rkey })))
+        let (root, _) = tree
+            .to_node_data_with_blocks_atproto()
+            .map_err(PublicRepoWriteError::Internal)?;
+        let unsigned = UnsignedCommit::new(
+            self.did.clone(),
+            root.cid_atproto().map_err(PublicRepoWriteError::Internal)?,
+            next_revision(previous_rev),
+            previous,
+        );
+        Ok(PublicCreatePreparation::Pending(Box::new(
+            PublicPendingCreate {
+                account: Arc::clone(&self.account),
+                request,
+                record,
+                unsigned,
+                active_verifying_key: verifying_key,
+                head_condition: condition,
+                generated_rkey,
+            },
+        )))
     }
 
     pub fn finish_external_record(
@@ -773,72 +960,64 @@ impl PublicRepoWriter {
         preparation: PublicPendingCreate,
         signature: Vec<u8>,
     ) -> Result<PublicCommitResult, PublicRepoWriteError> {
-        if !self.external { return Err(PublicRepoWriteError::InvalidRequest(anyhow!("external finish requires an external writer"))); }
-        self.authorizer.authorize(&preparation.request.principal, &self.did, &preparation.request.collection).map_err(PublicRepoWriteError::Authorization)?;
-        let verifying_key = self.active_verifying_key().map_err(PublicRepoWriteError::Internal)?;
-        if verifying_key != preparation.active_verifying_key { return Err(PublicRepoWriteError::Internal(anyhow!("external signing authority changed"))); }
-        let state = self.account.external_key.lock();
-        if state.as_ref() != Some(&verifying_key) { return Err(PublicRepoWriteError::Internal(anyhow!("external signing authority changed"))); }
-        if let Some(existing) = self.store.snapshot(&self.did).map_err(PublicRepoWriteError::Internal)? {
-            let previous = existing.commit.cid_atproto().map_err(PublicRepoWriteError::Internal)?;
-            if !preparation.head_condition.matches(Some(previous)) { return Err(PublicRepoWriteError::InvalidSwap); }
-            let keyed = existing.records.into_iter().map(|((collection, rkey), record)| (format!("{collection}/{}", rkey.as_str()), record.cid())).collect::<BTreeMap<_, _>>();
-            let key = format!("{}/{}", preparation.record.collection(), preparation.record.rkey().as_str());
-            if keyed.contains_key(&key) { return Err(PublicRepoWriteError::RecordAlreadyExists); }
-            let mut keyed = keyed;
-            keyed.insert(key, preparation.record.cid());
-            let tree = Node::from_keyed_records(&keyed);
-            let (root, _) = tree.to_node_data_with_blocks_atproto().map_err(PublicRepoWriteError::Internal)?;
-            if root.cid_atproto().map_err(PublicRepoWriteError::Internal)? != preparation.unsigned.data { return Err(PublicRepoWriteError::InvalidSwap); }
-        } else if !preparation.head_condition.matches(None) {
+        if !self.external {
+            return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                "external finish requires an external writer"
+            )));
+        }
+        if !Arc::ptr_eq(&self.account, &preparation.account)
+            || preparation.request.did != self.did
+            || preparation.unsigned.did != self.did
+        {
+            return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                "prepared publication belongs to another writer"
+            )));
+        }
+        let _transaction = self.account.active_key.lock();
+        // Re-run authorization, strict receipt matching, the prospective budget
+        // and head selection after the external signer returned. Identical
+        // concurrent retries recover the original receipt before CAS checks.
+        let current = match self.prepare_external_record_locked(
+            preparation.request.clone(),
+            preparation.head_condition.clone(),
+            Some(preparation.record.rkey().clone()),
+        )? {
+            PublicCreatePreparation::Existing(result) => return Ok(result),
+            PublicCreatePreparation::Pending(current) => current,
+        };
+        let verifying_key = current.active_verifying_key;
+        if verifying_key != preparation.active_verifying_key
+            || current.unsigned.did != preparation.unsigned.did
+            || current.unsigned.prev != preparation.unsigned.prev
+            || current.unsigned.data != preparation.unsigned.data
+        {
             return Err(PublicRepoWriteError::InvalidSwap);
         }
-        let commit = Commit::from_atproto_signature(&preparation.unsigned, signature, &verifying_key).map_err(PublicRepoWriteError::Internal)?;
-        let commit_cid = commit.cid_atproto().map_err(PublicRepoWriteError::Internal)?;
-        let intent = PublicationIntent { request_id: preparation.request.request_id.clone(), principal: preparation.request.principal.clone(), did: self.did.clone(), collection: preparation.record.collection().to_owned(), rkey: preparation.record.rkey().as_str().to_owned(), generated_rkey: preparation.generated_rkey, cid: preparation.record.cid().to_string(), commit_cid: commit_cid.to_string(), head_condition: Some(preparation.head_condition.identity()) };
-        self.store.write_transaction(&self.did, &preparation.record, &commit, &intent).map_err(PublicRepoWriteError::Internal)?;
-        Ok(PublicCommitResult { uri: preparation.record.uri(&self.did), cid: preparation.record.cid(), commit_cid })
-    }
-
-    pub async fn create_external_record(
-        &self,
-        request: PublicCreateRequest,
-        expected_prev: Option<&str>,
-        account_store: &hyprstream_pds_service::AccountRecordStore,
-        authority: &hyprstream_rpc::Subject,
-    ) -> Result<PublicCommitResult, PublicRepoWriteError> {
-        let verifying_key = account_store
-            .verifying_key_for_hosted_did(authority, &request.did)
-            .await
-            .map_err(|error| PublicRepoWriteError::Internal(anyhow!(error)))?
-            .ok_or_else(|| PublicRepoWriteError::Authorization(anyhow!("hosted account is not locally owned")))?;
-        let (native_bytes, public_bytes) = account_store
-            .hosted_repo_genesis_for_hosted_did(authority, &request.did)
-            .await
-            .map_err(|error| PublicRepoWriteError::Internal(anyhow!(error)))?
-            .ok_or_else(|| PublicRepoWriteError::Authorization(anyhow!("hosted account has no dual-format repository genesis")))?;
-        let native = Commit::from_dag_cbor(&native_bytes).map_err(PublicRepoWriteError::Internal)?;
-        native.verify(&verifying_key).map_err(PublicRepoWriteError::Internal)?;
-        if native.did != request.did || native.prev.is_some() {
-            return Err(PublicRepoWriteError::Internal(anyhow!("hosted native repository genesis is invalid")));
-        }
-        let public = Commit::from_atproto_dag_cbor(&public_bytes).map_err(PublicRepoWriteError::Internal)?;
-        public.verify_atproto(&verifying_key).map_err(PublicRepoWriteError::Internal)?;
-        if public.did != native.did || public.data != native.data || public.rev != native.rev || public.prev != native.prev {
-            return Err(PublicRepoWriteError::Internal(anyhow!("hosted dual-format repository genesis differs")));
-        }
-        self.store.seed_public_genesis(&request.did, public, &verifying_key).map_err(PublicRepoWriteError::Internal)?;
-        match self.prepare_external_record_with_expected_prev_text(request, expected_prev)? {
-            PublicCreatePreparation::Existing(result) => Ok(result),
-            PublicCreatePreparation::Pending(pending) => {
-                let signature = account_store
-                    .sign_for_hosted_did(authority, &pending.request.did, &pending.signing_bytes().map_err(PublicRepoWriteError::Internal)? )
-                    .await
-                    .map_err(|error| PublicRepoWriteError::Internal(anyhow!(error)))?
-                    .ok_or_else(|| PublicRepoWriteError::Authorization(anyhow!("hosted account is not locally owned")))?;
-                self.finish_external_record(*pending, signature)
-            }
-        }
+        let commit =
+            Commit::from_atproto_signature(&preparation.unsigned, signature, &verifying_key)
+                .map_err(PublicRepoWriteError::Internal)?;
+        let commit_cid = commit
+            .cid_atproto()
+            .map_err(PublicRepoWriteError::Internal)?;
+        let intent = PublicationIntent {
+            request_id: preparation.request.request_id.clone(),
+            principal: preparation.request.principal.clone(),
+            did: self.did.clone(),
+            collection: preparation.record.collection().to_owned(),
+            rkey: preparation.record.rkey().as_str().to_owned(),
+            generated_rkey: preparation.generated_rkey,
+            cid: preparation.record.cid().to_string(),
+            commit_cid: commit_cid.to_string(),
+            head_condition: Some(preparation.head_condition.identity()),
+        };
+        self.store
+            .write_transaction(&self.did, &preparation.record, &commit, &intent)
+            .map_err(PublicRepoWriteError::Internal)?;
+        Ok(PublicCommitResult {
+            uri: preparation.record.uri(&self.did),
+            cid: preparation.record.cid(),
+            commit_cid,
+        })
     }
 
     /// Explicit account-owner promotion boundary. The trusted caller must
@@ -1099,10 +1278,21 @@ pub struct HostedAccountSelfAuthorizer;
 impl PublicPublicationAuthorizer for HostedAccountSelfAuthorizer {
     fn authorize(&self, principal: &str, account: &str, collection: &str) -> Result<()> {
         validate_principal(principal)?;
-        ensure!(principal == account, "direct publication principal is not repo owner");
-        ensure!(matches!(collection, "app.bsky.feed.post" | "app.bsky.actor.profile"), "collection is outside the enabled posting slice");
-        let host = account.strip_prefix("did:web:").filter(|host| !host.is_empty() && !host.contains(['/', ':', '%']));
-        ensure!(host.is_some(), "direct publication requires a hosted did:web account");
+        ensure!(
+            principal == account,
+            "direct publication principal is not repo owner"
+        );
+        ensure!(
+            matches!(collection, "app.bsky.feed.post" | "app.bsky.actor.profile"),
+            "collection is outside the enabled posting slice"
+        );
+        let host = account
+            .strip_prefix("did:web:")
+            .filter(|host| !host.is_empty() && !host.contains(['/', ':', '%']));
+        ensure!(
+            host.is_some(),
+            "direct publication requires a hosted did:web account"
+        );
         Ok(())
     }
 }
@@ -1116,7 +1306,8 @@ pub struct HostedAccountPublicRepoWriter {
 
 impl std::fmt::Debug for HostedAccountPublicRepoWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostedAccountPublicRepoWriter").finish_non_exhaustive()
+        f.debug_struct("HostedAccountPublicRepoWriter")
+            .finish_non_exhaustive()
     }
 }
 
@@ -1127,7 +1318,20 @@ impl HostedAccountPublicRepoWriter {
         authority: hyprstream_rpc::Subject,
         authorizer: Arc<dyn PublicPublicationAuthorizer>,
     ) -> Self {
-        Self { store, account_store, authority, authorizer }
+        Self {
+            store,
+            account_store,
+            authority,
+            authorizer,
+        }
+    }
+
+    pub(crate) async fn has_account(&self, did: &str) -> Result<bool> {
+        Ok(self
+            .account_store
+            .verifying_key_for_hosted_did(&self.authority, did)
+            .await?
+            .is_some())
     }
 
     pub async fn create_record(
@@ -1135,16 +1339,184 @@ impl HostedAccountPublicRepoWriter {
         request: PublicCreateRequest,
         expected_prev: Option<&str>,
     ) -> Result<PublicCommitResult, PublicRepoWriteError> {
-        let verifying_key = self.account_store
+        // Admission and authorization precede all authority reads and storage.
+        let authorizer = Arc::clone(&self.authorizer);
+        let admission_store = Arc::clone(&self.store);
+        let validated = request.clone();
+        let expected_prev = expected_prev.map(str::to_owned);
+        let expected = expected_prev.clone();
+        let admission = blocking_public_work(move || {
+            validate_request_id(&validated.request_id)
+                .map_err(PublicRepoWriteError::InvalidRequest)?;
+            validate_principal(&validated.principal)
+                .map_err(PublicRepoWriteError::InvalidRequest)?;
+            validate_did(&validated.did).map_err(PublicRepoWriteError::InvalidRequest)?;
+            if let Some(expected) = expected {
+                parse_atproto_json_cid(&expected).map_err(PublicRepoWriteError::InvalidRequest)?;
+            }
+            authorizer
+                .authorize(&validated.principal, &validated.did, &validated.collection)
+                .map_err(PublicRepoWriteError::Authorization)?;
+            reject_unverified_blobs(&validated.value)
+                .map_err(PublicRepoWriteError::InvalidRequest)?;
+            let key = validated
+                .rkey
+                .clone()
+                .unwrap_or(AtprotoRecordKey::new("self")?);
+            let record = AtprotoRecord::new(validated.collection, &key, validated.value)
+                .map_err(PublicRepoWriteError::InvalidRequest)?;
+            if record.bytes().len() > MAX_PUBLIC_RECORD_BYTES {
+                return Err(PublicRepoWriteError::InvalidRequest(anyhow!(
+                    "public record exceeds canonical byte limit"
+                )));
+            }
+            let mut accounts = admission_store.accounts.lock();
+            Ok(Arc::clone(
+                &accounts.entry(validated.did).or_default().external_write,
+            ))
+        })
+        .await?;
+        let _admission = admission.lock_owned().await;
+        let verifying_key = self
+            .account_store
             .verifying_key_for_hosted_did(&self.authority, &request.did)
             .await
             .map_err(|error| PublicRepoWriteError::Internal(anyhow!(error)))?
-            .ok_or_else(|| PublicRepoWriteError::Authorization(anyhow!("hosted account is not locally owned")))?;
-        let writer = PublicRepoWriter::new_external(
-            Arc::clone(&self.store), request.did.clone(), verifying_key, Arc::clone(&self.authorizer),
-        ).map_err(PublicRepoWriteError::Internal)?;
-        writer.create_external_record(request, expected_prev, &self.account_store, &self.authority).await
+            .ok_or_else(|| {
+                PublicRepoWriteError::Authorization(anyhow!("hosted account is not locally owned"))
+            })?;
+        let (native_bytes, public_bytes) = self
+            .account_store
+            .hosted_repo_genesis_for_hosted_did(&self.authority, &request.did)
+            .await
+            .map_err(|error| PublicRepoWriteError::Internal(anyhow!(error)))?
+            .ok_or_else(|| {
+                PublicRepoWriteError::Authorization(anyhow!(
+                    "hosted account has no dual-format repository genesis"
+                ))
+            })?;
+        let store = Arc::clone(&self.store);
+        let authorizer = Arc::clone(&self.authorizer);
+        let (writer, prepared) = blocking_public_work(move || {
+            let native = Commit::from_dag_cbor(&native_bytes)?;
+            native.verify(&verifying_key)?;
+            let public = Commit::from_atproto_dag_cbor(&public_bytes)?;
+            public.verify_atproto(&verifying_key)?;
+            if !(native.did == request.did
+                && native.prev.is_none()
+                && public.did == native.did
+                && public.data == native.data
+                && public.rev == native.rev
+                && public.prev == native.prev)
+            {
+                return Err(PublicRepoWriteError::Internal(anyhow!(
+                    "hosted dual-format repository genesis differs"
+                )));
+            }
+            // Recheck policy immediately before initialization; no private key
+            // crosses this boundary, only authority-verified public artifacts.
+            authorizer
+                .authorize(&request.principal, &request.did, &request.collection)
+                .map_err(PublicRepoWriteError::Authorization)?;
+            let writer = Arc::new(PublicRepoWriter::new_external(
+                Arc::clone(&store),
+                request.did.clone(),
+                verifying_key,
+                authorizer,
+            )?);
+            store.seed_public_genesis(&request.did, public, &verifying_key)?;
+            let prepared = writer.prepare_external_record_with_expected_prev_text(
+                request,
+                expected_prev.as_deref(),
+            )?;
+            Ok((writer, prepared))
+        })
+        .await?;
+        match prepared {
+            PublicCreatePreparation::Existing(result) => Ok(result),
+            PublicCreatePreparation::Pending(pending) => {
+                let signature = self
+                    .account_store
+                    .sign_for_hosted_did(
+                        &self.authority,
+                        &pending.request.did,
+                        &pending.signing_bytes()?,
+                    )
+                    .await
+                    .map_err(|error| PublicRepoWriteError::Internal(anyhow!(error)))?
+                    .ok_or_else(|| {
+                        PublicRepoWriteError::Authorization(anyhow!(
+                            "hosted account is not locally owned"
+                        ))
+                    })?;
+                blocking_public_work(move || writer.finish_external_record(*pending, signature))
+                    .await
+            }
+        }
     }
+}
+
+/// A durable read source. Resolving authority and reading/encoding happen only
+/// after the route acquires snapshot/body admission. Hosted failures never
+/// fall back to the unrelated model snapshot cache.
+pub(crate) enum PublicRepoReader {
+    Local(Arc<PublicRepoWriter>),
+    Hosted {
+        writer: Arc<HostedAccountPublicRepoWriter>,
+        did: String,
+    },
+}
+
+impl PublicRepoReader {
+    pub(crate) fn did(&self) -> &str {
+        match self {
+            Self::Local(writer) => writer.did(),
+            Self::Hosted { did, .. } => did,
+        }
+    }
+
+    pub(crate) async fn read<T: Send + 'static>(
+        self,
+        encode: impl FnOnce(Option<(PublicRepoSnapshot, p256::ecdsa::VerifyingKey)>) -> Result<T>
+            + Send
+            + 'static,
+    ) -> Result<T> {
+        match self {
+            Self::Local(writer) => {
+                tokio::task::spawn_blocking(move || encode(writer.public_snapshot()?)).await?
+            }
+            Self::Hosted { writer, did } => {
+                let key = writer
+                    .account_store
+                    .verifying_key_for_hosted_did(&writer.authority, &did)
+                    .await?;
+                tokio::task::spawn_blocking(move || {
+                    let Some(key) = key else {
+                        return encode(None);
+                    };
+                    let account = {
+                        let mut accounts = writer.store.accounts.lock();
+                        Arc::clone(accounts.entry(did.clone()).or_default())
+                    };
+                    let _transaction = account.active_key.lock();
+                    let snapshot = writer.store.snapshot(&did)?;
+                    if let Some(snapshot) = &snapshot {
+                        snapshot.commit.verify_atproto(&key)?;
+                    }
+                    encode(snapshot.map(|snapshot| (snapshot, key)))
+                })
+                .await?
+            }
+        }
+    }
+}
+
+async fn blocking_public_work<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, PublicRepoWriteError> + Send + 'static,
+) -> Result<T, PublicRepoWriteError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| PublicRepoWriteError::Internal(error.into()))?
 }
 
 /// Allocate after authorization, retry lookup and head selection, while the
@@ -2706,3 +3078,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod hosted_tests;
