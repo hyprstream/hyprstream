@@ -1,4 +1,4 @@
-//! CRI ImageClient implementation with Dragonfly-native blob fetching
+//! CRI image service implementation with Dragonfly-native blob fetching
 //!
 //! Provides Kubernetes CRI-aligned APIs for managing container images.
 //! Backed by Nydus RAFS for chunk-level CAS deduplication.
@@ -6,7 +6,7 @@
 //! # Architecture
 //!
 //! ```text
-//! ImageClient (CRI-aligned, client-side interface)
+//! The canonical ImageClient contract and client live in `hyprstream-rpc-std`.
 //!     │
 //!     ├── list_images()     → List available images
 //!     ├── image_status()    → Get image details
@@ -35,8 +35,6 @@
 // HTTP) and `store_trait` (the trait seam) are nydus-free and always compiled —
 // the trait surface stays feature-invariant so `WorkerService` can hold
 // `Option<Arc<dyn ImageStore>>` with no cfg mirror (#646).
-#[cfg(feature = "oci-image")]
-mod client;
 mod manifest;
 // `pub(crate)` so sibling-module tests (e.g. runtime::sandbox_fs, FS-D #365)
 // can synthesize RAFS images. The builder fn stays crate-internal.
@@ -61,10 +59,6 @@ mod store;
 #[cfg(feature = "oci-image")]
 mod store_mount;
 
-pub use crate::generated::worker_client::{
-    ImageSpec, ImageInfo, ImageStatusResult,
-    AuthConfig, FilesystemUsage, FilesystemIdentifier,
-};
 pub use manifest::{ImageReference, ManifestFetcher, ManifestResult, OciManifest};
 #[cfg(all(feature = "oci-image", not(target_arch = "wasm32")))]
 pub use image_fs::{image_fs_for, image_fs_from_rafs, ImageFs};

@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use hyprstream_rpc::Subject;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 
-use crate::services::generated::model_client::{ModelClient, ModelFsClient};
+use hyprstream_rpc_std::model_client::{ModelClient, ModelFsClient};
 use crate::services::ninep_bridge::{fid_key, map_err, parse_dir_stats, NinePBridge, RemoteFidKey};
 use crate::services::types::QTDIR;
 
@@ -98,7 +98,7 @@ impl Mount for RemoteModelMount {
         let remote_newfid = local_fid; // Use same numbering for simplicity.
 
         let fs = self.fs_client(model_ref);
-        let walk_req = crate::services::generated::model_client::NpWalk {
+        let walk_req = hyprstream_rpc_std::model_client::NpWalk {
             fid: 0, // root
             newfid: remote_newfid,
             wnames,
@@ -130,7 +130,7 @@ impl Mount for RemoteModelMount {
         let mut state = self.bridge.get_mut(local_id)?;
 
         let fs = self.fs_client(&state.model_ref);
-        let open_req = crate::services::generated::model_client::NpOpen {
+        let open_req = hyprstream_rpc_std::model_client::NpOpen {
             fid: state.remote_fid,
             mode,
         };
@@ -157,7 +157,7 @@ impl Mount for RemoteModelMount {
         let state = self.bridge.get(local_id)?;
 
         let fs = self.fs_client(&state.model_ref);
-        let read_req = crate::services::generated::model_client::NpRead {
+        let read_req = hyprstream_rpc_std::model_client::NpRead {
             fid: state.remote_fid,
             offset,
             count,
@@ -183,7 +183,7 @@ impl Mount for RemoteModelMount {
         let state = self.bridge.get(local_id)?;
 
         let fs = self.fs_client(&state.model_ref);
-        let write_req = crate::services::generated::model_client::NpWrite {
+        let write_req = hyprstream_rpc_std::model_client::NpWrite {
             fid: state.remote_fid,
             offset,
             data: data.to_vec(),
@@ -217,7 +217,7 @@ impl Mount for RemoteModelMount {
 
         // Read directory data from remote.
         let fs = self.fs_client(&state.model_ref);
-        let read_req = crate::services::generated::model_client::NpRead {
+        let read_req = hyprstream_rpc_std::model_client::NpRead {
             fid: state.remote_fid,
             offset: 0,
             count: 65536, // Large enough for most directory listings.
@@ -241,7 +241,7 @@ impl Mount for RemoteModelMount {
         let state = self.bridge.get(local_id)?;
 
         let fs = self.fs_client(&state.model_ref);
-        let stat_req = crate::services::generated::model_client::NpStatReq {
+        let stat_req = hyprstream_rpc_std::model_client::NpStatReq {
             fid: state.remote_fid,
         };
 
@@ -277,7 +277,7 @@ impl Mount for RemoteModelMount {
 
         if let Some(state) = self.bridge.remove(local_id) {
             let fs = self.fs_client(&state.model_ref);
-            let clunk_req = crate::services::generated::model_client::NpClunk {
+            let clunk_req = hyprstream_rpc_std::model_client::NpClunk {
                 fid: state.remote_fid,
             };
 

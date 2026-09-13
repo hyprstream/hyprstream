@@ -15,7 +15,7 @@
 use anyhow::{Result, anyhow};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::VerifyingKey;
-use hyprstream_discovery::DiscoveryClient;
+use hyprstream_rpc_std::discovery_client::DiscoveryClient;
 use hyprstream_rpc::auth::{FederationKey, FederationKeySource};
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -95,7 +95,7 @@ pub struct FederationKeyResolver {
     ///
     /// `None` retains the legacy posture (config-only trust) for
     /// callers that haven't wired PolicyService access yet.
-    policy_client: Option<Arc<crate::services::PolicyClient>>,
+    policy_client: Option<Arc<hyprstream_rpc_std::policy_client::PolicyClient>>,
 }
 
 impl FederationKeyResolver {
@@ -144,7 +144,7 @@ impl FederationKeyResolver {
     /// set, calls to `get_keys` for issuers that aren't currently
     /// permitted by PolicyService policy return Err — fail-closed,
     /// matching the CIMD client path.
-    pub fn with_policy_client(mut self, client: Arc<crate::services::PolicyClient>) -> Self {
+    pub fn with_policy_client(mut self, client: Arc<hyprstream_rpc_std::policy_client::PolicyClient>) -> Self {
         self.policy_client = Some(client);
         self
     }
@@ -194,7 +194,7 @@ impl FederationKeyResolver {
         // (do we currently accept this peer). Same gate as CIMD; same
         // fail-closed semantics on RPC outage.
         if let Some(ref pc) = self.policy_client {
-            use crate::services::generated::policy_client::PolicyCheck;
+            use hyprstream_rpc_std::policy_client::PolicyCheck;
             // Reuse the OAuth-side RFC 6454 origin extractor: same
             // normalization (scheme + lowercase host + non-default port)
             // means a single Casbin rule covers a CIMD client at

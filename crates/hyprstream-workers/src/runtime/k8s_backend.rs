@@ -74,7 +74,7 @@ use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 
 use super::backend::{NamespaceDelivery, NamespaceTransport, SandboxBackend, SandboxHandle};
-use super::client::{KeyValue, PodSandboxConfig};
+use hyprstream_rpc_std::worker_client::{KeyValue, PodSandboxConfig};
 use super::sandbox::PodSandbox;
 
 // ─────────────────────────────────────────────────────────────────────────────

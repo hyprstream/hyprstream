@@ -6,7 +6,7 @@
 
 pub use hyprstream_discovery::{AuthorizationProvider, DiscoveryService};
 
-use crate::services::generated::policy_client::PolicyCheck;
+use hyprstream_rpc_std::policy_client::PolicyCheck;
 use async_trait::async_trait;
 
 use std::collections::BTreeMap;
@@ -30,20 +30,17 @@ use hyprstream_pds::repo_authority::is_path_form_did_web;
 use hyprstream_pds::tid::Tid;
 use sha2::Digest as _;
 
-// Re-export the generated discovery client types from our local generated module
-// (hyprstream still needs its own discovery_client for the DiscoveryClient type)
-
 /// Policy-based authorization provider wrapping PolicyClient.
 ///
 /// Bridges the `AuthorizationProvider` trait from `hyprstream-discovery`
 /// to the `PolicyClient` generated in this crate.
 pub struct PolicyAuthProvider {
-    client: crate::services::PolicyClient,
+    client: hyprstream_rpc_std::policy_client::PolicyClient,
 }
 
 impl PolicyAuthProvider {
     /// Create a new policy-based authorization provider.
-    pub fn new(client: crate::services::PolicyClient) -> Self {
+    pub fn new(client: hyprstream_rpc_std::policy_client::PolicyClient) -> Self {
         Self { client }
     }
 }
@@ -54,7 +51,7 @@ impl AuthorizationProvider for PolicyAuthProvider {
         &self, subject: &str, domain: &str, resources: &[String],
         operation: &str, bearer: Option<&str>,
     ) -> anyhow::Result<Vec<bool>> {
-        use crate::services::generated::policy_client::PolicyCheckBatch;
+        use hyprstream_rpc_std::policy_client::PolicyCheckBatch;
         anyhow::ensure!(resources.len() <= 256, "authorization batch exceeds 256");
         let client = match bearer {
             Some(token) => self.client.clone().with_delegated_bearer(token.to_owned()),

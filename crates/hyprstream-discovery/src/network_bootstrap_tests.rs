@@ -147,7 +147,7 @@ async fn network_roundtrip() -> Result<()> {
     let _ = hyprstream_rpc::envelope::install_verify_config(hyprstream_rpc::envelope::EnvelopeVerifyConfig {
         policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid, pq_store: Some(Arc::new(request_keys)),
     });
-    let discovery_client = crate::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
+    let discovery_client = hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
         "discovery", "discovery", None, model.clone(), None, bootstrap_resolver,
     )?));
     tokio::time::timeout(Duration::from_secs(10), discovery_client.announce(&announcement(&model_state, "model", &model, &policy))).await??;

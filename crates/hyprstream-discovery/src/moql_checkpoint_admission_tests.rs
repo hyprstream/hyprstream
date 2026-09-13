@@ -286,7 +286,7 @@ async fn roundtrip() -> Result<()> {
     bootstrap.network_required = true;
     DiscoveryService::bootstrap_authenticated_process(
         bootstrap,
-        crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+        hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
     )?;
     let authority = production_moql_accepted_state_authority()?;
     let tenants = BTreeMap::from([

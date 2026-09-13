@@ -24,8 +24,8 @@ use hyprstream_rpc::auth::{
 use hyprstream_rpc::crypto::SigningKey;
 use hyprstream_service::ServiceContext;
 
-use crate::services::PolicyClient;
-use crate::services::generated::policy_client::{
+use hyprstream_rpc_std::policy_client::PolicyClient;
+use hyprstream_rpc_std::policy_client::{
     CheckCredentialRevocation, CheckSession, CredentialIdRef, CredentialIdRefContent,
     RegisterSession, RevokeCredential, RevokeSession, SessionKeyRef, SessionKeyRefContent,
 };
@@ -131,7 +131,7 @@ impl PolicyAuthoritySessionRegistry {
         Self::with_client_provider(move || {
             let token = crate::services::factories::service_token(&signing_key)
                 .context("current service JWT unavailable for session authority")?;
-            PolicyClient::from_resolver(signing_key.clone(), Some(token)).map(Arc::new)
+            PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), Some(token)).map(Arc::new)
         })
     }
 }
@@ -244,7 +244,7 @@ impl PolicyAuthorityRevocationStore {
         Self::with_client_provider(move || {
             let token = crate::services::factories::service_token(&signing_key)
                 .context("current service JWT unavailable for revocation authority")?;
-            PolicyClient::from_resolver(signing_key.clone(), Some(token)).map(Arc::new)
+            PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), Some(token)).map(Arc::new)
         })
     }
 }

@@ -23,7 +23,7 @@ use crate::error::{Result, WorkerError};
 use crate::image::RafsStore;
 
 use super::backend::{SandboxBackend, SandboxHandle};
-use super::client::{CpuUsage, LinuxContainerResources, MemoryUsage, PodSandboxConfig};
+use hyprstream_rpc_std::worker_client::{CpuUsage, LinuxContainerResources, MemoryUsage, PodSandboxConfig};
 use super::kata_agent::{AgentAddress, ContainerRootfs, KataAgentClient};
 use super::sandbox::PodSandbox;
 use super::sandbox_fs::{SandboxFs, SandboxFsServer, VFS_SOCKET_NAME};
@@ -1439,13 +1439,13 @@ mod tests {
     fn create_test_sandbox(sandbox_path: PathBuf) -> PodSandbox {
         PodSandbox {
             id: "test-sandbox-001".to_owned(),
-            metadata: crate::generated::worker_client::PodSandboxMetadata {
+            metadata: hyprstream_rpc_std::worker_client::PodSandboxMetadata {
                 name: String::new(),
                 uid: String::new(),
                 namespace: "default".to_owned(),
                 attempt: 0,
             },
-            state: crate::runtime::PodSandboxState::SandboxNotReady,
+            state: hyprstream_rpc_std::worker_client::PodSandboxState::SandboxNotReady,
             created_at: chrono::Utc::now(),
             labels: vec![],
             annotations: vec![],
@@ -1454,7 +1454,7 @@ mod tests {
             sandbox_path,
             image_id: None,
             console_socket: None,
-            applied_resources: crate::runtime::client::LinuxContainerResources::default(),
+            applied_resources: hyprstream_rpc_std::worker_client::LinuxContainerResources::default(),
             reservation: None,
         }
     }

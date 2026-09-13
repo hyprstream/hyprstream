@@ -3,8 +3,8 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::cli::git_handlers::apply_policy_template_to_model;
-use crate::services::RegistryClient;
-use crate::services::generated::registry_client::{CreateWorktreeRequest, RemoveWorktreeRequest};
+use hyprstream_rpc_std::registry_client::RegistryClient;
+use hyprstream_rpc_std::registry_client::{CreateWorktreeRequest, RemoveWorktreeRequest};
 use anyhow::Result;
 use std::io::{self, Write};
 use tracing::info;

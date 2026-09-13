@@ -46,7 +46,7 @@ use crate::config::{TlsConfig, XetConfig};
 use crate::server::state::ResourceAuthState;
 use crate::server::tls::{resolve_rustls_config, serve_app};
 use crate::server::{middleware as server_middleware, AuthenticatedUser};
-use crate::services::RegistryClient;
+use hyprstream_rpc_std::registry_client::RegistryClient;
 use crate::storage::cas::{CasMount, CasMountAuthorizer, CasSubstrate, DedupDomain};
 use anyhow::Result;
 use axum::{

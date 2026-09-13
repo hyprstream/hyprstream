@@ -34,7 +34,7 @@ hyprstream-rpc           (EndpointRegistry, Resolver trait, SocketKind)
 hyprstream-discovery     ← you are here
     ↑
 hyprstream               (DiscoveryService factory, DiscoveryClient in OAuthService)
-hyprstream-rpc-std       (re-exports DiscoveryClient for browser use)
+hyprstream-rpc-std       (canonical DiscoveryClient for browser/Rust use)
 ```
 
 Built as `rlib` only — `OnceLock` singletons must be shared across the workspace, not duplicated per cdylib.

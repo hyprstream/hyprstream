@@ -9,6 +9,7 @@ description = "Isolated workload execution using Kata Containers with CRI-aligne
 [dependencies]
 # Workspace crates
 hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }
 # CRI v1 (runtime.v1) tonic-generated client bindings (#510): the CriBackend
 # drives an external, already-running CRI runtime service (containerd's CRI
 # plugin, or CRI-O) over CRI gRPC — the same protocol kubelet speaks — rather
@@ -316,12 +317,6 @@ dragonball = ["kata-vm", "kata-hypervisor/dragonball"]
 dbus = ["dep:zbus"]
 # Systemd integration (socket activation, service units)
 systemd = ["dbus", "hyprstream-rpc/systemd"]
-
-[build-dependencies]
-capnpc = { workspace = true }
-capnp = { workspace = true }
-serde_json = { workspace = true }
-hyprstream-rpc-build = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

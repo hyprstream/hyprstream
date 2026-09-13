@@ -11,7 +11,7 @@ use super::qwen3_5_vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 use super::{ModelArchitecture, ModelOperations};
 use crate::runtime::device_pool::LayerDeviceMap;
 use crate::runtime::kv_cache::KVCacheManager;
-use crate::runtime::KVQuantType;
+use hyprstream_rpc_std::model_client::KVQuantType;
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::rope::RoPE;
 use crate::runtime::tensor_helpers::{dims3, dims4};
