@@ -10,23 +10,38 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+      - name: Load builder image pin
+        run: bash .github/scripts/load-builder-image.sh
+      - name: Pull builder image
+        run: podman pull "$BUILDER_IMAGE"
       - name: Bind audited input revision
         shell: bash
+        env:
+          AUDIT_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          AUDIT_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
           case "$GITHUB_EVENT_NAME" in
-            pull_request) printf 'DOCS_CATALOG_EVENT=pull_request\nDOCS_CATALOG_AUDITED_COMMIT=%s\nDOCS_CATALOG_AUDITED_HEAD=%s\n' "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" >> "$GITHUB_ENV" ;;
-            push) printf 'DOCS_CATALOG_EVENT=push\nDOCS_CATALOG_AUDITED_COMMIT=%s\n' "${{ github.event.before }}" >> "$GITHUB_ENV" ;;
+            pull_request|push)
+              printf 'DOCS_CATALOG_EVENT=%s\nDOCS_CATALOG_AUDITED_COMMIT=%s\nDOCS_CATALOG_AUDITED_HEAD=%s\n' \
+                "$GITHUB_EVENT_NAME" "$AUDIT_BASE" "$AUDIT_HEAD" >> "$GITHUB_ENV" ;;
             *) exit 1 ;;
           esac
-      - run: python3 tools/check-docs-catalog.py
-      - run: python3 tools/check-docs-catalog.py --self-test
+      - name: Validate catalog and regression fixtures
+        run: |
+          podman run --rm \
+            -v "$PWD":/build:Z -w /build \
+            -e GITHUB_ACTIONS=true \
+            -e DOCS_CATALOG_EVENT -e DOCS_CATALOG_AUDITED_COMMIT -e DOCS_CATALOG_AUDITED_HEAD \
+            "$BUILDER_IMAGE" bash -euo pipefail -c '
+              python3 -B tools/check-docs-catalog.py --recover-source-objects
+              python3 -B tools/check-docs-catalog.py --self-test
+              python3 -B tools/test-docs-catalog.py
+            '

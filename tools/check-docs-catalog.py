@@ -11,9 +11,10 @@ import json
 import os
 import re
 import subprocess
+import stat
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 SURFACES = ("cli", "mcp", "factory", "vfs", "typescript")
 CATALOG_SURFACES = (*SURFACES, "docs")
@@ -90,10 +91,35 @@ def git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def read_json(path: Path) -> dict[str, Any]:
+def read_regular(repo: Path, path: str) -> bytes:
+    """Read only regular files, without following a selected path's symlinks."""
+    parts = path.split("/")
+    required(parts and all(part not in {"", ".", ".."} for part in parts), f"invalid input path: {path}")
+    descriptors = []
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        directory = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
+        descriptors.append(directory)
+        for part in parts[:-1]:
+            directory = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            descriptors.append(directory)
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(descriptor, "rb") as source:
+            required(stat.S_ISREG(os.fstat(source.fileno()).st_mode), f"selected input is not a regular file: {path}")
+            return source.read()
+    except OSError as error:
+        raise CatalogError(f"cannot read regular input {path}: {error.strerror}") from error
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def read_json(path: Path, repo: Path | None = None) -> dict[str, Any]:
+    root = repo or path.parent
+    try:
+        value = json.loads(read_regular(root, str(path.relative_to(root))))
+        required(isinstance(value, dict), f"{path} must contain an object")
+        return value
+    except (UnicodeError, json.JSONDecodeError) as error:
         raise CatalogError(f"{path}: {error}") from error
 
 
@@ -105,7 +131,7 @@ def tracked(repo: Path, *patterns: str) -> list[str]:
 def text(repo: Path, path: str, mutations: dict[str, str] | None) -> str:
     if mutations and path in mutations:
         return mutations[path]
-    return (repo / path).read_text(encoding="utf-8")
+    return read_regular(repo, path).decode("utf-8")
 
 
 def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict[str, dict[str, Any]]:
@@ -239,23 +265,35 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
     }
 
 
+def valid_object_id(value: Any, label: str) -> str:
+    required(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+             and value != "0" * 40, f"invalid {label}")
+    return value
+
+
 def audited_input(repo: Path, event: str | None = None, revision: str | None = None) -> tuple[str, str]:
     event = event or os.environ.get("DOCS_CATALOG_EVENT", "local")
     revision = revision or os.environ.get("DOCS_CATALOG_AUDITED_COMMIT")
-    if event == "pull_request":
+    head = git(repo, "rev-parse", "HEAD")
+    if event in {"pull_request", "push"}:
         expected_head = os.environ.get("DOCS_CATALOG_AUDITED_HEAD")
-        required(expected_head in {None, git(repo, "rev-parse", "HEAD")},
-                 "pull-request checkout is not the workflow-supplied head")
-        base = revision or git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
-        git(repo, "cat-file", "-e", f"{base}^{{commit}}")
-        required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", base, "HEAD"]).returncode == 0,
-                 "pull-request audited input is not an ancestor of the workflow-supplied head")
-        return event, base
-    if event == "push":
-        boundary = revision or git(repo, "rev-parse", "HEAD^")
-        required(boundary != git(repo, "rev-parse", "HEAD"), "push audited input must precede pushed HEAD")
-        required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", boundary, "HEAD"]).returncode == 0,
-                 "push audited input is not reachable from HEAD")
+        required(expected_head in {None, head}, "checkout is not the workflow-supplied head")
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            required(expected_head == head and revision is not None, "hosted event lacks exact head/base binding")
+        if event == "pull_request":
+            boundary = revision or git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
+        else:
+            boundary = revision or git(repo, "rev-parse", "HEAD^")
+        valid_object_id(boundary, "audited boundary")
+        git(repo, "cat-file", "-e", f"{boundary}^{{commit}}")
+        if event == "pull_request":
+            # The base branch can advance after the PR forks. Bind its exact
+            # tree as the trust anchor without requiring it in head ancestry.
+            git(repo, "merge-base", boundary, head)
+        else:
+            required(boundary != head, "push audited input must precede pushed HEAD")
+            required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", boundary, head],
+                                    capture_output=True).returncode == 0, "push audited input is not reachable from HEAD")
         return event, boundary
     if event == "local":
         return event, ""
@@ -294,94 +332,171 @@ def deleted(path: str, mutations: dict[str, str] | None) -> bool:
     return bool(mutations) and path in mutations and mutations[path] is None
 
 
+def provenance_fixed_paths() -> set[str]:
+    return {"crates/hyprstream/src/cli/schema_cli.rs", "crates/hyprstream/src/services/mcp_service.rs",
+            "crates/hyprstream/src/services/factories.rs", "crates/hyprstream-rpc-std/src/vfs_mount.rs",
+            ".github/license-boundary.toml", "tools/check-docs-catalog.py",
+            *(str(Path(directory).parent / "Cargo.toml") for directory in OWNER_DIRECTORIES)}
+
+
+def selected_input_paths(paths: list[str], read: Callable[[str], bytes], corpus: dict[str, Any]) -> list[str]:
+    selected = set(provenance_fixed_paths())
+    for path in paths:
+        if path.endswith(".capnp") or path == "build.rs" or path.endswith("/build.rs"):
+            selected.add(path)
+        elif path.startswith("docs/") and path.endswith(".md") \
+                and any(path_matches(path, item["glob"]) for item in corpus.get("public_prose", [])) \
+                and not any(path_matches(path, item["glob"]) for item in corpus.get("excluded", [])):
+            selected.add(path)
+        elif path.endswith((".ts", ".tsx", ".js", ".jsx")) or path == "package.json":
+            if typescript_consumer(path, read(path).decode("utf-8")):
+                selected.add(path)
+    return sorted(selected)
+
+
+def tree_reader(repo: Path, tree: str) -> tuple[list[str], Callable[[str], bytes]]:
+    valid_object_id(tree, "source tree")
+    entries = {}
+    for entry in git(repo, "ls-tree", "-rz", "--full-tree", tree).split("\0"):
+        if entry:
+            metadata, path = entry.split("\t", 1)
+            entries[path] = metadata.split()
+    def read(path: str) -> bytes:
+        required(path in entries, f"audited source tree omits {path}")
+        mode, kind, oid = entries[path]
+        required(mode in {"100644", "100755"} and kind == "blob", f"selected tree input is not a regular file: {path}")
+        result = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", oid], capture_output=True)
+        required(result.returncode == 0, f"cannot read audited blob {path}")
+        return result.stdout
+    return sorted(entries), read
+
+
 def provenance_paths(repo: Path, corpus: dict[str, Any],
                      mutations: dict[str, str] | None = None) -> list[str]:
-    manifests = [str(Path(directory).parent / "Cargo.toml") for directory in OWNER_DIRECTORIES]
-    paths = sorted(set(tracked(repo, "*.capnp") + corpus_paths(repo, corpus) + tracked(repo, "build.rs", "**/build.rs")
-                      + typescript_schema_sources(repo, mutations) + [
-        "crates/hyprstream/src/cli/schema_cli.rs", "crates/hyprstream/src/services/mcp_service.rs",
-        "crates/hyprstream/src/services/factories.rs", "crates/hyprstream-rpc-std/src/vfs_mount.rs",
-        ".github/license-boundary.toml", "tools/check-docs-catalog.py", *manifests,
-    ]))
-    return [path for path in paths if not deleted(path, mutations)]
+    read = lambda path: text(repo, path, mutations).encode("utf-8") if mutations else read_regular(repo, path)
+    paths = [path for path in tracked(repo) if not deleted(path, mutations)]
+    return [path for path in selected_input_paths(paths, read, corpus) if not deleted(path, mutations)]
+
+
+def digest_inputs(paths: list[str], read: Callable[[str], bytes]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        digest.update(path.encode("utf-8") + b"\0" + read(path) + b"\0")
+    return digest.hexdigest()
 
 
 def input_digest(repo: Path, paths: list[str], mutations: dict[str, str] | None = None,
                  tree: str | None = None) -> str:
-    digest = hashlib.sha256()
-    for path in paths:
-        if deleted(path, mutations):
-            continue
-        if tree is None:
-            content = text(repo, path, mutations).encode("utf-8")
-        else:
-            result = subprocess.run(["git", "-C", str(repo), "show", f"{tree}:{path}"], capture_output=True, check=False)
-            required(result.returncode == 0, f"audited source tree omits {path}")
-            content = result.stdout
-        digest.update(path.encode("utf-8") + b"\0" + content + b"\0")
-    return digest.hexdigest()
+    if tree is not None:
+        _, read = tree_reader(repo, tree)
+    else:
+        read = lambda path: text(repo, path, mutations).encode("utf-8") if mutations else read_regular(repo, path)
+    return digest_inputs([path for path in paths if not deleted(path, mutations)], read)
 
 
 def attested_tree_universe(repo: Path, tree: str, corpus: dict[str, Any]) -> set[str]:
-    """Audited paths present in a declared tree, mirroring provenance_paths."""
-    manifests = {str(Path(directory).parent / "Cargo.toml") for directory in OWNER_DIRECTORIES}
-    fixed = {"crates/hyprstream/src/cli/schema_cli.rs", "crates/hyprstream/src/services/mcp_service.rs",
-             "crates/hyprstream/src/services/factories.rs", "crates/hyprstream-rpc-std/src/vfs_mount.rs",
-             ".github/license-boundary.toml", "tools/check-docs-catalog.py", *manifests}
-    universe: set[str] = set()
-    for path in git(repo, "ls-tree", "-r", "--name-only", tree).splitlines():
-        if path.endswith(".capnp") or path.endswith("/build.rs") or path == "build.rs" or path in fixed:
-            universe.add(path)
-        elif path.startswith("docs/") and path.endswith(".md") \
-                and any(path_matches(path, item["glob"]) for item in corpus.get("public_prose", [])) \
-                and not any(path_matches(path, item["glob"]) for item in corpus.get("excluded", [])):
-            universe.add(path)
-        elif (path.endswith((".ts", ".tsx", ".js", ".jsx")) or path == "package.json") \
-                and ts_source_is_consumer(git(repo, "show", f"{tree}:{path}")):
-            universe.add(path)
-    return universe
+    paths, read = tree_reader(repo, tree)
+    return set(selected_input_paths(paths, read, corpus))
+
+
+PROVENANCE_FIELDS = ("provenance_version", "authority", "source_commit", "source_tree", "source_input_digest")
+
+
+def provenance_tuple(record: dict[str, Any]) -> tuple[Any, ...]:
+    required(record.get("provenance_version") == 2, "unsupported provenance policy")
+    required(record.get("authority") == "docs/system-ontology.md", "invalid provenance authority")
+    valid_object_id(record.get("source_commit"), "source_commit")
+    valid_object_id(record.get("source_tree"), "source_tree")
+    required(isinstance(record.get("source_input_digest"), str)
+             and re.fullmatch(r"[0-9a-f]{64}", record["source_input_digest"]) is not None,
+             "invalid source_input_digest")
+    return tuple(record[field] for field in PROVENANCE_FIELDS)
+
+
+def object_exists(repo: Path, oid: str, kind: str) -> bool:
+    # A wrong object type is contradictory evidence, not an unavailable object.
+    result = subprocess.run(["git", "-C", str(repo), "cat-file", "-t", oid], capture_output=True, text=True)
+    if result.returncode != 0:
+        return False
+    required(result.stdout.strip() == kind, f"declared {kind} has the wrong object type")
+    return True
+
+
+def inherited_provenance(repo: Path, boundary: str, record: dict[str, Any], paths: list[str]) -> bool:
+    if not boundary:
+        return False
+    names, read = tree_reader(repo, git(repo, "rev-parse", f"{boundary}^{{tree}}"))
+    manifests = ["docs/schema-catalog.json", "docs/corpus-sources.json"]
+    if not all(path in names for path in manifests):
+        return False
+    try:
+        prior_catalog, prior_corpus = [json.loads(read(path)) for path in manifests]
+        if not all(isinstance(prior, dict) and tuple(prior.get(field) for field in PROVENANCE_FIELDS)
+                   == provenance_tuple(record) for prior in (prior_catalog, prior_corpus)):
+            return False
+        check_publication_policy(prior_corpus)
+        selected = selected_input_paths(names, read, prior_corpus)
+        required(selected == paths, "trusted boundary input universe differs from inherited attestation")
+        required(digest_inputs(selected, read) == record["source_input_digest"],
+                 "trusted boundary inputs do not reproduce inherited digest")
+        return True
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise CatalogError(f"invalid trusted boundary manifest: {error}") from error
+
+
+def recover_source_objects(repo: Path, commit: str) -> None:
+    valid_object_id(commit, "recovery source_commit")
+    origin = git(repo, "remote", "get-url", "origin")
+    # The repository is fixed; a catalog can never choose a fetch URL/refspec.
+    required(origin in {"https://github.com/hyprstream/hyprstream", "https://github.com/hyprstream/hyprstream.git"},
+             "recovery origin is not the trusted repository")
+    try:
+        result = subprocess.run(["git", "-C", str(repo), "fetch", "--no-tags", "--no-write-fetch-head",
+                                 "--no-recurse-submodules", "origin", commit], capture_output=True, text=True,
+                                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, timeout=60)
+    except subprocess.TimeoutExpired as error:
+        raise CatalogError("source recovery timed out; restore the exact source object or re-attest current inputs") from error
+    required(result.returncode == 0 and object_exists(repo, commit, "commit"),
+             "source object unavailable from trusted origin; restore that exact object or re-attest current inputs")
 
 
 def check_provenance(record: dict[str, Any], repo: Path, label: str, corpus: dict[str, Any],
                      mutations: dict[str, str] | None = None, event: str | None = None,
-                     revision: str | None = None) -> None:
-    commit = record.get("source_commit")
-    tree = record.get("source_tree")
-    declared_digest = record.get("source_input_digest")
-    required(isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) is not None, f"{label} has invalid source_commit")
-    required(isinstance(tree, str) and re.fullmatch(r"[0-9a-f]{40}", tree) is not None, f"{label} has invalid source_tree")
-    required(isinstance(declared_digest, str) and re.fullmatch(r"[0-9a-f]{64}", declared_digest) is not None,
-             f"{label} has invalid source_input_digest")
+                     revision: str | None = None, recover: bool = False) -> None:
+    provenance_tuple(record)
+    commit, tree, declared_digest = (record[key] for key in ("source_commit", "source_tree", "source_input_digest"))
     topology, boundary = audited_input(repo, event, revision)
-    # PR checks require the recorded Git pair. Squash/rebase can discard those
-    # PR-only objects, so later push/local checks use the durable selected-input
-    # digest attestation below while still verifying a pair when it is present.
-    pair_exists = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{commit}^{{commit}}"],
-                                 capture_output=True).returncode == 0
-    if topology == "pull_request":
-        required(pair_exists, f"{label} source_commit is unavailable for pull-request attestation")
-    if pair_exists:
-        required(git(repo, "rev-parse", f"{commit}^{{tree}}") == tree,
-                 f"{label} source_tree does not match source_commit")
-    if topology == "pull_request":
-        required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", boundary, commit]).returncode == 0,
-                 f"{label} source_commit is not descended from the trusted {topology} boundary")
-    staged_catalog = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--quiet", "--",
-                                     "docs/schema-catalog.json", "docs/corpus-sources.json"]).returncode != 0
-    required(commit != git(repo, "rev-parse", "HEAD") or staged_catalog,
-             f"{label} source_commit must not self-reference HEAD")
-    required(tree != git(repo, "rev-parse", "HEAD^{tree}") or staged_catalog,
-             f"{label} source_tree must not self-reference HEAD")
+    staged_catalog = topology == "local" and subprocess.run(
+        ["git", "-C", str(repo), "diff", "--cached", "--quiet", "--", "docs/schema-catalog.json", "docs/corpus-sources.json"],
+        capture_output=True).returncode != 0
+    required(commit != git(repo, "rev-parse", "HEAD") or staged_catalog, f"{label} source_commit must not self-reference HEAD")
+    required(tree != git(repo, "rev-parse", "HEAD^{tree}") or staged_catalog, f"{label} source_tree must not self-reference HEAD")
     paths = provenance_paths(repo, corpus, mutations)
-    required(input_digest(repo, paths, mutations) == declared_digest,
-             f"{label} current audited inputs differ from source_input_digest")
-    if pair_exists:
-        removed = sorted(attested_tree_universe(repo, tree, corpus) - set(paths))
-        required(not removed,
-                 f"{label} declared tree attests inputs removed from the current checkout: {', '.join(removed)}")
-    if pair_exists and not mutations:
-        required(input_digest(repo, paths, tree=tree) == declared_digest,
-                 f"{label} source_tree does not reproduce the audited input digest")
+    required(input_digest(repo, paths, mutations) == declared_digest, f"{label} current audited inputs differ from source_input_digest")
+
+    def verify_available() -> bool:
+        pair = object_exists(repo, commit, "commit")
+        if pair:
+            required(git(repo, "rev-parse", f"{commit}^{{tree}}") == tree, f"{label} source_tree does not match source_commit")
+        tree_exists = object_exists(repo, tree, "tree")
+        if tree_exists:
+            selected = attested_tree_universe(repo, tree, corpus)
+            required(not (selected - set(paths)), f"{label} declared tree attests inputs removed from the current checkout")
+            # Source mutations are internal extractor-test inputs only. CLI
+            # production validation never supplies this argument.
+            if not mutations:
+                required(selected == set(paths), f"{label} source tree input universe differs")
+                required(input_digest(repo, paths, tree=tree) == declared_digest,
+                         f"{label} source_tree does not reproduce the audited input digest")
+        return pair and tree_exists
+
+    if verify_available():
+        return
+    if not mutations and inherited_provenance(repo, boundary, record, paths):
+        return
+    required(recover and not mutations, f"{label} lacks verifiable source objects or inherited attestation; use --recover-source-objects")
+    recover_source_objects(repo, commit)
+    required(verify_available(), f"{label} recovered source objects are incomplete")
 
 
 def owner_manifest(repo: Path, schema_path: str, owner_directories: list[str]) -> tuple[str, str, str]:
@@ -586,25 +701,23 @@ def ts_source_is_consumer(source: str) -> bool:
     return False
 
 
+def typescript_consumer(path: str, source: str) -> bool:
+    if path == "package.json":
+        try:
+            package = json.loads(source)
+        except json.JSONDecodeError as error:
+            raise CatalogError("invalid package.json consumer input") from error
+        required(isinstance(package, dict), "package.json must be an object")
+        return any(isinstance(package.get(section), dict) and "@hyprstream/docs" in package[section]
+                   for section in ("dependencies", "devDependencies", "peerDependencies"))
+    return ts_source_is_consumer(source)
+
+
 def typescript_schema_sources(repo: Path, mutations: dict[str, str] | None = None,
                               candidates: list[str] | None = None) -> list[str]:
-    """Select tracked frontend sources importing or requiring a schema dependency."""
     candidates = candidates if candidates is not None else tracked(repo, "*.ts", "*.tsx", "*.js", "*.jsx", "package.json")
-    result = []
-    for path in candidates:
-        source = text(repo, path, mutations)
-        if path == "package.json":
-            try:
-                package = json.loads(source)
-            except json.JSONDecodeError:
-                continue
-            sections = (package.get("dependencies", {}), package.get("devDependencies", {}), package.get("peerDependencies", {}))
-            if any("@hyprstream/docs" in section for section in sections if isinstance(section, dict)):
-                result.append(path)
-            continue
-        if ts_source_is_consumer(source):
-            result.append(path)
-    return sorted(result)
+    return sorted(path for path in candidates if not deleted(path, mutations)
+                  and typescript_consumer(path, text(repo, path, mutations)))
 
 
 def split_top_level(value: str) -> list[str]:
@@ -861,6 +974,11 @@ def schema_method_metadata(repo: Path, schemas: list[dict[str, Any]],
         body = block(source, f"struct {struct}")
         union = block(body, "union")
         return {name: type_name for name, type_name in re.findall(r"(?m)^\s*(\w+)\s+@\d+\s*:\s*(\w+(?:\.\w+)*)", union)}
+    def hidden_fields(source: str, struct: str) -> list[str]:
+        union = block(block(source, f"struct {struct}"), "union")
+        return [name for name, annotations in re.findall(
+            r"(?m)^\s*(\w+)\s+@\d+\s*:\s*\w+(?:\.\w+)*([^;]*);", union)
+                if re.search(r"\$cliHidden\b", annotations)]
     hidden, streaming = [], []
     for entry in schemas:
         service = entry.get("service")
@@ -877,18 +995,13 @@ def schema_method_metadata(repo: Path, schemas: list[dict[str, Any]],
             imported = re.match(r'\s*"(/?streaming\.capnp)"\s*;', import_source[match.end():])
             if imported:
                 stream_types.add(f"{match.group(1)}.StreamInfo")
-        hidden.extend(
-            f"{service}.{method}"
-            for method in re.findall(
-                r"(?ms)^\s*([A-Za-z][A-Za-z0-9_]*)\s+@\d+\s*:(?:(?!^\s*[A-Za-z][A-Za-z0-9_]*\s+@\d+).)*?\$cliHidden\b[^;]*;", source
-            )
-        )
         pascal = "".join(part.capitalize() for part in service.split("-"))
         if f"struct {pascal}Request" not in source:
             continue
         request, response = fields(source, f"{pascal}Request"), fields(source, f"{pascal}Response")
+        hidden.extend(f"{service}.{method}" for method in hidden_fields(source, f"{pascal}Request"))
         streaming.extend(f"{service}.{method}" for method in request if response.get(f"{method}Result") in stream_types)
-        def nested_streams(request_fields: dict[str, str], response_fields: dict[str, str], seen: set[tuple[str, str]]) -> list[str]:
+        def nested_streams(request_fields: dict[str, str], response_fields: dict[str, str], seen: set[tuple[str, str]], prefix: str) -> list[str]:
             result: list[str] = []
             for scope, request_type in request_fields.items():
                 response_type = response_fields.get(f"{scope}Result")
@@ -899,19 +1012,20 @@ def schema_method_metadata(repo: Path, schemas: list[dict[str, Any]],
                     nested_request, nested_response = fields(source, request_type), fields(source, response_type)
                 except CatalogError:
                     continue
+                hidden.extend(f"{prefix}.{scope}.{method}" for method in hidden_fields(source, request_type))
                 result.extend(f"{scope}.{method}" for method in nested_request if nested_response.get(method) in stream_types)
-                result.extend(f"{scope}.{method}" for method in nested_streams(nested_request, nested_response, path_seen))
+                result.extend(f"{scope}.{method}" for method in nested_streams(nested_request, nested_response, path_seen, f"{prefix}.{scope}"))
             return result
-        streaming.extend(f"{service}.{method}" for method in nested_streams(request, response, set()))
+        streaming.extend(f"{service}.{method}" for method in nested_streams(request, response, set(), service))
     return {"cli_hidden": sorted(hidden), "streaming": sorted(streaming)}
 
 
 def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list[str],
                          consumers: dict[str, dict[str, Any]], corpus: dict[str, Any], mutations: dict[str, str] | None,
-                         event: str | None = None, revision: str | None = None) -> None:
+                         event: str | None = None, revision: str | None = None, recover: bool = False) -> None:
     required(catalog.get("schema_version") == 1, "schema catalog must use schema_version 1")
     required(catalog.get("authority") == "docs/system-ontology.md", "system ontology must remain authoritative")
-    check_provenance(catalog, repo, "schema catalog", corpus, mutations, event, revision)
+    check_provenance(catalog, repo, "schema catalog", corpus, mutations, event, revision, recover)
     schemas = catalog.get("schemas")
     required(isinstance(schemas, list), "catalog.schemas must be a list")
     paths = [entry.get("path") for entry in schemas]
@@ -1014,10 +1128,23 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
                 required(service in record[key], f"{service} claims {surface} activity without source registration")
 
 
+def check_publication_policy(corpus: dict[str, Any]) -> None:
+    public, excluded = corpus.get("public_prose", []), corpus.get("excluded", [])
+    required({item.get("glob") for item in public} == PUBLIC_GLOBS, "public prose allowlist widened or incomplete")
+    for item in public:
+        required(item.get("license") == "AGPL-3.0-only", f"{item.get('glob')} lacks exact SPDX license")
+        required(isinstance(item.get("provenance"), str) and item["provenance"].startswith("tracked first-party repository"), "public prose provenance drift")
+    required(all(isinstance(item, dict) and isinstance(item.get("glob"), str)
+                 and isinstance(item.get("reason"), str) and item["reason"].strip() for item in excluded),
+             "every exclusion requires a nonempty reason")
+    required(len({item["glob"] for item in excluded}) == len(excluded), "duplicate exclusion glob")
+    required({item.get("glob"): item.get("reason") for item in excluded} == EXCLUSIONS, "corpus exclusions or reasons drift")
+
+
 def check_corpus(corpus: dict[str, Any], repo: Path, mutations: dict[str, str] | None = None,
-                 event: str | None = None, revision: str | None = None) -> None:
+                 event: str | None = None, revision: str | None = None, recover: bool = False) -> None:
     required(corpus.get("schema_version") == 1 and corpus.get("authority") == "docs/system-ontology.md", "invalid corpus authority/version")
-    check_provenance(corpus, repo, "corpus catalog", corpus, mutations, event, revision)
+    check_provenance(corpus, repo, "corpus catalog", corpus, mutations, event, revision, recover)
     for name in ("api_manifest", "corpus_manifest"):
         record = corpus.get(name, {})
         required(record.get("version") == 1 and isinstance(record.get("limit_bytes"), int) and record["limit_bytes"] > 0, f"invalid {name}")
@@ -1026,12 +1153,8 @@ def check_corpus(corpus: dict[str, Any], repo: Path, mutations: dict[str, str] |
              "API manifest contract drift")
     required(corpus["corpus_manifest"] == {"version": 1, "path": "corpus/v1/{document_id}.md", "id": "doc:{repository-relative-path}", "integrity": "sha256 of source bytes", "limit_bytes": 2097152},
              "corpus manifest contract drift")
-    public, excluded = corpus.get("public_prose", []), corpus.get("excluded", [])
-    required({item.get("glob") for item in public} == PUBLIC_GLOBS, "public prose allowlist widened or incomplete")
-    for item in public:
-        required(item.get("license") == "AGPL-3.0-only", f"{item.get('glob')} lacks exact SPDX license")
-        required(isinstance(item.get("provenance"), str) and item["provenance"].startswith("tracked first-party repository"), "public prose provenance drift")
-    required({item.get("glob"): item.get("reason") for item in excluded} == EXCLUSIONS, "corpus exclusions or reasons drift")
+    check_publication_policy(corpus)
+    public, excluded = corpus["public_prose"], corpus["excluded"]
     package = corpus.get("package_contract", {})
     required(package.get("name") == "@hyprstream/docs" and package.get("state") == "declared-not-yet-published", "invalid docs package contract")
     required(package.get("requirements") == PACKAGE_REQUIREMENTS, "docs package requirements drift")
@@ -1045,17 +1168,19 @@ def check_corpus(corpus: dict[str, Any], repo: Path, mutations: dict[str, str] |
 
 def validate(repo: Path, catalog: dict[str, Any] | None = None, corpus: dict[str, Any] | None = None,
              schema_paths: list[str] | None = None, consumers: dict[str, dict[str, Any]] | None = None,
-             mutations: dict[str, str] | None = None, event: str | None = None, revision: str | None = None) -> None:
-    catalog = catalog or read_json(repo / "docs/schema-catalog.json")
-    corpus = corpus or read_json(repo / "docs/corpus-sources.json")
+             mutations: dict[str, str] | None = None, event: str | None = None, revision: str | None = None,
+             recover: bool = False) -> None:
+    catalog = catalog or read_json(repo / "docs/schema-catalog.json", repo)
+    corpus = corpus or read_json(repo / "docs/corpus-sources.json", repo)
+    required(provenance_tuple(catalog) == provenance_tuple(corpus), "catalog/corpus provenance tuples differ")
     derived_consumers = source_services(repo, mutations)
     if consumers is not None:
         required(consumers == derived_consumers, "consumer inventory is not derived from current source state")
     check_schema_catalog(
         catalog, repo, schema_paths or tracked(repo, "*.capnp"),
-        derived_consumers, corpus, mutations, event, revision,
+        derived_consumers, corpus, mutations, event, revision, recover,
     )
-    check_corpus(corpus, repo, mutations, event, revision)
+    check_corpus(corpus, repo, mutations, event, revision, recover)
     required("docs/system-ontology.md" in text(repo, "docs/contracts/docs-pipeline.md", None), "pipeline contract omits ontology authority")
 
 
@@ -1115,7 +1240,7 @@ def expect_cgr_failure(name: str, build_file: str, source: str) -> None:
 
 
 def self_test(repo: Path) -> None:
-    catalog, corpus = read_json(repo / "docs/schema-catalog.json"), read_json(repo / "docs/corpus-sources.json")
+    catalog, corpus = read_json(repo / "docs/schema-catalog.json", repo), read_json(repo / "docs/corpus-sources.json", repo)
     schemas, consumers = tracked(repo, "*.capnp"), source_services(repo)
     validate(repo, catalog, corpus, schemas, consumers)
     # PR-topology probes need a derivable merge-base: hosted PR runs always
@@ -1285,11 +1410,11 @@ def self_test(repo: Path) -> None:
     hidden_removed = text(repo, worker_path, None).replace("$cliHidden ", "", 1)
     expect_failure("schema hidden annotation", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: hidden_removed})
     hidden_comment = text(repo, worker_path, None).replace("$cliHidden", "# $cliHidden", 1)
-    required("worker.attach" not in schema_method_metadata(repo, catalog["schemas"], {worker_path: hidden_comment})["cli_hidden"],
+    required("worker.container.attach" not in schema_method_metadata(repo, catalog["schemas"], {worker_path: hidden_comment})["cli_hidden"],
              "comment-only hidden annotation drift")
     expect_failure("schema hidden comment decoy", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: hidden_comment})
     hidden_literal = text(repo, worker_path, None).replace("$cliHidden", '$mutationSemantics("$cliHidden")', 1)
-    required("worker.attach" not in schema_method_metadata(repo, catalog["schemas"], {worker_path: hidden_literal})["cli_hidden"],
+    required("worker.container.attach" not in schema_method_metadata(repo, catalog["schemas"], {worker_path: hidden_literal})["cli_hidden"],
              "literal-only hidden annotation drift")
     expect_failure("schema hidden literal decoy", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: hidden_literal})
     discovery_build = "crates/hyprstream-discovery/build.rs"
@@ -1544,11 +1669,12 @@ def self_test(repo: Path) -> None:
     # landing validates even though the boundary omits attested paths.
     landing_boundary = pr_base if has_pr_boundary else git(repo, "rev-parse", "HEAD~1")
     validate(repo, catalog, corpus, schemas, consumers, event="push", revision=landing_boundary)
-    # A squash landing discards the branch's commits: the declared pair no
-    # longer exists and only the durable digest attestation remains.
+    # Missing/forged source objects are never accepted on digest alone. Real
+    # recovery and trusted inheritance are exercised in the isolated fixtures.
     squashed = copy.deepcopy(catalog)
     squashed["source_commit"], squashed["source_tree"] = "f" * 40, "f" * 40
-    validate(repo, squashed, corpus, schemas, consumers, event="push", revision=landing_boundary)
+    expect_event_failure("unverified squash provenance", repo, squashed, corpus, schemas,
+                         consumers, "push", landing_boundary)
     # A landing commit cannot attest itself.
     if committed:
         bad = copy.deepcopy(catalog)
@@ -1560,19 +1686,24 @@ def self_test(repo: Path) -> None:
             pass
         else:
             raise AssertionError("mutation probe modeled landing push provenance unexpectedly passed")
-    print("docs catalog mutation probes: passed (all expected failures plus modeled merge/squash/rebase main push)")
+    print("docs catalog mutation probes: passed (all expected failures plus modeled landing push)")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--recover-source-objects", action="store_true")
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args()
     try:
-        (self_test if args.self_test else validate)(args.repo.resolve())
+        if args.self_test:
+            required(not args.recover_source_objects, "self-tests never recover source objects")
+            self_test(args.repo.resolve())
+        else:
+            validate(args.repo.resolve(), recover=args.recover_source_objects)
         if not args.self_test:
             print("docs catalog: OK")
-    except (CatalogError, AssertionError) as error:
+    except (CatalogError, AssertionError, UnicodeError) as error:
         print(f"docs catalog: FAILED: {error}", file=sys.stderr)
         return 1
     return 0
