@@ -3636,10 +3636,7 @@ impl SamplingParams {
     ///
     /// Applies `SamplingParams` fields as `Option<T>` — `None` means "not specified",
     /// letting the engine use its defaults.
-    pub fn into_generation_request(
-        self,
-        prompt: String,
-    ) -> crate::services::generated::inference_client::GenerationRequest {
+    pub fn into_generation_request(self, prompt: String) -> crate::services::generated::inference_client::GenerationRequest {
         crate::services::generated::inference_client::GenerationRequest {
             prompt,
             max_tokens: self.max_tokens.map(|v| v as u32),
