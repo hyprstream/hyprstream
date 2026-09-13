@@ -25,4 +25,7 @@ docs/.obsidian/
 
 # CI browser-conformance runtime receipt (written by browser-wasm-test.sh)
 browser-wasm-receipt.txt
+
+# Python bytecode from scripts/ + scripts/tests/ (CI and local unittest runs)
 __pycache__/
+*.pyc

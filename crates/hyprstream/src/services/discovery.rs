@@ -508,7 +508,14 @@ impl PdsRecordStore {
         let d = sha2::Sha256::digest(repo_id.as_bytes());
         let micros = u64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]);
         let clock_id = u16::from_be_bytes([d[8], d[9]]);
-        Tid::from_micros(micros, clock_id)
+        // Preserve the spelling already stored in RocksDB and signed into
+        // native MSTs before the public TID codec correction. The old codec
+        // encoded this 63-bit hash as base32(raw << 1). Lift the derivation
+        // into the corrected integer representation, rather than changing
+        // existing keys or teaching the public parser an ambiguous format.
+        // from_micros always leaves bit 63 clear, so this shift cannot lose
+        // entropy or exceed the public TID's 64-bit range.
+        Tid::from_raw(Tid::from_micros(micros, clock_id).to_raw() << 1)
     }
 
     /// Load the full record set + signed commit for `did`, or `None` if the
@@ -2673,6 +2680,116 @@ mod pds_store_tests {
                 publisher.publish_record(bad, "repo-a", SAMPLE_OID).is_err(),
                 "collection {bad:?} must be rejected"
             );
+        }
+    }
+
+    // Frozen spellings from the pre-correction base32(raw << 1) codec.
+    // In particular repo-a exercises bit 63 of the corrected representation.
+    const LEGACY_RKEYS: [(&str, &str); 3] = [
+        ("repo-a", "i4pvpmy7trq2g"),
+        ("repo-b", "42al4ks2j6lfu"),
+        ("name-a", "65wkrauzdcfsw"),
+    ];
+
+    #[test]
+    fn tid_for_repo_preserves_legacy_storage_spelling() {
+        for (id, spelling) in LEGACY_RKEYS {
+            let tid = PdsRecordStore::tid_for_repo(id);
+            assert_eq!(tid.encode(), spelling);
+            assert_eq!(Tid::parse(spelling).unwrap(), tid);
+            assert_eq!(tid.to_raw() & 1, 0);
+        }
+        assert!(PdsRecordStore::tid_for_repo("repo-a").to_raw() > i64::MAX as u64);
+    }
+
+    #[test]
+    fn legacy_store_upgrade_preserves_keys_and_republishes_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let vk = *sk.verifying_key();
+        let collections = [COLLECTION_NSID, COLLECTION_NSID, NAME_COLLECTION];
+        let record = ModelRecord::new(
+            format!("at://{DID}"),
+            git_oid_to_cid_string(SAMPLE_OID).unwrap(),
+            "2026-07-19T00:00:00.000Z",
+        )
+        .unwrap();
+        // Seed the pre-upgrade wire/disk representation directly: no current
+        // tid_for_repo, record_key, or build_tree helper can mask a regression.
+        let mut keyed = BTreeMap::new();
+        let mut expected_keys = std::collections::BTreeSet::new();
+        let legacy_commit = {
+            let db = rocksdb::DB::open_default(dir.path()).unwrap();
+            let mut batch = rocksdb::WriteBatch::default();
+            for ((_, spelling), collection) in LEGACY_RKEYS.iter().zip(collections) {
+                let key = format!("rk\0{DID}\0{collection}\0{spelling}").into_bytes();
+                batch.put(&key, record.to_dag_cbor());
+                expected_keys.insert(key);
+                keyed.insert(format!("{collection}/{spelling}"), record.cid());
+            }
+            let root = Node::from_keyed_records(&keyed).root_cid();
+            // Parsing the old on-wire revision preserves its exact signed
+            // bytes even though the codec's internal raw representation changed.
+            let commit = Commit::sign(
+                &UnsignedCommit::new(
+                    DID.to_owned(),
+                    root,
+                    Tid::parse("3jzfcijpj2z2a").unwrap(),
+                    None,
+                ),
+                &sk,
+            );
+            batch.put(format!("commit\0{DID}"), commit.to_dag_cbor());
+            db.write(batch).unwrap();
+            commit
+        };
+        let mut previous = legacy_commit.cid();
+        for oid in [SAMPLE_OID_2, SAMPLE_OID] {
+            let store = Arc::new(PdsRecordStore::open(dir.path()).unwrap());
+            let loaded = store.load_repo(DID).unwrap().unwrap();
+            assert_eq!(loaded.commit.cid(), previous);
+            assert_eq!(loaded.records.len(), LEGACY_RKEYS.len());
+            assert_eq!(
+                PdsRecordStore::build_tree(&loaded.records).root_cid(),
+                loaded.commit.data
+            );
+            loaded.commit.verify(&vk).unwrap();
+            for ((id, _), collection) in LEGACY_RKEYS.iter().zip(collections) {
+                resolve_and_verify(&store, &vk, collection, id);
+            }
+            let publisher =
+                PdsPublisher::new(store.clone(), DID.to_owned(), test_es256_store(sk.clone()));
+            for ((id, spelling), collection) in LEGACY_RKEYS.iter().zip(collections) {
+                publisher.publish_record(collection, id, oid).unwrap();
+                let repo = store.load_repo(DID).unwrap().unwrap();
+                assert_eq!(repo.records.len(), LEGACY_RKEYS.len());
+                assert_eq!(repo.commit.prev, Some(previous));
+                assert_eq!(
+                    repo.records[&(collection.to_owned(), Tid::parse(spelling).unwrap())]
+                        .current_oid,
+                    git_oid_to_cid_string(oid).unwrap()
+                );
+                resolve_and_verify(&store, &vk, collection, id);
+                previous = repo.commit.cid();
+            }
+            let RecordBacking::ReadWrite(db) = &store.backing else {
+                unreachable!()
+            };
+            let actual_keys: std::collections::BTreeSet<_> = db
+                .prefix_iterator(record_prefix(DID))
+                .map(|entry| entry.unwrap().0.to_vec())
+                .take_while(|key| key.starts_with(&record_prefix(DID)))
+                .collect();
+            assert_eq!(
+                actual_keys, expected_keys,
+                "upgrade must overwrite the original keys"
+            );
+            drop(publisher);
+            drop(store);
+            let readonly = Arc::new(PdsRecordStore::open_readonly(dir.path()).unwrap());
+            for ((id, _), collection) in LEGACY_RKEYS.iter().zip(collections) {
+                resolve_and_verify(&readonly, &vk, collection, id);
+            }
         }
     }
 

@@ -860,13 +860,21 @@ def schema_method_metadata(repo: Path, schemas: list[dict[str, Any]],
     def fields(source: str, struct: str) -> dict[str, str]:
         body = block(source, f"struct {struct}")
         union = block(body, "union")
-        return {name: type_name for name, type_name in re.findall(r"(?m)^\s*(\w+)\s+@\d+\s*:\s*(\w+)", union)}
+        return {name: type_name for name, type_name in re.findall(r"(?m)^\s*(\w+)\s+@\d+\s*:\s*(\w+(?:\.\w+)*)", union)}
     hidden, streaming = [], []
     for entry in schemas:
         service = entry.get("service")
         if not service:
             continue
-        source = strip_capnp_noncode(text(repo, entry["path"], mutations))
+        raw_source = text(repo, entry["path"], mutations)
+        source = strip_capnp_noncode(raw_source)
+        stream_types = {"StreamInfo"}
+        # Import paths are masked by the lexer; recover only the string at a
+        # syntactically active import, never a comment or annotation decoy.
+        for match in re.finditer(r"\busing\s+(\w+)\s*=\s*import\b", source):
+            imported = re.match(r'\s+"(/?streaming\.capnp)"\s*;', raw_source[match.end():])
+            if imported:
+                stream_types.add(f"{match.group(1)}.StreamInfo")
         hidden.extend(
             f"{service}.{method}"
             for method in re.findall(
@@ -877,20 +885,20 @@ def schema_method_metadata(repo: Path, schemas: list[dict[str, Any]],
         if f"struct {pascal}Request" not in source:
             continue
         request, response = fields(source, f"{pascal}Request"), fields(source, f"{pascal}Response")
-        streaming.extend(f"{service}.{method}" for method in request if response.get(f"{method}Result") == "StreamInfo")
+        streaming.extend(f"{service}.{method}" for method in request if response.get(f"{method}Result") in stream_types)
         def nested_streams(request_fields: dict[str, str], response_fields: dict[str, str], seen: set[tuple[str, str]]) -> list[str]:
             result: list[str] = []
             for scope, request_type in request_fields.items():
                 response_type = response_fields.get(f"{scope}Result")
                 if not (request_type.endswith("Request") and response_type and response_type.endswith("Response")) or (request_type, response_type) in seen:
                     continue
-                seen.add((request_type, response_type))
+                path_seen = seen | {(request_type, response_type)}
                 try:
                     nested_request, nested_response = fields(source, request_type), fields(source, response_type)
                 except CatalogError:
                     continue
-                result.extend(method for method in nested_request if nested_response.get(method) == "StreamInfo")
-                result.extend(nested_streams(nested_request, nested_response, seen))
+                result.extend(f"{scope}.{method}" for method in nested_request if nested_response.get(method) in stream_types)
+                result.extend(f"{scope}.{method}" for method in nested_streams(nested_request, nested_response, path_seen))
             return result
         streaming.extend(f"{service}.{method}" for method in nested_streams(request, response, set()))
     return {"cli_hidden": sorted(hidden), "streaming": sorted(streaming)}
@@ -1380,6 +1388,15 @@ def self_test(repo: Path) -> None:
     model_path = "crates/hyprstream-rpc-std/schema/model.capnp"
     model_drift = text(repo, model_path, None).replace("generateStream @1 :StreamInfo", "generateStream @1 :Text", 1)
     expect_failure("scoped model streaming response", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {model_path: model_drift})
+    qualified_model = text(repo, model_path, None).replace(
+        'using import "/streaming.capnp".StreamInfo;',
+        'using Streaming = import "/streaming.capnp";',
+    ).replace(":StreamInfo", ":Streaming.StreamInfo")
+    required(schema_method_metadata(repo, catalog["schemas"], {model_path: qualified_model})
+             == schema_method_metadata(repo, catalog["schemas"], None),
+             "qualified streaming type changes method identity")
+    expect_success("qualified streaming import", repo, catalog, corpus, schemas,
+                   {model_path: qualified_model})
     worker_drift = text(repo, worker_path, None).replace("attach @10 :StreamInfo", "attach @10 :Text", 1)
     expect_failure("scoped worker streaming response", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: worker_drift})
     registry_path = "crates/hyprstream-rpc-std/schema/registry.capnp"
@@ -1394,8 +1411,18 @@ def self_test(repo: Path) -> None:
         1,
     )
     deep_metadata = schema_method_metadata(repo, catalog["schemas"], {registry_path: deep_stream})
-    required("registry.deepStream" in deep_metadata["streaming"],
+    required("registry.repo.worktree.deepStream" in deep_metadata["streaming"],
              "deeply scoped streaming extractor drift")
+    shared_scope = deep_stream.replace(
+        "repo @9 :RepositoryRequest", "mirror @98 :RepositoryRequest;\n    repo @9 :RepositoryRequest",
+    ).replace(
+        "repoResult @10 :RepositoryResponse;",
+        "mirrorResult @98 :RepositoryResponse;\n    repoResult @10 :RepositoryResponse;",
+    )
+    shared_metadata = schema_method_metadata(repo, catalog["schemas"], {registry_path: shared_scope})
+    required({"registry.repo.worktree.deepStream", "registry.mirror.worktree.deepStream"}
+             <= set(shared_metadata["streaming"]),
+             "shared request/response types lose distinct scope identities")
     expect_failure("deeply scoped streaming response", repo, copy.deepcopy(catalog), corpus, schemas,
                    consumers, {registry_path: deep_stream})
     for name, path, decoy in [

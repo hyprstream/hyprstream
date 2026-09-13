@@ -218,9 +218,8 @@ impl Commit {
         Self::validate_atproto_fields(&value)?;
         let commit = Self::from_value(&value)?;
         // Public verification must bind the exact canonical block bytes. In
-        // particular, Tid::parse normalizes the final base32 bit; without
-        // this round-trip check, two distinct `rev` encodings could decode to
-        // one value and share signature verification.
+        // particular, decoding and re-encoding the revision must preserve
+        // its exact text; no alternate field encoding may share verification.
         ensure!(
             commit.to_atproto_dag_cbor()?.as_slice() == bytes,
             "public commit bytes are not canonical"
@@ -729,32 +728,43 @@ mod tests {
     }
 
     #[test]
-    fn public_commit_rejects_noncanonical_tid_rev_bytes() {
-        let (commit, _vk) = make_signed_commit();
-        let canonical = commit
-            .to_atproto_dag_cbor()
-            .expect("canonical public commit");
-        let mut value = crate::atproto_cbor::decode(&canonical).expect("decode public commit");
-        let mut fields = value.as_map().expect("commit map").to_vec();
+    fn public_commit_preserves_odd_tid_revisions_and_rejects_changed_signature_input() {
+        let key = SigningKey::random(&mut rand::rngs::OsRng);
+        let unsigned = UnsignedCommit::new(
+            "did:web:alice.example.com",
+            Cid::from_dag_cbor(b"root"),
+            Tid::parse("3jzfcijpj2z2a").unwrap(),
+            None,
+        );
+        let commit = Commit::sign_atproto(&unsigned, &key).unwrap();
+        let mut fields = commit.to_value().as_map().unwrap().to_vec();
         let rev = fields
             .iter_mut()
             .find(|(key, _)| matches!(key, DagCbor::Text(name) if name == "rev"))
-            .expect("rev field");
-        let mut rev_text = rev.1.as_str().expect("rev text").to_owned();
-        let last = rev_text.pop().expect("tid digit");
-        let replacement = match last {
-            '2' => '3',
-            '3' => '2',
-            _ => panic!("test TID must end in 2 or 3, got {last}"),
-        };
-        rev_text.push(replacement);
-        rev.1 = DagCbor::Text(rev_text);
-        value = DagCbor::Map(fields);
-        let tampered = crate::atproto_cbor::encode(&value).expect("encode tampered commit");
-        assert!(
-            Commit::from_atproto_dag_cbor(&tampered).is_err(),
-            "public decoder must reject a rev encoding that normalizes to a different byte form"
-        );
+            .unwrap();
+        rev.1 = DagCbor::Text("3jzfcijpj2z2b".into());
+        let changed = crate::atproto_cbor::encode(&DagCbor::Map(fields.clone())).unwrap();
+        let decoded = Commit::from_atproto_dag_cbor(&changed).unwrap();
+        assert_eq!(decoded.rev.encode(), "3jzfcijpj2z2b");
+        assert_eq!(decoded.to_atproto_dag_cbor().unwrap(), changed);
+        assert!(decoded.verify_atproto(key.verifying_key()).is_err());
+        let signed_odd = Commit::sign_atproto(&decoded.unsigned(), &key).unwrap();
+        Commit::from_atproto_dag_cbor(&signed_odd.to_atproto_dag_cbor().unwrap())
+            .unwrap()
+            .verify_atproto(key.verifying_key())
+            .unwrap();
+        for invalid in ["kjzfcijpj2z2a", "3JZFCIJPJ2Z2B"] {
+            let mut fields = fields.clone();
+            fields
+                .iter_mut()
+                .find(|(key, _)| matches!(key, DagCbor::Text(name) if name == "rev"))
+                .unwrap()
+                .1 = DagCbor::Text(invalid.into());
+            assert!(Commit::from_atproto_dag_cbor(
+                &crate::atproto_cbor::encode(&DagCbor::Map(fields)).unwrap()
+            )
+            .is_err());
+        }
     }
 
     #[test]

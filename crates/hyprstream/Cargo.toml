@@ -97,6 +97,10 @@ bincode.workspace = true
 tokio-stream.workspace = true
 hex.workspace = true
 chrono.workspace = true
+# Lexicon string constraints: grapheme clusters, BCP47 and RFC3986 syntax.
+unicode-segmentation = "=1.12.0"
+language-tags = "0.3.2"
+uriparse = "0.6.4"
 async-stream.workspace = true
 anyhow.workspace = true
 sha2.workspace = true  # SHA256 validation for LFS files
