@@ -1023,16 +1023,8 @@ pub async fn get_session(
             "native account returned an invalid handle",
         );
     }
-    if let Some(status) = info.status.as_deref() {
-        if !matches!(status, "takendown" | "suspended" | "deactivated") {
-            tracing::error!(did = %claims.sub, %status, "ATProto session resolver returned invalid status");
-            return xrpc_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                errors::INTERNAL_SERVER_ERROR,
-                "native account returned an invalid status",
-            );
-        }
-    }
+    // The getSession lexicon's status knownValues are an open string set.
+    // Preserve the trusted native authority's lifecycle reason verbatim.
     let mut body = json!({
         "handle": handle,
         "did": claims.sub,
@@ -4156,6 +4148,78 @@ mod tests {
                     "message": "native account returned an invalid handle",
                 }), "malformed authority value must not leak into the fixed error");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn router_get_session_preserves_open_lifecycle_status() {
+        struct LifecycleProbe(parking_lot::Mutex<Option<String>>);
+
+        #[async_trait::async_trait]
+        impl AtprotoSessionResolver for LifecycleProbe {
+            async fn resolve_session(
+                &self,
+                did: &str,
+            ) -> anyhow::Result<Option<AtprotoSessionInfo>> {
+                assert_eq!(did, "did:web:pub.example.com");
+                Ok(Some(AtprotoSessionInfo {
+                    handle: "pub.example.com".to_owned(),
+                    active: false,
+                    status: self.0.lock().clone(),
+                    ..Default::default()
+                }))
+            }
+        }
+
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let mut state = build_test_state(true).await;
+        let probe = Arc::new(LifecycleProbe(parking_lot::Mutex::new(None)));
+        Arc::get_mut(&mut state).unwrap().atproto_session_resolver = Some(probe.clone());
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]);
+        Arc::get_mut(&mut state).unwrap().verifying_key_bytes = key.verifying_key().to_bytes();
+        let issuer = state.atproto_issuer_url();
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "did:web:pub.example.com".to_owned(),
+            now,
+            now + 3600,
+        )
+        .with_issuer(issuer.clone())
+        .with_audience(Some(issuer))
+        .with_tenant("session-tests".to_owned())
+        .with_client_id("session-tests")
+        .with_scope(Some("atproto".to_owned()))
+        .with_jti();
+        let token = hyprstream_rpc::auth::jwt::encode(&claims, &key);
+        let app = build_production_app_from_state(state).await;
+        // The vendored getSession lexicon defines knownValues, not enum:
+        // lifecycle strings from the trusted native authority remain open.
+        for status in [
+            None,
+            Some("takendown"),
+            Some("suspended"),
+            Some("deactivated"),
+            Some("Pending-Reactivation.v2"),
+        ] {
+            *probe.0.lock() = status.map(str::to_owned);
+            let request = HttpRequest::builder()
+                .uri("/xrpc/com.atproto.server.getSession")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "status {status:?}");
+            let mut expected = json!({
+                "did": "did:web:pub.example.com", "handle": "pub.example.com", "active": false,
+            });
+            if let Some(status) = status {
+                expected["status"] = json!(status);
+            }
+            assert_eq!(resp_json(response).await, expected);
         }
     }
 
