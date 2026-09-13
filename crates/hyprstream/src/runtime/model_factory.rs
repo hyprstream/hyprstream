@@ -30,6 +30,50 @@ fn strict_loader_enabled() -> bool {
         .unwrap_or(false)
 }
 
+// Match safetensors' header bound. Only metadata is read during the MTP
+// preflight; checkpoint tensor payloads are left to the existing loader.
+const MTP_HEADER_LIMIT: usize = 100_000_000;
+
+fn mtp_header_len(prefix: &[u8]) -> Result<usize> {
+    let encoded: [u8; 8] = prefix
+        .try_into()
+        .context("truncated safetensors header length")?;
+    let len = usize::try_from(u64::from_le_bytes(encoded))?;
+    anyhow::ensure!(
+        len <= MTP_HEADER_LIMIT,
+        "safetensors header exceeds metadata limit"
+    );
+    Ok(len)
+}
+
+fn mtp_config_supported(config: &serde_json::Value) -> bool {
+    // Qwen checkpoints may store these fields at the root or in text_config.
+    // A declared unsupported layout must win over absent/default fields.
+    [config, &config["text_config"]].into_iter().all(|cfg| {
+        !cfg["model_type"]
+            .as_str()
+            .is_some_and(|name| name.contains("moe"))
+            && cfg["num_experts"].as_u64().unwrap_or(0) == 0
+            && cfg
+                .get("mtp_num_hidden_layers")
+                .is_none_or(|n| n.as_u64() == Some(1))
+    })
+}
+
+fn mtp_header_supported(header: &[u8]) -> Result<bool> {
+    let entries: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(header)?;
+    Ok(entries.keys().all(|name| {
+        if !name.starts_with("mtp.") {
+            return true;
+        }
+        !name.contains(".experts.")
+            && !name.contains(".shared_expert.")
+            && name
+                .strip_prefix("mtp.layers.")
+                .is_none_or(|layer| layer.starts_with("0."))
+    }))
+}
+
 /// Materialize every FP8 weight in `weights` as BF16 once, applying the
 /// companion block-wise `<name>_scale_inv` scales during the conversion, and
 /// drop the scale tensors. Gated by `HYPRSTREAM_FP8_DEQUANT_LOAD` /
@@ -303,7 +347,8 @@ impl ModelFactory {
     /// `device`). At runtime this depends on #405 (from_weights device-placement
     /// fix) to actually place per-layer tensors on non-primary devices.
     /// `speculative_decoding` is the resolved runtime policy (including TOML).
-    /// When false, MTP weights are skipped before any device allocation.
+    /// When false, or config/checkpoint metadata declares an unsupported MTP
+    /// layout, draft weights are skipped before any tensor/device allocation.
     #[instrument(name = "model_factory.create", skip(device, dtype, device_pool), fields(model_path = %model_path.display()))]
     pub async fn create(
         model_path: &Path,
@@ -339,6 +384,17 @@ impl ModelFactory {
 
         // Check if we have sharded files that need incremental loading
         let shard_files = Self::find_shard_files(model_path)?;
+
+        // Decide eligibility across the whole checkpoint before the first
+        // shard can allocate a draft tensor. A later shard may reveal layer 1.
+        let mtp_shards = if shard_files.len() <= 1 && model_path.join("model.safetensors").exists() {
+            vec![model_path.join("model.safetensors")]
+        } else {
+            shard_files.clone()
+        };
+        let speculative_decoding = Self::mtp_loading_policy(
+            model_path, &mtp_shards, speculative_decoding,
+        ).await?;
 
         if !shard_files.is_empty() && shard_files.len() > 1 {
             // Use incremental loading for large sharded models
@@ -1021,6 +1077,75 @@ impl ModelFactory {
             loaded_bytes
         );
         Ok(weights)
+    }
+
+    async fn mtp_config_policy(model_path: &Path) -> Result<bool> {
+        match tokio::fs::read(model_path.join("config.json")).await {
+            Ok(bytes) => Ok(mtp_config_supported(&serde_json::from_slice(&bytes)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Preflight all shard headers before materializing any MTP tensor. The
+    /// same resolved bytes/LFS handling as normal loading are used locally.
+    async fn mtp_loading_policy(
+        model_path: &Path,
+        shards: &[PathBuf],
+        requested: bool,
+    ) -> Result<bool> {
+        if !requested {
+            return Ok(false);
+        }
+        if !Self::mtp_config_policy(model_path).await? {
+            return Ok(false);
+        }
+        for shard in shards {
+            let resolved = Self::resolve_weight_for_digest(shard).await?;
+            let supported = tokio::task::spawn_blocking(move || -> Result<bool> {
+                use std::io::Read;
+                let mut reader: Box<dyn Read> = match resolved {
+                    ResolvedWeight::File(file) => Box::new(file),
+                    ResolvedWeight::Owned(bytes) => Box::new(std::io::Cursor::new(bytes)),
+                };
+                let mut prefix = [0; 8];
+                reader.read_exact(&mut prefix)?;
+                let mut header = vec![0; mtp_header_len(&prefix)?];
+                reader.read_exact(&mut header)?;
+                mtp_header_supported(&header)
+            })
+            .await??;
+            if !supported {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn mtp_loading_policy_fs(
+        model_path: &Path,
+        fs: &WorktreeClient,
+        shards: &[String],
+        requested: bool,
+    ) -> Result<bool> {
+        if !requested {
+            return Ok(false);
+        }
+        // Config loading already uses model_path on this entry point. Keep
+        // that same config authority while reading weight metadata via FsOps.
+        if !Self::mtp_config_policy(model_path).await? {
+            return Ok(false);
+        }
+        for shard in shards {
+            let prefix = fs.read_file_prefix(shard, 8).await?;
+            let len = mtp_header_len(&prefix)?;
+            let bytes = fs.read_file_prefix(shard, 8 + len).await?;
+            anyhow::ensure!(bytes.len() == 8 + len, "truncated safetensors metadata");
+            if !mtp_header_supported(&bytes[8..])? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Create model using incremental loading for large sharded models
@@ -1951,8 +2076,8 @@ impl ModelFactory {
     /// Uses FsOps::read_file() instead of direct filesystem access.
     /// The `model_path` is still needed for ModelConfig and architecture detection
     /// (which parse config.json), but weight data is read through FsOps.
-    /// The explicit speculative-decoding policy also filters MTP tensors before
-    /// materialization on this path; it is not re-read from the environment.
+    /// Explicit policy and whole-checkpoint layout preflight filter MTP tensors
+    /// before materialization here too; policy is not re-read from the environment.
     #[instrument(name = "model_factory.create_with_fs", skip(device, dtype, fs, device_pool), fields(model_path = %model_path.display()))]
     pub async fn create_with_fs(
         model_path: &Path,
@@ -1968,6 +2093,10 @@ impl ModelFactory {
         info!("Loading model via FsOps: {}", model_path.display());
 
         let shard_names = Self::find_shard_names_fs(fs).await?;
+
+        let speculative_decoding = Self::mtp_loading_policy_fs(
+            model_path, fs, &shard_names, speculative_decoding,
+        ).await?;
 
         if shard_names.len() > 1 {
             info!("Loading {} weight shards via FsOps", shard_names.len());
@@ -2236,6 +2365,148 @@ mod stage_subset_tests {
             assert!(weights.contains_key("model.norm.weight"));
             assert_eq!(weights.contains_key("mtp.norm.weight"), enabled);
         }
+    }
+
+    #[tokio::test]
+    async fn mtp_unsupported_config_skips_before_materialization() {
+        for config in [
+            serde_json::json!({"model_type": "qwen3_5_moe"}),
+            serde_json::json!({"model_type": "qwen3_5", "num_experts": 16}),
+            serde_json::json!({"model_type": "qwen3_5", "text_config": {"num_experts": 16}}),
+            serde_json::json!({"model_type": "qwen3_5", "mtp_num_hidden_layers": 2}),
+            serde_json::json!({"model_type": "qwen3_5", "text_config": {"mtp_num_hidden_layers": 2}}),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+            write_shard(
+                dir.path(),
+                "model.safetensors",
+                &[
+                    FixtureTensor::f32("model.norm.weight", &[4], 1.0),
+                    FixtureTensor::i64("mtp.unmaterializable"),
+                ],
+            );
+            let shards = vec![dir.path().join("model.safetensors")];
+            let allowed = ModelFactory::mtp_loading_policy(dir.path(), &shards, true)
+                .await
+                .unwrap();
+            assert!(!allowed, "unsupported config admitted: {config}");
+            // This is the actual weight-loading phase, before model construction
+            // (a tiny fixture need not allocate a complete MoE backbone).
+            let weights =
+                ModelFactory::load_weights(dir.path(), &Device::Cpu, DType::Float, allowed)
+                    .await
+                    .unwrap();
+            assert_eq!(weights.len(), 1);
+            assert!(weights.contains_key("model.norm.weight"));
+        }
+    }
+
+    async fn check_mtp_multilayer_factory(sharded: bool) {
+        for layer in ["0", "1", "7"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut first = tiny_dense_tensors(true);
+            first.push(FixtureTensor::i64("mtp.unmaterializable"));
+            write_tiny_dense_checkpoint(dir.path(), &first);
+            let marker = FixtureTensor::f32(format!("mtp.layers.{layer}.norm.weight"), &[4], 1.0);
+            if sharded {
+                // The poison is in the first shard, while the unsupported
+                // layer is only discoverable in the last shard's header.
+                write_shard(dir.path(), "model-00001-of-00002.safetensors", &first);
+                write_shard(dir.path(), "model-00002-of-00002.safetensors", &[marker]);
+                let mut entries: Vec<_> = first
+                    .iter()
+                    .map(|t| (t.name.as_str(), "model-00001-of-00002.safetensors"))
+                    .collect();
+                let marker_name = format!("mtp.layers.{layer}.norm.weight");
+                entries.push((&marker_name, "model-00002-of-00002.safetensors"));
+                write_index(dir.path(), &entries);
+            } else {
+                first.push(marker);
+                write_shard(dir.path(), "model.safetensors", &first);
+            }
+            let result = ModelFactory::create(
+                dir.path(),
+                &Device::Cpu,
+                DType::Float,
+                Some(16),
+                KVQuantType::None,
+                None,
+                false,
+                true,
+            )
+            .await;
+            if layer == "0" {
+                let error = result
+                    .err()
+                    .expect("supported layout must still load enabled head");
+                assert!(error.to_string().contains("mtp.unmaterializable"));
+                assert!(error.to_string().contains("unsupported dtype"));
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "unsupported head was materialized: {:?}",
+                    result.err()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mtp_multilayer_single_file_skips_before_materialization() {
+        check_mtp_multilayer_factory(false).await;
+    }
+
+    #[tokio::test]
+    async fn mtp_multilayer_sharded_skips_before_materialization() {
+        check_mtp_multilayer_factory(true).await;
+    }
+
+    #[test]
+    fn mtp_fsops_header_policy_filters_unsupported_before_materialization() {
+        let dir = tempfile::tempdir().unwrap();
+        for marker in [
+            "mtp.layers.0.norm.weight",
+            "mtp.layers.1.norm.weight",
+            "mtp.layers.0.mlp.experts.0.weight",
+        ] {
+            write_shard(
+                dir.path(),
+                "weights.safetensors",
+                &[
+                    FixtureTensor::f32("model.norm.weight", &[4], 1.0),
+                    FixtureTensor::f32(marker, &[4], 1.0),
+                    FixtureTensor::i64("mtp.unmaterializable"),
+                ],
+            );
+            let bytes = std::fs::read(dir.path().join("weights.safetensors")).unwrap();
+            // Exactly the bounded prefix/header parser and materializer used
+            // by the FsOps entry point, without an RPC service in this test.
+            let len = mtp_header_len(&bytes[..8]).unwrap();
+            let allowed = mtp_header_supported(&bytes[8..8 + len]).unwrap();
+            let mut weights = HashMap::new();
+            let result = ModelFactory::create_tensors_from_safetensors(
+                safetensors::SafeTensors::deserialize(&bytes).unwrap(),
+                &mut weights,
+                &Device::Cpu,
+                DType::Float,
+                allowed,
+            );
+            if marker == "mtp.layers.0.norm.weight" {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("mtp.unmaterializable")
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(weights.len(), 1);
+                assert!(weights.contains_key("model.norm.weight"));
+            }
+        }
+        assert!(mtp_header_len(&[0; 7]).is_err());
+        assert!(mtp_header_len(&u64::MAX.to_le_bytes()).is_err());
     }
 
     fn write_tiny_dense_checkpoint(dir: &Path, tensors: &[FixtureTensor]) {
