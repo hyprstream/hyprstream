@@ -3333,7 +3333,7 @@ impl RequestService for RegistryService {
 }
 
 // ============================================================================
-// MetricsRegistryClient Implementation (on generated RegistryClient)
+// Metrics checkpoint adapter for the canonical generated RegistryClient
 // ============================================================================
 
 #[cfg(feature = "metrics")]
@@ -3342,13 +3342,16 @@ use hyprstream_metrics::checkpoint::manager::{
 };
 
 #[cfg(feature = "metrics")]
+pub(crate) struct MetricsRegistryAdapter(pub(crate) RegistryClient);
+
+#[cfg(feature = "metrics")]
 #[async_trait]
-impl MetricsRegistryClient for RegistryClient {
+impl MetricsRegistryClient for MetricsRegistryAdapter {
     async fn get_by_name(
         &self,
         name: &str,
     ) -> Result<Option<TrackedRepository>, MetricsRegistryError> {
-        let r = self.get_by_name(name)
+        let r = self.0.get_by_name(name)
             .await
             .map_err(|e| MetricsRegistryError::Operation(e.to_string()))?;
         Ok(Some(variant_to_tracked_repository(
@@ -3365,7 +3368,7 @@ impl MetricsRegistryClient for RegistryClient {
         let path_str = path
             .to_str()
             .ok_or_else(|| MetricsRegistryError::Operation("Invalid path encoding".to_owned()))?;
-        self.register(&RegisterRequest {
+        self.0.register(&RegisterRequest {
             path: path_str.to_owned(),
             name: name.unwrap_or("").to_owned(),
             tracking_ref: String::new(),

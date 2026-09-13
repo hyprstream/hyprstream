@@ -2029,12 +2029,12 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     ));
 
     // Create registry client for dataset lookup (if default_dataset is configured)
-    // RegistryClient already implements hyprstream_metrics::RegistryClient
+    // Adapt the canonical RPC client to the metrics checkpoint interface.
     let registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>> =
         if config.flight.default_dataset.is_some() {
             let registry_client: RegistryClient =
                 RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk.clone(), service_token(&sk))?;
-            Some(Arc::new(registry_client))
+            Some(Arc::new(crate::services::registry::MetricsRegistryAdapter(registry_client)))
         } else {
             None
         };
