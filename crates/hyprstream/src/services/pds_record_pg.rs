@@ -440,7 +440,10 @@ fn build_driver_config(driver_url: &str, dns_hostname: &str) -> AnyResult<tokio_
         config.port(port);
     }
     if !url.username().is_empty() {
-        config.user(url.username());
+        let user = urlencoding::decode(url.username()).map_err(|e| {
+            anyhow::anyhow!("validated RDS username has invalid percent encoding: {e}")
+        })?;
+        config.user(user.into_owned());
     }
     if let Some(password) = url.password() {
         let password = urlencoding::decode(password).map_err(|e| {
@@ -448,9 +451,13 @@ fn build_driver_config(driver_url: &str, dns_hostname: &str) -> AnyResult<tokio_
         })?;
         config.password(password.into_owned());
     }
-    let dbname = url.path().trim_start_matches('/');
+    let path = url.path();
+    let dbname = path.strip_prefix('/').unwrap_or(path);
     if !dbname.is_empty() {
-        config.dbname(dbname);
+        let dbname = urlencoding::decode(dbname).map_err(|e| {
+            anyhow::anyhow!("validated RDS database name has invalid percent encoding: {e}")
+        })?;
+        config.dbname(dbname.into_owned());
     }
     for (key, value) in url.query_pairs() {
         if key == "application_name" {
@@ -919,6 +926,55 @@ mod tests {
             options.contains("statement_timeout="),
             "failover contract: server-side statement timeout must be set: {options}"
         );
+    }
+
+    #[test]
+    fn driver_config_decodes_identity_components_exactly_once() {
+        for (user, database, expected_user, expected_database) in [
+            (
+                "agent%40tenant",
+                "agent%2Frecords",
+                "agent@tenant",
+                "agent/records",
+            ),
+            (
+                "agent+tenant",
+                "records+archive",
+                "agent+tenant",
+                "records+archive",
+            ),
+            (
+                "agent%2540tenant",
+                "records%252Farchive",
+                "agent%40tenant",
+                "records%2Farchive",
+            ),
+            ("agent%C3%A9", "%E6%95%B0%E6%8D%AE", "agenté", "数据"),
+            ("agent", "/records", "agent", "/records"),
+        ] {
+            let validated = translated_url(&format!(
+                "postgresql://{user}:secret@db.internal.example/{database}?sslmode=verify-full"
+            ));
+            let config = build_driver_config(validated.driver_url(), validated.dns_hostname())
+                .unwrap_or_else(|e| panic!("driver config rejected encoded identity: {e}"));
+            assert_eq!(config.get_user(), Some(expected_user));
+            assert_eq!(config.get_dbname(), Some(expected_database));
+            assert_eq!(
+                config.get_ssl_mode(),
+                tokio_postgres::config::SslMode::Require
+            );
+        }
+    }
+
+    #[test]
+    fn driver_config_rejects_non_utf8_identity_components() {
+        for url in [
+            "postgresql://agent%FF:secret@db.internal.example/records?sslmode=verify-full",
+            "postgresql://agent:secret@db.internal.example/records%FF?sslmode=verify-full",
+        ] {
+            let validated = translated_url(url);
+            assert!(build_driver_config(validated.driver_url(), validated.dns_hostname()).is_err());
+        }
     }
 
     #[test]
