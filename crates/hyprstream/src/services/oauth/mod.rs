@@ -224,7 +224,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             auth::require_global_service_authority,
         ));
 
-    let protected_router = Router::new()
+    let protected_routes = Router::new()
         .route(
             xrpc::GET_SERVICE_AUTH_PATH,
             get(xrpc::get_service_auth),
@@ -240,7 +240,13 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(userinfo::userinfo).post(userinfo::userinfo),
         )
         .merge(authority_router)
-        .layer(axum::middleware::from_fn_with_state(
+        .merge(if state.public_repo_writer.is_some() {
+            xrpc::xrpc_write_routes()
+        } else {
+            Router::new()
+        });
+
+    let protected_router = protected_routes.layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_bearer_token,
         ));
