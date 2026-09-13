@@ -28,11 +28,16 @@ use crate::transport::{EndpointType, TransportConfig};
 
 /// Signal startup readiness: fire the `on_ready` oneshot (spawner waits on it)
 /// and notify systemd (`Type=notify`).
-fn signal_ready(on_ready: Option<tokio::sync::oneshot::Sender<()>>) {
+fn signal_ready(
+    on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    notify_systemd: bool,
+) {
     if let Some(tx) = on_ready {
         let _ = tx.send(());
     }
-    let _ = crate::notify::ready();
+    if notify_systemd {
+        let _ = crate::notify::ready();
+    }
 }
 
 /// Serve a bridged request `processor` over its registered `transport` until
@@ -48,11 +53,77 @@ pub async fn serve_bridged(
     shutdown: Arc<Notify>,
     on_ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
+    serve_bridged_with_shutdown_armed(transport, processor, signing_key, shutdown, on_ready, None)
+        .await
+}
+
+/// Variant of [`serve_bridged`] that acknowledges after the shutdown waiter is
+/// registered, before startup readiness is signalled. This closes the window
+/// where an owner can notify shutdown after readiness but before the helper has
+/// begun waiting on the shared [`Notify`].
+pub async fn serve_bridged_with_shutdown_armed(
+    transport: &TransportConfig,
+    processor: Arc<dyn IrohRequestProcessor>,
+    signing_key: SigningKey,
+    shutdown: Arc<Notify>,
+    on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown_armed: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
+    serve_bridged_with_shutdown_armed_impl(
+        transport,
+        processor,
+        signing_key,
+        shutdown,
+        on_ready,
+        shutdown_armed,
+        true,
+    )
+    .await
+}
+
+/// Variant of [`serve_bridged_with_shutdown_armed`] for nested helpers whose
+/// parent owns the service readiness boundary. It acknowledges the shutdown
+/// waiter but does not emit a systemd `READY=1` notification.
+pub async fn serve_bridged_with_shutdown_armed_silent(
+    transport: &TransportConfig,
+    processor: Arc<dyn IrohRequestProcessor>,
+    signing_key: SigningKey,
+    shutdown: Arc<Notify>,
+    on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown_armed: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
+    serve_bridged_with_shutdown_armed_impl(
+        transport,
+        processor,
+        signing_key,
+        shutdown,
+        on_ready,
+        shutdown_armed,
+        false,
+    )
+    .await
+}
+
+async fn serve_bridged_with_shutdown_armed_impl(
+    transport: &TransportConfig,
+    processor: Arc<dyn IrohRequestProcessor>,
+    signing_key: SigningKey,
+    shutdown: Arc<Notify>,
+    on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown_armed: Option<tokio::sync::oneshot::Sender<()>>,
+    notify_systemd: bool,
+) -> Result<()> {
     match &transport.endpoint {
         EndpointType::Inproc { endpoint } => {
             crate::dial::register_inproc(endpoint.clone(), &processor);
-            signal_ready(on_ready);
-            shutdown.notified().await;
+            let notified = shutdown.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(tx) = shutdown_armed {
+                let _ = tx.send(());
+            }
+            signal_ready(on_ready, notify_systemd);
+            notified.await;
             processor.close_admission();
             crate::dial::unregister_inproc(endpoint);
             // The service owner drains and joins, even with retained clients.
@@ -75,8 +146,16 @@ pub async fn serve_bridged(
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
                     .map_err(|e| anyhow!("set uds perms {}: {e}", path.display()))?;
             }
-            signal_ready(on_ready);
-            run_uds(listener, processor, signing_key, shutdown).await
+            run_uds(
+                listener,
+                processor,
+                signing_key,
+                shutdown,
+                on_ready,
+                shutdown_armed,
+                notify_systemd,
+            )
+            .await
         }
         EndpointType::SystemdFd { fd, .. } => {
             use std::os::unix::io::FromRawFd;
@@ -87,8 +166,16 @@ pub async fn serve_bridged(
                 .map_err(|e| anyhow!("systemd fd set_nonblocking: {e}"))?;
             let listener = tokio::net::UnixListener::from_std(std_listener)
                 .map_err(|e| anyhow!("adopt systemd uds fd: {e}"))?;
-            signal_ready(on_ready);
-            run_uds(listener, processor, signing_key, shutdown).await
+            run_uds(
+                listener,
+                processor,
+                signing_key,
+                shutdown,
+                on_ready,
+                shutdown_armed,
+                notify_systemd,
+            )
+            .await
         }
         other => bail!(
             "serve_bridged: {other:?} is not a spawn-path RPC endpoint \
@@ -103,14 +190,29 @@ async fn run_uds(
     processor: Arc<dyn IrohRequestProcessor>,
     signing_key: SigningKey,
     shutdown: Arc<Notify>,
+    on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown_armed: Option<tokio::sync::oneshot::Sender<()>>,
+    notify_systemd: bool,
 ) -> Result<()> {
-    let server = UdsRpcServer::with_capacity(listener, Arc::clone(&processor), signing_key, DEFAULT_STREAM_LIMIT);
+    let server = UdsRpcServer::with_capacity(
+        listener,
+        Arc::clone(&processor),
+        signing_key,
+        DEFAULT_STREAM_LIMIT,
+    );
     let token = server.shutdown_token();
     let limit = server.stream_limit();
     let cap = server.capacity();
+    let notified = shutdown.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    if let Some(tx) = shutdown_armed {
+        let _ = tx.send(());
+    }
+    signal_ready(on_ready, notify_systemd);
     tokio::select! {
         r = server.run() => r,
-        _ = shutdown.notified() => {
+        _ = notified => {
             let deadline = processor.begin_shutdown(
                 tokio::time::Instant::now() + crate::transport::rpc_session::DRAIN_TIMEOUT,
             );

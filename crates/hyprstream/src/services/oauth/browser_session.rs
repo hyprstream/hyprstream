@@ -291,7 +291,7 @@ mod tests {
         _storage: tempfile::TempDir,
     }
 
-    fn fixture(local: bool) -> SessionFixture {
+    async fn fixture(local: bool) -> SessionFixture {
         let storage = tempfile::TempDir::new().unwrap();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
         let remote_key = ed25519_dalek::SigningKey::from_bytes(&[0x72; 32]).verifying_key();
@@ -402,6 +402,15 @@ mod tests {
                 Arc::new(RejectIdentityResolver),
             )
             .unwrap();
+
+        if let Some(store) = hosted_store.as_ref() {
+            store
+                .refresh_hosted_did_index(&hyprstream_rpc::Subject::new(
+                    hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                ))
+                .await
+                .unwrap();
+        }
 
         let mut state = OAuthState::new(
             &oauth,
@@ -539,7 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_atproto_exchange_cookie_whoami_and_register_end_to_end() {
-        let fixture = fixture(true);
+        let fixture = fixture(true).await;
         let exchange = exchange_request(&fixture, "local-service", "local-dpop").await;
         assert_eq!(exchange.status(), StatusCode::OK);
         let session_cookie = cookie(&exchange);
@@ -582,7 +591,7 @@ mod tests {
 
     #[tokio::test]
     async fn federated_exchange_whoami_has_no_local_authority() {
-        let fixture = fixture(false);
+        let fixture = fixture(false).await;
         let exchange = exchange_request(&fixture, "foreign-service", "foreign-dpop").await;
         assert_eq!(exchange.status(), StatusCode::OK);
         let session_cookie = cookie(&exchange);
@@ -606,7 +615,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_whoami_is_public_floor() {
-        let fixture = fixture(false);
+        let fixture = fixture(false).await;
         let generic_id = fixture
             .state
             .sessions
@@ -642,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_requires_dpop_and_consumes_service_assertion_once() {
-        let fixture = fixture(false);
+        let fixture = fixture(false).await;
         let app = super::super::create_app(Arc::clone(&fixture.state), &fixture.cors);
         let missing_dpop = app
             .clone()

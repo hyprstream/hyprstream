@@ -101,7 +101,7 @@ run_phase "native release build" cargo build --release
 # marker and without PGlite. Exercise both its production binary and typed
 # handler tests in the required merge/preflight path; the default build above
 # cannot compile this mutually exclusive profile.
-run_phase "Metrics release build" cargo build --locked --release --no-default-features --features metrics
+run_phase "Metrics release build" cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features metrics
 run_phase "Metrics typed handler tests" cargo test -p hyprstream --locked --lib --no-default-features --features metrics services::metrics::tests::
 
 # wasm guest artifacts for the sandbox/mount tests (deny-on-missing-guest guard).

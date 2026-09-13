@@ -268,22 +268,61 @@ async fn init_acme_rustls_config(
     Ok(rustls_config)
 }
 
-/// Serve an Axum router over HTTPS (if rustls_config is Some) or plain HTTP.
+/// A bound HTTP(S) listener retained between the bind and serve phases.
 ///
-/// Uses `axum_server` for HTTPS with `Handle`-based graceful shutdown,
-/// or standard `axum::serve` for HTTP.
-pub async fn serve_app(
+/// Bind early (before readiness signals); serve later, consuming the handle.
+/// No second bind occurs: the TLS arm keeps the already-bound std listener
+/// and hands it to the pinned `axum-server` prebound constructor.
+pub enum BoundHttpListener {
+    /// Prebound nonblocking listener adopted by tokio.
+    Http(tokio::net::TcpListener),
+    /// Prebound std listener + TLS config, served via
+    /// `axum_server::from_tcp_rustls`.
+    Https(std::net::TcpListener, axum_server::tls_rustls::RustlsConfig),
+}
+
+/// Bind phase: a real `std::net::TcpListener::bind` plus `set_nonblocking`.
+///
+/// Call this BEFORE any readiness signal so a bind failure (e.g. an occupied
+/// port) surfaces before the launcher is told the service is ready.
+pub fn bind_listener(
     addr: SocketAddr,
-    app: axum::Router,
     rustls_config: Option<axum_server::tls_rustls::RustlsConfig>,
+    service_name: &str,
+) -> Result<BoundHttpListener, RpcError> {
+    let std_listener = std::net::TcpListener::bind(addr).map_err(|e| {
+        RpcError::SpawnFailed(format!("{service_name} HTTP(S) bind failed: {e}"))
+    })?;
+    std_listener.set_nonblocking(true).map_err(|e| {
+        RpcError::SpawnFailed(format!(
+            "{service_name} HTTP(S) set_nonblocking failed: {e}"
+        ))
+    })?;
+    match rustls_config {
+        Some(tls) => Ok(BoundHttpListener::Https(std_listener, tls)),
+        None => Ok(BoundHttpListener::Http(
+            tokio::net::TcpListener::from_std(std_listener).map_err(|e| {
+                RpcError::SpawnFailed(format!(
+                    "{service_name} HTTP listener adoption failed: {e}"
+                ))
+            })?,
+        )),
+    }
+}
+
+/// Serve phase: consume a [`BoundHttpListener`] with graceful shutdown.
+///
+/// The TLS arm uses the pinned free function
+/// `axum_server::from_tcp_rustls(listener, tls)` on the already-bound std
+/// listener — no second bind.
+pub async fn serve_bound(
+    bound: BoundHttpListener,
+    app: axum::Router,
     shutdown: Arc<Notify>,
     service_name: &str,
 ) -> Result<(), RpcError> {
-    let scheme = if rustls_config.is_some() { "https" } else { "http" };
-    info!("{service_name} listening on {scheme}://{addr}");
-
-    match rustls_config {
-        Some(tls) => {
+    match bound {
+        BoundHttpListener::Https(std_listener, tls) => {
             let handle = axum_server::Handle::new();
             let shutdown_handle = handle.clone();
             let name = service_name.to_owned();
@@ -295,19 +334,15 @@ pub async fn serve_app(
                 shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
             });
 
-            axum_server::bind_rustls(addr, tls)
+            axum_server::from_tcp_rustls(std_listener, tls)
                 .handle(handle)
                 .serve(app.into_make_service())
                 .await
                 .map_err(|e| RpcError::SpawnFailed(format!("{service_name} HTTPS server error: {e}")))?;
         }
-        None => {
-            let name = service_name.to_owned();
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .map_err(|e| RpcError::SpawnFailed(format!("{name} HTTP bind failed: {e}")))?;
-
+        BoundHttpListener::Http(listener) => {
             let shutdown_clone = shutdown.clone();
+            let name = service_name.to_owned();
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     shutdown_clone.notified().await;
@@ -320,6 +355,25 @@ pub async fn serve_app(
 
     info!("{service_name} stopped");
     Ok(())
+}
+
+/// Serve an Axum router over HTTPS (if rustls_config is Some) or plain HTTP.
+///
+/// Uses `axum_server` for HTTPS with `Handle`-based graceful shutdown,
+/// or standard `axum::serve` for HTTP. Bind-then-serve wrapper over
+/// [`bind_listener`] + [`serve_bound`]; existing callers are unchanged.
+pub async fn serve_app(
+    addr: SocketAddr,
+    app: axum::Router,
+    rustls_config: Option<axum_server::tls_rustls::RustlsConfig>,
+    shutdown: Arc<Notify>,
+    service_name: &str,
+) -> Result<(), RpcError> {
+    let scheme = if rustls_config.is_some() { "https" } else { "http" };
+    info!("{service_name} listening on {scheme}://{addr}");
+
+    let bound = bind_listener(addr, rustls_config, service_name)?;
+    serve_bound(bound, app, shutdown, service_name).await
 }
 
 /// The shared listener must negotiate both HTTP and TLS-ALPN-01. The ACME
@@ -413,4 +467,97 @@ mod acme_tests {
         }
         Ok(())
     }
+}
+
+
+#[cfg(test)]
+mod bound_serve_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use axum::routing::get;
+    use rustls::pki_types::ServerName;
+
+    /// Positive HTTPS regression through the production bind/serve seam:
+    /// `bind_listener` retains the real socket, `serve_bound` hands it to the
+    /// pinned `axum_server::from_tcp_rustls` constructor, a client that
+    /// TRUSTS the served certificate and verifies the hostname normally (no
+    /// verification bypass) completes a real request, and shutdown is
+    /// bounded. Same helper OAuth and OAI call before their readiness
+    /// signals.
+    #[tokio::test]
+    async fn bound_https_serves_verified_client_and_shuts_down_bounded()
+    -> anyhow::Result<()> {
+        hyprstream_rpc::transport::install_pq_crypto_provider()?;
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
+            generated.cert.pem().into_bytes(),
+            generated.key_pair.serialize_pem().into_bytes(),
+        )
+        .await?;
+
+        // Reserve, then bind through the production seam (no second bind).
+        let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = probe.local_addr()?;
+        drop(probe);
+        let bound = bind_listener(addr, Some(rustls_config), "BoundServeTest")?;
+
+        let app = axum::Router::new().route(
+            "/bound-serve-probe",
+            get(|| async { "bound-serve-ok" }),
+        );
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_signal = Arc::clone(&shutdown);
+        let server = tokio::spawn(serve_bound(bound, app, Arc::clone(&shutdown), "BoundServeTest"));
+
+        // Client trusts the served certificate and verifies "localhost"
+        // normally; no dangerous verification-disabling configuration.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(generated.cert.der().clone())?;
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        // The client runs on a blocking thread over a real socket. `StreamOwned`
+        // implements blocking Read/Write that drives rustls IO internally (the
+        // raw ClientConnection reader only drains buffered plaintext); hostname
+        // and certificate verification stay fully enabled.
+        let client = std::thread::spawn(move || -> anyhow::Result<String> {
+            use std::io::{Read, Write};
+            let tcp = std::net::TcpStream::connect(addr)?;
+            tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let tls = rustls::ClientConnection::new(
+                Arc::new(client_config),
+                ServerName::try_from("localhost")?,
+            )?;
+            let mut stream = rustls::StreamOwned::new(tls, tcp);
+            stream.write_all(
+                b"GET /bound-serve-probe HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            Ok(String::from_utf8_lossy(&response).into_owned())
+        });
+
+        let response = tokio::task::spawn_blocking(move || client.join())
+            .await
+            .expect("client joiner must not fail")
+            .expect("client thread must not panic")?;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "verified-TLS client must receive HTTP 200: got {response:?}"
+        );
+        assert!(
+            response.contains("bound-serve-ok"),
+            "exact probe body must be served through the TLS path: got {response:?}"
+        );
+
+        // Bounded shutdown: the retained handle's server ends cleanly.
+        shutdown_signal.notify_one();
+        tokio::time::timeout(Duration::from_secs(30), server)
+            .await
+            .expect("serve_bound must terminate within the shutdown budget")?
+            .expect("graceful shutdown must complete Ok");
+        Ok(())
+    }
+
 }

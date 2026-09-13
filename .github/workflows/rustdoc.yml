@@ -17,15 +17,17 @@ name: Rustdoc quality
 # `continue-on-error` purely to produce machine-checkable evidence of the
 # current warning debt.
 #
-# This workflow runs plain cargo on a GitHub-hosted runner — the pilot crate
-# needs no libtorch and none of the self-hosted rust-builder plumbing that
-# rust.yml drives through podman. Host-side BuildQ is a local development
-# policy and intentionally does not apply to remote CI.
+# Use the same self-hosted ARM64 runner and pinned builder as rust.yml.
+# The util-only pilot needs no workspace build, libtorch setup, or S3 cache:
+# disable the image's sccache wrapper and keep target/doc in the checkout for
+# artifact upload. No OIDC/AWS credentials are requested or forwarded.
 on:
   pull_request:
     paths:
       - 'crates/hyprstream-util/**'
       - '.github/workflows/rustdoc.yml'
+      - '.github/scripts/load-builder-image.sh'
+      - '.github/builder-image.env'
       - 'docs/rustdoc-quality.md'
       # Shared build inputs: workspace dependencies, the lockfile, and the
       # toolchain pin all influence rustdoc behavior for the pilot crate.
@@ -43,14 +45,27 @@ env:
 jobs:
   rustdoc-util:
     name: rustdoc (hyprstream-util pilot)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
+      - name: Load builder image pin
+        run: bash .github/scripts/load-builder-image.sh
+
+      - name: Pull builder image
+        run: podman pull "$BUILDER_IMAGE"
+
       - name: Generate rustdoc (generation errors fail; warnings visible in log)
-        run: cargo doc -p hyprstream-util --no-deps
+        run: |
+          podman run --rm \
+            -v "$PWD":/build:Z -w /build \
+            -e RUSTC_WRAPPER= -e CARGO_TARGET_DIR=/build/target \
+            -e CARGO_INCREMENTAL=0 -e CARGO_BUILD_JOBS=2 -e CARGO_TERM_COLOR=always \
+            "$BUILDER_IMAGE" \
+            cargo doc --locked -p hyprstream-util --no-deps
 
       - name: Collect warning evidence (non-blocking)
         # Changing RUSTDOCFLAGS invalidates the rustdoc fingerprint, so this
@@ -61,10 +76,22 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          RUSTDOCFLAGS="-D warnings" cargo doc -p hyprstream-util --no-deps 2>&1 | tee rustdoc-warnings.log
+          podman run --rm \
+            -v "$PWD":/build:Z -w /build \
+            -e RUSTC_WRAPPER= -e CARGO_TARGET_DIR=/build/target \
+            -e CARGO_INCREMENTAL=0 -e CARGO_BUILD_JOBS=2 -e CARGO_TERM_COLOR=always \
+            -e 'RUSTDOCFLAGS=-D warnings' \
+            "$BUILDER_IMAGE" \
+            cargo doc --locked -p hyprstream-util --no-deps 2>&1 | tee rustdoc-warnings.log
 
       - name: Run documented examples (doctests)
-        run: cargo test -p hyprstream-util --doc
+        run: |
+          podman run --rm \
+            -v "$PWD":/build:Z -w /build \
+            -e RUSTC_WRAPPER= -e CARGO_TARGET_DIR=/build/target \
+            -e CARGO_INCREMENTAL=0 -e CARGO_BUILD_JOBS=2 -e CARGO_TERM_COLOR=always \
+            "$BUILDER_IMAGE" \
+            cargo test --locked -p hyprstream-util --doc
 
       - name: Upload warning evidence
         if: always()

@@ -522,6 +522,34 @@ pub fn load_service_jwt_for_profile(
     }
 }
 
+/// Seed a provisioned service JWT under the key selected by startup.
+///
+/// Service factories first consult the process trust store. Keeping this
+/// bridge beside the profile-aware loader lets a caller that already resolved
+/// a custom config path carry the authoritative JWT into a factory that has no
+/// config handle of its own.
+pub fn seed_service_jwt_into_trust_store(
+    service_name: &str,
+    signing_key: &SigningKey,
+    credentials_dir: &std::path::Path,
+    profile: SecretsProfile,
+) {
+    if let Ok(Some(jwt_str)) = load_service_jwt_for_profile(credentials_dir, service_name, profile) {
+        let expires_at = decode_jwt_exp_raw(&jwt_str).unwrap_or(0);
+        hyprstream_service::global_trust_store().insert(
+            signing_key.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: std::iter::once(service_name.to_owned()).collect(),
+                subject: None,
+                jwt: Some(jwt_str),
+                expires_at,
+                attested_by: None,
+            },
+        );
+        tracing::info!(service = %service_name, "Seeded trust store with own service-jwt from credential dir");
+    }
+}
+
 /// Persist a service JWT using the same profile-aware path startup reads.
 pub fn write_service_jwt_for_profile(
     credentials_dir: &std::path::Path,

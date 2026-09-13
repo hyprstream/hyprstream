@@ -60,15 +60,7 @@ pub fn provision_services(
         (600..=86_400).contains(&valid_for_seconds),
         "service identity lifetime must be 600..86400 seconds"
     );
-    ensure!(!services.is_empty(), "at least one service is required");
-    let mut unique = std::collections::HashSet::new();
-    for name in services {
-        ensure!(unique.insert(name), "duplicate service in bootstrap roster");
-        ensure!(
-            hyprstream_service::get_factory(name).is_some(),
-            "unknown service in bootstrap roster: {name}"
-        );
-    }
+    validate_service_roster(services)?;
     let verifier = hyprstream_discovery::authenticate_local_deployment_registry()?;
     let secrets = provisioning_secrets_dir(config)?;
     let acceptance =
@@ -128,6 +120,76 @@ pub fn provision_services(
         tracing::info!(path = %path.display(), "verified service roster manifest exported");
     }
     Ok(())
+}
+
+/// Read the current accepted roster without acquiring a writer or admitting
+/// state. Returns a complete public JSON document only after every member has
+/// passed the existing deployment/checkpoint/key-binding/freshness validators.
+/// The caller emits these buffered bytes; no output or store is written here.
+pub fn inspect_services(config: &HyprConfig, services: &[String]) -> Result<Vec<u8>> {
+    validate_service_roster(services)?;
+    let verifier = hyprstream_discovery::authenticate_local_deployment_registry()?;
+    let secrets = provisioning_secrets_dir(config)?;
+    let keys = load_roster_keys(&secrets, services)?;
+    let directory = hyprstream_service::deployment_data_dir()?.join("pds-store");
+    let store = PdsRecordStore::open_readonly(&directory)?
+        .with_at9p_deployment_verifier(verifier);
+    inspect_verified_roster(&store, &keys, &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+fn validate_service_roster(services: &[String]) -> Result<()> {
+    ensure!(!services.is_empty(), "at least one service is required");
+    let mut unique = std::collections::HashSet::new();
+    for name in services {
+        ensure!(unique.insert(name), "duplicate service in bootstrap roster");
+        ensure!(
+            hyprstream_service::get_factory(name).is_some(),
+            "unknown service in bootstrap roster: {name}"
+        );
+    }
+    Ok(())
+}
+
+fn load_roster_keys(secrets: &Path, services: &[String]) -> Result<Vec<(String, SigningKey)>> {
+    services.iter().map(|name| {
+        load_existing_service_signing_key(secrets, name, SecretsProfile::SharedDirectory)
+            .map(|key| (name.clone(), key))
+    }).collect()
+}
+
+fn inspect_verified_roster(
+    store: &PdsRecordStore,
+    keys: &[(String, SigningKey)],
+    now_text: &str,
+) -> Result<Vec<u8>> {
+    // Enumerate through the authenticated checkpoint path, never deserialize
+    // raw DB bytes or use an editable prior export as authority. Missing or
+    // ambiguous service IDs cannot silently become first boot or a new DID.
+    let states = store.accepted_at9p_states()?;
+    let mut admitted = Vec::with_capacity(keys.len());
+    for (name, key) in keys {
+        let service_id = format!("#{name}");
+        let mut matching = states.iter().filter(|state| {
+            state.current.services.iter().any(|service| service.id == service_id)
+        });
+        let state = matching.next().with_context(|| format!("no accepted identity for service {name}"))?;
+        ensure!(matching.next().is_none(), "multiple accepted identities match service {name}");
+        admitted.push((name.as_str(), key, state.clone()));
+    }
+    let entries = build_verified_roster_entries(store, &admitted, now_text)?;
+    let mut bytes = serialize_verified_roster_manifest(entries)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn serialize_verified_roster_manifest(services: Vec<VerifiedServiceRosterEntry>) -> Result<Vec<u8>> {
+    ensure!(!services.is_empty(), "refusing to export an empty verified service roster");
+    let manifest = VerifiedServiceRosterManifest {
+        schema: VERIFIED_ROSTER_SCHEMA,
+        generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        services,
+    };
+    Ok(serde_json::to_vec_pretty(&manifest)?)
 }
 
 /// Re-read and re-verify every admitted member from the checkpoint store,
@@ -196,12 +258,7 @@ fn write_verified_roster_manifest(
         file_name.to_string_lossy(),
         std::process::id()
     ));
-    let manifest = VerifiedServiceRosterManifest {
-        schema: VERIFIED_ROSTER_SCHEMA,
-        generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        services,
-    };
-    let bytes = serde_json::to_vec_pretty(&manifest)?;
+    let bytes = serialize_verified_roster_manifest(services)?;
     // Ownership boundary: until the exclusive create succeeds, `temp` is not
     // ours — a collision means a leftover from an interrupted earlier process
     // (possibly with a reused PID) or another entry in the caller's directory,
@@ -352,6 +409,134 @@ fn provision_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Inventory contents and names (including directories) without relying on
+    // atime, which a read may legitimately update at the filesystem layer.
+    fn filesystem_contents(root: &Path) -> Result<std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>> {
+        fn visit(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>) -> Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let relative = path.strip_prefix(root)?.to_path_buf();
+                if entry.file_type()?.is_dir() {
+                    out.insert(relative, None);
+                    visit(root, &path, out)?;
+                } else {
+                    out.insert(relative, Some(std::fs::read(path)?));
+                }
+            }
+            Ok(())
+        }
+        let mut out = std::collections::BTreeMap::new();
+        visit(root, root, &mut out)?;
+        Ok(out)
+    }
+
+    #[test]
+    fn readonly_roster_reads_verified_state_without_changing_store_or_keys() -> Result<()> {
+        let (dir, store, ingest, model) = fixture()?;
+        let event = SigningKey::from_bytes(&[0x63; 32]);
+        let now = Utc::now();
+        let accepted_model = provision_one(&store, &ingest, "model", &model, now, 86400)?;
+        let accepted_event = provision_one(&store, &ingest, "event", &event, now, 86400)?;
+        let credentials = dir.path().join("retained-credentials");
+        crate::auth::identity_store::write_secret(&credentials.join("model"), "signing-key", &model.to_bytes())?;
+        crate::auth::identity_store::write_secret(&credentials.join("event"), "signing-key", &event.to_bytes())?;
+        drop(ingest);
+        drop(store);
+        let before = filesystem_contents(dir.path())?;
+        let keys = load_roster_keys(&credentials, &["model".into(), "event".into()])?;
+        let readonly = PdsRecordStore::open_readonly(dir.path())?
+            .with_at9p_acceptance_identity(SigningKey::from_bytes(&[0x61; 32]).verifying_key());
+        let bytes = inspect_verified_roster(&readonly, &keys, &now.to_rfc3339_opts(SecondsFormat::Secs, true))?;
+        let document: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(document["schema"], VERIFIED_ROSTER_SCHEMA);
+        assert_eq!(document["services"].as_array().context("services")?.len(), 2);
+        for (index, state) in [accepted_model, accepted_event].iter().enumerate() {
+            assert_eq!(document["services"][index]["did"], state.did);
+            assert_eq!(document["services"][index]["epoch"], state.epoch);
+            assert_eq!(document["services"][index]["accepted_head_digest"], hex::encode(state.head_digest));
+            assert_eq!(document["services"][index]["expires_at"], state.expires_at.as_deref().context("expiry")?);
+        }
+        assert!(!String::from_utf8(bytes)?.contains(&hex::encode(model.to_bytes())));
+        assert_eq!(filesystem_contents(dir.path())?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn readonly_roster_failure_preserves_state_and_never_initializes_missing_input() -> Result<()> {
+        let missing_root = tempfile::tempdir()?;
+        let before = filesystem_contents(missing_root.path())?;
+        assert!(PdsRecordStore::open_readonly(&missing_root.path().join("missing-store")).is_err());
+        assert!(load_roster_keys(missing_root.path(), &["model".into()]).is_err());
+        assert_eq!(filesystem_contents(missing_root.path())?, before);
+        let empty = missing_root.path().join("empty-store");
+        std::fs::create_dir(&empty)?;
+        let before = filesystem_contents(missing_root.path())?;
+        assert!(PdsRecordStore::open_readonly(&empty).is_err());
+        assert_eq!(filesystem_contents(missing_root.path())?, before);
+        std::fs::write(empty.join("CURRENT"), b"invalid current manifest")?;
+        let before = filesystem_contents(missing_root.path())?;
+        assert!(PdsRecordStore::open_readonly(&empty).is_err());
+        assert_eq!(filesystem_contents(missing_root.path())?, before);
+
+        let (dir, store, ingest, key) = fixture()?;
+        let now = Utc::now();
+        provision_one(&store, &ingest, "model", &key, now, 86400)?;
+        drop(ingest);
+        drop(store);
+        let before = filesystem_contents(dir.path())?;
+        let readonly = PdsRecordStore::open_readonly(dir.path())?
+            .with_at9p_acceptance_identity(SigningKey::from_bytes(&[0x61; 32]).verifying_key());
+        // A successful first member cannot produce a partial JSON result when
+        // a later requested service is missing or its retained key mismatches.
+        assert!(inspect_verified_roster(&readonly, &[("model".into(), key.clone()), ("event".into(), key.clone())], &now.to_rfc3339_opts(SecondsFormat::Secs, true)).is_err());
+        assert!(inspect_verified_roster(&readonly, &[("model".into(), SigningKey::from_bytes(&[0x77; 32]))], &now.to_rfc3339_opts(SecondsFormat::Secs, true)).is_err());
+        assert!(inspect_verified_roster(&readonly, &[("model".into(), key.clone())], &(now + Duration::hours(25)).to_rfc3339_opts(SecondsFormat::Secs, true)).is_err());
+        let wrong_verifier = PdsRecordStore::open_readonly(dir.path())?
+            .with_at9p_acceptance_identity(SigningKey::from_bytes(&[0x78; 32]).verifying_key());
+        assert!(inspect_verified_roster(&wrong_verifier, &[("model".into(), key)], &now.to_rfc3339_opts(SecondsFormat::Secs, true)).is_err());
+        assert_eq!(filesystem_contents(dir.path())?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn readonly_roster_rejects_corrupt_checkpoint_and_preserves_failure_evidence() -> Result<()> {
+        let (dir, store, ingest, key) = fixture()?;
+        let now = Utc::now();
+        let accepted = provision_one(&store, &ingest, "model", &key, now, 86400)?;
+        drop(ingest);
+        drop(store);
+        // Tamper only in fixture setup, then close the writer before capturing
+        // the failed reader's complete on-disk before/after evidence.
+        let db = rocksdb::DB::open(&rocksdb::Options::default(), dir.path())?;
+        db.put(format!("at9p-checkpoint\0{}", accepted.subject_cid512), b"invalid checkpoint")?;
+        drop(db);
+        let before = filesystem_contents(dir.path())?;
+        let readonly = PdsRecordStore::open_readonly(dir.path())?
+            .with_at9p_acceptance_identity(SigningKey::from_bytes(&[0x61; 32]).verifying_key());
+        assert!(inspect_verified_roster(&readonly, &[("model".into(), key)], &now.to_rfc3339_opts(SecondsFormat::Secs, true)).is_err());
+        assert_eq!(filesystem_contents(dir.path())?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn readonly_roster_rejects_empty_first_boot_store_without_consuming_marker() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = PdsRecordStore::open(dir.path())?;
+        store.mark_first_boot()?;
+        drop(store);
+        let before = filesystem_contents(dir.path())?;
+        let readonly = PdsRecordStore::open_readonly(dir.path())?
+            .with_at9p_acceptance_identity(SigningKey::from_bytes(&[0x61; 32]).verifying_key());
+        assert!(inspect_verified_roster(&readonly, &[("model".into(), SigningKey::from_bytes(&[0x62; 32]))], &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)).is_err());
+        assert!(readonly.first_boot_pending()?);
+        assert_eq!(filesystem_contents(dir.path())?, before);
+        assert!(validate_service_roster(&[]).is_err());
+        assert!(validate_service_roster(&["model".into(), "model".into()]).is_err());
+        assert!(validate_service_roster(&["unknown-service".into()]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn deployment_bootstrap_rejects_invalid_roster_and_lifetime_before_credentials() {

@@ -86,7 +86,13 @@ below is the authoritative, always-runnable measurement.
 ## CI evidence
 
 `.github/workflows/rustdoc.yml` runs the same scoped commands on PRs touching
-the pilot (plus manual dispatch) and uploads:
+the pilot (plus manual dispatch). It uses the existing self-hosted ARM64
+runner labels and the tracked builder-image loader shared with `rust.yml`,
+then runs only the util pilot commands through Podman. The image's sccache
+wrapper is disabled; this small leaf needs neither AWS/OIDC credentials nor
+a workspace build. Its checkout-local `target/doc` is uploaded as evidence.
+The builder pin and loader are included in the workflow's path filters.
+The lane uploads:
 
 - `rustdoc-hyprstream-util-warnings` — the strict-mode log, showing any
   remaining missing-doc warnings verbatim; and
