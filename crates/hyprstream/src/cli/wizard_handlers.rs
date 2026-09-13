@@ -8,7 +8,7 @@
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use inquire::{Confirm, Select, Text};
@@ -152,7 +152,20 @@ pub async fn handle_wizard(
 ) -> Result<()> {
     // Install systemd units before entering spawn_blocking (async operation).
     if !options.bootstrap_only && hyprstream_rpc::has_systemd() {
-        handle_service_install(models_dir, config_services, None, false, false, hyprstream_service::ServiceTarget::User, false).await?;
+        wizard_pre_install_step(|iroh_required| {
+            handle_service_install(
+                models_dir,
+                config_services,
+                None,
+                false,
+                false,
+                hyprstream_service::ServiceTarget::User,
+                false,
+                crate::config::explicit_config_path().map(PathBuf::as_path),
+                iroh_required,
+            )
+        })
+        .await?;
     }
 
     let rt = tokio::runtime::Handle::current();
@@ -167,6 +180,33 @@ pub async fn handle_wizard(
     .await??;
 
     Ok(())
+}
+
+/// Wizard pre-install step: load the process configuration and decide whether
+/// fixed-unit installation may run before the wizard phases proceed.
+///
+/// An unloadable configuration fails closed here — it is never silently
+/// treated as the default profile (#1585). Installed systemd units run their
+/// own stored configuration and can carry neither this process's explicit
+/// `--config` provenance nor the required-native profile, so for those
+/// profiles unit installation is skipped and setup continues; a later start
+/// routes through the supported direct launch path instead.
+///
+/// The `install` closure is the real `handle_service_install` call in
+/// production; tests inject a recording side effect.
+async fn wizard_pre_install_step<F, Fut>(install: F) -> Result<()>
+where
+    F: FnOnce(bool) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let iroh_required = crate::config::HyprConfig::load()
+        .map_err(|e| anyhow::anyhow!("wizard configuration load failed: {e}"))?
+        .quic
+        .iroh_required();
+    if crate::config::explicit_config_path().is_some() || iroh_required {
+        return Ok(());
+    }
+    install(iroh_required).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1075,4 +1115,243 @@ fn print_summary(summary: &TextWizardSummary) {
     println!("    hyprstream quick clone <model>     # Clone a model");
     println!("    hyprstream quick infer <model>     # Run inference");
     println!();
+}
+
+#[cfg(test)]
+mod wizard_launch_routing_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    /// Gate marking a re-exec'd child that runs one routing scenario in an
+    /// isolated process (the pinned/explicit slots are process-global and
+    /// write-once, so each scenario needs its own process — same pattern as
+    /// `config::pinned_config_tests`).
+    const PRE_INSTALL_CHILD: &str = "HYPRSTREAM_WIZARD_PRE_CHILD";
+
+    /// All four configuration profiles through the real pre-install decision:
+    /// default installs with the loaded requirement; explicit-config and
+    /// required-native skip fixed-unit installation; an unloadable
+    /// configuration fails closed instead of falling back to defaults.
+    #[tokio::test]
+    async fn wizard_pre_install_step_routes_profiles_causally() -> anyhow::Result<()> {
+        if let Ok(scenario) = std::env::var(PRE_INSTALL_CHILD) {
+            return pre_install_child_scenario(&scenario).await;
+        }
+        for scenario in ["default", "explicit", "required", "invalid"] {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "cli::wizard_handlers::wizard_launch_routing_tests::wizard_pre_install_step_routes_profiles_causally",
+                    "--nocapture",
+                ])
+                .env(PRE_INSTALL_CHILD, scenario)
+                .status()?;
+            anyhow::ensure!(
+                status.success(),
+                "wizard pre-install routing scenario '{scenario}' failed"
+            );
+        }
+        Ok(())
+    }
+
+    async fn pre_install_child_scenario(scenario: &str) -> anyhow::Result<()> {
+        let called: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = called.clone();
+        let record_install = |required: bool| {
+            sink.lock().push(required);
+            async { Ok::<(), anyhow::Error>(()) }
+        };
+
+        match scenario {
+            "default" => {
+                let _ = crate::config::install_pinned_config(crate::config::HyprConfig::default());
+                wizard_pre_install_step(record_install).await?;
+                assert_eq!(
+                    *called.lock(),
+                    vec![false],
+                    "default profile must install fixed units, forwarding the loaded (non-required) profile"
+                );
+            }
+            "explicit" => {
+                let _ = crate::config::install_pinned_config(crate::config::HyprConfig::default());
+                let explicit = tempfile::tempdir()?;
+                let marker = explicit.path().join("operator.toml");
+                assert!(
+                    crate::config::install_explicit_config_path(marker),
+                    "explicit provenance slot must be installable in a fresh child"
+                );
+                wizard_pre_install_step(record_install).await?;
+                assert!(
+                    called.lock().is_empty(),
+                    "explicit --config provenance must skip fixed-unit installation"
+                );
+            }
+            "required" => {
+                let mut required_config = crate::config::HyprConfig::default();
+                required_config.quic.enabled = true;
+                required_config.quic.iroh = true;
+                required_config.quic.native_network_profile =
+                    crate::config::NativeNetworkProfile::NetworkIrohRequired;
+                required_config.validate()?;
+                let _ = crate::config::install_pinned_config(required_config);
+                assert!(
+                    crate::config::HyprConfig::load()?.quic.iroh_required(),
+                    "precondition: the pinned child config must load as required-native"
+                );
+                wizard_pre_install_step(record_install).await?;
+                assert!(
+                    called.lock().is_empty(),
+                    "required-native profile must skip fixed-unit installation"
+                );
+            }
+            "invalid" => {
+                // No pinned snapshot: force the XDG re-derivation onto a
+                // garbage config file so HyprConfig::load() itself fails.
+                let root = tempfile::tempdir()?;
+                let xdg = root.path().join("xdg-config");
+                std::env::set_var("XDG_CONFIG_HOME", &xdg);
+                let config_dir = xdg.join("hyprstream");
+                std::fs::create_dir_all(&config_dir)?;
+                std::fs::write(config_dir.join("config.toml"), "this is = not [valid toml")?;
+                let outcome = wizard_pre_install_step(record_install).await;
+                assert!(
+                    outcome.is_err(),
+                    "an unloadable configuration must fail closed, not resolve to the default profile"
+                );
+                assert!(
+                    called.lock().is_empty(),
+                    "fixed-unit installation must not run when the configuration cannot be loaded"
+                );
+            }
+            other => anyhow::bail!("unknown wizard routing scenario '{other}'"),
+        }
+        Ok(())
+    }
+
+    /// Recording `WizardBackend` that only implements the services phase and
+    /// delegates every other method to `MockWizardBackend`.
+    struct ServicesPhaseBackend {
+        inner: MockWizardBackend,
+        start_calls: Cell<usize>,
+        poll_script: std::cell::RefCell<VecDeque<OpStatus>>,
+    }
+
+    impl ServicesPhaseBackend {
+        fn new() -> Self {
+            Self {
+                inner: MockWizardBackend::new(),
+                start_calls: Cell::new(0),
+                poll_script: std::cell::RefCell::new(VecDeque::new()),
+            }
+        }
+
+        fn with_poll_script(script: Vec<OpStatus>) -> Self {
+            Self {
+                poll_script: std::cell::RefCell::new(script.into()),
+                ..Self::new()
+            }
+        }
+    }
+
+    impl WizardBackend for ServicesPhaseBackend {
+        fn detect_environment(&mut self) -> EnvironmentInfo {
+            self.inner.detect_environment()
+        }
+        fn recommend_action(&self, env: &EnvironmentInfo) -> InstallAction {
+            self.inner.recommend_action(env)
+        }
+        fn start_install(&mut self, variant: &LibtorchVariant) {
+            self.inner.start_install(variant);
+        }
+        fn poll_install(&mut self) -> InstallPoll {
+            self.inner.poll_install()
+        }
+        fn start_bootstrap(&mut self) {
+            self.inner.start_bootstrap();
+        }
+        fn poll_bootstrap(&mut self) -> BootstrapPoll {
+            self.inner.poll_bootstrap()
+        }
+        fn has_existing_policy(&self) -> bool {
+            self.inner.has_existing_policy()
+        }
+        fn apply_template(&mut self, name: &str) {
+            self.inner.apply_template(name);
+        }
+        fn add_user(&mut self, username: &str, role: &str) {
+            self.inner.add_user(username, role);
+        }
+        fn add_user_custom(&mut self, username: &str, resource: &str, actions: &[String]) {
+            self.inner.add_user_custom(username, resource, actions);
+        }
+        fn save_policies(&mut self) {
+            self.inner.save_policies();
+        }
+        fn generate_token(&mut self, username: &str, duration: &str) -> TokenResult {
+            self.inner.generate_token(username, duration)
+        }
+        fn start_services(&mut self) {
+            self.start_calls.set(self.start_calls.get() + 1);
+        }
+        fn poll_pending(&mut self) -> OpStatus {
+            self.poll_script
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(OpStatus::Done)
+        }
+        fn local_username(&self) -> String {
+            self.inner.local_username()
+        }
+        fn templates(&self) -> Vec<TemplateInfo> {
+            self.inner.templates()
+        }
+    }
+
+    /// Setup without startup: the non-interactive services phase with no start
+    /// flag must never invoke the backend's service start.
+    #[test]
+    fn services_phase_skips_startup_without_start_flag() -> Result<()> {
+        let mut backend = ServicesPhaseBackend::new();
+        text_phase_services(&mut backend, &["policy".to_owned()], true, false)?;
+        assert_eq!(
+            backend.start_calls.get(),
+            0,
+            "non-interactive wizard without --start-services must not start services"
+        );
+        Ok(())
+    }
+
+    /// A requested start drives the backend through the pending poll loop to a
+    /// terminal status — the phase is the wizard-side boundary that decides
+    /// whether BootstrapManager's launch routing runs at all.
+    #[test]
+    fn services_phase_requested_start_polls_to_done() -> Result<()> {
+        let mut backend = ServicesPhaseBackend::with_poll_script(vec![
+            OpStatus::InProgress,
+            OpStatus::Done,
+        ]);
+        text_phase_services(&mut backend, &["policy".to_owned()], true, true)?;
+        assert_eq!(
+            backend.start_calls.get(),
+            1,
+            "requested startup must invoke the backend start exactly once"
+        );
+        Ok(())
+    }
+
+    /// A failed start surfaces through the same phase without hanging.
+    #[test]
+    fn services_phase_surfaces_start_failure() -> Result<()> {
+        let mut backend =
+            ServicesPhaseBackend::with_poll_script(vec![OpStatus::Failed("boom".to_owned())]);
+        text_phase_services(&mut backend, &[], true, true)?;
+        assert_eq!(backend.start_calls.get(), 1);
+        Ok(())
+    }
 }

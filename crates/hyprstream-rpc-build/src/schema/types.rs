@@ -59,6 +59,30 @@ pub struct UnionVariant {
     /// genesis-coverage finding (no permissive default).
     #[serde(default)]
     pub vfs_mac: String,
+    /// `$dispatchMac` annotation text — the method's target dispatch MAC label
+    /// in the strict `<level>:<assurance>[:<compartments>]` grammar (v16 §6,
+    /// WS-D). Empty = not declared (a leaf with neither dispatch annotation is
+    /// a build error; a scoped dispatcher carries neither).
+    #[serde(default)]
+    pub dispatch_mac: String,
+    /// Whether `$dispatchMac` was present, including an explicitly empty value.
+    #[serde(default)]
+    pub dispatch_mac_present: bool,
+    /// `$dispatchPublic` annotation text — the mandatory, reviewable reason a
+    /// leaf may be dispatched unauthenticated (v16 §6). Empty = not declared.
+    /// Expands to exactly system low; public is never inherited.
+    #[serde(default)]
+    pub dispatch_public: String,
+    /// Whether `$dispatchPublic` was present, including an explicitly empty value.
+    #[serde(default)]
+    pub dispatch_public_present: bool,
+    /// `$mutationSemantics` declaration for a mutating leaf (v16 §4.8/§6.1).
+    /// Empty only for read-class, scope-exempt, or dispatcher variants.
+    #[serde(default)]
+    pub mutation_semantics: String,
+    /// Whether `$mutationSemantics` was present, including an explicitly empty value.
+    #[serde(default)]
+    pub mutation_semantics_present: bool,
 }
 
 /// Payload carried by a tagged-union arm.
@@ -92,6 +116,21 @@ pub struct UnionArm {
     pub discriminant_value: u16,
     /// Description from `$paramDescription`/`$mcpDescription` (may be empty).
     pub description: String,
+    /// `$dispatchMac` metadata carried by a pure-union arm.
+    #[serde(default)]
+    pub dispatch_mac: String,
+    #[serde(default)]
+    pub dispatch_mac_present: bool,
+    /// `$dispatchPublic` metadata carried by a pure-union arm.
+    #[serde(default)]
+    pub dispatch_public: String,
+    #[serde(default)]
+    pub dispatch_public_present: bool,
+    /// `$mutationSemantics` metadata carried by a pure-union arm.
+    #[serde(default)]
+    pub mutation_semantics: String,
+    #[serde(default)]
+    pub mutation_semantics_present: bool,
     /// The payload this arm carries.
     pub payload: ArmPayload,
 }
@@ -299,6 +338,12 @@ mod vfs_metadata_tests {
             vfs_bulk: false,
             vfs_hidden: false,
             vfs_mac: String::new(),
+            dispatch_mac: String::new(),
+            dispatch_public: String::new(),
+            mutation_semantics: String::new(),
+            dispatch_mac_present: false,
+            dispatch_public_present: false,
+            mutation_semantics_present: false,
         };
         let json = serde_json::to_string(&v).expect("serialize");
         let back: UnionVariant = serde_json::from_str(&json).expect("deserialize");

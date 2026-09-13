@@ -26,10 +26,25 @@ pub fn issue_or_load_service_jwt(
     credentials_dir: &Path,
     service_name: &str,
     ca_jwt_key: &SigningKey,
-    service_vk: &VerifyingKey,
+    bootstrap: &super::identity_store::BootstrapPubkey,
     local_issuer_url: &str,
     now: i64,
+    target_clearance: Option<&hyprstream_rpc::auth::mac::SecurityLabel>,
 ) -> Result<String> {
+    let service_vk = &bootstrap.ed25519;
+    // v16 confirmation (frozen A §1.1/§5): the service credential's
+    // `cnf.hs_signer_suite` is the content thumbprint over the SERVICE's own
+    // enrolled primary signer group — Ed25519 plus, when the identity is
+    // hybrid, ML-DSA-65 — taken directly from the authoritative BootstrapPubkey
+    // (never re-derived from the public Ed key or hidden global state).
+    let ml_dsa_bytes = bootstrap
+        .ml_dsa_65
+        .as_ref()
+        .map(hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes);
+    let expected_hs = hyprstream_rpc::auth::service_signer_suite_b64(
+        &service_vk.to_bytes(),
+        ml_dsa_bytes.as_deref(),
+    );
     let existing = super::identity_store::load_service_jwt(credentials_dir, service_name)?;
     let needs_issue = match existing {
         None => true,
@@ -48,6 +63,20 @@ pub fn issue_or_load_service_jwt(
             (exp - now) <= RENEW_THRESHOLD
                 || !claims_bind_local_issuer(jwt, local_issuer_url)
                 || !header_alg_covers_pq(jwt)
+                // Full binding validation before reuse: a corrupted or
+                // foreign persisted token must force reissue here, not a
+                // later boot failure — verify the CA composite signature,
+                // exact subject, cnf key binding, and required jti.
+                || !persisted_token_binds(jwt, ca_jwt_key, service_name, service_vk, &expected_hs)
+                // The persisted token's clearance must equal the enrollment
+                // target's WIRE PROJECTION (level + compartments; assurance is
+                // never on the wire): a clearance-less or stale-clearance token
+                // is re-minted, never reused (v16 §11 — renewal cannot preserve
+                // authority the enrollment no longer grants, and an enrolled
+                // credential never goes clearance-less).
+                || decode_jwt_clearance(jwt)
+                    != target_clearance
+                        .map(|c| hyprstream_rpc::auth::mac::CredentialClearance::from_label(*c))
         }
     };
 
@@ -74,7 +103,10 @@ pub fn issue_or_load_service_jwt(
         now,
         expiry,
     )
-    .with_cnf_jwk(service_vk.as_bytes());
+    // v16 confirmation (the authoritative signer-suite thumbprint) stamped
+    // alongside the legacy single-key `cnf.jwk` (never replacing it).
+    .with_cnf_jwk(service_vk.as_bytes())
+    .with_cnf_hs_signer_suite(expected_hs.clone());
     if !local_issuer_url.is_empty() {
         // Stamp `aud` alongside `iss`: composite verification is strict about
         // the audience (an absent `aud` is rejected when the verifier expects
@@ -82,6 +114,12 @@ pub fn issue_or_load_service_jwt(
         claims = claims
             .with_issuer(local_issuer_url.to_owned())
             .with_audience(Some(local_issuer_url.to_owned()));
+    }
+    // Stamp the enrollment target clearance (v16 §11): the bootstrap/wizard
+    // mint is clearance-bearing when the deployment has an enrollment
+    // manifest. `None` (legacy, no manifest) mints without the claim.
+    if let Some(clearance) = target_clearance {
+        claims = claims.with_clearance(*clearance);
     }
 
     // Mint the mandatory hybrid (ML-DSA-65-Ed25519) form: the dispatch plane
@@ -129,6 +167,63 @@ fn header_alg_covers_pq(jwt: &str) -> bool {
     )
 }
 
+/// Full binding validation of a persisted service JWT before reuse: verify
+/// the CA's composite signature and require the exact subject, the cnf key
+/// binding to this service's verifying key, and a present `jti`. Any parse,
+/// signature, or binding failure returns false (forcing reissue) — reuse
+/// decides from VERIFIED fields, never unsigned decodes alone.
+fn persisted_token_binds(
+    jwt: &str,
+    ca_jwt_key: &SigningKey,
+    service_name: &str,
+    service_vk: &VerifyingKey,
+    expected_hs: &str,
+) -> bool {
+    let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(ca_jwt_key);
+    let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
+    let Ok(dispatch) = hyprstream_rpc::auth::jwt::parse_composite_dispatch(jwt, &["wit+jwt"])
+    else {
+        return false;
+    };
+    let Ok(claims) = hyprstream_rpc::auth::jwt::decode_composite(
+        jwt,
+        &ca_pq_vk,
+        &ca_jwt_key.verifying_key(),
+        None,
+        &dispatch,
+    ) else {
+        return false;
+    };
+    // A legacy persisted token bound only by `cnf.jwk` (no v16
+    // `cnf.hs_signer_suite`, or a stale one) is NOT reused — it reissues with
+    // the authoritative confirmation, so the service credential C admits is a
+    // v16 credential, never a legacy-only one.
+    let hs_binds = claims
+        .cnf
+        .as_ref()
+        .and_then(|c| c.hs_signer_suite.as_deref())
+        == Some(expected_hs);
+    claims.sub == format!("service:{service_name}")
+        && claims.cnf_key_bytes() == Some(service_vk.to_bytes())
+        && claims.jti.is_some()
+        && hs_binds
+}
+
+/// Decode the two-axis `clearance` claim (`[level, [compartments]]`) without
+/// verifying the signature — the reuse predicate's enrollment-currency check (a
+/// mismatched or missing clearance forces re-issue). Returns `None` when the
+/// token carries no clearance or the claim is not a well-formed two-axis wire
+/// value. The assurance axis is never on the wire; comparison is against the
+/// enrollment target's wire projection (level + compartments).
+fn decode_jwt_clearance(
+    jwt: &str,
+) -> Option<hyprstream_rpc::auth::mac::CredentialClearance> {
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    serde_json::from_value(value.get("clearance")?.clone()).ok()
+}
+
 fn decode_jwt_exp(jwt: &str) -> Option<i64> {
     let payload_b64 = jwt.split('.').nth(1)?;
     let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
@@ -161,6 +256,12 @@ fn decode_jwt_aud(jwt: &str) -> Option<String> {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use super::super::identity_store::BootstrapPubkey;
+
+    /// Classical (single Ed25519) BootstrapPubkey for the service-JWT tests.
+    fn bp(vk: ed25519_dalek::VerifyingKey) -> BootstrapPubkey {
+        BootstrapPubkey { ed25519: vk, ml_dsa_65: None }
+    }
 
     /// A freshly issued service JWT carries the local issuer URL (NOT empty).
     /// Empty `iss` is rejected on the IPC/AnySigner plane by the #328 gate, so
@@ -174,7 +275,7 @@ mod tests {
         let issuer = "http://localhost:6791";
 
         let jwt = issue_or_load_service_jwt(
-            dir.path(), "model", &ca, &svc.verifying_key(), issuer, 1_000_000,
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, 1_000_000, None,
         )
         .unwrap();
 
@@ -208,9 +309,10 @@ mod tests {
             dir.path(),
             "policy",
             &ca_jwt_key,
-            &policy_vk,
+            &bp(policy_vk),
             issuer,
             1_000_000,
+            None,
         )
         .unwrap();
         super::super::identity_store::write_service_jwt(dir.path(), "policy", &jwt).unwrap();
@@ -273,7 +375,7 @@ mod tests {
         super::super::identity_store::write_service_jwt(dir.path(), "model", &legacy).unwrap();
 
         let jwt = issue_or_load_service_jwt(
-            dir.path(), "model", &ca, &svc.verifying_key(), issuer, now,
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, None,
         )
         .unwrap();
         assert_ne!(jwt, legacy, "classical token must not be returned as-is");
@@ -326,7 +428,7 @@ mod tests {
         super::super::identity_store::write_service_jwt(dir.path(), "model", &legacy).unwrap();
 
         let jwt = issue_or_load_service_jwt(
-            dir.path(), "model", &ca, &svc.verifying_key(), issuer, now,
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, None,
         )
         .unwrap();
         assert_ne!(jwt, legacy, "aud-less token must not be returned as-is");
@@ -354,16 +456,18 @@ mod tests {
         let ca = SigningKey::from_bytes(&[3u8; 32]);
         let svc = SigningKey::from_bytes(&[4u8; 32]);
         let issuer = "http://localhost:6791";
-        let now = 1_000_000;
+        // Real wall-clock time: reuse validation verifies the persisted
+        // token's composite signature, which enforces iat/exp against now.
+        let now = chrono::Utc::now().timestamp();
 
         let first = issue_or_load_service_jwt(
-            dir.path(), "model", &ca, &svc.verifying_key(), issuer, now,
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, None,
         )
         .unwrap();
         super::super::identity_store::write_service_jwt(dir.path(), "model", &first).unwrap();
 
         let second = issue_or_load_service_jwt(
-            dir.path(), "model", &ca, &svc.verifying_key(), issuer, now,
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, None,
         )
         .unwrap();
         assert_eq!(first, second);
@@ -390,9 +494,323 @@ mod tests {
         // Even though it is far from expiry, the empty-iss legacy token forces a
         // re-issue carrying the issuer.
         let jwt = issue_or_load_service_jwt(
-            dir.path(), "model", &ca, &svc.verifying_key(), "http://localhost:6791", now,
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), "http://localhost:6791", now, None,
         )
         .unwrap();
         assert_eq!(decode_jwt_iss(&jwt).as_deref(), Some("http://localhost:6791"));
+    }
+
+    fn enrollment_label() -> hyprstream_rpc::auth::mac::SecurityLabel {
+        hyprstream_rpc::auth::mac::SecurityLabel::new(
+            hyprstream_rpc::auth::mac::Level::Internal,
+            hyprstream_rpc::auth::mac::Assurance::Classical,
+            hyprstream_rpc::auth::mac::CompartmentSet::EMPTY,
+        )
+    }
+
+    /// A manifest-backed mint stamps the enrollment target clearance, and a
+    /// persisted token whose clearance is MISSING or STALE is re-minted, not
+    /// reused — renewal never preserves authority the enrollment no longer
+    /// grants, and an enrolled credential never goes clearance-less.
+    #[test]
+    fn clearance_is_stamped_and_stale_or_missing_clearance_reissued() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = SigningKey::from_bytes(&[3u8; 32]);
+        let svc = SigningKey::from_bytes(&[4u8; 32]);
+        let issuer = "http://localhost:6791";
+        // Real wall-clock time: reuse validation verifies the persisted token's
+        // composite signature (`persisted_token_binds`), which enforces
+        // iat/exp against `now` — a fixed epoch would leave every persisted
+        // token expired and force a reissue on the same-target reuse path.
+        let now = chrono::Utc::now().timestamp();
+        let target = enrollment_label();
+
+        // Fresh mint carries the target clearance.
+        let jwt = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, Some(&target),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_jwt_clearance(&jwt),
+            Some(hyprstream_rpc::auth::mac::CredentialClearance::from_label(target))
+        );
+        super::super::identity_store::write_service_jwt(dir.path(), "model", &jwt).unwrap();
+
+        // Same target: reused unchanged.
+        let second = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, Some(&target),
+        )
+        .unwrap();
+        assert_eq!(jwt, second);
+
+        // Enrollment NARROWED (compartment added): the persisted token is
+        // stale and must be re-minted.
+        let narrowed = hyprstream_rpc::auth::mac::SecurityLabel::new(
+            hyprstream_rpc::auth::mac::Level::Secret,
+            hyprstream_rpc::auth::mac::Assurance::Classical,
+            hyprstream_rpc::auth::mac::CompartmentSet::EMPTY,
+        );
+        let reminted = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, Some(&narrowed),
+        )
+        .unwrap();
+        assert_ne!(reminted, jwt, "stale-clearance token must not be reused");
+        assert_eq!(
+            decode_jwt_clearance(&reminted),
+            Some(hyprstream_rpc::auth::mac::CredentialClearance::from_label(narrowed))
+        );
+
+        // A clearance-less legacy token under an enrollment target is
+        // re-minted with the clearance.
+        let legacy_claims =
+            hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 30 * 86_400)
+                .with_issuer(issuer.to_owned())
+                .with_audience(Some(issuer.to_owned()))
+                .with_cnf_jwk(svc.verifying_key().as_bytes());
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
+        let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
+        let legacy = hyprstream_rpc::auth::jwt::encode_service_jwt_hybrid(
+            &legacy_claims, &ca, &ca_pq, &ca_pq_vk,
+        );
+        super::super::identity_store::write_service_jwt(dir.path(), "model", &legacy).unwrap();
+        let healed = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, Some(&target),
+        )
+        .unwrap();
+        assert_ne!(healed, legacy, "clearance-less token must not be reused");
+        assert_eq!(
+            decode_jwt_clearance(&healed),
+            Some(hyprstream_rpc::auth::mac::CredentialClearance::from_label(target))
+        );
+    }
+
+    /// Reuse validates the persisted token's binding, not just its unsigned
+    /// fields: a tampered signature, a foreign cnf key, or a foreign subject
+    /// all force reissue.
+    #[test]
+    fn persisted_token_with_broken_binding_is_reissued() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = SigningKey::from_bytes(&[3u8; 32]);
+        let svc = SigningKey::from_bytes(&[4u8; 32]);
+        let issuer = "http://localhost:6791";
+        let now = chrono::Utc::now().timestamp();
+
+        let good = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, None,
+        )
+        .unwrap();
+        super::super::identity_store::write_service_jwt(dir.path(), "model", &good).unwrap();
+
+        // Sanity: the good token is reused.
+        let reused = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, None,
+        )
+        .unwrap();
+        assert_eq!(good, reused);
+
+        // Tampered signature (payload untouched, signature flipped) → the
+        // composite verification fails and the token is reissued.
+        let parts: Vec<&str> = good.split('.').collect();
+        let mut sig = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        sig[0] ^= 0x01;
+        let tampered = format!(
+            "{}.{}.{}",
+            parts[0],
+            parts[1],
+            URL_SAFE_NO_PAD.encode(sig)
+        );
+        super::super::identity_store::write_service_jwt(dir.path(), "model", &tampered)
+            .unwrap();
+        let reissued = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, None,
+        )
+        .unwrap();
+        assert_ne!(reissued, tampered, "tampered-signature token must be reissued");
+
+        // Foreign cnf (signed by the CA but bound to a DIFFERENT service key)
+        // → reissue.
+        let other_svc = SigningKey::from_bytes(&[9u8; 32]);
+        let foreign_claims =
+            hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 30 * 86_400)
+                .with_issuer(issuer.to_owned())
+                .with_audience(Some(issuer.to_owned()))
+                .with_cnf_jwk(other_svc.verifying_key().as_bytes());
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
+        let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
+        let foreign = hyprstream_rpc::auth::jwt::encode_service_jwt_hybrid(
+            &foreign_claims, &ca, &ca_pq, &ca_pq_vk,
+        );
+        super::super::identity_store::write_service_jwt(dir.path(), "model", &foreign).unwrap();
+        let reissued = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, None,
+        )
+        .unwrap();
+        assert_ne!(reissued, foreign, "foreign-cnf token must be reissued");
+        // And the reissue binds the correct service key.
+        let dispatch =
+            hyprstream_rpc::auth::jwt::parse_composite_dispatch(&reissued, &["wit+jwt"]).unwrap();
+        let verified = hyprstream_rpc::auth::jwt::decode_composite(
+            &reissued,
+            &ca_pq_vk,
+            &ca.verifying_key(),
+            None,
+            &dispatch,
+        )
+        .unwrap();
+        assert_eq!(
+            verified.cnf_key_bytes(),
+            Some(svc.verifying_key().to_bytes())
+        );
+    }
+
+    /// Decode the raw `cnf` object from a JWT payload (unsigned) for assertions.
+    fn decode_cnf(jwt: &str) -> Option<serde_json::Value> {
+        let payload_b64 = jwt.split('.').nth(1)?;
+        let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+        let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+        value.get("cnf").cloned()
+    }
+
+    /// A fresh HYBRID-enrolled service JWT stamps `cnf.hs_signer_suite` equal to
+    /// the authoritative signer-suite thumbprint over the service's own enrolled
+    /// Ed25519 + ML-DSA-65 keys, and preserves the legacy `cnf.jwk` alongside it.
+    #[test]
+    fn fresh_hybrid_service_jwt_stamps_authoritative_signer_suite() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = SigningKey::from_bytes(&[3u8; 32]);
+        let svc = SigningKey::from_bytes(&[4u8; 32]);
+        let (_svc_pq, svc_pq_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let issuer = "http://localhost:6791";
+        let now = chrono::Utc::now().timestamp();
+
+        let bootstrap = BootstrapPubkey {
+            ed25519: svc.verifying_key(),
+            ml_dsa_65: Some(svc_pq_vk.clone()),
+        };
+        let jwt = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &bootstrap, issuer, now, None,
+        )
+        .unwrap();
+
+        let expected = hyprstream_rpc::auth::service_signer_suite_b64(
+            &svc.verifying_key().to_bytes(),
+            Some(&hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&svc_pq_vk)),
+        );
+        let cnf = decode_cnf(&jwt).expect("minted JWT carries cnf");
+        assert_eq!(
+            cnf.get("hs_signer_suite").and_then(|v| v.as_str()),
+            Some(expected.as_str()),
+            "cnf.hs_signer_suite must equal the authoritative hybrid signer suite"
+        );
+        // The legacy single-key jwk binding is preserved alongside it.
+        assert!(
+            cnf.get("jwk").and_then(|v| v.get("x")).is_some(),
+            "cnf.jwk must be preserved alongside hs_signer_suite"
+        );
+    }
+
+    /// Build an otherwise-current, correctly CA-signed hybrid persisted token
+    /// whose only defect is its `cnf.hs_signer_suite` (supplied via `hs`): `None`
+    /// omits it, `Some(x)` stamps `x`. Every OTHER reuse predicate
+    /// (iss/aud/sub/jti/cnf.jwk/clearance/expiry/alg) is satisfied, so the hs
+    /// gate is the ONLY predicate that can fire.
+    fn write_persisted_token_with_hs(
+        dir: &Path,
+        ca: &SigningKey,
+        svc: &SigningKey,
+        issuer: &str,
+        now: i64,
+        hs: Option<&str>,
+    ) {
+        let mut claims =
+            hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 30 * 86_400)
+                .with_issuer(issuer.to_owned())
+                .with_audience(Some(issuer.to_owned()))
+                .with_cnf_jwk(svc.verifying_key().as_bytes())
+                .with_jti();
+        if let Some(hs) = hs {
+            claims = claims.with_cnf_hs_signer_suite(hs.to_owned());
+        }
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(ca);
+        let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt_hybrid(
+            &claims, ca, &ca_pq, &ca_pq_vk,
+        );
+        super::super::identity_store::write_service_jwt(dir, "model", &jwt).unwrap();
+    }
+
+    /// An otherwise-current, correctly-signed hybrid persisted token that is
+    /// MISSING `cnf.hs_signer_suite` is reissued (never reused): the new v16 gate
+    /// fires even though every legacy predicate passes.
+    #[test]
+    fn persisted_token_missing_hs_signer_suite_is_reissued() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = SigningKey::from_bytes(&[3u8; 32]);
+        let svc = SigningKey::from_bytes(&[4u8; 32]);
+        let issuer = "http://localhost:6791";
+        let now = chrono::Utc::now().timestamp();
+
+        write_persisted_token_with_hs(dir.path(), &ca, &svc, issuer, now, None);
+        let existing =
+            super::super::identity_store::load_service_jwt(dir.path(), "model").unwrap().unwrap();
+
+        let reissued = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, None,
+        )
+        .unwrap();
+        assert_ne!(reissued, existing, "a legacy-only (no hs) token must be reissued");
+        // The reissue carries the authoritative hs.
+        let expected = hyprstream_rpc::auth::service_signer_suite_b64(
+            &svc.verifying_key().to_bytes(),
+            None,
+        );
+        let cnf = decode_cnf(&reissued).unwrap();
+        assert_eq!(
+            cnf.get("hs_signer_suite").and_then(|v| v.as_str()),
+            Some(expected.as_str())
+        );
+    }
+
+    /// An otherwise-current persisted token carrying a STALE/WRONG
+    /// `cnf.hs_signer_suite` (a suite over a different key) is reissued.
+    #[test]
+    fn persisted_token_stale_hs_signer_suite_is_reissued() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = SigningKey::from_bytes(&[3u8; 32]);
+        let svc = SigningKey::from_bytes(&[4u8; 32]);
+        let other = SigningKey::from_bytes(&[9u8; 32]);
+        let issuer = "http://localhost:6791";
+        let now = chrono::Utc::now().timestamp();
+
+        // Wrong hs: the classical suite over a DIFFERENT key.
+        let wrong_hs = hyprstream_rpc::auth::service_signer_suite_b64(
+            &other.verifying_key().to_bytes(),
+            None,
+        );
+        write_persisted_token_with_hs(dir.path(), &ca, &svc, issuer, now, Some(&wrong_hs));
+        let existing =
+            super::super::identity_store::load_service_jwt(dir.path(), "model").unwrap().unwrap();
+
+        let reissued = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, None,
+        )
+        .unwrap();
+        assert_ne!(reissued, existing, "a stale-hs token must be reissued");
+
+        // Control: a token carrying the CORRECT hs (and nothing else wrong) IS
+        // reused — proving the reissue above is driven by the hs mismatch, not
+        // another predicate.
+        let correct_hs = hyprstream_rpc::auth::service_signer_suite_b64(
+            &svc.verifying_key().to_bytes(),
+            None,
+        );
+        write_persisted_token_with_hs(dir.path(), &ca, &svc, issuer, now, Some(&correct_hs));
+        let current =
+            super::super::identity_store::load_service_jwt(dir.path(), "model").unwrap().unwrap();
+        let reused = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &bp(svc.verifying_key()), issuer, now, None,
+        )
+        .unwrap();
+        assert_eq!(reused, current, "a correct-hs current token must be reused");
     }
 }

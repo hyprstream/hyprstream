@@ -73,9 +73,14 @@
 //! - Refresh-token rotation with re-evaluation plumbing end-to-end (the
 //!   `evaluate_grant` call on refresh is wired; rotation storage is the OAuth
 //!   layer's job).
-//! - Revocation propagation into the grant path (credential revocation store
-//!   check at grant time — the store exists but the grant path does not yet
-//!   query it).
+//!
+//! Revocation propagation into the grant path (the former
+//! `TODO(#572-revocation)`) is closed by construction: every credential the
+//! grant path mints carries an issuer-scoped `jti` and is checked against the
+//! canonical revocation authority at every verification point; interactive
+//! refresh chains carry a session ID whose revocation prevents refresh
+//! without consuming the credential; and UCAN-grant refresh entries are
+//! single-use, re-evaluated here, and deletable through `/oauth/revoke`.
 
 use hyprstream_rpc::auth::mac::{
     SecurityContext, SecurityLabel, SubjectContextClaims, VerifiedKeyMaterial,

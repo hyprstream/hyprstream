@@ -522,6 +522,34 @@ pub fn load_service_jwt_for_profile(
     }
 }
 
+/// Seed a provisioned service JWT under the key selected by startup.
+///
+/// Service factories first consult the process trust store. Keeping this
+/// bridge beside the profile-aware loader lets a caller that already resolved
+/// a custom config path carry the authoritative JWT into a factory that has no
+/// config handle of its own.
+pub fn seed_service_jwt_into_trust_store(
+    service_name: &str,
+    signing_key: &SigningKey,
+    credentials_dir: &std::path::Path,
+    profile: SecretsProfile,
+) {
+    if let Ok(Some(jwt_str)) = load_service_jwt_for_profile(credentials_dir, service_name, profile) {
+        let expires_at = decode_jwt_exp_raw(&jwt_str).unwrap_or(0);
+        hyprstream_service::global_trust_store().insert(
+            signing_key.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: std::iter::once(service_name.to_owned()).collect(),
+                subject: None,
+                jwt: Some(jwt_str),
+                expires_at,
+                attested_by: None,
+            },
+        );
+        tracing::info!(service = %service_name, "Seeded trust store with own service-jwt from credential dir");
+    }
+}
+
 /// Persist a service JWT using the same profile-aware path startup reads.
 pub fn write_service_jwt_for_profile(
     credentials_dir: &std::path::Path,
@@ -1034,6 +1062,24 @@ pub fn resolve_service_signing_key(
             load_or_generate_service_signing_key(secrets_dir, service_name)
         }
     }
+}
+
+/// Load a provisioned service identity without ever generating a replacement.
+pub fn load_existing_service_signing_key(
+    secrets_dir: &std::path::Path,
+    service_name: &str,
+    profile: SecretsProfile,
+) -> Result<SigningKey> {
+    validate_service_name(service_name)?;
+    let directory = match (profile, service_name) {
+        (_, "policy") | (SecretsProfile::PerServiceScoped, _) => secrets_dir.to_owned(),
+        (SecretsProfile::SharedDirectory, _) => secrets_dir.join(service_name),
+    };
+    let bytes = Zeroizing::new(read_secret(&directory, "signing-key")?
+        .ok_or_else(|| anyhow!("provisioned signing key is missing for service {service_name}"))?);
+    let seed = Zeroizing::new(<[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| anyhow!("service {service_name} signing-key must be 32 bytes"))?);
+    Ok(SigningKey::from_bytes(&seed))
 }
 
 // The `#atproto` commit-signing key is NOT loaded here. It is the *active* key

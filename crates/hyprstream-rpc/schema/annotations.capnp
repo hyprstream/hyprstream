@@ -27,9 +27,10 @@
 # NAME (not the ordinal), and the runtime `Scope`/`Operation` are keyed on those names,
 # so the names are the stable contract and the ordinals are free to be re-grouped.
 enum ScopeAction {
-  # ── Block A: read-class — side-effect-free (9p read = no side effects).
-  #            TE object-class: "read". Cheap to grant to a group.
-  query      @0;  # read status/state/list           (UCAN cmd: /query)
+  # ── Block A: read-class authorization. TE object-class: "read". A leaf
+  #            may still declare bounded session/subscription effects through
+  #            $mutationSemantics; authorization and effect policy are separate.
+  query      @0;  # query/read authority              (UCAN cmd: /query)
   subscribe  @1;  # subscribe to stream/notification  (UCAN cmd: /subscribe)
   # ── Block B: write/authority-class — mutating or capability-bearing actions on
   #            models/resources. TE object-class: "write". Least-privilege per-node.
@@ -78,6 +79,59 @@ annotation capability(field) :ScopeAction;
 # (envelope/CA attestation) documented inline. A reason string is mandatory so the
 # exemption is reviewable. Absence of BOTH `$scope` and `$scopeExempt` = build error.
 annotation scopeExempt(field) :Text;
+
+# ── Dispatch MAC policy (v16 §6, WS-D) ────────────────────────────────────
+# The strict dispatch-policy pair that REPLACES `$scope`/`$scopeExempt` as the
+# source of the generated method-policy inventory (v16 #1505). `$scope` remains
+# the control-plane scope vocabulary (S3); it is no longer the dispatch-floor
+# stand-in.
+#
+# `$dispatchMac` carries the method's target MAC label in the strict grammar:
+#
+#   <level>:<assurance>[:<compartment>[,<compartment>...]]
+#
+#   level        one of public | internal | confidential | secret
+#   assurance    one of unverified | classical | pq-hybrid
+#   compartment  a name resolved through the checked-in, versioned
+#                InitialLabelMap (stable bit assignments, append-only,
+#                tombstoned — never reused), listed in canonical (bit-ascending)
+#                order, no duplicates.
+#
+# `$dispatchPublic("<reason>")` is the ONLY way a leaf may be dispatched by an
+# unauthenticated caller; the reason string is mandatory and reviewable, and the
+# label expands to exactly system low.
+#
+# Enforced by the schema reader / code generator (v16 §6):
+#   - every recursively discovered leaf carries exactly one of the two;
+#   - scoped dispatcher nodes carry neither; their leaves do;
+#   - both annotations on one leaf are a build error;
+#   - `$dispatchPublic` requires a trimmed nonempty reason and appears only on
+#     leaves (public is never inherited through a dispatcher);
+#   - system low written through `$dispatchMac` is a build error;
+#   - empty components, duplicate/unknown compartments, noncanonical ordering,
+#     unknown levels/assurances, and parse failures are build errors;
+#   - an annotation failure can never produce an unlabeled runtime row.
+annotation dispatchMac(field)    :Text;
+annotation dispatchPublic(field) :Text;
+
+# Explicit replay/application-effect policy for each mutating leaf (v16 §4.8,
+# §6.1). This is checked metadata, never inferred from a scope or method name.
+# A missing declaration means the leaf has no application mutation effect. A
+# `query`/`subscribe` scope may still declare a policy when it changes bounded
+# session or subscription state: authorization and effect semantics are
+# separate axes. The closed values are:
+#   naturally-idempotent       — retry-safe with no extra mechanism
+#   idempotency-key-required   — REQUIRED PREREQUISITE: before retry is
+#                                enabled, the payload must carry a caller
+#                                application idempotency key and the result
+#                                must be durably recorded per key
+#   transaction-ledger-required — REQUIRED PREREQUISITE: retry safety
+#                                requires a separately claimed
+#                                exactly-once-visible contract with atomic
+#                                commit/fencing
+# The latter two declare required activation work; the annotation does not claim
+# that a key or ledger has already been implemented.
+annotation mutationSemantics(field) :Text;
 
 # Mark as deprecated with reason
 annotation deprecated(field, union, struct, enum) :Text;

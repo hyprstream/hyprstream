@@ -8,6 +8,30 @@ pub mod model_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
     hyprstream_rpc_derive::generate_rpc_service!("model", scope_handlers);
+
+    /// Send the canonical Model health request and retain its typed response.
+    ///
+    /// The generated `health_check` convenience method turns `ErrorInfo` into
+    /// an untyped error. OAI startup needs to distinguish one authenticated
+    /// Model denial from local transport and response-verification failures,
+    /// so this narrow helper keeps the method-bound call and parses the
+    /// already-verified response bytes without changing shared code generation.
+    pub(crate) async fn verified_health_check_response(
+        client: &ModelClient,
+    ) -> anyhow::Result<ModelResponseVariant> {
+        const HEALTH_CHECK_METHOD: u16 = 3;
+
+        let request_id = client.next_id();
+        let payload = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message.init_root::<crate::model_capnp::model_request::Builder>();
+            request.set_id(request_id);
+            request.set_health_check(());
+        })?;
+        let response = client
+            .call_with_method(HEALTH_CHECK_METHOD, payload)
+            .await?;
+        ModelClient::parse_response(&response)
+    }
 }
 
 pub mod registry_client {

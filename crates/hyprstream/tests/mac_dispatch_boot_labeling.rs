@@ -23,8 +23,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 
+use hyprstream_core::auth::identity_store::BootstrapPubkey;
 use hyprstream_core::auth::service_jwt::issue_or_load_service_jwt;
 use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::config::TokenConfig;
@@ -35,7 +36,7 @@ use hyprstream_rpc::auth::ClusterKeySource;
 use hyprstream_rpc::dial::{dial_with_crypto_stores, register_inproc};
 use hyprstream_rpc::envelope::{InMemoryNonceCache, KeyedPqTrustStore};
 use hyprstream_rpc::node_identity::{derive_mesh_mldsa_key, derive_purpose_key};
-use hyprstream_rpc::service::{Continuation, EnvelopeContext, RequestService};
+use hyprstream_rpc::service::{Continuation, DecodedRequestBody, EnvelopeContext, RequestService};
 use hyprstream_rpc::signer::LocalSigner;
 use hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge;
 use hyprstream_rpc::transport::rpc_session::IrohRequestProcessor;
@@ -51,6 +52,15 @@ const ISSUER: &str = "http://127.0.0.1:6791";
 /// verification (Hybrid policy) with the PQ anchors of the fixture keys.
 /// These anchors authenticate keys; they grant no authorization.
 fn install_crypto() {
+    // Match the Policy-host startup authority: the dispatch plane fails
+    // closed on jti-bearing service credentials without the process-global
+    // revocation store, even on a fresh deployment. Get-or-init an in-memory
+    // authority for this binary.
+    if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+        let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+            hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+        ));
+    }
     let mut store = KeyedPqTrustStore::new();
     for bytes in [POLICY_ROOT_KEY, DISCOVERY_KEY, GHOST_CLIENT_KEY] {
         let ed = SigningKey::from_bytes(&bytes);
@@ -82,16 +92,19 @@ fn mint_service_jwt(
     dir: &tempfile::TempDir,
     service_name: &str,
     ca_jwt_key: &SigningKey,
-    service_vk: &VerifyingKey,
+    service_key: &SigningKey,
 ) -> String {
     let now = chrono::Utc::now().timestamp();
+    let bootstrap = BootstrapPubkey::for_service_key(service_key)
+        .expect("fixture service hybrid enrollment");
     issue_or_load_service_jwt(
         dir.path(),
         service_name,
         ca_jwt_key,
-        service_vk,
+        &bootstrap,
         ISSUER,
         now,
+        Some(&hyprstream_core::mac::dispatch_labels::BOOTSTRAP_SERVICE_CLEARANCE),
     )
     .expect("mint service JWT")
 }
@@ -159,7 +172,7 @@ async fn fresh_state_register_service_key_passes_production_dispatch_pep() -> Re
         &creds,
         "discovery",
         &ca_jwt_key,
-        &discovery_key.verifying_key(),
+        &discovery_key,
     );
 
     let tag = format!("mac-1499-policy-{}", uuid::Uuid::new_v4());
@@ -192,7 +205,11 @@ async fn fresh_state_register_service_key_passes_production_dispatch_pep() -> Re
     // Causal twin: identical caller, identical service, undeclared leaf.
     // `resolveServiceKey` is a real policy method (discriminant 17) that this
     // slice deliberately does NOT declare — declaration, not schema, is the
-    // authority. It must deny before handler entry with UnlabeledObject.
+    // authority. It must deny before handler entry. Per the v16 §14.2
+    // uniform-denial rule the wire error is opaque ("dispatch denied") so the
+    // response cannot leak which gate fired; the specific UnlabeledObject
+    // reason is asserted at the PEP unit level (mac::dispatch_labels and
+    // mac::cas_pep tests) and in the audit trail.
     let undeclared = client
         .resolve_service_key(&ResolveServiceKey {
             service_name: "registry".to_owned(),
@@ -200,8 +217,8 @@ async fn fresh_state_register_service_key_passes_production_dispatch_pep() -> Re
         .await;
     let error = undeclared.expect_err("undeclared leaf must deny");
     assert!(
-        format!("{error:?}").contains("UnlabeledObject"),
-        "undeclared leaf must deny UnlabeledObject, got: {error:?}"
+        format!("{error:?}").contains(hyprstream_rpc::service::dispatch::DISPATCH_DENIED),
+        "undeclared leaf must deny through the uniform dispatch denial, got: {error:?}"
     );
 
     assert!(
@@ -227,10 +244,20 @@ impl RequestService for CountingEchoService {
     async fn handle_request(
         &self,
         _ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
         self.invocations.fetch_add(1, Ordering::SeqCst);
-        Ok((payload.to_vec(), None))
+        Ok((body.bytes().to_vec(), None))
+    }
+
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> Result<DecodedRequestBody> {
+        // Byte-oriented echo: no Cap'n Proto request schema, no derivable
+        // method leaf — the same affirmative `opaque` choice as the in-crate
+        // mock services (v16 §5.2).
+        Ok(DecodedRequestBody::opaque(signed_body.to_vec()))
     }
 
     fn name(&self) -> &str {
@@ -263,7 +290,7 @@ async fn undeclared_service_domain_denies_before_handler_entry() -> Result<()> {
         &creds,
         "discovery",
         &ca_jwt_key,
-        &discovery_key.verifying_key(),
+        &discovery_key,
     );
 
     // A live service whose domain is NOT in the declared table.

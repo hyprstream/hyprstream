@@ -421,6 +421,12 @@ pub enum WorktreeQuickCommand {
 /// Notification subcommands
 #[derive(Subcommand)]
 pub enum NotifyCommand {
+    /// Verify authenticated native Event access by receiving the system track.
+    Probe {
+        /// Maximum seconds for discovery, admission and authorized delivery.
+        #[arg(long, default_value = "10")]
+        timeout: u64,
+    },
     /// Subscribe to real-time events matching a scope pattern
     ///
     /// Opens an encrypted notification channel and prints events as they arrive.

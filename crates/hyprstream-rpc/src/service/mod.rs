@@ -9,6 +9,7 @@
 //! Spawner, factory, and manager have moved to the `hyprstream-service` crate.
 //! Metadata types remain here (used by proc macro codegen across all crates).
 
+pub mod body;
 mod traits;
 mod svc;
 pub mod dispatch;
@@ -17,6 +18,7 @@ pub mod spawnable;
 pub mod metadata;
 pub mod doc;
 
+pub use body::DecodedRequestBody;
 pub use traits::{RpcHandler, RpcRequest, RpcService};
 /// Transport-neutral request dispatch core (#148) — shared by all front-ends.
 pub use dispatch::process_request;

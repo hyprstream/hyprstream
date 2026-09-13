@@ -7,6 +7,8 @@
 
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
+using import "/annotations.capnp".dispatchMac;
+using import "/annotations.capnp".mutationSemantics;
 using import "/annotations.capnp".mcpDescription;
 using import "/streaming.capnp".StreamInfo;
 
@@ -21,7 +23,7 @@ struct MetricRecord {
 }
 
 enum AggregationFunc {
-  rawSql @0;   # No aggregation — use sql field or unmodified SELECT
+  rawSql @0;   # Retained for wire compatibility; raw SQL is rejected by query RPCs
   count  @1;
   sum    @2;
   avg    @3;
@@ -30,7 +32,7 @@ enum AggregationFunc {
 }
 
 struct MetricQuery {
-  sql             @0 :Text;          # Raw SQL (takes priority when non-empty)
+  sql             @0 :Text;          # Deprecated raw SQL field; non-empty values are rejected
   metricId        @1 :Text;          # Structured filter (translated to WHERE clause)
   windowSecs      @2 :UInt32;        # Fixed time window seconds (0 = none)
   aggregation     @3 :AggregationFunc;
@@ -79,25 +81,32 @@ struct MetricsRequest {
 
   union {
     ingest       @1 :IngestRequest
-      $scope(write) $mcpDescription("Ingest metric records into the time-series store");
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Ingest metric records into the time-series store");
 
     query        @2 :MetricQuery
-      $scope(query) $mcpDescription("Execute a structured or raw SQL aggregation query");
+      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Execute a structured metrics aggregation query; raw SQL is rejected");
 
+    # Prepares a server-side third-party interop stream context under the
+    # client's ephemeral pubkey and schedules the query continuation before
+    # the reply is observed, so a replay duplicates the allocation/work — the
+    # same allocation/continuation effect already classified key-required for
+    # the other streaming leaves. Retry safety requires a caller-supplied
+    # application idempotency key plus a recorded result; neither exists
+    # today — this declares the missing activation work.
     queryStream  @3 :MetricQuery
-      $scope(query) $mcpDescription("Stream query results as Arrow IPC RecordBatch chunks");
+      $scope(query) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Stream structured metrics query results as Arrow IPC RecordBatch chunks; raw SQL is rejected");
 
     createView   @4 :ViewSpec
-      $scope(manage) $mcpDescription("Create a materialized view over the metrics table");
+      $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Create a materialized view over the metrics table");
 
     listViews    @5 :Void
-      $scope(query) $mcpDescription("List all materialized views");
+      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("List all materialized views");
 
     dropView     @6 :Text
-      $scope(manage) $mcpDescription("Drop a materialized view by name");
+      $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Drop a materialized view by name");
 
     health       @7 :Void
-      $scope(query) $mcpDescription("Check service health and row count");
+      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Check service health and row count");
   }
 }
 

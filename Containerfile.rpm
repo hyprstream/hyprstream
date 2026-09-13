@@ -1,0 +1,36 @@
+# CPU staging runtime built from the canonical FerruleOS RPM, not Cargo.
+# Use the same pinned Hummingbird baseline as the canonical RPM install gate.
+# This is an application container: no bootc switch and no host OS migration.
+FROM quay.io/hummingbird-community/bootc-os@sha256:4285846e3980533f156217181718360e971dd4e8b889cf75c47fce71728785b0
+USER 0:0
+ARG SOURCE_COMMIT
+ARG RPM_SHA256
+ARG RPM_ARCH=x86_64
+COPY hyprstream.rpm /tmp/hyprstream.rpm
+RUN set -eu; \
+    test "${#SOURCE_COMMIT}" = 40; \
+    test "${#RPM_SHA256}" = 64; \
+    case "$SOURCE_COMMIT$RPM_SHA256" in *[!0-9a-f]*) exit 1;; esac; \
+    case "$RPM_ARCH" in x86_64|aarch64) ;; *) exit 1;; esac; \
+    test "$(uname -m)" = "$RPM_ARCH"; \
+    printf '%s  /tmp/hyprstream.rpm\n' "$RPM_SHA256" | sha256sum --check -; \
+    test "$(rpm -qp --queryformat '%{ARCH}' /tmp/hyprstream.rpm)" = "$RPM_ARCH"; \
+    rpm -qp --provides /tmp/hyprstream.rpm | grep -Fx "bundled(hyprstream-source) = $SOURCE_COMMIT"; \
+    dnf -y --setopt=install_weak_deps=False install /tmp/hyprstream.rpm; \
+    rpm -qf /usr/bin/hyprstream; \
+    /usr/bin/hyprstream --version; \
+    ln -s /usr/bin/hyprstream /hyprstream; \
+    dnf clean all; \
+    rm -f /tmp/hyprstream.rpm; \
+    getent group 65532 >/dev/null || groupadd --gid 65532 hyprstream
+RUN getent passwd 65532 >/dev/null || \
+    useradd --uid 65532 --gid 65532 --no-create-home \
+      --home-dir /var/lib/hyprstream --shell /sbin/nologin hyprstream
+LABEL org.opencontainers.image.source="https://github.com/hyprstream/hyprstream" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      ai.hyprstream.rpm.sha256="${RPM_SHA256}" \
+      ai.hyprstream.rpm.arch="${RPM_ARCH}"
+ENV HOME=/var/lib/hyprstream RUST_LOG=info
+USER 65532:65532
+ENTRYPOINT ["/hyprstream"]
+CMD ["--help"]

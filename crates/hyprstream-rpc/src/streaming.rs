@@ -47,11 +47,11 @@ use crate::crypto::derive_stream_keys;
 // DH key types - Ristretto255 (default) or P-256 (FIPS)
 #[cfg(not(feature = "fips"))]
 use crate::crypto::{
-    ristretto_dh as dh_compute, RistrettoPublic as DhPublic, RistrettoSecret as DhSecret,
+    RistrettoPublic as DhPublic, RistrettoSecret as DhSecret, ristretto_dh as dh_compute,
 };
 
 #[cfg(feature = "fips")]
-use crate::crypto::{p256_dh as dh_compute, P256PublicKey as DhPublic, P256SecretKey as DhSecret};
+use crate::crypto::{P256PublicKey as DhPublic, P256SecretKey as DhSecret, p256_dh as dh_compute};
 use crate::streaming_capnp;
 
 // ============================================================================
@@ -540,6 +540,16 @@ impl StreamContext {
         self.reach_config
             .reach_with_relay(self.relay_choice.clone())
     }
+
+    /// The server accepted-state witness carried with this signed StreamInfo.
+    /// A missing witness decodes as the default and is rejected before a native
+    /// Iroh admission exchange; it does not affect Quinn/UDS consumers.
+    pub fn moql_server_identity(&self) -> crate::stream_info::MoqlServerIdentity {
+        self.reach_config
+            .moql_server_identity
+            .clone()
+            .unwrap_or_default()
+    }
 }
 
 // ============================================================================
@@ -732,7 +742,10 @@ impl StreamChannel {
     }
 
     /// Share a service-owned reach handle with this channel.
-    pub fn with_reach_config_handle(mut self, handle: crate::moq_stream::ProducerReachConfigHandle) -> Self {
+    pub fn with_reach_config_handle(
+        mut self,
+        handle: crate::moq_stream::ProducerReachConfigHandle,
+    ) -> Self {
         self.reach_config = handle;
         self
     }
@@ -743,7 +756,10 @@ impl StreamChannel {
     }
 
     /// Share a service-owned MoQ origin handle with this channel.
-    pub fn with_moq_origin_handle(mut self, handle: crate::moq_stream::MoqStreamOriginHandle) -> Self {
+    pub fn with_moq_origin_handle(
+        mut self,
+        handle: crate::moq_stream::MoqStreamOriginHandle,
+    ) -> Self {
         self.moq_origin = handle;
         self
     }
@@ -1354,9 +1370,9 @@ mod tests {
         pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
         _claims: Option<Claims>,
     ) -> Vec<u8> {
+        use crate::ToCapnp;
         use crate::common_capnp;
         use crate::envelope::{RequestEnvelope, SignedEnvelope};
-        use crate::ToCapnp;
 
         let mut inner_msg = Builder::new_default();
         {
@@ -1409,11 +1425,11 @@ mod tests {
     /// which already verifies the self-asserted `cnf`'s EdDSA without a pin.
     #[test]
     fn stream_register_hybrid_verifies_only_when_pq_anchored() -> anyhow::Result<()> {
-        use crate::common_capnp;
-        use crate::crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_from_bytes};
-        use crate::crypto::CryptoPolicy;
-        use crate::envelope::{InMemoryNonceCache, KeyedPqTrustStore, SignedEnvelope};
         use crate::FromCapnp;
+        use crate::common_capnp;
+        use crate::crypto::CryptoPolicy;
+        use crate::crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_from_bytes};
+        use crate::envelope::{InMemoryNonceCache, KeyedPqTrustStore, SignedEnvelope};
 
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
         let (pq_sk, pq_vk) = ml_dsa_generate_keypair();
@@ -1510,6 +1526,8 @@ mod tests {
 
         let config = |port| -> Result<ProducerReachConfig> {
             Ok(ProducerReachConfig {
+                moql_server_identity: None,
+                relay_moql_server_identity: None,
                 iroh_node_id: None,
                 quic_reach: Some(NodeStreamReach {
                     addr: format!("127.0.0.1:{port}").parse()?,
@@ -1519,10 +1537,10 @@ mod tests {
                 relay: None,
             })
         };
-        let channel_a = StreamChannel::new(SigningKey::from_bytes(&[1; 32]))
-            .with_reach_config(config(4101)?);
-        let channel_b = StreamChannel::new(SigningKey::from_bytes(&[2; 32]))
-            .with_reach_config(config(4102)?);
+        let channel_a =
+            StreamChannel::new(SigningKey::from_bytes(&[1; 32])).with_reach_config(config(4101)?);
+        let channel_b =
+            StreamChannel::new(SigningKey::from_bytes(&[2; 32])).with_reach_config(config(4102)?);
         let (_, client_pub) = crate::crypto::generate_ephemeral_keypair();
 
         let stream_a = channel_a
@@ -1543,7 +1561,7 @@ mod tests {
 
     #[tokio::test]
     async fn identified_preparation_uses_hybrid_material_not_interop_dh() -> Result<()> {
-        use crate::crypto::hybrid_kem::{generate_recipient, SuiteId};
+        use crate::crypto::hybrid_kem::{SuiteId, generate_recipient};
         use crate::stream_epoch::{
             IdentifiedStreamBinding, StreamAcceptedState, StreamCarrierProfile, StreamRouteRole,
         };
@@ -1591,7 +1609,8 @@ mod tests {
     #[tokio::test]
     async fn stream_channel_uses_service_scoped_moq_origin() -> Result<()> {
         let scoped_origin = crate::moq_stream::MoqStreamOrigin::standalone().build();
-        let origin_handle = std::sync::Arc::new(parking_lot::RwLock::new(Some(scoped_origin.clone())));
+        let origin_handle =
+            std::sync::Arc::new(parking_lot::RwLock::new(Some(scoped_origin.clone())));
         let channel = StreamChannel::new(SigningKey::from_bytes(&[3; 32]))
             .with_moq_origin_handle(origin_handle);
         let (_, client_pub) = crate::crypto::generate_ephemeral_keypair();

@@ -1036,6 +1036,13 @@ pub struct RefreshTokenEntry {
     /// keeps the generic OAuth 2.1 rotation path unchanged.
     #[serde(default)]
     pub ucan_grant: Option<UcanGrantRefresh>,
+    /// OIDC session ID (`sid`) of the interactive session this refresh token
+    /// belongs to. The same session spans every rotation (distinct credential
+    /// IDs, one stable sid — v16 §3.3); the refresh path checks it against
+    /// the session authority before consuming the single-use token, so a
+    /// revoked session cannot refresh. `None` only on pre-session records.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Re-evaluation context persisted alongside a UCAN-grant refresh token so the
@@ -1158,6 +1165,9 @@ pub struct OAuthState {
     /// by the write path (#910) and tests; the read endpoints consult it
     /// directly. Default-empty so existing construction sites need no change.
     pub xrpc_repos: Arc<super::xrpc::XrpcRepoStore>,
+    /// Optional native-authorized public repository writer. No public write
+    /// routes are mounted while this is absent.
+    pub public_repo_writer: Option<Arc<crate::services::public_repo::PublicRepoWriter>>,
     /// When `true`, the XRPC read-slice routes (`/xrpc/…`) are mounted on the
     /// OAuth router (#1112). Copied from `OAuthConfig::xrpc_read_slice`.
     pub xrpc_read_slice: bool,
@@ -1218,7 +1228,6 @@ pub struct OAuthState {
     /// When present, JWKS serves all slots and issuance uses the active key.
     pub signing_key_store: Option<Arc<crate::auth::SigningKeyStore>>,
     /// Shared JWT ID blocklist for access token revocation (shared with PolicyService).
-    pub jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
     /// ES256 (P-256) signing key rotation store for JWKS and DPoP/atproto interop.
     pub es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 signing key rotation store for PQ-hybrid JWT issuance.
@@ -1352,6 +1361,7 @@ impl OAuthState {
             ),
             sessions: super::session::SessionStore::default(),
             xrpc_repos: Arc::new(super::xrpc::XrpcRepoStore::new()),
+            public_repo_writer: None,
             xrpc_read_slice: config.xrpc_read_slice,
             deployment_well_known_dir: config.deployment_well_known_dir.clone(),
             rsa_encoding_key: None,
@@ -1384,7 +1394,6 @@ impl OAuthState {
             jwt_key_nbf: chrono::Utc::now().timestamp(),
             jwt_key_exp: chrono::Utc::now().timestamp() + 14 * 86400,
             signing_key_store: None,
-            jti_blocklist: None,
             es256_key_store: None,
             ml_dsa_key_store: None,
             audit_sink: None,
@@ -1419,6 +1428,16 @@ impl OAuthState {
         store: Arc<hyprstream_pds_service::AccountRecordStore>,
     ) -> Self {
         self.hosted_account_store = Some(store);
+        self
+    }
+
+    /// Install the explicit native-authorized public repository writer. This
+    /// opt-in is required before standard XRPC repository writes are exposed.
+    pub fn with_public_repo_writer(
+        mut self,
+        writer: Arc<crate::services::public_repo::PublicRepoWriter>,
+    ) -> Self {
+        self.public_repo_writer = Some(writer);
         self
     }
 
@@ -1532,19 +1551,6 @@ impl OAuthState {
     pub fn with_iroh_transport(mut self, node_id: [u8; 32], relays: Vec<String>) -> Self {
         self.iroh_node_id = Some(node_id);
         self.iroh_relays = relays;
-        self
-    }
-
-    /// Attach the shared JWT ID blocklist (shared with PolicyService).
-    ///
-    /// When set, `POST /oauth/revoke` on access tokens writes the JTI into
-    /// this blocklist so the PolicyService RPC enforcement path also rejects
-    /// revoked tokens — closing the gap between HTTP revocation and RPC auth.
-    pub fn with_jti_blocklist(
-        mut self,
-        bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
-    ) -> Self {
-        self.jti_blocklist = Some(bl);
         self
     }
 
@@ -2254,7 +2260,7 @@ pub fn canonical_issuer_origin(issuer_url: &str) -> Option<String> {
 /// while a non-default port is retained and its domain-segment separator is
 /// encoded as `%3A`. IPv6 is rejected until client and server share one
 /// canonical DID representation for it.
-fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
+pub(super) fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
     let url = url::Url::parse(issuer_url).ok()?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()

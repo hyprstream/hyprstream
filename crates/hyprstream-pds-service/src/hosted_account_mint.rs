@@ -567,6 +567,10 @@ mod tests {
         );
         let store =
             AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), Arc::new(PermitReads));
+        store
+            .refresh_hosted_did_index(&Subject::new(crate::OAUTH_ACCOUNT_RESOLVER_SUBJECT))
+            .await
+            .unwrap();
 
         assert_eq!(
             store
