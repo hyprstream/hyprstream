@@ -645,8 +645,9 @@ impl GatedDeltaNetLayer {
                 // First call: zero-pad left by kernel_size-1
                 let pad = Tensor::zeros([batch, conv_dim, ks - 1], (dtype, device));
                 let padded = Tensor::cat(&[&pad, &x_t], 2);
-                let new_state = x_t.narrow(2, (seq - (ks - 1)).max(0), (ks - 1).min(seq))
-                    .contiguous();
+                // Retain the left padding when the first prompt is shorter
+                // than the convolution history, so the next decode has all taps.
+                let new_state = padded.narrow(2, seq, ks - 1).contiguous();
                 (padded, new_state)
             }
         };
@@ -758,8 +759,11 @@ impl GatedDeltaNetLayer {
             let g_h = g.permute([0, 2, 1]);                 // [B, nv, T]
             let b_h = b_f.permute([0, 2, 1]);               // [B, nv, T]
 
-            let init = if rec_state.is_some() { rec_state.as_ref() } else { None };
-            let (out_h, new_state) = chunked_delta_rule(&q_h, &k_h, &v_h, &g_h, &b_h, init, device)?;
+            // The previous state was moved out above. Use that owned state
+            // for cached multi-token continuation, just as single-token decode does.
+            let (out_h, new_state) = chunked_delta_rule(
+                &q_h, &k_h, &v_h, &g_h, &b_h, Some(&state_init), device,
+            )?;
             // out_h: [B, nv, T, hv]
             *rec_state = Some(new_state);
 
@@ -2490,6 +2494,60 @@ mod pipeline_tests {
     const LIN_K_DIM: usize = 4;
     const LIN_V_DIM: usize = 4;
     const CONV_KERNEL: usize = 4;
+
+    #[test]
+    fn gdn_chunked_continuation_preserves_recurrent_history() {
+        let mut weights = tiny_weights();
+        let layer = GatedDeltaNetLayer::load(
+            &mut weights, "model.layers.0.linear_attn", &tiny_config(), 0,
+        ).unwrap();
+        let input = (Tensor::arange(2 * HIDDEN, (Kind::Float, Device::Cpu)) * 0.13)
+            .sin().reshape([1, 2, HIDDEN]);
+        let initial = Tensor::full(
+            [1, LIN_V_HEADS as i64, LIN_K_DIM as i64, LIN_V_DIM as i64],
+            3.0, (Kind::Float, Device::Cpu),
+        );
+        let conv = Tensor::zeros([1, layer.conv_dim as i64, layer.kernel_size as i64 - 1],
+            (Kind::Float, Device::Cpu));
+        let mut serial_conv = Some(conv.copy());
+        let mut serial_outputs = Vec::new();
+        let mut serial_rec = Some(initial.copy());
+        for position in 0..2 {
+            serial_outputs.push(layer.forward(
+                &input.narrow(1, position, 1), &mut serial_conv, &mut serial_rec, None,
+            ).unwrap());
+        }
+        let mut chunk_conv = Some(conv.copy());
+        let mut chunk_rec = Some(initial);
+        let chunk_output = layer.forward(&input, &mut chunk_conv, &mut chunk_rec, None).unwrap();
+        let mut zero_conv = Some(conv);
+        let mut zero_rec = None;
+        let _ = layer.forward(&input, &mut zero_conv, &mut zero_rec, None).unwrap();
+        let expected = serial_rec.unwrap();
+        assert!(!expected.allclose(&zero_rec.unwrap(), 1e-4, 1e-4, false),
+            "fixture must distinguish preserved history from an empty recurrent state");
+        assert!(chunk_output.allclose(&Tensor::cat(&serial_outputs, 1), 1e-4, 1e-4, false),
+            "chunked outputs must match serial continuation");
+        let actual = chunk_rec.unwrap();
+        assert!(actual.allclose(&expected, 1e-4, 1e-4, false),
+            "chunked continuation lost recurrent history; max difference {}",
+            (&actual - &expected).abs().max().double_value(&[]));
+    }
+
+    #[test]
+    fn gdn_short_prefill_keeps_full_convolution_history() {
+        let mut weights = tiny_weights();
+        let layer = GatedDeltaNetLayer::load(
+            &mut weights, "model.layers.0.linear_attn", &tiny_config(), 0,
+        ).unwrap();
+        let input = Tensor::ones([1, 1, HIDDEN], (Kind::Float, Device::Cpu));
+        let mut conv = None;
+        let mut recurrent = None;
+        for _ in 0..2 {
+            let _ = layer.forward(&input, &mut conv, &mut recurrent, None).unwrap();
+            assert_eq!(conv.as_ref().unwrap().size()[2], layer.kernel_size as i64 - 1);
+        }
+    }
 
     fn tiny_config() -> Qwen3_5TextConfig {
         // Default hybrid pattern: layer (i+1)%4==0 is full attention, rest GDN.
