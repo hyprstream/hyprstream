@@ -1458,6 +1458,9 @@ impl OAuthState {
         self
     }
 
+    /// Install the explicit native account resolver used by standard
+    /// `com.atproto.server.getSession`. The resolver owns handle, DID-document
+    /// and lifecycle truth; no session route is mounted without it.
     pub fn with_atproto_session_resolver(
         mut self,
         resolver: Arc<dyn super::xrpc::AtprotoSessionResolver>,
