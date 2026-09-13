@@ -294,6 +294,19 @@ struct DeepResponse { union {
         self.assertEqual(result["cli_hidden"], ["demo.first.deeper.same", "demo.first.same", "demo.root",
                                                  "demo.second.deeper.same", "demo.second.same"])
 
+    def test_commented_hidden_field_stops_before_next_field(self):
+        actual = catalog.read_json(ROOT / "docs/schema-catalog.json", ROOT)
+        path = "crates/hyprstream-workers/schema/worker.capnp"
+        source = catalog.text(ROOT, path, None)
+        baseline = catalog.schema_method_metadata(ROOT, actual["schemas"], None)
+        self.assertIn("worker.container.attach", baseline["cli_hidden"])
+        for replacement in ["# $cliHidden", '$mutationSemantics("$cliHidden")']:
+            with self.subTest(replacement=replacement):
+                changed = source.replace("$cliHidden", replacement, 1)
+                methods = catalog.schema_method_metadata(ROOT, actual["schemas"], {path: changed})
+                self.assertNotIn("worker.container.attach", methods["cli_hidden"])
+                self.assertIn("worker.container.detach", methods["cli_hidden"])
+
     def test_workflow_contract(self):
         source = (ROOT / ".github/workflows/docs-catalog.yml").read_text()
         for required in ["[self-hosted, linux, arm64, graviton, hyprstream-merge-gate]", "load-builder-image.sh",

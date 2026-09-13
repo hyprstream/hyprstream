@@ -977,7 +977,8 @@ def schema_method_metadata(repo: Path, schemas: list[dict[str, Any]],
     def hidden_fields(source: str, struct: str) -> list[str]:
         union = block(block(source, f"struct {struct}"), "union")
         return [name for name, annotations in re.findall(
-            r"(?m)^\s*(\w+)\s+@\d+\s*:\s*\w+(?:\.\w+)*([^;]*);", union)
+            r"(?ms)^\s*(\w+)\s+@\d+\s*:\s*\w+(?:\.\w+)*"
+            r"((?:(?!^\s*[A-Za-z][A-Za-z0-9_]*\s+@\d+)[^;])*);", union)
                 if re.search(r"\$cliHidden\b", annotations)]
     hidden, streaming = [], []
     for entry in schemas:
