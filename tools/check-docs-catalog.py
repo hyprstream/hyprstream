@@ -481,8 +481,8 @@ def rust_fn_body(source: str, name: str) -> str:
     return source[open_brace + 1:index]
 
 
-def strip_capnp_noncode(source: str) -> str:
-    """Offset-preserving lexer for Cap'n Proto line comments and string values."""
+def strip_capnp_noncode(source: str, mask_literals: bool = True) -> str:
+    """Offset-preserving Cap'n Proto comment lexer, optionally masking strings."""
     out, index = [], 0
     def blank(value: str) -> str:
         return "".join("\n" if char == "\n" else " " for char in value)
@@ -497,7 +497,7 @@ def strip_capnp_noncode(source: str) -> str:
                 if source[end] == "\\": end += 2; continue
                 end += 1
                 if source[end - 1] == '"': break
-            out.append(blank(source[index:end])); index = end; continue
+            out.append(blank(source[index:end]) if mask_literals else source[index:end]); index = end; continue
         out.append(source[index]); index += 1
     return "".join(out)
 
@@ -868,11 +868,13 @@ def schema_method_metadata(repo: Path, schemas: list[dict[str, Any]],
             continue
         raw_source = text(repo, entry["path"], mutations)
         source = strip_capnp_noncode(raw_source)
+        import_source = strip_capnp_noncode(raw_source, mask_literals=False)
         stream_types = {"StreamInfo"}
-        # Import paths are masked by the lexer; recover only the string at a
-        # syntactically active import, never a comment or annotation decoy.
+        # Locate declarations with strings/comments masked, then read the path
+        # from the same offsets with only comments masked. Valid comment gaps
+        # before the path or semicolon must behave exactly like whitespace.
         for match in re.finditer(r"\busing\s+(\w+)\s*=\s*import\b", source):
-            imported = re.match(r'\s+"(/?streaming\.capnp)"\s*;', raw_source[match.end():])
+            imported = re.match(r'\s*"(/?streaming\.capnp)"\s*;', import_source[match.end():])
             if imported:
                 stream_types.add(f"{match.group(1)}.StreamInfo")
         hidden.extend(
@@ -1397,6 +1399,34 @@ def self_test(repo: Path) -> None:
              "qualified streaming type changes method identity")
     expect_success("qualified streaming import", repo, catalog, corpus, schemas,
                    {model_path: qualified_model})
+    # A new qualified leaf must require a catalog update independently of
+    # provenance, including comments on either side of the imported path.
+    for name, declaration in [
+        ("ordinary", 'using Streaming = import "/streaming.capnp";'),
+        ("adjacent literal", 'using Streaming=import"/streaming.capnp";'),
+        ("before path", 'using Streaming = import # ignored "decoy.capnp";\n  "/streaming.capnp";'),
+        ("after path", 'using Streaming = import "/streaming.capnp" # ignored "decoy.capnp";\n  ;'),
+        ("all gaps", 'using # declaration\n Streaming # alias\n = # assignment\n import # path\n "/streaming.capnp" # terminator\n ;'),
+    ]:
+        added_stream = text(repo, model_path, None).replace(
+            'using import "/streaming.capnp".StreamInfo;',
+            'using import "/streaming.capnp".StreamInfo;\n' + declaration, 1,
+        ).replace(
+            "struct InferRequest {\n  modelRef @0 :Text;\n  union {",
+            'struct InferRequest {\n  modelRef @0 :Text;\n  union {\n'
+            '    extraStream @5 :Void $scope(query) $dispatchMac("internal:pq-hybrid");', 1,
+        ).replace(
+            "struct InferResponse {\n  union {",
+            "struct InferResponse {\n  union {\n    extraStream @5 :Streaming.StreamInfo;", 1,
+        )
+        added_metadata = schema_method_metadata(repo, catalog["schemas"], {model_path: added_stream})
+        required("model.infer.extraStream" in added_metadata["streaming"],
+                 f"qualified streaming leaf lost across {name} import gap")
+        expect_failure(f"new qualified streaming leaf with {name} import", repo,
+                       catalog, corpus, schemas, consumers, {model_path: added_stream})
+        updated = copy.deepcopy(catalog); updated["method_metadata"] = added_metadata
+        expect_success(f"cataloged qualified streaming leaf with {name} import", repo,
+                       updated, corpus, schemas, {model_path: added_stream})
     worker_drift = text(repo, worker_path, None).replace("attach @10 :StreamInfo", "attach @10 :Text", 1)
     expect_failure("scoped worker streaming response", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: worker_drift})
     registry_path = "crates/hyprstream-rpc-std/schema/registry.capnp"
