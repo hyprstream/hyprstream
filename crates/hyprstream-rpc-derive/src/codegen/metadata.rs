@@ -393,6 +393,21 @@ fn generate_json_method_dispatch_arm(
                 Ok(serde_json::to_value(&result)?)
             }
         },
+        _ if ct == CapnpType::Bool || ct.is_numeric() => {
+            let rust_ty = rust_type_tokens(&ct.rust_owned_type());
+            quote! {
+                #method_name_str => {
+                    let __value = args
+                        .get(#method_name_str)
+                        .or_else(|| args.get("value"))
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("missing argument for {}", #method_name_str))?;
+                    let value: #rust_ty = serde_json::from_value(__value)?;
+                    let result = self.#method_name(value).await?;
+                    Ok(serde_json::to_value(&result)?)
+                }
+            }
+        }
         _ => {
             if let Some(sdef) = resolved.find_struct(&v.type_name) {
                 let nuf: Vec<_> = sdef.non_union_fields().collect();
@@ -1152,5 +1167,59 @@ fn doc_first_sentence(desc: &str) -> &str {
         &desc[..pos + 1]
     } else {
         desc
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod primitive_json_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn bool_and_numeric_arguments_generate_typed_json_calls() {
+        for (capnp_type, rust_type) in [
+            ("Bool", "bool"),
+            ("UInt8", "u8"),
+            ("UInt16", "u16"),
+            ("UInt32", "u32"),
+            ("UInt64", "u64"),
+            ("Int8", "i8"),
+            ("Int16", "i16"),
+            ("Int32", "i32"),
+            ("Int64", "i64"),
+            ("Float32", "f32"),
+            ("Float64", "f64"),
+        ] {
+            let variant: UnionVariant = serde_json::from_value(serde_json::json!({
+                "name": "setValue", "type_name": capnp_type, "description": "",
+                "scope": "write", "cli_hidden": false, "doc_example": ""
+            }))
+            .expect("primitive request variant");
+            let schema = ParsedSchema {
+                request_variants: vec![variant],
+                response_variants: vec![],
+                structs: vec![],
+                scoped_clients: vec![],
+                enums: vec![],
+                request_struct: None,
+                response_struct: None,
+            };
+            let resolved = ResolvedSchema::from(&schema);
+            for scoped in [false, true] {
+                let arm = generate_json_method_dispatch_arm(
+                    &schema.request_variants[0],
+                    &[],
+                    scoped,
+                    &resolved,
+                );
+                let text = arm.to_string();
+                assert!(text.contains(&format!("let value : {rust_type}")), "{text}");
+                assert!(text.contains("serde_json :: from_value"), "{text}");
+                assert!(text.contains("self . set_value (value) . await"), "{text}");
+                assert!(!text.contains("struct type not found"), "{text}");
+                syn::parse2::<syn::Expr>(quote! { match method { #arm _ => unreachable!() } })
+                    .expect("primitive dispatch arm is valid Rust syntax");
+            }
+        }
     }
 }
