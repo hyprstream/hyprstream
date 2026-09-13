@@ -2281,14 +2281,16 @@ pub fn canonical_issuer_origin(issuer_url: &str) -> Option<String> {
 }
 
 /// Convert the configured OAuth URL to the host-form `did:web` service DID
-/// used by ATProto service-auth audiences.
+/// used by public identity documents, discovery verification, and ATProto
+/// service-auth audiences. This conversion is stateless and does not resolve
+/// or mint hosted account identities.
 ///
 /// For supported DNS/IPv4 origins this mirrors the browser's
 /// `originToDidWeb`: URL parsing normalizes an explicit default port away,
 /// while a non-default port is retained and its domain-segment separator is
 /// encoded as `%3A`. IPv6 is rejected until client and server share one
 /// canonical DID representation for it.
-pub(super) fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
+pub(crate) fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
     let url = url::Url::parse(issuer_url).ok()?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()

@@ -1931,6 +1931,25 @@ pub struct KVCacheManager {
     access_count: AtomicU64,
     /// Token IDs this cache was computed for (for prefix matching across turns)
     cached_token_ids: Vec<i64>,
+    /// Recurrent-state (SSM conv/rec) snapshot for hybrid models (Qwen3.5 GDN),
+    /// captured at the end of the prefill that produced `cached_token_ids`.
+    ///
+    /// Unlike KV, recurrent state is Markovian and cannot be truncated to an
+    /// arbitrary prefix position — a prefix hit is only exact when the FULL
+    /// cached token sequence matched and this snapshot is restored alongside
+    /// the KV truncation. One snapshot per cache, overwritten each turn;
+    /// `None` for pure-attention models. Tensors are deep copies, independent
+    /// of subsequent forward-pass mutations of the live model state.
+    ssm_snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>,
+    /// Owning device per snapshot slot (per layer, index-aligned with the
+    /// conv/rec lists), recorded from the slots' own tensors when the
+    /// snapshot is stored. A CPU-offloaded cache restores each slot to this
+    /// device instead of `restore_to_gpu`'s single argument: under a multi-GPU
+    /// `LayerDeviceMap` the recurrent state belongs to its layer's device,
+    /// and moving every slot to one device (normally CUDA 0) makes the next
+    /// GDN forward fail on a device mismatch. Layers without slots record the
+    /// CPU fallback; a snapshot-less cache records nothing.
+    ssm_slot_devices: Vec<tch::Device>,
     /// Where this cache's tensors currently reside
     location: CacheLocation,
     /// Compatibility fingerprint under which this cache's KV was produced
@@ -1963,6 +1982,8 @@ impl KVCacheManager {
             last_access_ms: AtomicU64::new(current_timestamp_ms()),
             access_count: AtomicU64::new(0),
             cached_token_ids: Vec::new(),
+            ssm_snapshot: None,
+            ssm_slot_devices: Vec::new(),
             location: CacheLocation::Gpu,
             compat_fingerprint: None,
         }
@@ -1998,6 +2019,8 @@ impl KVCacheManager {
             last_access_ms: AtomicU64::new(current_timestamp_ms()),
             access_count: AtomicU64::new(0),
             cached_token_ids: Vec::new(),
+            ssm_snapshot: None,
+            ssm_slot_devices: Vec::new(),
             location: CacheLocation::Gpu,
             compat_fingerprint: None,
         }
@@ -2038,8 +2061,19 @@ impl KVCacheManager {
         self.layer_caches.contains_key(&layer_idx).then_some(())
     }
 
-    /// Clear all caches
-    pub fn clear_all(&self) {
+    /// Clear all KV tensors together with the metadata that describes them.
+    ///
+    /// `cached_token_ids`, the SSM snapshot, and its slot-device record only
+    /// have meaning alongside the layer tensors they were computed with. A
+    /// cleared cache that retained them would let a later extending prompt
+    /// claim a `prefix_len` — or restore a stale snapshot — against KV that
+    /// no longer exists (e.g. a session turn cancelled before its first
+    /// prefill: the set-up clear runs at generation setup, and the drop
+    /// records nothing new).
+    pub fn clear_all(&mut self) {
+        self.cached_token_ids = Vec::new();
+        self.ssm_snapshot = None;
+        self.ssm_slot_devices = Vec::new();
         for mut cache_ref in self.layer_caches.iter_mut() {
             cache_ref.clear();
         }
@@ -2129,7 +2163,22 @@ impl KVCacheManager {
             return 0;
         }
 
-        self.layer_caches.iter().map(|c| c.memory_usage()).sum()
+        // Include the SSM snapshot (Qwen3.5 GDN conv/rec state): it holds
+        // device tensors and must count toward the eviction budget, or
+        // `evict_to_budget` undercounts and skips offloading.
+        let ssm_bytes: usize = self
+            .ssm_snapshot
+            .as_ref()
+            .map(|(conv, rec)| {
+                conv.iter()
+                    .chain(rec.iter())
+                    .flatten()
+                    .map(|t| t.numel() * dtype_element_size(t.kind()))
+                    .sum()
+            })
+            .unwrap_or(0);
+
+        self.layer_caches.iter().map(|c| c.memory_usage()).sum::<usize>() + ssm_bytes
     }
 
     /// Get the quantization type
@@ -2168,8 +2217,58 @@ impl KVCacheManager {
     /// Record which tokens this cache was computed for.
     ///
     /// Called after generation completes so the next turn can detect prefix overlap.
+    /// Any prior SSM snapshot is dropped: tokens recorded without a known
+    /// recurrent state must not resurrect a stale one.
     pub fn set_cached_tokens(&mut self, tokens: Vec<i64>) {
+        self.set_cached_tokens_with_ssm(tokens, None);
+    }
+
+    /// Record which tokens this cache was computed for, together with the
+    /// recurrent-state (SSM conv/rec) snapshot as of the end of the prefill
+    /// that produced them (hybrid models only; `None` for pure attention).
+    ///
+    /// The snapshot is what makes a later prefix hit rewindable for recurrent
+    /// layers: KV truncates to the matched prefix, the snapshot restores the
+    /// GDN conv/rec state to the end of the cached sequence.
+    pub fn set_cached_tokens_with_ssm(
+        &mut self,
+        tokens: Vec<i64>,
+        ssm_snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>,
+    ) {
         self.cached_token_ids = tokens;
+        // Record each slot's owning device from its own tensor: the snapshot
+        // is what a later CPU-offload/restore round trip must reproduce
+        // device-wise (per-layer under a multi-GPU LayerDeviceMap). Layers
+        // with no slots record the CPU fallback (irrelevant — nothing to
+        // move); a snapshot-less recording clears the devices with it.
+        self.ssm_slot_devices = match &ssm_snapshot {
+            Some((conv, rec)) => conv
+                .iter()
+                .zip(rec.iter())
+                .map(|(c, r)| {
+                    c.as_ref()
+                        .or(r.as_ref())
+                        .map(Tensor::device)
+                        .unwrap_or(tch::Device::Cpu)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        self.ssm_snapshot = ssm_snapshot;
+    }
+
+    /// Deep-copied SSM snapshot for restore on a prefix hit.
+    ///
+    /// Returns deep copies (same `.copy()` discipline as
+    /// `Qwen3_5Model::snapshot_ssm_states`) so that restoring into the live
+    /// model state never aliases — and cannot mutate — the stored snapshot.
+    pub fn ssm_snapshot(&self) -> Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)> {
+        self.ssm_snapshot.as_ref().map(|(conv, rec)| {
+            (
+                conv.iter().map(|opt| opt.as_ref().map(Tensor::copy)).collect(),
+                rec.iter().map(|opt| opt.as_ref().map(Tensor::copy)).collect(),
+            )
+        })
     }
 
     /// Get the cached token IDs (for debugging/metrics).
@@ -2205,6 +2304,13 @@ impl KVCacheManager {
         for mut cache_ref in self.layer_caches.iter_mut() {
             cache_ref.to_device(tch::Device::Cpu);
         }
+        // Carry the SSM snapshot with the cache so a later restore + prefix
+        // hit still finds matching-device state.
+        if let Some((conv, rec)) = &mut self.ssm_snapshot {
+            for t in conv.iter_mut().chain(rec.iter_mut()).flatten() {
+                *t = t.to_device(tch::Device::Cpu);
+            }
+        }
         self.location = CacheLocation::Cpu;
         tracing::debug!(
             "Offloaded KV cache to CPU ({} tokens, {} layers)",
@@ -2222,6 +2328,26 @@ impl KVCacheManager {
         }
         for mut cache_ref in self.layer_caches.iter_mut() {
             cache_ref.to_device(device);
+        }
+        if let Some((conv, rec)) = &mut self.ssm_snapshot {
+            // Each slot returns to its recorded owning device (its layer's
+            // device under a multi-GPU LayerDeviceMap), falling back to the
+            // argument only when a snapshot predates recording. Restoring
+            // every slot to one device would leave states on the wrong side
+            // of a device boundary and break the next GDN forward.
+            let slot_devices = self.ssm_slot_devices.clone();
+            let restore_slot = |t: &mut Option<Tensor>, i: usize| {
+                if let Some(t) = t {
+                    let dst = slot_devices.get(i).copied().unwrap_or(device);
+                    *t = t.to_device(dst);
+                }
+            };
+            for (i, t) in conv.iter_mut().enumerate() {
+                restore_slot(t, i);
+            }
+            for (i, t) in rec.iter_mut().enumerate() {
+                restore_slot(t, i);
+            }
         }
         self.location = CacheLocation::Gpu;
         tracing::debug!(
@@ -2355,6 +2481,136 @@ mod tests {
         let manager = KVCacheManager::new(num_layers, max_seq_len, KVQuantType::Nf4);
 
         assert_eq!(manager.quant_type(), KVQuantType::Nf4);
+    }
+
+    /// The SSM snapshot (Qwen3.5 GDN conv/rec state) holds device tensors and
+    /// must count toward the eviction budget: `memory_usage` grows when a
+    /// snapshot is recorded and shrinks back when it is dropped.
+    #[test]
+    fn test_memory_usage_includes_ssm_snapshot() {
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+        let baseline = manager.memory_usage();
+
+        let opt = (DType::Float, Device::Cpu);
+        let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
+        let rec = vec![Some(Tensor::zeros([4], opt)), None];
+        let expected = (2 * 3 + 4) * dtype_element_size(DType::Float);
+
+        manager.set_cached_tokens_with_ssm(vec![1, 2, 3], Some((conv, rec)));
+        assert_eq!(manager.memory_usage(), baseline + expected);
+
+        // Recording tokens without a snapshot drops it (no stale state) and
+        // the budget accounting shrinks back.
+        manager.set_cached_tokens(vec![1, 2, 3, 4]);
+        assert_eq!(manager.memory_usage(), baseline);
+    }
+
+    /// Storing an SSM snapshot must record each slot's owning device from its
+    /// own tensor — the record a later CPU-offload/restore round trip uses to
+    /// put slots back on their layer devices (multi-GPU LayerDeviceMap).
+    /// Token-only recording drops the snapshot and its device record with it.
+    #[test]
+    fn test_ssm_snapshot_records_owning_devices() {
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+        assert!(manager.ssm_slot_devices.is_empty(), "fresh cache records nothing");
+
+        let opt = (DType::Float, Device::Cpu);
+        let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
+        let rec = vec![Some(Tensor::zeros([4], opt)), None];
+        manager.set_cached_tokens_with_ssm(vec![1, 2], Some((conv, rec)));
+        // One record per layer; layers without slots record the fallback.
+        assert_eq!(manager.ssm_slot_devices.len(), 2);
+        assert_eq!(manager.ssm_slot_devices, vec![Device::Cpu, Device::Cpu]);
+
+        // Token-only recording clears the device record with the snapshot.
+        manager.set_cached_tokens(vec![3]);
+        assert!(manager.ssm_slot_devices.is_empty());
+    }
+
+    /// Restore must send each SSM snapshot slot back to its recorded owning
+    /// device — NOT `restore_to_gpu`'s single argument. Mixed Cuda(0)/Cpu
+    /// owning devices reproduce the multi-GPU LayerDeviceMap hazard: the
+    /// registry restores an offloaded cache with one device (normally CUDA 0),
+    /// and moving every slot there leaves layer-1 recurrent state on the wrong
+    /// device for the next GDN forward. Gated on a CUDA build (a CPU-only host
+    /// has no second device to discriminate).
+    #[test]
+    fn test_restore_moves_snapshot_slots_to_owning_devices() {
+        let cuda = Device::cuda_if_available();
+        if cuda == Device::Cpu {
+            // No CUDA on this host: single-device restore is trivially
+            // correct, and the mixed-device fixture cannot be constructed.
+            return;
+        }
+
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+        // Layer 0 owns CUDA state, layer 1 owns CPU state (as a pipeline
+        // split places each layer's stage-local state on its own device).
+        let conv = vec![
+            Some(Tensor::ones([2, 3], (DType::Float, cuda)) * 7.0),
+            Some(Tensor::ones([2, 3], (DType::Float, Device::Cpu)) * 9.0),
+        ];
+        let rec = vec![
+            Some(Tensor::ones([4], (DType::Float, cuda)) * 11.0),
+            Some(Tensor::ones([4], (DType::Float, Device::Cpu)) * 13.0),
+        ];
+        manager.set_cached_tokens_with_ssm(vec![1, 2, 3], Some((conv, rec)));
+
+        manager.offload_to_cpu();
+        // The registry's single-device restore call (`cuda_if_available`,
+        // normally CUDA 0) — the exact pre-fix call shape.
+        manager.restore_to_gpu(cuda);
+
+        let (conv_restored, rec_restored) = manager.ssm_snapshot().unwrap();
+        for (layer, expected) in [(0usize, cuda), (1, Device::Cpu)] {
+            if let Some(c) = &conv_restored[layer] {
+                assert_eq!(
+                    c.device(),
+                    expected,
+                    "conv slot {layer} must return to its owning device"
+                );
+            }
+            if let Some(r) = &rec_restored[layer] {
+                assert_eq!(
+                    r.device(),
+                    expected,
+                    "rec slot {layer} must return to its owning device"
+                );
+            }
+        }
+        // Values survived the offload/restore round trip.
+        assert_eq!(conv_restored[0].as_ref().unwrap().double_value(&[1, 2]), 7.0);
+        assert_eq!(conv_restored[1].as_ref().unwrap().double_value(&[1, 2]), 9.0);
+        assert_eq!(rec_restored[0].as_ref().unwrap().double_value(&[3]), 11.0);
+        assert_eq!(rec_restored[1].as_ref().unwrap().double_value(&[3]), 13.0);
+    }
+
+    /// `clear_all` must drop the cached token IDs, the SSM snapshot, and its
+    /// slot-device record together with the layer tensors: metadata that
+    /// survives a tensor clear lets a later extending prompt claim a prefix
+    /// — or restore a stale snapshot — against KV that no longer exists
+    /// (set-up clear on an exact hit/miss, then cancellation before the
+    /// first poll leaves nothing to re-record over it).
+    #[test]
+    fn clear_all_drops_cached_token_and_ssm_metadata() {
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+        let opt = (DType::Float, Device::Cpu);
+        let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
+        let rec = vec![Some(Tensor::zeros([4], opt)), None];
+        manager.set_cached_tokens_with_ssm(vec![9, 9, 9], Some((conv, rec)));
+        assert_eq!(manager.cached_token_count(), 3);
+        assert!(manager.ssm_snapshot().is_some());
+
+        manager.clear_all();
+
+        assert_eq!(manager.cached_token_count(), 0, "token IDs must go with the tensors");
+        assert!(manager.ssm_snapshot().is_none(), "stale snapshot must not survive a clear");
+        assert!(manager.ssm_slot_devices.is_empty(), "slot-device record must go with the snapshot");
+        assert_eq!(
+            manager.prefix_match_len(&[9, 9, 9, 4]),
+            0,
+            "an extending prompt must not claim a prefix over cleared KV"
+        );
     }
 
     #[test]

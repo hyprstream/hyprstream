@@ -53,7 +53,10 @@ use std::sync::{
 
 use anyhow::{Context, Result, anyhow, ensure};
 use bytes::Bytes;
-use moq_net::{BroadcastProducer, Group, OriginConsumer, OriginProducer, Track, TrackProducer};
+use moq_net::{
+    Broadcast, BroadcastConsumer, BroadcastProducer, Group, OriginConsumer, OriginProducer, Track,
+    TrackProducer,
+};
 use parking_lot::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -662,12 +665,9 @@ impl MoqStreamOrigin {
         // zero or reuse the same AEAD key and nonce domain.
         ctx.with_publisher_epoch_ratchet(|epoch_ratchet| {
             let path = self.broadcast_path(ctx.topic());
-            let mut broadcast = self
-                .inner
-                .producer
-                .create_broadcast(path.as_str())
-                .ok_or_else(|| anyhow!("create_broadcast denied for {path}"))?;
-            let track = broadcast.create_track(Track::new(STREAM_TRACK))?;
+            let (broadcast, track) = publish_stream_broadcast(&path, |path, broadcast| {
+                self.inner.producer.publish_broadcast(path, broadcast)
+            })?;
 
             let generation = self
                 .inner
@@ -711,6 +711,21 @@ impl MoqStreamOrigin {
             })
         })
     }
+}
+
+/// Announce only after the required track is ready: another worker can subscribe
+/// as soon as publication becomes visible, before publisher construction returns.
+fn publish_stream_broadcast(
+    path: &str,
+    announce: impl FnOnce(&str, BroadcastConsumer) -> bool,
+) -> Result<(BroadcastProducer, TrackProducer)> {
+    let mut broadcast = Broadcast::new().produce();
+    let track = broadcast.create_track(Track::new(STREAM_TRACK))?;
+    ensure!(
+        announce(path, broadcast.consume()),
+        "create_broadcast denied for {path}"
+    );
+    Ok((broadcast, track))
 }
 
 /// In-process moq publisher with the §7.5 chained-HMAC tokenstream.
@@ -2328,6 +2343,49 @@ mod tests {
         let producer = Origin::random().produce();
         let consumer = producer.consume();
         MoqStreamOrigin::from_pair(producer, consumer)
+    }
+
+    /// Force a subscription inside the announcement call. This deterministically
+    /// exercises the gap that another runtime worker can observe during setup.
+    #[tokio::test]
+    async fn moq_stream_announcement_has_subscribable_track() -> Result<()> {
+        use futures::FutureExt;
+
+        let origin = origin();
+        let path = origin.broadcast_path("immediate-subscriber");
+        let mut subscriber = None;
+        let (_broadcast, track) = publish_stream_broadcast(&path, |path, broadcast| {
+            assert!(origin.inner.producer.publish_broadcast(path, broadcast));
+            let announced = origin
+                .consumer()
+                .announced_broadcast(path)
+                .now_or_never()
+                .expect("publication must be immediately visible")
+                .expect("published broadcast must exist");
+            subscriber = Some(
+                announced
+                    .subscribe_track(&Track::new(STREAM_TRACK))
+                    .expect("announced stream track must already be subscribable"),
+            );
+            true
+        })?;
+        assert!(subscriber.is_some());
+        track
+            .used()
+            .now_or_never()
+            .expect("subscriber demand must be visible")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn moq_stream_announcement_denial_is_an_error() {
+        let error = publish_stream_broadcast("denied/stream", |_, _| false)
+            .err()
+            .expect("denied announcement must not return a publisher");
+        assert_eq!(
+            error.to_string(),
+            "create_broadcast denied for denied/stream"
+        );
     }
 
     /// In-process publish → in-process consume over the *same* origin (the data

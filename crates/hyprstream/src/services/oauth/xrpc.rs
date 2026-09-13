@@ -1042,7 +1042,10 @@ pub async fn get_session(
             );
         }
     };
-    if info.handle.is_empty() || info.handle.chars().any(char::is_whitespace) {
+    // Reuse the canonical Lexicon handle grammar. Reserved-domain admission
+    // belongs to the native authority; handle.invalid is a valid API sentinel.
+    let handle = info.handle.to_ascii_lowercase();
+    if !record_validation::valid_handle(&handle) {
         tracing::error!(did = %claims.sub, "ATProto session resolver returned invalid handle");
         return xrpc_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1061,7 +1064,7 @@ pub async fn get_session(
         }
     }
     let mut body = json!({
-        "handle": info.handle,
+        "handle": handle,
         "did": claims.sub,
         "active": info.active,
     });
@@ -4035,6 +4038,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_issuer_identity_routes_share_canonical_service_did() {
+        for (issuer, expected) in [
+            ("https://pds.example", "did:web:pds.example"),
+            ("https://PDS.example:443/oauth", "did:web:pds.example"),
+            ("https://pds.example:8443/oauth", "did:web:pds.example%3A8443"),
+            ("http://127.0.0.1:6791", "did:web:127.0.0.1%3A6791"),
+        ] {
+            let mut state = build_test_state(true).await;
+            let mutable = Arc::get_mut(&mut state).unwrap();
+            mutable.issuer_url = issuer.to_owned();
+            mutable.signing_key = Some(ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]));
+            let app = build_production_app_from_state(state).await;
+            for (path, field) in [
+                ("/xrpc/com.atproto.server.describeServer", "did"),
+                ("/.well-known/did.json", "id"),
+                ("/clients/test-client/did.json", "id"),
+            ] {
+                let response = app.clone().oneshot(req(path)).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{issuer} {path}");
+                let body = resp_json(response).await;
+                let subject = if path.starts_with("/clients/") {
+                    format!("{expected}:clients:test-client")
+                } else { expected.to_owned() };
+                assert_eq!(body[field], subject, "{issuer} {path}");
+                if path == "/.well-known/did.json" {
+                    assert!(!body["verificationMethod"].as_array().unwrap().is_empty());
+                }
+                if let Some(methods) = body["verificationMethod"].as_array() {
+                    for method in methods {
+                        assert_eq!(method["controller"], subject);
+                        assert!(method["id"].as_str().unwrap().starts_with(&format!("{subject}#")));
+                    }
+                }
+            }
+            let response = app.oneshot(req("/.well-known/atproto-did")).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(body.as_ref(), expected.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn router_issuer_identity_routes_reject_unsupported_origins() {
+        for issuer in ["https://user@pds.example", "https://[::1]:8443", "ftp://pds.example", "not-a-url"] {
+            let mut state = build_test_state(true).await;
+            let mutable = Arc::get_mut(&mut state).unwrap();
+            mutable.issuer_url = issuer.to_owned();
+            mutable.signing_key = Some(ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]));
+            let app = build_production_app_from_state(state).await;
+            for path in ["/xrpc/com.atproto.server.describeServer", "/.well-known/did.json",
+                "/.well-known/atproto-did", "/clients/test-client/did.json"] {
+                let response = app.clone().oneshot(req(path)).await.unwrap();
+                assert!(response.status().is_server_error(), "{issuer} {path}");
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert!(!String::from_utf8_lossy(&body).contains(issuer));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn describe_server_advertises_only_configured_account_zone() {
         let mut state = build_test_state(false).await;
         Arc::get_mut(&mut state).unwrap().hosted_account_zone =
@@ -4195,6 +4258,7 @@ mod tests {
 
     struct SessionProbe {
         calls: std::sync::atomic::AtomicUsize,
+        handle: parking_lot::Mutex<String>,
     }
 
     #[async_trait::async_trait]
@@ -4203,7 +4267,7 @@ mod tests {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert_eq!(did, "did:web:pub.example.com");
             Ok(Some(AtprotoSessionInfo {
-                handle: "pub.example.com".to_owned(),
+                handle: self.handle.lock().clone(),
                 active: true,
                 ..Default::default()
             }))
@@ -4219,7 +4283,10 @@ mod tests {
             ));
         }
         let mut state = build_test_state(true).await;
-        let probe = Arc::new(SessionProbe { calls: 0.into() });
+        let probe = Arc::new(SessionProbe {
+            calls: 0.into(),
+            handle: parking_lot::Mutex::new("pub.example.com".to_owned()),
+        });
         Arc::get_mut(&mut state).unwrap().atproto_session_resolver = Some(probe.clone());
         let key = ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]);
         Arc::get_mut(&mut state).unwrap().verifying_key_bytes = key.verifying_key().to_bytes();
@@ -4291,6 +4358,85 @@ mod tests {
             })
         );
         assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn router_get_session_validates_native_handle_syntax() {
+        use std::sync::atomic::Ordering;
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let mut state = build_test_state(true).await;
+        let probe = Arc::new(SessionProbe {
+            calls: 0.into(),
+            handle: parking_lot::Mutex::new(String::new()),
+        });
+        Arc::get_mut(&mut state).unwrap().atproto_session_resolver = Some(probe.clone());
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]);
+        Arc::get_mut(&mut state).unwrap().verifying_key_bytes = key.verifying_key().to_bytes();
+        let issuer = state.atproto_issuer_url();
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "did:web:pub.example.com".to_owned(), now, now + 3600,
+        )
+        .with_issuer(issuer.clone())
+        .with_audience(Some(issuer))
+        .with_tenant("session-tests".to_owned())
+        .with_client_id("session-tests")
+        .with_scope(Some("atproto".to_owned()))
+        .with_jti();
+        let token = hyprstream_rpc::auth::jwt::encode(&claims, &key);
+        let app = build_production_app_from_state(state).await;
+        let max_handle = format!("{}.{}.{}.{}",
+            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(61));
+        assert_eq!(max_handle.len(), 253);
+        let invalid = [
+            "", " ", "not-a-handle", "foo..example.com", ".example.com",
+            "example.com.", "-foo.example.com", "foo-.example.com",
+            "foo_bar.example.com", "foo.example.123", "foo.example.0a",
+            "127.0.0.1", "[::1]", "@foo.example.com", "föo.example.com",
+            "foo\n.example.com", "foo.example.com:443", ".invalid",
+        ].map(str::to_owned).into_iter().chain([
+            format!("{}.example.com", "a".repeat(64)),
+            format!("{max_handle}a"),
+        ]);
+        let valid = [
+            "pub.example.com", "PUB.Example.COM", "8.cn", "a.co", "name.t--t",
+            "xn--notarealidn.com", "xn--fiqa61au8b7zsevnm8ak20mc4a87e.xn--fiqs8s",
+            // The reserved .invalid API sentinel is explicitly allowed by
+            // the ATProto spec; it is not a claim of resolvable ownership.
+            "handle.invalid",
+        ].map(str::to_owned).into_iter().chain([
+            format!("{}.example.com", "a".repeat(63)), max_handle,
+        ]);
+        for (index, (handle, valid)) in invalid.map(|h| (h, false))
+            .chain(valid.map(|h| (h, true))).enumerate()
+        {
+            *probe.handle.lock() = handle.clone();
+            let request = HttpRequest::builder()
+                .uri("/xrpc/com.atproto.server.getSession")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty()).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(probe.calls.load(Ordering::SeqCst), index + 1);
+            assert_eq!(response.status(), if valid { StatusCode::OK } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }, "handle {handle:?}");
+            let body = resp_json(response).await;
+            if valid {
+                assert_eq!(body, json!({
+                    "did": "did:web:pub.example.com", "handle": handle.to_ascii_lowercase(),
+                    "active": true,
+                }));
+            } else {
+                assert_eq!(body, json!({
+                    "error": errors::INTERNAL_SERVER_ERROR,
+                    "message": "native account returned an invalid handle",
+                }), "malformed authority value must not leak into the fixed error");
+            }
+        }
     }
 
     #[tokio::test]
