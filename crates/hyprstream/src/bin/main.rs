@@ -4801,7 +4801,7 @@ mod resolver_startup_controls {
             .find("install_process_production_resolver(&signing_key, &config).await")
             .expect("process resolver install");
         let first_generated = production[startup..]
-            .find("RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, ")
+            .find("RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,")
             .expect("first generated client");
         let command_dispatch = production[startup..]
             .find("match matches.subcommand()")
