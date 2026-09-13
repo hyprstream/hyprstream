@@ -48,8 +48,8 @@ pub struct TemplateToolCallFunction {
     pub arguments: serde_json::Value,
 }
 
-impl From<&crate::services::generated::inference_client::ToolCall> for TemplatToolCall {
-    fn from(tc: &crate::services::generated::inference_client::ToolCall) -> Self {
+impl From<&hyprstream_rpc_std::inference_client::ToolCall> for TemplatToolCall {
+    fn from(tc: &hyprstream_rpc_std::inference_client::ToolCall) -> Self {
         Self {
             id: tc.id.clone(),
             tool_type: tc.tool_type.clone(),

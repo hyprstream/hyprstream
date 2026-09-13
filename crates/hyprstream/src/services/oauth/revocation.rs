@@ -115,7 +115,8 @@ async fn publish_credential_revocation(
 mod tests {
     use super::*;
     use crate::config::OAuthConfig;
-    use crate::services::{DiscoveryClient, PolicyClient};
+    use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+    use hyprstream_rpc_std::policy_client::PolicyClient;
 
     /// Build a minimal OAuthState with a known Ed25519 signing key.
     fn make_test_state(

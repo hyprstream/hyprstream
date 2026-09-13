@@ -65,7 +65,7 @@ use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject};
 // `hyprstream_vfs::devfile::DevFileState` (same parking_lot::Mutex shape).
 use parking_lot::Mutex as PmMutex;
 
-use super::client::PodSandboxState;
+use hyprstream_rpc_std::worker_client::PodSandboxState;
 use super::pool::SandboxPool;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -974,7 +974,7 @@ mod tests {
     use crate::config::PoolConfig;
     use crate::error::Result as WorkerResult;
     use crate::runtime::backend::{SandboxBackend, SandboxHandle};
-    use crate::runtime::client::{LinuxContainerResources, PodSandboxConfig};
+    use hyprstream_rpc_std::worker_client::{LinuxContainerResources, PodSandboxConfig};
     use crate::runtime::sandbox::PodSandbox;
     use std::any::Any;
     use std::sync::atomic::{AtomicBool, Ordering};

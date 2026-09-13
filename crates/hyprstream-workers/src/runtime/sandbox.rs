@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use super::admission::ReservationRecord;
 use super::backend::SandboxHandle;
-use super::client::{KeyValue, LinuxContainerResources, PodSandboxState};
-use crate::generated::worker_client::PodSandboxMetadata;
+use hyprstream_rpc_std::worker_client::{KeyValue, LinuxContainerResources, PodSandboxState};
+use hyprstream_rpc_std::worker_client::PodSandboxMetadata;
 
 /// Runtime representation of a pod sandbox
 ///
@@ -104,7 +104,7 @@ impl PodSandbox {
     ///
     /// The sandbox is created in the NotReady state. The `SandboxBackend`
     /// will populate `backend_handle` when it starts the sandbox.
-    pub fn new(id: String, config: &super::client::PodSandboxConfig, sandbox_path: PathBuf) -> Self {
+    pub fn new(id: String, config: &hyprstream_rpc_std::worker_client::PodSandboxConfig, sandbox_path: PathBuf) -> Self {
         Self {
             id,
             metadata: config.metadata.clone(),

@@ -4,9 +4,9 @@
 //! pattern over the 9P protocol. These replace the old `read_file`/`write_file`/`mkdir`
 //! convenience methods that sent entire files in a single message.
 
-use crate::services::WorktreeClient;
+use hyprstream_rpc_std::registry_client::WorktreeClient;
 use crate::services::types::{OREAD, OWRITE, DMDIR};
-use crate::services::generated::registry_client::{
+use hyprstream_rpc_std::registry_client::{
     NpWalk, NpOpen, NpCreate, NpRead, NpWrite, NpClunk, NpRemove, NpStatReq,
 };
 use anyhow::Result;
@@ -36,13 +36,21 @@ pub struct StatResult {
     pub modified_at: i64,
 }
 
-impl WorktreeClient {
+/// High-level 9P helpers for the generated Registry worktree client.
+///
+/// The client itself is owned by `hyprstream-rpc-std`; keeping these
+/// implementation-specific convenience operations as an extension trait lets
+/// the AGPL daemon add ergonomics without defining an inherent impl for an
+/// external type.
+pub(crate) trait WorktreeClientExt:
+    hyprstream_rpc_std::registry_client::WorktreeRpc
+{
     /// Read an entire file via walk/open/read-loop/clunk (bounded by iounit per message).
     ///
     /// This is the replacement for the old `read_file()` method. Instead of sending
     /// the entire file in a single Cap'n Proto message (which fails for files >16MB),
     /// this reads in iounit-sized chunks via the 9P protocol.
-    pub async fn read_file_chunked(&self, path: &str) -> Result<Vec<u8>> {
+    async fn read_file_chunked(&self, path: &str) -> Result<Vec<u8>> {
         let fid = next_fid();
         let wnames = split_path(path);
 
@@ -78,7 +86,7 @@ impl WorktreeClient {
     /// Write an entire file via walk-parent/create/write-loop/clunk.
     ///
     /// This is the replacement for the old `write_file()` method.
-    pub async fn write_file_chunked(&self, path: &str, data: &[u8]) -> Result<()> {
+    async fn write_file_chunked(&self, path: &str, data: &[u8]) -> Result<()> {
         let components = split_path(path);
         let (parent_components, file_name) = if components.len() > 1 {
             (&components[..components.len() - 1], &components[components.len() - 1])
@@ -122,7 +130,7 @@ impl WorktreeClient {
     /// Create a directory (and parents if needed), like `mkdir -p`.
     ///
     /// This replaces the old `mkdir(path, recursive)` method.
-    pub async fn mkdir_p(&self, path: &str) -> Result<()> {
+    async fn mkdir_p(&self, path: &str) -> Result<()> {
         let components = split_path(path);
         if components.is_empty() {
             return Ok(());
@@ -158,7 +166,7 @@ impl WorktreeClient {
     /// Stat a file by path. Returns a StatResult for backward compatibility.
     ///
     /// This replaces the old `stat(path)` method.
-    pub async fn stat_path(&self, path: &str) -> Result<StatResult> {
+    async fn stat_path(&self, path: &str) -> Result<StatResult> {
         let fid = next_fid();
         let wnames = split_path(path);
 
@@ -192,7 +200,7 @@ impl WorktreeClient {
     /// Remove a file by path via walk/remove.
     ///
     /// This replaces the old `remove(path)` method.
-    pub async fn remove_path(&self, path: &str) -> Result<()> {
+    async fn remove_path(&self, path: &str) -> Result<()> {
         let fid = next_fid();
         let wnames = split_path(path);
 
@@ -206,7 +214,7 @@ impl WorktreeClient {
     ///
     /// This replaces the old `copy(src, dst)` method. Since 9P has no copy op,
     /// this reads the source file and writes it to the destination.
-    pub async fn copy_path(&self, src: &str, dst: &str) -> Result<()> {
+    async fn copy_path(&self, src: &str, dst: &str) -> Result<()> {
         let data = self.read_file_chunked(src).await?;
         self.write_file_chunked(dst, &data).await
     }
@@ -216,7 +224,7 @@ impl WorktreeClient {
     /// This replaces the old `list_dir(path)` method. Returns directory entries
     /// by walking to the directory, opening it, and reading the dir entries.
     /// For now, implemented via walk + stat on the directory.
-    pub async fn list_dir_path(&self, path: &str) -> Result<Vec<super::FsDirEntryInfo>> {
+    async fn list_dir_path(&self, path: &str) -> Result<Vec<super::FsDirEntryInfo>> {
         // Walk to the directory and open it for reading
         let fid = next_fid();
         let wnames = split_path(path);
@@ -262,3 +270,5 @@ impl WorktreeClient {
         Ok(entries)
     }
 }
+
+impl WorktreeClientExt for WorktreeClient {}

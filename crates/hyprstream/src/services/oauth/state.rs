@@ -15,7 +15,8 @@ use super::token_store::TokenStore;
 use super::user_service::UserService;
 use crate::auth::user_store::UserStore;
 use crate::config::OAuthConfig;
-use crate::services::{DiscoveryClient, PolicyClient};
+use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+use hyprstream_rpc_std::policy_client::PolicyClient;
 use hyprstream_util::{InsertIfAbsentNoEvictResult, TtlCache};
 
 use super::replay_key::ReplayKey;

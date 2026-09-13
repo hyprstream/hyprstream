@@ -404,7 +404,7 @@ async fn dead_or_wrong_key_discovery_fails_liveness() {
     let discovery_vk = fixture.discovery_sk.verifying_key();
     let rpc =
         hyprstream_rpc::dial::dial(&dead_transport, signer, Some(discovery_vk), None).unwrap();
-    let client = hyprstream_discovery::DiscoveryClient::new(rpc);
+    let client = hyprstream_rpc_std::discovery_client::DiscoveryClient::new(rpc);
     assert!(
         client.ping().await.is_err(),
         "ping against a dead endpoint must fail"
@@ -416,7 +416,7 @@ async fn dead_or_wrong_key_discovery_fails_liveness() {
     let live_transport = TransportConfig::quic_pinned(fixture.quic_addr, "hyprstream.local", pin);
     let signer = hyprstream_rpc::signer::LocalSigner::new(SigningKey::from_bytes(&[0x59; 32]));
     let rpc = hyprstream_rpc::dial::dial(&live_transport, signer, Some(wrong_vk), None).unwrap();
-    let client = hyprstream_discovery::DiscoveryClient::new(rpc);
+    let client = hyprstream_rpc_std::discovery_client::DiscoveryClient::new(rpc);
     assert!(
         client.ping().await.is_err(),
         "ping pinned to a key the endpoint does not hold must fail"

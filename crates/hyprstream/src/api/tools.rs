@@ -8,7 +8,7 @@ use serde_json::Value;
 use regex::Regex;
 use once_cell::sync::Lazy;
 
-use super::openai_compat::{ToolCall, ToolCallFunction};
+use hyprstream_rpc_std::inference_client::{ToolCall, ToolCallFunction};
 use crate::runtime::model_config::ModelArchitecture;
 
 // =============================================================================

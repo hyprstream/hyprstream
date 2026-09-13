@@ -34,7 +34,10 @@ use nydus_storage::backend::{BlobBackend, BlobBufReader};
 use crate::config::ImageConfig;
 use crate::error::{Result, WorkerError};
 
-use super::{AuthConfig as GenAuthConfig, ImageSpec, ImageInfo, ImageStatusResult, FilesystemUsage, FilesystemIdentifier};
+use hyprstream_rpc_std::worker_client::{
+    AuthConfig as GenAuthConfig, FilesystemIdentifier, FilesystemUsage, ImageInfo,
+    ImageSpec, ImageStatusResult,
+};
 use super::manifest::{AuthConfig, ImageReference, ManifestFetcher, ManifestResult};
 
 /// RAFS-backed image store with Dragonfly-native blob fetching
@@ -841,7 +844,7 @@ pub struct ImageMetadata {
 
 #[async_trait::async_trait]
 impl crate::image::store_trait::ImageStore for RafsStore {
-    async fn list_images(&self) -> anyhow::Result<Vec<crate::image::ImageInfo>> {
+    async fn list_images(&self) -> anyhow::Result<Vec<ImageInfo>> {
         RafsStore::list_images(self).await.map_err(Into::into)
     }
 
@@ -849,7 +852,7 @@ impl crate::image::store_trait::ImageStore for RafsStore {
         &self,
         image_ref: &str,
         verbose: bool,
-    ) -> anyhow::Result<crate::image::ImageStatusResult> {
+    ) -> anyhow::Result<ImageStatusResult> {
         RafsStore::image_status(self, image_ref, verbose)
             .await
             .map_err(Into::into)
@@ -858,7 +861,7 @@ impl crate::image::store_trait::ImageStore for RafsStore {
     async fn pull_with_auth(
         &self,
         image_ref: &str,
-        auth: Option<&crate::image::AuthConfig>,
+        auth: Option<&hyprstream_rpc_std::worker_client::AuthConfig>,
     ) -> anyhow::Result<String> {
         RafsStore::pull_with_auth(self, image_ref, auth)
             .await
@@ -871,7 +874,7 @@ impl crate::image::store_trait::ImageStore for RafsStore {
             .map_err(Into::into)
     }
 
-    async fn fs_info(&self) -> anyhow::Result<Vec<crate::image::FilesystemUsage>> {
+    async fn fs_info(&self) -> anyhow::Result<Vec<FilesystemUsage>> {
         RafsStore::fs_info(self).await.map_err(Into::into)
     }
 }

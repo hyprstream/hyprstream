@@ -99,7 +99,8 @@ Worker-engine crates are always `hyprstream-workers-{engine}`, never `hyprstream
 - `mac/` — Native MAC data-plane: TE evaluator, AVC, UCAN→TE compiler, grant exchange, audit (see Native MAC below)
 - `events/` — group-keyed EventService integration (epic #600)
 - `auth/`, `inference/`, `tui/`, `cli/`, `config/`, `archetypes/` — supporting modules
-- `schema/` — app-local Cap'n Proto schemas: `tui.capnp`, `compositor_ipc.capnp` (service schemas live in `hyprstream-rpc-std/schema/`)
+- `schema/` — retained only for non-RPC application assets; service schemas,
+  including TUI/compositor IPC, live in `hyprstream-rpc-std/schema/`
 
 ## Services (13 total, registered via `#[service_factory]` in `services/factories.rs`)
 
@@ -161,14 +162,17 @@ ZMQ/ZeroMQ is **gone**. RPC uses ZMTP 3.1 *framing* (the wire serialization only
 | `#[authorize]` | Declarative JWT + Casbin authorization on handlers |
 | `#[register_scopes]` | Compile-time scope registration |
 | `#[service_factory]` | Inventory-based service registration |
-| `generate_rpc_service!` | Full client/handler/dispatch from CGR metadata |
+| `generate_rpc_service!` | Legacy full client/handler/dispatch generation |
+| `generate_rpc_client!` | Portable Apache client/data/metadata generation |
+| `generate_rpc_server!` | Server-only handler/dispatch generation against external contracts |
 
 ### Schema Locations
 
 - `crates/hyprstream-rpc/schema/` — `common.capnp` (envelopes, identity, claims), `streaming.capnp`, `events.capnp`, `annotations.capnp`, `nine.capnp` (9P bridge), `optional.capnp`
-- `crates/hyprstream-rpc-std/schema/` — `registry.capnp`, `model.capnp`, `policy.capnp`, `mcp.capnp`, `oauth.capnp`, `inference.capnp`, `metrics.capnp`, `chat_core.capnp`, `service_events.capnp`
-- `crates/hyprstream/schema/` — `tui.capnp`, `compositor_ipc.capnp`
-- `crates/hyprstream-workers/schema/` — `worker.capnp`, `workflow.capnp`
+- `crates/hyprstream-rpc-std/schema/` — all public service contracts:
+  `registry`, `model`, `policy`, `mcp`, `oauth`, `inference`, `metrics`,
+  `chat_core`, `service_events`, `worker`, `workflow`, `discovery`, `tui`, and
+  `compositor_ipc`
 
 ### Key RPC Types (`crates/hyprstream-rpc/src/`)
 

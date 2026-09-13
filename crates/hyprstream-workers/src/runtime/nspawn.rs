@@ -22,7 +22,7 @@ use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 
 use super::backend::{SandboxBackend, SandboxHandle};
-use super::client::{LinuxContainerResources, PodSandboxConfig};
+use hyprstream_rpc_std::worker_client::{LinuxContainerResources, PodSandboxConfig};
 use super::sandbox::PodSandbox;
 #[cfg(feature = "oci-image")]
 use crate::image::RafsStore;

@@ -25,8 +25,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config::GenerationResult;
-use crate::runtime::GenerationRequest;
-use crate::runtime::ModelInfo;
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::inference_client::ModelInfo;
 use crate::training::TenantDeltaConfig;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
