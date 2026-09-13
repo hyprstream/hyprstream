@@ -26,6 +26,8 @@ const PUBLIC_SCHEMAS: &[&str] = &[
     "policy",
     "mcp",
     "metrics",
+    "service_events",
+    "chat_core",
     "oauth",
     "worker",
     "workflow",
