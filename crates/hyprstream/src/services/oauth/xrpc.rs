@@ -2216,8 +2216,10 @@ mod tests {
         writable.verifying_key_bytes = signing_key.verifying_key().to_bytes();
         writable.hosted_account_zone =
             Some(crate::account::AccountZone::new("accounts.example.com").unwrap());
-        writable.hosted_public_repo_writer =
-            Some(Arc::new(hosted_tests::hosted(store.clone(), accounts)));
+        writable.hosted_public_repo_writer = Some(Arc::new(hosted_tests::hosted(
+            store.clone(),
+            accounts.clone(),
+        )));
         let issuer = state.atproto_issuer_url();
         let now = chrono::Utc::now().timestamp();
         let key = SigningKey::random(&mut OsRng);
@@ -2301,6 +2303,16 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(body_json(response).await["cid"], first["cid"]);
         }
+        // Healthy durable data must retain native identity even when a legacy
+        // model snapshot advertises a different handle and verification key.
+        snapshots
+            .put(sample_snapshot(
+                hosted_tests::DID,
+                "other.example.com",
+                true,
+            ))
+            .await
+            .unwrap();
         let resolved = app.clone().oneshot(HttpRequest::builder().uri("/xrpc/com.atproto.identity.resolveHandle?handle=alice.accounts.example.com").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resolved.status(), StatusCode::OK);
         assert_eq!(body_json(resolved).await["did"], hosted_tests::DID);
@@ -2321,6 +2333,28 @@ mod tests {
         let description = body_json(description).await;
         assert_eq!(description["handle"], "alice.accounts.example.com");
         assert_eq!(description["did"], hosted_tests::DID);
+        assert_eq!(description["handleIsCorrect"], true);
+        assert_eq!(description["didDoc"]["id"], hosted_tests::DID);
+        assert_eq!(
+            description["didDoc"]["alsoKnownAs"],
+            json!(["at://alice.accounts.example.com"])
+        );
+        let native_key = accounts
+            .verifying_key_for_hosted_did(
+                &hyprstream_rpc::Subject::new(
+                    hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                ),
+                hosted_tests::DID,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let native_method =
+            super::super::did_document::atproto_verification_method(hosted_tests::DID, &native_key);
+        assert!(description["didDoc"]["verificationMethod"]
+            .as_array()
+            .unwrap()
+            .contains(&native_method));
         let export = app
             .clone()
             .oneshot(
@@ -2339,14 +2373,6 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        snapshots
-            .put(sample_snapshot(
-                hosted_tests::DID,
-                "alice.accounts.example.com",
-                true,
-            ))
-            .await
-            .unwrap();
         store
             .insert_snapshot_budget_fixture_for_test(hosted_tests::DID, 257, 1)
             .unwrap();

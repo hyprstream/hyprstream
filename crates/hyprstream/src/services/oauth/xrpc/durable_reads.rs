@@ -174,25 +174,29 @@ pub(super) async fn get_repo(
 }
 
 pub(super) async fn describe_repo(state: &OAuthState, writer: PublicRepoReader) -> Response {
-    let handle = state
-        .xrpc_repos
-        .get_public(writer.did())
-        .await
-        .map(|snapshot| snapshot.handle.clone());
-    // No trusted account handle exists for some PLC/non-issuer repositories.
-    // Use the protocol's invalid-handle sentinel without inventing a binding.
-    let handle = handle.or_else(|| {
-        if matches!(&writer, PublicRepoReader::Hosted { .. }) {
-            return writer.did().strip_prefix("did:web:").map(str::to_owned);
-        }
-        (state.atproto_service_did().as_deref() == Some(writer.did()))
-            .then(|| {
-                url::Url::parse(&state.issuer_url)
-                    .ok()
-                    .and_then(|url| url.host_str().map(str::to_owned))
+    let handle = match &writer {
+        // Hosted selection already validated this exact host against AccountZone.
+        // Legacy model metadata must not override the native account identity.
+        PublicRepoReader::Hosted { did, .. } => did.strip_prefix("did:web:").map(str::to_owned),
+        PublicRepoReader::Local(_) => {
+            let handle = state
+                .xrpc_repos
+                .get_public(writer.did())
+                .await
+                .map(|snapshot| snapshot.handle.clone());
+            // No trusted handle exists for some PLC/non-issuer repositories.
+            // Preserve the issuer fallback and invalid-handle sentinel policy.
+            handle.or_else(|| {
+                (state.atproto_service_did().as_deref() == Some(writer.did()))
+                    .then(|| {
+                        url::Url::parse(&state.issuer_url)
+                            .ok()
+                            .and_then(|url| url.host_str().map(str::to_owned))
+                    })
+                    .flatten()
             })
-            .flatten()
-    });
+        }
+    };
     let handle_is_correct = handle.is_some();
     let handle = handle.unwrap_or_else(|| "handle.invalid".to_owned());
     let permit = match state.xrpc_repos.acquire_snapshot_work_owned().await {
