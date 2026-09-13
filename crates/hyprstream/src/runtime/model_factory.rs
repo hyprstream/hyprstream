@@ -35,6 +35,12 @@ fn strict_loader_enabled() -> bool {
 // preflight; checkpoint tensor payloads are left to the existing loader.
 const MTP_HEADER_LIMIT: usize = 100_000_000;
 
+fn mtp_runtime_supported(requested: bool, kv_quant_type: KVQuantType) -> bool {
+    // Match TextStream admission: quantized KV cannot rewind a rejected draft.
+    // Exclude its unusable head before metadata preflight or tensor allocation.
+    requested && kv_quant_type == KVQuantType::None
+}
+
 fn mtp_header_len(prefix: &[u8]) -> Result<usize> {
     let encoded: [u8; 8] = prefix
         .try_into()
@@ -348,8 +354,8 @@ impl ModelFactory {
     /// `device`). At runtime this depends on #405 (from_weights device-placement
     /// fix) to actually place per-layer tensors on non-primary devices.
     /// `speculative_decoding` is the resolved runtime policy (including TOML).
-    /// When false, or config/checkpoint metadata declares an unsupported MTP
-    /// layout, draft weights are skipped before any tensor/device allocation.
+    /// When false, KV is quantized, or config/checkpoint metadata declares an
+    /// unsupported MTP layout, draft weights skip tensor/device allocation.
     #[instrument(name = "model_factory.create", skip(device, dtype, device_pool), fields(model_path = %model_path.display()))]
     pub async fn create(
         model_path: &Path,
@@ -394,7 +400,7 @@ impl ModelFactory {
             shard_files.clone()
         };
         let speculative_decoding = Self::mtp_loading_policy(
-            model_path, &mtp_shards, speculative_decoding,
+            model_path, &mtp_shards, mtp_runtime_supported(speculative_decoding, kv_quant_type),
         ).await?;
 
         if !shard_files.is_empty() && shard_files.len() > 1 {
@@ -2096,7 +2102,7 @@ impl ModelFactory {
         let shard_names = Self::find_shard_names_fs(fs).await?;
 
         let speculative_decoding = Self::mtp_loading_policy_fs(
-            model_path, fs, &shard_names, speculative_decoding,
+            model_path, fs, &shard_names, mtp_runtime_supported(speculative_decoding, kv_quant_type),
         ).await?;
 
         if shard_names.len() > 1 {
@@ -2461,6 +2467,116 @@ mod stage_subset_tests {
     #[tokio::test]
     async fn mtp_multilayer_sharded_skips_before_materialization() {
         check_mtp_multilayer_factory(true).await;
+    }
+
+    async fn check_mtp_quantized_factory(sharded: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut base = tiny_dense_tensors(true);
+        write_tiny_dense_checkpoint(dir.path(), &base);
+        if sharded {
+            write_shard(
+                dir.path(),
+                "model-00002-of-00002.safetensors",
+                &[FixtureTensor::i64("mtp.unmaterializable")],
+            );
+            let mut entries: Vec<_> = base
+                .iter()
+                .map(|t| (t.name.as_str(), "model-00001-of-00001.safetensors"))
+                .collect();
+            entries.push(("mtp.unmaterializable", "model-00002-of-00002.safetensors"));
+            write_index(dir.path(), &entries);
+        } else {
+            base.push(FixtureTensor::i64("mtp.unmaterializable"));
+            write_shard(dir.path(), "model.safetensors", &base);
+        }
+        for requested in [false, true] {
+            for kv in [
+                KVQuantType::None,
+                KVQuantType::Int8,
+                KVQuantType::Nf4,
+                KVQuantType::Fp4,
+            ] {
+                let result = ModelFactory::create(
+                    dir.path(),
+                    &Device::Cpu,
+                    DType::Float,
+                    Some(16),
+                    kv,
+                    None,
+                    false,
+                    requested,
+                )
+                .await;
+                if requested && kv == KVQuantType::None {
+                    let error = result
+                        .err()
+                        .expect("unquantized enabled head must still load");
+                    assert!(error.to_string().contains("mtp.unmaterializable"));
+                    assert!(error.to_string().contains("unsupported dtype"));
+                } else {
+                    assert!(
+                        result.is_ok(),
+                        "unusable MTP reached allocation: requested={requested}, kv={kv:?}, error={:?}",
+                        result.err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mtp_quantized_single_file_skips_before_materialization() {
+        check_mtp_quantized_factory(false).await;
+    }
+
+    #[tokio::test]
+    async fn mtp_quantized_sharded_skips_before_materialization() {
+        check_mtp_quantized_factory(true).await;
+    }
+
+    #[test]
+    fn mtp_quantized_fsops_policy_skips_before_materialization() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(
+            dir.path(),
+            "weights.safetensors",
+            &[
+                FixtureTensor::f32("model.norm.weight", &[4], 1.0),
+                FixtureTensor::i64("mtp.unmaterializable"),
+            ],
+        );
+        let bytes = std::fs::read(dir.path().join("weights.safetensors")).unwrap();
+        for requested in [false, true] {
+            for kv in [
+                KVQuantType::None,
+                KVQuantType::Int8,
+                KVQuantType::Nf4,
+                KVQuantType::Fp4,
+            ] {
+                let mut weights = HashMap::new();
+                // FsOps uses the same effective-runtime gate before its layout
+                // preflight; exercise the admitted flag at its materializer.
+                let result = ModelFactory::create_tensors_from_safetensors(
+                    safetensors::SafeTensors::deserialize(&bytes).unwrap(),
+                    &mut weights,
+                    &Device::Cpu,
+                    DType::Float,
+                    mtp_runtime_supported(requested, kv),
+                );
+                if requested && kv == KVQuantType::None {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("mtp.unmaterializable")
+                    );
+                } else {
+                    result.unwrap();
+                    assert_eq!(weights.len(), 1);
+                    assert!(weights.contains_key("model.norm.weight"));
+                }
+            }
+        }
     }
 
     #[test]
