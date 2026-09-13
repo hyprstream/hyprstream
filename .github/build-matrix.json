@@ -1,0 +1,368 @@
+{
+  "schema_version": 1,
+  "description": "Versioned architecture/backend build contract for hyprstream CI (native self-hosted CI/CD + ARM64 plan, 2026-09-13). scripts/check_build_matrix.py validates this file and enforces the hosted-runner allowlist against .github/workflows/*.yml on every Rust `deny` run. Truthful about current state: rows describe what executes TODAY; each Wave-2 migration PR moves a row's runner_class and removes its hosted_allowlist entry together. Capability evidence: metal/.fleet-coord/ci-native-arm64-capability-evidence-20260913.md.",
+  "runner_classes": {
+    "arm64-merge-gate": {
+      "labels": ["self-hosted", "linux", "arm64", "graviton", "hyprstream-merge-gate"],
+      "architecture": "aarch64",
+      "status": "live",
+      "substrate": "AWS Graviton ephemeral JIT runners (r6g.2xlarge, us-east-1a), Rocky 10 golden AMI, rootless podman, /mnt/hypr-ci-cache volume. Consumed today by rust.yml clippy/wasm/build, appimage.yml build-arm64-cpu, docker-build.yml build-docker-arm64, build-image.yml, graviton-build-validate.yml, oci-runtime-validate.yml, merge-gate-preflight.yml build."
+    },
+    "arm64-preflight": {
+      "labels": ["self-hosted", "linux", "arm64", "graviton", "hyprstream-preflight"],
+      "architecture": "aarch64",
+      "status": "live",
+      "substrate": "Same Graviton substrate, spot/opportunistic tier; target of merge-gate-preflight.yml via inputs.runner_label."
+    },
+    "amd64-release": {
+      "labels": ["self-hosted", "linux", "amd64", "hyprstream-release"],
+      "architecture": "x86_64",
+      "status": "unproven",
+      "substrate": "AWS x86_64 ephemeral JIT runners, x86_64 golden AMI (hyprstream-runner.pkr.hcl -var architecture=amd64), on-demand. Defined in metal stacks/aws-runners since commit ecf9de7 (ingest#98) but NO hyprstream job has ever consumed it. Liveness must be proven with .github/workflows/runner-capability-probe.yml before any row moves here."
+    },
+    "amd64-canary": {
+      "labels": ["self-hosted", "linux", "amd64", "hyprstream-canary"],
+      "architecture": "x86_64",
+      "status": "unproven",
+      "substrate": "Same as amd64-release on the spot/opportunistic tier. Liveness unproven; see runner-capability-probe.yml."
+    },
+    "github-hosted": {
+      "labels": ["ubuntu-latest"],
+      "architecture": "x86_64",
+      "status": "legacy-allowlisted",
+      "substrate": "GitHub-hosted runners. Legacy only: every job still executing here must appear in hosted_allowlist below, and scripts/check_build_matrix.py rejects any NEW hosted job. The end state (native self-hosted CI plan) removes this class from build paths entirely; only reviewed external services may remain."
+    }
+  },
+  "rows": [
+    {
+      "id": "appimage-x86_64-cpu",
+      "product": "appimage",
+      "arch": "x86_64",
+      "target_triple": "x86_64-unknown-linux-gnu",
+      "backend": "cpu",
+      "status": "active",
+      "runner_class": "github-hosted",
+      "migration_target_class": "amd64-release",
+      "builder_image": null,
+      "rust_toolchain": "dtolnay/rust-toolchain@stable (moving; pin inside a published amd64 builder image as part of N1.2 before migrating)",
+      "libtorch": {
+        "source": "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.10.0%2Bcpu.zip",
+        "identity": "libtorch 2.10.0+cpu x86_64 archive (per-run download + cache)"
+      },
+      "accelerator": "none",
+      "cache": {
+        "kind": "s3-sccache",
+        "namespace": "appimage/x86_64/cpu"
+      },
+      "artifacts": ["hyprstream-{version}-cpu-x86_64.AppImage"],
+      "staging_artifacts": ["universal-staging-cpu"]
+    },
+    {
+      "id": "appimage-x86_64-cuda128",
+      "product": "appimage",
+      "arch": "x86_64",
+      "target_triple": "x86_64-unknown-linux-gnu",
+      "backend": "cuda128",
+      "status": "active",
+      "runner_class": "github-hosted",
+      "migration_target_class": "amd64-release",
+      "builder_image": null,
+      "rust_toolchain": "dtolnay/rust-toolchain@stable (moving; pin inside a published amd64 builder image as part of N1.2 before migrating)",
+      "libtorch": {
+        "source": "https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-2.10.0%2Bcu128.zip",
+        "identity": "libtorch 2.10.0+cu128 x86_64 archive (per-run download + cache)"
+      },
+      "accelerator": "nvidia-cuda-12.8 (build-only; runtime needs driver 535+)",
+      "cache": {
+        "kind": "s3-sccache",
+        "namespace": "appimage/x86_64/cuda128"
+      },
+      "artifacts": ["hyprstream-{version}-cuda128-x86_64.AppImage"],
+      "staging_artifacts": ["universal-staging-cuda128"]
+    },
+    {
+      "id": "appimage-x86_64-cuda130",
+      "product": "appimage",
+      "arch": "x86_64",
+      "target_triple": "x86_64-unknown-linux-gnu",
+      "backend": "cuda130",
+      "status": "active",
+      "runner_class": "github-hosted",
+      "migration_target_class": "amd64-release",
+      "builder_image": null,
+      "rust_toolchain": "dtolnay/rust-toolchain@stable (moving; pin inside a published amd64 builder image as part of N1.2 before migrating)",
+      "libtorch": {
+        "source": "https://download.pytorch.org/libtorch/cu130/libtorch-shared-with-deps-2.10.0%2Bcu130.zip",
+        "identity": "libtorch 2.10.0+cu130 x86_64 archive (per-run download + cache)"
+      },
+      "accelerator": "nvidia-cuda-13.0 (build-only; runtime needs driver 555+)",
+      "cache": {
+        "kind": "s3-sccache",
+        "namespace": "appimage/x86_64/cuda130"
+      },
+      "artifacts": ["hyprstream-{version}-cuda130-x86_64.AppImage"],
+      "staging_artifacts": ["universal-staging-cuda130"]
+    },
+    {
+      "id": "appimage-x86_64-rocm71",
+      "product": "appimage",
+      "arch": "x86_64",
+      "target_triple": "x86_64-unknown-linux-gnu",
+      "backend": "rocm71",
+      "status": "active",
+      "runner_class": "github-hosted",
+      "migration_target_class": "amd64-release",
+      "builder_image": null,
+      "rust_toolchain": "dtolnay/rust-toolchain@stable (moving; pin inside a published amd64 builder image as part of N1.2 before migrating)",
+      "libtorch": {
+        "source": "https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-2.10.0%2Brocm7.1.zip",
+        "identity": "libtorch 2.10.0+rocm7.1 x86_64 archive (per-run download + cache)"
+      },
+      "accelerator": "amd-rocm-7.1 (build-only)",
+      "cache": {
+        "kind": "s3-sccache",
+        "namespace": "appimage/x86_64/rocm71"
+      },
+      "artifacts": ["hyprstream-{version}-rocm71-x86_64.AppImage"],
+      "staging_artifacts": ["universal-staging-rocm71"]
+    },
+    {
+      "id": "appimage-universal-x86_64",
+      "product": "appimage-universal",
+      "arch": "x86_64",
+      "target_triple": "x86_64-unknown-linux-gnu",
+      "backend": "universal",
+      "status": "active",
+      "runner_class": "github-hosted",
+      "migration_target_class": "amd64-release",
+      "builder_image": null,
+      "rust_toolchain": "none (compiler-free packaging job: consumes same-run staged backend payloads only)",
+      "libtorch": {
+        "source": "same-run universal-staging-* artifacts (no download)",
+        "identity": "per-backend libtorch trees staged by the build-x86_64 legs"
+      },
+      "accelerator": "none",
+      "cache": {
+        "kind": "none"
+      },
+      "artifacts": ["hyprstream-{version}-x86_64.AppImage"],
+      "staging_artifacts": []
+    },
+    {
+      "id": "appimage-aarch64-cpu",
+      "product": "appimage",
+      "arch": "aarch64",
+      "target_triple": "aarch64-unknown-linux-gnu",
+      "backend": "cpu",
+      "status": "active",
+      "runner_class": "arm64-merge-gate",
+      "builder_image": "pin:.github/builder-image.env",
+      "rust_toolchain": "pinned by rust-toolchain.toml, pre-provisioned in the builder image",
+      "libtorch": {
+        "source": "pip wheel torch==2.10.0 (aarch64 CPU), symlinked to /opt/libtorch in the builder image",
+        "identity": "libtorch 2.10.0+cpu aarch64 wheel (LIBTORCH_BYPASS_VERSION_CHECK=1)"
+      },
+      "accelerator": "none",
+      "cache": {
+        "kind": "none"
+      },
+      "artifacts": ["hyprstream-{version}-cpu-aarch64.AppImage"],
+      "staging_artifacts": []
+    },
+    {
+      "id": "appimage-aarch64-cuda130",
+      "product": "appimage",
+      "arch": "aarch64",
+      "target_triple": "aarch64-unknown-linux-gnu",
+      "backend": "cuda130",
+      "status": "gated",
+      "runner_class": "arm64-merge-gate",
+      "builder_image": null,
+      "rust_toolchain": "pinned by rust-toolchain.toml (spike image builds ad hoc; N1.2 published pin required before activation)",
+      "libtorch": {
+        "source": "pip wheel torch==2.10.0+cu130 (aarch64) from https://download.pytorch.org/whl/cu130",
+        "identity": "libtorch 2.10.0+cu130 aarch64 wheel (torch.version.cuda == 13.0; link closure proven, runtime NOT)"
+      },
+      "accelerator": "nvidia-cuda-13.0 (UNPROVEN at runtime: no ARM host with an attached NVIDIA GPU exists in the fleet)",
+      "cache": {
+        "kind": "none"
+      },
+      "artifacts": ["hyprstream-{version}-cuda130-aarch64.AppImage"],
+      "staging_artifacts": [],
+      "gate": {
+        "blocker": "No ARM64 host with an attached NVIDIA GPU exists in the fleet (Graviton pool is r6g.2xlarge, CPU-only silicon). Spike run 32897623715 recorded torch.cuda.is_available()==False and 'No NVIDIA device is attached'. ROCm aarch64 wheels are additionally unavailable upstream.",
+        "build_only_evidence": "https://github.com/hyprstream/hyprstream/actions/runs/32897623715",
+        "hardware_proof": null,
+        "preflight_job": "arm-gpu-spike.yml: arm-cuda-enable-preflight (fail-closed; must go green on real hardware before this row may be marked active)",
+        "activation_requirements": "1) arm-cuda-enable-preflight green run URL recorded in hardware_proof; 2) published digest-pinned ARM CUDA builder image (N1.2); 3) cache namespace distinct from every other row; 4) separate hardware-gated runtime smoke job (N3.3) — build-only green is not runtime support."
+      }
+    },
+    {
+      "id": "merge-gate-aarch64-default",
+      "product": "rust-workspace",
+      "arch": "aarch64",
+      "target_triple": "aarch64-unknown-linux-gnu",
+      "backend": "cpu",
+      "status": "active",
+      "runner_class": "arm64-merge-gate",
+      "builder_image": "pin:.github/builder-image.env",
+      "rust_toolchain": "pinned by rust-toolchain.toml, pre-provisioned in the builder image",
+      "libtorch": {
+        "source": "pip wheel torch==2.10.0 (aarch64 CPU), symlinked to /opt/libtorch in the builder image",
+        "identity": "libtorch 2.10.0+cpu aarch64 wheel (LIBTORCH_BYPASS_VERSION_CHECK=1)"
+      },
+      "accelerator": "none",
+      "cache": {
+        "kind": "s3-sccache+persistent-target",
+        "namespace": null,
+        "note": "S3 sccache via per-run OIDC + persistent CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream (single-writer per host). No explicit S3 key prefix today; adding one cold-starts the merge-gate cache and is deliberately deferred until a measured window (acceleration plan, compile-reuse item)."
+      },
+      "artifacts": [],
+      "staging_artifacts": []
+    }
+  ],
+  "hosted_allowlist": {
+    "appimage.yml": {
+      "build-x86_64": {
+        "target_class": "amd64-release",
+        "reason": "x86_64 AppImage matrix (cpu/cuda128/cuda130/rocm71); gated on AMD64 pool liveness probe + N1.2 pinned amd64 builder image"
+      },
+      "package-universal-x86_64": {
+        "target_class": "amd64-release",
+        "reason": "compiler-free universal packaging; migrates with the x86 matrix legs"
+      },
+      "release": {
+        "target_class": "amd64-release",
+        "reason": "tagged-release publish (contents:write) — keep isolated from untrusted PR code per N1.1 when migrating"
+      }
+    },
+    "archlinux.yml": {
+      "pkgbuild": {
+        "target_class": "amd64-release",
+        "reason": "Arch packaging needs the x86 Arch toolchain; migrate as a pinned container on the amd64 pool"
+      }
+    },
+    "arm-gpu-spike.yml": {
+      "rocm-aarch64-inventory": {
+        "target_class": "amd64-canary",
+        "reason": "arch-neutral upstream wheel inventory probe; lowest-value migration, migrate last"
+      }
+    },
+    "atproto-lexicons.yml": {
+      "verify": {
+        "target_class": "amd64-canary",
+        "reason": "arch-neutral lexicon contract check; pinned container on the amd64 pool"
+      }
+    },
+    "attest-rpc-std-wasm.yml": {
+      "attest-tarball": {
+        "target_class": "amd64-canary",
+        "reason": "arch-neutral cosign/attestation of the wasm tarball"
+      }
+    },
+    "claude-code-review.yml": {
+      "claude-review": {
+        "target_class": "github-hosted",
+        "external_service": true,
+        "reason": "third-party Claude review action; currently if:false. External review automation cannot execute on our fleet and stays on GitHub-hosted runners per the plan's N2.5 allowlist category (kept separate from privileged build credentials)."
+      }
+    },
+    "claude.yml": {
+      "claude": {
+        "target_class": "github-hosted",
+        "external_service": true,
+        "reason": "third-party Claude Code action driven by issue/PR comments; external service that cannot execute on our fleet (N2.5 permanent allowlist category)."
+      }
+    },
+    "docker-build.yml": {
+      "verify-source": {
+        "target_class": "amd64-canary",
+        "reason": "arch-neutral gh-api source validation; pinned container on the amd64 pool"
+      },
+      "build-docker": {
+        "target_class": "amd64-release",
+        "reason": "amd64 docker buildx matrix with registry publish; gated on AMD64 pool liveness + rootless buildx support in the x86 golden AMI"
+      },
+      "publish-cpu-manifest": {
+        "target_class": "amd64-canary",
+        "reason": "arch-neutral buildx imagetools manifest composition"
+      }
+    },
+    "hypr9p-guest.yml": {
+      "hypr9p-guest": {
+        "target_class": "amd64-canary",
+        "reason": "wasm cross-build of the 9P guest; arch-neutral, pinned container"
+      }
+    },
+    "merge-gate-preflight.yml": {
+      "resolve-pr": {
+        "target_class": "amd64-canary",
+        "reason": "pull_request_target controller resolving PR head SHA; arch-neutral, must stay on trusted substrate when migrated"
+      }
+    },
+    "nix.yml": {
+      "flake-check": {
+        "target_class": "amd64-release",
+        "reason": "nix flake evaluation; pinned container on the amd64 pool"
+      }
+    },
+    "publish-rpc-std-wasm.yml": {
+      "build-package-smoke": {
+        "target_class": "amd64-canary",
+        "reason": "wasm/npm package build + smoke; arch-neutral pinned container"
+      },
+      "expose-staging-identity": {
+        "target_class": "amd64-canary",
+        "reason": "identity extraction from staged package artifacts"
+      },
+      "publish-staging": {
+        "target_class": "amd64-release",
+        "reason": "npm publish with credentials; migrate to the isolated publish class, never alongside untrusted PR code"
+      },
+      "publish-production": {
+        "target_class": "amd64-release",
+        "reason": "npm production publish with credentials; isolated publish class"
+      }
+    },
+    "rust.yml": {
+      "deny": {
+        "target_class": "arm64-merge-gate",
+        "reason": "arch-neutral (cargo-deny metadata + python static checks). Migration additionally requires baking cargo-deny into the arm64 builder image (N1.2) — it is not in the image today."
+      },
+      "loopback-burndown": {
+        "target_class": "amd64-canary",
+        "reason": "pure-python static scan; any pinned container"
+      }
+    },
+    "standards.yml": {
+      "validate": {
+        "target_class": "amd64-canary",
+        "reason": "arch-neutral standards artifact validation"
+      }
+    },
+    "ts-codegen-roundtrip.yml": {
+      "ts-roundtrip": {
+        "target_class": "amd64-canary",
+        "reason": "cargo + ts codegen round-trip; needs both toolchains in one pinned container"
+      }
+    },
+    "wanix-guest.yml": {
+      "wanix-guest": {
+        "target_class": "amd64-canary",
+        "reason": "wasm cross-build of the wanix guest; arch-neutral pinned container"
+      }
+    },
+    "workers-wasm-tests.yml": {
+      "workers-wasm": {
+        "target_class": "amd64-canary",
+        "reason": "wasm backend tests; arch-neutral pinned container"
+      }
+    },
+    "workers-wasmtime-tests.yml": {
+      "workers-wasmtime-tests": {
+        "target_class": "amd64-canary",
+        "reason": "native wasmtime host tests; arch-native, any pool"
+      }
+    }
+  }
+}
