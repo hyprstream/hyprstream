@@ -1,0 +1,173 @@
+{
+  "vector_set_version": 1,
+  "profile": "hs-rpc-proof-v1",
+  "status": "frozen by the Gate-2 vote (v16 \u00a719, 2026-08-19); not production-closed",
+  "encoding": "RFC 8949 core deterministic encoding; untagged COSE structures",
+  "external_aad": "zero-length for every Sig_structure in this profile",
+  "verifier_now": 1786000015,
+  "max_clock_skew_secs": 30,
+  "proof_max_remaining_lifetime_secs": {
+    "authenticated": 300,
+    "unattributed": 30
+  },
+  "generator": "docs/standards/v16/tools/gen_proof_vectors.py",
+  "keys": {
+    "warning": "TEST KEYS ONLY. Every key below is derived from a published constant seed and MUST NOT be enrolled or trusted.",
+    "ed25519": [
+      {
+        "role": "authenticated primary signer (classical credential cnf-bound)",
+        "kid_hex": "636c69656e742d656432353531392d31",
+        "kid_ascii": "client-ed25519-1",
+        "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "public_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8"
+      },
+      {
+        "role": "authenticated primary signer (HYBRID credential cnf-bound, V1 distinct Ed25519 component)",
+        "kid_hex": "636c69656e742d656432353531392d68792d31",
+        "kid_ascii": "client-ed25519-hy-1",
+        "seed_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+        "public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664"
+      },
+      {
+        "role": "authenticated primary signer (WORKLOAD credential cnf-bound, A1 workload-1 principal)",
+        "kid_hex": "636c69656e742d656432353531392d776c2d31",
+        "kid_ascii": "client-ed25519-wl-1",
+        "seed_hex": "02030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021",
+        "public_hex": "43cdc023d22d5f9e107d1a0693457d35d1d10eb7d21c721192f56f5de40665d3"
+      },
+      {
+        "role": "approver signer group 2",
+        "kid_hex": "617070726f7665722d656432353531392d31",
+        "kid_ascii": "approver-ed25519-1",
+        "seed_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+        "public_hex": "2543b92ff1095511476adc8369db6ddc933665a11978dda1404ee1066ca9559d"
+      },
+      {
+        "role": "enrolled service response signer",
+        "kid_hex": "736572766963652d656432353531392d31",
+        "kid_ascii": "service-ed25519-1",
+        "seed_hex": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+        "public_hex": "174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd5"
+      },
+      {
+        "role": "second enrolled service response signer (A3 exactly-one negative)",
+        "kid_hex": "736572766963652d656432353531392d32",
+        "kid_ascii": "service-ed25519-2",
+        "seed_hex": "6162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80",
+        "public_hex": "882d0ea3b2864e7a587f3e698cea4459998312e655e05fa5e8b5119d8baac8cd"
+      },
+      {
+        "role": "unattributed self-asserted signer",
+        "kid_hex": "756e617474726962757465642d656432353531392d31",
+        "kid_ascii": "unattributed-ed25519-1",
+        "seed_hex": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+        "public_hex": "cd14b37f956e953194ff7fb73b3d81dcc561d61a7538094b7c3e1a643ee5f3aa"
+      },
+      {
+        "role": "credential issuer (type-confusion vectors N-1/N-2)",
+        "kid_hex": "6973737565722d656432353531392d31",
+        "kid_ascii": "issuer-ed25519-1",
+        "seed_hex": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+        "public_hex": "dde3bccec7f3a66a1115f45d720f4dc135c3ae7c4e22dca38fdb1efd6a495ff8"
+      },
+      {
+        "role": "group-cap signer 1 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d31",
+        "kid_ascii": "cap-signer-1",
+        "seed_hex": "d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeef",
+        "public_hex": "6f0f0eeb3fbff925c66d03e19dce48d5edc9ffee51cd26ae71dd39e56f7fdda2"
+      },
+      {
+        "role": "group-cap signer 2 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d32",
+        "kid_ascii": "cap-signer-2",
+        "seed_hex": "d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0",
+        "public_hex": "b79a5770956e8d5e416f49b671092d075615b1ac6ed0a0507b0c9fb2defb008b"
+      },
+      {
+        "role": "group-cap signer 3 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d33",
+        "kid_ascii": "cap-signer-3",
+        "seed_hex": "d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1",
+        "public_hex": "e22c057fbbcc33e1bedf7729251472cfc4a1d4559336eaaa8079febc96a4e408"
+      },
+      {
+        "role": "group-cap signer 4 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d34",
+        "kid_ascii": "cap-signer-4",
+        "seed_hex": "d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2",
+        "public_hex": "6ad6c5fdc71b3a926c642a1fb1c1bb5c8acb2cf58aaa65772590f3997da9392e"
+      },
+      {
+        "role": "group-cap signer 5 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d35",
+        "kid_ascii": "cap-signer-5",
+        "seed_hex": "d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3",
+        "public_hex": "f97f6f18352e8d0acf5a4bb82ad0732c82f89a042472df8381778752d6695abf"
+      },
+      {
+        "role": "group-cap signer 6 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d36",
+        "kid_ascii": "cap-signer-6",
+        "seed_hex": "d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4",
+        "public_hex": "f27bea00891eaf96b221f60ec25a3ff1b289750ed381ce9d8ce5b2457a758c12"
+      },
+      {
+        "role": "group-cap signer 7 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d37",
+        "kid_ascii": "cap-signer-7",
+        "seed_hex": "d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5",
+        "public_hex": "ae20a678df5f127e5ae657e44c1988845d6c019433e6706d44669c0f63cfd2bc"
+      },
+      {
+        "role": "group-cap signer 8 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d38",
+        "kid_ascii": "cap-signer-8",
+        "seed_hex": "d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6",
+        "public_hex": "eb7f900f4343d1787a15836ff67ac28323f2fa1f2be78da89f40ce8fcb7cced2"
+      },
+      {
+        "role": "group-cap signer 9 (N-6, Q2)",
+        "kid_hex": "6361702d7369676e65722d39",
+        "kid_ascii": "cap-signer-9",
+        "seed_hex": "d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7",
+        "public_hex": "63568e6c2a060e83785cef6af6011da82fb95c20debc3f51cd8ad2aecf2710a7"
+      }
+    ],
+    "ml_dsa_65": [
+      {
+        "role": "authenticated primary signer PQ component",
+        "kid_hex": "636c69656e742d6d6c64736136352d31",
+        "kid_ascii": "client-mldsa65-1",
+        "seed_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+        "public_hex": "01b24276275667002e40e9685a8716a51cbcabb39369f54f24b30982defca3cee3392b8edf5ef650fa3f31df92726d3d2f5f280996bccbd5781bb2cc106794ec4717113c9ff481cb88b5fa46e2118f6fcfe4311a1bf0b78b84af72d25cb22a48ee3c30232f1a42a02b6dd5679b25255954454d1d5c1b1801c8673708e3843ff571113479e19f5a5dd151f88519af06111625dd9eef0ba2d3d967553531f9779af7b58ff3ddcaaed07fccc7b2333dd85daab26dbdef318ab8ab16544ed6d044311959d733ba69af2a0cd051fa21ebd84b4c6e58bf75bc004702582035ec2d7c1950fd4a60c529fa0d3fb3ea7474fc70132017bd7b41e6e6ac27f0543df67cbe092b95426ffee3b78376a8aa539f2661f08a7558e03913ffdd3bcf2656b5058a2a646c44b3ab04e723425297b1e99b4ccf376ca19f3020cf866f47b0cd4ed732ead88f8e101c3a792750d8fdfec9f870077cb4459e4dc4081a1de060e25525ff2594524ad89f96f3a90cf732d800b9b370f24b799466dd13e8b4c01dec26d68011c2c06131eff47cc4a4074a7fdb217e073cda0abbe2700d74aed2349df6d432245f36b68fd40c1903735217b707ea924ea0d239b435cefa88f48711a1b136d447a1c9d9c688c80f3c74ef01076c0d878f05819024641f849f746a295833af6cd9b19058dfcbdcb69d8679513d23b4973025ada05302ed9079be49c6ab56c98baa986e16a1fe319d3bde60b8bdff836d234b8df0c1f462c369cd685333fc4a41e8ecb6db7efde4d29f24fd09ff812d88b6d74743d6d9352bfeba2faa7df435f453cfcab896c57523538e0973c92e1bfd3bc46e8f19b76419a7af326e472b36118cd519c69ce079dec0a9cced5739e835ca555ca557af9b9138787abcf69883e8d8964226af94d4d62ac5adcc0a3ba12735df37ed47a86ae22719b562c1299cdb8b5826a260216e85735563f488eec1bca33e9967457a3b73a497d8d556ce7c5288e938f3bbe3882a20091a9d0fa9c5a595cda2d077c5838a325ca1997ab59fec1527171cdf818843ca0375b289c8fd315cc44bc60e316db6149661351ca93405737e6c044af7f32d1a21498e33ce0059af9dd0f9c40d558cdcae51ee9b6e5c92db26e7e45aa46d2b2e7f24e7bec8d8f4656156403e0412512af352d2a2292440c51dbeeeb1c4000a13ca869782d8953607d432eca2d18735fd735aeed79647bc1374535caffd270d5b8b67ed20f6d328a93e9886fd31cd6436e0d67efa2e957e4f8a1d14d26a805e75bb7c1bf3a724d4936be3264aec6c0abb51eca3c8957282bfebb279279c54582e982f46e2cb8ff5dda4ca122e1b0d43eced94f474673a2837c05db605c3c5f84c4125213df75ef13e443eaf82b05142bdb30c37917e66c136b64132cdb6da1fc685ce1bc974bbd0ed9e719f1522528dd51ce3de5944b241e4a2fa2105d912e4aecf3963dcec2556a555edec4170ee110e438f1bbbdb3449ea3f0a5cb2cb5c6edd2d643b858cd6d90b20ae79b9a45361cc57ec8baf4cfa5ea7633dc27d1d504f43c8a9d543bd8e7e3c27fc31a529d473d03600e906fb9f5979ec73987bc307d210d144cd2ed3fc11a6160f3081b1d4a5372fbb69a39b8e2f4840e9ad623c891c287dbc37718b7e80f45dc7f4f950b9f1c665dd45f12c60c16d36afbca003596615925ee440ad948076d2df86ca1314071918784806acd2e3b2edc67a86a9b0fb56ebcf4316aa68f8ac2065992a3e7ea2e5073dd4f92b76d29c0d66902ab9f4cf1db6f2a9b0b2d94f623692e9894fe190cca815a837a1a5ebd1af08da715014464fee3ccf29b726993b1fc81164779d7b5d79258f2358e91f736457ca57c76ff74b5861aa151d9dc15213855d462807ae55905a163dbc86b6e331438ce0ccd9f11e550d9fa90b89d71825b2f2d6faa7cb2edc673d3909b8d8569d81e02762a4099dcafabe58389e320e0361b9b2616fd8409c0cd298b661a4c21ea3556dc0eb477ca5d56973a27a7a5fe0b0db32dda95fd5a34970daf99475b707921d6e956845299e855f9ec9cd478c0fb4a65ed607410ab58a634fff5ec2257e93ea2f5cff6c47e0a7af533f6041bedc84f3ae0cbd0c1e582e4995edb46a2d3ed09ec74f637fee9d16c13f0637bef721788e9749a338a6228972802b1bf3be89761b082f7b49ec01857802a7372b00a61a006e496e870a89ab5b3b30d4e152a60b233cabc1fbb8c8379dbb3024b3c5e1940e5791d9c74a612985ba9573bfba7aa1a57010f6344b4608d5f19c4af9bb7bc02a7ea78105b89acff45a25675f4a6338cf9729d04e867260fb856c2d7dbc8baed24713c5b58981de94b2f4769d2e2867faf1de0f5764d0af463612430d2f9332eb71a17ba782028b74dc01a0b81481a76750a8348a67b22aa6c5a797d9a44e414708ad7b8ad5072396ee11992b168f656b881a309823c4fbd9167a629cec455508f37b0c43e5ceb08c60d7d357daabdab0cd5cc5dc851661abd91f2f7b4d1769fe52d2af9ba4b783a9f2b21f233a5228e467c0464faf7f32ce50376cf7f05ac9511b81730388c8a265bd848e4c7b81243dd85f447e372ccc87363b95595c6f9f5678ac1f5123033e48eac52ea441fccc4fec3a2db35f569e1962a24462f71ecf02a6d91775cc516bedc18fcc2cc8c5115bf60bd622333c4067b41fcd49aade5ede66c16a33b53a3b27ef74c0e7235dbe4d0a070a6926125a82bf12e01f70e1c544f317b3a10d5aef2362e1ab0f1b"
+      },
+      {
+        "role": "unattributed self-asserted PQ component",
+        "kid_hex": "756e617474726962757465642d6d6c64736136352d31",
+        "kid_ascii": "unattributed-mldsa65-1",
+        "seed_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+        "public_hex": "1963d47ac0e93110e3add0354e0333e31c75de34038909ec8833eb6e2aaa7218aab58084b026df27a1b8e61ae0511bee27f297db8da41925b000a3075cd7efab254df88737876bd27d212ba2b5e3367f26fc0725dd35790ee8e687e708065844e5f05dc4a73b62d8307831baa94b93be39a604889bb04aa1df1eb4865012c2bcd5f4a2eecd604febd3bff6860b72344330271378e50f7216f6eec2340f86abe5fe25ac656ddb645486438816e6eb187d78d92820c8674c5a84d5d4ee0caf6b2b7944a314300c1f9355308ba0334e519c7769cd28e40cb950b5633defe3851831f8fb41a106bad083c99fe7bb5dfa510ed0827bbcbc09ff76e020633a0515ab3d02085a8cd7ab13927c3e1062df70c829288cba4f37ea6d6e0268e837dcf3044bd71f29459bf75a5d217cdaedf15d7e648190df1777d6a1df4ed909dc2e1dabab43251bb70da601d26e43639943608022a7130ad2d8e38c27ecf7d1f42d750db520d43619618640a3f0025bf32256d921902f8a2c2c0a95ef87a6c9a404db57033429a27294de8e10872e5c1ce2cc075cb004f99ca324b4c79c674d4e4cd6740ac309a25928067c1b220325337fb07ef8bd83ffd36ef26da04ce46a8b3adff86e27eabe5644f6b776b3b326d7c42b79bc537aa4966b4404320e0b83dbae445f86ebaf15e3d61bd03f50a8cd6fff4736f153a104b45f68a3169fc7846ca0bb7d88fd63c098af2f85dec46b3e9dd1a6403db0fbd65c24bb45c9e5653739e73768b3dc6e9068b1b5ea2c98c3e751ffce602f1de550f7723feeb1afe59dfcda30f2cfb69665bf9f021b2f079131bacf38bf5a72d7af8466cc7eccafbeae8d0ef0a410b0476ce97b5f8991bab302e4409ec7bbac11d6031f71e6159c8925ab42ad21fd4cfa518c36bc2afe9fa7119781dde42878738ea6f0ef71c9412bed9f65458540f3ea5843642f3b771ca599d823cb0f73d3c139c45003a9635f2c267b0802c459658092ee403bc0a7ed8f75f5f180b82595a5b2ba5d2026f3b172e217359258039546b373a9c13495529e514580bd332d16119cf0755f94577e68dc39de2df2aef153d5170b6f5c6ea684272b3000ff445d1c2bf8f1662401fb8e4284f87bf94d92f96b1591fb9a710efdccebf82c6cbd7d9d3edd9ef5d4ec1f86812f2562dd0cd7f58d676c1189822a2eeb5979c0bc821496c7e95fb06a8e86e30cacaa28a6eebfee239e9e56caeb1aa06cbccd090ce9974266c36a614a75f0ac1e2070a262f574e69efc84c8f303a9d93fd871fee58e8b335a43e99e72294249195f99c84597d201626655a340f7ef8ec4a60002cebf03ca90b6e431cdf78f6486ca779a46edf99b0cf5a300438026683d06ae4898e1bb2fd6a490483a689c3d2b0a7641c24c402ece1892442467c9b503304f756f513c0262bd393a450eb891e8de852a703172a63ea23680bd1b0ba7094f0fad8333c94d02430b9f76850506f9637502dd79acc0873dbd8d01cdceab2c8f9cd15010b630b97487aee6f4b7a25a100274dd2a3898b81d21b79987a949611f9c43b80053803b2c88199250e6cf66bea41b1f576eab45f45bcf56eca61fc0ac134fe06fc640eff4f6a157e1446dac044b0c9d65406f30124a74fd9a0061f56e00ab89afc74590c48d3cddeff22f9841d198af6cc3a39f3d5e051d2925f7eb77b482aa5ba04f5562aa4c96b8ae1fce99bc66588d80b18bea2417a868aba8d80a9079550b075a45b4b5c385f70293570c5dfd3767bcaffc877ffdd369a14af638a6e50b743e3f4dd9dc6e48e1780c7f707e73b20af66f55d52c869aeb91b3eeb326697d824a1a6227af850cf7fbc1e4616785888881001a4012549823b16f32bbddc8233094bc9e6f6859f6e4d32664f8124506417bace8e2147121134b6feb55cb6aa3da66570101fb67585b6c15692e41409cc2509bb67cc7cb26d5083b2d6936fd48482d911dc1f3dce80bed6b85bfdf4b6e91aec4c5a2dc4be9462b2b6edb5101b93471d35af4130b35c0cea4496012263c5c9566508edc08d16e71b1fb314adfc6fc761053cebb4c2c12f4c8b6dcb122f556669ded30b202b122a5438be927eacdfed4638dca3c0be2af6bda54eb7f65e1e0d0738a06d03d4de8039ec97e1cc48c2bf56662105d633b2a7b0a581ffa3b8ed188300e494485f1bc5ee34346f8f06c14ac6b9df8597856372489595cd7e53c186974b0ac7b9da271a5f6e129dfd092fd164e2cf65d872b166a214e0fa09992d2c68da7661fa1314bbc1051cda64b0364a162ec2f02fe0fa4dfef13bc1377ad600f9eab3dbcfae5ef64d4ae279b97ad479b54a7c7f88cf79d7e716fae6fc6340fc1a892d649b9f2dc8385c1801bec6271ec4b6c7682ade203f7e5a795844d4ed31b54c8f350d6d0a77135a6457d0f821b6ff109f6bfa8bcca508b3e6229dc51b8c02b8d708d366c2045a154e3b8bece77832e546e9da6f3ad677fcd4feaac9b1da7bd683d33135fb3659bcee6a222830a1f6754130c78874da256d4407bd43a468e51fabc562b3cfdeea9e7050b151962273311361919ba50dc60f0522b2e438c369ba692da88014e4f2a93e876920e8dec7b79c05fa7e124945401bd374a60a726bf561b01c3f7e5e72c26f4b0cde34819db3eebb50a41709900817efdcba3444d15ecc6a05d83eea453d253bfe58b6be37675aee0ccd7ed73f10101db9b241103b61d18a3cfc420e322dbcd3198f25ee573d2feec26bbe30c5671dd5c0eb4e9"
+      }
+    ],
+    "generation": {
+      "ed25519": "RFC 8032 deterministic signatures over the Sig_structure",
+      "ml_dsa_65": "openssl genpkey -algorithm ML-DSA-65 -pkeyopt hexseed:<seed>; openssl pkeyutl -sign -rawin -pkeyopt deterministic:1"
+    },
+    "fixtures": {
+      "service_domain": "registry.svc.hyprstream.test",
+      "request_id_hex": "3f1c9a04b7d2416e8c05a9137b6e2d80",
+      "challenge_hex": "8ad3011f4c76b25e90c4713f5a26ee08",
+      "iat": 1786000000,
+      "exp": 1786000030,
+      "capnp_schema_id_request": 15335023507516264039,
+      "capnp_schema_id_response": 10500073148751533194,
+      "capnp_request_bytes_hex": "0000000000000000010000001700000001000500000000000000",
+      "capnp_response_bytes_hex": "0000000000000000010000000f000000020003000000000000",
+      "verifier_now": 1786000015,
+      "credential_hash_classical_hex": "21a30adf2150bfb47232d9b87c273b549c17d424b9a359e44458772b3bc5bd23",
+      "credential_hash_hybrid_hex": "75ff6caa1a5db4949af6183730511459287b17ba39d0329a5e55fef14583fb20",
+      "external_aad": "zero-length"
+    }
+  }
+}

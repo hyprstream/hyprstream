@@ -6,9 +6,19 @@ name: Build arm64 rust-builder image
 # rebuilding it per job. sccache-S3 handles the incremental cargo cache on top.
 #
 # The image is built ON a Graviton runner (native arm64 — no qemu) and pushed
-# with both :latest and an immutable content tag (short SHA of the Dockerfile).
+# with release tags by default. Reviewed manual candidates publish only their
+# unique candidate tag; consumers use the resulting immutable manifest digest.
 on:
   workflow_dispatch:
+    inputs:
+      candidate:
+        description: Publish a candidate digest only (no latest tag or pin PR)
+        type: boolean
+        default: true
+      expected_source_sha:
+        description: Exact reviewed 40-hex commit selected by the workflow ref
+        type: string
+        required: true
   push:
     branches: [main, ewindisch/runner-smoke-test]
     paths:
@@ -32,9 +42,20 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify reviewed checkout and publication mode
+        id: dispatch
+        env:
+          CANDIDATE: ${{ inputs.candidate }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+        run: bash .github/scripts/builder-dispatch.sh
 
       - name: Compute immutable tag (hash of all image inputs)
         id: tag
+        env:
+          MODE: ${{ steps.dispatch.outputs.mode }}
         run: |
           # Hash every input that affects image contents so the tag stays
           # content-addressed: the Dockerfile AND rust-toolchain.toml (COPYed in to
@@ -43,29 +64,52 @@ jobs:
           h=$(git hash-object Dockerfile rust-toolchain.toml | sha256sum | cut -c1-12)
           echo "sha=$h" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          if [[ "$MODE" == candidate ]]; then
+            echo "image=$IMAGE:candidate-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=$IMAGE:$(date -u +%Y%m%d)-$h" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Log in to GHCR
-        run: podman login ghcr.io -u "$GITHUB_ACTOR" -p "${{ secrets.GITHUB_TOKEN }}"
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
       - name: Build arm64 builder image
+        env:
+          BUILD_IMAGE: ${{ steps.tag.outputs.image }}
         run: |
           podman build \
             --target builder-cpu-arm64 \
             --build-arg VARIANT=cpu-arm64 \
-            -t "$IMAGE:latest" \
-            -t "$IMAGE:${{ steps.tag.outputs.date }}-${{ steps.tag.outputs.sha }}" \
+            -t "$BUILD_IMAGE" \
             -f Dockerfile \
             .
 
-      - name: Push tags
-        id: push
+      - name: Verify candidate library and native CPU runtime
+        env:
+          BUILD_IMAGE: ${{ steps.tag.outputs.image }}
         run: |
-          # --digestfile captures the pushed manifest digest (content-addressed);
-          # both tags point at the same image, so either yields the same digest.
-          podman push --digestfile /tmp/img.digest \
-            "$IMAGE:${{ steps.tag.outputs.date }}-${{ steps.tag.outputs.sha }}"
-          podman push "$IMAGE:latest"
-          echo "digest=$(cat /tmp/img.digest)" >> "$GITHUB_OUTPUT"
+          podman run --rm -v "$PWD":/build:ro,Z -w /build "$BUILD_IMAGE" \
+            bash .github/scripts/verify-libtorch.sh /opt/libtorch --cpu-runtime
+
+      - name: Push validated image
+        id: push
+        env:
+          BUILD_IMAGE: ${{ steps.tag.outputs.image }}
+          MODE: ${{ steps.dispatch.outputs.mode }}
+        run: |
+          digest_file="$RUNNER_TEMP/builder-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.digest"
+          podman push --digestfile "$digest_file" "$BUILD_IMAGE"
+          digest=$(cat "$digest_file")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          if [[ "$MODE" == release ]]; then
+            podman tag "$BUILD_IMAGE" "$IMAGE:latest"
+            podman push "$IMAGE:latest"
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          printf 'Source: `%s`\nImage: `%s@%s`\nMode: `%s`\n' \
+            "$GITHUB_SHA" "$IMAGE" "$digest" "$MODE" >> "$GITHUB_STEP_SUMMARY"
 
       # -------------------------------------------------------------------------
       # Auto-bump the canonical builder-image pin. Every consumer loads this
@@ -87,6 +131,7 @@ jobs:
       # -------------------------------------------------------------------------
       - name: Rewrite the canonical builder-image pin if the digest changed
         id: pin
+        if: steps.dispatch.outputs.mode == 'release'
         run: |
           new="$IMAGE@${{ steps.push.outputs.digest }}"
           cur=$(cat .github/builder-image.env)
@@ -98,6 +143,7 @@ jobs:
 
       - name: Check for the bump PAT
         id: bot
+        if: steps.dispatch.outputs.mode == 'release'
         env:
           BOT: ${{ secrets.BUILDER_IMAGE_BUMP_TOKEN }}
         run: |
@@ -109,7 +155,7 @@ jobs:
           fi
 
       - name: Open digest-bump PR
-        if: steps.pin.outputs.changed == 'true' && steps.bot.outputs.present == 'true'
+        if: steps.dispatch.outputs.mode == 'release' && steps.pin.outputs.changed == 'true' && steps.bot.outputs.present == 'true'
         # Pinned to a full commit SHA (not a mutable tag): this step runs with a
         # write-capable PAT, so an upstream tag move must not silently change what
         # executes here.

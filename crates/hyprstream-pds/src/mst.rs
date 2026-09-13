@@ -38,6 +38,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{ensure, Result};
 
+use crate::atproto_cbor::AtprotoRecordKey;
 use crate::cid::Cid;
 use crate::dag_cbor::DagCbor;
 use crate::tid::Tid;
@@ -46,6 +47,10 @@ use crate::tid::Tid;
 /// `ai.hyprstream.model/3zztslq4be52u`. The MST orders by these UTF-8 bytes.
 fn record_key(collection: &str, rkey: Tid) -> String {
     format!("{collection}/{rkey}")
+}
+
+fn public_record_key(collection: &str, rkey: &AtprotoRecordKey) -> String {
+    format!("{collection}/{}", rkey.as_str())
 }
 
 /// Compute the MST level (height) of a record key: the number of trailing zero
@@ -71,6 +76,26 @@ fn key_level(key: &str) -> u32 {
         }
     }
     zeros.min(31)
+}
+
+/// Compute the protocol MST layer for a public AT Protocol record key.
+///
+/// AT Protocol derives layers from the number of leading zero bits in the
+/// SHA-256 key hash, using two leading bits per layer. This is deliberately
+/// separate from the native tree's trailing-zero convention.
+fn atproto_key_level(key: &str) -> u32 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    let mut leading = 0u32;
+    for &byte in digest.iter() {
+        if byte == 0 {
+            leading += 8;
+        } else {
+            leading += byte.leading_zeros();
+            break;
+        }
+    }
+    (leading / 2).min(31)
 }
 
 // (key_level is private; tests that need it live in this module and see it directly.)
@@ -110,6 +135,49 @@ impl NodeData {
 
     pub fn cid(&self) -> Cid {
         Cid::from_dag_cbor(&self.encode())
+    }
+
+    /// Public AT Protocol serialization. The existing native format remains
+    /// the default for already-signed artifacts.
+    pub fn encode_atproto(&self) -> Result<Vec<u8>> {
+        crate::atproto_cbor::encode(&self.to_value())
+    }
+
+    pub fn cid_atproto(&self) -> Result<Cid> {
+        Ok(Cid::from_dag_cbor(&self.encode_atproto()?))
+    }
+
+    pub fn from_atproto_dag_cbor(bytes: &[u8]) -> Result<Self> {
+        let value = crate::atproto_cbor::decode(bytes)?;
+        // Keep the wire bytes tied to the value used for projection.  The
+        // public decoder is canonical today; retaining this explicit check
+        // prevents a future normalizer change from silently changing the MST
+        // node bytes and therefore its CID.
+        ensure!(
+            crate::atproto_cbor::encode(&value)? == bytes,
+            "ATProto MST bytes are not canonical"
+        );
+        Self::reject_unknown_fields(&value, &["l", "e"], "MST node")?;
+        if let Some(entries) = value.get("e") {
+            for entry in entries.as_list()? {
+                Self::reject_unknown_fields(entry, &["p", "k", "v", "t"], "MST entry")?;
+            }
+        }
+        Self::from_value(&value)
+    }
+
+    /// Public DAG-CBOR nodes are a frozen wire shape.  Dropping an unknown
+    /// field would produce a different canonical encoding and therefore a
+    /// different CID, so reject it before projecting into [`NodeData`].
+    fn reject_unknown_fields(value: &DagCbor, allowed: &[&str], what: &str) -> Result<()> {
+        for (key, _) in value.as_map()? {
+            let key = match key {
+                DagCbor::Text(key) => key.as_str(),
+                _ => return Err(anyhow::anyhow!("{what} has a non-text field key")),
+            };
+            ensure!(allowed.contains(&key), "{what} has unknown field {key:?}");
+        }
+        Ok(())
     }
 
     pub fn to_value(&self) -> DagCbor {
@@ -245,14 +313,28 @@ impl Node {
     /// A directory walker enumerates a collection's records by filtering
     /// entries whose key starts with `"<collection>/"`.
     pub fn from_keyed_records(records: &BTreeMap<String, Cid>) -> Self {
+        Self::from_keyed_records_with_level(records, key_level)
+    }
+
+    /// Build an MST using the public AT Protocol layer function. The native
+    /// [`Self::from_keyed_records`] constructor remains unchanged for native
+    /// artifacts; callers producing public roots should use this constructor.
+    pub fn from_keyed_records_atproto(records: &BTreeMap<String, Cid>) -> Self {
+        Self::from_keyed_records_with_level(records, atproto_key_level)
+    }
+
+    fn from_keyed_records_with_level(
+        records: &BTreeMap<String, Cid>,
+        level_fn: fn(&str) -> u32,
+    ) -> Self {
         let keys: Vec<(String, Cid)> = records.iter().map(|(k, v)| (k.clone(), *v)).collect();
         if keys.is_empty() {
             return Node::empty();
         }
         // The root level is the maximum key level (so every key is at or below
         // the root). Building top-down from here keeps subtrees well-formed.
-        let max_level = keys.iter().map(|(k, _)| key_level(k)).max().unwrap_or(0);
-        Self::build_subtree(max_level, &keys)
+        let max_level = keys.iter().map(|(k, _)| level_fn(k)).max().unwrap_or(0);
+        Self::build_subtree(max_level, &keys, level_fn)
     }
 
     /// Recursively build a subtree at `level` from the given sorted
@@ -262,7 +344,7 @@ impl Node {
     /// - Keys with `key_level == level` become direct entries of this node.
     /// - Runs of keys with `key_level < level` become left (`l`) / right (`t`)
     ///   subtrees, each built at `level - 1`.
-    fn build_subtree(level: u32, keys: &[(String, Cid)]) -> Self {
+    fn build_subtree(level: u32, keys: &[(String, Cid)], level_fn: fn(&str) -> u32) -> Self {
         let mut node = Node {
             level,
             l: None,
@@ -281,13 +363,13 @@ impl Node {
         let mut have_anchor = false;
         let mut low_start: usize = 0;
         for (i, (k, _)) in keys.iter().enumerate() {
-            if key_level(k) == level {
+            if level_fn(k) == level {
                 // Flush the low-level run [low_start, i) as a subtree.
                 let run = &keys[low_start..i];
                 let subtree = if run.is_empty() {
                     None
                 } else {
-                    Some(Box::new(Self::build_subtree(level - 1, run)))
+                    Some(Box::new(Self::build_subtree(level - 1, run, level_fn)))
                 };
                 if !have_anchor {
                     node.l = subtree; // leading run → leftmost subtree
@@ -309,7 +391,7 @@ impl Node {
         // Trailing low-level run after the last anchor → that anchor's right subtree.
         let trailing = &keys[low_start..];
         if !trailing.is_empty() {
-            let subtree = Some(Box::new(Self::build_subtree(level - 1, trailing)));
+            let subtree = Some(Box::new(Self::build_subtree(level - 1, trailing, level_fn)));
             if let Some(last) = node.entries.last_mut() {
                 last.right = subtree;
             } else {
@@ -372,6 +454,125 @@ impl Node {
     pub fn all_blocks(&self) -> Vec<(Cid, NodeData)> {
         let (_data, blocks) = self.to_node_data_with_blocks();
         blocks
+    }
+
+    /// Serialize this tree with public AT Protocol node ordering and CIDs.
+    pub fn to_node_data_with_blocks_atproto(&self) -> Result<(NodeData, Vec<(Cid, NodeData)>)> {
+        // A native Node may have been built with the native layer function.
+        // Rebuild from its complete key set before public serialization so the
+        // resulting topology follows the AT Protocol layer rule.
+        let mut records = BTreeMap::new();
+        self.collect_keyed_records(&mut records);
+        Self::from_keyed_records_atproto(&records).to_node_data_with_blocks_atproto_current()
+    }
+
+    fn to_node_data_with_blocks_atproto_current(&self) -> Result<(NodeData, Vec<(Cid, NodeData)>)> {
+        let mut blocks = Vec::new();
+        let data = self.to_node_data_atproto_rec(&mut blocks)?;
+        let cid = data.cid_atproto()?;
+        blocks.push((cid, data.clone()));
+        Ok((data, blocks))
+    }
+
+    fn collect_keyed_records(&self, records: &mut BTreeMap<String, Cid>) {
+        if let Some(left) = &self.l {
+            left.collect_keyed_records(records);
+        }
+        for entry in &self.entries {
+            records.insert(entry.key.clone(), entry.value);
+            if let Some(right) = &entry.right {
+                right.collect_keyed_records(records);
+            }
+        }
+    }
+
+    fn to_node_data_atproto_rec(&self, blocks: &mut Vec<(Cid, NodeData)>) -> Result<NodeData> {
+        let l = self
+            .l
+            .as_ref()
+            .map(|child| -> Result<Cid> {
+                let child_data = child.to_node_data_atproto_rec(blocks)?;
+                let cid = child_data.cid_atproto()?;
+                blocks.push((cid, child_data));
+                Ok(cid)
+            })
+            .transpose()?;
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for (idx, entry) in self.entries.iter().enumerate() {
+            let p = shared_prefix_len(
+                self.entries
+                    .get(idx.wrapping_sub(1))
+                    .map(|e| e.key.as_str()),
+                &entry.key,
+            );
+            let k = entry.key.as_bytes()[p..].to_vec();
+            let t = entry
+                .right
+                .as_ref()
+                .map(|child| -> Result<Cid> {
+                    let child_data = child.to_node_data_atproto_rec(blocks)?;
+                    let cid = child_data.cid_atproto()?;
+                    blocks.push((cid, child_data));
+                    Ok(cid)
+                })
+                .transpose()?;
+            entries.push(TreeEntry {
+                p,
+                k,
+                v: entry.value,
+                t,
+            });
+        }
+        Ok(NodeData { l, e: entries })
+    }
+
+    /// Build an inclusion proof whose node CIDs use public AT serialization.
+    pub fn proof_atproto<K>(&self, collection: &str, rkey: K) -> Option<Proof>
+    where
+        K: Into<AtprotoRecordKey>,
+    {
+        let rkey: AtprotoRecordKey = rkey.into();
+        let target = public_record_key(collection, &rkey);
+        let mut records = BTreeMap::new();
+        self.collect_keyed_records(&mut records);
+        let tree = Self::from_keyed_records_atproto(&records);
+        let mut path = Vec::new();
+        tree.proof_rec_atproto(&target, &mut path).ok()?;
+        Some(Proof { path })
+    }
+
+    fn proof_rec_atproto(&self, target: &str, path: &mut Vec<ProofStep>) -> Result<()> {
+        let node_data = self.to_node_data_atproto_rec(&mut Vec::new())?;
+        if let Some(left) = &self.l {
+            let below_first = self
+                .entries
+                .first()
+                .map(|e| target < e.key.as_str())
+                .unwrap_or(true);
+            if below_first {
+                path.push(ProofStep::LeftSubtree(node_data));
+                return left.proof_rec_atproto(target, path);
+            }
+        }
+        for (i, entry) in self.entries.iter().enumerate() {
+            if entry.key == target {
+                path.push(ProofStep::FoundAt(node_data, i));
+                return Ok(());
+            }
+            let next_key = self.entries.get(i + 1).map(|e| e.key.as_str());
+            let in_range = match next_key {
+                Some(nk) => entry.key.as_str() < target && target < nk,
+                None => entry.key.as_str() < target,
+            };
+            if in_range {
+                if let Some(right) = &entry.right {
+                    path.push(ProofStep::ThroughEntry(node_data, i));
+                    return right.proof_rec_atproto(target, path);
+                }
+                return Err(anyhow::anyhow!("target is not present"));
+            }
+        }
+        Err(anyhow::anyhow!("target is not present"))
     }
 
     /// Compute the MST path (inclusion proof) for `rkey`: the chain of
@@ -459,6 +660,18 @@ impl Proof {
     /// (they asked for it), so we don't reconstruct it from prefix-compression —
     /// the value-CID check plus the CID chain is the load-bearing guarantee.
     pub fn verify(&self, root_cid: &Cid, record_cid: &Cid) -> Result<()> {
+        self.verify_with(root_cid, record_cid, |data| Ok(data.cid()))
+    }
+
+    /// Verify an inclusion proof using public AT Protocol node serialization.
+    pub fn verify_atproto(&self, root_cid: &Cid, record_cid: &Cid) -> Result<()> {
+        self.verify_with(root_cid, record_cid, NodeData::cid_atproto)
+    }
+
+    fn verify_with<F>(&self, root_cid: &Cid, record_cid: &Cid, cid_for: F) -> Result<()>
+    where
+        F: Fn(&NodeData) -> Result<Cid>,
+    {
         ensure!(!self.path.is_empty(), "empty MST proof");
         let mut expected_cid: Option<Cid> = None; // CID the *current* node must have
         let mut found_value: Option<Cid> = None;
@@ -470,7 +683,7 @@ impl Proof {
                 ProofStep::LeftSubtree(d) => (d, ProofKind::Left),
             };
             // Recompute this node's CID and verify against the expectation.
-            let node_cid = data.cid();
+            let node_cid = cid_for(data)?;
             if let Some(ref want) = expected_cid {
                 ensure!(
                     node_cid == *want,
@@ -694,7 +907,84 @@ mod tests {
             }
         }
         walk(tree.root_cid(), &block_map, &mut found);
-        assert_eq!(found, keyed, "walked entries must match the input key set exactly");
+        assert_eq!(
+            found, keyed,
+            "walked entries must match the input key set exactly"
+        );
+    }
+
+    #[test]
+    fn public_mst_uses_protocol_layer_function() {
+        let keyed: BTreeMap<String, Cid> = (1..=32)
+            .map(|i| {
+                (
+                    format!("app.bsky.feed.post/{i:013}"),
+                    Cid::from_dag_cbor(format!("record-{i}").as_bytes()),
+                )
+            })
+            .collect();
+        let native = Node::from_keyed_records(&keyed);
+        let public = Node::from_keyed_records_atproto(&keyed);
+        let expected_level = keyed
+            .keys()
+            .map(|key| atproto_key_level(key))
+            .max()
+            .unwrap_or(0);
+        assert_eq!(public.level, expected_level);
+        assert_ne!(native.level, public.level);
+
+        // Public serialization must also rebuild a native tree's topology.
+        let (serialized, _) = native.to_node_data_with_blocks_atproto().unwrap();
+        let (expected, _) = public.to_node_data_with_blocks_atproto_current().unwrap();
+        assert_eq!(serialized, expected);
+    }
+
+    #[test]
+    fn public_mst_rejects_unknown_node_fields() {
+        let value = DagCbor::str_map([
+            ("e", DagCbor::List(Vec::new())),
+            ("l", DagCbor::Null),
+            ("future", DagCbor::Text("must-not-be-dropped".to_owned())),
+        ]);
+        let bytes = crate::atproto_cbor::encode(&value).expect("encode public node");
+        let error = NodeData::from_atproto_dag_cbor(&bytes).expect_err("unknown node field");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn public_mst_rejects_unknown_entry_fields() {
+        let cid = Cid::from_dag_cbor(b"record");
+        let value = DagCbor::str_map([
+            ("l", DagCbor::Null),
+            (
+                "e",
+                DagCbor::List(vec![DagCbor::str_map([
+                    ("p", DagCbor::Unsigned(0)),
+                    ("k", DagCbor::Bytes(b"app.bsky.feed.post/1".to_vec())),
+                    ("v", DagCbor::Link(cid)),
+                    ("t", DagCbor::Null),
+                    ("future", DagCbor::Bool(true)),
+                ])]),
+            ),
+        ]);
+        let bytes = crate::atproto_cbor::encode(&value).expect("encode public node");
+        let error = NodeData::from_atproto_dag_cbor(&bytes).expect_err("unknown entry field");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn public_mst_preserves_canonical_bytes_on_decode() {
+        let value = DagCbor::str_map([
+            ("l", DagCbor::Null),
+            ("e", DagCbor::List(Vec::new())),
+        ]);
+        let bytes = crate::atproto_cbor::encode(&value).expect("encode public node");
+        let node = NodeData::from_atproto_dag_cbor(&bytes).expect("decode public node");
+        assert_eq!(
+            crate::atproto_cbor::encode(&node.to_value()).expect("re-encode public node"),
+            bytes,
+            "public MST decode must preserve canonical bytes and CID"
+        );
     }
 
     #[test]

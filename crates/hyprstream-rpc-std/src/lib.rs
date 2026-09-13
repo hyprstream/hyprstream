@@ -4,7 +4,7 @@
 //! generated client types for all standard hyprstream services (model,
 //! registry, inference, policy, mcp, etc.).
 //!
-//! MIT licensed. Depends only on hyprstream-rpc (also MIT).
+//! Apache-2.0 licensed. Depends only on hyprstream-rpc (also Apache-2.0).
 //! Compiles to native and wasm32.
 
 #![allow(dead_code, unused_imports)]

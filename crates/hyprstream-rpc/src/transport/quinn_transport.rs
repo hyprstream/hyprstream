@@ -358,14 +358,23 @@ impl QuinnRpcServer {
     /// through a clone of the relevant handles while [`QuinnRpcServer::run`]
     /// owns `self`. See the `quinn_shutdown_drains_in_flight` test.
     pub async fn shutdown(stream_limit: &Arc<Semaphore>, capacity: u32, token: &CancellationToken) {
+        Self::shutdown_until(stream_limit, capacity, token,
+            tokio::time::Instant::now() + super::rpc_session::DRAIN_TIMEOUT).await;
+    }
+
+    /// Drain against the owner's shared deadline, without starting a new grace.
+    pub async fn shutdown_until(
+        stream_limit: &Arc<Semaphore>, capacity: u32, token: &CancellationToken,
+        deadline: tokio::time::Instant,
+    ) {
         // Stop accepting new streams (level-triggered).
         token.cancel();
         // Wait for all in-flight streams to release their permits, but bound
         // the wait (#159): a wedged processor/transport must not hang shutdown
         // forever. On timeout we close() and proceed — remaining tasks are torn
         // down when the connection drops.
-        match tokio::time::timeout(
-            super::rpc_session::DRAIN_TIMEOUT,
+        match tokio::time::timeout_at(
+            deadline,
             stream_limit.acquire_many(capacity),
         )
         .await
@@ -532,6 +541,7 @@ impl QuinnRpcServer {
                             );
                             if !moq_authz
                                 .authorize_without_track_hook(&moq_peer)
+                                .await
                                 .is_allowed()
                             {
                                 tracing::warn!(

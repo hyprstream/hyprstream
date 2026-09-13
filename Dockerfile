@@ -246,6 +246,13 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 #   - git-lfs: git2db's LFS worktree tests shell out to the git-lfs binary.
 #   - cargo-nextest: pinned + SHA-256 verified (never get.nexte.st/latest — a
 #     mutable fetch that would otherwise run in an AWS-credentialed container).
+#   - cargo-deny: pinned to an EmbarkStudios release tarball with a RECORDED
+#     SHA-256 (the upstream .sha256 sidecar verified against the download at
+#     pin time; the digest is baked here, never fetched at build time). The
+#     musl build runs on the bookworm glibc base. Prereq for migrating the
+#     arch-neutral rust.yml `deny` job onto this self-hosted builder image
+#     (native CI plan, evidence blocker B3) — the migrated job must install
+#     nothing ad hoc, matching this image's no-runtime-fetch rule.
 ARG NEXTEST_VERSION=0.9.140
 ARG NEXTEST_SHA256=8b3f4d4560b6b0f83774fecc6be07e47716dbad0eb0bb6c3890f478f4affe4b6
 RUN apt-get update && apt-get install -y --no-install-recommends git-lfs \
@@ -256,6 +263,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends git-lfs \
     && tar zxf /tmp/nextest.tar.gz -C /root/.cargo/bin \
     && rm -f /tmp/nextest.tar.gz \
     && cargo-nextest --version && git-lfs --version
+
+# cargo-deny from the pinned upstream release (see the tooling note above).
+# The recorded digest is the real integrity gate; the trailing version
+# assertion makes the baked tool's identity deterministic — comparing the
+# first two tokens survives a build-id/commit suffix while still pinning the
+# exact version, and a mismatch fails the image build rather than shipping a
+# wrong tool silently.
+ARG CARGO_DENY_VERSION=0.20.2
+ARG CARGO_DENY_SHA256=995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d
+RUN curl -fsSL -o /tmp/cargo-deny.tar.gz \
+        "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
+    && echo "${CARGO_DENY_SHA256}  /tmp/cargo-deny.tar.gz" | sha256sum -c - \
+    && tar zxf /tmp/cargo-deny.tar.gz -C /root/.cargo/bin --strip-components=1 \
+        "cargo-deny-${CARGO_DENY_VERSION}-aarch64-unknown-linux-musl/cargo-deny" \
+    && rm -f /tmp/cargo-deny.tar.gz \
+    && test "$(cargo-deny --version | awk '{print $1, $2}')" = "cargo-deny ${CARGO_DENY_VERSION}"
 
 # Pre-provision the repo's pinned Rust toolchain (channel + components + targets)
 # from rust-toolchain.toml so the merge gate does NOT rustup-download it at
@@ -316,6 +339,8 @@ WORKDIR /build
 COPY Cargo.toml ./
 COPY Cargo.lock ./
 COPY crates ./crates
+# Compile-time include_str! inputs for the pinned AT Protocol schema validator.
+COPY lexicons/upstream/atproto ./lexicons/upstream/atproto
 
 ENV LIBTORCH=/opt/libtorch
 ENV LD_LIBRARY_PATH=/opt/libtorch/lib

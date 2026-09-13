@@ -24,7 +24,7 @@ pub struct CorsConfig {
     /// explicitly in Bearer/DPoP headers, never in ambient browser credentials.
     /// Operators may still configure an exact origin list; pairing that list
     /// with `allow_credentials = true` preserves the legacy deployment posture.
-    #[serde(default = "default_cors_origins")]
+    #[serde(default = "default_cors_origins", deserialize_with = "deserialize_cors_origins")]
     pub allowed_origins: Vec<String>,
 
     /// Allow ambient browser credentials (cookies or HTTP authentication).
@@ -57,6 +57,25 @@ fn default_cors_enabled() -> bool {
 }
 fn default_cors_origins() -> Vec<String> {
     vec!["*".to_owned()]
+}
+
+fn deserialize_cors_origins<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Environment list parsing preserves separator whitespace. Normalize only
+    // origin entries so the middleware can still perform exact membership
+    // checks, and drop entries that are empty after trimming — matching the
+    // legacy `HYPRSTREAM_CORS_ORIGINS` parser. An empty, whitespace-only, or
+    // separators-only value then yields an empty vector, restoring the
+    // middleware's existing fallback instead of admitting nothing.
+    Vec::<String>::deserialize(deserializer).map(|origins| {
+        origins
+            .into_iter()
+            .map(|origin| origin.trim().to_owned())
+            .filter(|origin| !origin.is_empty())
+            .collect()
+    })
 }
 fn default_cors_credentials() -> bool {
     false
@@ -625,7 +644,18 @@ mod tests {
     #[test]
     fn mtls_client_verifier_is_not_wired() {
         let src = read_src("server/tls.rs");
-        for needle in ["client_auth", "ClientCert", "client_ca"] {
+        assert_no_mtls_verifier(&src);
+    }
+
+    fn assert_no_mtls_verifier(src: &str) {
+        // rustls requires an explicit choice here. Disabling client auth is
+        // not an mTLS implementation; allow only that exact identifier.
+        let src = src
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|identifier| *identifier != "with_no_client_auth")
+            .collect::<Vec<_>>()
+            .join(" ");
+        for needle in ["client_auth", "client_cert", "ClientCert", "client_ca"] {
             assert!(
                 !src.contains(needle),
                 "server/tls.rs now references `{needle}`: mTLS client-cert verification is being \
@@ -633,5 +663,22 @@ mod tests {
                  authz model or remove the reference.",
             );
         }
+    }
+
+    #[test]
+    fn mtls_guard_allows_explicit_no_client_auth() {
+        assert_no_mtls_verifier("builder.with_no_client_auth().with_cert_resolver(resolver)");
+    }
+
+    #[test]
+    #[should_panic(expected = "mTLS client-cert verification")]
+    fn mtls_guard_rejects_client_verifier() {
+        assert_no_mtls_verifier("builder.with_client_cert_verifier(verifier)");
+    }
+
+    #[test]
+    #[should_panic(expected = "mTLS client-cert verification")]
+    fn mtls_guard_rejects_client_auth_even_alongside_no_auth() {
+        assert_no_mtls_verifier("builder.with_no_client_auth(); builder.with_client_auth_cert(cert)");
     }
 }

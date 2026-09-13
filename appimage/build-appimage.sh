@@ -6,6 +6,7 @@
 #
 # Commands:
 #   build [VARIANT]      Build and package AppImage (default: all variants + universal)
+#   package-universal    Package universal AppImage from staged backend outputs
 #   clean [VARIANT]      Clean libtorch cache and build artifacts
 #   help                 Show this help message
 #
@@ -19,16 +20,24 @@
 #   ./build-appimage.sh build                    # Build all variants + universal
 #   ./build-appimage.sh build cpu --version 1.0  # Build only CPU variant
 #   ./build-appimage.sh build universal          # Build all variants into universal AppImage
+#   ./build-appimage.sh package-universal        # Package from prior stage commands
 #   ./build-appimage.sh clean                    # Clean everything
 #   ./build-appimage.sh clean cuda128            # Clean only CUDA 12.8 libtorch
 #
 # Environment:
 #   LIBTORCH_CACHE_DIR   Directory to cache libtorch downloads (default: ./libtorch-cache)
+#   CARGO_TARGET_DIR     Honored: the built binary is copied from Cargo's
+#                        resolved target directory (see lib.sh cargo_target_dir),
+#                        never a hard-coded target/release.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Shared packaging helpers (target resolution, ELF arch verification,
+# checksums, phase timing). Sourced from the script's own directory.
+source "$SCRIPT_DIR/lib.sh"
 
 # Configuration
 VERSION="${VERSION:-dev}"
@@ -119,29 +128,48 @@ download_libtorch() {
     local variant="$1"
     # The aarch64 PyTorch wheel is already installed by the arm64 builder image.
     # It supplies both headers and shared libraries at HYPRSTREAM_LIBTORCH_DIR.
-    [[ -n "${HYPRSTREAM_LIBTORCH_DIR:-}" ]] && return 0
+    if [[ -n "${HYPRSTREAM_LIBTORCH_DIR:-}" ]]; then
+        require_libtorch_version "$HYPRSTREAM_LIBTORCH_DIR" "$LIBTORCH_VERSION"
+        return
+    fi
     local url="${LIBTORCH_URLS[$variant]}"
     local cache_file="$LIBTORCH_CACHE_DIR/libtorch-${LIBTORCH_VERSION}-${variant}.zip"
-    local extract_dir="$LIBTORCH_CACHE_DIR/$variant"
-
+    local extract_dir="$LIBTORCH_CACHE_DIR/$LIBTORCH_VERSION-$variant"
     mkdir -p "$LIBTORCH_CACHE_DIR"
 
-    if [[ ! -f "$cache_file" ]]; then
-        log_info "Downloading libtorch for $variant..."
-        curl -sSL -o "$cache_file" "$url"
+    if [[ -d "$extract_dir" ]]; then
+        [[ -f "$extract_dir/.complete" ]] || {
+            log_error "Incomplete libtorch cache: $extract_dir"
+            return 1
+        }
+        require_libtorch_version "$extract_dir/libtorch" "$LIBTORCH_VERSION"
+        return
     fi
-
-    if [[ ! -d "$extract_dir/libtorch" ]]; then
-        log_info "Extracting libtorch for $variant..."
-        mkdir -p "$extract_dir"
-        unzip -q "$cache_file" -d "$extract_dir"
-    fi
+    # Publish only a fully extracted, version-checked tree. Failure leaves no
+    # apparently reusable directory. Old variant-only caches remain untouched.
+    (
+        local scratch
+        scratch=$(mktemp -d "$LIBTORCH_CACHE_DIR/.libtorch-$LIBTORCH_VERSION-$variant.XXXXXX")
+        trap 'rm -rf "$scratch"' EXIT
+        if [[ ! -f "$cache_file" ]]; then
+            log_info "Downloading libtorch for $variant..."
+            curl -fSL -o "$scratch/archive.zip" "$url" || exit 1
+            mv "$scratch/archive.zip" "$cache_file"
+        fi
+        unzip -q "$cache_file" -d "$scratch/tree" || exit 1
+        require_libtorch_version "$scratch/tree/libtorch" "$LIBTORCH_VERSION" || exit 1
+        touch "$scratch/tree/.complete"
+        # -T refuses to nest the tree if another invocation populated the cache.
+        mv -T "$scratch/tree" "$extract_dir"
+    )
 }
 
 # Build hyprstream binary for a variant
 build_binary() {
     local variant="$1"
-    local libtorch_dir="${HYPRSTREAM_LIBTORCH_DIR:-$LIBTORCH_CACHE_DIR/$variant/libtorch}"
+    local libtorch_dir
+    libtorch_dir="$(libtorch_variant_dir "$variant")"
+    require_libtorch_version "$libtorch_dir" "$LIBTORCH_VERSION" || return 1
 
     log_info "Building hyprstream for $variant..."
 
@@ -154,8 +182,22 @@ build_binary() {
 
     (cd "$PROJECT_ROOT" && cargo build --release --features otel)
 
-    cp "$PROJECT_ROOT/target/release/hyprstream" "$BUILD_DIR/bin/hyprstream-$variant"
-    log_success "Built hyprstream-$variant"
+    # Copy from Cargo's RESOLVED target directory, never a hard-coded
+    # target/release: BuildQ and CI cache mounts set CARGO_TARGET_DIR, and a
+    # default-path copy would fail or package a stale binary. Fail closed on
+    # a missing or foreign-architecture output before it reaches an AppImage.
+    local target_dir binary
+    target_dir="$(cargo_target_dir)" || {
+        log_error "Could not resolve Cargo's target directory"
+        exit 1
+    }
+    binary="$target_dir/release/hyprstream"
+    require_elf_arch "$binary" "$APPIMAGE_ARCH" || {
+        log_error "Built binary at $binary is missing or not an ${APPIMAGE_ARCH} ELF"
+        exit 1
+    }
+    cp "$binary" "$BUILD_DIR/bin/hyprstream-$variant"
+    log_success "Built hyprstream-$variant (from $binary)"
 }
 
 # Strip host symbol tables from bundled libtorch shared objects.
@@ -181,7 +223,9 @@ create_appimage() {
     local variant="$1"
     local appdir="$BUILD_DIR/hyprstream-$variant.AppDir"
     local output="$OUTPUT_DIR/hyprstream-${VERSION}-${variant}-${APPIMAGE_ARCH}.AppImage"
-    local libtorch_dir="${HYPRSTREAM_LIBTORCH_DIR:-$LIBTORCH_CACHE_DIR/$variant/libtorch}"
+    local libtorch_dir
+    libtorch_dir="$(libtorch_variant_dir "$variant")"
+    require_libtorch_version "$libtorch_dir" "$LIBTORCH_VERSION" || return 1
 
     log_info "Creating AppImage for $variant..."
 
@@ -207,9 +251,10 @@ create_appimage() {
 
 # Create universal AppImage with all backends
 create_universal_appimage() {
+    local staged_only="${1:-0}"
     local appdir="$BUILD_DIR/hyprstream-universal.AppDir"
     local output="$OUTPUT_DIR/hyprstream-${VERSION}-${APPIMAGE_ARCH}.AppImage"
-    local staging="$BUILD_DIR/universal-staging"
+    local staging="$BUILD_DIR/universal-staging/$LIBTORCH_VERSION"
 
     log_info "Creating universal AppImage..."
 
@@ -219,13 +264,19 @@ create_universal_appimage() {
     for variant in "${ALL_VARIANTS[@]}"; do
         # Use staged files if available (from stage command), otherwise use build dirs
         if [[ -f "$staging/bin/hyprstream-$variant" ]]; then
+            require_libtorch_version "$staging/lib/$variant/libtorch" "$LIBTORCH_VERSION" || return 1
             cp "$staging/bin/hyprstream-$variant" "$appdir/usr/bin/"
             mkdir -p "$appdir/usr/lib/$variant/libtorch/lib"
             cp -r "$staging/lib/$variant/libtorch/lib/"* "$appdir/usr/lib/$variant/libtorch/lib/"
+        elif [[ "$staged_only" == "1" ]]; then
+            log_error "Staged backend output is missing for $variant"
+            return 1
         else
             cp "$BUILD_DIR/bin/hyprstream-$variant" "$appdir/usr/bin/"
             mkdir -p "$appdir/usr/lib/$variant/libtorch/lib"
-            local libtorch_dir="${HYPRSTREAM_LIBTORCH_DIR:-$LIBTORCH_CACHE_DIR/$variant/libtorch}"
+            local libtorch_dir
+            libtorch_dir="$(libtorch_variant_dir "$variant")"
+            require_libtorch_version "$libtorch_dir" "$LIBTORCH_VERSION" || return 1
             cp -r "$libtorch_dir/lib/"* "$appdir/usr/lib/$variant/libtorch/lib/"
         fi
     done
@@ -242,10 +293,29 @@ create_universal_appimage() {
     log_success "Created: $output"
 }
 
+# Package a universal AppImage without compiling or downloading anything. The
+# per-backend workflow steps call stage before clean, so this command consumes
+# only outputs from this run and fails closed when one is absent.
+cmd_package_universal() {
+    validate_variant universal
+    local phase_start
+    phase_start="$(ci_phase_begin)"
+    log_info "Packaging universal AppImage from staged backend outputs"
+    ensure_appimagetool
+    create_universal_appimage 1
+    log_success "Universal package complete"
+    ls -lh "$OUTPUT_DIR/hyprstream-${VERSION}-${APPIMAGE_ARCH}.AppImage"
+    write_artifact_checksums "$OUTPUT_DIR"
+    ci_phase_end "package-universal" "$phase_start"
+}
+
 # Command: build
 cmd_build() {
     local variant="${1:-all}"
     validate_variant "$variant"
+
+    local phase_start
+    phase_start="$(ci_phase_begin)"
 
     log_info "Building hyprstream AppImage"
     log_info "Version: $VERSION"
@@ -277,6 +347,8 @@ cmd_build() {
 
     log_success "Build complete!"
     ls -lh "$OUTPUT_DIR"/*.AppImage 2>/dev/null || true
+    write_artifact_checksums "$OUTPUT_DIR"
+    ci_phase_end "build $variant" "$phase_start"
 }
 
 # Command: stage - copy files needed for universal AppImage before cleaning
@@ -288,7 +360,7 @@ cmd_stage() {
     fi
     validate_variant "$variant"
 
-    local staging="$BUILD_DIR/universal-staging"
+    local staging="$BUILD_DIR/universal-staging/$LIBTORCH_VERSION"
     log_info "Staging $variant for universal AppImage..."
 
     # Stage binary
@@ -297,7 +369,13 @@ cmd_stage() {
 
     # Stage entire lib directory (includes subdirs with Tensile libraries for ROCm)
     mkdir -p "$staging/lib/$variant/libtorch/lib"
-    cp -r "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"* "$staging/lib/$variant/libtorch/lib/"
+    local libtorch_dir version_header
+    libtorch_dir="$(libtorch_variant_dir "$variant")"
+    require_libtorch_version "$libtorch_dir" "$LIBTORCH_VERSION" || return 1
+    cp -r "$libtorch_dir/lib/"* "$staging/lib/$variant/libtorch/lib/"
+    version_header=$(libtorch_version_header "$libtorch_dir")
+    mkdir -p "$staging/lib/$variant/libtorch/$(dirname "$version_header")"
+    cp "$libtorch_dir/$version_header" "$staging/lib/$variant/libtorch/$version_header"
 
     log_success "Staged $variant"
     du -sh "$staging"
@@ -314,7 +392,7 @@ cmd_clean() {
     else
         validate_variant "$variant"
         log_info "Cleaning $variant..."
-        rm -rf "$LIBTORCH_CACHE_DIR/$variant"
+        rm -rf "$LIBTORCH_CACHE_DIR/$LIBTORCH_VERSION-$variant"
         rm -f "$LIBTORCH_CACHE_DIR/libtorch-${LIBTORCH_VERSION}-${variant}.zip"
         rm -f "$BUILD_DIR/bin/hyprstream-$variant"
         rm -rf "$BUILD_DIR/hyprstream-$variant.AppDir"
@@ -358,6 +436,9 @@ main() {
         stage)
             cmd_stage "$variant"
             ;;
+        package-universal)
+            cmd_package_universal
+            ;;
         clean)
             cmd_clean "$variant"
             ;;
@@ -372,4 +453,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

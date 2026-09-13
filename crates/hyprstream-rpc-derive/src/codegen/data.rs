@@ -1208,15 +1208,24 @@ fn generate_data_field_reader_inner(
                 quote! {
                     #rust_name: {
                         let data = reader.#getter_name()?;
-                        if data.len() != #n_lit {
+                        // A null/empty Cap'n Proto pointer is the wire default
+                        // for an absent fixed-size field. Preserve that as the
+                        // all-zero Rust default so optional higher-level
+                        // evidence (such as a resolver witness) can fail closed
+                        // at its policy boundary instead of making unrelated
+                        // legacy records undecodable.
+                        if data.is_empty() {
+                            [0u8; #n_lit]
+                        } else if data.len() != #n_lit {
                             anyhow::bail!(
                                 "{}: expected {} bytes, got {}",
                                 #field_name_str, #n_lit, data.len()
                             );
+                        } else {
+                            let mut arr = [0u8; #n_lit];
+                            arr.copy_from_slice(data);
+                            arr
                         }
-                        let mut arr = [0u8; #n_lit];
-                        arr.copy_from_slice(data);
-                        arr
                     },
                 }
             } else {
@@ -1224,13 +1233,16 @@ fn generate_data_field_reader_inner(
                 quote! {
                     #rust_name: {
                         let data = reader.#getter_name()?;
-                        if data.len() != #n_lit {
+                        if data.is_empty() {
+                            Vec::new()
+                        } else if data.len() != #n_lit {
                             anyhow::bail!(
                                 "{}: expected {} bytes, got {}",
                                 #field_name_str, #n_lit, data.len()
                             );
+                        } else {
+                            data.to_vec()
                         }
-                        data.to_vec()
                     },
                 }
             }

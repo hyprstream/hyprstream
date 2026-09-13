@@ -162,6 +162,9 @@ pub struct EnvelopeContext {
     pub(crate) response_kem_recipient: Option<crate::crypto::hybrid_kem::RecipientPublic>,
     pub(crate) service_domain: Option<String>,
 
+    /// v16 proof CWT bytes, if present on the verified envelope.
+    pub(crate) envelope_proof_cwt: Option<Vec<u8>>,
+
     /// Browser-only method commitment independently checked by generated
     /// service dispatch after the sealed transcript is recovered.
     pub(crate) browser_method_discriminator: Option<u16>,
@@ -203,6 +206,7 @@ impl EnvelopeContext {
             request_nonce: envelope.envelope.nonce,
             response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
             service_domain: envelope.envelope.service_domain.clone(),
+            envelope_proof_cwt: envelope.envelope.proof_cwt.clone(),
             browser_method_discriminator: None,
             // AnySigner / networked plane — NOT a local caller (#328).
             is_local_caller: false,
@@ -231,6 +235,7 @@ impl EnvelopeContext {
             request_nonce: envelope.envelope.nonce,
             response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
             service_domain: envelope.envelope.service_domain.clone(),
+            envelope_proof_cwt: envelope.envelope.proof_cwt.clone(),
             browser_method_discriminator: None,
             // FixedSigner mutual-auth plane — genuine in-process / IPC caller (#328).
             is_local_caller: true,
@@ -263,6 +268,7 @@ impl EnvelopeContext {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             // Internal self-call that never crosses a network boundary (#328).
             is_local_caller: true,
@@ -309,6 +315,7 @@ impl EnvelopeContext {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         }
@@ -461,6 +468,7 @@ impl EnvelopeContext {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         }
@@ -475,6 +483,21 @@ impl EnvelopeContext {
     ) -> Self {
         let mut context = Self::for_test_authenticated_subject(subject, signer);
         context.verified_tenant = Some(tenant.into());
+        context
+    }
+
+    /// Build an authenticated, tenant-bound context fixture that also carries
+    /// verified `claims` — for exercising handlers that read `ctx.claims()`
+    /// (e.g. a service credential's `workload_session_id` on renewal).
+    #[cfg(any(test, feature = "test-classical-policy"))]
+    pub fn for_test_authenticated_subject_with_claims(
+        subject: Subject,
+        tenant: impl Into<String>,
+        signer: ed25519_dalek::VerifyingKey,
+        claims: crate::auth::Claims,
+    ) -> Self {
+        let mut context = Self::for_test_authenticated_subject_in_tenant(subject, tenant, signer);
+        context.claims = Some(claims);
         context
     }
 
@@ -706,7 +729,12 @@ pub trait RequestService: 'static {
     /// # Arguments
     ///
     /// * `ctx` - Verified envelope context with identity
-    /// * `payload` - Raw inner request bytes (Cap'n Proto encoded)
+    /// * `body` - The request body decoded exactly once by
+    ///   [`RequestService::decode_request_body`] (v16 §5.2). Generated
+    ///   dispatch reads the typed request from [`DecodedRequestBody::root`]
+    ///   — the same decoded message whose derived leaf fed the generated
+    ///   method policy and the dispatch MAC PEP — never from a second decode
+    ///   of the bytes.
     ///
     /// Returns `(response_bytes, optional_continuation)`:
     /// - `response_bytes`: Cap'n Proto encoded response sent as REP
@@ -717,8 +745,35 @@ pub trait RequestService: 'static {
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &crate::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)>;
+
+    /// Decode the signed request body **exactly once** (bounded) and derive
+    /// the full numeric method leaf path (v16 §5.2 step 4).
+    ///
+    /// The returned [`DecodedRequestBody`] is the one decode for the entire
+    /// request lifetime: its leaf path keys the generated method policy and
+    /// the dispatch MAC PEP, and its decoded message is what
+    /// [`RequestService::handle_request`] dispatches from. The leaf comes
+    /// from the signed body — never from a transport-specific hint such as
+    /// the browser transcript's method commitment, which does not exist on
+    /// other carriers and is not the signed leaf.
+    ///
+    /// This method is **required** — there is deliberately no default. A
+    /// schema-generated service delegates to its generated
+    /// `decode_<service>_request_body` function; a service with no Cap'n
+    /// Proto request schema must affirmatively construct
+    /// [`DecodedRequestBody::opaque`], which denies proof-bearing dispatch at
+    /// leaf derivation instead of silently passing a policy row it never
+    /// resolved.
+    ///
+    /// An unknown discriminant, a malformed body, or a body exceeding the
+    /// reviewed decode caps is an error — the same denial as an unlisted
+    /// leaf, never a coarser fallback.
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> Result<crate::service::DecodedRequestBody>;
 
     /// Service name (for logging and registry).
     fn name(&self) -> &str;
@@ -800,12 +855,17 @@ pub trait RequestService: 'static {
         true
     }
 
-    /// JWT ID blocklist for access token revocation.
+    /// Credential revocation store for access token revocation.
     ///
-    /// When `Some`, `verify_claims()` rejects tokens whose `jti` appears
-    /// in the blocklist. Override to provide a shared blocklist instance.
-    fn jti_blocklist(&self) -> Option<&dyn crate::auth::JtiBlocklist> {
-        None
+    /// Returns the process-global store published at startup: the durable
+    /// authority store in the policy process, or a policy-authority RPC
+    /// client store in every other process (checks cross the RPC bus to the
+    /// policy service, the one canonical revocation authority). When `None`
+    /// (startup not yet complete or authority initialization failed),
+    /// `verify_claims()` rejects tokens with a jti (fail-closed). Override
+    /// only for specialized testing.
+    fn credential_revocation_store(&self) -> Option<&dyn crate::auth::CredentialRevocationStore> {
+        crate::auth::global_credential_revocation_store().map(std::convert::AsRef::as_ref)
     }
 
     /// Fu4/#677: the minimum JWT `alg` policy enforced in `verify_claims`.
@@ -1142,14 +1202,111 @@ pub trait RequestService: 'static {
             _ => anyhow::bail!("unsupported JWT algorithm"),
         };
 
-        // Check jti against blocklist (revoked access tokens)
-        if let Some(ref jti) = verified.jti {
-            if let Some(blocklist) = self.jti_blocklist() {
-                if blocklist.is_revoked(jti) {
-                    tracing::warn!(jti = %jti, sub = %verified.sub, "Revoked JWT rejected");
-                    anyhow::bail!("JWT has been revoked");
+        // Credential/session checks. The local-issuer set is resolved first:
+        // the credential profile makes `jti` REQUIRED on locally issued
+        // tokens, and the session registry is a local authority — both
+        // enforcements below apply to local issuers. Federated tokens keep
+        // the revocation check only (their sessions are not local state).
+        let local_issuers = key_source.local_issuers();
+        let local_issuers_refs: Vec<&str> = local_issuers.iter().map(String::as_str).collect();
+        let token_is_local = crate::auth::is_local_iss(&verified.iss, &local_issuers_refs);
+
+        // v16 §3.1/§3.3: issuer-scoped credential and session enforcement
+        // applies only to tokens carrying a real authoritative issuer. An
+        // empty `iss` is the in-process provenance sentinel — accepted solely
+        // from in-process callers (gated above where an empty issuer from a
+        // networked caller is rejected) and never issuer-scoped: a
+        // `CredentialId` requires a non-empty issuer by construction (§3.1), so
+        // an empty-iss token has no revocable credential identity and no
+        // issuer namespace to scope a session to. The `jti` that `jwt::encode`
+        // auto-injects is then an encoding artifact, not a credential —
+        // running it through the issuer-scoped gate would build an invalid
+        // `CredentialId`, fail closed, and reject a legitimate in-process
+        // caller. `is_local_iss` deliberately reports empty-iss as local, so
+        // the credential gate must additionally require a non-empty issuer.
+        let issuer_scoped = !verified.iss.is_empty();
+
+        // A locally issued token with a real issuer must carry a jti:
+        // revocation could never observe it otherwise. Reject rather than
+        // skipping the check. Empty-iss in-process provenance is exempt (no
+        // issuer to scope the credential to).
+        if token_is_local && issuer_scoped && verified.jti.is_none() {
+            tracing::warn!(iss = %verified.iss, sub = %verified.sub, "Rejected local-issuer JWT without jti");
+            anyhow::bail!("local credential missing required jti");
+        }
+
+        // Check credential against the revocation store (revoked access
+        // tokens). Only issuer-scoped tokens (non-empty issuer) have a valid
+        // `CredentialId`; empty-iss in-process provenance carries no revocable
+        // credential identity and is exempt.
+        if let Some(jti) = verified.jti.as_ref().filter(|_| issuer_scoped) {
+            match self.credential_revocation_store() {
+                Some(store) => {
+                    let cred_id = crate::auth::CredentialId::jwt(&verified.iss, jti);
+                    if store.is_revoked(&cred_id).await {
+                        tracing::warn!(jti = %jti, iss = %verified.iss, sub = %verified.sub, "Revoked JWT rejected");
+                        anyhow::bail!("JWT has been revoked");
+                    }
+                }
+                None => {
+                    // Fail-closed: a token carrying a jti cannot be verified
+                    // for revocation without a store. Reject rather than
+                    // admitting a potentially-revoked credential.
+                    tracing::warn!(jti = %jti, sub = %verified.sub, "Token with jti rejected: no revocation store configured");
+                    anyhow::bail!("revocation store unavailable");
                 }
             }
+        }
+
+        // Session check (v16 §3.3): a local token carrying a session ID is
+        // rejected when the session is revoked, expired, unknown, or cannot
+        // be checked. Only issuer-scoped local tokens participate — an
+        // empty-iss in-process token has no issuer namespace to scope a
+        // session to (a `SessionKey` requires a non-empty issuer).
+        if token_is_local && issuer_scoped {
+            // Exact-one session parsing (v16 §3.3): both-present or empty
+            // session identifiers are malformed and reject here, before any
+            // authorization or cache insertion.
+            let session_key = match verified.session_key() {
+                Ok(key) => key,
+                Err(e) => {
+                    tracing::warn!(iss = %verified.iss, sub = %verified.sub, error = %e, "Rejected JWT with malformed session claims");
+                    anyhow::bail!("malformed session claims");
+                }
+            };
+            if let Some(session_key) = session_key {
+                match crate::auth::global_session_registry() {
+                    Some(registry) => {
+                        if registry.is_revoked(&session_key).await {
+                            tracing::warn!(iss = %verified.iss, sub = %verified.sub, "JWT with revoked/unknown session rejected");
+                            anyhow::bail!("session has been revoked");
+                        }
+                    }
+                    None => {
+                        tracing::warn!(sub = %verified.sub, "Token with session id rejected: no session registry configured");
+                        anyhow::bail!("session registry unavailable");
+                    }
+                }
+            }
+        }
+
+        // RFC 9068 §2.2.1 (v16 credential profile): an issuer-scoped `at+jwt`
+        // credential MUST carry a non-empty `client_id`. Positively typed on
+        // the already-exact-validated JOSE `typ` (parsed once above): a
+        // `wit+jwt` service credential is exempt (it carries no client_id), and
+        // empty-iss in-process provenance is exempt (`issuer_scoped` is false).
+        // This covers EVERY accepted `at+jwt` — local AND trusted
+        // federated/delegated — not merely local ones; `token_is_local` is
+        // deliberately NOT part of the predicate.
+        if issuer_scoped
+            && crate::auth::is_rfc9068_access_token_type(&protected.typ)
+            && verified
+                .client_id
+                .as_deref()
+                .is_none_or(|c| c.trim().is_empty())
+        {
+            tracing::warn!(iss = %verified.iss, sub = %verified.sub, typ = %protected.typ, "Rejected at+jwt without client_id");
+            anyhow::bail!("at+jwt credential missing required client_id");
         }
 
         // Store verified claims on context for downstream use
@@ -1159,8 +1316,6 @@ pub trait RequestService: 'static {
                 "{UNAUTHENTICATED_DID_SENTINEL} is credential absence and cannot authenticate"
             );
         }
-        let local_issuers = key_source.local_issuers();
-        let local_issuers_refs: Vec<&str> = local_issuers.iter().map(String::as_str).collect();
         // Fu5/#677: MAC clearance is authority-asserted and honored only from
         // local-issuer tokens. An external OIDC issuer trusted for identity is
         // not trusted to assert MAC clearance on this node — strip the claim
@@ -1292,6 +1447,8 @@ pub trait RequestService: 'static {
 ///
 /// QUIC server configuration for the service loop.
 pub struct QuicLoopConfig {
+    /// Cancels all announcements owned by this bound service before teardown.
+    pub announcement_cancellation: tokio_util::sync::CancellationToken,
     /// DER-encoded certificate chain (leaf first, then intermediates/CA)
     pub cert_chain: Vec<Vec<u8>>,
     /// DER-encoded private key — zeroed on drop.
@@ -1313,12 +1470,17 @@ pub struct QuicLoopConfig {
     /// Set `false` (via `[quic] iroh = false`) to run quinn-only (legacy).
     #[cfg(not(target_arch = "wasm32"))]
     pub iroh_enabled: bool,
+    /// Iroh is a startup/readiness requirement for native traffic. Quinn may
+    /// still serve the browser edge but cannot satisfy this native contract.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub iroh_required: bool,
     /// #282: callback invoked after the iroh substrate binds, with
     /// (service_name, node_id) where `node_id` is the endpoint's 32-byte Ed25519
     /// public carrier address. Used to advertise only an `IrohTransport` service
     /// entry when bound; it must never become a verification method.
     #[cfg(not(target_arch = "wasm32"))]
-    pub on_iroh_bound: Option<Box<dyn FnOnce(String, [u8; 32]) + Send>>,
+    pub on_iroh_bound:
+        Option<Box<dyn FnOnce(String, [u8; 32]) -> anyhow::Result<()> + Send>>,
     /// #358: the producer-chosen moq RELAY this node rendezvouses through, in
     /// wire-reach form ([`crate::stream_info::TransportConfig`]). When set, the
     /// spawner places it in the service's `ProducerReachConfig` (so published
@@ -1332,6 +1494,28 @@ pub struct QuicLoopConfig {
     /// drift. `None` = direct-only (the S1/S2 behaviour). Native-only.
     #[cfg(not(target_arch = "wasm32"))]
     pub moq_relay: Option<crate::stream_info::TransportConfig>,
+    /// Resolver-verified accepted-state witness for `moq_relay`. Iroh relay
+    /// links require this distinct remote identity for mutual admission.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_relay_server_identity: Option<crate::stream_info::MoqlServerIdentity>,
+    /// #1027: optional inside-carrier admission authenticator for the iroh
+    /// `moql` accept path. When set, every accepted `moql` connection must
+    /// prove an accepted current Ed25519 + ML-DSA-65 identity (fresh
+    /// challenge/response binding epoch/head/nonces) before the moq handshake;
+    /// the admitted peer is served only its resolved tenant's scope. When
+    /// `None`, the pre-#1027 posture stands: anonymous carriers are refused.
+    /// Native-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_admission:
+        Option<Arc<crate::transport::moql_admission::MoqlAdmissionAuthenticator>>,
+    /// Optional service-owned ingress authorization. The spawner forwards it
+    /// unchanged to the Iroh MoQL handler; absence is deliberately read-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_ingress_authorizer:
+        Option<crate::transport::iroh_moq::SharedIngressAuthorizer>,
+    /// Native client proof for authenticated Iroh `moql` dials in this process.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_admission_proof: Option<crate::transport::moql_admission::MoqlAdmissionProof>,
 }
 
 /// Handle for a running service
@@ -1467,9 +1651,16 @@ mod empty_iss_gate_tests {
         async fn handle_request(
             &self,
             _ctx: &EnvelopeContext,
-            _payload: &[u8],
+            _body: &crate::service::DecodedRequestBody,
         ) -> Result<(Vec<u8>, Option<Continuation>)> {
             Ok((vec![], None))
+        }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> Result<crate::service::DecodedRequestBody> {
+            // Byte-oriented mock: no Cap'n Proto schema, no derivable leaf.
+            Ok(crate::service::DecodedRequestBody::opaque(signed_body.to_vec()))
         }
         fn name(&self) -> &str {
             "mock"
@@ -1482,6 +1673,17 @@ mod empty_iss_gate_tests {
         }
         fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn crate::auth::JwtKeySource>> {
             Some(self.key_source.clone())
+        }
+        fn credential_revocation_store(&self) -> Option<&dyn crate::auth::CredentialRevocationStore> {
+            // Test-local revocation store: these tests verify local
+            // jti-bearing tokens, and every production process publishes a
+            // store at startup (the policy-authority bootstrap). Without
+            // this, verification fails closed on store absence and the tests
+            // only pass when an unrelated sibling test happens to publish
+            // the process-global handle first.
+            static STORE: std::sync::OnceLock<crate::auth::InMemoryCredentialRevocationStore> =
+                std::sync::OnceLock::new();
+            Some(STORE.get_or_init(crate::auth::InMemoryCredentialRevocationStore::new))
         }
         fn require_cnf_binding(&self) -> bool {
             false
@@ -1528,12 +1730,27 @@ mod empty_iss_gate_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller,
         }
     }
 
+    /// `verify_claims` fails closed on jti-bearing, issuer-bearing tokens
+    /// without the process-global revocation store (`jwt::encode`
+    /// auto-assigns a jti). Install an in-memory authority when no other test
+    /// in this binary got there first — under nextest per-test process
+    /// isolation no other test can provide it.
+    fn ensure_test_revocation_store() {
+        if crate::auth::global_credential_revocation_store().is_none() {
+            let _ = crate::auth::set_global_credential_revocation_store(std::sync::Arc::new(
+                crate::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+    }
+
     fn mock_service() -> (MockService, SigningKey) {
+        ensure_test_revocation_store();
         // The CA key signs the bare-sub (empty-iss) token; the ClusterKeySource
         // anchors that same CA key with an empty local issuer URL (so empty iss
         // is "local").
@@ -1749,6 +1966,7 @@ mod empty_iss_gate_tests {
 
     #[tokio::test]
     async fn federated_issuer_cannot_assert_local_tenant() {
+        ensure_test_revocation_store();
         let local_ca = SigningKey::from_bytes(&[9u8; 32]);
         let federated_signer = SigningKey::from_bytes(&[10u8; 32]);
         let local_issuer = "https://this.node";
@@ -1772,7 +1990,8 @@ mod empty_iss_gate_tests {
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
             .with_issuer(federated_issuer.to_owned())
-            .with_tenant("acme".to_owned());
+            .with_tenant("acme".to_owned())
+            .with_client_id("hyprstream-oauth-client-1");
         let token = crate::auth::jwt::encode(&claims, &federated_signer);
         let mut ctx = ctx_with_token(token, /* is_local_caller */ false);
 
@@ -1791,6 +2010,7 @@ mod empty_iss_gate_tests {
 
     #[tokio::test]
     async fn local_issuer_preserves_verified_tenant() {
+        ensure_test_revocation_store();
         let local_ca = SigningKey::from_bytes(&[11u8; 32]);
         let local_issuer = "https://this.node";
         let key_source = std::sync::Arc::new(ClusterKeySource::new(
@@ -1808,7 +2028,8 @@ mod empty_iss_gate_tests {
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
             .with_issuer(local_issuer.to_owned())
-            .with_tenant("acme".to_owned());
+            .with_tenant("acme".to_owned())
+            .with_client_id("hyprstream-oauth-client-1");
         let token = crate::auth::jwt::encode(&claims, &local_ca);
         let mut ctx = ctx_with_token(token, /* is_local_caller */ false);
 
@@ -1819,6 +2040,142 @@ mod empty_iss_gate_tests {
         assert_eq!(ctx.subject().name(), Some("alice"));
         assert_eq!(ctx.verified_tenant(), Some("acme"));
         assert_eq!(ctx.domain().expect("local tenant domain"), "acme");
+    }
+
+    /// RFC 9068 §2.2.1 (v16 credential profile) at the signed verify boundary:
+    /// an issuer-scoped `at+jwt` credential MUST carry a non-empty `client_id`.
+    /// A missing or empty `client_id` is rejected; a `wit+jwt` service
+    /// credential is positively exempt (it carries no client_id). The
+    /// federated/nonlocal `at+jwt` path is covered by the sibling
+    /// `federated_at_jwt_missing_client_id_is_rejected`.
+    #[tokio::test]
+    async fn local_at_jwt_requires_client_id_and_wit_jwt_is_exempt() {
+        let local_ca = SigningKey::from_bytes(&[11u8; 32]);
+        let local_issuer = "https://this.node";
+        let key_source = std::sync::Arc::new(ClusterKeySource::new(
+            local_ca.verifying_key(),
+            local_issuer.to_owned(),
+        ));
+        let svc = MockService {
+            signing_key: local_ca.clone(),
+            transport: TransportConfig::inproc("mock"),
+            key_source,
+            policy: crate::crypto::CryptoPolicy::Classical,
+            relay: None,
+            cached_subjects: std::sync::Arc::default(),
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        // Local at+jwt WITHOUT client_id → rejected.
+        let missing = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(local_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        let err = svc
+            .verify_claims(&mut ctx_with_token(
+                crate::auth::jwt::encode(&missing, &local_ca),
+                false,
+            ))
+            .await
+            .expect_err("local at+jwt without client_id must be rejected");
+        assert!(
+            err.to_string().contains("client_id"),
+            "unexpected error for missing client_id: {err}"
+        );
+
+        // Local at+jwt with EMPTY client_id → rejected (set directly, bypassing
+        // the empty-filtering builder).
+        let mut empty = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(local_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        empty.client_id = Some(String::new());
+        let err = svc
+            .verify_claims(&mut ctx_with_token(
+                crate::auth::jwt::encode(&empty, &local_ca),
+                false,
+            ))
+            .await
+            .expect_err("local at+jwt with empty client_id must be rejected");
+        assert!(
+            err.to_string().contains("client_id"),
+            "unexpected error for empty client_id: {err}"
+        );
+
+        // A local `wit+jwt` service credential WITHOUT client_id is positively
+        // exempt — it is ADMITTED (not merely un-rejected-for-client_id). The
+        // MockService provides a test-local revocation store, so the
+        // jti-bearing service token verifies.
+        let service = Claims::new("service:model".to_owned(), now, now + 3600)
+            .with_issuer(local_issuer.to_owned())
+            .with_jti();
+        let mut wit_ctx = ctx_with_token(
+            crate::auth::jwt::encode_service_jwt(&service, &local_ca),
+            false,
+        );
+        svc.verify_claims(&mut wit_ctx)
+            .await
+            .expect("local wit+jwt without client_id must be admitted (type-driven exemption)");
+        assert_eq!(wit_ctx.subject().name(), Some("service:model"));
+    }
+
+    /// A trusted federated (nonlocal) `at+jwt` without `client_id` is rejected —
+    /// the requirement is positively typed on `at+jwt` and applies regardless of
+    /// issuer locality.
+    #[tokio::test]
+    async fn federated_at_jwt_missing_or_empty_client_id_is_rejected() {
+        let local_ca = SigningKey::from_bytes(&[9u8; 32]);
+        let federated_signer = SigningKey::from_bytes(&[10u8; 32]);
+        let local_issuer = "https://this.node";
+        let federated_issuer = "https://idp.example.com";
+        let federation = std::sync::Arc::new(MockFederation {
+            issuer: federated_issuer.to_owned(),
+            verifying_key: federated_signer.verifying_key(),
+        });
+        let key_source = std::sync::Arc::new(FederatedKeySource::new(
+            ClusterKeySource::new(local_ca.verifying_key(), local_issuer.to_owned()),
+            federation,
+        ));
+        let svc = MockService {
+            signing_key: local_ca,
+            transport: TransportConfig::inproc("mock"),
+            key_source,
+            policy: crate::crypto::CryptoPolicy::Classical,
+            relay: None,
+            cached_subjects: std::sync::Arc::default(),
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        // Missing client_id → rejected.
+        let missing = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(federated_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        let err = svc
+            .verify_claims(&mut ctx_with_token(
+                crate::auth::jwt::encode(&missing, &federated_signer),
+                false,
+            ))
+            .await
+            .expect_err("federated at+jwt without client_id must be rejected");
+        assert!(
+            err.to_string().contains("client_id"),
+            "unexpected error for federated missing client_id: {err}"
+        );
+
+        // Empty/whitespace client_id → rejected.
+        let mut empty = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(federated_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        empty.client_id = Some("   ".to_owned());
+        let err = svc
+            .verify_claims(&mut ctx_with_token(
+                crate::auth::jwt::encode(&empty, &federated_signer),
+                false,
+            ))
+            .await
+            .expect_err("federated at+jwt with empty client_id must be rejected");
+        assert!(
+            err.to_string().contains("client_id"),
+            "unexpected error for federated empty client_id: {err}"
+        );
     }
 
     fn composite_token(
@@ -1901,8 +2258,13 @@ mod empty_iss_gate_tests {
             cached_subjects: std::sync::Arc::default(),
         };
         let now = chrono::Utc::now().timestamp();
-        let claims =
-            Claims::new("alice".to_owned(), now, now + 60).with_issuer("https://local".to_owned());
+        // Local-issuer credentials must carry a credential ID (jti is a
+        // REQUIRED profile claim); the hand-rolled composite helper does not
+        // inject one, so set it explicitly.
+        let claims = Claims::new("alice".to_owned(), now, now + 60)
+            .with_issuer("https://local".to_owned())
+            .with_jti()
+            .with_client_id("hyprstream-oauth-client-1");
         for typ in crate::auth::RFC9068_ACCESS_TOKEN_TYPES {
             let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"{typ}","kid":"{kid_a}"}}"#);
             let valid = composite_token(&header, &claims, &pq_a, &ed_a, false);
@@ -1916,6 +2278,25 @@ mod empty_iss_gate_tests {
 
         let valid_header =
             format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{kid_a}"}}"#);
+
+        // Exact-one session parsing (v16 §3.3) at the PRIMARY verify boundary: a
+        // local credential carrying BOTH `sid` and `workload_session_id` is
+        // ambiguous and rejected before any authorization — an active OIDC sid
+        // must never mask a revoked/unknown workload session.
+        let both_sessions = Claims::new("alice".to_owned(), now, now + 60)
+            .with_issuer("https://local".to_owned())
+            .with_jti()
+            .with_sid("s1")
+            .with_workload_session_id("w1");
+        let ambiguous_token = composite_token(&valid_header, &both_sessions, &pq_a, &ed_a, false);
+        let ambiguous_err = svc
+            .verify_claims(&mut ctx_with_token(ambiguous_token, false))
+            .await
+            .expect_err("a credential carrying both sid and workload_session_id must be rejected");
+        assert!(
+            ambiguous_err.to_string().contains("malformed session claims"),
+            "unexpected error for ambiguous session claims: {ambiguous_err}"
+        );
 
         let mutations = [
             (
@@ -2088,9 +2469,15 @@ mod ipc_key_identity_tests {
         async fn handle_request(
             &self,
             _ctx: &EnvelopeContext,
-            _payload: &[u8],
+            _body: &crate::service::DecodedRequestBody,
         ) -> Result<(Vec<u8>, Option<Continuation>)> {
             Ok((vec![], None))
+        }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> Result<crate::service::DecodedRequestBody> {
+            Ok(crate::service::DecodedRequestBody::opaque(signed_body.to_vec()))
         }
         fn name(&self) -> &str {
             "discovery"
@@ -2139,6 +2526,7 @@ mod ipc_key_identity_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             // AnySigner / networked-or-UDS plane.
             is_local_caller: false,
@@ -2441,6 +2829,7 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: true,
         }
@@ -2499,6 +2888,7 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         };
@@ -2567,6 +2957,7 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         }

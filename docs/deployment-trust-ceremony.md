@@ -226,7 +226,10 @@ with it the ability to mint registry credentials until the delegation expires. T
 unattended operation, and it is why the delegation is scoped to the registry service and given a
 short life rather than being a second root. It is *not* a path to the root authority — the root
 bundle is sealed to a disjoint recipient set that this identity cannot open, and it never touches a
-deployed host.
+deployed host. Where the delegation also carries the service-key-enrollment capability, compromise
+additionally yields the ability to attest this host's discovery/policy hybrid keys under the same
+expiry — a key binding, not an authorization: it cannot mint service JWTs, rotate the authority, or
+enroll registry/CA keys, and it seeds only the compromised host's own bootstrap trust store.
 
 Two consequences worth planning for: keep the delegation TTL short enough that a compromise window
 you would tolerate is the same window you actually have, and treat rotating the delegated signer —

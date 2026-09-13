@@ -2,7 +2,9 @@ name: Build Docker Images
 
 on:
   # Merge-queue candidates pass the Rust gate before GitHub lands their exact
-  # SHA on main. Publish that landed SHA directly; Rust intentionally has no
+  # SHA on main. An administrator queue landing can instead be followed by an
+  # operator-requested, exact-SHA `workflow_dispatch` Rust validation. Publish
+  # only after either full-validation path succeeds; Rust intentionally has no
   # duplicate push-to-main run (#1331).
   push:
     branches: [ "main" ]
@@ -26,7 +28,7 @@ jobs:
       actions: read
       contents: read
     steps:
-    - name: Verify protected-main Rust gate
+    - name: Verify exact-main Rust validation
       if: github.ref == 'refs/heads/main'
       env:
         EXPECTED_SHA: ${{ github.sha }}
@@ -36,7 +38,7 @@ jobs:
         set -euo pipefail
         runs="$(
           gh api \
-            "repos/${REPOSITORY}/actions/runs?head_sha=${EXPECTED_SHA}&event=merge_group&per_page=100"
+            "repos/${REPOSITORY}/actions/runs?head_sha=${EXPECTED_SHA}&per_page=100"
         )"
         matches="$(
           jq \
@@ -46,7 +48,7 @@ jobs:
               select(
                 .name == "Rust" and
                 .path == ".github/workflows/rust.yml" and
-                .event == "merge_group" and
+                (.event == "merge_group" or .event == "workflow_dispatch") and
                 .head_sha == $sha and
                 .conclusion == "success"
               )
@@ -54,7 +56,7 @@ jobs:
             <<< "$runs"
         )"
         if [ "$matches" -lt 1 ]; then
-          echo "::error::refusing to publish ${EXPECTED_SHA}: no successful Rust merge-group gate found"
+          echo "::error::refusing to publish ${EXPECTED_SHA}: no successful exact-SHA Rust validation found"
           exit 1
         fi
 
@@ -66,24 +68,55 @@ jobs:
       packages: write
       attestations: write
       id-token: write
+    # Decouple the flavor legs from each other's consumers: the only
+    # downstream job, publish-cpu-manifest, composes the CPU index from the
+    # cpu leg's sha-<rev>-cpu-amd64 staging tag (plus build-docker-arm64's
+    # -cpu-arm64 tag); needs is per-JOB, not per-leg, so without this a
+    # failed cuda/rocm leg fails the whole build-docker job and SKIPS the
+    # CPU manifest publish (run 33420411621: transient ghcr.io 429 on rocm71
+    # killed an otherwise-good CPU publish). The cuda*/rocm71 flavors are
+    # single-arch amd64 and push their own final tags (latest-cuda128,
+    # semver, ...) directly from their build-push step, so each flavor's
+    # publish path is already self-contained within its leg and nothing
+    # downstream consumes them. Let a non-cpu leg fail without failing the
+    # matrix job. The cpu leg stays critical: if IT fails, build-docker
+    # still fails and publish-cpu-manifest is skipped rather than composing
+    # a partial/stale index. A failed non-cpu leg remains visible as a red
+    # leg in the run, but the run conclusion is green — on release tags,
+    # check the leg list for a missing flavor before announcing.
+    continue-on-error: ${{ matrix.variant != 'cpu' }}
 
     strategy:
       fail-fast: false
       matrix:
         variant: [cpu, cuda128, cuda130, rocm71]
         include:
+          # delay_seconds de-synchronizes the four legs' registry cache-import
+          # bursts. All legs start simultaneously behind one NAT IP, and each
+          # mode=max cache-from import fires hundreds of blob GETs at ghcr.io
+          # at once; ghcr answers with 429 Too Many Requests (runs
+          # 33420411621, 33429089855: rocm71/cuda128 died in "Build and push
+          # Docker image" on "httpReadSeeker: failed open ... 429"). A small
+          # deterministic per-variant offset keeps the t=0 import bursts from
+          # colliding. It does NOT help a leg that trips the limiter later in
+          # its build (one failure was ~26 min in) — that residual risk is
+          # accepted; #1567 already contains the blast radius of a failed leg.
           - variant: cpu
             tag_suffix: cpu
             docker_variant: cpu
+            delay_seconds: 0
           - variant: cuda128
             tag_suffix: cuda128
             docker_variant: cuda128
+            delay_seconds: 30
           - variant: cuda130
             tag_suffix: cuda130
             docker_variant: cuda130
+            delay_seconds: 60
           - variant: rocm71
             tag_suffix: rocm71
             docker_variant: rocm71
+            delay_seconds: 90
 
     steps:
     - name: Clean up disk space before build
@@ -137,6 +170,15 @@ jobs:
           type=semver,pattern={{version}},suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' }}
           type=semver,pattern={{major}}.{{minor}},suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' }}
 
+    - name: Stagger registry cache-import start
+      # Sleep the per-variant offset (see matrix include above) so the four
+      # legs don't open their ghcr.io blob-GET bursts at the same instant.
+      # Runs BEFORE the build step (not earlier) so the offset lands right at
+      # the cache-from import and isn't eaten by step-startup jitter.
+      run: |
+        echo "delaying ${{ matrix.variant }} leg by ${{ matrix.delay_seconds }}s to stagger ghcr.io cache import"
+        sleep "${{ matrix.delay_seconds }}"
+
     - name: Build and push Docker image
       uses: docker/build-push-action@v6
       with:
@@ -148,10 +190,14 @@ jobs:
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
         platforms: linux/amd64
-        # Registry cache: no 10GB limit, persists across branches, faster than GHA cache
+        # Registry cache: no 10GB limit, persists across branches, faster than
+        # GHA cache. cache-from intentionally lists ONLY the per-variant ref:
+        # the former buildcache-base importer was never pushed by any job
+        # (git log -S confirms it was cache-from-only since its introduction),
+        # so every leg wasted ghcr.io requests probing a dead ref — extra
+        # pressure against the 429 rate limiter for zero benefit.
         cache-from: |
           type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.variant }}
-          type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-base
         cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.variant }},mode=max
 
     - name: Generate SBOM
@@ -277,6 +323,8 @@ jobs:
         TAGS: ${{ steps.meta.outputs.tags }}
       run: |
         set -euo pipefail
+        revision=$(git rev-parse HEAD)
+        test "$revision" = "$GITHUB_SHA"
         mkdir -p "$PODMAN_ROOT" "$PODMAN_RUNROOT"
         # Turn the newline-separated tag list into repeated `-t` args.
         tag_args=()
@@ -294,9 +342,16 @@ jobs:
         podman --root "$PODMAN_ROOT" --runroot "$PODMAN_RUNROOT" build \
           --target runtime \
           --build-arg VARIANT=cpu-arm64 \
+          --label "org.opencontainers.image.revision=$revision" \
           "${tag_args[@]}" \
           -f Dockerfile \
           .
+        # Staging pins the arm64 child digest only after checking this label.
+        # Refuse publication if the built image does not identify our source.
+        built_revision=$(podman --root "$PODMAN_ROOT" --runroot "$PODMAN_RUNROOT" \
+          image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+          "${tag_args[1]}")
+        test "$built_revision" = "$revision"
 
     - name: Push image tags
       if: github.event_name != 'pull_request'
