@@ -1,15 +1,20 @@
-//! Browser WIT bootstrap endpoint.
+//! Browser WIT bootstrap endpoint — DISABLED for v16 (frozen A).
 //!
-//! `POST /oauth/wit` — exchanges a PKCE-issued `at+jwt` for a `wit+jwt`
-//! that binds the browser's vault (or ephemeral) Ed25519 pubkey via `cnf.jwk`.
+//! `POST /oauth/wit` formerly minted a HYBRID `wit+jwt` (a SERVICE credential
+//! type) for a USER subject, bound to a caller-SUBMITTED (untrusted) Ed25519
+//! public key, with no RFC 9068 `client_id`, no authoritative interactive /
+//! non-interactive session classification, and no authoritative Primary
+//! signer-suite enrollment.
 //!
-//! The browser can then use the WIT in ZMQ envelope calls, giving the same
-//! key-bound identity story as service workloads. ExchangeWit becomes
-//! available after the browser holds a WIT.
-//!
-//! Auth: `Authorization: Bearer <at+jwt>` (verified by `require_bearer_token`).
-//! Body: `application/json` — `{ "pubkey": "<base64url Ed25519 pubkey>" }`.
-//! Response: `{ "wit": "<wit+jwt>", "expires_in": <seconds> }`.
+//! Frozen A requires a hybrid credential to be an `at+jwt` (never a service
+//! `wit+jwt`) and a user credential to carry a non-empty `client_id` + an active
+//! session; §5/T1 forbids a self-asserted wire key as the confirmation. The
+//! `AuthenticatedUser` request extension exposes only identity/token/exp, so
+//! this route cannot authoritatively recover any of those and cannot mint a
+//! v16-conformant credential. It is therefore **disabled fail-closed** — a
+//! browser access token is issued through the typed OAuth issuance profiles
+//! that carry those authorities. (Git history holds the removed mint; it is not
+//! retained here as unreachable code.)
 
 use std::sync::Arc;
 
@@ -19,122 +24,37 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use hyprstream_pds::repo_authority::is_path_form_did_web;
 use serde::Deserialize;
 
 use crate::server::middleware::AuthenticatedUser;
 use super::state::OAuthState;
 
-/// Browser WIT TTL: 8 hours. Shorter than service WITs (30 days).
-const BROWSER_WIT_TTL: i64 = 8 * 3600;
-
 #[derive(Deserialize)]
 pub struct WitRequest {
-    /// Base64url-encoded 32-byte Ed25519 public key to bind in `cnf.jwk`.
+    /// Base64url-encoded Ed25519 public key — retained for wire compatibility of
+    /// the disabled route; no longer trusted, decoded, or used.
     pub pubkey: String,
 }
 
-/// POST /oauth/wit — issue a browser WIT bound to the caller's Ed25519 pubkey.
+/// POST /oauth/wit — DISABLED fail-closed for v16 (see the module docs). Returns
+/// `501 Not Implemented` for every request, before any credential is minted.
 pub async fn issue_browser_wit(
     State(state): State<Arc<OAuthState>>,
     Extension(user): Extension<AuthenticatedUser>,
     Json(body): Json<WitRequest>,
 ) -> Response {
-    if is_path_form_did_web(&user.user) {
-        return (
-            StatusCode::BAD_REQUEST,
-            [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
-            Json(serde_json::json!({
-                "error": "invalid_grant",
-                "error_description": "path-form did:web account subjects are frozen; host-form account minting is not available yet (#1159)",
-            })),
-        )
-            .into_response();
-    }
-
-    let ca_key_arc = state.active_jwt_signing_key().await;
-    let ca_key = match ca_key_arc.as_deref() {
-        Some(k) => k,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
-                Json(serde_json::json!({
-                    "error": "temporarily_unavailable",
-                    "error_description": "WIT issuance not available — CA signing key not loaded",
-                })),
-            ).into_response();
-        }
-    };
-
-    // Decode and validate the submitted Ed25519 public key.
-    let pubkey_bytes: [u8; 32] = match URL_SAFE_NO_PAD.decode(&body.pubkey)
-        .ok()
-        .and_then(|b| b.try_into().ok())
-    {
-        Some(b) => b,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
-                Json(serde_json::json!({
-                    "error": "invalid_request",
-                    "error_description": "pubkey must be base64url-encoded 32-byte Ed25519 public key",
-                })),
-            ).into_response();
-        }
-    };
-
-    // Validate the key bytes form a valid Ed25519 point.
-    if ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes).is_err() {
-        return (
-            StatusCode::BAD_REQUEST,
-            [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
-            Json(serde_json::json!({
-                "error": "invalid_request",
-                "error_description": "pubkey is not a valid Ed25519 public key",
-            })),
-        ).into_response();
-    }
-
-    let sub = &user.user;
-    let now = chrono::Utc::now().timestamp();
-    let expires_at = now + BROWSER_WIT_TTL;
-
-    let domain = match user.authorization_domain() {
-        Ok(domain) => domain,
-        Err(_) => {
-            return (
-                StatusCode::FORBIDDEN,
-                [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
-                Json(serde_json::json!({
-                    "error": "insufficient_scope",
-                    "error_description": "Verified hosted-account tenant binding required",
-                })),
-            )
-                .into_response();
-        }
-    };
-    let mut claims = hyprstream_rpc::auth::Claims::new(sub.clone(), now, expires_at)
-        .with_issuer(state.issuer_url.clone())
-        .with_cnf_jwk(&pubkey_bytes);
-    if domain != "*" {
-        claims = claims.with_tenant(domain);
-    }
-
-    let wit = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, ca_key);
-
-    tracing::info!(sub = %sub, "Browser WIT issued");
-
+    let _ = (&state, &user, &body);
     (
-        StatusCode::OK,
+        StatusCode::NOT_IMPLEMENTED,
         [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
         Json(serde_json::json!({
-            "wit": wit,
-            "expires_in": BROWSER_WIT_TTL,
+            "error": "unsupported_grant_type",
+            "error_description": "browser WIT bootstrap is disabled: a v16 credential cannot be \
+                minted from an untrusted submitted key without an OAuth client_id, an active \
+                session, and authoritative signer-suite enrollment; use the OAuth token flow",
         })),
-    ).into_response()
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -151,14 +71,16 @@ mod tests {
     fn test_state() -> Arc<OAuthState> {
         let key = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]);
         let dummy = std::path::PathBuf::from("/dev/null/wit-freeze-test.sock");
-        let make_client = || Arc::new(
-            RpcClientImpl::new(
-                LocalSigner::new(key.clone()),
-                LazyUdsTransport::new(dummy.clone()),
-                Some(key.verifying_key()),
+        let make_client = || {
+            Arc::new(
+                RpcClientImpl::new(
+                    LocalSigner::new(key.clone()),
+                    LazyUdsTransport::new(dummy.clone()),
+                    Some(key.verifying_key()),
+                )
+                .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical),
             )
-            .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical),
-        );
+        };
         Arc::new(
             OAuthState::new(
                 &OAuthConfig::default(),
@@ -171,31 +93,14 @@ mod tests {
     }
 
     fn request() -> WitRequest {
-        let public_key = ed25519_dalek::SigningKey::from_bytes(&[0x74; 32]).verifying_key();
-        WitRequest {
-            pubkey: URL_SAFE_NO_PAD.encode(public_key.as_bytes()),
-        }
+        WitRequest { pubkey: String::new() }
     }
 
+    /// The browser WIT bootstrap route is DISABLED fail-closed for v16: it
+    /// returns `501 Not Implemented` with an `unsupported_grant_type` body and
+    /// never mints a credential.
     #[tokio::test]
-    async fn browser_wit_rejects_path_form_authenticated_user_before_signing() {
-        let response = issue_browser_wit(
-            State(test_state()),
-            Extension(AuthenticatedUser {
-                user: "did:web:accounts.example:users:alice".to_owned(),
-                verified_tenant: Some("tenant-a.example".to_owned()),
-                token: None,
-                exp: None,
-            }),
-            Json(request()),
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn browser_wit_allows_ordinary_authenticated_user() {
+    async fn browser_wit_route_is_disabled_fail_closed() {
         let response = issue_browser_wit(
             State(test_state()),
             Extension(AuthenticatedUser {
@@ -208,17 +113,30 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let claims = crate::auth::jwt::decode(
-            json["wit"].as_str().unwrap(),
-            &ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]).verifying_key(),
-            None,
+        assert_eq!(json["error"].as_str(), Some("unsupported_grant_type"));
+    }
+
+    /// The refusal is unconditional — even a path-form subject (which the old
+    /// mint rejected only later) is refused before any signing.
+    #[tokio::test]
+    async fn browser_wit_route_disabled_for_path_form_subject() {
+        let response = issue_browser_wit(
+            State(test_state()),
+            Extension(AuthenticatedUser {
+                user: "did:web:accounts.example:users:alice".to_owned(),
+                verified_tenant: Some("tenant-a.example".to_owned()),
+                token: None,
+                exp: None,
+            }),
+            Json(request()),
         )
-        .unwrap();
-        assert_eq!(claims.tenant.as_deref(), Some("tenant-a.example"));
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 }

@@ -18,7 +18,7 @@ pub fn install_explicit_dispatch_pep() {
             &self,
             _ctx: &EnvelopeContext,
             _service_domain: &str,
-            _method: Option<u16>,
+            _method: Option<&[u16]>,
         ) -> MacDecision {
             MacDecision::Permit
         }

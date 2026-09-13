@@ -188,6 +188,7 @@ pub struct ModelServiceInner {
     registry: RegistryClient,
     // Infrastructure (for Spawnable)
     transport: TransportConfig,
+    policy_transport: TransportConfig,
     /// Expected JWT audience for token validation (RFC 8707).
     expected_audience: Option<String>,
     /// Unified JWT key source for verifying JWTs (local and federated).
@@ -414,6 +415,7 @@ impl ModelService {
         policy_client: PolicyClient,
         registry: RegistryClient,
         transport: TransportConfig,
+        policy_transport: TransportConfig,
     ) -> Result<Self> {
         config.inference_deployment.validate()?;
         // SAFETY: 5 is a valid non-zero value
@@ -436,6 +438,7 @@ impl ModelService {
             event_publisher,
             registry,
             transport,
+            policy_transport,
             expected_audience: None,
             jwt_key_source: None,
             discovery_client: None,
@@ -994,6 +997,7 @@ impl ModelService {
             self.signing_key.verifying_key(),
             self.signing_key.clone(),
             transport.clone(),
+            self.policy_transport.clone(),
             fs,
         )
         .with_instance_identity(
@@ -1974,18 +1978,19 @@ impl ParsedLoadRequest {
 }
 
 impl ModelService {
-    /// Try to parse a load request from the raw Cap'n Proto payload.
+    /// Try to parse a load request from the ONE decoded request body.
     /// Returns `None` for all other request variants (list, unload, health, scoped, etc.).
-    fn try_parse_load_request(payload: &[u8]) -> Option<(u64, ParsedLoadRequest)> {
+    ///
+    /// Reads from the already-decoded message (v16 §5.2) — pointer traversal,
+    /// not a second decode of the signed bytes.
+    fn try_parse_load_request(
+        body: &hyprstream_rpc::service::DecodedRequestBody,
+    ) -> Option<(u64, ParsedLoadRequest)> {
         use crate::model_capnp::model_request;
         use crate::model_capnp::KVQuantType as CKV;
         use crate::optional_capnp::option_uint32;
         use crate::model_capnp::option_k_v_quant_type;
-        let reader = capnp::serialize::read_message(
-            &mut std::io::Cursor::new(payload),
-            capnp::message::ReaderOptions::new(),
-        ).ok()?;
-        let req = reader.get_root::<model_request::Reader>().ok()?;
+        let req = body.root::<model_request::Reader>().ok()?;
         let request_id = req.get_id();
         match req.which().ok()? {
             model_request::Which::Load(data) => {
@@ -2012,7 +2017,17 @@ impl ModelService {
 
 #[async_trait(?Send)]
 impl crate::services::RequestService for ModelService {
-    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        // The ONE bounded decode (v16 §5.2): the generated decoder derives
+        // the full method leaf and returns the decoded message that policy,
+        // MAC, the load fast-path, and dispatch below all consume.
+        crate::services::generated::model_client::decode_model_request_body(signed_body)
+    }
+
+    async fn handle_request(&self, ctx: &EnvelopeContext, body: &hyprstream_rpc::service::DecodedRequestBody) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         debug!(
             "Model request from {} (id={})",
             ctx.subject(),
@@ -2024,7 +2039,7 @@ impl crate::services::RequestService for ModelService {
         // block all other model service requests (list, health, info, etc.).
         // Instead, return an immediate "accepted" response and do the actual
         // load in a Continuation (spawned via spawn_local after the REP is sent).
-        if let Some((request_id, load_data)) = Self::try_parse_load_request(payload) {
+        if let Some((request_id, load_data)) = Self::try_parse_load_request(body) {
             // This fast path bypasses generated dispatch, so reproduce its
             // mandatory operation-level authorization and audit record exactly
             // (`load` is `$scope(write)` in model.capnp).
@@ -2120,7 +2135,7 @@ impl crate::services::RequestService for ModelService {
             return Ok((response, Some(continuation)));
         }
 
-        dispatch_model(self, ctx, payload).await
+        dispatch_model(self, ctx, body).await
     }
 
     fn name(&self) -> &str {
@@ -2716,12 +2731,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("fixture inference identity failed: {error}"))
     }
 
-    fn remote_transport(port: u16) -> TransportConfig {
-        TransportConfig::quic(
-            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-            "fixture.test",
-        )
-        .with_connect_mode()
+    fn remote_transport(id: u8) -> TransportConfig {
+        TransportConfig::iroh([id; 32], Vec::new(), None)
     }
 
     fn selector_fixture() -> (
@@ -2740,7 +2751,7 @@ mod tests {
             });
             hyprstream_discovery::install_production_inference_fixture(
                 &selector_instance().service_name(),
-                &[remote_transport(41_001)],
+                &[remote_transport(0x01)],
                 dial,
             )
             .unwrap_or_else(|error| panic!("install selector fixture failed: {error}"))
@@ -2763,6 +2774,7 @@ mod tests {
             PolicyClient::new(Arc::clone(&infrastructure_rpc)),
             RegistryClient::new(infrastructure_rpc),
             TransportConfig::inproc("selector-model-service"),
+            TransportConfig::inproc("policy"),
         )
         .await
         .unwrap_or_else(|error| panic!("construct model-free selector service failed: {error}"))
@@ -2824,7 +2836,7 @@ mod tests {
     async fn selector_boundary_fixed_authority_exact_reach_and_delegated_readiness() {
         let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
         let (fixture, dial_state) = selector_fixture();
-        let advertised = remote_transport(41_011);
+        let advertised = remote_transport(0x11);
         fixture
             .reset(std::slice::from_ref(&advertised))
             .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
@@ -2861,7 +2873,7 @@ mod tests {
         let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
         let (fixture, dial_state) = selector_fixture();
         fixture
-            .reset(&[remote_transport(41_021)])
+            .reset(&[remote_transport(0x21)])
             .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
         dial_state.reset(Some(SELECTOR_BEARER));
         let local_state = Arc::new(BoundaryDialState::default());
@@ -2869,7 +2881,7 @@ mod tests {
         let mut model = selector_loaded_model(
             vec![
                 server_at(0x10, TransportConfig::inproc("selector-local")),
-                server_at(0x22, remote_transport(41_022)),
+                server_at(0x22, remote_transport(0x22)),
             ],
             local_state,
         );
@@ -2895,7 +2907,7 @@ mod tests {
     async fn selector_boundary_rejects_stale_reach_before_bearer_disclosure() {
         let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
         let (fixture, dial_state) = selector_fixture();
-        let advertised = remote_transport(41_031);
+        let advertised = remote_transport(0x31);
         fixture
             .reset(std::slice::from_ref(&advertised))
             .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
@@ -2927,12 +2939,12 @@ mod tests {
     async fn selector_boundary_rejects_cross_authority_retry_set_before_bearer_disclosure() {
         let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
         let (fixture, dial_state) = selector_fixture();
-        let selected = remote_transport(41_041);
+        let selected = remote_transport(0x41);
         fixture
             .reset(std::slice::from_ref(&selected))
             .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
         fixture
-            .add_foreign_authority(&remote_transport(41_042))
+            .add_foreign_authority(&remote_transport(0x42))
             .unwrap_or_else(|error| panic!("add foreign fixture authority failed: {error}"));
         dial_state.reset(Some(SELECTOR_BEARER));
         let selected_id = crate::services::router::ReplicaId::from_bytes([0x24; 32]);
@@ -2966,7 +2978,7 @@ mod tests {
         let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
         let (fixture, dial_state) = selector_fixture();
         fixture
-            .reset(&[remote_transport(41_051)])
+            .reset(&[remote_transport(0x51)])
             .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
         dial_state.reset(Some(SELECTOR_BEARER));
         let selected_id = crate::services::router::ReplicaId::from_bytes([0x25; 32]);
@@ -2997,8 +3009,8 @@ mod tests {
     async fn selector_boundary_failure_marks_exact_selected_replica_and_reselects_once() {
         let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
         let (fixture, dial_state) = selector_fixture();
-        let first = remote_transport(41_061);
-        let second = remote_transport(41_062);
+        let first = remote_transport(0x61);
+        let second = remote_transport(0x62);
         fixture
             .reset(&[first.clone(), second.clone()])
             .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
@@ -3045,7 +3057,7 @@ mod tests {
         let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
         let (fixture, dial_state) = selector_fixture();
         fixture
-            .reset(&[remote_transport(41_071)])
+            .reset(&[remote_transport(0x71)])
             .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
         dial_state.reset(Some(SELECTOR_BEARER));
         let local_state = Arc::new(BoundaryDialState::default());
@@ -3072,8 +3084,8 @@ mod tests {
     async fn selector_boundary_exhaustion_fails_without_local_fallback() {
         let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
         let (fixture, dial_state) = selector_fixture();
-        let first = remote_transport(41_081);
-        let second = remote_transport(41_082);
+        let first = remote_transport(0x81);
+        let second = remote_transport(0x82);
         fixture
             .reset(&[first.clone(), second.clone()])
             .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));

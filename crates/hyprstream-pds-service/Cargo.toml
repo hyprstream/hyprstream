@@ -2,12 +2,13 @@
 name = "hyprstream-pds-service"
 version = "0.1.0"
 edition.workspace = true
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 repository.workspace = true
 description = "Tenant-scoped PDS account record service over the Hyprstream 9P mount plane"
 
 [dependencies]
 anyhow = { workspace = true }
+axum = { workspace = true }
 async-trait = { workspace = true }
 hyprstream-pds = { path = "../hyprstream-pds" }
 hyprstream-rpc = { path = "../hyprstream-rpc" }
@@ -17,13 +18,14 @@ p256 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
 hyprstream-crypto = { path = "../hyprstream-crypto" }
 hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 rand = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+"tower" = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

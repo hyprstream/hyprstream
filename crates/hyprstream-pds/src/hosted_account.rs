@@ -38,14 +38,46 @@ use crate::did_op::{
     UnsignedGenesisDidOp,
 };
 use crate::hosted_did_document::SealedHostedDidDocument;
+use crate::AccountLabel;
 use hyprstream_rpc::identity::UNAUTHENTICATED_DID_SENTINEL;
 
 /// Version of the durable hosted-account record.
 pub const ACCOUNT_RECORD_VERSION: u16 = 1;
 const COMPRESSED_P256_PUBLIC_KEY_LEN: usize = 33;
 const ACCOUNT_RECORD_FILE: &str = "account-record.cbor";
-const GENESIS_DID_OP_FILE: &str = "genesis.didop.cbor";
-const DID_DOCUMENT_FILE: &str = "did-document.json";
+pub const GENESIS_DID_OP_FILE: &str = "genesis.didop.cbor";
+pub const DID_DOCUMENT_FILE: &str = "did-document.json";
+const ACCOUNT_STAGING_MARKER: &str = ".mint-";
+
+/// Return whether `name` is an unpublished account-mint staging directory.
+///
+/// The writer uses this exact private name shape while assembling a complete
+/// account bundle: `.{label}.mint-{random_u128}-{attempt}`. A crash can leave
+/// one of these directories behind, so readers may ignore only names that
+/// match the complete documented shape and contain a valid permanent label.
+pub fn is_hosted_account_staging_directory(name: &str) -> bool {
+    let Some(name) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((label, suffix)) = name.split_once(ACCOUNT_STAGING_MARKER) else {
+        return false;
+    };
+    if AccountLabel::parse(label).is_err() {
+        return false;
+    }
+    let Some((random_text, attempt_text)) = suffix.rsplit_once('-') else {
+        return false;
+    };
+    let Ok(random) = random_text.parse::<u128>() else {
+        return false;
+    };
+    let Ok(attempt) = attempt_text.parse::<u32>() else {
+        return false;
+    };
+    // Keep this in lockstep with new_staging_directory's bounded retry loop.
+    random.to_string() == random_text && attempt.to_string() == attempt_text && attempt < 128
+}
+
 /// Secret account-specific P-256 key paired with the public `#atproto`
 /// verification method in the immutable account record and DID document.
 ///
@@ -87,25 +119,7 @@ impl AllocatedAccountName {
             self.did != UNAUTHENTICATED_DID_SENTINEL,
             "{UNAUTHENTICATED_DID_SENTINEL} is reserved for the unauthenticated floor and cannot be registered or minted"
         );
-        ensure!(!self.label.is_empty(), "allocated account label is empty");
-        ensure!(
-            self.label.len() <= 63,
-            "allocated account label exceeds 63 octets"
-        );
-        ensure!(
-            self.label == self.label.to_ascii_lowercase(),
-            "allocated account label must already be lowercase"
-        );
-        ensure!(
-            self.label
-                .bytes()
-                .all(|byte| { byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' }),
-            "allocated account label must be a single LDH label"
-        );
-        ensure!(
-            !self.label.starts_with('-') && !self.label.ends_with('-'),
-            "allocated account label must not start or end with a hyphen"
-        );
+        AccountLabel::parse(&self.label).context("allocated account label is invalid")?;
         validate_host_form_did_web(&self.did)?;
         let host = self
             .did

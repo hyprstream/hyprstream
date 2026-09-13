@@ -2,10 +2,12 @@
 
 `bootstrap-pubkeys` is a node-local credential file: the public keys of the
 services a node must trust before Discovery is available to look anything up
-(chicken-and-egg). It is unrelated to deployment trust (see
-[deployment-registry-trust.md](deployment-registry-trust.md)) — it seeds an
-unattested, non-expiring, local-trust-on-first-use entry per service, not a
-CA-verified credential.
+(chicken-and-egg). Outside OS-owned deployments it is unrelated to deployment
+trust (see [deployment-registry-trust.md](deployment-registry-trust.md)) — it
+seeds an unattested, non-expiring, local-trust-on-first-use entry per service,
+not a CA-verified credential. In an OS-owned deployment the `discovery` and
+`policy` entries must additionally be enrolled in the ceremony signature
+chain; see [Chain-signed enrollment (OS-owned deployments)](#chain-signed-enrollment-os-owned-deployments).
 
 ## Wire format
 
@@ -124,6 +126,24 @@ itself, can report precisely which services are stale. This rule is scoped to
 the node's own services: external classical clients and federated peers do not
 appear in this file and are unaffected by it.
 
+## Per-service public sidecars
+
+Each service also publishes its own entry as standalone public files next to
+its signing-key seed, written (and backfilled for pre-existing seeds) by the
+key loader and by `hyprstream service ensure-key <name>`:
+
+- `{service}/signing-key.pub` — the raw 32-byte Ed25519 verifying key.
+- `{service}/service-pubkey.hybrid` — the raw 1984-byte hybrid entry value
+  (before base64), byte-for-byte the same value this file encodes for that
+  service.
+
+Both are public trust material (mode 0644) derived from the key's public half
+only; the seed never appears in either. They exist so consumers that need one
+service's live public key — the registry credential mint, the bootstrap
+enrollment mint — can read it from a volume mount without access to any secret
+material. For `policy`, whose key is the flat node/CA key, the sidecars are
+written flat alongside `credentials/signing-key`.
+
 ## Which service names matter
 
 The wizard mints a keypair for every registered factory, but the runtime only
@@ -146,6 +166,36 @@ Provisioning keys under any other service name (for example a name matching
 some other artifact you have on hand) satisfies nothing — the loader will
 parse the file successfully but the process will still fail to find the
 `discovery` entry it actually needs.
+
+## Chain-signed enrollment (OS-owned deployments)
+
+In an OS-owned deployment (no DID anchors configured; the ceremony trust chain
+installed under `/etc/hyprstream/trust`), the unsigned-TOFU posture above is
+**not** accepted for the two services the runtime resolves before Discovery is
+up. Every `bootstrap-pubkeys` entry for an allowlisted service (`discovery`,
+`policy` — the fixed `SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES`) must be backed
+by a chain-signed enrollment attestation
+(`hyprstream.service-key-enrollment.v1`) in a sibling directory:
+
+```
+<credentials>/bootstrap-pubkeys.enrollment/<service>.json
+```
+
+At startup (`install_process_production_resolver`), each such attestation is
+verified by `hyprstream-discovery`'s
+`verify_os_owned_service_key_enrollment` against the node's OS-owned
+deployment trust chain (root, authority log, checkpoint), and the attested
+1984-byte hybrid key must equal the service's `bootstrap-pubkeys` entry
+byte-for-byte. A missing, malformed, expired, or mismatched attestation fails
+startup closed — there is no pinned-key or config fallback, matching the
+operator ruling that trust is cryptographic via the ceremony chain.
+Attestations expire (one-hour TTL ceiling), so the enrollment provisioning
+step re-runs on every activation, mirroring the registry credential mint.
+Wizard/dev (DID-anchored or undeployed) nodes do not perform this check.
+Attestations are minted by `hyprstream trust enroll-service-key` from the
+service's public `service-pubkey.hybrid` sidecar and can be checked
+out-of-band with `hyprstream trust verify-deployment
+--service-key-attestation <file>`.
 
 ## Not deployment trust
 

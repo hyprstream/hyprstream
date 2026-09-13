@@ -165,11 +165,14 @@ pub struct InferenceStage {
     model: Box<dyn ModelOperations>,
     contract: StageContract,
     active_sequence: Option<u64>,
+    poisoned: bool,
     _not_send: PhantomData<Rc<()>>,
 }
 
 impl InferenceStage {
     /// Load exactly the weights required for one contiguous stage.
+    /// `fp8_dequant_load` forwards the caller's explicit FP8 loading policy to
+    /// the model factory; stage loading does not change that policy.
     pub async fn load(
         model_path: &Path,
         device: &Device,
@@ -177,6 +180,7 @@ impl InferenceStage {
         max_context: Option<usize>,
         kv_quant_type: KVQuantType,
         request: ModelStageRequest,
+        fp8_dequant_load: bool,
     ) -> Result<Self> {
         let layer_range = request.layer_range.clone();
         let model = ModelFactory::create_stage(
@@ -187,6 +191,7 @@ impl InferenceStage {
             kv_quant_type,
             None,
             request,
+            fp8_dequant_load,
         )
         .await?;
         let contract = StageContract::new(layer_range, model.num_layers())?;
@@ -198,6 +203,7 @@ impl InferenceStage {
             model,
             contract,
             active_sequence: None,
+            poisoned: false,
             _not_send: PhantomData,
         }
     }
@@ -214,13 +220,24 @@ impl InferenceStage {
     /// `start_pos` must advance monotonically from zero for that sequence. The
     /// loaded model keeps its per-layer KV (and architecture-specific recurrent)
     /// state locally; the typed result stays on the engine-owning thread.
+    /// A failure after decoder execution starts can leave that cache partially
+    /// updated. Such a stage rejects further execution and must be reloaded.
     pub fn execute(
         &mut self,
         sequence: &mut StageSequence,
         input: StageInput<'_>,
         start_pos: usize,
     ) -> Result<StageOutput> {
+        if self.poisoned {
+            bail!("stage execution previously failed; the stage must be reloaded");
+        }
         sequence.require_start_pos(start_pos)?;
+        if self
+            .active_sequence
+            .is_some_and(|active| active != sequence.id)
+        {
+            bail!("a loaded stage instance admits exactly one sequence");
+        }
 
         let hidden = match input {
             StageInput::TokenIds(token_ids) if self.contract.is_first() => {
@@ -234,13 +251,10 @@ impl InferenceStage {
                 bail!("the first decoder stage requires token IDs, not a hidden activation");
             }
         };
-        match self.active_sequence {
-            Some(active) if active != sequence.id => {
-                bail!("a loaded stage instance admits exactly one sequence");
-            }
-            Some(_) => {}
-            None => self.active_sequence = Some(sequence.id),
-        }
+        self.active_sequence = Some(sequence.id);
+        // ModelOperations has no rollback contract. Leave this set on every
+        // error after entering the decoder, including final projection errors.
+        self.poisoned = true;
 
         let hidden =
             self.model
@@ -252,15 +266,15 @@ impl InferenceStage {
             .ok_or_else(|| anyhow!("stage output must have a sequence dimension"))?;
         let token_count = usize::try_from(token_count)
             .map_err(|_| anyhow!("stage output sequence dimension must be non-negative"))?;
-        sequence.advance(token_count)?;
-        if self.contract.is_last() {
+        let output = if self.contract.is_last() {
             let normalized = self.model.apply_final_norm(&hidden)?;
-            Ok(StageOutput::Logits(StageTensor::new(
-                self.model.lm_head(&normalized)?,
-            )))
+            StageOutput::Logits(StageTensor::new(self.model.lm_head(&normalized)?))
         } else {
-            Ok(StageOutput::Hidden(StageTensor::new(hidden)))
-        }
+            StageOutput::Hidden(StageTensor::new(hidden))
+        };
+        sequence.advance(token_count)?;
+        self.poisoned = false;
+        Ok(output)
     }
 }
 
@@ -269,7 +283,7 @@ mod tests {
     use std::ops::Range;
     use std::sync::Arc;
 
-    use anyhow::{anyhow, Result};
+    use anyhow::{anyhow, bail, Result};
     use parking_lot::Mutex;
     use tch::{Device, Kind, Tensor};
 
@@ -333,6 +347,7 @@ mod tests {
         config: TestConfig,
         total_layers: usize,
         observed_ranges: Arc<Mutex<Vec<Range<usize>>>>,
+        fail_at: Option<&'static str>,
     }
 
     impl ModelOperations for TestModel {
@@ -363,14 +378,23 @@ mod tests {
             _delta: Option<&crate::training::TenantDelta>,
         ) -> Result<Tensor> {
             self.observed_ranges.lock().push(range);
+            if self.fail_at == Some("decoder") {
+                bail!("decoder failed after updating cache");
+            }
             Ok(hidden.shallow_clone())
         }
 
         fn apply_final_norm(&self, hidden: &Tensor) -> Result<Tensor> {
+            if self.fail_at == Some("norm") {
+                bail!("final normalization failed");
+            }
             Ok(hidden.shallow_clone())
         }
 
         fn lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+            if self.fail_at == Some("head") {
+                bail!("final projection failed");
+            }
             Ok(hidden.shallow_clone())
         }
 
@@ -408,6 +432,7 @@ mod tests {
             config: TestConfig,
             total_layers,
             observed_ranges: Arc::clone(&observed_ranges),
+            fail_at: None,
         };
         let stage =
             InferenceStage::from_loaded_model(Box::new(model), valid_contract(range, total_layers));
@@ -477,6 +502,37 @@ mod tests {
             StageOutput::Hidden(_) => panic!("the final stage must emit logits"),
         }
         assert_eq!(*final_ranges.lock(), vec![4..6]);
+    }
+
+    #[test]
+    fn failed_stage_cannot_reuse_partially_updated_cache() {
+        for fail_at in ["decoder", "norm", "head"] {
+            let observed_ranges = Arc::new(Mutex::new(Vec::new()));
+            let model = TestModel {
+                config: TestConfig,
+                total_layers: 2,
+                observed_ranges: Arc::clone(&observed_ranges),
+                fail_at: Some(fail_at),
+            };
+            let mut stage =
+                InferenceStage::from_loaded_model(Box::new(model), valid_contract(0..2, 2));
+            let mut sequence = StageSequence::new();
+            assert!(stage
+                .execute(&mut sequence, StageInput::TokenIds(&token_ids()), 0)
+                .is_err());
+            assert_eq!(
+                sequence.next_start_pos, 0,
+                "failed output must not advance sequence"
+            );
+            assert!(stage
+                .execute(&mut sequence, StageInput::TokenIds(&token_ids()), 0)
+                .is_err());
+            assert_eq!(
+                observed_ranges.lock().len(),
+                1,
+                "poisoned cache must not be reused"
+            );
+        }
     }
 
     #[test]

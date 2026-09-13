@@ -797,7 +797,7 @@ pub async fn root_did_document(State(state): State<Arc<OAuthState>>) -> Response
             endpoint: hyprstream_rpc::service_entry::encode_iroh(
                 &node_id,
                 &state.iroh_relays,
-                &["hyprstream-rpc/1", "moql"],
+                &["hyprstream-rpc/1"],
             ),
         });
     }
@@ -1878,7 +1878,7 @@ mod tests {
             endpoint: hyprstream_rpc::service_entry::encode_iroh(
                 &node_id,
                 &[],
-                &["hyprstream-rpc/1", "moql"],
+                &["hyprstream-rpc/1"],
             ),
         }];
         let doc = build_did_document(
@@ -1904,8 +1904,7 @@ mod tests {
         assert_eq!(iroh_svc["id"].as_str().unwrap(), format!("{did}#iroh"));
         let accept = iroh_svc["serviceEndpoint"]["accept"].as_array().unwrap();
         let accept: Vec<&str> = accept.iter().filter_map(|v| v.as_str()).collect();
-        assert!(accept.contains(&"hyprstream-rpc/1"));
-        assert!(accept.contains(&"moql"));
+        assert_eq!(accept, vec!["hyprstream-rpc/1"]);
     }
 
     #[test]

@@ -11,7 +11,10 @@
 //! production remains operator-gated and floor-only.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-#![cfg_attr(feature = "credential-pds", allow(dead_code, unused_imports))]
+#![cfg_attr(
+    feature = "encrypted-account-admission",
+    allow(dead_code, unused_imports)
+)]
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -103,7 +106,7 @@ fn install_gate_crypto() -> Result<()> {
 struct RpcFloorLabels(&'static str);
 
 impl RpcObjectLabelResolver for RpcFloorLabels {
-    fn resolve(&self, service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
+    fn resolve(&self, service_domain: &str, _method: Option<&[u16]>) -> Option<SecurityLabel> {
         (service_domain == self.0).then(|| label(Level::Public, Assurance::Classical))
     }
 }
@@ -120,7 +123,7 @@ impl MacDispatchPep for ExactServiceBootstrapPep {
         &self,
         _ctx: &EnvelopeContext,
         service_domain: &str,
-        _method: Option<u16>,
+        _method: Option<&[u16]>,
     ) -> MacDecision {
         if service_domain == self.0 {
             MacDecision::Permit
@@ -139,13 +142,22 @@ struct GateEchoService {
 
 #[async_trait(?Send)]
 impl RequestService for GateEchoService {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> Result<hyprstream_rpc::service::DecodedRequestBody> {
+        Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(
+            signed_body.to_vec(),
+        ))
+    }
+
     async fn handle_request(
         &self,
         _ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
         self.invocations.fetch_add(1, Ordering::SeqCst);
-        Ok((payload.to_vec(), None))
+        Ok((body.bytes().to_vec(), None))
     }
 
     fn name(&self) -> &str {
@@ -459,7 +471,7 @@ async fn unauthorized_subject_is_denied_and_audited_on_rpc_and_9p() -> Result<()
 // Positive acceptance path retained as the executable T8 contract.
 //
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(feature = "credential-pds"))]
+#[cfg(not(feature = "encrypted-account-admission"))]
 async fn verified_atproto_identity_authorizes_rpc_and_9p() -> Result<()> {
     let _globals = GATE_GLOBALS.lock().await;
     let coverage = hyprstream_rpc::auth::mac::GenesisReport {
@@ -540,7 +552,7 @@ struct T8SessionCredential {
     ninep_bytes: Vec<u8>,
 }
 
-#[cfg(not(feature = "credential-pds"))]
+#[cfg(not(feature = "encrypted-account-admission"))]
 async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
     use base64::{
         engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -1133,13 +1145,22 @@ struct AuthenticatedGateEcho {
 
 #[async_trait(?Send)]
 impl RequestService for AuthenticatedGateEcho {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> Result<hyprstream_rpc::service::DecodedRequestBody> {
+        Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(
+            signed_body.to_vec(),
+        ))
+    }
+
     async fn handle_request(
         &self,
         _ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
         self.invocations.fetch_add(1, Ordering::SeqCst);
-        Ok((payload.to_vec(), None))
+        Ok((body.bytes().to_vec(), None))
     }
 
     fn name(&self) -> &str {

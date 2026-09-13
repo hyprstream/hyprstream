@@ -1048,6 +1048,7 @@ impl TorchEngine {
             self.config.max_context.map(|v| v as usize),
             self.config.kv_quant_type,
             self.device_pool.as_deref(),
+            self.config.fp8_dequant_load,
         ).await?;
         let factory_time = factory_start.elapsed();
         info!("✅ Model weights loaded in {:.2}s", factory_time.as_secs_f64());

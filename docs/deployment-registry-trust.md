@@ -49,9 +49,11 @@ The OS-owned deployment seam is deliberately small and fail-closed:
   provisioned expected log head: schema, deployment domain, log DID, sequence,
   and head CID. The supplied log must match it exactly.
 
-By default, all installed files and parent directories must be real,
-root-owned paths and not group/world writable. Missing, malformed, symlinked,
-or incorrectly owned material makes production resolver startup fail closed.
+All installed files and parent directories must be real, owned by root or the
+daemon's effective service UID, and not group/world writable. This invariant is
+identical for fixed and explicitly overridden paths. Missing, malformed,
+symlinked, or incorrectly owned material makes production resolver startup fail
+closed.
 Missing log or checkpoint never selects a less restrictive verifier. Both JWT
 signature components are verified against the checkpointed active authority
 before its key is represented by an opaque verification-only capability. The
@@ -60,7 +62,7 @@ Discovery APIs.
 
 The repository does not yet contain an operator enrollment protocol. Deployments
 using this OS-owned source must therefore provision the `/etc` pin through their
-OS image, configuration manager, measured-boot policy, or equivalent root-owned
+OS image, configuration manager, measured-boot policy, or equivalent trusted
 mechanism, and project the registry JWT into the fixed `/run` location before
 starting hyprstream.
 
@@ -79,13 +81,13 @@ from systemd's absolute `$CREDENTIALS_DIRECTORY` as
 `$CREDENTIALS_DIRECTORY/registry-service.jwt`. Either variable being present
 but empty, relative, or containing `..` components is a startup error; it
 never falls back to a fixed path. When a variable is absent, only its fixed
-root-owned path is used.
+path is used.
 
-Explicit user-service artifacts and every real ancestor must be owned by root
-or the daemon's effective user and must not be group/world writable. Symlinks
-are rejected and the final file is opened with `O_NOFOLLOW`. This mode trusts
-the service account to provision its own development trust inputs; it does not
-turn XDG or general secret directories into authority.
+Every selected artifact and real ancestor must be owned by root or the daemon's
+effective user and must not be group/world writable. Symlinks are rejected and
+the final file is opened with `O_NOFOLLOW`. The service identity is the trusted
+principal in the non-root production model; this does not turn XDG or general
+secret directories into authority.
 
 Path selection changes no cryptographic rule. The CA is still exactly the
 mandatory 1,984-byte Ed25519 + ML-DSA-65 pair; the authority log must still

@@ -181,6 +181,30 @@ pub struct CallbackParams {
     pub state: String,
 }
 
+/// Reject an upstream error using only public response metadata.
+fn check_token_response(
+    response: reqwest::Response,
+    provider_slug: &str,
+) -> Result<reqwest::Response, (axum::http::StatusCode, &'static str)> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    // Never read or log the body, even at DEBUG/TRACE: error fields and provider
+    // diagnostics can contain credentials, and arbitrary providers have no safe
+    // redaction contract. Keep only the configured provider and HTTP status.
+    tracing::error!(
+        provider = %provider_slug,
+        status = status.as_u16(),
+        "External token endpoint returned error"
+    );
+    Err((
+        axum::http::StatusCode::BAD_GATEWAY,
+        "External token exchange rejected",
+    ))
+}
+
 /// Handle callback from external OIDC provider.
 ///
 /// `GET /oauth/callback/:provider`
@@ -253,11 +277,10 @@ pub async fn external_callback(
         }
     };
 
-    if !token_response.status().is_success() {
-        let body = token_response.text().await.unwrap_or_default();
-        tracing::error!(provider = %provider_slug, body = %body, "External token endpoint returned error");
-        return (axum::http::StatusCode::BAD_GATEWAY, "External token exchange rejected").into_response();
-    }
+    let token_response = match check_token_response(token_response, &provider_slug) {
+        Ok(response) => response,
+        Err(response) => return response.into_response(),
+    };
 
     let token_json: serde_json::Value = match token_response.json().await {
         Ok(v) => v,
@@ -672,4 +695,140 @@ async fn provision_federated_user(
     }
 
     Ok(resolution.username)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod token_response_tests {
+    use super::check_token_response;
+    use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
+    use parking_lot::Mutex;
+    use std::io::Write;
+    use std::sync::Arc;
+    use tracing::Level;
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn upstream_response(status: StatusCode, body: String) -> reqwest::Response {
+        let app = Router::new().route("/token", post(move || async move { (status, body) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock token endpoint");
+        let address = listener.local_addr().expect("mock endpoint address");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("test client")
+            .post(format!("http://{address}/token"))
+            .send()
+            .await
+            .expect("mock token response");
+        server.abort();
+        response
+    }
+
+    fn capture_check(
+        response: reqwest::Response,
+        level: Level,
+    ) -> (Result<reqwest::Response, axum::response::Response>, String) {
+        let capture = LogCapture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_max_level(level)
+            .with_writer(move || writer.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            check_token_response(response, "test-provider")
+        })
+        .map_err(IntoResponse::into_response);
+        let logs = String::from_utf8(capture.0.lock().clone()).expect("UTF-8 structured logs");
+        (result, logs)
+    }
+
+    #[tokio::test]
+    async fn token_response_errors_log_only_public_metadata() {
+        let bodies = [
+            serde_json::json!({
+                "access_token": "access-secret-canary",
+                "refresh_token": "refresh-secret-canary",
+                "id_token": "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.signature-canary",
+                "code": "authorization-code-canary",
+                "client_secret": "client-secret-canary",
+                "error": "provider-defined-secret-canary",
+                "error_description": "Bearer diagnostic-secret-canary",
+                "diagnostics": { "nested": "nested-secret-canary" }
+            })
+            .to_string(),
+            "Bearer opaque-token-canary\nclient_secret=secret-canary&code=code-canary".repeat(1024),
+            "".to_owned(),
+        ];
+        for status in [
+            StatusCode::FOUND,
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            for body in &bodies {
+                // TRACE additionally proves that diagnostics weren't merely
+                // moved to a lower severity. Each normal threshold is covered.
+                for level in [Level::ERROR, Level::WARN, Level::INFO, Level::TRACE] {
+                    let upstream = upstream_response(status, body.clone()).await;
+                    let (result, logs) = capture_check(upstream, level);
+                    let rejection = result.expect_err("reject non-success response");
+                    assert_eq!(rejection.status(), StatusCode::BAD_GATEWAY);
+                    let rejection_body = axum::body::to_bytes(rejection.into_body(), 1024)
+                        .await
+                        .expect("read rejection body");
+                    assert_eq!(&rejection_body[..], b"External token exchange rejected");
+                    let events: Vec<serde_json::Value> = logs
+                        .lines()
+                        .map(|line| serde_json::from_str(line).expect("JSON log event"))
+                        .collect();
+                    assert_eq!(events.len(), 1, "one safe error event: {logs}");
+                    assert_eq!(events[0]["level"], "ERROR");
+                    // Exact field allowlist catches raw bodies, unknown error
+                    // codes, nested credentials, and future diagnostic fields.
+                    assert_eq!(
+                        events[0]["fields"],
+                        serde_json::json!({
+                            "message": "External token endpoint returned error",
+                            "provider": "test-provider",
+                            "status": status.as_u16(),
+                        })
+                    );
+                    assert!(!logs.contains("canary"), "secret in logs: {logs}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn token_response_success_preserves_body_without_logging() {
+        let body = r#"{"access_token":"success-secret-canary"}"#;
+        let upstream = upstream_response(StatusCode::OK, body.to_owned()).await;
+        let (result, logs) = capture_check(upstream, Level::TRACE);
+        let response = result.expect("successful response passes through");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.expect("untouched token body"), body);
+        assert!(logs.is_empty(), "successful token response logged: {logs}");
+    }
 }

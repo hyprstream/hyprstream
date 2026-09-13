@@ -287,10 +287,3 @@ impl<'a> StageManager<'a> {
         Ok(self.staged_files().await?.is_empty())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    
-
-    // Tests will be added for staging operations
-}

@@ -18,6 +18,35 @@ use hyprstream_rpc::transport::TransportConfig;
 // Import anyhow! macro for error creation in ServiceManager impl
 use anyhow::anyhow;
 
+/// Build the exact MoQL authorization configuration installed on the Iroh
+/// handler. Keeping this at the production seam makes it impossible for a
+/// shared-config field to be silently dropped between service setup and the
+/// handler; absence of a service-owned ingress grant remains deny-by-default.
+fn production_moq_authz(
+    admission: Arc<hyprstream_rpc::transport::moql_admission::MoqlAdmissionAuthenticator>,
+    ingress_authorizer: Option<hyprstream_rpc::transport::iroh_moq::SharedIngressAuthorizer>,
+) -> hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig {
+    hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig::default()
+        .with_admission(admission)
+        .with_ingress_authorizer_option(ingress_authorizer)
+}
+
+/// Native producer reach and channel must refer to the same service-owned tree.
+fn producer_moq_origin(
+    required: bool,
+    relay: Option<hyprstream_rpc::moq_stream::MoqStreamOrigin>,
+    has_producer: bool,
+) -> Option<hyprstream_rpc::moq_stream::MoqStreamOrigin> {
+    relay.or_else(|| {
+        if required {
+            has_producer.then(|| hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
+                .with_prefix(hyprstream_rpc::moq_stream::DEFAULT_PREFIX).build())
+        } else {
+            hyprstream_rpc::moq_stream::global_moq_origin().cloned()
+        }
+    })
+}
+
 // Re-export Spawnable trait from hyprstream-rpc (where it's defined so
 // types in that crate can implement it without circular deps).
 pub use hyprstream_rpc::service::Spawnable;
@@ -41,7 +70,84 @@ pub struct UnifiedServiceConfig<S: RequestService + Send + 'static> {
 impl<S: RequestService + Send + 'static> UnifiedServiceConfig<S> {
     /// Create a unified service config with optional QUIC.
     pub fn new(service: S, quic_config: Option<hyprstream_rpc::service::QuicLoopConfig>) -> Self {
-        Self { service, quic_config }
+        Self {
+            service,
+            quic_config,
+        }
+    }
+}
+
+/// Reject a required native profile before any compatibility carrier can start.
+fn validate_required_iroh_enabled(
+    config: &hyprstream_rpc::service::QuicLoopConfig,
+) -> Result<()> {
+    if config.iroh_required && !config.iroh_enabled {
+        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+            "network-iroh-required rejects iroh = false".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Complete the native bind seam: required deployments must publish their
+/// first Iroh reach, while the compatibility profile deliberately logs and
+/// continues on publication failure.
+fn announce_iroh_bound(
+    callback: Option<Box<dyn FnOnce(String, [u8; 32]) -> anyhow::Result<()> + Send>>,
+    required: bool,
+    service_name: &str,
+    node_id: [u8; 32],
+) -> Result<()> {
+    match callback {
+        Some(callback) => match callback(service_name.to_owned(), node_id) {
+            Ok(()) => Ok(()),
+            Err(error) if required => {
+                Err(hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                    "network-iroh-required initial Iroh announcement failed: {error}"
+                )))
+            }
+            Err(error) => {
+                tracing::warn!(service = %service_name, "Iroh announcement failed; continuing compatibility profile: {error}");
+                Ok(())
+            }
+        },
+        None if required => Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+            "network-iroh-required has no initial Iroh announcement callback".to_owned(),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The publisher's first-result handshake is synchronous. Keep it off this
+/// service's current-thread runtime so shutdown can cancel an in-flight first
+/// publication instead of waiting for the readiness barrier to finish.
+async fn announce_iroh_bound_until_shutdown(
+    config: &mut hyprstream_rpc::service::QuicLoopConfig,
+    service_name: &str,
+    node_id: [u8; 32],
+    shutdown: &Notify,
+) -> Result<()> {
+    let callback = config.on_iroh_bound.take();
+    let required = config.iroh_required;
+    let cancellation = config.announcement_cancellation.clone();
+    let service_name = service_name.to_owned();
+    let publication = tokio::task::spawn_blocking(move || {
+        announce_iroh_bound(callback, required, &service_name, node_id)
+    });
+    tokio::select! {
+        biased;
+        _ = shutdown.notified() => {
+            cancellation.cancel();
+            Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                "service stopped before initial Iroh announcement completed".to_owned(),
+            ))
+        }
+        _ = cancellation.cancelled() => Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+            "initial Iroh announcement cancelled before readiness".to_owned(),
+        )),
+        result = publication => result.map_err(|error| {
+            hyprstream_rpc::error::RpcError::SpawnFailed(format!("initial Iroh announcement task: {error}"))
+        })?,
     }
 }
 
@@ -51,7 +157,10 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
     }
 
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
-        vec![(SocketKind::Rep, RequestService::transport(&self.service).clone())]
+        vec![(
+            SocketKind::Rep,
+            RequestService::transport(&self.service).clone(),
+        )]
     }
 
     fn run(
@@ -61,7 +170,10 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
     ) -> Result<()> {
         use hyprstream_rpc::transport::rpc_session::IrohRequestProcessor;
 
-        let UnifiedServiceConfig { service, quic_config } = *self;
+        let UnifiedServiceConfig {
+            service,
+            quic_config,
+        } = *self;
         let transport = RequestService::transport(&service).clone();
         let signing_key = RequestService::signing_key(&service);
         let server_pubkey = signing_key.verifying_key();
@@ -83,9 +195,28 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
             let bridge = hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
                 service, Arc::clone(&nonce_cache), 0,
             ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("bridge: {e}")))?;
-            let processor: Arc<dyn IrohRequestProcessor> = Arc::new(bridge);
+            let bridge = Arc::new(bridge);
+            let processor: Arc<dyn IrohRequestProcessor> = bridge.clone();
 
+            let result = async {
             if let Some(mut qc) = quic_config {
+                let announcement_cancellation = qc.announcement_cancellation.clone();
+                let _announcement_guard = announcement_cancellation.clone().drop_guard();
+                validate_required_iroh_enabled(&qc)?;
+                // The native client proof is projected from the same
+                // checkpoint-verified local accepted state that StreamInfo
+                // advertises. Reuse its private halves for the server's mutual
+                // confirmation; never manufacture a separate MoQ identity.
+                let moq_server_identity = qc
+                    .moq_admission_proof
+                    .as_ref()
+                    .map(hyprstream_rpc::transport::moql_admission::MoqlServerIdentityProof::from_local_admission_proof)
+                    .transpose()
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "MoQ server confirmation identity: {error}"
+                        ))
+                    })?;
                 // web-transport-quinn has no per-builder provider hook and
                 // resolves rustls's process default. Install and validate it at
                 // the actual bind seam so task/thread/subprocess startup cannot
@@ -135,12 +266,11 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         .with_prefix(hyprstream_rpc::moq_stream::DEFAULT_PREFIX)
                         .build()
                 });
+                // Native producers serve only their own stream channel origin.
+                let moq_origin = producer_moq_origin(qc.iroh_required, relay_origin.clone(), moq_origin_handle.is_some());
                 if let Some(handle) = &moq_origin_handle {
-                    *handle.write() = relay_origin.clone();
+                    *handle.write() = moq_origin.clone();
                 }
-                let moq_origin = relay_origin
-                    .clone()
-                    .or_else(|| hyprstream_rpc::moq_stream::global_moq_origin().cloned());
 
                 let mut rpc_server = hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::with_capacity(
                     wt_server,
@@ -208,7 +338,13 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     );
                 }
                 if let Some(handle) = &reach_config_handle {
+                    let moql_server_identity = qc
+                        .moq_admission_proof
+                        .as_ref()
+                        .map(|proof| proof.expected_server.clone());
                     *handle.write() = hyprstream_rpc::moq_stream::ProducerReachConfig {
+                        moql_server_identity,
+                        relay_moql_server_identity: qc.moq_relay_server_identity.clone(),
                         iroh_node_id: None,
                         quic_reach: Some(hyprstream_rpc::moq_stream::NodeStreamReach {
                         addr: advertise_addr,
@@ -222,13 +358,28 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     cb(service_name.clone(), advertise_addr, qc.server_name.clone());
                 }
 
+                // Install an accepted-state-bound proof before any native
+                // subscriber or relay dial. It is absent for browser/local
+                // profiles, where no Iroh admission is attempted.
+                let relay_admission_proof = qc.moq_admission_proof.clone();
+                if let Some(proof) = relay_admission_proof.clone() {
+                    let _ = hyprstream_rpc::moq_stream::init_global_moq_admission_proof(proof);
+                }
+
                 // Link a relay only to this service's scoped origin. The shared
                 // process origin would leak other services' broadcasts into it.
                 if let Some(relay) = qc.moq_relay.take() {
+                    if qc.iroh_required && !matches!(relay, hyprstream_rpc::stream_info::TransportConfig::Iroh(_)) {
+                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                            "network-iroh-required rejects non-Iroh stream relay".into(),
+                        ));
+                    }
                     if let Some(origin) = relay_origin {
                         hyprstream_rpc::moq_stream::serve_origin_to_relay_background(
                             origin.producer().clone(),
                             relay,
+                            relay_admission_proof,
+                            qc.moq_relay_server_identity.take(),
                         );
                         tracing::info!(
                             service = %service_name,
@@ -268,6 +419,34 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         }
                         None => hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new(),
                     };
+                    // #1027: when the daemon threaded an admission authenticator
+                    // through `QuicLoopConfig`, install it so every accepted
+                    // `moql` connection must prove an accepted current
+                    // Ed25519 + ML-DSA-65 identity inside the carrier before the
+                    // moq handshake. Without it the accept path stays in its
+                    // fail-closed anonymous posture.
+                    let moq_ingress_authorizer = qc.moq_ingress_authorizer.take();
+                    let moq_handler = match qc.moq_admission.take() {
+                        Some(admission) => {
+                            let server_identity = moq_server_identity.ok_or_else(|| {
+                                hyprstream_rpc::error::RpcError::SpawnFailed(
+                                    "MoQ admission enabled without checkpointed server confirmation identity"
+                                        .to_owned(),
+                                )
+                            })?;
+                            admission
+                                .install_server_identity(server_identity, node_id)
+                                .map_err(|error| {
+                                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                                        "MoQ server confirmation identity: {error}"
+                                    ))
+                            })?;
+                            moq_handler.with_authz(
+                                production_moq_authz(admission, moq_ingress_authorizer),
+                            )
+                        }
+                        None => moq_handler,
+                    };
                     // RPC plane: same processor + signing key as the quinn path.
                     let rpc_handler =
                         hyprstream_rpc::transport::iroh_rpc::IrohRpcProtocolHandler::with_stream_limit(
@@ -291,9 +470,7 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                             }
                             // Advertise iroh reachability only now that the carrier
                             // is bound; EndpointId is never application authority.
-                            if let Some(cb) = qc.on_iroh_bound.take() {
-                                cb(service_name.clone(), node_id);
-                            }
+                            announce_iroh_bound_until_shutdown(&mut qc, &service_name, node_id, &shutdown).await?;
                             tracing::info!(
                                 service = %service_name,
                                 node_id = %hex_short(&node_id),
@@ -302,6 +479,11 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                             Some(substrate)
                         }
                         Err(e) => {
+                            if qc.iroh_required {
+                                return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                                    format!("network-iroh-required Iroh bind failed: {e}"),
+                                ));
+                            }
                             // Fail soft: an iroh bind failure must not take down the
                             // working quinn plane. Log and continue quinn-only.
                             tracing::warn!(
@@ -312,46 +494,99 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         }
                     }
                 } else {
+                    validate_required_iroh_enabled(&qc)?;
                     None
                 };
-                // Drain the iroh substrate on shutdown (parallel to quinn drain).
-                if let Some(substrate) = _iroh_substrate_guard {
-                    let iroh_shutdown = Arc::clone(&shutdown);
-                    tokio::spawn(async move {
-                        iroh_shutdown.notified().await;
-                        if let Err(e) = substrate.shutdown().await {
-                            tracing::warn!("iroh substrate shutdown error: {e}");
-                        }
-                    });
-                }
-
-                // Bridge the `Notify` shutdown to the server's graceful drain.
+                // One owner consumes the service shutdown notification. Multiple
+                // independent Notify waiters would race for notify_one's permit.
+                // Cancel publication before draining either carrier, including
+                // when a serving loop exits without an explicit stop request.
                 let drain_limit = rpc_server.stream_limit();
                 let drain_capacity = rpc_server.capacity();
                 let drain_token = rpc_server.shutdown_token();
-                let drain_shutdown = Arc::clone(&shutdown);
-                tokio::spawn(async move {
-                    drain_shutdown.notified().await;
-                    hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown(
-                        &drain_limit, drain_capacity, &drain_token,
-                    ).await;
-                });
-
-                let rep_fut = hyprstream_rpc::service::serve::serve_bridged(
-                    &transport, Arc::clone(&processor), signing_key.clone(),
-                    Arc::clone(&shutdown), on_ready,
-                );
+                let local_shutdown = Arc::new(tokio::sync::Notify::new());
+                let rep_fut = async {
+                    if qc.iroh_required {
+                        // Iroh bind and first publication have completed. Local
+                        // sockets do not gate readiness or serve required RPCs.
+                        // This future may first be polled while draining after
+                        // shutdown won the outer select. Never notify in that case.
+                        if !announcement_cancellation.is_cancelled() {
+                            let _ = hyprstream_rpc::notify::ready();
+                            if let Some(ready) = on_ready { let _ = ready.send(()); }
+                        }
+                        local_shutdown.notified().await;
+                        Ok(())
+                    } else {
+                        hyprstream_rpc::service::serve::serve_bridged(
+                            &transport, Arc::clone(&processor), signing_key.clone(),
+                            Arc::clone(&local_shutdown), on_ready,
+                        ).await
+                    }
+                };
                 let quic_fut = rpc_server.run();
-                let (rep_result, quic_result) = tokio::join!(rep_fut, quic_fut);
-                if let Err(e) = quic_result {
-                    tracing::warn!("QUIC server loop ended with error: {e}");
-                }
+                tokio::pin!(rep_fut, quic_fut);
+                let completed_rep = tokio::select! {
+                    biased;
+                    _ = shutdown.notified() => None,
+                    _ = announcement_cancellation.cancelled() => None,
+                    result = &mut rep_fut => Some(result),
+                    result = &mut quic_fut => {
+                        if let Err(error) = result {
+                            tracing::warn!("QUIC server loop ended with error: {error}");
+                        }
+                        None
+                    }
+                    _ = async {
+                        loop {
+                            match _iroh_substrate_guard.as_ref() {
+                                Some(substrate) if substrate.router().is_shutdown()
+                                    || substrate.endpoint().is_closed() => break,
+                                Some(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        }
+                    } => None,
+                };
+                announcement_cancellation.cancel();
+                // All carriers and the independent bridge consume one grace.
+                // Publishing the deadline starts the bridge drain immediately;
+                // the final shutdown below still joins its owned thread/result.
+                let deadline = bridge.begin_shutdown(
+                    tokio::time::Instant::now() + hyprstream_rpc::transport::rpc_session::DRAIN_TIMEOUT,
+                );
+                local_shutdown.notify_one();
+                drain_token.cancel();
+                let substrate_drain = async {
+                    if let Some(substrate) = _iroh_substrate_guard {
+                        if let Err(error) = substrate.shutdown().await {
+                            tracing::warn!("iroh substrate shutdown error: {error}");
+                        }
+                    }
+                };
+                let quinn_drain = hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown_until(
+                    &drain_limit, drain_capacity, &drain_token, deadline,
+                );
+                let rep_drain = async {
+                    match completed_rep {
+                        Some(result) => result,
+                        None => rep_fut.await,
+                    }
+                };
+                let (_, (), rep_result) = tokio::join!(substrate_drain, quinn_drain, rep_drain);
                 rep_result.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
             } else {
                 hyprstream_rpc::service::serve::serve_bridged(
                     &transport, processor, signing_key, shutdown, on_ready,
                 ).await.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
             }
+            }.await;
+            let teardown = bridge.shutdown().await.map_err(|error| {
+                tracing::error!(%error, "bridge shutdown failed");
+                hyprstream_rpc::error::RpcError::SpawnFailed(error.to_string())
+            });
+            // Always join, while retaining the earlier serving error if both fail.
+            result.and(teardown)
         })
     }
 }
@@ -484,7 +719,8 @@ impl ServiceSpawner {
             ServiceMode::Tokio => self.spawn_tokio(service, registration).await,
             ServiceMode::Thread => self.spawn_thread(service, registration).await,
             ServiceMode::Subprocess { binary } => {
-                self.spawn_subprocess(service, binary.clone(), registration).await
+                self.spawn_subprocess(service, binary.clone(), registration)
+                    .await
             }
         }
     }
@@ -557,7 +793,9 @@ impl ServiceSpawner {
                     tracing::error!("Service {} failed: {}", name_for_thread, e);
                 }
             })
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("thread spawn: {e}")))?;
+            .map_err(|e| {
+                hyprstream_rpc::error::RpcError::SpawnFailed(format!("thread spawn: {e}"))
+            })?;
 
         // Wait for ready signal (sent by service after socket binds)
         if ready_rx.await.is_err() {
@@ -593,8 +831,7 @@ impl ServiceSpawner {
             }
         };
 
-        let process_config =
-            ProcessConfig::new(&name, binary).args(["service", &name]);
+        let process_config = ProcessConfig::new(&name, binary).args(["service", &name]);
 
         let process = spawner.spawn(process_config).await?;
 
@@ -614,14 +851,10 @@ impl ServiceSpawner {
 
         Ok(SpawnedService {
             id: process.id.clone(),
-            kind: ServiceKind::Subprocess {
-                process,
-                pid_file,
-            },
+            kind: ServiceKind::Subprocess { process, pid_file },
             _registration: registration,
         })
     }
-
 }
 
 impl Default for ServiceSpawner {
@@ -679,10 +912,7 @@ impl SpawnedService {
     pub fn subprocess(id: String, process: SpawnedProcess, pid_file: PathBuf) -> Self {
         Self {
             id,
-            kind: ServiceKind::Subprocess {
-                process,
-                pid_file,
-            },
+            kind: ServiceKind::Subprocess { process, pid_file },
             _registration: None,
         }
     }
@@ -696,10 +926,7 @@ impl SpawnedService {
     ) -> Self {
         Self {
             id,
-            kind: ServiceKind::Thread {
-                handle,
-                shutdown,
-            },
+            kind: ServiceKind::Thread { handle, shutdown },
             _registration: registration,
         }
     }
@@ -712,9 +939,10 @@ impl SpawnedService {
     /// Check if the service is running.
     pub fn is_running(&self) -> bool {
         match &self.kind {
-            ServiceKind::TokioTask { handle } => {
-                handle.as_ref().map(hyprstream_rpc::service::ServiceHandle::is_running).unwrap_or(false)
-            }
+            ServiceKind::TokioTask { handle } => handle
+                .as_ref()
+                .map(hyprstream_rpc::service::ServiceHandle::is_running)
+                .unwrap_or(false),
             ServiceKind::Thread { handle, .. } => {
                 handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
             }
@@ -723,11 +951,8 @@ impl SpawnedService {
                 if let Ok(pid_str) = std::fs::read_to_string(pid_file) {
                     if let Ok(pid) = pid_str.trim().parse::<i32>() {
                         // Signal 0 checks if process exists without sending a signal
-                        return nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(pid),
-                            None,
-                        )
-                        .is_ok();
+                        return nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                            .is_ok();
                     }
                 }
                 false
@@ -758,7 +983,11 @@ impl SpawnedService {
                 // Read PID from file and send SIGTERM
                 if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
                     if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                        tracing::info!("Sending SIGTERM to subprocess {} (PID {})", process.id, pid);
+                        tracing::info!(
+                            "Sending SIGTERM to subprocess {} (PID {})",
+                            process.id,
+                            pid
+                        );
                         if let Err(e) = nix::sys::signal::kill(
                             nix::unistd::Pid::from_raw(pid),
                             nix::sys::signal::Signal::SIGTERM,
@@ -967,10 +1196,55 @@ impl Spawnable for DualSpawnable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result as AnyhowResult;
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::prelude::SigningKey;
     use hyprstream_rpc::service::RequestService;
-    use anyhow::Result as AnyhowResult;
+
+    #[tokio::test]
+    async fn native_producer_origins_do_not_expose_sibling_tracks() -> AnyhowResult<()> {
+        let first = producer_moq_origin(true, None, true).ok_or_else(|| anyhow!("native producer origin missing"))?;
+        let second = producer_moq_origin(true, None, true).ok_or_else(|| anyhow!("native producer origin missing"))?;
+        let _broadcast = first.producer().create_broadcast("local/streams/first").ok_or_else(|| anyhow!("first broadcast missing"))?;
+        assert!(first.consumer().announced_broadcast("local/streams/first").await.is_some());
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100),
+            second.consumer().announced_broadcast("local/streams/first")).await.is_err());
+        assert!(producer_moq_origin(true, None, false).is_none());
+        let relayed = producer_moq_origin(true, Some(first), true).ok_or_else(|| anyhow!("relay origin missing"))?;
+        assert!(relayed.consumer().announced_broadcast("local/streams/first").await.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn production_moq_handler_preserves_explicit_ingress_and_defaults_to_denial() {
+        let admission = Arc::new(
+            hyprstream_rpc::transport::moql_admission::MoqlAdmissionAuthenticator::new(
+                Arc::new(|_: &str| None),
+                Arc::new(|_: &hyprstream_rpc::moq_authz::PeerIdentity| None),
+            ),
+        );
+        let producer = hyprstream_rpc::moq_authz::PeerIdentity::authenticated("did:at9p:producer");
+        let authorizer = Arc::new(
+            |peer: &hyprstream_rpc::moq_authz::PeerIdentity, tenant: &str| {
+                peer.subject.as_deref() == Some("did:at9p:producer") && tenant == "local"
+            },
+        );
+
+        let granted = hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new()
+            .with_authz(production_moq_authz(
+                Arc::clone(&admission),
+                Some(authorizer),
+            ));
+        assert!(granted.authorizes_ingress(&producer, "local"));
+        assert!(!granted.authorizes_ingress(&producer, "other"));
+
+        let absent = hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new()
+            .with_authz(production_moq_authz(admission, None));
+        assert!(
+            !absent.authorizes_ingress(&producer, "local"),
+            "an admission-only production handler must remain read-only"
+        );
+    }
 
     /// Test service that includes infrastructure (new pattern)
     struct EchoService {
@@ -980,18 +1254,30 @@ mod tests {
 
     impl EchoService {
         fn new(transport: TransportConfig, signing_key: SigningKey) -> Self {
-            Self { transport, signing_key }
+            Self {
+                transport,
+                signing_key,
+            }
         }
     }
 
     #[async_trait::async_trait(?Send)]
     impl RequestService for EchoService {
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> AnyhowResult<hyprstream_rpc::service::DecodedRequestBody> {
+            Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(
+                signed_body.to_vec(),
+            ))
+        }
+
         async fn handle_request(
             &self,
             _ctx: &hyprstream_rpc::service::EnvelopeContext,
-            payload: &[u8],
+            body: &hyprstream_rpc::service::DecodedRequestBody,
         ) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
-            Ok((payload.to_vec(), None))
+            Ok((body.bytes().to_vec(), None))
         }
 
         fn name(&self) -> &str {
@@ -1004,6 +1290,165 @@ mod tests {
 
         fn signing_key(&self) -> SigningKey {
             self.signing_key.clone()
+        }
+    }
+
+    struct GatedService {
+        echo: EchoService,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        panic_on_drop: bool,
+    }
+
+    impl Drop for GatedService {
+        fn drop(&mut self) {
+            self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(!self.panic_on_drop, "causal service destructor panic");
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl RequestService for GatedService {
+        fn decode_request_body(&self, signed_body: &[u8]) -> AnyhowResult<hyprstream_rpc::service::DecodedRequestBody> {
+            self.echo.decode_request_body(signed_body)
+        }
+        async fn handle_request(
+            &self,
+            _ctx: &hyprstream_rpc::service::EnvelopeContext,
+            body: &hyprstream_rpc::service::DecodedRequestBody,
+        ) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
+            anyhow::bail!("denied request reached handler: {}", body.bytes().len())
+        }
+        async fn verify_claims(&self, _ctx: &mut hyprstream_rpc::service::EnvelopeContext) -> AnyhowResult<()> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            anyhow::bail!("gated claims denial")
+        }
+        fn build_error_payload(&self, _request_id: u64, error: &str) -> Vec<u8> {
+            error.as_bytes().to_vec()
+        }
+        fn name(&self) -> &str { "echo" }
+        fn transport(&self) -> &TransportConfig { &self.echo.transport }
+        fn signing_key(&self) -> SigningKey { self.echo.signing_key.clone() }
+    }
+
+    #[tokio::test]
+    async fn both_inproc_owners_drain_entered_request_with_retained_client() -> AnyhowResult<()> {
+        use hyprstream_rpc::envelope::{EnvelopeVerifyConfig, KeyedPqTrustStore};
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::in_memory::InMemoryTransport;
+        let (key, _) = generate_signing_keypair();
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
+        let mut store = KeyedPqTrustStore::new();
+        store.bind(key.verifying_key().to_bytes(), &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&pq));
+        let store = Arc::new(store);
+        hyprstream_rpc::envelope::install_verify_config(EnvelopeVerifyConfig {
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(store.clone()),
+        })?;
+        for unified in [false, true] {
+            let endpoint = format!("bridge-drain-owner-{unified}");
+            let transport = TransportConfig::inproc(&endpoint);
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let service = GatedService {
+                echo: EchoService::new(transport, key.clone()),
+                entered: entered.clone(), release: release.clone(), dropped: dropped.clone(),
+                panic_on_drop: false,
+            };
+            let owner: Box<dyn Spawnable> = if unified {
+                Box::new(UnifiedServiceConfig::new(service, None))
+            } else { Box::new(service) };
+            let shutdown = Arc::new(Notify::new());
+            struct Cleanup(Arc<Notify>);
+            impl Drop for Cleanup { fn drop(&mut self) { self.0.notify_one(); } }
+            let _cleanup = Cleanup(shutdown.clone());
+            let stopped = shutdown.clone();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::task::spawn_blocking(move || owner.run(stopped, Some(ready_tx)));
+            tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx).await??;
+            let processor = hyprstream_rpc::dial::lookup_inproc(&endpoint)
+                .ok_or_else(|| anyhow::anyhow!("missing ready processor"))?;
+            let client = Arc::new(RpcClientImpl::new(
+                LocalSigner::new(key.clone()), InMemoryTransport::new(processor),
+                Some(key.verifying_key()),
+            ).with_response_pq_store(store.clone()));
+            let caller = client.clone();
+            let response = tokio::spawn(async move { caller.call(b"accepted".to_vec()).await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified()).await?;
+            shutdown.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while hyprstream_rpc::dial::lookup_inproc(&endpoint).is_some() {
+                    tokio::task::yield_now().await;
+                }
+            }).await?;
+            assert!(!task.is_finished(), "owner returned while accepted request is gated");
+            assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+            // Endpoint removal follows admission closure, so this retained
+            // client must be rejected while the accepted call is still gated.
+            assert!(tokio::time::timeout(std::time::Duration::from_secs(5), client.call(b"late".to_vec())).await?.is_err());
+            release.notify_one();
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), response).await???, hyprstream_rpc::service::dispatch::DISPATCH_DENIED.as_bytes());
+            tokio::time::timeout(std::time::Duration::from_secs(5), task).await???;
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "retained client pinned service");
+            assert!(client.call(b"late".to_vec()).await.is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn both_inproc_owners_propagate_destructor_panic() -> AnyhowResult<()> {
+        for unified in [false, true] {
+            let (key, _) = generate_signing_keypair();
+            let service = GatedService {
+                echo: EchoService::new(TransportConfig::inproc(format!("bridge-panic-owner-{unified}")), key),
+                entered: Arc::new(Notify::new()), release: Arc::new(Notify::new()),
+                dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)), panic_on_drop: true,
+            };
+            let owner: Box<dyn Spawnable> = if unified {
+                Box::new(UnifiedServiceConfig::new(service, None))
+            } else { Box::new(service) };
+            let shutdown = Arc::new(Notify::new());
+            struct Cleanup(Arc<Notify>);
+            impl Drop for Cleanup { fn drop(&mut self) { self.0.notify_one(); } }
+            let _cleanup = Cleanup(shutdown.clone());
+            let stopped = shutdown.clone();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::task::spawn_blocking(move || owner.run(stopped, Some(ready_tx)));
+            tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx).await??;
+            shutdown.notify_one();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), task).await??;
+            assert!(result.is_err(), "owner hid bridge destructor panic");
+        }
+        Ok(())
+    }
+
+    fn loop_config(
+        iroh_enabled: bool,
+        iroh_required: bool,
+        on_iroh_bound: Option<Box<dyn FnOnce(String, [u8; 32]) -> anyhow::Result<()> + Send>>,
+    ) -> hyprstream_rpc::service::QuicLoopConfig {
+        hyprstream_rpc::service::QuicLoopConfig {
+            announcement_cancellation: tokio_util::sync::CancellationToken::new(),
+            cert_chain: Vec::new(),
+            key_der: zeroize::Zeroizing::new(Vec::new()),
+            bind_addr: "127.0.0.1:0"
+                .parse()
+                .unwrap_or_else(|error| panic!("test socket address: {error}")),
+            server_name: "service.test".to_owned(),
+            protected_resource_json: None,
+            on_quic_bound: None,
+            iroh_enabled,
+            iroh_required,
+            on_iroh_bound,
+            moq_relay: None,
+            moq_relay_server_identity: None,
+            moq_admission: None,
+            moq_ingress_authorizer: None,
+            moq_admission_proof: None,
         }
     }
 
@@ -1039,5 +1484,152 @@ mod tests {
 
         spawned.stop().await?;
         Ok(())
+    }
+
+    #[test]
+    fn required_profile_rejects_disabled_iroh_at_spawner_seam() {
+        let config = loop_config(false, true, None);
+        let error = match validate_required_iroh_enabled(&config) {
+            Ok(()) => panic!("required profile accepted a disabled Iroh carrier"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("rejects iroh = false"));
+    }
+
+    /// Exercise actual carrier bind and the publication barrier with a real
+    /// lifecycle socket. Each outcome runs in its own process (env/singletons).
+    #[cfg(all(unix, feature = "systemd"))]
+    #[test]
+    fn required_profile_systemd_ready_follows_bind_and_publication() -> AnyhowResult<()> {
+        use std::os::unix::net::UnixDatagram;
+        use std::time::Duration;
+        const CHILD: &str = "HYPRSTREAM_REQUIRED_NOTIFY_TEST";
+        let Ok(outcome) = std::env::var(CHILD) else {
+            for outcome in ["success", "failure", "cancel"] {
+                let status = std::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", "service::spawner::service::tests::required_profile_systemd_ready_follows_bind_and_publication", "--nocapture"])
+                    .env(CHILD, outcome).status()?;
+                anyhow::ensure!(status.success(), "notification case {outcome} failed");
+            }
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let socket_path = dir.path().join("notify.sock");
+        let socket = UnixDatagram::bind(&socket_path)?;
+        socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+        // Isolated child; set before creating any runtime or service threads.
+        std::env::set_var("NOTIFY_SOCKET", &socket_path);
+        let rpc_path = dir.path().join("echo.sock");
+        let (signing_key, _) = generate_signing_keypair();
+        let service = EchoService::new(TransportConfig::ipc(&rpc_path), signing_key);
+        let mut config = loop_config(true, true, None);
+        let certified = rcgen::generate_simple_self_signed(vec!["service.test".to_owned()])?;
+        config.cert_chain = vec![certified.cert.der().to_vec()];
+        config.key_der = zeroize::Zeroizing::new(certified.key_pair.serialize_der());
+        let cancellation = config.announcement_cancellation.clone();
+        let callback_cancellation = cancellation.clone();
+        let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel(1);
+        let (publication_tx, publication_rx) = std::sync::mpsc::sync_channel(1);
+        config.on_iroh_bound = Some(Box::new(move |name, node| {
+            anyhow::ensure!(name == "echo" && node != [0; 32], "actual bound carrier");
+            bound_tx.send(())?;
+            loop {
+                if callback_cancellation.is_cancelled() { anyhow::bail!("publication cancelled"); }
+                match publication_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => anyhow::bail!("publication rejected"),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }));
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_service = Arc::clone(&shutdown);
+        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = Box::new(UnifiedServiceConfig::new(service, Some(config)))
+                .run(shutdown_service, Some(ready_tx));
+            let _ = done_tx.send(result);
+        });
+        bound_rx.recv_timeout(Duration::from_secs(20))?;
+        let mut message = [0; 128];
+        assert!(socket.recv(&mut message).is_err(), "no READY while publication pending");
+        assert!(matches!(ready_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert!(!rpc_path.exists(), "required RPC never binds IPC");
+        match outcome.as_str() {
+            "success" => {
+                publication_tx.send(true)?;
+                socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+                let size = socket.recv(&mut message)?;
+                assert_eq!(&message[..size], b"READY=1");
+                ready_rx.blocking_recv()?;
+                shutdown.notify_one();
+            }
+            "failure" => publication_tx.send(false)?,
+            "cancel" => shutdown.notify_one(),
+            _ => anyhow::bail!("unknown case"),
+        }
+        let result = done_rx.recv_timeout(Duration::from_secs(20))?;
+        worker.join().map_err(|_| anyhow::anyhow!("service thread panicked"))?;
+        assert_eq!(result.is_ok(), outcome == "success");
+        assert!(cancellation.is_cancelled());
+        assert!(!rpc_path.exists());
+        socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+        assert!(socket.recv(&mut message).is_err(), "failure/cancellation cannot emit READY");
+        Ok(())
+    }
+
+    #[test]
+    fn required_profile_requires_announcement_while_compatibility_continues() {
+        let mut required = loop_config(true, true, None);
+        let error = match announce_iroh_bound(required.on_iroh_bound.take(), required.iroh_required, "echo", [0x11; 32]) {
+            Ok(()) => panic!("required profile accepted a missing announcement callback"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("no initial Iroh announcement callback"));
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut compatibility = loop_config(
+            true,
+            false,
+            Some(Box::new({
+                let calls = Arc::clone(&calls);
+                move |_, _| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    anyhow::bail!("announcement unavailable")
+                }
+            })),
+        );
+        if let Err(error) = announce_iroh_bound(compatibility.on_iroh_bound.take(), compatibility.iroh_required, "echo", [0x22; 32]) {
+            panic!("compatibility profile did not continue after announcement failure: {error}");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn required_profile_stop_cancels_pending_first_publication() {
+        let mut config = loop_config(true, true, None);
+        let cancellation = config.announcement_cancellation.clone();
+        let callback_cancellation = cancellation.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        config.on_iroh_bound = Some(Box::new(move |_, _| {
+            let _ = started_tx.send(());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !callback_cancellation.is_cancelled() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            anyhow::bail!("first publication cancelled")
+        }));
+        let shutdown = Notify::new();
+        let (result, ()) = tokio::join!(
+            announce_iroh_bound_until_shutdown(&mut config, "echo", [0x11; 32], &shutdown),
+            async {
+                assert!(started_rx.await.is_ok(), "first callback entered");
+                shutdown.notify_one();
+            },
+        );
+        assert!(result.is_err(), "cancelled first publication cannot permit readiness");
+        assert!(cancellation.is_cancelled(), "shutdown must reach the blocked publication");
     }
 }

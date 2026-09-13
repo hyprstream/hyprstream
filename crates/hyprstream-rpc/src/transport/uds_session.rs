@@ -147,6 +147,15 @@ impl web_transport_trait::SendStream for UdsSendStream {
         wh.write(buf).await.map_err(UdsError::io)
     }
 
+    async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), Self::Error> {
+        // The trait's default `write_chunk` issues a single `write` and silently
+        // discards any unwritten tail. yamux caps each write at its split-send
+        // size (16 KiB), so a larger chunk — e.g. a signed envelope carrying a
+        // hybrid ML-DSA JWT — would be truncated and then FIN'd by the caller.
+        // Loop until the whole chunk is on the stream.
+        self.write_all(&chunk).await
+    }
+
     fn set_priority(&mut self, _order: u8) {
         // yamux has no per-stream priority; no-op.
     }
@@ -587,6 +596,36 @@ mod tests {
         }
         assert_eq!(&got, b"hello");
         srv.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_chunk_larger_than_yamux_split_size_is_not_truncated() {
+        // yamux caps a single poll_write at its split-send size (16 KiB). A
+        // chunk larger than that must still arrive whole: a partial write that
+        // gets FIN'd truncates the message (e.g. a >16 KiB signed envelope
+        // arriving with its capnp length header claiming more words than the
+        // peer received).
+        let (client, server) = session_pair().await;
+
+        let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+
+        let srv = tokio::spawn(async move {
+            let (_send, mut recv) = server.accept_bi().await.unwrap();
+            recv.read_all().await.unwrap()
+        });
+
+        let (mut send, _recv) = client.open_bi().await.unwrap();
+        send.write_chunk(Bytes::from(payload)).await.unwrap();
+        send.finish().unwrap();
+
+        let got = tokio::time::timeout(Duration::from_secs(5), srv)
+            .await
+            .expect("server read timed out")
+            .unwrap();
+        assert_eq!(got.len(), expected.len(), "chunk was truncated in flight");
+        assert_eq!(&got[..], &expected[..]);
+        drop(client);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

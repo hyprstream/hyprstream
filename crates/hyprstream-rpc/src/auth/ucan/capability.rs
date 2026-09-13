@@ -170,6 +170,8 @@ pub enum CaveatValue {
     Int(i64),
     /// A boolean restriction.
     Bool(bool),
+    /// A list-of-strings restriction (e.g. a fixed allowlist).
+    List(Vec<String>),
 }
 
 impl Caveats {
@@ -379,6 +381,21 @@ mod tests {
     }
 
     // ---- set_attenuates --------------------------------------------------
+
+    #[test]
+    fn caveat_value_list_round_trips_through_cbor() {
+        let mut map = BTreeMap::new();
+        map.insert(
+            "allowed_services".to_owned(),
+            CaveatValue::List(vec!["discovery".to_owned(), "policy".to_owned()]),
+        );
+        let capability =
+            Capability::with_caveats(res("mac://model/qwen"), ab("infer"), Caveats(map));
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&capability, &mut bytes).unwrap();
+        let decoded: Capability = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, capability);
+    }
 
     #[test]
     fn set_attenuates_every_claimed_must_be_covered() {

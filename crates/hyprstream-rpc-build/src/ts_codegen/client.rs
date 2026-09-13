@@ -494,6 +494,12 @@ mod browser_binding_tests {
             vfs_bulk: false,
             vfs_hidden: false,
             vfs_mac: String::new(),
+            dispatch_mac: String::new(),
+            dispatch_public: String::new(),
+            mutation_semantics: String::new(),
+            dispatch_mac_present: false,
+            dispatch_public_present: false,
+            mutation_semantics_present: false,
         }
     }
 

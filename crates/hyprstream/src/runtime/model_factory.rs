@@ -30,6 +30,124 @@ fn strict_loader_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Materialize every FP8 weight in `weights` as BF16 once, applying the
+/// companion block-wise `<name>_scale_inv` scales during the conversion, and
+/// drop the scale tensors. Gated by `HYPRSTREAM_FP8_DEQUANT_LOAD` /
+/// [`crate::config::RuntimeConfig::fp8_dequant_load`].
+///
+/// This runs on the raw checkpoint tensor map (all FP8 weights are 2D there,
+/// stored `[out, in]` with scales `[out/128, in/128]`), so a single generic
+/// pass covers every FP8 site downstream — llama-family `LinearProjection`,
+/// Qwen3.5 fused QKV/gate-up projections, MoE expert stacks, and lm_head all
+/// observe plain BF16 weights with no scales, and their lazy per-matmul
+/// dequant branches never trigger. Returns the number of tensors converted.
+pub(crate) fn dequantize_fp8_weights_at_load(weights: &mut HashMap<String, Tensor>) -> usize {
+    #[inline]
+    fn is_fp8(kind: tch::Kind) -> bool {
+        matches!(kind, tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2)
+    }
+
+    let fp8_keys: Vec<String> = weights
+        .iter()
+        .filter(|(name, tensor)| is_fp8(tensor.kind()) && !name.ends_with("_scale_inv"))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut converted = 0;
+
+    for key in fp8_keys {
+        let Some(weight) = weights.remove(&key) else { continue };
+        let scale_key = format!("{key}_scale_inv");
+        let scale = weights.remove(&scale_key);
+        if let Some(s) = &scale {
+            let ws = weight.size();
+            let ss = s.size();
+            if !(ws.len() == 2 && ss.len() == 2 && ws[0] % ss[0] == 0 && ws[1] % ss[1] == 0) {
+                // Non-conforming scale shape: leave the weight FP8 and the scale
+                // in the map untouched. Downstream lazy dequant keeps ownership
+                // of the pair and fails loudly if the shapes really are unusable,
+                // instead of silently running on raw FP8-code magnitudes.
+                warn!(
+                    "FP8 weight '{}' scale shape {:?} does not block-divide weight shape {:?}; \
+                     leaving FP8 + scale untouched for the lazy dequant path",
+                    key, ss, ws
+                );
+                weights.insert(scale_key, s.shallow_clone());
+                weights.insert(key, weight);
+                continue;
+            }
+        }
+        // Block-wise dequantization via 4D broadcast multiply (same math as the
+        // lazy path in `LinearProjection::apply`): scale [r/128, c/128] is
+        // broadcast across each 128-element block. Elementwise per block, so
+        // the stored [out, in] orientation needs no special handling.
+        //
+        // Peak-memory discipline (P2 review): the scale is applied IN PLACE on
+        // the BF16 cast buffer — no second BF16 allocation — and the FP8
+        // source is dropped before the result is retained, so converting one
+        // tensor peaks at FP8 + 1x BF16 instead of the old FP8 + 2x BF16
+        // (out-of-place multiply held all three). With HashMap iteration order
+        // arbitrary, that spike could land on top of the already-converted
+        // bulk of the model and OOM a load whose final BF16 size would fit.
+        let w_bf16 = weight.to_kind(tch::Kind::BFloat16);
+        if let Some(scale) = scale {
+            let ws = w_bf16.size();
+            let ss = scale.size();
+            let block_r = ws[0] / ss[0];
+            let block_c = ws[1] / ss[1];
+            let s_4d = scale.to_kind(tch::Kind::BFloat16).view([ss[0], 1, ss[1], 1]);
+            // In-place broadcast multiply on a block view of the contiguous
+            // BF16 buffer; the buffer already IS the 2D result (the 4D view
+            // is zero-copy). On the (practically unreachable) kernel error,
+            // restore the untouched FP8 weight + scale for the lazy path
+            // rather than retaining an unscaled cast.
+            if let Err(e) = w_bf16.view([ss[0], block_r, ss[1], block_c]).f_mul_(&s_4d) {
+                warn!(
+                    "FP8 weight '{key}' in-place scale multiply failed ({e}); \
+                     leaving FP8 + scale untouched for the lazy dequant path"
+                );
+                drop(w_bf16);
+                weights.insert(scale_key, scale);
+                weights.insert(key, weight);
+                continue;
+            }
+            drop(scale);
+        }
+        drop(weight);
+        weights.insert(key, w_bf16);
+        converted += 1;
+    }
+    converted
+}
+
+/// Run load-time FP8 dequantization when requested — but never for a
+/// multi-device pipeline: every checkpoint tensor is loaded onto the pool's
+/// *primary* device first, so materializing the whole model as BF16 there
+/// (before `stage_from_weights_with_config` spreads layers across the pool)
+/// would peak at full-BF16 on one device and could OOM a model whose BF16
+/// weights only fit across the pool. In that case the flag is ignored with a
+/// warning and the FP8 lazy-dequant path is kept.
+fn maybe_dequantize_fp8_weights_at_load(
+    weights: &mut HashMap<String, Tensor>,
+    fp8_dequant_load: bool,
+    device_pool: Option<&DevicePool>,
+) {
+    if !fp8_dequant_load {
+        return;
+    }
+    if device_pool.is_some_and(|p| !p.is_single()) {
+        warn!(
+            "FP8 dequant-at-load ignored for multi-device pipeline: all weights land on the \
+             primary device before layer distribution, so full-model BF16 materialization \
+             there could OOM; keeping FP8 lazy per-matmul dequant"
+        );
+        return;
+    }
+    let converted = dequantize_fp8_weights_at_load(weights);
+    if converted > 0 {
+        info!("Dequantized {} FP8 weight tensor(s) to BF16 at load", converted);
+    }
+}
+
 /// Glob-fallback shard discovery, shared by the sync/async loader paths.
 ///
 /// Loud by design (#315): a multi-shard model reached via glob (no index.json) is
@@ -192,6 +310,7 @@ impl ModelFactory {
         max_context: Option<usize>,
         kv_quant_type: KVQuantType,
         device_pool: Option<&DevicePool>,
+        fp8_dequant_load: bool,
     ) -> Result<Box<dyn ModelOperations>> {
         info!("Loading model: {}", model_path.display());
         if let Some(mc) = max_context {
@@ -199,6 +318,9 @@ impl ModelFactory {
         }
         if kv_quant_type != KVQuantType::None {
             info!("Using KV cache quantization: {:?}", kv_quant_type);
+        }
+        if fp8_dequant_load {
+            info!("FP8 dequant-at-load enabled: FP8 weights will be materialized as BF16 during load");
         }
         if let Some(pool) = device_pool {
             if !pool.is_single() {
@@ -221,12 +343,12 @@ impl ModelFactory {
                 "📦 Using incremental loading for {} shards",
                 shard_files.len()
             );
-            Self::create_incremental(model_path, device, dtype, shard_files, max_context, kv_quant_type, device_pool).await
+            Self::create_incremental(model_path, device, dtype, shard_files, max_context, kv_quant_type, device_pool, fp8_dequant_load).await
         } else {
             // Standard loading for single files or small models
             let weights = Self::load_weights(model_path, device, dtype).await?;
             let config = ModelConfig::load(model_path, &weights)?;
-            let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type, model_path, device_pool)?;
+            let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type, model_path, device_pool, fp8_dequant_load)?;
             info!("✅ ModelFactory: Model created successfully");
             Ok(model)
         }
@@ -259,6 +381,7 @@ impl ModelFactory {
         kv_quant_type: KVQuantType,
         device_pool: Option<&DevicePool>,
         request: ModelStageRequest,
+        fp8_dequant_load: bool,
     ) -> Result<Box<dyn ModelOperations>> {
         let config_path = model_path.join("config.json");
         if !config_path.is_file() {
@@ -287,9 +410,10 @@ impl ModelFactory {
         )?;
         let metadata = Self::stage_tensor_metadata(&plan).await?;
         Self::validate_stage_tensor_schema(&config, &request.layer_range, &metadata)?;
-        let weights =
+        let mut weights =
             Self::load_weights_for_stage_plan(plan, request.layer_range.clone(), device, dtype)
                 .await?;
+        maybe_dequantize_fp8_weights_at_load(&mut weights, fp8_dequant_load, device_pool);
 
         Self::create_llama_model(
             config,
@@ -425,6 +549,24 @@ impl ModelFactory {
             })
     }
 
+    /// Add the block-wise `<name>_scale_inv` companion of a top-level stage
+    /// tensor when the manifest has one. Layer-prefixed FP8 scales are
+    /// selected automatically by the layer-index filter, but top-level tensors
+    /// (embedding, lm_head) enter the plan by exact name — without this the
+    /// stage loads a scale-less FP8 tensor and `dequantize_fp8_weights_at_load`
+    /// casts raw FP8 codes straight to BF16 (#1519 review). No-op for
+    /// unquantized checkpoints, which have no such key.
+    fn insert_companion_scale(
+        weight_map: &BTreeMap<String, String>,
+        required: &mut BTreeSet<String>,
+        name: &str,
+    ) {
+        let scale = format!("{name}_scale_inv");
+        if weight_map.contains_key(&scale) {
+            required.insert(scale);
+        }
+    }
+
     /// Resolve one stage to exact manifest tensor names grouped by shard.
     ///
     /// The returned map is the complete I/O plan: callers must not open any
@@ -497,11 +639,13 @@ impl ModelFactory {
         let is_first = layer_range.start == 0;
         let is_last = layer_range.end == num_layers;
         if is_first {
-            required.insert(Self::resolve_required_alias(
+            let embed = Self::resolve_required_alias(
                 &index.weight_map,
                 &["model.embed_tokens.weight", "embed_tokens.weight"],
                 "embedding tensor",
-            )?);
+            )?;
+            Self::insert_companion_scale(&index.weight_map, &mut required, &embed);
+            required.insert(embed);
         }
         if is_last {
             required.insert(Self::resolve_required_alias(
@@ -514,6 +658,7 @@ impl ModelFactory {
                 .into_iter()
                 .find(|name| index.weight_map.contains_key(*name))
             {
+                Self::insert_companion_scale(&index.weight_map, &mut required, lm_head);
                 required.insert(lm_head.to_owned());
             } else if !is_first {
                 bail!("a non-first final stage requires an explicit lm_head tensor in weight_map");
@@ -885,6 +1030,7 @@ impl ModelFactory {
         max_context: Option<usize>,
         kv_quant_type: KVQuantType,
         device_pool: Option<&DevicePool>,
+        fp8_dequant_load: bool,
     ) -> Result<Box<dyn ModelOperations>> {
         // For now, we still need to load all weights, but we do it more efficiently
         // by processing shards sequentially and immediately transferring to GPU
@@ -907,7 +1053,7 @@ impl ModelFactory {
 
         // Load config and create model
         let config = ModelConfig::load(model_path, &all_weights)?;
-        let model = Self::create_model_from_config(config, all_weights, device, dtype, max_context, kv_quant_type, model_path, device_pool)?;
+        let model = Self::create_model_from_config(config, all_weights, device, dtype, max_context, kv_quant_type, model_path, device_pool, fp8_dequant_load)?;
 
         info!("Model loaded");
         Ok(model)
@@ -1388,13 +1534,14 @@ impl ModelFactory {
     /// Create model instance from configuration
     fn create_model_from_config(
         config: ModelConfig,
-        weights: HashMap<String, Tensor>,
+        mut weights: HashMap<String, Tensor>,
         device: &Device,
         dtype: DType,
         max_context: Option<usize>,
         kv_quant_type: KVQuantType,
         model_path: &Path,
         device_pool: Option<&DevicePool>,
+        fp8_dequant_load: bool,
     ) -> Result<Box<dyn ModelOperations>> {
         // Run TTN analysis: Tier 1 (embedded) → Tier 2 (cached) → Tier 3 (weight entropy SVD).
         // Weights are available here, enabling Tier 3 for unknown models.
@@ -1403,6 +1550,12 @@ impl ModelFactory {
         if let Err(e) = crate::runtime::ttn_profile::get_layer_profile(model_path, &config, Some(&weights)) {
             tracing::warn!("TTN profile analysis failed (non-fatal): {e}");
         }
+
+        // FP8 dequant-once-at-load: materialize every FP8 weight as BF16 with
+        // its block scale applied, before any architecture constructor consumes
+        // the map. Downstream FP8 lazy-dequant branches then never trigger —
+        // the per-matmul dequant disappears from the hot path.
+        maybe_dequantize_fp8_weights_at_load(&mut weights, fp8_dequant_load, device_pool);
 
         // Multi-device is only wired for Llama-family architectures today (the
         // only family with a `stage_from_weights_with_config` that honors a
@@ -1786,6 +1939,7 @@ impl ModelFactory {
         kv_quant_type: KVQuantType,
         fs: &WorktreeClient,
         device_pool: Option<&DevicePool>,
+        fp8_dequant_load: bool,
     ) -> Result<Box<dyn ModelOperations>> {
         info!("Loading model via FsOps: {}", model_path.display());
 
@@ -1797,7 +1951,7 @@ impl ModelFactory {
 
         let weights = Self::load_weights_fs(fs, &shard_names, device, dtype).await?;
         let config = ModelConfig::load(model_path, &weights)?;
-        let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type, model_path, device_pool)?;
+        let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type, model_path, device_pool, fp8_dequant_load)?;
         info!("Model created successfully via FsOps");
         Ok(model)
     }
@@ -2114,6 +2268,7 @@ mod stage_subset_tests {
             KVQuantType::None,
             None,
             ModelStageRequest { layer_range: 0..1 },
+            false,
         )
         .await
         .err()
@@ -2142,6 +2297,7 @@ mod stage_subset_tests {
             None,
             KVQuantType::None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2153,6 +2309,7 @@ mod stage_subset_tests {
             KVQuantType::None,
             None,
             ModelStageRequest { layer_range: 0..1 },
+            false,
         )
         .await
         .unwrap();
@@ -2170,6 +2327,45 @@ mod stage_subset_tests {
             ),
             "valid complete-range stage forward diverged from ModelFactory::create"
         );
+    }
+
+    #[test]
+    fn stage_weight_plan_includes_top_level_fp8_companion_scales() {
+        // FP8 checkpoints carry block-wise `<name>_scale_inv` companions for
+        // quantized tensors. Layer-prefixed scales enter the stage plan via the
+        // layer-index filter; top-level embedding/lm_head scales must be added
+        // explicitly, or the stage loads a scale-less FP8 tensor and eager
+        // dequant casts raw FP8 codes to BF16 (#1519 Codex review).
+        let dir = tempfile::tempdir().unwrap();
+        let shard = "model-00001-of-00001.safetensors";
+        write_index(
+            dir.path(),
+            &[
+                ("model.embed_tokens.weight", shard),
+                ("model.embed_tokens.weight_scale_inv", shard),
+                ("model.norm.weight", shard),
+                ("lm_head.weight", shard),
+                ("lm_head.weight_scale_inv", shard),
+                ("model.layers.0.self_attn.q_proj.weight", shard),
+                ("model.layers.0.self_attn.q_proj.weight_scale_inv", shard),
+            ],
+        );
+
+        let plan = ModelFactory::stage_weight_plan(dir.path(), 1, 0..1).unwrap();
+        let names: Vec<&str> = plan.values().flatten().map(String::as_str).collect();
+        for expected in [
+            "model.embed_tokens.weight",
+            "model.embed_tokens.weight_scale_inv",
+            "model.norm.weight",
+            "lm_head.weight",
+            "lm_head.weight_scale_inv",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.weight_scale_inv",
+        ] {
+            assert!(names.contains(&expected), "stage plan missing {expected}");
+        }
+        // No phantom scale entries: the plan contains exactly these tensors.
+        assert_eq!(names.len(), 7, "unexpected extra tensors in stage plan");
     }
 
     #[tokio::test]
@@ -2315,6 +2511,7 @@ size 4096\n",
             KVQuantType::None,
             None,
             ModelStageRequest { layer_range: 0..1 },
+            false,
         )
         .await
         .unwrap();
@@ -2413,6 +2610,310 @@ size 4096\n",
         assert!(
             malformed.to_string().contains("valid `weight_map` object"),
             "got: {malformed}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod fp8_dequant_tests {
+    use super::*;
+    use crate::runtime::architectures::llama::LinearProjection;
+    use safetensors::tensor::{serialize, Dtype, TensorView};
+
+    /// FP8 E4M3 byte for an exactly-representable power of two:
+    /// value = (-1)^sign * 2^log2 (S EEEE MMM, exponent bias 7, mantissa 0).
+    fn f8e4m3_pow2(negative: bool, log2: i32) -> u8 {
+        let sign = if negative { 0x80u8 } else { 0 };
+        sign | (((log2 + 7) as u8) << 3)
+    }
+
+    /// Build an FP8 E4M3 weight tensor with a deterministic power-of-two
+    /// pattern (exactly representable in both E4M3 and BF16).
+    fn fp8_weight(rows: i64, cols: i64) -> Tensor {
+        let vals: Vec<f32> = (0..(rows * cols))
+            .map(|i| {
+                let mag = [0.5f32, 1.0, 2.0][(i % 3) as usize];
+                if i % 2 == 1 { -mag } else { mag }
+            })
+            .collect();
+        Tensor::from_slice(&vals)
+            .reshape([rows, cols])
+            .to_kind(DType::Float8e4m3fn)
+    }
+
+    /// Deterministic FP8 weight + companion BF16 block scale (single block).
+    fn fp8_weight_with_scale(rows: i64, cols: i64, scale: f32) -> (Tensor, Tensor) {
+        let weight = fp8_weight(rows, cols);
+        let scale = Tensor::from_slice(&[scale])
+            .reshape([1, 1])
+            .to_kind(DType::BFloat16);
+        (weight, scale)
+    }
+
+    #[test]
+    fn dequant_at_load_materializes_bf16_and_drops_scales() {
+        let (weight, scale) = fp8_weight_with_scale(4, 4, 0.5);
+        let untouched = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).to_kind(DType::BFloat16);
+        let mut weights = HashMap::from([
+            ("w.weight".to_owned(), weight),
+            ("w.weight_scale_inv".to_owned(), scale),
+            ("norm.weight".to_owned(), untouched),
+        ]);
+
+        let converted = dequantize_fp8_weights_at_load(&mut weights);
+
+        assert_eq!(converted, 1);
+        let w = weights.get("w.weight").expect("weight kept");
+        assert_eq!(w.kind(), DType::BFloat16, "FP8 weight must be materialized as BF16");
+        assert!(
+            !weights.contains_key("w.weight_scale_inv"),
+            "block scale must be dropped after load-time dequant"
+        );
+        assert_eq!(
+            weights.get("norm.weight").expect("norm kept").kind(),
+            DType::BFloat16,
+            "non-FP8 tensors untouched"
+        );
+
+        // Values must equal the eager block dequantization: pattern is
+        // ±{0.5, 1, 2} with scale 0.5 → ±{0.25, 0.5, 1} (exact in BF16).
+        let expected: Vec<f32> = (0..16)
+            .map(|i| {
+                let mag = [0.25f32, 0.5, 1.0][(i % 3) as usize];
+                if i % 2 == 1 { -mag } else { mag }
+            })
+            .collect();
+        let expected = Tensor::from_slice(&expected).reshape([4, 4]);
+        let got = w.to_kind(DType::Float);
+        assert!(
+            got.allclose(&expected, 1e-6, 1e-6, false),
+            "load-time dequant values diverged from eager block dequantization"
+        );
+    }
+
+    #[test]
+    fn dequant_at_load_forward_matches_lazy_path() {
+        // Same stored checkpoint tensor map fed through the production
+        // `LinearProjection::take` load path twice: once left FP8 (lazy
+        // per-matmul dequant), once dequantized at load.
+        let mut lazy_weights = HashMap::new();
+        let (w, s) = fp8_weight_with_scale(4, 8, 0.5);
+        lazy_weights.insert("p.weight".to_owned(), w);
+        lazy_weights.insert("p.weight_scale_inv".to_owned(), s);
+        let lazy_proj = LinearProjection::take(&mut lazy_weights, "p.weight").unwrap();
+        assert_eq!(lazy_proj.weight.kind(), DType::Float8e4m3fn);
+        assert!(lazy_proj.scale.is_some());
+
+        let mut eager_weights = HashMap::new();
+        let (w, s) = fp8_weight_with_scale(4, 8, 0.5);
+        eager_weights.insert("p.weight".to_owned(), w);
+        eager_weights.insert("p.weight_scale_inv".to_owned(), s);
+        assert_eq!(dequantize_fp8_weights_at_load(&mut eager_weights), 1);
+        let eager_proj = LinearProjection::take(&mut eager_weights, "p.weight").unwrap();
+        assert_eq!(eager_proj.weight.kind(), DType::BFloat16);
+        assert!(eager_proj.scale.is_none(), "scale must be consumed at load");
+
+        let input_vals: Vec<f32> = (0..8).map(|i| 0.125 * (i as f32 + 1.0)).collect();
+        let input = Tensor::from_slice(&input_vals)
+            .reshape([1, 8])
+            .to_kind(DType::BFloat16);
+        let y_lazy = lazy_proj.apply(&input).to_kind(DType::Float);
+        let y_eager = eager_proj.apply(&input).to_kind(DType::Float);
+        assert_eq!(y_lazy.size(), y_eager.size());
+        assert!(
+            y_lazy.allclose(&y_eager, 1e-3, 1e-3, false),
+            "load-time dequant forward diverged from lazy per-matmul dequant"
+        );
+    }
+
+    #[test]
+    fn dequant_at_load_noop_without_fp8() {
+        let mut weights = HashMap::from([(
+            "w.weight".to_owned(),
+            Tensor::from_slice(&[1.0f32, 2.0]).to_kind(DType::BFloat16),
+        )]);
+        assert_eq!(dequantize_fp8_weights_at_load(&mut weights), 0);
+        assert_eq!(weights["w.weight"].kind(), DType::BFloat16);
+    }
+
+    #[test]
+    fn dequant_at_load_leaves_nonconforming_scale_untouched() {
+        // Scale shape [3, 1] does not block-divide weight [4, 4]: the pair must
+        // be left FP8 + scale for the lazy path (which fails loudly), not cast
+        // to BF16 without scales, and must not count as converted.
+        let (weight, _) = fp8_weight_with_scale(4, 4, 0.5);
+        let bad_scale = Tensor::from_slice(&[0.5f32, 0.5, 0.5])
+            .reshape([3, 1])
+            .to_kind(DType::BFloat16);
+        let mut weights = HashMap::from([
+            ("w.weight".to_owned(), weight),
+            ("w.weight_scale_inv".to_owned(), bad_scale),
+        ]);
+
+        assert_eq!(dequantize_fp8_weights_at_load(&mut weights), 0);
+        assert_eq!(
+            weights["w.weight"].kind(),
+            DType::Float8e4m3fn,
+            "non-conforming weight must stay FP8 for the lazy dequant path"
+        );
+        assert!(
+            weights.contains_key("w.weight_scale_inv"),
+            "non-conforming scale must stay in the map"
+        );
+    }
+
+    /// Byte-level fixture for the end-to-end checkpoint test.
+    struct RawTensor {
+        name: String,
+        dtype: Dtype,
+        shape: Vec<usize>,
+        data: Vec<u8>,
+    }
+
+    impl RawTensor {
+        fn bf16(name: impl Into<String>, shape: &[usize], fill: f32) -> Self {
+            let elements = shape.iter().product();
+            let bits = ((fill.to_bits() >> 16) as u16).to_le_bytes();
+            Self {
+                name: name.into(),
+                dtype: Dtype::BF16,
+                shape: shape.to_vec(),
+                data: (0..elements).flat_map(|_| bits).collect(),
+            }
+        }
+
+        fn f8(name: impl Into<String>, shape: &[usize]) -> Self {
+            let elements = shape.iter().product();
+            Self {
+                name: name.into(),
+                dtype: Dtype::F8_E4M3,
+                shape: shape.to_vec(),
+                data: (0..elements)
+                    .map(|i| f8e4m3_pow2(i % 2 == 1, ((i % 3) as i32) - 1))
+                    .collect(),
+            }
+        }
+
+        fn f8_scale(name: impl Into<String>, scale: f32) -> Self {
+            Self::bf16(name, &[1, 1], scale)
+        }
+    }
+
+    /// Write a tiny Llama checkpoint with every projection weight stored as
+    /// FP8 E4M3 + a 1x1 BF16 block scale (norms/embeddings stay BF16, as in
+    /// real FP8 checkpoints).
+    fn write_tiny_fp8_checkpoint(dir: &Path) {
+        const SHARD: &str = "model-00001-of-00001.safetensors";
+        let mut tensors = vec![
+            RawTensor::bf16("model.embed_tokens.weight", &[8, 4], 0.02),
+            RawTensor::bf16("model.norm.weight", &[4], 1.0),
+        ];
+        let prefix = "model.layers.0";
+        for (suffix, shape) in [
+            ("self_attn.q_proj.weight", vec![4, 4]),
+            ("self_attn.k_proj.weight", vec![4, 4]),
+            ("self_attn.v_proj.weight", vec![4, 4]),
+            ("self_attn.o_proj.weight", vec![4, 4]),
+            ("mlp.gate_proj.weight", vec![8, 4]),
+            ("mlp.up_proj.weight", vec![8, 4]),
+            ("mlp.down_proj.weight", vec![4, 8]),
+        ] {
+            tensors.push(RawTensor::f8(format!("{prefix}.{suffix}"), &shape));
+            tensors.push(RawTensor::f8_scale(
+                format!("{prefix}.{suffix}_scale_inv"),
+                0.5,
+            ));
+        }
+        tensors.push(RawTensor::bf16(
+            format!("{prefix}.input_layernorm.weight"),
+            &[4],
+            1.0,
+        ));
+        tensors.push(RawTensor::bf16(
+            format!("{prefix}.post_attention_layernorm.weight"),
+            &[4],
+            1.0,
+        ));
+
+        let views: Vec<_> = tensors
+            .iter()
+            .map(|tensor| {
+                (
+                    tensor.name.clone(),
+                    TensorView::new(tensor.dtype, tensor.shape.clone(), &tensor.data).unwrap(),
+                )
+            })
+            .collect();
+        let bytes = serialize(views, &None).unwrap();
+        std::fs::write(dir.join(SHARD), bytes).unwrap();
+
+        let weight_map: BTreeMap<_, _> = tensors
+            .iter()
+            .map(|tensor| (tensor.name.clone(), SHARD.to_owned()))
+            .collect();
+        let index = serde_json::json!({ "weight_map": weight_map });
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+
+        let config = serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 2,
+            "vocab_size": 8,
+            "max_position_embeddings": 16,
+            "rms_norm_eps": 0.00001
+        });
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fp8_dequant_load_checkpoint_forward_matches_lazy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tiny_fp8_checkpoint(dir.path());
+
+        let eager = ModelFactory::create(
+            dir.path(),
+            &Device::Cpu,
+            DType::BFloat16,
+            None,
+            KVQuantType::None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let lazy = ModelFactory::create(
+            dir.path(),
+            &Device::Cpu,
+            DType::BFloat16,
+            None,
+            KVQuantType::None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let input = Tensor::from_slice(&[0_i64, 1, 2]).reshape([1, 3]);
+        let eager_logits = eager.forward(&input, None).unwrap().to_kind(DType::Float);
+        let lazy_logits = lazy.forward(&input, None).unwrap().to_kind(DType::Float);
+        assert_eq!(eager_logits.size(), lazy_logits.size());
+        assert!(
+            eager_logits.allclose(&lazy_logits, 1e-3, 1e-3, false),
+            "checkpoint loaded with fp8_dequant_load diverged from lazy-dequant load"
         );
     }
 }

@@ -47,12 +47,52 @@ allow = [
 # Owner-approved first-party AGPL packages. Keep AGPL name-scoped rather than
 # adding it to the global allow list.
 [[licenses.exceptions]]
+name = "hyprstream"
+version = "*"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "hyprstream-appview"
+version = "*"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "hyprstream-discovery"
+version = "*"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
 name = "hyprstream-metrics"
 version = "*"
 allow = ["AGPL-3.0-only"]
 
 [[licenses.exceptions]]
 name = "hyprstream-flight"
+version = "*"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "hyprstream-k8s-pds"
+version = "*"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "hyprstream-ledger"
+version = "*"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "hyprstream-pds"
+version = "*"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "hyprstream-pds-service"
+version = "*"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "hyprstream-service"
 version = "*"
 allow = ["AGPL-3.0-only"]
 

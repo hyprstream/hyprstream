@@ -151,6 +151,9 @@ pub struct McpConfig {
     pub signing_key: SigningKey,
     /// RPC transport for control plane
     pub transport: TransportConfig,
+    /// Policy RPC transport resolved by the factory. This is an IPC socket when
+    /// MCP runs in its own rootless Quadlet process.
+    pub policy_transport: TransportConfig,
     /// Service context for client construction (optional for backward compat)
     pub ctx: Option<Arc<ServiceContext>>,
     /// PolicyService verifying key — used to create the internal PolicyClient
@@ -531,6 +534,7 @@ fn register_scoped_tools_recursive(
                                 dh_public,
                                 reach,
                                 broadcast_path,
+                                moql_server_identity,
                             } = decode_stream_reach(stream_info)?;
                             // #321: derive_client_stream_keys yields the AEAD enc_key.
                             let (mac_key, enc_key, topic) =
@@ -541,13 +545,14 @@ fn register_scoped_tools_recursive(
                                 )?;
                             // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
                             let qos = hyprstream_rpc::stream_info::StreamOpt::default();
-                            let handle = MoqStreamHandle::networked(
+                            let handle = MoqStreamHandle::networked_with_server_identity(
                                 reach,
                                 &qos,
                                 broadcast_path,
                                 mac_key,
                                 enc_key,
                                 topic,
+                                moql_server_identity,
                             );
 
                             Ok(ToolResult::Stream(Box::new(handle)))
@@ -709,6 +714,7 @@ fn register_streaming_tool(
                     dh_public,
                     reach,
                     broadcast_path,
+                    moql_server_identity,
                 } = decode_stream_reach(stream_info)?;
                 // #321: derive_client_stream_keys yields the AEAD enc_key.
                 let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
@@ -718,13 +724,14 @@ fn register_streaming_tool(
                 )?;
                 // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
                 let qos = hyprstream_rpc::stream_info::StreamOpt::default();
-                let handle = MoqStreamHandle::networked(
+                let handle = MoqStreamHandle::networked_with_server_identity(
                     reach,
                     &qos,
                     broadcast_path,
                     mac_key,
                     enc_key,
                     topic,
+                    moql_server_identity,
                 );
 
                 Ok(ToolResult::Stream(Box::new(handle)))
@@ -785,6 +792,8 @@ struct DecodedStreamReach {
     dh_public: [u8; 32],
     reach: Vec<hyprstream_rpc::stream_info::Destination>,
     broadcast_path: String,
+    /// Resolver-verified identity of the server that signed this response.
+    moql_server_identity: hyprstream_rpc::stream_info::MoqlServerIdentity,
 }
 
 /// Decode a streaming response into its moq reach (#356).
@@ -809,6 +818,7 @@ fn decode_stream_reach(
         dh_public: info.dh_public,
         reach: info.announced_at,
         broadcast_path: info.broadcast_path,
+        moql_server_identity: info.moql_server_identity,
     })
 }
 
@@ -936,11 +946,20 @@ impl McpService {
             tool_reg.by_uuid.len(),
         );
 
-        let policy_client = PolicyClient::for_local_bootstrap(
-            config.signing_key.clone(),
-            config.policy_verifying_key,
-            None,
-        )?;
+        // Required profile resolves through the checkpoint-backed discovery
+        // resolver; compatibility dials the factory-resolved deterministic
+        // IPC transport — registry-free, so a separate rootless Quadlet
+        // process can reach the PolicyService socket.
+        let policy_client = if hyprstream_discovery::native_network_required() {
+            PolicyClient::from_resolver(config.signing_key.clone(), None)?
+        } else {
+            PolicyClient::for_local_transport_bootstrap(
+                &config.policy_transport,
+                config.signing_key.clone(),
+                config.policy_verifying_key,
+                None,
+            )?
+        };
 
         Ok(Self {
             registry: Arc::new(RwLock::new(tool_reg)),
@@ -1447,17 +1466,27 @@ impl McpHandler for McpService {
 
 #[async_trait(?Send)]
 impl RequestService for McpService {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        // The ONE bounded decode (v16 §5.2): the generated decoder derives
+        // the full method leaf and returns the decoded message that policy,
+        // MAC, and dispatch below all consume.
+        crate::services::generated::mcp_client::decode_mcp_request_body(signed_body)
+    }
+
     async fn handle_request(
         &self,
         ctx: &crate::services::EnvelopeContext,
-        payload: &[u8],
+        body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> anyhow::Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         trace!(
             "McpService request from {} (id={})",
             ctx.subject(),
             ctx.request_id
         );
-        dispatch_mcp(self, ctx, payload).await
+        dispatch_mcp(self, ctx, body).await
     }
 
     fn name(&self) -> &str {
@@ -1502,6 +1531,26 @@ mod tests {
 
     fn signing_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// MCP must be constructible before any in-process endpoint registry has
+    /// been populated: rootless Quadlets reach Policy through the shared IPC
+    /// socket selected by the factory.
+    #[test]
+    fn mcp_accepts_unregistered_ipc_policy_transport() {
+        let signing_key = signing_key(0x51);
+        let config = McpConfig {
+            verifying_key: signing_key.verifying_key(),
+            signing_key: signing_key.clone(),
+            transport: TransportConfig::ipc("/run/hyprstream/mcp.sock"),
+            policy_transport: TransportConfig::ipc("/run/hyprstream/policy.sock"),
+            ctx: None,
+            policy_verifying_key: signing_key.verifying_key(),
+            expected_audience: None,
+            jwt_key_source: None,
+        };
+
+        assert!(McpService::new(config).is_ok());
     }
 
     /// #989: workflow tools must be advertised to MCP clients. Proves both that
