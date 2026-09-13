@@ -146,10 +146,7 @@ pub trait AtprotoSessionResolver: Send + Sync {
 /// authority-provided [`AtprotoSessionResolver`] is installed.
 pub fn xrpc_session_routes() -> axum::Router<Arc<OAuthState>> {
     use axum::routing::get;
-    axum::Router::new().route(
-        "/xrpc/com.atproto.server.getSession",
-        get(get_session),
-    )
+    axum::Router::new().route("/xrpc/com.atproto.server.getSession", get(get_session))
 }
 
 /// An in-memory snapshot of one repo's signed state — enough to answer the
@@ -3746,9 +3743,8 @@ mod tests {
     #[tokio::test]
     async fn describe_server_advertises_only_configured_account_zone() {
         let mut state = build_test_state(false).await;
-        Arc::get_mut(&mut state)
-            .unwrap()
-            .hosted_account_zone = Some(crate::account::AccountZone::new("acct.example.com").unwrap());
+        Arc::get_mut(&mut state).unwrap().hosted_account_zone =
+            Some(crate::account::AccountZone::new("acct.example.com").unwrap());
         let body = resp_json(describe_server(State(state)).await).await;
         assert_eq!(body["availableUserDomains"], json!([".acct.example.com"]));
     }
@@ -3901,6 +3897,106 @@ mod tests {
                 "route {uri} status mismatch when xrpc_read_slice is enabled"
             );
         }
+    }
+
+    struct SessionProbe {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AtprotoSessionResolver for SessionProbe {
+        async fn resolve_session(&self, did: &str) -> anyhow::Result<Option<AtprotoSessionInfo>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(did, "did:web:pub.example.com");
+            Ok(Some(AtprotoSessionInfo {
+                handle: "pub.example.com".to_owned(),
+                active: true,
+                ..Default::default()
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn router_get_session_authenticates_before_native_resolution() {
+        use std::sync::atomic::Ordering;
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let mut state = build_test_state(true).await;
+        let probe = Arc::new(SessionProbe { calls: 0.into() });
+        Arc::get_mut(&mut state).unwrap().atproto_session_resolver = Some(probe.clone());
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]);
+        Arc::get_mut(&mut state).unwrap().verifying_key_bytes = key.verifying_key().to_bytes();
+        let issuer = state.atproto_issuer_url();
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "did:web:pub.example.com".to_owned(),
+            now,
+            now + 3600,
+        )
+        .with_issuer(issuer.clone())
+        .with_audience(Some(issuer))
+        .with_tenant("session-tests".to_owned())
+        .with_client_id("session-tests")
+        .with_scope(Some("atproto".to_owned()))
+        .with_jti();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]);
+        let app = build_production_app_from_state(state).await;
+        let uri = "/xrpc/com.atproto.server.getSession";
+        assert_eq!(
+            app.clone().oneshot(req(uri)).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut no_scope = claims.clone();
+        no_scope.scope = Some("openid".to_owned());
+        let mut expired = claims.clone();
+        expired.exp = now - 3600;
+        let mut wrong_audience = claims.clone();
+        wrong_audience = wrong_audience.with_audience(Some("https://foreign.example".to_owned()));
+        let mut missing_tenant = claims.clone();
+        missing_tenant.tenant = None;
+        let bound_as_bearer = claims
+            .clone()
+            .with_cnf_jkt_thumbprint("test-proof-key".to_owned());
+        for invalid in [
+            no_scope,
+            expired,
+            wrong_audience,
+            missing_tenant,
+            bound_as_bearer,
+        ] {
+            let token = hyprstream_rpc::auth::jwt::encode(&invalid, &key);
+            let request = HttpRequest::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            assert!(app
+                .clone()
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status()
+                .is_client_error());
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        }
+        let token = hyprstream_rpc::auth::jwt::encode(&claims, &key);
+        let request = HttpRequest::builder()
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            resp_json(response).await,
+            json!({
+                "did": "did:web:pub.example.com", "handle": "pub.example.com", "active": true,
+            })
+        );
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
