@@ -137,7 +137,10 @@ impl Spawnable for OAIService {
             .build()?;
 
         rt.block_on(async move {
-            // Signal ready immediately (don't block on slow operations)
+            // Compatibility mode can signal ready after binding HTTP. Required
+            // mode first completes bounded Model reachability/tenant-denial
+            // and Registry health RPCs through the process-owned bootstrap
+            // Iroh endpoint.
             if let Some(tx) = on_ready {
                 let _ = tx.send(());
             }

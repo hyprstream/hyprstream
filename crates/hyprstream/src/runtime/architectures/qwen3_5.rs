@@ -1488,6 +1488,9 @@ unsafe impl Send for Qwen3_5Model {}
 unsafe impl Sync for Qwen3_5Model {}
 
 impl Qwen3_5Model {
+    /// Construct from caller-owned tensors. Disabled speculation discards any
+    /// MTP tensors already supplied; use ModelFactory to filter them before
+    /// materialization and avoid their temporary device allocation as well.
     pub fn from_weights(
         weights: &mut HashMap<String, Tensor>,
         cfg: Qwen3_5TextConfig,
@@ -1495,6 +1498,7 @@ impl Qwen3_5Model {
         device: &Device,
         dtype: Kind,
         _kv_quant_type: KVQuantType,
+        speculative_decoding: bool,
     ) -> Result<Self> {
         // Normalize weight key prefixes:
         // Qwen3.5 Instruct weights use "model.language_model." and "model.visual." prefixes
@@ -1564,7 +1568,13 @@ impl Qwen3_5Model {
         // MTP (multi-token prediction) head: 1-layer self-speculative draft module.
         // v1 loads dense checkpoints only; MoE MTP blocks (~785 tensors) are a
         // documented follow-up — fall back to non-speculative decode there.
-        let mtp = if weights.keys().any(|k| k.starts_with("mtp.")) {
+        let mtp = if !speculative_decoding {
+            // Factory loading filters these before device allocation. Direct
+            // callers may supply already-materialized tensors; discard them
+            // here too rather than retaining a disabled draft head.
+            weights.retain(|k, _| !k.starts_with("mtp."));
+            None
+        } else if weights.keys().any(|k| k.starts_with("mtp.")) {
             if cfg.is_moe {
                 info!("MTP head present but MoE MTP is not yet supported; skipping mtp.* weights (non-speculative decode)");
                 weights.retain(|k, _| !k.starts_with("mtp."));
@@ -2847,6 +2857,7 @@ mod pipeline_tests {
         let mut w = tiny_weights();
         Qwen3_5Model::from_weights(
             &mut w, tiny_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+            false,
         )
         .unwrap()
     }
@@ -3116,6 +3127,7 @@ mod pipeline_tests {
         }
         let model = Qwen3_5Model::from_weights(
             &mut w, tiny_config(), None, &Device::Cpu, dtype, KVQuantType::None,
+            false,
         )
         .unwrap();
 
@@ -3146,6 +3158,103 @@ mod pipeline_tests {
         let emb = Tensor::randn([1, 3, HIDDEN], (Kind::Float, Device::Cpu));
         assert!(stage.forward_layers_train(&emb, 0..2, None).is_err(), "range below window");
         assert!(stage.forward_layers_train(&emb, 2..LAYERS, None).is_ok(), "owned range ok");
+    }
+
+    /// Regression guard for the causal-mask offset in cached multi-token
+    /// forwards: with `q_len > 1` and `start_pos > 0` the mask must be
+    /// `tril(kv_len - q_len)`, not `tril(0)` — otherwise every cached row
+    /// attends only to the first `i+1` keys and all prompt history is masked
+    /// out. This is exactly the serial partial-prefill shape taken on a session
+    /// prefix-cache hit with a >=2-token suffix. Compares LOGITS (not just
+    /// argmax) at fp tolerance.
+    ///
+    /// Uses an all-full-attention variant of the tiny model so the only
+    /// divergence source is attention itself (the hybrid GDN stack adds ~1e-3
+    /// chunked-vs-recurrent kernel noise, too loose for this guard).
+    #[test]
+    fn cached_two_token_forward_matches_serial_decode_steps() {
+        let allattn_config = || {
+            let mut cfg = tiny_config();
+            cfg.layer_types = (0..cfg.num_hidden_layers)
+                .map(|_| "full_attention".to_owned())
+                .collect();
+            cfg
+        };
+        let build = || {
+            let mut w = tiny_weights();
+            let cfg = allattn_config();
+            // Replace GDN mixers with full-attention ones (deterministic pattern,
+            // same style as tiny_weights).
+            let opt = (Kind::Float, Device::Cpu);
+            let mut seed: i64 = 20_000;
+            let mut pat = |dims: &[i64]| -> Tensor {
+                let n: i64 = dims.iter().product();
+                seed += 7;
+                (Tensor::arange(n, opt) * 0.017 + seed as f64 * 0.013)
+                    .sin()
+                    .reshape(dims)
+                    * 0.05
+            };
+            for i in 0..cfg.num_hidden_layers as usize {
+                if (i + 1) % 4 == 0 {
+                    continue; // already full-attention in tiny_weights
+                }
+                let p = format!("model.layers.{i}");
+                w.retain(|k, _| !k.starts_with(&format!("{p}.linear_attn.")));
+                let ap = format!("{p}.self_attn");
+                w.insert(format!("{ap}.q_proj.weight"), pat(&[HEADS * HEAD_DIM * 2, HIDDEN]));
+                w.insert(format!("{ap}.k_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
+                w.insert(format!("{ap}.v_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
+                w.insert(format!("{ap}.o_proj.weight"), pat(&[HIDDEN, HEADS * HEAD_DIM]));
+                w.insert(format!("{ap}.q_norm.weight"), pat(&[HEAD_DIM]));
+                w.insert(format!("{ap}.k_norm.weight"), pat(&[HEAD_DIM]));
+            }
+            Qwen3_5Model::from_weights(
+                &mut w, allattn_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+                false,
+            )
+            .unwrap()
+        };
+
+        let prompt: [i64; 6] = [1, 5, 9, 2, 7, 3];
+        let prompt_t = Tensor::from_slice(&prompt).reshape([1, prompt.len() as i64]);
+        let pos = prompt.len();
+
+        // Serial reference: prefill, then two one-token decode steps.
+        let serial = build();
+        let _ = serial.forward_with_cache(&prompt_t, 0).unwrap();
+        let step1 = Tensor::from_slice(&[11i64]).reshape([1, 1]);
+        let ref1 = serial.forward_with_cache(&step1, pos).unwrap(); // [1, 1, V]
+        let step2 = Tensor::from_slice(&[13i64]).reshape([1, 1]);
+        let ref2 = serial.forward_with_cache(&step2, pos + 1).unwrap();
+
+        // Cached two-token forward at start_pos=pos (partial-prefill shape).
+        // forward_with_cache returns last-row logits only (#201), so go through
+        // the forward_layers orchestration to get BOTH rows.
+        let cached = build();
+        let _ = cached.forward_with_cache(&prompt_t, 0).unwrap();
+        let pair = Tensor::from_slice(&[11i64, 13]).reshape([1, 2]);
+        let emb = cached.embed_tokens(&pair).unwrap();
+        let h = cached.forward_layers(&emb, 0..cached.num_layers(), pos, None).unwrap();
+        let h = cached.apply_final_norm(&h).unwrap();
+        let logits2 = cached.lm_head(&h).unwrap(); // [1, 2, V]
+
+        for (row, ref_l) in [(0i64, &ref1), (1, &ref2)] {
+            let got = logits2.select(1, row).reshape([-1i64]);
+            let want = ref_l.reshape([-1i64]);
+            let max_diff = (&got - &want).abs().max().double_value(&[]);
+            assert!(
+                got.allclose(&want, 1e-4, 1e-4, false),
+                "cached 2-token forward row {row} diverged from the serial decode step \
+                 (max_diff={max_diff}); the causal mask must keep kv_len - q_len history, \
+                 not tril(0)"
+            );
+            assert_eq!(
+                got.argmax(-1, false).int64_value(&[]),
+                want.argmax(-1, false).int64_value(&[]),
+                "row {row} argmax differs",
+            );
+        }
     }
 }
 
@@ -3207,8 +3316,29 @@ mod mtp_tests {
         let mut w = tiny_weights_mtp();
         Qwen3_5Model::from_weights(
             &mut w, tiny_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+            true,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn mtp_head_obeys_explicit_toml_runtime_setting() {
+        for enabled in [false, true] {
+            let configured = crate::config::RuntimeConfig {
+                speculative_decoding: enabled,
+                use_gpu: false,
+                ..Default::default()
+            };
+            let toml = toml::to_string(&configured).unwrap();
+            let runtime: crate::config::RuntimeConfig = toml::from_str(&toml).unwrap();
+            let mut weights = tiny_weights_mtp();
+            let model = Qwen3_5Model::from_weights(
+                &mut weights, tiny_config(), None, &Device::Cpu, Kind::Float,
+                KVQuantType::None, runtime.speculative_decoding,
+            ).unwrap();
+            assert_eq!(model.has_mtp(), enabled);
+            assert!(!weights.keys().any(|name| name.starts_with("mtp.")));
+        }
     }
 
     /// Greedy argmax of a single position's logits (any leading dims).
@@ -3393,6 +3523,7 @@ mod mtp_tests {
             let mut w = tiny_weights_mtp();
             let mut model = Qwen3_5Model::from_weights(
                 &mut w, tiny_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+                true,
             )
             .unwrap();
             let layers = model.num_layers();
@@ -3563,6 +3694,7 @@ mod mtp_tests {
         let mut w = tiny_weights();
         let model = Qwen3_5Model::from_weights(
             &mut w, tiny_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+            true,
         )
         .unwrap();
         assert!(!model.has_mtp(), "model without mtp.* weights must not speculate");
@@ -3619,6 +3751,7 @@ mod mtp_tests {
             }
             Qwen3_5Model::from_weights(
                 &mut w, allattn_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+                true,
             )
             .unwrap()
         };

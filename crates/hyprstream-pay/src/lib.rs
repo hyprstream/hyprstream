@@ -3,7 +3,8 @@
 //! The **protocol surface** for the pay-wave: `SettlementIssuer` +
 //! `TariffProvider` traits, shared types, capability model, and a client stub.
 //!
-//! This crate is MIT-only (not dual MIT/AGPL like `hyprstream`). It contains
+//! This protocol crate is MIT-only; the Hyprstream application is
+//! AGPL-3.0-only. This crate contains
 //! ONLY the protocol definitions. The AGPL service implementation — which
 //! verifies PQ-hybrid attestations server-side, checks the restricted
 //! settlement store, and calls the ledger's internal credit path — lives in

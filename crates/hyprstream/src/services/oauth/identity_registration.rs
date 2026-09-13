@@ -1720,6 +1720,15 @@ mod tests {
         use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
 
         let storage = tempfile::TempDir::new().unwrap();
+        // Bearer-token verification fails closed without the process-global
+        // revocation store (one canonical store; no per-service plumbing).
+        // Install an in-memory authority when no other test in this binary
+        // got there first.
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
         let certified =
             rcgen::generate_simple_self_signed(vec!["pds.example.test".to_owned()]).unwrap();
         let cert_path = storage.path().join("quic-cert.pem");
@@ -1735,12 +1744,16 @@ mod tests {
             ..AccountZoneConfig::default()
         };
         let quic = QuicConfig {
+            event_publishers: Default::default(),
+            stream_publishers: Default::default(),
+            moql_subject_tenants: Default::default(),
             enabled: true,
             bind_addr: "127.0.0.1:4433".to_owned(),
             server_name: "pds.example.test".to_owned(),
             cert_path: cert_path.to_string_lossy().into_owned(),
             key_path: key_path.to_string_lossy().into_owned(),
             iroh: false,
+            native_network_profile: crate::config::NativeNetworkProfile::Compatibility,
             relay: String::new(),
         };
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x53; 32]);
@@ -2065,7 +2078,8 @@ mod tests {
             now + 60,
         )
         .with_issuer("https://pds.example.test".to_owned())
-        .with_audience(Some("https://pds.example.test".to_owned()));
+        .with_audience(Some("https://pds.example.test".to_owned()))
+        .with_client_id("hyprstream-oauth-client-1");
         let token = hyprstream_rpc::auth::jwt::encode(&claims, &fixture.signing_key);
         let response = super::super::create_app(Arc::clone(&fixture.state), &fixture.cors)
             .oneshot(post(

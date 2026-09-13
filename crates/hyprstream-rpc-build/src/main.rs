@@ -70,6 +70,7 @@ fn main() {
 
     // Parse all schemas
     let mut schemas = Vec::new();
+    let mut parse_errors = Vec::new();
     for (name, path) in &cgr_files {
         match hyprstream_rpc_build::schema::cgr_reader::parse_from_cgr_path(path, name) {
             Ok(schema) => {
@@ -82,9 +83,21 @@ fn main() {
                 schemas.push((name.clone(), schema));
             }
             Err(e) => {
-                eprintln!("  Warning: Failed to parse {name}.cgr: {e}");
+                eprintln!("  Error: Failed to parse {name}.cgr: {e}");
+                parse_errors.push(format!("{name}.cgr: {e}"));
             }
         }
+    }
+
+    if !parse_errors.is_empty() {
+        eprintln!(
+            "Refusing to generate partial TypeScript output; {} schema(s) failed to parse:",
+            parse_errors.len()
+        );
+        for error in parse_errors {
+            eprintln!("  {error}");
+        }
+        std::process::exit(1);
     }
 
     // Create output directory

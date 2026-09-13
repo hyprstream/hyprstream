@@ -279,12 +279,15 @@ visual.merger.mlp.2.weight                             [out_hidden_size, out_hid
 
 Dense checkpoints ship a 1-layer MTP (multi-token prediction) head under the
 `mtp.*` prefix. When `RuntimeConfig::speculative_decoding` is on
-(`HYPRSTREAM_SPECULATIVE_DECODE=1`), the engine drafts 1 token per decode step
+(runtime TOML or `HYPRSTREAM_SPECULATIVE_DECODE=1`), the engine drafts 1 token per decode step
 with the MTP head and verifies it in the next main-model forward: greedy
 exact-match accept emits 2 tokens, reject emits the verifier's token and
 rewinds (SSM snapshot restore + KV `truncate_to` + a 1-token re-forward to
-re-sync the GDN conv/rec state). Without the flag the head is loaded but
-unused. MoE checkpoints carry a full MoE MLP in the MTP block (~785 tensors);
+re-sync the GDN conv/rec state). With the flag off, the normal, sharded, and
+FsOps loaders skip `mtp.*` before tensor construction or device transfer.
+Direct `Qwen3_5Model::from_weights` callers also pass the flag explicitly;
+disabled construction discards their already-materialized MTP tensors, but
+cannot undo allocation performed by the caller. MoE checkpoints carry a full MoE MLP in the MTP block (~785 tensors);
 v1 skips those (`mtp.*` dropped with a log line) and decodes non-speculatively.
 
 ```
@@ -370,4 +373,3 @@ handled by `ToolCallFormat::Qwen35XmlParam` in `crates/hyprstream/src/api/tools.
 7. **Q gate split**: `q_proj` output dim is `num_heads * head_dim * 2`. Reshape and split along last dim to get query and gate tensors.
 
 8. **MoE routing normalization**: top-k weights are normalized post-softmax (divide by sum of selected weights). Shared expert output is added unconditionally.
-

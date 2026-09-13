@@ -217,7 +217,14 @@ struct VerifiedSubjectEntry {
     context: SecurityContext,
     tenant: Option<String>,
     expires_at: i64,
-    jti: Option<String>,
+    /// Issuer-scoped credential ID `(iss, jti/cti)` this entry was derived
+    /// from. Typed so eviction targets the exact credential without
+    /// cross-issuer or JWT/CWT ambiguity.
+    credential_id: Option<crate::auth::CredentialId>,
+    /// Issuer-scoped session ID `(iss, sid)` this entry was derived from, if
+    /// the credential carried one. Revalidated against the canonical session
+    /// registry on every read, exactly like the credential ID.
+    session_key: Option<crate::auth::SessionKey>,
     generation: u64,
 }
 
@@ -232,20 +239,19 @@ fn verified_subjects() -> &'static RwLock<VerifiedSubjectCache> {
     SUBJECTS.get_or_init(|| RwLock::new(VerifiedSubjectCache::default()))
 }
 
-/// Revoke every cached subject context derived from `jti`.
+/// Revoke every cached subject context derived from the given credential.
 ///
-/// The shared in-memory JTI blocklist calls this hook on every revocation, so
-/// VFS/CAS/MoQ lookups cannot continue using authority cached before the
-/// blocklist update.
-pub fn revoke_verified_subject_jti(jti: &str) -> usize {
-    if jti.is_empty() {
-        return 0;
-    }
+/// The shared credential-revocation store calls this hook on every
+/// revocation, so VFS/CAS/MoQ lookups cannot continue using authority
+/// cached before the blocklist update. The typed `CredentialId` ensures
+/// only entries derived from the exact `(iss, jti/cti)` pair are evicted
+/// — no cross-issuer or JWT/CWT ambiguity.
+pub fn revoke_verified_subject_credential(id: &crate::auth::CredentialId) -> usize {
     let mut cache = verified_subjects().write();
     let before = cache.subjects.len();
     cache
         .subjects
-        .retain(|_, entry| entry.jti.as_deref() != Some(jti));
+        .retain(|_, entry| entry.credential_id.as_ref() != Some(id));
     before.saturating_sub(cache.subjects.len())
 }
 
@@ -307,6 +313,95 @@ pub fn remember_verified_claims(
     let Some(context) = claims.security_context(key_material) else {
         return;
     };
+    // Derive the JWT credential ID from `(iss, jti)`. CWT credential paths
+    // use [`remember_verified_claims_with_credential`] with an explicit CWT
+    // CredentialId so `cti` bytes are never stringified.
+    let credential_id = claims
+        .jti
+        .as_ref()
+        .map(|jti| crate::auth::CredentialId::jwt(&claims.iss, jti));
+    // Exact-one session parsing (v16 §3.3): a credential with ambiguous or
+    // malformed session claims is never cached — without a cache entry every
+    // PEP read misses and denies (fail-closed).
+    let Ok(session_key) = claims.session_key() else {
+        return;
+    };
+    insert_verified_subject_entry(
+        name,
+        context,
+        verified_tenant,
+        claims.exp,
+        credential_id,
+        session_key,
+    );
+}
+
+/// Cache a verified-Claims binding with an explicit [`CredentialId`],
+/// for credential encodings whose identifier is not derivable from
+/// `Claims::jti` (notably CWT `cti` byte strings).
+///
+/// This is the **only** insertion path for CWT credentials. It repeats
+/// every invariant check that [`remember_verified_claims`] enforces:
+/// `sub` must match `subject.name()`, `exp` must be in the future,
+/// `security_context` must be derivable from `Claims × VerifiedKeyMaterial`,
+/// and the credential ID's issuer must match `claims.iss`.
+/// The cache entry is keyed by the caller-supplied `credential_id`, so
+/// eviction targets the exact `(iss, jti/cti)` pair.
+///
+/// `credential_id.issuer` MUST equal `claims.iss`. This prevents a caller
+/// from attaching a credential ID from a different issuer to a cache
+/// entry, which would break issuer-scoped eviction.
+pub fn remember_verified_claims_with_credential(
+    subject: &Subject,
+    claims: &crate::auth::Claims,
+    key_material: VerifiedKeyMaterial,
+    verified_tenant: Option<&str>,
+    credential_id: crate::auth::CredentialId,
+) {
+    use super::SubjectContextClaims as _;
+
+    let Some(name) = subject.name() else {
+        return;
+    };
+    if claims.exp <= chrono::Utc::now().timestamp() {
+        return;
+    }
+    if claims.sub != name {
+        return;
+    }
+    let Some(context) = claims.security_context(key_material) else {
+        return;
+    };
+    // The credential ID's issuer must match the claims' issuer, so
+    // issuer-scoped eviction cannot be subverted by attaching a
+    // foreign-issuer credential ID.
+    if !credential_id.is_valid() || credential_id.issuer != claims.iss {
+        return;
+    }
+    // Exact-one session parsing (v16 §3.3): a credential with ambiguous or
+    // malformed session claims is never cached — without a cache entry every
+    // PEP read misses and denies (fail-closed).
+    let Ok(session_key) = claims.session_key() else {
+        return;
+    };
+    insert_verified_subject_entry(
+        name,
+        context,
+        verified_tenant,
+        claims.exp,
+        Some(credential_id),
+        session_key,
+    );
+}
+
+fn insert_verified_subject_entry(
+    name: &str,
+    context: SecurityContext,
+    verified_tenant: Option<&str>,
+    expires_at: i64,
+    credential_id: Option<crate::auth::CredentialId>,
+    session_key: Option<crate::auth::SessionKey>,
+) {
     let mut cache = verified_subjects().write();
     let generation = cache.generation;
     cache.subjects.insert(
@@ -314,8 +409,9 @@ pub fn remember_verified_claims(
         VerifiedSubjectEntry {
             context,
             tenant: verified_tenant.map(str::to_owned),
-            expires_at: claims.exp,
-            jti: claims.jti.clone(),
+            expires_at,
+            credential_id,
+            session_key,
             generation,
         },
     );
@@ -323,38 +419,114 @@ pub fn remember_verified_claims(
 
 /// Resolve a VFS/CAS/MoQ subject through the verified-Claims cache and current
 /// activation mode.  Tenant mismatch is a hard miss.
-#[must_use]
-pub fn subject_context(
+///
+/// Revocation revalidation: a cache hit whose entry carries a credential ID
+/// is revalidated against the process-global credential-revocation store on
+/// EVERY read — in non-policy processes that is one authority RPC per hit,
+/// which is deliberate strict observation, mirroring the per-request check in
+/// `verify_claims`. A revoked credential, an absent store, or an unreachable
+/// authority (the store's own fail-closed `true`) all evict the entry and
+/// deny. Entries without a credential ID keep the cache-only behavior.
+///
+/// Session revalidation: a hit whose entry carries a session ID is likewise
+/// revalidated against the process-global session registry on every read — a
+/// revoked, expired, or unknown session, an absent registry, or an
+/// unreachable authority all evict the entry and deny (v16 §3.3: session
+/// revocation rejects every carrying credential).
+pub async fn subject_context(
     subject: &Subject,
     verified_tenant: Option<&str>,
 ) -> Option<SecurityContext> {
-    let verified = subject.name().and_then(|name| {
-        let now = chrono::Utc::now().timestamp();
-        let mut cache = verified_subjects().write();
-        let entry = cache.subjects.get(name)?.clone();
-        if entry.generation != cache.generation {
-            cache.subjects.remove(name);
-            return None;
-        }
-        if entry.expires_at <= now {
-            cache.subjects.remove(name);
-            return None;
-        }
-        if let Some(expected) = verified_tenant {
-            if entry.tenant.as_deref() != Some(expected) {
-                return None;
+    subject_context_with(
+        crate::auth::global_credential_revocation_store().map(std::convert::AsRef::as_ref),
+        crate::auth::global_session_registry().map(std::convert::AsRef::as_ref),
+        subject,
+        verified_tenant,
+    )
+    .await
+}
+
+/// [`subject_context`] against explicit authority handles instead of the
+/// process-global ones. `None` behaves exactly like an unpublished global:
+/// credential-bearing and session-bearing hits fail closed.
+pub async fn subject_context_with(
+    store: Option<&dyn crate::auth::CredentialRevocationStore>,
+    session_registry: Option<&dyn crate::auth::SessionRegistry>,
+    subject: &Subject,
+    verified_tenant: Option<&str>,
+) -> Option<SecurityContext> {
+    let verified = match subject.name() {
+        Some(name) => {
+            // Sync screening pass (unchanged rules): generation, expiry,
+            // tenant. A miss here never reaches the store.
+            let entry = {
+                let now = chrono::Utc::now().timestamp();
+                let mut cache = verified_subjects().write();
+                match cache.subjects.get(name) {
+                    Some(entry) => {
+                        let entry = entry.clone();
+                        if entry.generation != cache.generation || entry.expires_at <= now {
+                            cache.subjects.remove(name);
+                            None
+                        } else if let Some(expected) = verified_tenant {
+                            if entry.tenant.as_deref() != Some(expected) {
+                                None
+                            } else {
+                                Some(entry)
+                            }
+                        } else {
+                            Some(entry)
+                        }
+                    }
+                    None => None,
+                }
+            };
+            match entry {
+                Some(entry) => {
+                    // Revalidate the credential AND the session when both are
+                    // present — a revocation of either rejects the entry.
+                    if let Some(ref credential_id) = entry.credential_id {
+                        let revoked = match store {
+                            Some(store) => store.is_revoked(credential_id).await,
+                            // No authority handle published — fail closed.
+                            None => true,
+                        };
+                        if revoked {
+                            revoke_verified_subject_credential(credential_id);
+                            return global_mac_activation_control().select_context(None);
+                        }
+                    }
+                    if let Some(ref session_key) = entry.session_key {
+                        let session_revoked = match session_registry {
+                            Some(registry) => registry.is_revoked(session_key).await,
+                            // No session authority handle published — fail closed.
+                            None => true,
+                        };
+                        if session_revoked {
+                            let mut cache = verified_subjects().write();
+                            cache.subjects.remove(name);
+                            return global_mac_activation_control().select_context(None);
+                        }
+                    }
+                    Some(entry.context)
+                }
+                None => None,
             }
         }
-        Some(entry.context)
-    });
+        None => None,
+    };
     global_mac_activation_control().select_context(verified)
 }
+
+/// Test lock for tests that touch the global verified-subjects cache.
+/// All tests across modules that insert/evict/flush cache entries MUST
+/// acquire this lock to prevent parallel test interference.
+#[cfg(test)]
+pub(crate) static CACHE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     fn report(complete: bool) -> GenesisReport {
         GenesisReport {
@@ -370,7 +542,7 @@ mod tests {
 
     #[test]
     fn widening_requires_complete_coverage_and_narrowing_is_always_available() {
-        let _guard = TEST_LOCK.lock();
+        let _guard = CACHE_TEST_LOCK.lock();
         let control = MacActivationControl::default();
         let incomplete = report(false);
         let mut evidence = MacActivationEvidence {
@@ -393,7 +565,7 @@ mod tests {
 
     #[test]
     fn unverified_attach_transport_structurally_blocks_g2_widening() {
-        let _guard = TEST_LOCK.lock();
+        let _guard = CACHE_TEST_LOCK.lock();
         let control = MacActivationControl::default();
         control.block_unverified_attach_transport("worker-uds-vsock");
 
@@ -416,7 +588,7 @@ mod tests {
 
     #[test]
     fn jti_revocation_and_generation_rotation_evict_cached_subjects() {
-        let _guard = TEST_LOCK.lock();
+        let _guard = CACHE_TEST_LOCK.lock();
         flush_verified_subject_cache_generation();
 
         let now = chrono::Utc::now().timestamp();
@@ -424,6 +596,7 @@ mod tests {
             crate::auth::Claims::new("did:web:alice".to_owned(), now, now + 300).with_clearance(
                 SecurityLabel::new(Level::Secret, Assurance::Classical, CompartmentSet::EMPTY),
             );
+        claims.iss = "https://local.example".to_owned();
         claims.jti = Some("revocable-jti".to_owned());
         let subject = Subject::new("did:web:alice");
         remember_verified_claims(
@@ -434,8 +607,13 @@ mod tests {
         );
 
         assert_eq!(verified_subjects().read().subjects.len(), 1);
-        assert_eq!(revoke_verified_subject_jti("other-jti"), 0);
-        assert_eq!(revoke_verified_subject_jti("revocable-jti"), 1);
+        let other_id = crate::auth::CredentialId::jwt("https://local.example", "other-jti");
+        let revocable_id = crate::auth::CredentialId::jwt("https://local.example", "revocable-jti");
+        let cross_issuer_id = crate::auth::CredentialId::jwt("https://other.example", "revocable-jti");
+        assert_eq!(revoke_verified_subject_credential(&other_id), 0);
+        assert_eq!(revoke_verified_subject_credential(&cross_issuer_id), 0,
+            "same jti from a different issuer must NOT evict");
+        assert_eq!(revoke_verified_subject_credential(&revocable_id), 1);
         assert!(verified_subjects().read().subjects.is_empty());
 
         remember_verified_claims(
@@ -448,5 +626,52 @@ mod tests {
         let new_generation = flush_verified_subject_cache_generation();
         assert!(new_generation >= old_generation);
         assert!(verified_subjects().read().subjects.is_empty());
+    }
+
+    /// Exact-one session parsing at the CACHE-INSERTION boundary (v16 §3.3): a
+    /// credential carrying BOTH `sid` and `workload_session_id` is ambiguous
+    /// and is NEVER cached — without a cache entry every PEP read misses and
+    /// denies (fail-closed), so an active OIDC sid can never mask a revoked or
+    /// unknown workload session through a stale cached context.
+    #[test]
+    fn ambiguous_session_claims_are_never_cached() {
+        let _guard = CACHE_TEST_LOCK.lock();
+        flush_verified_subject_cache_generation();
+        assert!(verified_subjects().read().subjects.is_empty());
+
+        let now = chrono::Utc::now().timestamp();
+        let clearance =
+            SecurityLabel::new(Level::Secret, Assurance::Classical, CompartmentSet::EMPTY);
+        let mut ambiguous = crate::auth::Claims::new("did:web:alice".to_owned(), now, now + 300)
+            .with_clearance(clearance)
+            .with_sid("oidc-1")
+            .with_workload_session_id("wl-1");
+        ambiguous.iss = "https://local.example".to_owned();
+        ambiguous.jti = Some("ambiguous-jti".to_owned());
+        remember_verified_claims(
+            &Subject::new("did:web:alice"),
+            &ambiguous,
+            VerifiedKeyMaterial::Classical,
+            Some("tenant-a"),
+        );
+        assert!(
+            verified_subjects().read().subjects.is_empty(),
+            "a credential with ambiguous session claims must never be cached"
+        );
+
+        // Control: a well-formed single-session credential IS cached.
+        let mut ok = crate::auth::Claims::new("did:web:alice".to_owned(), now, now + 300)
+            .with_clearance(clearance)
+            .with_sid("oidc-1");
+        ok.iss = "https://local.example".to_owned();
+        ok.jti = Some("ok-jti".to_owned());
+        remember_verified_claims(
+            &Subject::new("did:web:alice"),
+            &ok,
+            VerifiedKeyMaterial::Classical,
+            Some("tenant-a"),
+        );
+        assert_eq!(verified_subjects().read().subjects.len(), 1);
+        flush_verified_subject_cache_generation();
     }
 }

@@ -9,7 +9,7 @@
 //! ```text
 //! ProcessSpawner (raw process management)
 //!     ├── StandaloneBackend (tokio::process::Command)
-//!     │   └── .kill_on_drop(true) for cleanup
+//!     │   └── .kill_on_drop(false): adopted daemons outlive the launcher
 //!     │
 //!     └── SystemdBackend (systemd-run)
 //!         └── Transient units in hyprstream-workers.slice
@@ -54,9 +54,38 @@ pub use service::{
 };
 pub use systemd::SystemdBackend;
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-use hyprstream_rpc::error::Result;
+use hyprstream_rpc::error::{Result, RpcError};
+
+/// Readiness policy for a spawned child process (#1585).
+///
+/// The policy gates when a spawn is reported as successful. It is a
+/// lifecycle gate, not application authentication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessReadiness {
+    /// Report success as soon as the child is spawned (legacy behavior).
+    Immediate,
+    /// Wait for the child's own `READY=1` sd_notify datagram on a per-child
+    /// notification endpoint before reporting success. The sender PID must
+    /// match the spawned child; a child exit or the hard timeout fails the
+    /// spawn, and the child is terminated/reaped and its artifacts cleaned up.
+    ///
+    /// Platform support: the credential-authenticated receiver
+    /// (`SO_PASSCRED`/`SCM_CREDENTIALS`, exact child-PID matching) is
+    /// implemented for Linux/Android only. On other targets a Notify request
+    /// is refused with an explicit error BEFORE the child is spawned and
+    /// before any launch side effect; it is never silently downgraded to
+    /// [`ProcessReadiness::Immediate`], and no unauthenticated receiver
+    /// exists. This is a launcher lifecycle boundary: the Required
+    /// networking profile itself predates this readiness policy and is a
+    /// distinct concern.
+    Notify {
+        /// Hard bound on how long the child has to report readiness.
+        timeout: std::time::Duration,
+    },
+}
 
 /// Configuration for spawning a daemon process.
 #[derive(Debug, Clone)]
@@ -68,7 +97,7 @@ pub struct ProcessConfig {
     pub executable: PathBuf,
 
     /// Command-line arguments.
-    pub args: Vec<String>,
+    pub args: Vec<OsString>,
 
     /// Working directory.
     pub working_dir: Option<PathBuf>,
@@ -87,6 +116,9 @@ pub struct ProcessConfig {
 
     /// Whether to restart on failure (systemd only).
     pub restart_on_failure: bool,
+
+    /// When the spawn may be reported as started (#1585).
+    pub readiness: ProcessReadiness,
 }
 
 impl ProcessConfig {
@@ -102,14 +134,22 @@ impl ProcessConfig {
             cpu_quota: None,
             unit_properties: Vec::new(),
             restart_on_failure: false,
+            readiness: ProcessReadiness::Immediate,
         }
+    }
+
+    /// Require the child's own `READY=1` notification within `timeout`
+    /// before the spawn reports success (#1585).
+    pub fn with_notify_ready(mut self, timeout: std::time::Duration) -> Self {
+        self.readiness = ProcessReadiness::Notify { timeout };
+        self
     }
 
     /// Set command-line arguments.
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: Into<OsString>,
     {
         self.args = args.into_iter().map(Into::into).collect();
         self
@@ -160,6 +200,10 @@ pub struct SpawnedProcess {
 
     /// Process kind (direct or systemd).
     pub kind: ProcessKind,
+
+    /// The PID file this spawn published, if any; `stop` removes it so a
+    /// stopped child leaves no stale artifact (#1585).
+    pub pid_file: Option<PathBuf>,
 }
 
 impl SpawnedProcess {
@@ -168,7 +212,14 @@ impl SpawnedProcess {
         Self {
             id: id.into(),
             kind,
+            pid_file: None,
         }
+    }
+
+    /// Attach the PID file this spawn published, for cleanup on stop (#1585).
+    pub fn with_pid_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.pid_file = Some(path.into());
+        self
     }
 
     /// Get the process ID.
@@ -237,6 +288,18 @@ pub trait SpawnerBackend: Send + Sync {
 
     /// Check if a process is still running.
     async fn is_running(&self, process: &SpawnedProcess) -> Result<bool>;
+
+    /// Synchronous bounded stop of a TRACKED direct child, used only by the
+    /// launch-transaction guard's `Drop` for cancellation cleanup where no
+    /// async runtime work is guaranteed (#1585). Backends that retain child
+    /// handles override this to stop through the retained handle — never a
+    /// blind by-PID signal; the default fails honestly.
+    fn stop_tracked_child_sync(&self, process: &SpawnedProcess) -> Result<()> {
+        let _ = process;
+        Err(RpcError::InvalidOperation(
+            "backend does not support synchronous tracked-child stop".to_owned(),
+        ))
+    }
 
     /// Get the backend type name.
     fn backend_type(&self) -> &'static str;

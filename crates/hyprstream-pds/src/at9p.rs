@@ -147,6 +147,9 @@ pub struct ServiceEndpoint {
     pub node_id: Option<String>,
     pub relay: Option<String>,
     pub export: Option<String>,
+    /// Hybrid request-encryption public material bound by the signed capsule.
+    /// Absent on older identities; encrypted offline bootstrap requires it.
+    pub request_kem: Option<Vec<u8>>,
 }
 
 impl ServiceEndpoint {
@@ -157,6 +160,7 @@ impl ServiceEndpoint {
             node_id: None,
             relay: None,
             export: None,
+            request_kem: None,
         };
         endpoint.validate()?;
         Ok(endpoint)
@@ -167,6 +171,9 @@ impl ServiceEndpoint {
         validate_optional_no_ws(self.node_id.as_deref(), "service endpoint nodeId")?;
         validate_optional_no_ws(self.relay.as_deref(), "service endpoint relay")?;
         validate_optional_no_ws(self.export.as_deref(), "service endpoint export")?;
+        if let Some(key) = &self.request_kem {
+            ensure!(!key.is_empty() && key.len() <= 4096, "invalid endpoint request KEM length");
+        }
         Ok(())
     }
 
@@ -187,13 +194,16 @@ impl ServiceEndpoint {
         if let Some(export) = &self.export {
             fields.push(("export", DagCbor::Text(export.clone())));
         }
+        if let Some(key) = &self.request_kem {
+            fields.push(("requestKem", DagCbor::Bytes(key.clone())));
+        }
         DagCbor::str_map(fields)
     }
 
     fn from_value(value: &DagCbor) -> Result<Self> {
         reject_unknown(
             value,
-            &["address", "transport", "nodeId", "relay", "export"],
+            &["address", "transport", "nodeId", "relay", "export", "requestKem"],
             "at9p service endpoint",
         )?;
         let endpoint = Self {
@@ -206,6 +216,11 @@ impl ServiceEndpoint {
             node_id: optional_str(value, "nodeId")?.map(str::to_owned),
             relay: optional_str(value, "relay")?.map(str::to_owned),
             export: optional_str(value, "export")?.map(str::to_owned),
+            request_kem: match value.get("requestKem") {
+                Some(DagCbor::Bytes(key)) => Some(key.clone()),
+                Some(_) => bail!("endpoint requestKem must be bytes"),
+                None => None,
+            },
         };
         endpoint.validate()?;
         Ok(endpoint)

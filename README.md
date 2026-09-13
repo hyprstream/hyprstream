@@ -119,6 +119,15 @@ A multi-variant flake builds CPU, CUDA, and ROCm packages:
 nix build github:hyprstream/hyprstream#cpu     # or #cuda / #rocm
 ```
 
+### Install with RPM (FerruleOS/Hummingbird)
+
+The canonical dual-architecture RPM is maintained and built in the
+[FerruleOS RPM repository](https://gitlab.com/cyberdione/ferruleos/rpms/-/tree/main/rpms/hyprstream).
+See [RPM packaging and installation](docs/rpm-packaging.md) for the package
+generation and channel contract, an exact checksum-pinned installation
+example, and the compatibility boundary. Rolling channel URLs are discovery
+pointers, not provenance pins.
+
 ### Building from source
 
 ```bash
@@ -538,19 +547,21 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 Licensing is assigned per crate:
 
-**MIT** — `bitsandbytes-sys`, `cas-serve`, and `git-xet-filter`.
+**MIT** — `bitsandbytes-sys`, `cas-serve`, `git-xet-filter`, and
+`hyprstream-pay`.
 
-**AGPL-3.0-only** — `hyprstream-metrics`, `hyprstream-flight`,
+**AGPL-3.0-only** — the `hyprstream` application and its service-facing crates:
+`hyprstream-appview`, `hyprstream-discovery`, `hyprstream-flight`,
+`hyprstream-k8s-pds`, `hyprstream-ledger`, `hyprstream-metrics`,
+`hyprstream-pds`, `hyprstream-pds-service`, `hyprstream-service`,
 `hyprstream-vfs-server`, and `hyprstream-workers`.
 
-**Apache-2.0** — every other local Cargo package.
+**Apache-2.0** — every other local Cargo package: reusable libraries, RPC and
+transport substrate, build tooling, clients, and sandbox guests.
 
-These are source-package declarations. They are distinct from the obligations
-for a combined distribution: for example, the Apache-declared `hyprstream`
-application currently aggregates AGPL components through
-`hyprstream-flight`, so a combined distribution must satisfy the applicable
-AGPL terms. Reusable permissive-only roots are listed separately and guarded
-against acquiring an AGPL dependency in
+These are source-package declarations; third-party dependencies retain their
+own licenses. Reusable permissive packages are guarded against acquiring an
+AGPL dependency in
 `.github/license-boundary.toml`. The policy is exhaustive and CI requires every
 local package manifest to match it exactly.
 

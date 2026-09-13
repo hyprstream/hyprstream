@@ -1,0 +1,22 @@
+# Pinned dependencies for the v16 profile mechanical validation gate.
+#
+# Install deterministically in CI with:
+#     python3 -m pip install --require-hashes -r requirements.txt   # if hashes are added
+#     python3 -m pip install -r requirements.txt                    # minimum
+#
+# pycddl is the real CDDL parser/validator (Rust `cddl` crate behind a Python
+# wheel) the gate uses to validate the fixtures against the normative CDDL.
+# 0.3.0 ships prebuilt wheels (no Rust toolchain needed at install time).
+#
+# Known limitation of this pinned version, worked around by the gate and
+# documented in validate_profile.py: `.size (LO..HI)` byte-length RANGE controls
+# on byte strings are mis-evaluated, so the gate strips only those controls for
+# the CDDL structural pass and re-checks every size cap numerically in Python.
+# A fully `.size`-range-conformant reference run (e.g. the Ruby `cddl` gem) is
+# an optional additional CI layer; nothing in the freeze depends on it.
+pycddl==0.3.0
+# Ed25519 sign/verify only; bounded above so the supply-chain surface is a
+# closed range rather than an open floor. Widen the upper bound deliberately
+# when a newer major is validated. Hash-pinning (--require-hashes) is the next
+# hardening step and is deferred (docs-only tooling; see validate_profile.py).
+cryptography>=42,<47

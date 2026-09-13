@@ -6,11 +6,11 @@
 
 #![allow(clippy::print_stdout)]
 
-use crate::auth::age_seal::{AgeIdentities, AgeRecipients};
+use crate::auth::age_seal::{AgeIdentities, AgeIdentitySource, AgeRecipients};
 use crate::cli::commands::{
-    DelegateRegistrySignerArgs, InstallDeploymentTrustArgs, MintAnchorCapsuleArgs,
-    MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs, TrustCommand,
-    VerifyDeploymentArgs,
+    DelegateRegistrySignerArgs, EnrollServiceKeyArgs, InstallDeploymentTrustArgs,
+    MintAnchorCapsuleArgs, MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs,
+    TrustCommand, VerifyDeploymentArgs,
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::{
@@ -24,6 +24,7 @@ use hyprstream_discovery::did_op::{
 use hyprstream_discovery::{
     DeploymentAuthorityCheckpoint as AuthorityCheckpointFile,
     DeploymentAuthorityLog as AuthorityLogFile, RegistryDelegationArtifact as DelegationArtifact,
+    ServiceKeyEnrollmentArtifact, ServiceKeyEnrollmentSigningBody,
 };
 use hyprstream_pds::at9p::{
     CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
@@ -31,10 +32,7 @@ use hyprstream_pds::at9p::{
 use hyprstream_pds::at9p_sign::{sign_capsule_detached, CapsuleEd25519Signer};
 use hyprstream_rpc::transport::QuicServerAuth;
 use hyprstream_rpc::{
-    auth::ucan::{
-        validate as validate_ucan, Ability, Capability, CaveatValue, Caveats, Did, Resource, Ucan,
-        UcanError, UcanPayload, UcanVerifier,
-    },
+    auth::ucan::{Did, Ucan, UcanPayload},
     crypto::{
         cose_sign::{assemble_composite_nested, inner_tbs, outer_tbs},
         pq::{
@@ -47,9 +45,10 @@ use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs::OpenOptions,
     io::{Read as _, Write as _},
+    os::fd::{FromRawFd as _, RawFd},
     os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -67,8 +66,10 @@ const DELEGATION_SCHEMA: &str = "hyprstream.registry-delegation.v1";
 const PUBLISHER_MANIFEST_SCHEMA: &str = "hyprstream.deployment-trust-publisher-manifest.v1";
 /// Capsule service id the DID-anchored resolver requires for deployment reach.
 const ANCHOR_REACH_SERVICE: &str = "#ns";
-const DELEGATION_RESOURCE_PREFIX: &str = "hyprstream://deployment";
-const DELEGATION_ABILITY: &str = "mint-registry-jwt";
+const ENROLLMENT_SCHEMA: &str = "hyprstream.service-key-enrollment.v1";
+const ENROLLMENT_KEY_TYPE: &str = "hybrid-ed25519-mldsa65";
+const ENROLLMENT_SIGNATURE_CONTEXT: &[u8] = b"hyprstream.service-key-enrollment.v1";
+const MAX_ENROLLMENT_BYTES: usize = 256 * 1024;
 const MAX_AUTHORITY_LOG_OPERATIONS: usize = 128;
 const MAX_DELEGATION_BYTES: usize = 256 * 1024;
 const MAX_CLOUD_SECRET_BYTES: usize = 64 * 1024;
@@ -256,6 +257,7 @@ pub fn handle_trust_command(command: TrustCommand) -> Result<()> {
         TrustCommand::MintDeploymentCa(args) => mint_deployment_ca(&args),
         TrustCommand::DelegateRegistrySigner(args) => delegate_registry_signer(&args),
         TrustCommand::MintRegistryJwt(args) => mint_registry_jwt(&args),
+        TrustCommand::EnrollServiceKey(args) => enroll_service_key(&args),
         TrustCommand::VerifyDeployment(args) => verify_deployment(&args),
         TrustCommand::RotateAuthority(args) => rotate_authority(&args),
         TrustCommand::Install(args) => install_deployment_trust(&args),
@@ -424,21 +426,34 @@ fn delegate_registry_signer(args: &DelegateRegistrySignerArgs) -> Result<()> {
     let expiration = now
         .checked_add(args.delegation_ttl_seconds)
         .ok_or_else(|| anyhow!("delegation expiration overflow"))?;
-    let capability =
-        registry_mint_capability(&authority.bundle.deployment_domain, &delegated_public);
+    // hyprstream#1562: one artifact, one delegated signer — the delegation
+    // carries both the registry-mint and the service-key-enrollment scope.
+    // Capability construction lives in hyprstream-discovery (H3) so the mint
+    // and the production verifier can never drift apart.
+    let delegated_public_b64 = STANDARD.encode(&delegated_public);
+    let capabilities = vec![
+        hyprstream_discovery::registry_mint_capability(
+            &authority.bundle.deployment_domain,
+            &delegated_public_b64,
+        ),
+        hyprstream_discovery::service_key_enrollment_capability(
+            &authority.bundle.deployment_domain,
+            &delegated_public_b64,
+        ),
+    ];
     let payload = UcanPayload {
         issuer: Did::from_ed25519(&authority.ed.verifying_key().to_bytes()),
         audience: Did::from_ed25519(&delegated_ed.verifying_key().to_bytes()),
-        capabilities: vec![capability],
+        capabilities,
         not_before: Some(now),
         expiration: Some(expiration),
         nonce: random_bytes(16),
     };
     let ucan = sign_ucan(payload, &authority.ed, &authority.pq)?;
-    validate_registry_delegation_ucan(
+    hyprstream_discovery::validate_delegation_ucan(
         &ucan,
         &authority.bundle.deployment_domain,
-        &delegated_public,
+        &delegated_public_b64,
         &active.rotation_keys,
         now,
     )?;
@@ -462,10 +477,10 @@ fn delegate_registry_signer(args: &DelegateRegistrySignerArgs) -> Result<()> {
         schema: DELEGATION_SCHEMA.to_owned(),
         deployment_domain: authority.bundle.deployment_domain.clone(),
         authority_log_did: log.did.clone(),
-        delegated_public_key_b64: STANDARD.encode(&delegated_public),
+        delegated_public_key_b64: delegated_public_b64,
         ucan_b64: STANDARD.encode(ucan.to_cbor()?),
     };
-    validate_delegation_artifact(&public_ca, &log, &checkpoint, &artifact, now)?;
+    hyprstream_discovery::validate_registry_delegation(&public_ca, &log, &checkpoint, &artifact, now)?;
     commit_outputs(vec![
         PendingOutput::new(&args.delegated_key, encrypted, 0o600),
         PendingOutput::new(&args.delegation, pretty_json_bytes(&artifact)?, 0o644),
@@ -483,6 +498,11 @@ fn delegate_registry_signer(args: &DelegateRegistrySignerArgs) -> Result<()> {
                 "aud": REGISTRY_AUDIENCE,
                 "profile": REGISTRY_PROFILE,
                 "max_ttl_seconds": 3600
+            },
+            "enrollment_scope": {
+                "allowed_services": hyprstream_discovery::SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES,
+                "key_type": ENROLLMENT_KEY_TYPE,
+                "max_attestation_ttl_seconds": 3600
             }
         }))?
     );
@@ -497,7 +517,7 @@ fn mint_registry_jwt(args: &MintRegistryJwtArgs) -> Result<()> {
         .try_into()
         .map_err(|_| anyhow!("registry public key must be exactly 32 bytes"))?;
     VerifyingKey::from_bytes(&registry_key).context("invalid registry Ed25519 public key")?;
-    let identities = combined_identities(&args.identities, &args.yubikey_identities)?;
+    let identities = mint_identities(args)?;
     let authority_log_bytes = read_limited(&args.authority_log, MAX_CLOUD_SECRET_BYTES)?;
     let installed_log: AuthorityLogFile =
         serde_json::from_slice(&authority_log_bytes).context("decode installed authority log")?;
@@ -522,23 +542,33 @@ fn mint_registry_jwt(args: &MintRegistryJwtArgs) -> Result<()> {
         ensure_active_authority(&authority, &active)?;
         (authority, None)
     } else {
-        let delegated_path = args
-            .via_delegated_signer
-            .as_ref()
-            .ok_or_else(|| anyhow!("--via-delegated-signer is required"))?;
         let artifact_path = args
             .delegation
             .as_ref()
             .ok_or_else(|| anyhow!("--delegation is required"))?;
         let artifact: DelegationArtifact = read_json_limited(artifact_path, MAX_DELEGATION_BYTES)?;
-        validate_delegation_artifact(
+        hyprstream_discovery::validate_registry_delegation(
             &public_ca,
             &installed_log,
             &installed_checkpoint,
             &artifact,
             now_unix_u64()?,
         )?;
-        let delegated = decrypt_authority(delegated_path, &identities, args.software_recovery)?;
+        let delegated = match (
+            args.via_delegated_signer.as_deref(),
+            args.via_delegated_signer_fd,
+        ) {
+            (Some(delegated_path), None) => {
+                decrypt_authority(delegated_path, &identities, args.software_recovery)?
+            }
+            (None, Some(fd)) => {
+                let ciphertext = read_fd_limited(fd, MAX_AGE_CIPHERTEXT_BYTES, "delegated signer")?;
+                decrypt_authority_ciphertext(&ciphertext, &identities, args.software_recovery)?
+            }
+            // Clap requires exactly one signer source unless --root; this arm
+            // only fires if that invariant is bypassed programmatically.
+            _ => bail!("--via-delegated-signer or --via-delegated-signer-fd is required"),
+        };
         ensure!(
             delegated.bundle.purpose == AuthorityPurpose::RegistryDelegatedSigner,
             "selected key is not a registry delegated signer"
@@ -633,6 +663,143 @@ fn mint_registry_jwt(args: &MintRegistryJwtArgs) -> Result<()> {
     Ok(())
 }
 
+/// Mint a chain-signed service-key enrollment attestation (hyprstream#1562).
+///
+/// Same trust anchors and post-mint self-verify through the production
+/// verifier as `mint_registry_jwt`; the input contract is public-only — the
+/// 1984-byte hybrid sidecar, never the service's seed.
+fn enroll_service_key(args: &EnrollServiceKeyArgs) -> Result<()> {
+    preflight_outputs([&args.attestation], args.force)?;
+    ensure!(
+        hyprstream_discovery::SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES
+            .contains(&args.service.as_str()),
+        "service is outside the fixed discovery/policy enrollment allowlist"
+    );
+    let public_ca = read_limited(&args.public_ca, PUBLIC_CA_BYTES)?;
+    let root_domain = hyprstream_discovery::verify_deployment_public_ca(&public_ca)?;
+    let service_public_key = read_limited(&args.service_public_key, PUBLIC_CA_BYTES)?;
+    ensure!(
+        service_public_key.len() == PUBLIC_CA_BYTES,
+        "service public key must be exactly {PUBLIC_CA_BYTES} bytes \
+         (32-byte Ed25519 followed by 1952-byte ML-DSA-65; key type {ENROLLMENT_KEY_TYPE})"
+    );
+    let identities = inherited_identities(
+        &args.identities,
+        &args.identity_fds,
+        &args.yubikey_identities,
+    )?;
+    let authority_log_bytes = read_limited(&args.authority_log, MAX_CLOUD_SECRET_BYTES)?;
+    let installed_log: AuthorityLogFile =
+        serde_json::from_slice(&authority_log_bytes).context("decode installed authority log")?;
+    let authority_checkpoint_bytes =
+        read_limited(&args.authority_checkpoint, MAX_CLOUD_SECRET_BYTES)?;
+    let installed_checkpoint: AuthorityCheckpointFile =
+        serde_json::from_slice(&authority_checkpoint_bytes)
+            .context("decode installed authority checkpoint")?;
+
+    let artifact: DelegationArtifact = read_json_limited(&args.delegation, MAX_DELEGATION_BYTES)?;
+    let now = now_unix_u64()?;
+    let grants_enrollment = hyprstream_discovery::validate_registry_delegation(
+        &public_ca,
+        &installed_log,
+        &installed_checkpoint,
+        &artifact,
+        now,
+    )?
+    .grants_service_key_enrollment;
+    ensure!(
+        grants_enrollment,
+        "delegation does not carry the service-key-enrollment capability"
+    );
+    let delegated = match (
+        args.via_delegated_signer.as_deref(),
+        args.via_delegated_signer_fd,
+    ) {
+        (Some(delegated_path), None) => {
+            decrypt_authority(delegated_path, &identities, args.software_recovery)?
+        }
+        (None, Some(fd)) => {
+            let ciphertext = read_fd_limited(fd, MAX_AGE_CIPHERTEXT_BYTES, "delegated signer")?;
+            decrypt_authority_ciphertext(&ciphertext, &identities, args.software_recovery)?
+        }
+        // Clap requires exactly one signer source. This arm only fires if the
+        // invariant is bypassed programmatically.
+        _ => bail!("--via-delegated-signer or --via-delegated-signer-fd is required"),
+    };
+    ensure!(
+        delegated.bundle.purpose == AuthorityPurpose::RegistryDelegatedSigner,
+        "selected key is not a registry delegated signer"
+    );
+    let declared = STANDARD
+        .decode(&artifact.delegated_public_key_b64)
+        .context("decode delegated public key")?;
+    ensure!(
+        delegated.public_bytes() == declared,
+        "delegated private key does not match the root-authorized delegation"
+    );
+    ensure!(
+        delegated.bundle.deployment_domain == root_domain,
+        "signer is bound to a different deployment domain"
+    );
+
+    let expires_at = now
+        .checked_add(u64::from(args.ttl_seconds))
+        .ok_or_else(|| anyhow!("attestation expiration overflow"))?;
+    let body = ServiceKeyEnrollmentSigningBody {
+        schema: ENROLLMENT_SCHEMA.to_owned(),
+        deployment_domain: root_domain.clone(),
+        service: args.service.clone(),
+        hybrid_public_key_b64: STANDARD.encode(&service_public_key),
+        not_before: i64::try_from(now).context("system clock precedes Unix epoch")?,
+        expires_at: i64::try_from(expires_at).context("attestation expiry conversion")?,
+        delegation: artifact,
+    };
+    let mut attestation = ServiceKeyEnrollmentArtifact::unsigned(body);
+    let signature = sign_nested(
+        &attestation.signing_bytes()?,
+        ENROLLMENT_SIGNATURE_CONTEXT,
+        &delegated.ed,
+        &delegated.pq,
+    )?;
+    attestation.signature_b64 = STANDARD.encode(&signature);
+    let attestation_json = pretty_json_bytes(&attestation)?;
+    ensure!(
+        attestation_json.len() <= MAX_ENROLLMENT_BYTES,
+        "attestation exceeds the 256 KiB enrollment contract"
+    );
+    let verified = hyprstream_discovery::verify_service_key_enrollment(
+        &public_ca,
+        &authority_log_bytes,
+        &authority_checkpoint_bytes,
+        &attestation_json,
+    )
+    .context("production enrollment verifier rejected minted attestation")?;
+    ensure!(
+        verified.service == args.service
+            && verified.hybrid_public_key == service_public_key
+            && verified.deployment_domain == root_domain,
+        "production verification result does not match minted inputs"
+    );
+
+    commit_outputs(vec![PendingOutput::new(
+        &args.attestation,
+        attestation_json,
+        0o644,
+    )])?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "hyprstream.service-key-enrollment-output.v1",
+            "deployment_domain": root_domain,
+            "service": args.service,
+            "attestation_path": display_path(&args.attestation),
+            "attestation_expires_at": expires_at,
+            "key_type": ENROLLMENT_KEY_TYPE,
+        }))?
+    );
+    Ok(())
+}
+
 fn verify_deployment(args: &VerifyDeploymentArgs) -> Result<()> {
     let public_ca = read_limited(&args.public_ca, PUBLIC_CA_BYTES)?;
     let token_bytes = read_limited(&args.jwt, MAX_CLOUD_SECRET_BYTES)?;
@@ -709,6 +876,25 @@ fn verify_deployment(args: &VerifyDeploymentArgs) -> Result<()> {
             "contract permits private authority export"
         );
     }
+    // hyprstream#1562 H3: each supplied service-key enrollment attestation must
+    // verify against the same chain — fail closed on the first that does not.
+    let mut enrollments = Vec::with_capacity(args.service_key_attestations.len());
+    for attestation_path in &args.service_key_attestations {
+        let attestation = read_limited(attestation_path, MAX_ENROLLMENT_BYTES)?;
+        let enrollment = hyprstream_discovery::verify_service_key_enrollment(
+            &public_ca,
+            &authority_log,
+            &authority_checkpoint,
+            &attestation,
+        )
+        .with_context(|| {
+            format!(
+                "service-key attestation {} rejected",
+                display_path(attestation_path)
+            )
+        })?;
+        enrollments.push(enrollment);
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -717,7 +903,16 @@ fn verify_deployment(args: &VerifyDeploymentArgs) -> Result<()> {
             "registry_public_key_base64": STANDARD.encode(verified.registry_public_key),
             "public_ca_bytes": public_ca.len(),
             "profile": REGISTRY_PROFILE,
-            "audience": REGISTRY_AUDIENCE
+            "audience": REGISTRY_AUDIENCE,
+            "service_key_enrollments": enrollments
+                .iter()
+                .map(|enrollment| serde_json::json!({
+                    "service": enrollment.service,
+                    "deployment_domain": enrollment.deployment_domain,
+                    "hybrid_public_key_base64": STANDARD.encode(&enrollment.hybrid_public_key),
+                    "expires_at": enrollment.expires_at,
+                }))
+                .collect::<Vec<_>>()
         }))?
     );
     Ok(())
@@ -973,7 +1168,7 @@ fn trial_decrypt_delegated_signer(
     // the identical derivation path the refresher will exercise on every timer
     // firing. software_recovery is false because the refresher ExecStart never
     // passes --software-recovery.
-    let identities = vec![refresh_identity.to_path_buf()];
+    let identities = AgeIdentities::new(vec![refresh_identity.to_path_buf()])?;
     let trial = decrypt_authority(delegated_key, &identities, false)
         .context("refresh identity cannot decrypt the delegated signer ciphertext")?;
     ensure!(
@@ -1009,7 +1204,7 @@ fn install_trust_refresher(
     // Full cryptographic validation against the just-verified authority log:
     // an expired, tampered, or wrong-deployment delegation must fail install
     // rather than be discovered by the first unattended refresh.
-    validate_delegation_artifact(
+    hyprstream_discovery::validate_registry_delegation(
         public_ca,
         authority_log,
         authority_checkpoint,
@@ -1701,20 +1896,59 @@ fn distinct_recipients(recipients: Vec<String>) -> Result<Vec<String>> {
     Ok(unique.into_iter().collect())
 }
 
-fn combined_identities(generic: &[PathBuf], yubikey: &[PathBuf]) -> Result<Vec<PathBuf>> {
+fn combined_identities(generic: &[PathBuf], yubikey: &[PathBuf]) -> Result<AgeIdentities> {
     let identities: Vec<_> = generic.iter().chain(yubikey).cloned().collect();
     ensure!(
         !identities.is_empty(),
         "at least one --identity or --yubikey-identity is required"
     );
-    for identity in &identities {
-        ensure!(
-            identity.is_file(),
-            "age identity file does not exist: {}",
-            identity.display()
-        );
+    AgeIdentities::new(identities)
+}
+
+/// Resolve the mint identity set: either the on-disk path forms (existing
+/// ceremony tooling) or the inherited-FD form used by the staging stack
+/// (systemd `LoadCredentialEncrypted` + podman `--preserve-fds`), which clap
+/// makes mutually exclusive with `--identity`. FD identity bytes are validated
+/// and size-capped here, then handed to the `age` child through anonymous
+/// memfds so plaintext never touches a filesystem path.
+fn mint_identities(args: &MintRegistryJwtArgs) -> Result<AgeIdentities> {
+    inherited_identities(
+        &args.identities,
+        &args.identity_fds,
+        &args.yubikey_identities,
+    )
+}
+
+/// Resolve either path-backed or inherited-FD age identities. FD bytes remain
+/// zeroized while `AgeIdentities` materializes anonymous memfds for the age
+/// child; they are never reopened through a credential pathname.
+fn inherited_identities(
+    generic: &[PathBuf],
+    identity_fds: &[RawFd],
+    yubikey: &[PathBuf],
+) -> Result<AgeIdentities> {
+    if identity_fds.is_empty() {
+        return combined_identities(generic, yubikey);
     }
-    Ok(identities)
+    let mut bytes = Vec::with_capacity(identity_fds.len());
+    for &fd in identity_fds {
+        bytes.push(Zeroizing::new(read_fd_limited(
+            fd,
+            MAX_AGE_IDENTITY_BYTES,
+            "age identity",
+        )?));
+    }
+    if yubikey.is_empty() {
+        return AgeIdentities::new_in_memory(bytes);
+    }
+    // YubiKey path identities may be mixed in, exactly like the path forms.
+    let mut sources: Vec<_> = yubikey
+        .iter()
+        .cloned()
+        .map(AgeIdentitySource::Path)
+        .collect();
+    sources.extend(bytes.into_iter().map(AgeIdentitySource::InMemory));
+    AgeIdentities::from_sources(sources)
 }
 
 fn encrypt_age(plaintext: &[u8], recipients: &[String]) -> Result<Vec<u8>> {
@@ -1723,20 +1957,42 @@ fn encrypt_age(plaintext: &[u8], recipients: &[String]) -> Result<Vec<u8>> {
         .context("encrypt authority through deployment age seam")
 }
 
-fn decrypt_age(path: &Path, identities: &[PathBuf]) -> Result<Zeroizing<Vec<u8>>> {
-    AgeIdentities::new(identities.to_vec())?
-        .open_file(path, 128 * 1024)
+const MAX_AGE_PLAINTEXT_BYTES: usize = 128 * 1024;
+
+fn decrypt_age(path: &Path, identities: &AgeIdentities) -> Result<Zeroizing<Vec<u8>>> {
+    identities
+        .open_file(path, MAX_AGE_PLAINTEXT_BYTES)
+        .context("decrypt authority through deployment age seam")
+}
+
+fn decrypt_age_bytes(ciphertext: &[u8], identities: &AgeIdentities) -> Result<Zeroizing<Vec<u8>>> {
+    identities
+        .open(ciphertext, MAX_AGE_PLAINTEXT_BYTES)
         .context("decrypt authority through deployment age seam")
 }
 
 fn decrypt_authority(
     path: &Path,
-    identities: &[PathBuf],
+    identities: &AgeIdentities,
     software_recovery: bool,
 ) -> Result<LoadedAuthority> {
     let plaintext = decrypt_age(path, identities)?;
+    decode_authority(&plaintext, software_recovery)
+}
+
+/// Decrypt an age ciphertext already held in memory (inherited-FD form).
+fn decrypt_authority_ciphertext(
+    ciphertext: &[u8],
+    identities: &AgeIdentities,
+    software_recovery: bool,
+) -> Result<LoadedAuthority> {
+    let plaintext = decrypt_age_bytes(ciphertext, identities)?;
+    decode_authority(&plaintext, software_recovery)
+}
+
+fn decode_authority(plaintext: &[u8], software_recovery: bool) -> Result<LoadedAuthority> {
     let bundle: AuthorityBundle =
-        serde_json::from_slice(&plaintext).context("decode authority bundle")?;
+        serde_json::from_slice(plaintext).context("decode authority bundle")?;
     ensure!(
         bundle.schema == AUTHORITY_BUNDLE_SCHEMA,
         "unsupported authority bundle schema"
@@ -1890,34 +2146,6 @@ fn encode_registry_jwt(
         "{signing_input}.{}",
         URL_SAFE_NO_PAD.encode(signature)
     ))
-}
-
-fn registry_mint_capability(deployment_domain: &str, delegated_public: &[u8]) -> Capability {
-    let mut caveats = BTreeMap::new();
-    caveats.insert(
-        "audience".to_owned(),
-        CaveatValue::Text(REGISTRY_AUDIENCE.to_owned()),
-    );
-    caveats.insert(
-        "deployment_domain".to_owned(),
-        CaveatValue::Text(deployment_domain.to_owned()),
-    );
-    caveats.insert(
-        "delegated_public_key_b64".to_owned(),
-        CaveatValue::Text(STANDARD.encode(delegated_public)),
-    );
-    caveats.insert("max_ttl_seconds".to_owned(), CaveatValue::Int(3_600));
-    caveats.insert(
-        "profile".to_owned(),
-        CaveatValue::Text(REGISTRY_PROFILE.to_owned()),
-    );
-    Capability::with_caveats(
-        Resource::new(format!(
-            "{DELEGATION_RESOURCE_PREFIX}/{deployment_domain}/service/registry"
-        )),
-        Ability::new(DELEGATION_ABILITY),
-        Caveats(caveats),
-    )
 }
 
 fn sign_ucan(payload: UcanPayload, ed: &LoadedEdSigner, pq: &MlDsaSigningKey) -> Result<Ucan> {
@@ -2135,126 +2363,6 @@ fn ensure_anchor_authority(
     );
     ensure_active_authority(authority, active)?;
     Ok(())
-}
-
-struct AuthorityUcanVerifier<'a> {
-    keys: &'a [HybridRotationKey],
-}
-
-impl UcanVerifier for AuthorityUcanVerifier<'_> {
-    fn verify(
-        &self,
-        _issuer: &Did,
-        ed_key: &[u8; 32],
-        payload: &[u8],
-        signature: &[u8],
-    ) -> std::result::Result<(), UcanError> {
-        let key = self
-            .keys
-            .iter()
-            .find(|key| &key.ed25519_pub == ed_key)
-            .ok_or_else(|| {
-                UcanError::BadSignature("issuer is not an active authority".to_owned())
-            })?;
-        let ed = VerifyingKey::from_bytes(ed_key)
-            .map_err(|error| UcanError::BadSignature(error.to_string()))?;
-        let pq = ml_dsa_vk_from_bytes(&key.mldsa65_pub)
-            .map_err(|error| UcanError::BadSignature(error.to_string()))?;
-        hyprstream_rpc::crypto::cose_sign::verify_composite(
-            signature,
-            &ed,
-            Some(&pq),
-            payload,
-            hyprstream_rpc::auth::ucan::token::UCAN_AAD,
-            true,
-        )
-        .map(|_| ())
-        .map_err(|error| UcanError::BadSignature(error.to_string()))
-    }
-}
-
-fn validate_registry_delegation_ucan(
-    ucan: &Ucan,
-    deployment_domain: &str,
-    delegated_public: &[u8],
-    active_keys: &[HybridRotationKey],
-    now: u64,
-) -> Result<()> {
-    ensure!(
-        ucan.proofs.is_empty(),
-        "registry delegation must be one root-authorized link"
-    );
-    let verifier = AuthorityUcanVerifier { keys: active_keys };
-    validate_ucan(ucan, &verifier, now).context("validate registry UCAN delegation")?;
-    ensure!(
-        active_keys
-            .iter()
-            .any(|key| ucan.issuer().to_ed25519().ok() == Some(key.ed25519_pub)),
-        "delegation issuer is not active"
-    );
-    let delegated_ed: [u8; 32] = delegated_public
-        .get(..32)
-        .ok_or_else(|| anyhow!("delegated public key is truncated"))?
-        .try_into()
-        .map_err(|_| anyhow!("delegated Ed25519 key is malformed"))?;
-    ensure!(
-        ucan.audience().to_ed25519()? == delegated_ed,
-        "delegation audience does not match delegated signer"
-    );
-    ensure!(
-        ucan.capabilities()
-            == [registry_mint_capability(
-                deployment_domain,
-                delegated_public
-            )],
-        "delegation capability is not the exact registry-only scope"
-    );
-    ensure!(
-        ucan.payload.expiration.is_some(),
-        "registry delegation must expire"
-    );
-    Ok(())
-}
-
-fn validate_delegation_artifact(
-    public_ca: &[u8],
-    authority_log: &AuthorityLogFile,
-    authority_checkpoint: &AuthorityCheckpointFile,
-    artifact: &DelegationArtifact,
-    now: u64,
-) -> Result<()> {
-    ensure!(
-        artifact.schema == DELEGATION_SCHEMA,
-        "unsupported delegation schema"
-    );
-    let active = validate_authority_log(public_ca, authority_log, authority_checkpoint)?;
-    ensure!(
-        artifact.deployment_domain == authority_log.deployment_domain,
-        "delegation domain does not match authority log"
-    );
-    ensure!(
-        artifact.authority_log_did == authority_log.did,
-        "delegation names a different authority log"
-    );
-    let delegated_public = STANDARD
-        .decode(&artifact.delegated_public_key_b64)
-        .context("decode delegated public key")?;
-    parse_public_pair(&delegated_public)?;
-    let ucan_bytes = STANDARD
-        .decode(&artifact.ucan_b64)
-        .context("decode delegation UCAN")?;
-    ensure!(
-        ucan_bytes.len() <= MAX_DELEGATION_BYTES,
-        "delegation UCAN is too large"
-    );
-    let ucan = Ucan::from_cbor(&ucan_bytes)?;
-    validate_registry_delegation_ucan(
-        &ucan,
-        &artifact.deployment_domain,
-        &delegated_public,
-        &active.rotation_keys,
-        now,
-    )
 }
 
 /// `ykman` argv (after the program name) that asks whether a PIV slot holds
@@ -2902,6 +3010,31 @@ fn read_json_limited<T: for<'de> Deserialize<'de>>(path: &Path, max: usize) -> R
         .with_context(|| format!("decode JSON {}", path.display()))
 }
 
+/// Read an inherited credential file descriptor to EOF under a hard size cap.
+///
+/// The descriptor is duplicated first so the caller's fd stays open; the read
+/// then consumes the exact byte stream (pipe-friendly, no seek assumptions).
+/// Any I/O error, short read, EOF error, or over-cap stream fails closed.
+/// Used by the systemd `LoadCredentialEncrypted` / podman `--preserve-fds`
+/// interface so plaintext credentials never touch a filesystem path.
+fn read_fd_limited(fd: RawFd, max: usize, description: &str) -> Result<Vec<u8>> {
+    let duped = unsafe { libc::dup(fd) };
+    if duped < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("dup inherited {description} fd {fd}"));
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(duped) };
+    let mut bytes = Vec::new();
+    file.take(u64::try_from(max + 1).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read inherited {description} fd {fd}"))?;
+    ensure!(
+        bytes.len() <= max,
+        "inherited {description} fd {fd} exceeds {max} bytes"
+    );
+    Ok(bytes)
+}
+
 fn decode_fixed_b64<const N: usize>(value: &str, description: &str) -> Result<Zeroizing<[u8; N]>> {
     let decoded = Zeroizing::new(
         STANDARD
@@ -2969,6 +3102,8 @@ fn now_unix_u64() -> Result<u64> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
 mod tests {
     use super::*;
+    use hyprstream_rpc::auth::ucan::{Ability, Capability, CaveatValue, Resource};
+    use std::os::fd::AsRawFd as _;
 
     fn test_authority(
         purpose: AuthorityPurpose,
@@ -3246,13 +3381,652 @@ mod tests {
         let (pq, _) = ml_dsa_generate_keypair();
         let ed = SigningKey::generate(&mut rand::rngs::OsRng);
         let public = public_pair_bytes(&ed.verifying_key(), &pq);
-        let capability = registry_mint_capability("domain", &public);
-        assert_eq!(capability.ability.as_str(), DELEGATION_ABILITY);
+        let capability =
+            hyprstream_discovery::registry_mint_capability("domain", &STANDARD.encode(&public));
+        assert_eq!(capability.ability.as_str(), "mint-registry-jwt");
         assert!(!capability.resource.as_str().contains('*'));
         assert_eq!(
             capability.caveats.0["max_ttl_seconds"],
             CaveatValue::Int(3600)
         );
+    }
+
+    fn test_genesis(
+        root: &LoadedAuthority,
+    ) -> (Vec<u8>, AuthorityLogFile, AuthorityCheckpointFile) {
+        let root_rotation_key = HybridRotationKey::new(
+            root.ed.verifying_key().to_bytes(),
+            ml_dsa_sk_to_vk_bytes(&root.pq),
+        )
+        .unwrap();
+        let genesis = sign_did_op(
+            DidOp {
+                sequence: 0,
+                prev: None,
+                rotation_keys: vec![root_rotation_key],
+                signature: placeholder_did_signature(),
+            },
+            &root.ed,
+            &root.pq,
+        )
+        .unwrap();
+        let log = authority_log_from_ops(&root.bundle.deployment_domain, vec![genesis]).unwrap();
+        let checkpoint = checkpoint_for(&log);
+        (root.public_bytes(), log, checkpoint)
+    }
+
+    fn delegation_ucan(
+        root: &LoadedAuthority,
+        delegated: &LoadedAuthority,
+        capabilities: Vec<Capability>,
+        now: u64,
+    ) -> Ucan {
+        sign_ucan(
+            UcanPayload {
+                issuer: Did::from_ed25519(&root.ed.verifying_key().to_bytes()),
+                audience: Did::from_ed25519(&delegated.ed.verifying_key().to_bytes()),
+                capabilities,
+                not_before: Some(now),
+                expiration: Some(now + 3_600),
+                nonce: random_bytes(16),
+            },
+            &root.ed,
+            &root.pq,
+        )
+        .unwrap()
+    }
+
+    fn delegation_artifact(
+        root: &LoadedAuthority,
+        log: &AuthorityLogFile,
+        delegated: &LoadedAuthority,
+        capabilities: Vec<Capability>,
+        now: u64,
+    ) -> DelegationArtifact {
+        let ucan = delegation_ucan(root, delegated, capabilities, now);
+        DelegationArtifact {
+            schema: DELEGATION_SCHEMA.to_owned(),
+            deployment_domain: root.bundle.deployment_domain.clone(),
+            authority_log_did: log.did.clone(),
+            delegated_public_key_b64: STANDARD.encode(delegated.public_bytes()),
+            ucan_b64: STANDARD.encode(ucan.to_cbor().unwrap()),
+        }
+    }
+
+    fn registry_and_enrollment_capabilities(
+        root: &LoadedAuthority,
+        delegated: &LoadedAuthority,
+    ) -> (Vec<Capability>, Vec<Capability>) {
+        let delegated_b64 = STANDARD.encode(delegated.public_bytes());
+        let registry = vec![hyprstream_discovery::registry_mint_capability(
+            &root.bundle.deployment_domain,
+            &delegated_b64,
+        )];
+        let dual = vec![
+            registry[0].clone(),
+            hyprstream_discovery::service_key_enrollment_capability(
+                &root.bundle.deployment_domain,
+                &delegated_b64,
+            ),
+        ];
+        (registry, dual)
+    }
+
+    fn enrollment_fixture() -> (
+        LoadedAuthority,
+        LoadedAuthority,
+        Vec<u8>,
+        AuthorityLogFile,
+        AuthorityCheckpointFile,
+        Vec<u8>,
+        u64,
+    ) {
+        let root = test_authority(AuthorityPurpose::Root, None);
+        let delegated = test_authority(
+            AuthorityPurpose::RegistryDelegatedSigner,
+            Some(root.bundle.deployment_domain.clone()),
+        );
+        let (public_ca, log, checkpoint) = test_genesis(&root);
+        let service_ed = SigningKey::generate(&mut rand::rngs::OsRng);
+        let (service_pq, _) = ml_dsa_generate_keypair();
+        let service_public = public_pair_bytes(&service_ed.verifying_key(), &service_pq);
+        let now = now_unix_u64().unwrap();
+        (
+            root,
+            delegated,
+            public_ca,
+            log,
+            checkpoint,
+            service_public,
+            now,
+        )
+    }
+
+    fn mint_test_attestation(
+        delegated: &LoadedAuthority,
+        artifact: DelegationArtifact,
+        service: &str,
+        service_public_key: &[u8],
+        now: u64,
+        ttl_seconds: u64,
+    ) -> ServiceKeyEnrollmentArtifact {
+        let body = ServiceKeyEnrollmentSigningBody {
+            schema: ENROLLMENT_SCHEMA.to_owned(),
+            deployment_domain: delegated.bundle.deployment_domain.clone(),
+            service: service.to_owned(),
+            hybrid_public_key_b64: STANDARD.encode(service_public_key),
+            not_before: i64::try_from(now).unwrap(),
+            expires_at: i64::try_from(now + ttl_seconds).unwrap(),
+            delegation: artifact,
+        };
+        let mut attestation = ServiceKeyEnrollmentArtifact::unsigned(body);
+        let signature = sign_nested(
+            &attestation.signing_bytes().unwrap(),
+            ENROLLMENT_SIGNATURE_CONTEXT,
+            &delegated.ed,
+            &delegated.pq,
+        )
+        .unwrap();
+        attestation.signature_b64 = STANDARD.encode(&signature);
+        attestation
+    }
+
+    fn verify_test_attestation(
+        public_ca: &[u8],
+        log: &AuthorityLogFile,
+        checkpoint: &AuthorityCheckpointFile,
+        attestation: &ServiceKeyEnrollmentArtifact,
+    ) -> Result<hyprstream_discovery::VerifiedServiceKeyEnrollment> {
+        hyprstream_discovery::verify_service_key_enrollment(
+            public_ca,
+            &serde_json::to_vec(log)?,
+            &serde_json::to_vec(checkpoint)?,
+            &serde_json::to_vec(attestation)?,
+        )
+    }
+
+    #[test]
+    fn legacy_single_capability_delegation_still_validates() {
+        let (root, delegated, public_ca, log, checkpoint, _service, now) = enrollment_fixture();
+        let (legacy, _dual) = registry_and_enrollment_capabilities(&root, &delegated);
+        let active = validate_authority_log(&public_ca, &log, &checkpoint).unwrap();
+        // The exact single-capability delegation shape minted 2026-08-30 and
+        // live in production staging inputs must keep validating.
+        let ucan = delegation_ucan(&root, &delegated, legacy.clone(), now);
+        let validated = hyprstream_discovery::validate_delegation_ucan(
+            &ucan,
+            &root.bundle.deployment_domain,
+            &STANDARD.encode(delegated.public_bytes()),
+            &active.rotation_keys,
+            now,
+        )
+        .unwrap();
+        assert!(
+            !validated.grants_service_key_enrollment,
+            "legacy delegation must not grant enrollment"
+        );
+        let artifact = delegation_artifact(&root, &log, &delegated, legacy, now);
+        let validated =
+            hyprstream_discovery::validate_registry_delegation(&public_ca, &log, &checkpoint, &artifact, now)
+                .unwrap();
+        assert!(!validated.grants_service_key_enrollment);
+    }
+
+    #[test]
+    fn dual_capability_delegation_validates() {
+        let (root, delegated, public_ca, log, checkpoint, _service, now) = enrollment_fixture();
+        let (_legacy, dual) = registry_and_enrollment_capabilities(&root, &delegated);
+        let active = validate_authority_log(&public_ca, &log, &checkpoint).unwrap();
+        let ucan = delegation_ucan(&root, &delegated, dual.clone(), now);
+        let validated = hyprstream_discovery::validate_delegation_ucan(
+            &ucan,
+            &root.bundle.deployment_domain,
+            &STANDARD.encode(delegated.public_bytes()),
+            &active.rotation_keys,
+            now,
+        )
+        .unwrap();
+        assert!(
+            validated.grants_service_key_enrollment,
+            "two-capability delegation must grant enrollment"
+        );
+        let artifact = delegation_artifact(&root, &log, &delegated, dual, now);
+        let validated =
+            hyprstream_discovery::validate_registry_delegation(&public_ca, &log, &checkpoint, &artifact, now)
+                .unwrap();
+        assert!(validated.grants_service_key_enrollment);
+        // A delegated registry JWT carrying the two-capability artifact still
+        // passes the production verifier.
+        let registry = SigningKey::generate(&mut rand::rngs::OsRng);
+        let token = encode_registry_jwt(
+            &delegated,
+            registry.verifying_key().as_bytes(),
+            i64::try_from(now).unwrap(),
+            i64::try_from(now + 60).unwrap(),
+            Some(&URL_SAFE_NO_PAD.encode(serde_json::to_vec(&artifact).unwrap())),
+        )
+        .unwrap();
+        verify_with_log(&public_ca, &log, &checkpoint, &token).unwrap();
+    }
+
+    #[test]
+    fn delegation_capability_set_rejects_non_exact_sets() {
+        let (root, delegated, public_ca, log, checkpoint, _service, now) = enrollment_fixture();
+        let (legacy, dual) = registry_and_enrollment_capabilities(&root, &delegated);
+        let active = validate_authority_log(&public_ca, &log, &checkpoint).unwrap();
+        let validate = |capabilities: Vec<Capability>| {
+            let ucan = delegation_ucan(&root, &delegated, capabilities, now);
+            hyprstream_discovery::validate_delegation_ucan(
+                &ucan,
+                &root.bundle.deployment_domain,
+                &STANDARD.encode(delegated.public_bytes()),
+                &active.rotation_keys,
+                now,
+            )
+        };
+        // Enrollment without the registry scope is not an exact set.
+        assert!(validate(vec![dual[1].clone()]).is_err());
+        // Registry plus an unrelated extra capability widens the scope.
+        assert!(validate(vec![
+            legacy[0].clone(),
+            Capability::new(
+                Resource::new("hyprstream://deployment/domain/service/other"),
+                Ability::new("admin")
+            ),
+        ])
+        .is_err());
+        // An enrollment capability with a widened allowlist differs from the
+        // exact fixed-allowlist capability.
+        let mut widened = hyprstream_discovery::service_key_enrollment_capability(
+            &root.bundle.deployment_domain,
+            &STANDARD.encode(delegated.public_bytes()),
+        );
+        widened.caveats.0.insert(
+            "allowed_services".to_owned(),
+            CaveatValue::List(vec![
+                "discovery".to_owned(),
+                "policy".to_owned(),
+                "registry".to_owned(),
+            ]),
+        );
+        assert!(validate(vec![legacy[0].clone(), widened]).is_err());
+    }
+
+    #[test]
+    fn enrollment_capability_is_exact_and_fixed() {
+        let (pq, _) = ml_dsa_generate_keypair();
+        let ed = SigningKey::generate(&mut rand::rngs::OsRng);
+        let public = public_pair_bytes(&ed.verifying_key(), &pq);
+        let capability = hyprstream_discovery::service_key_enrollment_capability(
+            "domain",
+            &STANDARD.encode(&public),
+        );
+        assert_eq!(capability.ability.as_str(), "enroll-service-key");
+        assert_eq!(
+            capability.resource.as_str(),
+            "hyprstream://deployment/domain/service-key-enrollment"
+        );
+        assert!(!capability.resource.as_str().contains('*'));
+        assert_eq!(
+            capability.caveats.0["allowed_services"],
+            CaveatValue::List(vec!["discovery".to_owned(), "policy".to_owned()])
+        );
+        assert_eq!(
+            capability.caveats.0["key_type"],
+            CaveatValue::Text(ENROLLMENT_KEY_TYPE.to_owned())
+        );
+        assert_eq!(
+            capability.caveats.0["max_attestation_ttl_seconds"],
+            CaveatValue::Int(3_600)
+        );
+    }
+
+    #[test]
+    fn service_key_enrollment_artifact_schema_round_trip() {
+        let (root, delegated, _public_ca, log, _checkpoint, service_public, now) =
+            enrollment_fixture();
+        let (_legacy, dual) = registry_and_enrollment_capabilities(&root, &delegated);
+        let artifact = delegation_artifact(&root, &log, &delegated, dual, now);
+        let attestation = mint_test_attestation(
+            &delegated,
+            artifact,
+            "discovery",
+            &service_public,
+            now,
+            3_600,
+        );
+        let bytes = serde_json::to_vec(&attestation).unwrap();
+        let decoded: ServiceKeyEnrollmentArtifact = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, attestation);
+        assert_eq!(decoded.schema, ENROLLMENT_SCHEMA);
+        // Canonical signing bytes are stable across a round trip.
+        assert_eq!(
+            decoded.signing_bytes().unwrap(),
+            attestation.signing_bytes().unwrap()
+        );
+        // Unknown fields are rejected.
+        let mut value = serde_json::to_value(&attestation).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("attacker".to_owned(), serde_json::json!(true));
+        assert!(serde_json::from_value::<ServiceKeyEnrollmentArtifact>(value).is_err());
+    }
+
+    #[test]
+    fn service_key_enrollment_mint_verifies_through_production_verifier() {
+        let (root, delegated, public_ca, log, checkpoint, service_public, now) =
+            enrollment_fixture();
+        let (_legacy, dual) = registry_and_enrollment_capabilities(&root, &delegated);
+        let artifact = delegation_artifact(&root, &log, &delegated, dual, now);
+        let attestation =
+            mint_test_attestation(&delegated, artifact, "policy", &service_public, now, 3_600);
+        let verified =
+            verify_test_attestation(&public_ca, &log, &checkpoint, &attestation).unwrap();
+        assert_eq!(verified.service, "policy");
+        assert_eq!(verified.hybrid_public_key, service_public);
+        assert_eq!(verified.deployment_domain, root.bundle.deployment_domain);
+        assert_eq!(verified.expires_at, i64::try_from(now + 3_600).unwrap());
+    }
+
+    #[test]
+    fn service_key_enrollment_rejects_wrong_service_key_type_and_ttl() {
+        let (root, delegated, public_ca, log, checkpoint, service_public, now) =
+            enrollment_fixture();
+        let (legacy, dual) = registry_and_enrollment_capabilities(&root, &delegated);
+        let dual_artifact = || delegation_artifact(&root, &log, &delegated, dual.clone(), now);
+        // Wrong service: outside the fixed discovery/policy allowlist.
+        let wrong_service = mint_test_attestation(
+            &delegated,
+            dual_artifact(),
+            "registry",
+            &service_public,
+            now,
+            3_600,
+        );
+        assert!(
+            verify_test_attestation(&public_ca, &log, &checkpoint, &wrong_service).is_err(),
+            "enrollment of a non-allowlisted service was accepted"
+        );
+        // Wrong key type: a classical-only 32-byte key, not the 1984-byte hybrid.
+        let classical_only = mint_test_attestation(
+            &delegated,
+            dual_artifact(),
+            "discovery",
+            &service_public[..32],
+            now,
+            3_600,
+        );
+        assert!(
+            verify_test_attestation(&public_ca, &log, &checkpoint, &classical_only).is_err(),
+            "enrollment of a classical-only key was accepted"
+        );
+        // TTL above the one-hour capability ceiling.
+        let over_ttl = mint_test_attestation(
+            &delegated,
+            dual_artifact(),
+            "discovery",
+            &service_public,
+            now,
+            3_601,
+        );
+        assert!(
+            verify_test_attestation(&public_ca, &log, &checkpoint, &over_ttl).is_err(),
+            "enrollment with TTL > 3600 was accepted"
+        );
+        // A legacy registry-only delegation never authorizes enrollment.
+        let legacy_artifact = delegation_artifact(&root, &log, &delegated, legacy, now);
+        let legacy_scope = mint_test_attestation(
+            &delegated,
+            legacy_artifact,
+            "discovery",
+            &service_public,
+            now,
+            3_600,
+        );
+        assert!(
+            verify_test_attestation(&public_ca, &log, &checkpoint, &legacy_scope).is_err(),
+            "enrollment under a registry-only delegation was accepted"
+        );
+        // Any tampering breaks the hybrid signature.
+        let mut tampered = mint_test_attestation(
+            &delegated,
+            dual_artifact(),
+            "discovery",
+            &service_public,
+            now,
+            3_600,
+        );
+        let mut signature = STANDARD.decode(&tampered.signature_b64).unwrap();
+        signature[0] ^= 0x01;
+        tampered.signature_b64 = STANDARD.encode(&signature);
+        assert!(
+            verify_test_attestation(&public_ca, &log, &checkpoint, &tampered).is_err(),
+            "enrollment with a corrupted signature was accepted"
+        );
+    }
+
+    // ─── H3: verify-deployment --service-key-attestation ────────────────────
+
+    fn delegated_registry_token(
+        delegated: &LoadedAuthority,
+        artifact: &DelegationArtifact,
+        now: u64,
+    ) -> String {
+        let registry = SigningKey::generate(&mut rand::rngs::OsRng);
+        encode_registry_jwt(
+            delegated,
+            registry.verifying_key().as_bytes(),
+            i64::try_from(now).unwrap(),
+            i64::try_from(now + 60).unwrap(),
+            Some(&URL_SAFE_NO_PAD.encode(serde_json::to_vec(artifact).unwrap())),
+        )
+        .unwrap()
+    }
+
+    fn verify_deployment_args(
+        dir: &std::path::Path,
+        public_ca: &[u8],
+        log: &AuthorityLogFile,
+        checkpoint: &AuthorityCheckpointFile,
+        token: &str,
+    ) -> VerifyDeploymentArgs {
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        VerifyDeploymentArgs {
+            public_ca: write("deployment-ca.hybrid", public_ca),
+            jwt: write("registry-service.jwt", token.as_bytes()),
+            authority_log: write(
+                "deployment-authority.log.json",
+                &serde_json::to_vec(log).unwrap(),
+            ),
+            authority_checkpoint: write(
+                "deployment-authority.head.json",
+                &serde_json::to_vec(checkpoint).unwrap(),
+            ),
+            contract: None,
+            service_key_attestations: Vec::new(),
+        }
+    }
+
+    fn write_attestation(
+        dir: &std::path::Path,
+        attestation: &ServiceKeyEnrollmentArtifact,
+    ) -> std::path::PathBuf {
+        let path = dir.join(format!("{}.json", attestation.service));
+        std::fs::write(&path, serde_json::to_vec(attestation).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn verify_deployment_attests_service_key_enrollments() {
+        let (root, delegated, public_ca, log, checkpoint, service_public, now) =
+            enrollment_fixture();
+        let (_legacy, dual) = registry_and_enrollment_capabilities(&root, &delegated);
+        let artifact = delegation_artifact(&root, &log, &delegated, dual, now);
+        let token = delegated_registry_token(&delegated, &artifact, now);
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = verify_deployment_args(dir.path(), &public_ca, &log, &checkpoint, &token);
+        // No attestations supplied: the pre-H3 behavior is unchanged.
+        verify_deployment(&args).unwrap();
+        // Both allowlisted services attest against the same chain.
+        for service in ["discovery", "policy"] {
+            let attestation =
+                mint_test_attestation(&delegated, artifact.clone(), service, &service_public, now, 3_600);
+            args.service_key_attestations
+                .push(write_attestation(dir.path(), &attestation));
+        }
+        verify_deployment(&args).unwrap();
+    }
+
+    #[test]
+    fn verify_deployment_service_key_attestation_fails_closed() {
+        let (root, delegated, public_ca, log, checkpoint, service_public, now) =
+            enrollment_fixture();
+        let (legacy, dual) = registry_and_enrollment_capabilities(&root, &delegated);
+        let dual_artifact = delegation_artifact(&root, &log, &delegated, dual, now);
+        let token = delegated_registry_token(&delegated, &dual_artifact, now);
+        let dir = tempfile::tempdir().unwrap();
+        let args = |attestations: Vec<std::path::PathBuf>| {
+            let mut args =
+                verify_deployment_args(dir.path(), &public_ca, &log, &checkpoint, &token);
+            args.service_key_attestations = attestations;
+            args
+        };
+        // A missing attestation file fails the command.
+        assert!(verify_deployment(&args(vec![dir.path().join("absent.json")])).is_err());
+        // An attestation minted under a legacy registry-only delegation is not
+        // an enrollment and must fail closed.
+        let legacy_artifact = delegation_artifact(&root, &log, &delegated, legacy, now);
+        let legacy_scope = mint_test_attestation(
+            &delegated,
+            legacy_artifact,
+            "discovery",
+            &service_public,
+            now,
+            3_600,
+        );
+        assert!(verify_deployment(&args(vec![write_attestation(dir.path(), &legacy_scope)])).is_err());
+        // An attestation whose lifetime exceeds the one-hour capability ceiling
+        // is rejected by the production verifier.
+        let over_ttl = mint_test_attestation(
+            &delegated,
+            dual_artifact,
+            "discovery",
+            &service_public,
+            now,
+            3_601,
+        );
+        assert!(verify_deployment(&args(vec![write_attestation(dir.path(), &over_ttl)])).is_err());
+    }
+
+    // ─── H3: fail-closed OsOwnedFiles enrollment consumption ────────────────
+
+    static TRUST_DIR_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// RAII guard restoring the previous value of a process env var on drop.
+    struct TrustDirEnvGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+    impl TrustDirEnvGuard {
+        fn set(path: &std::path::Path) -> Self {
+            const VAR: &str = "HYPRSTREAM_DEPLOYMENT_TRUST_DIR";
+            let prev = std::env::var_os(VAR);
+            std::env::set_var(VAR, path);
+            Self { prev }
+        }
+    }
+    impl Drop for TrustDirEnvGuard {
+        fn drop(&mut self) {
+            const VAR: &str = "HYPRSTREAM_DEPLOYMENT_TRUST_DIR";
+            match &self.prev {
+                Some(value) => std::env::set_var(VAR, value),
+                None => std::env::remove_var(VAR),
+            }
+        }
+    }
+
+    #[test]
+    fn os_owned_bootstrap_enrollment_round_trip() {
+        use crate::auth::identity_store::{
+            ensure_bootstrap_pubkeys_enrolled, write_bootstrap_pubkeys_hybrid, BootstrapPubkey,
+            BOOTSTRAP_PUBKEYS_ENROLLMENT_DIR,
+        };
+
+        let _serial = TRUST_DIR_ENV_LOCK.lock();
+        let (root, delegated, public_ca, log, checkpoint, _unused, now) = enrollment_fixture();
+        let (_legacy, dual) = registry_and_enrollment_capabilities(&root, &delegated);
+        let artifact = delegation_artifact(&root, &log, &delegated, dual, now);
+        let service_ed = SigningKey::generate(&mut rand::rngs::OsRng);
+        let (service_pq, _) = ml_dsa_generate_keypair();
+        let service_pq_vk =
+            ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(&service_pq)).unwrap();
+        let service_public = public_pair_bytes(&service_ed.verifying_key(), &service_pq);
+        let attestation = mint_test_attestation(
+            &delegated,
+            artifact,
+            "discovery",
+            &service_public,
+            now,
+            3_600,
+        );
+
+        // The OS-owned trust dir must satisfy the discovery crate's
+        // trusted-artifact metadata policy (real directories, no
+        // group/world-writable component), so it lives under the crate dir
+        // like the discovery crate's own trusted-artifact tests.
+        let trust_dir = tempfile::Builder::new()
+            .prefix(".h3-trust-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        std::fs::write(trust_dir.path().join("deployment-ca.hybrid"), &public_ca).unwrap();
+        std::fs::write(
+            trust_dir.path().join("deployment-authority.log.json"),
+            serde_json::to_vec(&log).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            trust_dir.path().join("deployment-authority.head.json"),
+            serde_json::to_vec(&checkpoint).unwrap(),
+        )
+        .unwrap();
+        let _env = TrustDirEnvGuard::set(trust_dir.path());
+
+        let entry = || BootstrapPubkey::hybrid(service_ed.verifying_key(), service_pq_vk.clone());
+        let credentials = tempfile::tempdir().unwrap();
+        let mut entries = std::collections::HashMap::new();
+        entries.insert("discovery".to_owned(), entry());
+        write_bootstrap_pubkeys_hybrid(credentials.path(), &entries).unwrap();
+
+        // Missing attestation directory: fail closed.
+        assert!(ensure_bootstrap_pubkeys_enrolled(credentials.path(), &entries).is_err());
+
+        // Enrolled: the attestation verifies against the chain and matches the
+        // entry.
+        let enrollment_dir = credentials.path().join(BOOTSTRAP_PUBKEYS_ENROLLMENT_DIR);
+        std::fs::create_dir(&enrollment_dir).unwrap();
+        std::fs::write(
+            enrollment_dir.join("discovery.json"),
+            serde_json::to_vec(&attestation).unwrap(),
+        )
+        .unwrap();
+        ensure_bootstrap_pubkeys_enrolled(credentials.path(), &entries).unwrap();
+
+        // A bootstrap entry the attestation does not name (rotated without
+        // re-enrollment) fails closed.
+        let other_ed = SigningKey::generate(&mut rand::rngs::OsRng);
+        let (other_pq, _) = ml_dsa_generate_keypair();
+        let other_pq_vk = ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(&other_pq)).unwrap();
+        let mut rotated = std::collections::HashMap::new();
+        rotated.insert(
+            "discovery".to_owned(),
+            BootstrapPubkey::hybrid(other_ed.verifying_key(), other_pq_vk),
+        );
+        write_bootstrap_pubkeys_hybrid(credentials.path(), &rotated).unwrap();
+        assert!(ensure_bootstrap_pubkeys_enrolled(credentials.path(), &rotated).is_err());
     }
 
     #[test]
@@ -3403,9 +4177,9 @@ mod tests {
             UcanPayload {
                 issuer: Did::from_ed25519(&root.ed.verifying_key().to_bytes()),
                 audience: Did::from_ed25519(&delegated.ed.verifying_key().to_bytes()),
-                capabilities: vec![registry_mint_capability(
+                capabilities: vec![hyprstream_discovery::registry_mint_capability(
                     &root.bundle.deployment_domain,
-                    &delegated_public,
+                    &STANDARD.encode(&delegated_public),
                 )],
                 not_before: Some(now),
                 expiration: Some(now + 3_600),
@@ -3961,6 +4735,10 @@ mod tests {
             .expect_err("a capsule with no deployment reach must not verify");
         let rendered = format!("{error:#}");
         assert!(
+            rendered.contains("closed deployment-anchor profile violation"),
+            "a node capsule must be rejected by the closed anchor profile: {rendered}"
+        );
+        assert!(
             rendered.contains("mint-anchor-capsule"),
             "rejection must tell the operator how to mint a usable anchor: {rendered}"
         );
@@ -4263,5 +5041,530 @@ mod tests {
                 subcommand.join(" ")
             );
         }
+    }
+
+    // ---- inherited-FD credential interface (#1561) ---------------------
+
+    /// Write `bytes` into a pipe and return the read end, emulating an
+    /// inherited, non-seekable credential fd (systemd LoadCredentialEncrypted
+    /// + podman --preserve-fds).
+    fn fd_pipe(bytes: &[u8]) -> std::fs::File {
+        let mut fds = [0_i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+        let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        writer.write_all(bytes).expect("write pipe");
+        drop(writer); // closing the write end gives the reader a clean EOF
+        unsafe { std::fs::File::from_raw_fd(fds[0]) }
+    }
+
+    // TEST-ONLY static age key material for the FD-interface fixture. The
+    // rust-builder merge-gate container has no `age-keygen` binary, so the
+    // tests must not launch one; these keys protect only ephemeral tempdir
+    // artifacts and must never be used for a real deployment.
+    const TEST_ONLY_ROOT_IDENTITY: &str =
+        "AGE-SECRET-KEY-18DUYV5CM8FZ2DPGXFFN0NPA5QZVW6L245K04YN74FGYUDJU2DVYQUL97GF\n";
+    const TEST_ONLY_ROOT_RECIPIENT: &str =
+        "age1lpty3rrqge6ql2qu3ppyx2xxvwdwau593v88ffsgjt0lgu5jayqqrzhgqx";
+    const TEST_ONLY_BACKUP_RECIPIENT: &str =
+        "age1tvwjdr4gpg97ys63y34m78n2cmh5yvvc40em3ute8ztwml6hvfgssl9jqv";
+    const TEST_ONLY_SIGNER_IDENTITY: &str =
+        "AGE-SECRET-KEY-14JDHVJAXQKXE9YV9EG3GN2ZAMR37CKJF4VJHZDZDDCRATE2EGZ7QRM86RV\n";
+    const TEST_ONLY_SIGNER_RECIPIENT: &str =
+        "age1w886v3ltxtmc4vls30227nlf72sxcdgag60gup9j50srw2jgx93spxpwkk";
+
+    struct MintFdFixture {
+        // Holds the tempdir open for the fixture's lifetime.
+        _dir: tempfile::TempDir,
+        public_ca: PathBuf,
+        authority_key: PathBuf,
+        authority_log: PathBuf,
+        authority_checkpoint: PathBuf,
+        delegation: PathBuf,
+        registry_public_key: PathBuf,
+        delegated_key_bytes: Vec<u8>,
+        signer_identity_bytes: Vec<u8>,
+        registry_key_bytes: [u8; 32],
+    }
+
+    /// Run the real path-form ceremony (mint-deployment-ca +
+    /// delegate-registry-signer) into a tempdir, returning everything the
+    /// FD-form mint needs. Requires the `age` binary (production mint shells
+    /// out to it); callers skip when it is absent, matching the
+    /// `trial_decrypt_*` convention.
+    fn mint_fd_fixture() -> MintFdFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let root_identity = dir.path().join("root.identity");
+        std::fs::write(&root_identity, TEST_ONLY_ROOT_IDENTITY).unwrap();
+
+        let public_ca = dir.path().join("deployment-ca.hybrid");
+        let authority_key = dir.path().join("deployment-ca.age");
+        let authority_log = dir.path().join("deployment-authority.log.json");
+        let authority_checkpoint = dir.path().join("deployment-authority.head.json");
+        mint_deployment_ca(&MintDeploymentCaArgs {
+            public_ca: public_ca.clone(),
+            authority_key: authority_key.clone(),
+            authority_log: authority_log.clone(),
+            authority_checkpoint: authority_checkpoint.clone(),
+            recipients: vec![
+                TEST_ONLY_ROOT_RECIPIENT.to_owned(),
+                TEST_ONLY_BACKUP_RECIPIENT.to_owned(),
+            ],
+            yubikey_recipients: vec![],
+            kms_plugin_recipients: vec![],
+            piv_slot: None,
+            force: false,
+        })
+        .unwrap();
+
+        let delegated_key = dir.path().join("registry-delegated-signer.age");
+        let delegation = dir.path().join("registry-signer.delegation.json");
+        delegate_registry_signer(&DelegateRegistrySignerArgs {
+            public_ca: public_ca.clone(),
+            authority_log: authority_log.clone(),
+            authority_checkpoint: authority_checkpoint.clone(),
+            authority_key: authority_key.clone(),
+            identities: vec![root_identity],
+            yubikey_identities: vec![],
+            software_recovery: false,
+            signer_recipients: vec![TEST_ONLY_SIGNER_RECIPIENT.to_owned()],
+            delegated_key: delegated_key.clone(),
+            delegation: delegation.clone(),
+            delegation_ttl_seconds: 2_592_000,
+            force: false,
+        })
+        .unwrap();
+
+        let registry_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let registry_public_key = dir.path().join("registry-public-key");
+        std::fs::write(
+            &registry_public_key,
+            registry_key.verifying_key().as_bytes(),
+        )
+        .unwrap();
+
+        MintFdFixture {
+            delegated_key_bytes: std::fs::read(&delegated_key).unwrap(),
+            signer_identity_bytes: TEST_ONLY_SIGNER_IDENTITY.as_bytes().to_vec(),
+            registry_key_bytes: registry_key.verifying_key().to_bytes(),
+            _dir: dir,
+            public_ca,
+            authority_key,
+            authority_log,
+            authority_checkpoint,
+            delegation,
+            registry_public_key,
+        }
+    }
+
+    fn mint_fd_args(
+        fixture: &MintFdFixture,
+        signer_fd: RawFd,
+        identity_fd: RawFd,
+        out: &Path,
+    ) -> MintRegistryJwtArgs {
+        MintRegistryJwtArgs {
+            public_ca: fixture.public_ca.clone(),
+            authority_key: fixture.authority_key.clone(),
+            identities: vec![],
+            identity_fds: vec![identity_fd],
+            yubikey_identities: vec![],
+            software_recovery: false,
+            via_delegated_signer: None,
+            via_delegated_signer_fd: Some(signer_fd),
+            delegation: Some(fixture.delegation.clone()),
+            authority_log: fixture.authority_log.clone(),
+            authority_checkpoint: fixture.authority_checkpoint.clone(),
+            root: false,
+            registry_public_key: fixture.registry_public_key.clone(),
+            ttl_seconds: 3600,
+            jwt: out.join("registry-service.jwt"),
+            contract: out.join("deployment-trust.contract.json"),
+            force: false,
+        }
+    }
+
+    fn enrollment_fd_args(
+        fixture: &MintFdFixture,
+        signer_fd: RawFd,
+        identity_fd: RawFd,
+        service_public_key: PathBuf,
+        attestation: PathBuf,
+    ) -> EnrollServiceKeyArgs {
+        EnrollServiceKeyArgs {
+            public_ca: fixture.public_ca.clone(),
+            authority_log: fixture.authority_log.clone(),
+            authority_checkpoint: fixture.authority_checkpoint.clone(),
+            identities: vec![],
+            identity_fds: vec![identity_fd],
+            yubikey_identities: vec![],
+            software_recovery: false,
+            via_delegated_signer: None,
+            via_delegated_signer_fd: Some(signer_fd),
+            delegation: fixture.delegation.clone(),
+            service: "discovery".to_owned(),
+            service_public_key,
+            ttl_seconds: 3_600,
+            attestation,
+            force: false,
+        }
+    }
+
+    #[test]
+    fn mint_registry_jwt_via_inherited_fds_round_trips_through_production_verifier() {
+        // Production mint shells out to `age`; skip where it is absent (the
+        // rust-builder merge-gate container), matching the trial_decrypt_*
+        // convention. The static TEST-ONLY key material above means
+        // `age-keygen` is never needed.
+        if !age_available() {
+            eprintln!("skipping: age binary not on PATH");
+            return;
+        }
+        let fixture = mint_fd_fixture();
+        let out = tempfile::tempdir().unwrap();
+        let signer = fd_pipe(&fixture.delegated_key_bytes);
+        let identity = fd_pipe(&fixture.signer_identity_bytes);
+        let args = mint_fd_args(
+            &fixture,
+            signer.as_raw_fd(),
+            identity.as_raw_fd(),
+            out.path(),
+        );
+        mint_registry_jwt(&args).expect("FD-form mint must succeed");
+
+        // The same production verifier the registry runs at boot must accept
+        // the credential minted purely from inherited fds.
+        let token = std::fs::read_to_string(out.path().join("registry-service.jwt")).unwrap();
+        let verified = hyprstream_discovery::verify_deployment_artifacts_with_authority_log(
+            &std::fs::read(&fixture.public_ca).unwrap(),
+            &std::fs::read(&fixture.authority_log).unwrap(),
+            &std::fs::read(&fixture.authority_checkpoint).unwrap(),
+            &token,
+        )
+        .expect("production verifier must accept the FD-minted credential");
+        assert_eq!(verified.registry_public_key, fixture.registry_key_bytes);
+    }
+
+    #[test]
+    fn enroll_service_key_via_inherited_fds_round_trips_through_production_verifier() {
+        // The same real age seam as staging is used here: a non-seekable
+        // signer credential and identity are consumed directly from inherited
+        // FDs, never reopened through /proc/self/fd/N.
+        if !age_available() {
+            eprintln!("skipping: age binary not on PATH");
+            return;
+        }
+        let fixture = mint_fd_fixture();
+        let out = tempfile::tempdir().unwrap();
+        let service_public_key = out.path().join("service-pubkey.hybrid");
+        let service = test_authority(AuthorityPurpose::Root, None);
+        std::fs::write(&service_public_key, service.public_bytes()).unwrap();
+        let attestation = out.path().join("service-key-enrollment.json");
+        let signer = fd_pipe(&fixture.delegated_key_bytes);
+        let identity = fd_pipe(&fixture.signer_identity_bytes);
+        let args = enrollment_fd_args(
+            &fixture,
+            signer.as_raw_fd(),
+            identity.as_raw_fd(),
+            service_public_key,
+            attestation.clone(),
+        );
+
+        enroll_service_key(&args).expect("FD-form enrollment must succeed");
+
+        let verified = hyprstream_discovery::verify_service_key_enrollment(
+            &std::fs::read(&fixture.public_ca).unwrap(),
+            &std::fs::read(&fixture.authority_log).unwrap(),
+            &std::fs::read(&fixture.authority_checkpoint).unwrap(),
+            &std::fs::read(&attestation).unwrap(),
+        )
+        .expect("production verifier must accept the FD-minted attestation");
+        assert_eq!(verified.service, "discovery");
+        assert_eq!(verified.hybrid_public_key, service.public_bytes());
+    }
+
+    #[test]
+    fn enroll_service_key_fd_flags_reject_incomplete_or_mixed_forms() {
+        use clap::Subcommand as _;
+        let parse = |extra: &[&str]| {
+            TrustCommand::augment_subcommands(clap::Command::new("hyprstream"))
+                .try_get_matches_from(
+                    ["hyprstream", "enroll-service-key"]
+                        .into_iter()
+                        .chain(extra.iter().copied()),
+                )
+        };
+        let required = [
+            "--delegation",
+            "d.json",
+            "--service",
+            "discovery",
+            "--service-public-key",
+            "service-pubkey.hybrid",
+        ];
+        // A signer input is mandatory; there is no implicit path fallback.
+        assert!(parse(&[
+            "--identity",
+            "id",
+            "--delegation",
+            "d.json",
+            "--service",
+            "discovery",
+            "--service-public-key",
+            "service-pubkey.hybrid",
+        ])
+        .is_err());
+        // Path and inherited-FD signer forms are exclusive.
+        assert!(parse(&[
+            "--via-delegated-signer",
+            "signer.age",
+            "--via-delegated-signer-fd",
+            "10",
+            "--identity",
+            "id",
+            "--delegation",
+            "d.json",
+            "--service",
+            "discovery",
+            "--service-public-key",
+            "service-pubkey.hybrid",
+        ])
+        .is_err());
+        // Path and inherited-FD identity forms are exclusive.
+        assert!(parse(&[
+            "--via-delegated-signer-fd",
+            "10",
+            "--identity",
+            "id",
+            "--identity-fd",
+            "11",
+            "--delegation",
+            "d.json",
+            "--service",
+            "discovery",
+            "--service-public-key",
+            "service-pubkey.hybrid",
+        ])
+        .is_err());
+        // The pure inherited-FD form parses and has no pathname credential.
+        let mut fd_form = vec!["--via-delegated-signer-fd", "10", "--identity-fd", "11"];
+        fd_form.extend(required);
+        assert!(parse(&fd_form).is_ok());
+        // The established path form remains accepted.
+        assert!(parse(&[
+            "--via-delegated-signer",
+            "signer.age",
+            "--identity",
+            "id",
+            "--delegation",
+            "d.json",
+            "--service",
+            "discovery",
+            "--service-public-key",
+            "service-pubkey.hybrid",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn mint_registry_jwt_fd_flags_conflict_with_path_forms() {
+        use clap::Subcommand as _;
+        let parse = |extra: &[&str]| {
+            TrustCommand::augment_subcommands(clap::Command::new("hyprstream"))
+                .try_get_matches_from(
+                    ["hyprstream", "mint-registry-jwt"]
+                        .into_iter()
+                        .chain(extra.iter().copied()),
+                )
+        };
+        // Signer path + signer fd conflict.
+        assert!(parse(&[
+            "--via-delegated-signer",
+            "k.age",
+            "--via-delegated-signer-fd",
+            "3",
+            "--identity",
+            "id",
+        ])
+        .is_err());
+        // Identity path + identity fd conflict.
+        assert!(parse(&[
+            "--via-delegated-signer",
+            "k.age",
+            "--identity",
+            "id",
+            "--identity-fd",
+            "4",
+        ])
+        .is_err());
+        // --root + signer fd conflict.
+        assert!(parse(&[
+            "--root",
+            "--via-delegated-signer-fd",
+            "3",
+            "--identity",
+            "id"
+        ])
+        .is_err());
+        // --root + signer path conflict (behavior carried over from main).
+        assert!(parse(&[
+            "--root",
+            "--via-delegated-signer",
+            "k.age",
+            "--identity",
+            "id",
+            "--registry-public-key",
+            "r",
+        ])
+        .is_err());
+        // Exactly one signer source is required unless --root.
+        assert!(parse(&["--identity", "id"]).is_err());
+        // The --root bootstrap path parses WITHOUT any signer flag; on main
+        // --via-delegated-signer was required_unless_present = "root", and
+        // clap does not waive a required ArgGroup for a conflicting flag, so
+        // this case pins the restored semantics against that regression.
+        if let Err(error) = parse(&["--root", "--identity", "id", "--registry-public-key", "r"]) {
+            panic!("--root bootstrap form must parse: {error}");
+        }
+        // The pure FD form parses.
+        if let Err(error) = parse(&[
+            "--via-delegated-signer-fd",
+            "3",
+            "--identity-fd",
+            "4",
+            "--delegation",
+            "d.json",
+            "--registry-public-key",
+            "r",
+        ]) {
+            panic!("FD form must parse: {error}");
+        }
+        // The path forms are unchanged.
+        assert!(parse(&[
+            "--via-delegated-signer",
+            "k.age",
+            "--identity",
+            "id",
+            "--delegation",
+            "d.json",
+            "--registry-public-key",
+            "r",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn mint_registry_jwt_fd_read_failures_fail_closed() {
+        // Identity-fd read failures abort during identity resolution, before
+        // any authority-log/delegation validation or `age` subprocess runs, so
+        // these cases hold even where the age binary is absent (the
+        // rust-builder merge-gate container).
+        let stage = tempfile::tempdir().unwrap();
+        let authority = test_authority(AuthorityPurpose::Root, None);
+        let public_ca = stage.path().join("ca");
+        std::fs::write(&public_ca, authority.public_bytes()).unwrap();
+        let registry_public_key = stage.path().join("registry-pub");
+        std::fs::write(
+            &registry_public_key,
+            SigningKey::generate(&mut rand::rngs::OsRng)
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap();
+        let identity_fail_args = |identity_fd: RawFd, out: &Path| MintRegistryJwtArgs {
+            public_ca: public_ca.clone(),
+            authority_key: stage.path().join("unused.age"),
+            identities: vec![],
+            identity_fds: vec![identity_fd],
+            yubikey_identities: vec![],
+            software_recovery: false,
+            via_delegated_signer: None,
+            via_delegated_signer_fd: Some(0),
+            delegation: Some(stage.path().join("unused.json")),
+            authority_log: stage.path().join("unused.log"),
+            authority_checkpoint: stage.path().join("unused.head"),
+            root: false,
+            registry_public_key: registry_public_key.clone(),
+            ttl_seconds: 3600,
+            jwt: out.join("registry-service.jwt"),
+            contract: out.join("deployment-trust.contract.json"),
+            force: false,
+        };
+        for (name, bytes) in [
+            ("oversize", vec![b'x'; MAX_AGE_IDENTITY_BYTES + 1]),
+            ("empty", Vec::new()),
+        ] {
+            let out = tempfile::tempdir().unwrap();
+            let identity = fd_pipe(&bytes);
+            let args = identity_fail_args(identity.as_raw_fd(), out.path());
+            assert!(
+                mint_registry_jwt(&args).is_err(),
+                "{name} identity fd must fail closed"
+            );
+            assert!(
+                !out.path().join("registry-service.jwt").exists(),
+                "{name} identity fd left a partial JWT artifact"
+            );
+        }
+
+        // The remaining cases exercise signer-fd reads and age decryption,
+        // which need the full ceremony fixture and therefore the age binary;
+        // skip them where it is absent (trial_decrypt_* convention).
+        if !age_available() {
+            eprintln!("skipping age-dependent cases: age binary not on PATH");
+            return;
+        }
+        let fixture = mint_fd_fixture();
+        let run = |signer_fd: RawFd, identity_fd: RawFd| {
+            let out = tempfile::tempdir().unwrap();
+            let args = mint_fd_args(&fixture, signer_fd, identity_fd, out.path());
+            let result = mint_registry_jwt(&args);
+            (out, result)
+        };
+
+        // An invalid descriptor must fail the mint, not fall back anywhere.
+        let identity = fd_pipe(&fixture.signer_identity_bytes);
+        let (out, result) = run(-1, identity.as_raw_fd());
+        assert!(result.is_err(), "invalid signer fd must fail closed");
+        assert!(!out.path().join("registry-service.jwt").exists());
+
+        // A write-only descriptor yields a read error, not an empty secret.
+        let write_only = OpenOptions::new().write(true).open("/dev/null").unwrap();
+        let identity = fd_pipe(&fixture.signer_identity_bytes);
+        let (out, result) = run(write_only.as_raw_fd(), identity.as_raw_fd());
+        assert!(result.is_err(), "unreadable signer fd must fail closed");
+        assert!(!out.path().join("registry-service.jwt").exists());
+
+        // An over-cap identity stream is rejected before decryption.
+        let signer = fd_pipe(&fixture.delegated_key_bytes);
+        let oversize = fd_pipe(vec![b'x'; MAX_AGE_IDENTITY_BYTES + 1].as_slice());
+        let (out, result) = run(signer.as_raw_fd(), oversize.as_raw_fd());
+        assert!(result.is_err(), "oversize identity fd must fail closed");
+        assert!(!out.path().join("registry-service.jwt").exists());
+
+        // An empty identity stream is rejected before decryption.
+        let signer = fd_pipe(&fixture.delegated_key_bytes);
+        let empty = fd_pipe(b"");
+        let (out, result) = run(signer.as_raw_fd(), empty.as_raw_fd());
+        assert!(result.is_err(), "empty identity fd must fail closed");
+        assert!(!out.path().join("registry-service.jwt").exists());
+
+        // A truncated signer ciphertext (short read / EOF mid-stream) must not
+        // mint a partial credential.
+        let truncated =
+            fd_pipe(&fixture.delegated_key_bytes[..fixture.delegated_key_bytes.len() / 2]);
+        let identity = fd_pipe(&fixture.signer_identity_bytes);
+        let (out, result) = run(truncated.as_raw_fd(), identity.as_raw_fd());
+        assert!(result.is_err(), "truncated signer fd must fail closed");
+        assert!(!out.path().join("registry-service.jwt").exists());
+
+        // Identity bytes that cannot open the ciphertext fail in age.
+        let signer = fd_pipe(&fixture.delegated_key_bytes);
+        let wrong = fd_pipe(b"# not an identity\n");
+        let (out, result) = run(signer.as_raw_fd(), wrong.as_raw_fd());
+        assert!(
+            result.is_err(),
+            "non-decrypting identity fd must fail closed"
+        );
+        assert!(!out.path().join("registry-service.jwt").exists());
     }
 }

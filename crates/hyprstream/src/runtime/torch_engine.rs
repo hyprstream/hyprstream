@@ -1048,6 +1048,8 @@ impl TorchEngine {
             self.config.max_context.map(|v| v as usize),
             self.config.kv_quant_type,
             self.device_pool.as_deref(),
+            self.config.fp8_dequant_load,
+            self.config.speculative_decoding,
         ).await?;
         let factory_time = factory_start.elapsed();
         info!("✅ Model weights loaded in {:.2}s", factory_time.as_secs_f64());
@@ -2640,6 +2642,38 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
 
+    #[test]
+    fn mtp_bonus_sampling_matches_serial_repetition_window() {
+        let engine = TorchEngine::new(RuntimeConfig {
+            use_gpu: false, speculative_decoding: false, ..Default::default()
+        }).unwrap();
+        const TOKENIZER: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"oldest":0,"recent":1,"accepted":2,"[UNK]":3},"unk_token":"[UNK]"}}"#;
+        *engine.tokenizer.lock() = Some(Tokenizer::from_bytes(TOKENIZER.as_bytes()).unwrap());
+        let request = GenerationRequest {
+            prompt: "recent".into(), temperature: Some(0.0), repeat_penalty: Some(2.0),
+            repeat_last_n: Some(2), ..Default::default()
+        };
+        let mut stream = TextStream::new(&engine, request).unwrap();
+        stream.recent_tokens = VecDeque::from([0, 1]);
+        // The accepted first token makes serial evict token 0. Penalizing that
+        // stale token changes the bonus argmax from 0 to 3 in this fixture.
+        let logits = Tensor::from_slice(&[10.0_f32, 0.0, 0.0, 7.0]);
+        let serial = engine.sample_token_with_params(
+            &logits.copy(), &stream.sampling_params, &[1, 2], &stream.penalty_exempt_tokens,
+        ).unwrap();
+        let stale = engine.sample_token_with_params(
+            &logits.copy(), &stream.sampling_params, &[0, 1, 2], &stream.penalty_exempt_tokens,
+        ).unwrap();
+        assert_ne!(stale, serial, "fixture must detect the pre-fix history");
+        let bonus = stream.sample_spec_position(&logits.copy(), &[2]).unwrap();
+        assert_eq!(bonus as usize, serial);
+        assert_eq!(stream.recent_tokens_buffer, vec![1, 2]);
+        assert_eq!(stream.recent_tokens, VecDeque::from([0, 1]));
+        // More round-local tokens than the configured window still stay bounded.
+        stream.sample_spec_position(&logits.copy(), &[2, 3, 1]).unwrap();
+        assert_eq!(stream.recent_tokens_buffer, vec![3, 1]);
+    }
+
     // ===== #1253: prompt/token text must never reach process logs =====
 
     /// Distinctive canary planted in prompt inputs; the assertions below prove
@@ -4039,6 +4073,8 @@ impl<'a> TextStream<'a> {
         self.recent_tokens_buffer.clear();
         self.recent_tokens_buffer.extend(self.recent_tokens.iter().copied());
         self.recent_tokens_buffer.extend(extra_window.iter().copied());
+        let excess = self.recent_tokens_buffer.len().saturating_sub(self.repeat_last_n);
+        self.recent_tokens_buffer.drain(..excess);
         let next_token = self.engine.sample_token_with_params(
             logits, &params, &self.recent_tokens_buffer, &self.penalty_exempt_tokens,
         )?;

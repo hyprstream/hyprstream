@@ -1916,6 +1916,8 @@ pub enum CacheLocation {
 
 /// KV cache manager for all layers in a model
 pub struct KVCacheManager {
+    /// Backend and tenant ownership retained for lazily added auxiliary layers.
+    paged_backend: Option<(Arc<Mutex<BlockPool>>, CacheOwner)>,
     /// Cache for each layer (lock-free concurrent access)
     layer_caches: DashMap<usize, LayerKVCache>,
     /// Maximum sequence length
@@ -1959,6 +1961,7 @@ impl KVCacheManager {
             max_seq_len,
             enabled: true,
             quant_type,
+            paged_backend: None,
             last_access_ms: AtomicU64::new(current_timestamp_ms()),
             access_count: AtomicU64::new(0),
             cached_token_ids: Vec::new(),
@@ -1994,6 +1997,7 @@ impl KVCacheManager {
             max_seq_len,
             enabled: true,
             quant_type: KVQuantType::None,
+            paged_backend: Some((pool, owner)),
             last_access_ms: AtomicU64::new(current_timestamp_ms()),
             access_count: AtomicU64::new(0),
             cached_token_ids: Vec::new(),
@@ -2053,7 +2057,12 @@ impl KVCacheManager {
     pub fn ensure_layer_cache(&self, layer_idx: usize) {
         self.layer_caches
             .entry(layer_idx)
-            .or_insert_with(|| LayerKVCache::new(self.max_seq_len, self.quant_type));
+            .or_insert_with(|| match &self.paged_backend {
+                Some((pool, owner)) => {
+                    LayerKVCache::new_paged(self.max_seq_len, Arc::clone(pool), owner.clone())
+                }
+                None => LayerKVCache::new(self.max_seq_len, self.quant_type),
+            });
     }
 
     /// Maximum sequence length every layer cache is bounded by
@@ -2680,6 +2689,48 @@ mod tests {
         }
 
         assert_eq!(pool.lock().used_blocks(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn mtp_auxiliary_cache_retains_paged_pool_and_owner() -> Result<()> {
+        for main_layers in [0, 1] {
+            let pool = Arc::new(Mutex::new(BlockPool::new(
+                2, 2, 4, Device::Cpu, DType::Float,
+            )?));
+            let alice = CacheOwner::Session("mtp-alice".into());
+            let manager = KVCacheManager::new_paged(main_layers, 64, pool.clone(), alice.clone());
+            let keys = Tensor::ones([1, 1, 2, 4], (DType::Float, Device::Cpu));
+            manager.ensure_layer_cache(main_layers);
+            manager.with_layer_cache(main_layers, |cache| cache.update(&keys, &keys, 0))
+                .expect("auxiliary slot")?;
+            assert_eq!(pool.lock().used_blocks(), 2);
+            for block in 0..2 {
+                assert_eq!(pool.lock().owner_of(block), Some(&alice));
+            }
+            // Re-admission must retain the existing cache and its blocks.
+            manager.ensure_layer_cache(main_layers);
+            assert_eq!(pool.lock().used_blocks(), 2);
+            manager.ensure_layer_cache(main_layers + 1);
+            let error = manager.with_layer_cache(main_layers + 1, |cache| cache.update(&keys, &keys, 0))
+                .expect("second auxiliary slot").expect_err("shared pool is full");
+            assert!(error.downcast_ref::<BlockPoolExhausted>().is_some());
+            assert_eq!(pool.lock().used_blocks(), 2);
+            let bob = CacheOwner::Session("mtp-bob".into());
+            let other = KVCacheManager::new_paged(0, 64, pool.clone(), bob.clone());
+            other.ensure_layer_cache(0);
+            assert!(other.with_layer_cache(0, |cache| cache.update(&keys, &keys, 0))
+                .expect("other owner's auxiliary slot").is_err());
+            drop(manager);
+            assert_eq!(pool.lock().used_blocks(), 0);
+            other.with_layer_cache(0, |cache| cache.update(&keys, &keys, 0))
+                .expect("other owner's auxiliary slot")?;
+            for block in 0..2 {
+                assert_eq!(pool.lock().owner_of(block), Some(&bob));
+            }
+            drop(other);
+            assert_eq!(pool.lock().used_blocks(), 0);
+        }
         Ok(())
     }
 

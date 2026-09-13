@@ -4,6 +4,7 @@ pub mod client;
 pub mod data;
 pub mod dispatch;
 pub mod handler;
+pub mod leaf;
 pub mod metadata;
 pub mod scoped;
 pub mod vfs;

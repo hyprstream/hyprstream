@@ -137,6 +137,17 @@ jobs:
         python3 -m unittest discover -s scripts/tests -p 'test_check_license_boundary.py'
         python3 scripts/check_license_boundary.py
 
+    - name: Static build-matrix contract gate (native CI plan)
+      # Validates .github/build-matrix.json — the architecture/backend/runner/
+      # cache/artifact contract, the fail-closed ARM-CUDA row gate, and the
+      # hosted-runner allowlist (a NEW GitHub-hosted job fails here unless it
+      # is explicitly reviewed into hosted_allowlist; a completed migration
+      # must delete its entry). Pure static JSON+YAML inspection, no network.
+      # Must be able to fail — do NOT add `|| true`.
+      run: |
+        python3 scripts/check_build_matrix.py
+        python3 -m unittest discover -s scripts/tests -p 'test_check_build_matrix.py'
+
   loopback-burndown:
     name: Loopback-literal burn-down (#1152 W4)
     # Hardcoded 127.0.0.1 / localhost / ::1 are single-host-era residue that
@@ -323,7 +334,7 @@ jobs:
           -e LIBTORCH=/opt/libtorch -e LD_LIBRARY_PATH=/opt/libtorch/lib \
           -e LIBTORCH_BYPASS_VERSION_CHECK=1 -e OPENSSL_NO_VENDOR=1 \
           -e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream \
-          -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
+          -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always -e CI=true \
           -e BROWSER_ATTEST_NONCE \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '

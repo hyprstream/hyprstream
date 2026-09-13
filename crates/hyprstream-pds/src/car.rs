@@ -26,6 +26,7 @@
 use anyhow::{anyhow, bail, ensure, Result};
 use p256::ecdsa::VerifyingKey;
 
+use crate::atproto_cbor::AtprotoRecord;
 use crate::cid::{read_uvarint, write_uvarint, Cid};
 use crate::commit::Commit;
 use crate::dag_cbor::DagCbor;
@@ -115,6 +116,98 @@ pub fn build_car_v1(roots: &[Cid], blocks: &[(Cid, Vec<u8>)]) -> Vec<u8> {
     out
 }
 
+/// Build a public AT Protocol CAR proof without changing the native CAR
+/// builder. Every block CID and byte payload is derived from the public
+/// canonical codec, including the CAR header.
+pub fn build_public_record_proof_car(
+    commit: &Commit,
+    path: &Proof,
+    node_blocks: &[(Cid, NodeData)],
+    record: &AtprotoRecord,
+) -> Result<Vec<u8>> {
+    commit.ensure_atproto_signature()?;
+    // Bind the supplied proof to both the signed commit root and this exact
+    // record before emitting any blocks. This rejects empty proofs and proofs
+    // copied from a different commit or record.
+    path.verify_atproto(&commit.data, &record.cid())?;
+    ensure_proof_record_key(path, record)?;
+
+    let commit_cid = commit.cid_atproto()?;
+    let mut blocks = vec![(commit_cid, commit.to_atproto_dag_cbor()?)];
+    let path_cids: std::collections::BTreeSet<Cid> = path
+        .path
+        .iter()
+        .map(|step| match step {
+            crate::mst::ProofStep::FoundAt(d, _)
+            | crate::mst::ProofStep::ThroughEntry(d, _)
+            | crate::mst::ProofStep::LeftSubtree(d) => d.cid_atproto(),
+        })
+        .collect::<Result<_>>()?;
+    let mut supplied_path_cids = std::collections::BTreeSet::new();
+    for (cid, data) in node_blocks {
+        ensure!(
+            data.cid_atproto()? == *cid,
+            "public MST block is labeled with a CID that does not match its bytes"
+        );
+        if path_cids.contains(cid) {
+            ensure!(
+                supplied_path_cids.insert(*cid),
+                "duplicate public MST block for proof path"
+            );
+            blocks.push((*cid, data.encode_atproto()?));
+        }
+    }
+    ensure!(
+        supplied_path_cids.len() == path_cids.len(),
+        "public proof CAR is missing an MST path block"
+    );
+    blocks.push((record.cid(), record.bytes().to_vec()));
+    build_car_v1_atproto(&[commit_cid], &blocks)
+}
+
+fn ensure_proof_record_key(path: &Proof, record: &AtprotoRecord) -> Result<()> {
+    let (data, index) = match path.path.last() {
+        Some(crate::mst::ProofStep::FoundAt(data, index)) => (data, *index),
+        _ => bail!("public MST proof has no terminal record entry"),
+    };
+    let mut key = Vec::new();
+    for entry in data.e.iter().take(index + 1) {
+        ensure!(
+            entry.p <= key.len(),
+            "public MST proof has an invalid key prefix length"
+        );
+        key.truncate(entry.p);
+        key.extend_from_slice(&entry.k);
+    }
+    let key = String::from_utf8(key).map_err(|_| anyhow!("public MST proof key is not UTF-8"))?;
+    ensure!(
+        key == format!("{}/{}", record.collection(), record.rkey().as_str()),
+        "public MST proof key does not match the supplied record"
+    );
+    Ok(())
+}
+
+/// Public AT Protocol CARv1 builder. The native builder remains unchanged.
+pub fn build_car_v1_atproto(roots: &[Cid], blocks: &[(Cid, Vec<u8>)]) -> Result<Vec<u8>> {
+    let header_value = DagCbor::str_map([
+        ("version", DagCbor::Unsigned(1)),
+        (
+            "roots",
+            DagCbor::List(roots.iter().copied().map(DagCbor::Link).collect()),
+        ),
+    ]);
+    let header_bytes = crate::atproto_cbor::encode(&header_value)?;
+    let mut out = Vec::new();
+    write_section(&mut out, &header_bytes);
+    for (cid, bytes) in blocks {
+        let mut section = Vec::with_capacity(cid.as_bytes().len() + bytes.len());
+        section.extend_from_slice(cid.as_bytes());
+        section.extend_from_slice(bytes);
+        write_section(&mut out, &section);
+    }
+    Ok(out)
+}
+
 fn write_section(out: &mut Vec<u8>, body: &[u8]) {
     write_uvarint(body.len() as u64, out);
     out.extend_from_slice(body);
@@ -157,6 +250,40 @@ pub fn parse_car_v1(input: &[u8]) -> Result<(Vec<Cid>, Vec<(Cid, Vec<u8>)>)> {
     Ok((roots, blocks))
 }
 
+/// Parse a CAR whose header uses public AT canonical DAG-CBOR. Block framing is
+/// identical to [`parse_car_v1`]; callers decide how to decode each block.
+pub fn parse_car_v1_atproto(input: &[u8]) -> Result<(Vec<Cid>, Vec<(Cid, Vec<u8>)>)> {
+    let (header_body, mut cursor) = read_section(input, 0)?;
+    let header_val = crate::atproto_cbor::decode(header_body)?;
+    let version = header_val
+        .get("version")
+        .ok_or_else(|| anyhow!("CAR header missing 'version'"))?
+        .as_unsigned()?;
+    ensure!(
+        version == 1,
+        "only CARv1 is supported (got version {version})"
+    );
+    let roots_val = header_val
+        .get("roots")
+        .ok_or_else(|| anyhow!("CAR header missing 'roots'"))?
+        .as_list()?;
+    let roots = roots_val
+        .iter()
+        .map(|r| r.as_link())
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .copied()
+        .collect();
+    let mut blocks = Vec::new();
+    while cursor < input.len() {
+        let (body, after) = read_section(input, cursor)?;
+        cursor = after;
+        let (cid, consumed) = parse_cid_prefix(body)?;
+        blocks.push((cid, body[consumed..].to_vec()));
+    }
+    Ok((roots, blocks))
+}
+
 /// Read one length-prefixed CAR section. Returns `(body, new_cursor)`.
 fn read_section(input: &[u8], cursor: usize) -> Result<(&[u8], usize)> {
     let (len, rest) =
@@ -186,11 +313,17 @@ fn parse_cid_prefix(body: &[u8]) -> Result<(Cid, usize)> {
         i += (body.len() - i) - rest.len();
         let (len, rest) = read_uvarint(&body[i..]).ok_or_else(|| anyhow!("truncated mh len"))?;
         i += (body.len() - i) - rest.len();
-        i += len as usize;
+        let digest_len = usize::try_from(len).map_err(|_| anyhow!("CID digest length overflow"))?;
+        let end = i
+            .checked_add(digest_len)
+            .ok_or_else(|| anyhow!("CID digest length overflow"))?;
+        ensure!(end <= body.len(), "truncated CID digest");
+        i = end;
         let cid = Cid::from_bytes(&body[..i])?;
         Ok((cid, i))
     } else if body[0] == 0x12 {
         // CIDv0 (sha2-256, 32 bytes): 34 bytes total.
+        ensure!(body.len() >= 34, "truncated CIDv0");
         let cid = Cid::from_bytes(&body[..34])?;
         Ok((cid, 34))
     } else {
@@ -416,5 +549,17 @@ mod tests {
         let (roots, blocks) = parse_car_v1(&car).expect("parse");
         assert_eq!(roots, vec![root]);
         assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn atproto_parser_rejects_truncated_cid_without_panicking() {
+        // A CIDv1 multihash advertises a 32-byte digest but the CAR section
+        // ends immediately after the length varint.
+        let malformed = hex::decode("11a265726f6f7473806776657273696f6e010401711220")
+            .expect("fixture is valid hex");
+        assert!(parse_car_v1_atproto(&malformed).is_err());
+
+        // The fixed-width CIDv0 form must receive the same bounds check.
+        assert!(parse_cid_prefix(&[0x12, 0x20]).is_err());
     }
 }
