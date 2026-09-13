@@ -767,8 +767,17 @@ async fn owned_public_writer(
     repo: &str,
 ) -> Option<crate::services::public_repo::PublicRepoReader> {
     use crate::services::public_repo::PublicRepoReader;
+    // An existing alias is only a locator. Resolve its target before choosing
+    // storage so an alias to an owned DID cannot revive a legacy snapshot.
+    let did = if let Some(did) = hosted_repo_did(state, repo) {
+        did
+    } else if repo.starts_with("did:") {
+        repo.to_owned()
+    } else {
+        resolve_handle_did(&state.xrpc_repos, &state.issuer_url, repo).await?
+    };
     if let (Some(did), Some(writer)) = (
-        hosted_repo_did(state, repo),
+        hosted_repo_did(state, &did),
         &state.hosted_public_repo_writer,
     ) {
         return Some(PublicRepoReader::Hosted {
@@ -777,11 +786,6 @@ async fn owned_public_writer(
         });
     }
     let writer = state.public_repo_writer.as_ref()?;
-    let did = if repo.starts_with("did:") {
-        repo.to_owned()
-    } else {
-        resolve_handle_did(&state.xrpc_repos, &state.issuer_url, repo).await?
-    };
     (did == writer.did()).then(|| PublicRepoReader::Local(Arc::clone(writer)))
 }
 
@@ -2355,6 +2359,21 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&native_method));
+        let alias_description = app
+            .clone()
+            .oneshot(read_request(
+                "/xrpc/com.atproto.repo.describeRepo?repo=other.example.com",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(alias_description.status(), StatusCode::OK);
+        assert_eq!(body_json(alias_description).await, description);
+        let alias_record = app.clone().oneshot(read_request(&format!(
+            "/xrpc/com.atproto.repo.getRecord?repo=other.example.com&collection=app.bsky.feed.post&rkey={}",
+            Tid::from_raw(1).encode(),
+        ))).await.unwrap();
+        assert_eq!(alias_record.status(), StatusCode::OK);
+        assert_eq!(body_json(alias_record).await["cid"], first["cid"]);
         let export = app
             .clone()
             .oneshot(
@@ -2376,18 +2395,13 @@ mod tests {
         store
             .insert_snapshot_budget_fixture_for_test(hosted_tests::DID, 257, 1)
             .unwrap();
-        for uri in [
-            format!(
-                "/xrpc/com.atproto.repo.describeRepo?repo={}",
-                hosted_tests::DID
-            ),
-            format!(
-                "/xrpc/com.atproto.repo.getRecord?repo={}&collection=app.bsky.feed.post&rkey={}",
-                hosted_tests::DID,
-                Tid::from_raw(1).encode()
-            ),
-            format!("/xrpc/com.atproto.sync.getRepo?did={}", hosted_tests::DID),
-        ] {
+        for uri in [hosted_tests::DID, "alice.accounts.example.com", "other.example.com"]
+            .into_iter().flat_map(|repo| [
+                format!("/xrpc/com.atproto.repo.describeRepo?repo={repo}"),
+                format!("/xrpc/com.atproto.repo.getRecord?repo={repo}&collection=app.bsky.feed.post&rkey={}", Tid::from_raw(1).encode()),
+                format!("/xrpc/com.atproto.sync.getRepo?did={repo}"),
+            ]) {
+
             assert_eq!(
                 app.clone()
                     .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
