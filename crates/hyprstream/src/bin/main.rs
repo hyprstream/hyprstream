@@ -2917,7 +2917,7 @@ fn main() -> Result<()> {
     if let Some(("pds", sub_m)) = matches.subcommand() {
         match sub_m.subcommand() {
             Some(("init-deployment-store", _)) => {
-                hyprstream_discovery::initialize_deployment_checkpoint_store()?;
+                hyprstream_core::cli::deployment_bootstrap::init_checkpoint_store(&config)?;
                 println!("initialized empty deployment checkpoint store");
                 return Ok(());
             }

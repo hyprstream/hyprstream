@@ -99,6 +99,12 @@ jobs:
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
             cargo clippy --workspace --all-targets -- -D warnings
+            # The workspace lint builds default features only, so the
+            # RDS-backed PDS record store (#1257, `pds-postgres`) is cfg-gated
+            # out of it. Lint it explicitly so the module and its tests
+            # always compile in CI. Keep this script apostrophe-free: it is
+            # single-quoted, and an apostrophe would terminate it early.
+            cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings
             sccache --show-stats
           '
 
