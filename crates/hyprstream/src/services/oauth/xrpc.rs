@@ -3758,6 +3758,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_issuer_identity_routes_share_canonical_service_did() {
+        for (issuer, expected) in [
+            ("https://pds.example", "did:web:pds.example"),
+            ("https://PDS.example:443/oauth", "did:web:pds.example"),
+            ("https://pds.example:8443/oauth", "did:web:pds.example%3A8443"),
+            ("http://127.0.0.1:6791", "did:web:127.0.0.1%3A6791"),
+        ] {
+            let mut state = build_test_state(true).await;
+            let mutable = Arc::get_mut(&mut state).unwrap();
+            mutable.issuer_url = issuer.to_owned();
+            mutable.signing_key = Some(ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]));
+            let app = build_production_app_from_state(state).await;
+            for (path, field) in [
+                ("/xrpc/com.atproto.server.describeServer", "did"),
+                ("/.well-known/did.json", "id"),
+                ("/clients/test-client/did.json", "id"),
+            ] {
+                let response = app.clone().oneshot(req(path)).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{issuer} {path}");
+                let body = resp_json(response).await;
+                let subject = if path.starts_with("/clients/") {
+                    format!("{expected}:clients:test-client")
+                } else { expected.to_owned() };
+                assert_eq!(body[field], subject, "{issuer} {path}");
+                if path == "/.well-known/did.json" {
+                    assert!(!body["verificationMethod"].as_array().unwrap().is_empty());
+                }
+                if let Some(methods) = body["verificationMethod"].as_array() {
+                    for method in methods {
+                        assert_eq!(method["controller"], subject);
+                        assert!(method["id"].as_str().unwrap().starts_with(&format!("{subject}#")));
+                    }
+                }
+            }
+            let response = app.oneshot(req("/.well-known/atproto-did")).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(body.as_ref(), expected.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn router_issuer_identity_routes_reject_unsupported_origins() {
+        for issuer in ["https://user@pds.example", "https://[::1]:8443", "ftp://pds.example", "not-a-url"] {
+            let mut state = build_test_state(true).await;
+            let mutable = Arc::get_mut(&mut state).unwrap();
+            mutable.issuer_url = issuer.to_owned();
+            mutable.signing_key = Some(ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]));
+            let app = build_production_app_from_state(state).await;
+            for path in ["/xrpc/com.atproto.server.describeServer", "/.well-known/did.json",
+                "/.well-known/atproto-did", "/clients/test-client/did.json"] {
+                let response = app.clone().oneshot(req(path)).await.unwrap();
+                assert!(response.status().is_server_error(), "{issuer} {path}");
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert!(!String::from_utf8_lossy(&body).contains(issuer));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn describe_server_advertises_only_configured_account_zone() {
         let mut state = build_test_state(false).await;
         Arc::get_mut(&mut state).unwrap().hosted_account_zone =
