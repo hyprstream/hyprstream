@@ -3245,7 +3245,7 @@ impl ModelOperations for LlamaModel {
 
     fn clear_kv_cache(&self) {
         if let Some(cache_ref) = self.kv_cache.as_ref() {
-            let cache_manager = cache_ref.lock();
+            let mut cache_manager = cache_ref.lock();
             cache_manager.clear_all();
         }
     }
