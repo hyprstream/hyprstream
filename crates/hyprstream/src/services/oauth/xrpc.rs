@@ -1141,9 +1141,6 @@ pub async fn create_record(
             )
         }
     };
-    if let Err(message) = validate_flag(object.get("validate")) {
-        return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message);
-    }
     let rkey = match (collection, object.get("rkey")) {
         ("app.bsky.actor.profile", None) => AtprotoRecordKey::new("self").map(Some),
         ("app.bsky.actor.profile", Some(Value::String(value))) if value == "self" => {
@@ -1280,14 +1277,6 @@ pub async fn create_record(
     (StatusCode::OK, axum::Json(response)).into_response()
 }
 
-fn validate_flag(value: Option<&Value>) -> Result<(), &'static str> {
-    match value {
-        Some(Value::Bool(true)) => Err("Lexicon validation is not configured for this repository"),
-        Some(Value::Bool(false)) | None => Ok(()),
-        Some(_) => Err("validate must be a boolean"),
-    }
-}
-
 fn parse_swap_commit(value: Option<&Value>) -> Result<Option<&str>, &'static str> {
     match value {
         None => Ok(None),
@@ -1355,20 +1344,6 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
-    }
-
-    #[test]
-    fn create_record_validate_flag_fails_closed_without_lexicon_validator() {
-        assert!(validate_flag(None).is_ok());
-        assert!(validate_flag(Some(&Value::Bool(false))).is_ok());
-        assert_eq!(
-            validate_flag(Some(&Value::Bool(true))).unwrap_err(),
-            "Lexicon validation is not configured for this repository"
-        );
-        assert_eq!(
-            validate_flag(Some(&json!("yes"))).unwrap_err(),
-            "validate must be a boolean"
-        );
     }
 
     #[test]
