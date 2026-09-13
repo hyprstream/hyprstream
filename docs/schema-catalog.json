@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "source_commit": "81574fe1c8ca106a5d7d93276b686c1ac3803542",
-  "source_tree": "b01c98f79a6072a16e18198c3e1cf3c2ffe890b1",
-  "source_input_digest": "635969d234e4706c3a1966c7fbc3d5538a4b8fc57cb2ae5d79ddf7e1d6b20cd0",
+  "source_commit": "6eb65d2ce737cfa3761abee1fbdf100542684e3c",
+  "source_tree": "62ee961fc8f418c51116cac3e8cfa8c483615e86",
+  "source_input_digest": "e7e7c5b0b89182da7f032bbbd24c5375ca90f6ef56f136e9821ec7217b985be8",
   "authority": "docs/system-ontology.md",
   "tracked_schema_command": "git ls-files '*.capnp'",
   "owner_directories": [
@@ -23,7 +23,7 @@
   },
   "method_metadata": {
     "cli_hidden": ["worker.attach", "worker.detach"],
-    "streaming": ["inference.createLoraStream", "inference.exportPeftAdapterStream", "inference.generateStream", "inference.loadLoraStream", "inference.mergeLoraStream", "inference.saveAdaptationStream", "inference.saveLoraStream", "inference.snapshotDeltaStream", "inference.trainStepStream", "metrics.queryStream", "model.generateStream", "model.trainStream", "registry.cloneStream", "registry.getBlob", "worker.attach"]
+    "streaming": ["inference.createLoraStream", "inference.exportPeftAdapterStream", "inference.generateStream", "inference.loadLoraStream", "inference.mergeLoraStream", "inference.saveAdaptationStream", "inference.saveLoraStream", "inference.snapshotDeltaStream", "inference.trainStepStream", "metrics.queryStream", "model.infer.generateStream", "model.ttt.trainStream", "registry.cloneStream", "registry.getBlob", "worker.container.attach"]
   },
   "schemas": [
     {"path":"crates/hyprstream-discovery/schema/discovery.capnp","source_id":"0xe8bc708034927ef4","owner":"hyprstream-discovery","license":"AGPL-3.0-only","kind":"service","service":"discovery","cgr_producer":"crates/hyprstream-discovery/build.rs","cgr_producers":["crates/hyprstream-discovery/build.rs"],"surfaces":["cli","factory","docs"],"exclusions":{"mcp":"not registered as an MCP tool source","vfs":"not in vfs_mount dispatch","typescript":"CGR is emitted, but no tracked TypeScript package consumes it"}},

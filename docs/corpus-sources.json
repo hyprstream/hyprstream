@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "source_commit": "81574fe1c8ca106a5d7d93276b686c1ac3803542",
-  "source_tree": "b01c98f79a6072a16e18198c3e1cf3c2ffe890b1",
-  "source_input_digest": "635969d234e4706c3a1966c7fbc3d5538a4b8fc57cb2ae5d79ddf7e1d6b20cd0",
+  "source_commit": "6eb65d2ce737cfa3761abee1fbdf100542684e3c",
+  "source_tree": "62ee961fc8f418c51116cac3e8cfa8c483615e86",
+  "source_input_digest": "e7e7c5b0b89182da7f032bbbd24c5375ca90f6ef56f136e9821ec7217b985be8",
   "authority": "docs/system-ontology.md",
   "api_manifest": {"version": 1, "path": "api/v1/{service}/{scope}/{method}.json", "id": "api:{service}:{scope}:{method}", "integrity": "sha256 of canonical UTF-8 JSON", "limit_bytes": 1048576},
   "corpus_manifest": {"version": 1, "path": "corpus/v1/{document_id}.md", "id": "doc:{repository-relative-path}", "integrity": "sha256 of source bytes", "limit_bytes": 2097152},
