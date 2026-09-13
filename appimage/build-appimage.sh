@@ -26,11 +26,18 @@
 #
 # Environment:
 #   LIBTORCH_CACHE_DIR   Directory to cache libtorch downloads (default: ./libtorch-cache)
+#   CARGO_TARGET_DIR     Honored: the built binary is copied from Cargo's
+#                        resolved target directory (see lib.sh cargo_target_dir),
+#                        never a hard-coded target/release.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Shared packaging helpers (target resolution, ELF arch verification,
+# checksums, phase timing). Sourced from the script's own directory.
+source "$SCRIPT_DIR/lib.sh"
 
 # Configuration
 VERSION="${VERSION:-dev}"
@@ -156,8 +163,22 @@ build_binary() {
 
     (cd "$PROJECT_ROOT" && cargo build --release --features otel)
 
-    cp "$PROJECT_ROOT/target/release/hyprstream" "$BUILD_DIR/bin/hyprstream-$variant"
-    log_success "Built hyprstream-$variant"
+    # Copy from Cargo's RESOLVED target directory, never a hard-coded
+    # target/release: BuildQ and CI cache mounts set CARGO_TARGET_DIR, and a
+    # default-path copy would fail or package a stale binary. Fail closed on
+    # a missing or foreign-architecture output before it reaches an AppImage.
+    local target_dir binary
+    target_dir="$(cargo_target_dir)" || {
+        log_error "Could not resolve Cargo's target directory"
+        exit 1
+    }
+    binary="$target_dir/release/hyprstream"
+    require_elf_arch "$binary" "$APPIMAGE_ARCH" || {
+        log_error "Built binary at $binary is missing or not an ${APPIMAGE_ARCH} ELF"
+        exit 1
+    }
+    cp "$binary" "$BUILD_DIR/bin/hyprstream-$variant"
+    log_success "Built hyprstream-$variant (from $binary)"
 }
 
 # Strip host symbol tables from bundled libtorch shared objects.
@@ -253,17 +274,24 @@ create_universal_appimage() {
 # only outputs from this run and fails closed when one is absent.
 cmd_package_universal() {
     validate_variant universal
+    local phase_start
+    phase_start="$(ci_phase_begin)"
     log_info "Packaging universal AppImage from staged backend outputs"
     ensure_appimagetool
     create_universal_appimage 1
     log_success "Universal package complete"
     ls -lh "$OUTPUT_DIR/hyprstream-${VERSION}-${APPIMAGE_ARCH}.AppImage"
+    write_artifact_checksums "$OUTPUT_DIR"
+    ci_phase_end "package-universal" "$phase_start"
 }
 
 # Command: build
 cmd_build() {
     local variant="${1:-all}"
     validate_variant "$variant"
+
+    local phase_start
+    phase_start="$(ci_phase_begin)"
 
     log_info "Building hyprstream AppImage"
     log_info "Version: $VERSION"
@@ -295,6 +323,8 @@ cmd_build() {
 
     log_success "Build complete!"
     ls -lh "$OUTPUT_DIR"/*.AppImage 2>/dev/null || true
+    write_artifact_checksums "$OUTPUT_DIR"
+    ci_phase_end "build $variant" "$phase_start"
 }
 
 # Command: stage - copy files needed for universal AppImage before cleaning

@@ -37,6 +37,15 @@ jobs:
       fail-fast: false
       matrix:
         variant: [cpu, cuda128, cuda130, rocm71]
+    env:
+      # Cache-namespace isolation (native CI plan N1.4 / the target-isolation
+      # law in .github/build-matrix.json): this bucket is shared with the
+      # arm64 lanes, so each architecture/backend gets its own sccache object
+      # keyspace. sccache's content keys already include the compiler hash
+      # (cross-arch false hits were not expected), but an explicit prefix
+      # makes the isolation structural and per-row hit rates measurable.
+      # Rollout cost: one cold cache pass per leg.
+      SCCACHE_S3_KEY_PREFIX: appimage/x86_64/${{ matrix.variant }}
 
     steps:
       - name: Checkout code
