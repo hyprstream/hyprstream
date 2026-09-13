@@ -11,6 +11,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use tch::{Device, Kind, Tensor};
@@ -116,6 +117,7 @@ impl StageTensor {
 pub struct StageSequence {
     id: u64,
     next_start_pos: usize,
+    stage_identity: Option<Arc<()>>,
 }
 
 impl StageSequence {
@@ -126,6 +128,7 @@ impl StageSequence {
         Self {
             id: NEXT_STAGE_SEQUENCE_ID.fetch_add(1, Ordering::Relaxed),
             next_start_pos: 0,
+            stage_identity: None,
         }
     }
 
@@ -166,6 +169,7 @@ pub struct InferenceStage {
     contract: StageContract,
     active_sequence: Option<u64>,
     poisoned: bool,
+    identity: Arc<()>,
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -204,6 +208,7 @@ impl InferenceStage {
             contract,
             active_sequence: None,
             poisoned: false,
+            identity: Arc::new(()),
             _not_send: PhantomData,
         }
     }
@@ -221,7 +226,9 @@ impl InferenceStage {
     /// loaded model keeps its per-layer KV (and architecture-specific recurrent)
     /// state locally; the typed result stays on the engine-owning thread.
     /// A failure after decoder execution starts can leave that cache partially
-    /// updated. Such a stage rejects further execution and must be reloaded.
+    /// updated. Such a stage rejects further execution and must be reloaded
+    /// with a fresh sequence. A sequence cannot migrate to a different stage,
+    /// whose model-local cache would not contain that sequence's history.
     pub fn execute(
         &mut self,
         sequence: &mut StageSequence,
@@ -232,6 +239,13 @@ impl InferenceStage {
             bail!("stage execution previously failed; the stage must be reloaded");
         }
         sequence.require_start_pos(start_pos)?;
+        if sequence
+            .stage_identity
+            .as_ref()
+            .is_some_and(|identity| !Arc::ptr_eq(identity, &self.identity))
+        {
+            bail!("a stage sequence is bound to another loaded stage");
+        }
         if self
             .active_sequence
             .is_some_and(|active| active != sequence.id)
@@ -252,6 +266,9 @@ impl InferenceStage {
             }
         };
         self.active_sequence = Some(sequence.id);
+        sequence
+            .stage_identity
+            .get_or_insert_with(|| Arc::clone(&self.identity));
         // ModelOperations has no rollback contract. Leave this set on every
         // error after entering the decoder, including final projection errors.
         self.poisoned = true;
@@ -505,6 +522,43 @@ mod tests {
     }
 
     #[test]
+    fn sequence_cannot_migrate_to_an_empty_stage_cache() {
+        let (mut first, _) = test_stage(0..2, 6);
+        let (mut fresh, fresh_ranges) = test_stage(0..2, 6);
+        let mut sequence = StageSequence::new();
+        assert!(first
+            .execute(&mut sequence, StageInput::TokenIds(&token_ids()), 0)
+            .is_ok());
+        assert!(fresh
+            .execute(&mut sequence, StageInput::TokenIds(&token_ids()), 2)
+            .is_err());
+        assert!(
+            fresh_ranges.lock().is_empty(),
+            "foreign sequence must not reach decoder"
+        );
+        assert!(first
+            .execute(&mut sequence, StageInput::TokenIds(&token_ids()), 2)
+            .is_ok());
+    }
+
+    #[test]
+    fn zero_position_sequence_stays_bound_after_stage_is_dropped() {
+        let (mut original, _) = test_stage(0..2, 6);
+        let mut sequence = StageSequence::new();
+        let empty_ids = Tensor::zeros([1, 0], (Kind::Int64, Device::Cpu));
+        assert!(original
+            .execute(&mut sequence, StageInput::TokenIds(&empty_ids), 0)
+            .is_ok());
+        assert_eq!(sequence.next_start_pos, 0);
+        drop(original);
+        let (mut fresh, fresh_ranges) = test_stage(0..2, 6);
+        assert!(fresh
+            .execute(&mut sequence, StageInput::TokenIds(&token_ids()), 0)
+            .is_err());
+        assert!(fresh_ranges.lock().is_empty());
+    }
+
+    #[test]
     fn failed_stage_cannot_reuse_partially_updated_cache() {
         for fail_at in ["decoder", "norm", "head"] {
             let observed_ranges = Arc::new(Mutex::new(Vec::new()));
@@ -527,6 +581,11 @@ mod tests {
             assert!(stage
                 .execute(&mut sequence, StageInput::TokenIds(&token_ids()), 0)
                 .is_err());
+            let (mut fresh, fresh_ranges) = test_stage(0..2, 2);
+            assert!(fresh
+                .execute(&mut sequence, StageInput::TokenIds(&token_ids()), 0)
+                .is_err());
+            assert!(fresh_ranges.lock().is_empty());
             assert_eq!(
                 observed_ranges.lock().len(),
                 1,
