@@ -14,7 +14,7 @@ doubles as the migration checklist for every job still on `ubuntu-latest`.
 Two decisions this gate freezes:
 
 1. **Hosted-runner zero scan (plan N2.5, landed early):** every job in
-   `.github/workflows/*.yml` that runs on a GitHub-hosted label must be
+   `.github/workflows/*.yml` or `*.yaml` that runs on a GitHub-hosted label must be
    explicitly allowlisted in the manifest, and every allowlist entry must
    still correspond to a hosted job. New hosted jobs fail; completed
    migrations must delete their entry (a stale entry fails too, so the
@@ -124,10 +124,21 @@ def _job_blocks(text: str) -> dict[str, list[str]]:
                 cur = None
                 in_jobs = _strip_key(line.split(":", 1)[0]) == "jobs"
                 continue
-            if in_jobs and indent == 2 and line.rstrip(" \t").endswith(":"):
-                cur = _strip_key(line.strip()[:-1])
-                blocks[cur] = []
-                continue
+            if in_jobs and indent == 2:
+                stripped = line.strip()
+                if stripped.endswith(":"):
+                    cur = _strip_key(stripped[:-1])
+                    blocks[cur] = []
+                    continue
+                # Every direct child of `jobs:` must be a block mapping.
+                # Inline/flow mappings are deliberately rejected because this
+                # parser cannot inspect their runs-on value safely.
+                if ":" in stripped:
+                    job = _strip_key(stripped.split(":", 1)[0])
+                    fail(
+                        f"job `{job}` uses an unsupported inline mapping; "
+                        "write a block job with a single-line `runs-on:`"
+                    )
         if in_jobs and cur is not None:
             blocks[cur].append(line)
     return blocks
@@ -201,7 +212,8 @@ def scan_workflows(workflows_dir: pathlib.Path) -> dict[str, dict[str, str]]:
     if not workflows_dir.is_dir():
         fail(f"workflow directory missing: {workflows_dir}")
     scanned: dict[str, dict[str, str]] = {}
-    for path in sorted(workflows_dir.glob("*.yml")):
+    paths = sorted({*workflows_dir.glob("*.yml"), *workflows_dir.glob("*.yaml")})
+    for path in paths:
         text = path.read_text(encoding="utf-8")
         jobs = _job_runs_on(text)
         scanned[path.name] = {job: _classify(labels) for job, labels in jobs.items()}

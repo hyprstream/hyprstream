@@ -188,6 +188,29 @@ class BuildMatrixFixtures(unittest.TestCase):
         (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
         self.expect_fail("cannot classify")
 
+    def test_yaml_workflow_extension_is_scanned(self) -> None:
+        (self.root / ".github" / "workflows" / "wf.yaml").write_text(
+            HOSTED_WF, encoding="utf-8"
+        )
+        self.manifest["hosted_allowlist"]["wf.yaml"] = copy.deepcopy(
+            self.manifest["hosted_allowlist"]["wf.yml"]
+        )
+        self.write_manifest()
+        remaining = cbm.run_checks(self.root)
+        self.assertIn("wf.yaml:hosted-job", remaining)
+
+    def test_inline_job_mapping_is_rejected(self) -> None:
+        inline = """\
+name: synthetic
+on: [push]
+jobs:
+  hosted-job: { runs-on: ubuntu-latest, steps: [] }
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(
+            inline, encoding="utf-8"
+        )
+        self.expect_fail("unsupported inline mapping")
+
     def test_job_without_runs_on_is_rejected(self) -> None:
         wf = HOSTED_WF + """\
   broken-job:

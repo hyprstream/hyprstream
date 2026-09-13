@@ -13,7 +13,13 @@
 # missing binary whenever the real target directory lives elsewhere.
 cargo_target_dir() {
     if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-        printf '%s\n' "$CARGO_TARGET_DIR"
+        if [[ "$CARGO_TARGET_DIR" == /* ]]; then
+            printf '%s\n' "$CARGO_TARGET_DIR"
+        else
+            # Cargo runs from PROJECT_ROOT below, so relative target paths are
+            # resolved against that directory, not the caller's cwd.
+            printf '%s/%s\n' "$PROJECT_ROOT" "$CARGO_TARGET_DIR"
+        fi
         return 0
     fi
     command -v cargo >/dev/null 2>&1 || {
