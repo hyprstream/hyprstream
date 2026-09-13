@@ -327,7 +327,7 @@
     "rust.yml": {
       "deny": {
         "target_class": "arm64-merge-gate",
-        "reason": "arch-neutral (cargo-deny metadata + python static checks). Migration additionally requires baking cargo-deny into the arm64 builder image (N1.2) — it is not in the image today."
+        "reason": "arch-neutral (cargo-deny metadata + python static checks). cargo-deny 0.20.2 is baked into the arm64 builder image (pinned release + recorded SHA-256); migration additionally waits for build-image.yml to publish the new image and roll the builder-image.env pin, then a runs-on change with its allowlist-entry removal."
       },
       "loopback-burndown": {
         "target_class": "amd64-canary",
