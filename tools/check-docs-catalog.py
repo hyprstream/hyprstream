@@ -168,6 +168,44 @@ def visible_cli_binding(cli: str, bindings: dict[str, tuple[str, int, tuple[int,
     return module
 
 
+def mcp_registrations(source: str) -> tuple[list[str], dict[str, list[dict[str, str]]]]:
+    """Inventory registration roots, excluding the recursive helper itself.
+
+    The supported root grammar binds literal service/prefix arguments to a
+    generated scoped_client_tree call. Unresolved root arguments fail closed.
+    Keep both projections so a scoped change cannot hide behind a top-level
+    registration of the same service.
+    """
+    code = strip_rust_noncode(source)
+    definitions = list(re.finditer(r"\bfn register_schema_tools(?=\s*\()", code))
+    required(len(definitions) == 1, "missing or ambiguous MCP registration root")
+    definition = definitions[0].start()
+    body = rust_fn_body(code[definition:], "register_schema_tools")
+    start = code.find("{", definition) + 1
+    raw = source[start:start + len(body)]
+    roots: dict[str, list[dict[str, str]]] = {"top_level": [], "scoped": []}
+    ordered = []
+    for match in re.finditer(r"\bregister_top_level!\s*\(", body):
+        args = re.match(r"\s*reg\s*,\s*([A-Za-z_][\w:]*)::schema_metadata\s*\(\s*\)\s*,?\s*\)", body[match.end():])
+        required(args is not None, "unresolved MCP top-level registration")
+        module = args.group(1)
+        service = module.rsplit("::", 1)[-1].removesuffix("_client")
+        roots["top_level"].append({"service": service, "module": module})
+        ordered.append((match.start(), service))
+    for match in re.finditer(r"\bregister_scoped_tools_recursive\s*\(", body):
+        first = re.match(r"\s*reg\s*,\s*", body[match.end():])
+        required(first is not None, "unresolved MCP scoped registration registry")
+        service, end = rust_string(raw, match.end() + first.end(), "MCP scoped service")
+        tree = re.match(r"\s*,\s*([A-Za-z_][\w:]*)::scoped_client_tree\s*\(\s*\)\s*,\s*", body[end:])
+        required(tree is not None, f"MCP scoped registration for {service} lacks a generated tree binding")
+        prefix, end = rust_literal(raw, end + tree.end(), "MCP scoped prefix")
+        required(re.match(r"\s*,\s*&\[\s*\]\s*,?\s*\)", body[end:]) is not None,
+                 f"MCP scoped registration for {service} has unresolved root scope arguments")
+        roots["scoped"].append({"service": service, "module": tree.group(1), "prefix": prefix})
+        ordered.append((match.start(), service))
+    return list(dict.fromkeys(service for _, service in sorted(ordered))), roots
+
+
 def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict[str, dict[str, Any]]:
     cli_source = text(repo, "crates/hyprstream/src/cli/schema_cli.rs", mutations)
     mcp_source = text(repo, "crates/hyprstream/src/services/mcp_service.rs", mutations)
@@ -220,8 +258,7 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
     cli_guarded = all(guard in rust_fn_body(cli, name) for name in CLI_BUILDERS)
     manual_services = {service: methods for _, service, methods, _ in registrations if methods is not None}
     cli_modules = {service: modules for _, service, _, modules in registrations if modules is not None}
-    mcp_modules = re.findall(r"register_top_level!\(\s*reg,\s*([a-zA-Z0-9_:]+)::schema_metadata\(\)\s*\)", mcp)
-    mcp_services = [module.rsplit("::", 1)[-1].removesuffix("_client") for module in mcp_modules]
+    mcp_services, mcp_roots = mcp_registrations(mcp_source)
     factory_services, features, schema_attributes = [], {}, {}
     cfgs: list[tuple[int, int, str]] = []
     for match in re.finditer(r'#\s*\[\s*cfg\s*\(\s*feature\s*=\s*', factories):
@@ -276,6 +313,7 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
         "mcp": {
             "source": CONSUMER_SOURCE_PATHS["mcp"],
             "services": mcp_services,
+            "registrations": mcp_roots,
             "method_policy": {
                 "hidden": "excluded" if len(re.findall(r"if\s+method\.hidden\s*\{", mcp)) == 2 else "unknown",
                 "streaming": "included" if len(re.findall(r"if\s+method\.is_streaming\s*\{", mcp)) == 2 else "unknown",
@@ -370,7 +408,7 @@ def selected_input_paths(paths: list[str], read: Callable[[str], bytes], corpus:
                 and any(path_matches(path, item["glob"]) for item in corpus.get("public_prose", [])) \
                 and not any(path_matches(path, item["glob"]) for item in corpus.get("excluded", [])):
             selected.add(path)
-        elif path.endswith((".ts", ".tsx", ".js", ".jsx")) or is_package_manifest(path):
+        elif path.endswith(TS_SOURCE_SUFFIXES) or is_package_manifest(path):
             if typescript_consumer(path, read(path).decode("utf-8")):
                 selected.add(path)
     return sorted(selected)
@@ -729,6 +767,8 @@ def js_code_and_strings(source: str) -> tuple[str, dict[int, str]]:
     return "".join(out), strings
 
 
+TS_SOURCE_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
+TS_PACKAGE_SECTIONS = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
 TS_SPECIFIER_MARKER = re.compile(r"@hyprstream/docs|codegen-out|\.capnp$")
 TS_DEPENDENCY = re.compile(r"(?:\brequire\s*\(\s*|\bimport\s*\(\s*|\bimport\s+|\bfrom\s+)(['\"`]\0+['\"`])")
 
@@ -754,13 +794,13 @@ def typescript_consumer(path: str, source: str) -> bool:
             raise CatalogError("invalid package.json consumer input") from error
         required(isinstance(package, dict), "package.json must be an object")
         return any(isinstance(package.get(section), dict) and "@hyprstream/docs" in package[section]
-                   for section in ("dependencies", "devDependencies", "peerDependencies"))
+                   for section in TS_PACKAGE_SECTIONS)
     return ts_source_is_consumer(source)
 
 
 def typescript_schema_sources(repo: Path, mutations: dict[str, str] | None = None,
                               candidates: list[str] | None = None) -> list[str]:
-    candidates = candidates if candidates is not None else tracked(repo, "*.ts", "*.tsx", "*.js", "*.jsx", "package.json", "**/package.json")
+    candidates = candidates if candidates is not None else tracked(repo, *("*" + suffix for suffix in TS_SOURCE_SUFFIXES), "package.json", "**/package.json")
     return sorted(path for path in candidates if not deleted(path, mutations)
                   and typescript_consumer(path, text(repo, path, mutations)))
 
@@ -915,7 +955,7 @@ def capnp_only_inputs(build_file: str, source: str) -> list[str]:
         while index < len(code) and depth:
             depth += (code[index] == "{") - (code[index] == "}"); index += 1
         required(depth == 0, f"{build_file} has unterminated capnpc grouped import")
-        for found in re.finditer(r"(?:^|[,{]\s*)CompilerCommand(?:\s+as\s+([A-Za-z_]\w*))?\s*(?=,|})", code[start:index - 1]):
+        for found in re.finditer(r"(?:^|[,{]\s*)CompilerCommand(?:\s+as\s+([A-Za-z_]\w*))?\s*(?=,|}|$)", code[start:index - 1]):
             constructors.add(found.group(1) or "CompilerCommand")
     for name in constructors:
         required(not re.search(rf"\blet\s+(?:mut\s+)?{re.escape(name)}\b|\b{re.escape(name)}\s*=", code),
@@ -928,11 +968,11 @@ def capnp_only_inputs(build_file: str, source: str) -> list[str]:
                  f"{build_file} shadows the capnpc module alias {alias}")
         foreign = [path for path in re.findall(rf"\buse\s+([A-Za-z_][\w:]*)\s+as\s+{re.escape(alias)}\s*;", code) if path != "capnpc"]
         required(not foreign, f"{build_file} has an ambiguous module alias {alias}")
-    patterns = [r"capnpc\s*::\s*CompilerCommand\s*::\s*new\s*\(\s*\)"]
-    patterns += [rf"(?<![:\w]){re.escape(name)}\s*::\s*new\s*\(\s*\)" for name in sorted(constructors)]
-    patterns += [rf"(?<![:\w]){re.escape(alias)}\s*::\s*CompilerCommand\s*::\s*new\s*\(\s*\)" for alias in sorted(module_aliases)]
+    patterns = [r"capnpc\s*::\s*CompilerCommand\s*::\s*(?:new|default)\s*\(\s*\)"]
+    patterns += [rf"(?<![:\w]){re.escape(name)}\s*::\s*(?:new|default)\s*\(\s*\)" for name in sorted(constructors)]
+    patterns += [rf"(?<![:\w]){re.escape(alias)}\s*::\s*CompilerCommand\s*::\s*(?:new|default)\s*\(\s*\)" for alias in sorted(module_aliases)]
     recognized = re.compile("|".join(f"(?:{pattern})" for pattern in patterns))
-    constructor = re.compile(r"\b(?:[A-Za-z_]\w*\s*::\s*)?CompilerCommand\s*::\s*new\s*\(")
+    constructor = re.compile(r"\b(?:[A-Za-z_]\w*\s*::\s*)?CompilerCommand\s*::\s*(?:new|default)\s*\(")
     inputs: list[str] = []
     statement_starts: set[int] = set()
     for match in recognized.finditer(code):
@@ -1157,6 +1197,8 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
         if surface == "cli":
             required(record.get("manual_services") == actual.get("manual_services"), "CLI manual registration drift")
             required(record.get("module_bindings") == actual.get("module_bindings"), "CLI metadata/scoped-tree module binding drift")
+        if surface == "mcp":
+            required(record.get("registrations") == actual.get("registrations"), "MCP top-level/scoped registration binding drift")
         if surface == "factory":
             required(record.get("feature_conditions") == actual.get("feature_conditions"), "factory feature condition drift")
             required(record.get("schema_attributes") == actual.get("schema_attributes"), "factory schema/metadata attribute drift")
@@ -1686,6 +1728,21 @@ def self_test(repo: Path) -> None:
             mutated = replace_nth(text(repo, mcp_path, None), needle, "if false {", occurrence)
             expect_failure(f"MCP {path_name} {label}", repo, copy.deepcopy(catalog), corpus, schemas,
                            source_services(repo, {mcp_path: mutated}), {mcp_path: mutated})
+    # Scoped roots are a separate projection even when their service also
+    # has top-level tools. Their removal or rebinding must update the catalog.
+    scoped_source = text(repo, mcp_path, None)
+    for name, before, after in [
+        ("MCP scoped module", "registry_client::scoped_client_tree()", "model_client::scoped_client_tree()"),
+        ("MCP scoped prefix", '        "registry",\n        &[],', '        "other",\n        &[],'),
+        ("MCP scoped-only service", "    // Scoped tools:", '    register_scoped_tools_recursive(reg, "worker", worker_client::scoped_client_tree(), "worker", &[]);\n    // Scoped tools:'),
+    ]:
+        changed = replace_nth(scoped_source, before, after, 1)
+        expect_failure(name, repo, copy.deepcopy(catalog), corpus, schemas,
+                       source_services(repo, {mcp_path: changed}), {mcp_path: changed})
+    default_build = "crates/hyprstream-discovery/build.rs"
+    default_source = text(repo, default_build, None) + '\nfn extra() { capnpc::CompilerCommand::default().file("../hyprstream-pay/schema/settlement.capnp").run(); }'
+    expect_failure("default constructor compiles unclassified input", repo, copy.deepcopy(catalog),
+                   corpus, schemas, consumers, {default_build: default_source})
     bad = copy.deepcopy(catalog)
     fixture = next(entry for entry in bad["schemas"] if entry["path"].endswith("wire_roundtrip_fixture.capnp"))
     fixture["exclusions"].pop("docs")

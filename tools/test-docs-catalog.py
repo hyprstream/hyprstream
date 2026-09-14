@@ -190,7 +190,7 @@ class ProvenanceTests(unittest.TestCase):
             self.verify(base=unrelated)
 
     def test_package_selection_parity_and_removal(self):
-        for section in ["dependencies", "devDependencies", "peerDependencies"]:
+        for section in ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]:
             with self.subTest(section=section):
                 self.write(self.repo, "package.json", json.dumps({section: {"@hyprstream/docs": "1"}}))
                 source = self.commit(self.repo)
@@ -243,7 +243,7 @@ class ProvenanceTests(unittest.TestCase):
             catalog.read_regular(self.repo, "nested/outside")
 
     def test_nested_package_inventory_and_provenance(self):
-        for section in ["dependencies", "devDependencies", "peerDependencies"]:
+        for section in ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]:
             with self.subTest(section=section):
                 manifests = ["package.json", "packages/client/package.json", "web/deep/client/package.json"]
                 for path in manifests:
@@ -283,6 +283,31 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(set(paths), catalog.attested_tree_universe(self.repo, tree, self.corpus))
         self.write(self.repo, path, 'const x = `inert @hyprstream/docs`;')
         self.assertNotIn(path, catalog.provenance_paths(self.repo, self.corpus))
+
+    def test_module_extensions_inventory_and_provenance(self):
+        for extension in ["mjs", "cjs", "mts", "cts"]:
+            with self.subTest(extension=extension):
+                path = f"packages/client/src/consumer.{extension}"
+                inert = f"packages/client/src/inert.{extension}"
+                self.write(self.repo, path, 'const schema = import("@hyprstream/docs");')
+                self.write(self.repo, inert, '// import("@hyprstream/docs")\nconst note = "@hyprstream/docs";')
+                source = self.commit(self.repo)
+                tree = self.git(self.repo, "rev-parse", source + "^{tree}")
+                paths = catalog.provenance_paths(self.repo, self.corpus)
+                self.assertIn(path, catalog.typescript_schema_sources(self.repo))
+                self.assertNotIn(inert, catalog.typescript_schema_sources(self.repo))
+                self.assertIn(path, paths)
+                self.assertEqual(set(paths), catalog.attested_tree_universe(self.repo, tree, self.corpus))
+                before = catalog.input_digest(self.repo, paths)
+                self.write(self.repo, path, 'const schema = require("./generated/model.capnp");')
+                self.assertNotEqual(before, catalog.input_digest(self.repo, paths))
+                self.write(self.repo, path, '// dependency removed')
+                self.commit(self.repo)
+                current = catalog.provenance_paths(self.repo, self.corpus)
+                record = dict(self.record, source_commit=source, source_tree=tree,
+                              source_input_digest=catalog.input_digest(self.repo, current))
+                with self.assertRaisesRegex(catalog.CatalogError, "removed"):
+                    self.verify(record=record)
 
     def test_index_probes_preserve_caller_bytes(self):
         optional = "crates/hyprstream-rpc/schema/optional.capnp"
@@ -503,6 +528,58 @@ struct DeepResponse { union {
                 self.assertEqual(entry["owner"], "hyprstream-rpc-std")
                 self.assertEqual(entry["license"], "Apache-2.0")
                 self.assertEqual(entry["cgr_producers"], [build])
+
+    def test_mcp_scoped_service_inventory_and_binding_drift(self):
+        path = "crates/hyprstream/src/services/mcp_service.rs"
+        source = catalog.text(ROOT, path, None)
+        # Real root registration; neither the recursive implementation's call
+        # nor comments/literals are separate service registration roots.
+        baseline = catalog.source_services(ROOT)["mcp"]
+        scoped = 'register_scoped_tools_recursive(reg, "worker", worker_client::scoped_client_tree(), "worker", &[]);'
+        added = source.replace('    // Scoped tools:', '    ' + scoped + '\n    // Scoped tools:', 1)
+        actual = catalog.source_services(ROOT, {path: added})["mcp"]
+        self.assertIn("worker", actual["services"])
+        removed_top = source.replace('    register_top_level!(reg, registry_client::schema_metadata());', '', 1)
+        self.assertIn("registry", catalog.source_services(ROOT, {path: removed_top})["mcp"]["services"])
+        for old, new in [('registry_client::scoped_client_tree()', 'model_client::scoped_client_tree()'),
+                         ('        "registry",\n        &[],', '        "different",\n        &[],')]:
+            with self.subTest(new=new):
+                changed = source.replace(old, new, 1)
+                self.assertNotEqual(catalog.source_services(ROOT, {path: changed})["mcp"], baseline)
+        removed_scope = source.replace('    register_scoped_tools_recursive(\n        reg,\n        "registry",\n        registry_client::scoped_client_tree(),\n        "registry",\n        &[],\n    );', '', 1)
+        self.assertNotEqual(catalog.source_services(ROOT, {path: removed_scope})["mcp"], baseline)
+        for changed in [source.replace('registry_client::scoped_client_tree()', 'unknown_tree', 1),
+                        source.replace('        "registry",\n        registry_client::', '        dynamic_service,\n        registry_client::', 1)]:
+            with self.assertRaises(catalog.CatalogError):
+                catalog.source_services(ROOT, {path: changed})
+        decoy = source + '\n// ' + scoped + '\nconst NOTE: &str = r#"' + scoped + '"#;\n'
+        self.assertEqual(catalog.source_services(ROOT, {path: decoy})["mcp"], baseline)
+        similarly_named = 'fn register_schema_tools_unused(reg: &mut ToolRegistry) { ' + scoped + ' }\n' + source
+        self.assertEqual(catalog.source_services(ROOT, {path: similarly_named})["mcp"], baseline)
+        with self.assertRaisesRegex(catalog.CatalogError, "ambiguous MCP"):
+            catalog.source_services(ROOT, {path: 'fn register_schema_tools() {}\n' + source})
+
+    def test_capnp_default_constructor_and_aliases(self):
+        actual = catalog.read_json(ROOT / "docs/schema-catalog.json", ROOT)
+        build = "crates/hyprstream-rpc-build/build.rs"
+        source = catalog.text(ROOT, build, None)
+        expected = catalog.capnp_only_inputs(build, source)
+        self.assertEqual(expected, ["crates/hyprstream-rpc-build/tests/wire_roundtrip_fixture.capnp"])
+        for prefix, replacement in [('', 'capnpc::CompilerCommand::default()'),
+                                    ('use capnpc::CompilerCommand as C;\n', 'C::default()'),
+                                    ('use capnpc::{CompilerCommand as C};\n', 'C::default()'),
+                                    ('use capnpc as cp;\n', 'cp::CompilerCommand::default()')]:
+            with self.subTest(prefix=prefix, replacement=replacement):
+                changed = prefix + source.replace('capnpc::CompilerCommand::new()', replacement, 1)
+                self.assertEqual(catalog.capnp_only_inputs(build, changed), expected)
+        staging = "crates/hyprstream-discovery/build.rs"
+        added = catalog.text(ROOT, staging, None) + '\nfn extra() { capnpc::CompilerCommand::default().file("../hyprstream-pay/schema/settlement.capnp").run(); }'
+        with self.assertRaisesRegex(catalog.CatalogError, "capnp-only compiler input inventory drift"):
+            catalog.check_cgr(actual, ROOT, actual["schemas"], {staging: added})
+        decoy = source + '\n// capnpc::CompilerCommand::default().file("other.capnp");\n'
+        self.assertEqual(catalog.capnp_only_inputs(build, decoy), expected)
+        with self.assertRaises(catalog.CatalogError):
+            catalog.capnp_only_inputs(build, source.replace('capnpc::CompilerCommand::new()', 'unknown::CompilerCommand::default()', 1))
 
     def test_workflow_contract(self):
         source = (ROOT / ".github/workflows/docs-catalog.yml").read_text()
