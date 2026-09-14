@@ -2680,6 +2680,42 @@ pub struct RuntimeConfig {
     /// `HYPRSTREAM_CONTINUOUS_BATCH_MAX`.
     #[serde(default = "default_continuous_batch_max")]
     pub continuous_batch_max: usize,
+
+    /// Self-speculative decoding via the Qwen3.5 MTP draft head. **Default: off.**
+    ///
+    /// When enabled (and the loaded model is a dense Qwen3.5 checkpoint with an
+    /// MTP head), each decode step drafts 1 token with the MTP head and verifies
+    /// it in the next main-model forward: a greedy exact-match accept emits 2
+    /// tokens, a reject emits the verifier's token and rewinds KV/SSM state.
+    /// v1 restrictions: batch=1 streams only, greedy sampling only
+    /// (temperature ≤ 0.01), no tenant LoRA delta, no quantized KV cache
+    /// (`truncate_to` is a full clear for quantized storage, which would silently
+    /// break the reject rewind), dense (non-MoE) MTP blocks only. Override with
+    /// `HYPRSTREAM_SPECULATIVE_DECODE` (truthy = on). Correctness is gated by
+    /// `mtp_decode_matches_serial`.
+    ///
+    /// # Performance envelope (measured)
+    ///
+    /// **Experimental — measured regression, keep default-off.** GPU validation
+    /// (RTX 5090 / SM120, Qwen3.5-4B BF16) found the path functionally correct
+    /// but 0.237x serial throughput (48.84% draft acceptance). The naive cost
+    /// model — accept = 1 forward per 2 tokens, reject = 2 forwards per 1
+    /// token, breakeven at α ≈ 0.5 acceptance with speedup ≈ (1+α)/(2−α) —
+    /// holds only BEFORE structural per-round overheads:
+    ///
+    /// - a full GDN conv/rec SSM-state deep copy (`snapshot_ssm_states`) every
+    ///   round — fixed cost per round, suspected dominant (profile this first
+    ///   if this is ever optimized);
+    /// - the reject-path single-token re-forward that re-syncs SSM state;
+    /// - the per-round MTP draft forward itself.
+    ///
+    /// At 4B with k=1 these overheads dominate the verify savings; break-even
+    /// needs the verification cost amortized (larger backbone) or a cheaper
+    /// draft path. Enable only per workload after measuring acceptance via the
+    /// `inference_speculative_tokens_total` counter (kind=accepted|rejected);
+    /// if a workload shows <~60–70% acceptance this flag is a pessimization.
+    #[serde(default = "default_speculative_decoding")]
+    pub speculative_decoding: bool,
     /// Materialize FP8 weights as BF16 once at load time (applying the
     /// block-wise `_scale_inv` scales during load) and drop the FP8+scale
     /// tensors, instead of dequantizing inside every matmul on the hot path.
@@ -2715,6 +2751,16 @@ fn default_continuous_batch_max() -> usize {
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(16)
+}
+
+/// Default for [`RuntimeConfig::speculative_decoding`]: off unless
+/// `HYPRSTREAM_SPECULATIVE_DECODE` is set truthy. Off is the safe default — the
+/// serial batch=1 path is the verified reference; speculation is a v1 perf
+/// experiment (greedy-only, batch=1-only, dense Qwen3.5 MTP only).
+fn default_speculative_decoding() -> bool {
+    std::env::var("HYPRSTREAM_SPECULATIVE_DECODE")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 /// Default for [`RuntimeConfig::fp8_dequant_load`]: off unless
@@ -2793,6 +2839,7 @@ impl Default for RuntimeConfig {
             default_model_load_timeout_ms: 300000, // 5 minutes
             continuous_batching: default_continuous_batching(),
             continuous_batch_max: default_continuous_batch_max(),
+            speculative_decoding: default_speculative_decoding(),
             fp8_dequant_load: default_fp8_dequant_load(),
         }
     }

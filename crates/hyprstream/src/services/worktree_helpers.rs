@@ -45,6 +45,48 @@ pub struct StatResult {
 pub(crate) trait WorktreeClientExt:
     hyprstream_rpc_std::registry_client::WorktreeRpc
 {
+    /// Read at most `limit` bytes without transferring the rest of a file.
+    /// Used for checkpoint metadata preflight before tensor allocation.
+    async fn read_file_prefix(&self, path: &str, limit: usize) -> Result<Vec<u8>> {
+        let fid = next_fid();
+        self.walk(&NpWalk {
+            fid: 0,
+            newfid: fid,
+            wnames: split_path(path),
+        })
+        .await?;
+        let result: Result<Vec<u8>> = async {
+            let opened = self.open(&NpOpen { fid, mode: OREAD }).await?;
+            anyhow::ensure!(opened.iounit > 0, "file read returned zero iounit");
+            let mut bytes = Vec::new();
+            while bytes.len() < limit {
+                let count = (limit - bytes.len()).min(opened.iounit as usize) as u32;
+                let response = self
+                    .read(&NpRead {
+                        fid,
+                        offset: bytes.len() as u64,
+                        count,
+                    })
+                    .await?;
+                anyhow::ensure!(
+                    response.data.len() <= count as usize,
+                    "file read exceeded requested prefix"
+                );
+                if response.data.is_empty() {
+                    break;
+                }
+                bytes.extend_from_slice(&response.data);
+            }
+            Ok(bytes)
+        }
+        .await;
+        // Release the walked fid even when open/read/metadata access fails.
+        let closed = self.clunk(&NpClunk { fid }).await;
+        let bytes = result?;
+        closed?;
+        Ok(bytes)
+    }
+
     /// Read an entire file via walk/open/read-loop/clunk (bounded by iounit per message).
     ///
     /// This is the replacement for the old `read_file()` method. Instead of sending
