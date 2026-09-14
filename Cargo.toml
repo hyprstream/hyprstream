@@ -199,7 +199,9 @@ async-stream = "0.3"
 rayon = "1.8"
 memmap2 = "0.9"
 rand = "0.8"
-# tch is feature-gated per crate (see crates/hyprstream/Cargo.toml for tch-cpu/tch-cuda/tch-rocm)
+# tch's CPU/CUDA/ROCm backend is NOT a cargo feature: it follows whichever
+# libtorch build the LIBTORCH env points at when tch compiles/links
+# (e.g. appimage/libtorch-cache/{cpu,cuda128,cuda130,rocm71}/libtorch).
 tokenizers = { version = "0.22.1", features = ["onig"] }
 safetensors = "0.4"
 regex = "1.11"
@@ -274,10 +276,10 @@ quickcheck_macros = "1.0"
 criterion = "0.5.1"
 
 
-# tch backend selection is now handled via features in crates/hyprstream/Cargo.toml:
-# - default: tch-cpu (CPU-only)
-# - Build with: cargo build --no-default-features --features tch-cuda
-# - Build with: cargo build --no-default-features --features tch-rocm
+# tch backend selection: point LIBTORCH (and LD_LIBRARY_PATH) at the libtorch
+# variant to link — cpu, cuda128/cu130, or rocm71/rocm7.x — see
+# appimage/build-appimage.sh for the official variant downloads. There are no
+# tch-cpu/tch-cuda/tch-rocm cargo features.
 
 # moq-net wasm support (#484): relaxes the wasm-hostile `SessionInner: Send + Sync`
 # bound + swaps real-path tokio::time for a wasm-compatible wrapper, so a browser

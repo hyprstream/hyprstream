@@ -257,13 +257,39 @@ fn checkout_version(repo: &git2::Repository, version: &str) -> Result<(), git2::
     Ok(())
 }
 
+/// Detect the local GPU's gfx target via rocminfo so a source build of
+/// bitsandbytes compiles kernels for the *installed* accelerator. The
+/// historical default (`gfx90a`, MI210) produces binaries that cannot run on
+/// consumer APUs — e.g. gfx1151 / Strix Halo / Radeon 8060S — repeating the
+/// wrong-ISA silent-CPU-fallback class of bug seen in hyprstream #228.
+/// Mirrors the rocminfo detection in hyprstream.sh.
+#[cfg(feature = "build-from-source")]
+fn detect_rocm_arch() -> Option<String> {
+    let output = std::process::Command::new("rocminfo").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // rocminfo lists "Name: gfxXXXX" for each GPU agent (CPU agents name their
+    // model instead); take the first gfx-prefixed name.
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("Name:"))
+        .map(str::trim)
+        .find(|name| name.starts_with("gfx"))
+        .map(str::to_owned)
+}
+
 /// Build bitsandbytes from source using cmake
 #[cfg(feature = "build-from-source")]
 fn build_bitsandbytes_from_source(backend: Backend) -> Option<(PathBuf, String)> {
     let source_path = ensure_bitsandbytes_source()?;
 
     let rocm_path = env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_owned());
-    let rocm_arch = env::var("PYTORCH_ROCM_ARCH").unwrap_or_else(|_| "gfx90a".to_owned());
+    let rocm_arch = match env::var("PYTORCH_ROCM_ARCH") {
+        Ok(arch) => arch,
+        Err(_) => detect_rocm_arch().unwrap_or_else(|| "gfx90a".to_owned()),
+    };
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let build_dir = out_dir.join("bitsandbytes-build");
