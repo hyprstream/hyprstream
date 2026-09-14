@@ -32,7 +32,7 @@ jobs:
   # cache credentials for the others.
   build-x86_64:
     name: Build x86_64 AppImage (${{ matrix.variant }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, amd64, hyprstream-release]
     strategy:
       fail-fast: false
       matrix:
@@ -53,22 +53,15 @@ jobs:
 
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
+          sudo podman image prune --all --force || true
           df -h
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            capnproto \
-            libssl-dev \
-            libsystemd-dev \
-            pkg-config \
-            build-essential
+          sudo dnf -y install \
+            capnproto capnproto-devel \
+            openssl-devel systemd-devel \
+            pkgconf-pkg-config gcc gcc-c++ make
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -129,18 +122,14 @@ jobs:
   package-universal-x86_64:
     name: Package universal x86_64 AppImage
     needs: build-x86_64
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, amd64, hyprstream-release]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Free disk space before artifact extraction
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
+          sudo podman image prune --all --force || true
           df -h
 
       - name: Download staged backend payloads
@@ -235,7 +224,7 @@ jobs:
     name: Create Release
     if: startsWith(github.ref, 'refs/tags/')
     needs: [build-x86_64, package-universal-x86_64, build-arm64-cpu]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, amd64, hyprstream-release]
     permissions:
       contents: write
 
