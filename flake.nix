@@ -49,12 +49,33 @@
         # Crane instance with our toolchain
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # Source filtering: standard cargo sources + .capnp schemas (needed by hyprstream-rpc build.rs)
+        # Cargo sources plus compile-time inputs. Keep the JSON allowlist
+        # scoped: unrelated configuration/data files must not enter the source.
+        sourceRoot = craneLib.path ./.;
+        embeddedSourceFiles = [
+          "crates/hyprstream-rpc-build/schema/initial-label-map.json"
+          "crates/hyprstream-ledger/sql/ledger_schema.sql"
+          "crates/hyprstream-ledger/sql/ledger_migrate.sql"
+          # Test inputs are retained even when this package sets doCheck=false,
+          # so the same filtered source supports test-enabled derivations.
+          "docs/discovery-state.md"
+          "crates/hyprstream-rpc/src/fixtures/plc_directory_ewvi7nxzyoun6zhxrhs64oiz.json"
+          "crates/hyprstream-rpc/src/fixtures/plc_directory_ewvi7nxzyoun6zhxrhs64oiz_audit.json"
+          "docs/standards/v16/vectors/proof-v1-positive.json"
+          "docs/standards/v16/vectors/proof-v1-negative.json"
+          "docs/standards/v16/vectors/proof-v1-keys.json"
+          "docs/standards/v16/vectors/proof-v1-thumbprints.json"
+          "crates/hyprstream-discovery/tests/golden/training_pod.yaml"
+        ];
         src = pkgs.lib.cleanSourceWith {
-          src = craneLib.path ./.;
+          src = sourceRoot;
           filter = path: type:
-            (craneLib.filterCargoSources path type) ||
-            (builtins.match ".*\\.capnp$" path != null);
+            let relative = pkgs.lib.removePrefix "${toString sourceRoot}/" (toString path);
+            in (craneLib.filterCargoSources path type) ||
+            (builtins.match ".*\\.capnp$" path != null) ||
+            (pkgs.lib.hasPrefix "lexicons/upstream/atproto/" relative &&
+              pkgs.lib.hasSuffix ".json" relative) ||
+            builtins.elem relative embeddedSourceFiles;
         };
 
         # Pre-vendor cargo deps with fixes for broken git dependencies
