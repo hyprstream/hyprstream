@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "provenance_version": 2,
-  "source_commit": "0bb9ce724814e43b92c6485135247cbeca07b3dd",
-  "source_tree": "f5868d29304f17ad5c688e436bd0909a7c449637",
-  "source_input_digest": "e3c7661604bb7f2d61da0005cade1182427bd1ea670938ecbd2877e30627a261",
+  "source_commit": "cd6caf79f302e8b37b7b2da9780a89e4646a28dd",
+  "source_tree": "81e00f7495cad8f44fe1d8bbc8c8afc38d4ee96d",
+  "source_input_digest": "1a02e0ec726c641151feb7aa79c746c825312a862fe0afd311b3fd2b3be08644",
   "authority": "docs/system-ontology.md",
   "tracked_schema_command": "git ls-files '*.capnp'",
   "owner_directories": ["crates/hyprstream-pay/schema","crates/hyprstream-rpc/schema","crates/hyprstream-rpc-build/tests","crates/hyprstream-rpc-std/schema"],
