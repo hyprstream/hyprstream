@@ -41,7 +41,7 @@ source "$SCRIPT_DIR/lib.sh"
 
 # Configuration
 VERSION="${VERSION:-dev}"
-LIBTORCH_VERSION="2.10.0"
+LIBTORCH_VERSION="2.11.0"
 LIBTORCH_CACHE_DIR="${LIBTORCH_CACHE_DIR:-$SCRIPT_DIR/libtorch-cache}"
 BUILD_DIR="$SCRIPT_DIR/build"
 OUTPUT_DIR="$SCRIPT_DIR/output"
@@ -128,29 +128,48 @@ download_libtorch() {
     local variant="$1"
     # The aarch64 PyTorch wheel is already installed by the arm64 builder image.
     # It supplies both headers and shared libraries at HYPRSTREAM_LIBTORCH_DIR.
-    [[ -n "${HYPRSTREAM_LIBTORCH_DIR:-}" ]] && return 0
+    if [[ -n "${HYPRSTREAM_LIBTORCH_DIR:-}" ]]; then
+        require_libtorch_version "$HYPRSTREAM_LIBTORCH_DIR" "$LIBTORCH_VERSION"
+        return
+    fi
     local url="${LIBTORCH_URLS[$variant]}"
     local cache_file="$LIBTORCH_CACHE_DIR/libtorch-${LIBTORCH_VERSION}-${variant}.zip"
-    local extract_dir="$LIBTORCH_CACHE_DIR/$variant"
-
+    local extract_dir="$LIBTORCH_CACHE_DIR/$LIBTORCH_VERSION-$variant"
     mkdir -p "$LIBTORCH_CACHE_DIR"
 
-    if [[ ! -f "$cache_file" ]]; then
-        log_info "Downloading libtorch for $variant..."
-        curl -sSL -o "$cache_file" "$url"
+    if [[ -d "$extract_dir" ]]; then
+        [[ -f "$extract_dir/.complete" ]] || {
+            log_error "Incomplete libtorch cache: $extract_dir"
+            return 1
+        }
+        require_libtorch_version "$extract_dir/libtorch" "$LIBTORCH_VERSION"
+        return
     fi
-
-    if [[ ! -d "$extract_dir/libtorch" ]]; then
-        log_info "Extracting libtorch for $variant..."
-        mkdir -p "$extract_dir"
-        unzip -q "$cache_file" -d "$extract_dir"
-    fi
+    # Publish only a fully extracted, version-checked tree. Failure leaves no
+    # apparently reusable directory. Old variant-only caches remain untouched.
+    (
+        local scratch
+        scratch=$(mktemp -d "$LIBTORCH_CACHE_DIR/.libtorch-$LIBTORCH_VERSION-$variant.XXXXXX")
+        trap 'rm -rf "$scratch"' EXIT
+        if [[ ! -f "$cache_file" ]]; then
+            log_info "Downloading libtorch for $variant..."
+            curl -fSL -o "$scratch/archive.zip" "$url" || exit 1
+            mv "$scratch/archive.zip" "$cache_file"
+        fi
+        unzip -q "$cache_file" -d "$scratch/tree" || exit 1
+        require_libtorch_version "$scratch/tree/libtorch" "$LIBTORCH_VERSION" || exit 1
+        touch "$scratch/tree/.complete"
+        # -T refuses to nest the tree if another invocation populated the cache.
+        mv -T "$scratch/tree" "$extract_dir"
+    )
 }
 
 # Build hyprstream binary for a variant
 build_binary() {
     local variant="$1"
-    local libtorch_dir="${HYPRSTREAM_LIBTORCH_DIR:-$LIBTORCH_CACHE_DIR/$variant/libtorch}"
+    local libtorch_dir
+    libtorch_dir="$(libtorch_variant_dir "$variant")"
+    require_libtorch_version "$libtorch_dir" "$LIBTORCH_VERSION" || return 1
 
     log_info "Building hyprstream for $variant..."
 
@@ -204,7 +223,9 @@ create_appimage() {
     local variant="$1"
     local appdir="$BUILD_DIR/hyprstream-$variant.AppDir"
     local output="$OUTPUT_DIR/hyprstream-${VERSION}-${variant}-${APPIMAGE_ARCH}.AppImage"
-    local libtorch_dir="${HYPRSTREAM_LIBTORCH_DIR:-$LIBTORCH_CACHE_DIR/$variant/libtorch}"
+    local libtorch_dir
+    libtorch_dir="$(libtorch_variant_dir "$variant")"
+    require_libtorch_version "$libtorch_dir" "$LIBTORCH_VERSION" || return 1
 
     log_info "Creating AppImage for $variant..."
 
@@ -233,7 +254,7 @@ create_universal_appimage() {
     local staged_only="${1:-0}"
     local appdir="$BUILD_DIR/hyprstream-universal.AppDir"
     local output="$OUTPUT_DIR/hyprstream-${VERSION}-${APPIMAGE_ARCH}.AppImage"
-    local staging="$BUILD_DIR/universal-staging"
+    local staging="$BUILD_DIR/universal-staging/$LIBTORCH_VERSION"
 
     log_info "Creating universal AppImage..."
 
@@ -243,6 +264,7 @@ create_universal_appimage() {
     for variant in "${ALL_VARIANTS[@]}"; do
         # Use staged files if available (from stage command), otherwise use build dirs
         if [[ -f "$staging/bin/hyprstream-$variant" ]]; then
+            require_libtorch_version "$staging/lib/$variant/libtorch" "$LIBTORCH_VERSION" || return 1
             cp "$staging/bin/hyprstream-$variant" "$appdir/usr/bin/"
             mkdir -p "$appdir/usr/lib/$variant/libtorch/lib"
             cp -r "$staging/lib/$variant/libtorch/lib/"* "$appdir/usr/lib/$variant/libtorch/lib/"
@@ -252,7 +274,9 @@ create_universal_appimage() {
         else
             cp "$BUILD_DIR/bin/hyprstream-$variant" "$appdir/usr/bin/"
             mkdir -p "$appdir/usr/lib/$variant/libtorch/lib"
-            local libtorch_dir="${HYPRSTREAM_LIBTORCH_DIR:-$LIBTORCH_CACHE_DIR/$variant/libtorch}"
+            local libtorch_dir
+            libtorch_dir="$(libtorch_variant_dir "$variant")"
+            require_libtorch_version "$libtorch_dir" "$LIBTORCH_VERSION" || return 1
             cp -r "$libtorch_dir/lib/"* "$appdir/usr/lib/$variant/libtorch/lib/"
         fi
     done
@@ -336,7 +360,7 @@ cmd_stage() {
     fi
     validate_variant "$variant"
 
-    local staging="$BUILD_DIR/universal-staging"
+    local staging="$BUILD_DIR/universal-staging/$LIBTORCH_VERSION"
     log_info "Staging $variant for universal AppImage..."
 
     # Stage binary
@@ -345,7 +369,13 @@ cmd_stage() {
 
     # Stage entire lib directory (includes subdirs with Tensile libraries for ROCm)
     mkdir -p "$staging/lib/$variant/libtorch/lib"
-    cp -r "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"* "$staging/lib/$variant/libtorch/lib/"
+    local libtorch_dir version_header
+    libtorch_dir="$(libtorch_variant_dir "$variant")"
+    require_libtorch_version "$libtorch_dir" "$LIBTORCH_VERSION" || return 1
+    cp -r "$libtorch_dir/lib/"* "$staging/lib/$variant/libtorch/lib/"
+    version_header=$(libtorch_version_header "$libtorch_dir")
+    mkdir -p "$staging/lib/$variant/libtorch/$(dirname "$version_header")"
+    cp "$libtorch_dir/$version_header" "$staging/lib/$variant/libtorch/$version_header"
 
     log_success "Staged $variant"
     du -sh "$staging"
@@ -362,7 +392,7 @@ cmd_clean() {
     else
         validate_variant "$variant"
         log_info "Cleaning $variant..."
-        rm -rf "$LIBTORCH_CACHE_DIR/$variant"
+        rm -rf "$LIBTORCH_CACHE_DIR/$LIBTORCH_VERSION-$variant"
         rm -f "$LIBTORCH_CACHE_DIR/libtorch-${LIBTORCH_VERSION}-${variant}.zip"
         rm -f "$BUILD_DIR/bin/hyprstream-$variant"
         rm -rf "$BUILD_DIR/hyprstream-$variant.AppDir"
@@ -423,4 +453,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -97,7 +97,7 @@ use tokio::net::UnixListener;
 use tracing::{debug, info, warn};
 
 use crate::error::{Result, WorkerError};
-use crate::runtime::client::KeyValue;
+use hyprstream_rpc_std::worker_client::KeyValue;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Annotation / env contract (shared with the sandbox backends' existing seam)
@@ -237,7 +237,7 @@ pub struct WanixInjection {
     /// Annotations to merge into the sandbox's config. Shaped as the backend's
     /// `start` receives them (`HashMap<String, String>`); use
     /// [`WanixInjection::as_key_values`] to fold them into a
-    /// [`PodSandboxConfig`](super::client::PodSandboxConfig)'s
+    /// [`PodSandboxConfig`](hyprstream_rpc_std::worker_client::PodSandboxConfig)'s
     /// `annotations: Vec<KeyValue>` for the pool path.
     pub annotations: HashMap<String, String>,
     /// The live Direction-A 9P server (host exports its namespace to the guest).
@@ -252,7 +252,7 @@ pub struct WanixInjection {
 
 impl WanixInjection {
     /// The injection annotations as `Vec<KeyValue>` for merging into a
-    /// [`PodSandboxConfig`](super::client::PodSandboxConfig).
+    /// [`PodSandboxConfig`](hyprstream_rpc_std::worker_client::PodSandboxConfig).
     pub fn as_key_values(&self) -> Vec<KeyValue> {
         self.annotations
             .iter()

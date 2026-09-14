@@ -17,7 +17,7 @@ use ed25519_dalek::SigningKey;
 use std::io::Write;
 use tracing::info;
 
-use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayMode, SendInputRequest};
+use hyprstream_rpc_std::tui_client::{TuiClient, ConnectRequest, DisplayMode, SendInputRequest};
 
 /// Create a TuiClient for RPC calls.
 ///
@@ -26,7 +26,7 @@ use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayM
 pub fn create_tui_client(signing_key: &SigningKey) -> Result<TuiClient> {
     let sk = signing_key.clone();
 
-    TuiClient::from_resolver(sk, None).context("Failed to create TuiClient")
+    TuiClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk, None).context("Failed to create TuiClient")
 }
 
 /// Attach to an existing TUI session.
@@ -83,7 +83,7 @@ pub async fn handle_tui_attach(signing_key: &SigningKey, session_id: Option<u32>
 /// Subscribes to the viewer's moq broadcast via a UDS socket, verifying each
 /// frame's Blake3 HMAC chain before rendering ANSI data to the terminal.
 async fn run_attach_loop(
-    stream_info: &crate::services::generated::tui_client::StreamInfo,
+    stream_info: &hyprstream_rpc_std::tui_client::StreamInfo,
     client: &TuiClient,
     viewer_id: u32,
 ) -> Result<()> {
@@ -437,7 +437,7 @@ pub async fn forward_process_output(
     _pane_id: u32,
     initial_cols: u16,
     initial_rows: u16,
-    stdin_stream: Option<&crate::services::generated::tui_client::StreamInfo>,
+    stdin_stream: Option<&hyprstream_rpc_std::tui_client::StreamInfo>,
 ) -> Result<()> {
     use crate::tui::process::ProcessInput;
 

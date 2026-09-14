@@ -28,13 +28,10 @@ CONSUMER_SOURCE_PATHS = {
     "vfs": "crates/hyprstream-rpc-std/src/vfs_mount.rs",
 }
 OWNER_DIRECTORIES = (
-    "crates/hyprstream/schema",
-    "crates/hyprstream-discovery/schema",
     "crates/hyprstream-pay/schema",
     "crates/hyprstream-rpc/schema",
     "crates/hyprstream-rpc-build/tests",
     "crates/hyprstream-rpc-std/schema",
-    "crates/hyprstream-workers/schema",
 )
 PUBLIC_GLOBS = {
     "docs/*.md", "docs/adr/**/*.md", "docs/contracts/**/*.md",
@@ -52,23 +49,14 @@ EXCLUSIONS = {
     "dist/**": "release output is not source corpus",
 }
 CGR_ROOTS = {
-    "crates/hyprstream/build.rs": ["crates/hyprstream/schema", "crates/hyprstream-rpc/schema"],
-    "crates/hyprstream-discovery/build.rs": ["crates/hyprstream-discovery/schema", "crates/hyprstream-rpc/schema"],
+    "crates/hyprstream/build.rs": ["crates/hyprstream-rpc/schema"],
     "crates/hyprstream-rpc/build.rs": ["crates/hyprstream-rpc/schema"],
     "crates/hyprstream-rpc-std/build.rs": ["crates/hyprstream-rpc-std/schema", "crates/hyprstream-rpc/schema"],
-    "crates/hyprstream-workers/build.rs": ["crates/hyprstream-workers/schema", "crates/hyprstream-rpc/schema"],
 }
 EXPECTED_CGR_INVOCATIONS = {
-    "crates/hyprstream/build.rs": {
-        "invocations": [
-            {"source_root": "crates/hyprstream/schema", "import_roots": ["crates/hyprstream-rpc/schema", "crates/hyprstream/schema"], "schemas": ["tui", "compositor_ipc"]},
-            {"source_root": "crates/hyprstream-rpc/schema", "import_roots": ["crates/hyprstream-rpc/schema", "crates/hyprstream/schema"], "schemas": ["streaming", "nine"]},
-        ],
-    },
-    "crates/hyprstream-discovery/build.rs": {"invocations": [{"source_root":"crates/hyprstream-discovery/schema","import_roots":["crates/hyprstream-rpc/schema"],"schemas":["discovery"]}]},
+    "crates/hyprstream/build.rs": {"invocations": [{"source_root":"crates/hyprstream-rpc/schema","import_roots":["crates/hyprstream-rpc/schema"],"schemas":["streaming","nine"]}]},
     "crates/hyprstream-rpc/build.rs": {"invocations": [{"source_root":"crates/hyprstream-rpc/schema","import_roots":[],"schemas":["common","streaming","events","annotations","optional","nine"]}]},
-    "crates/hyprstream-rpc-std/build.rs": {"invocations": [{"source_root":"crates/hyprstream-rpc-std/schema","import_roots":["crates/hyprstream-rpc/schema","crates/hyprstream-rpc-std/schema"],"schemas":["inference","model","registry","policy","mcp","metrics","service_events","chat_core","oauth"]}]},
-    "crates/hyprstream-workers/build.rs": {"invocations": [{"source_root":"crates/hyprstream-workers/schema","import_roots":["crates/hyprstream-rpc/schema"],"schemas":["worker","workflow"]}]},
+    "crates/hyprstream-rpc-std/build.rs": {"invocations": [{"source_root":"crates/hyprstream-rpc-std/schema","import_roots":["crates/hyprstream-rpc/schema","crates/hyprstream-rpc-std/schema"],"schemas":["inference","model","registry","policy","mcp","metrics","service_events","chat_core","oauth","worker","workflow","discovery","tui","compositor_ipc"]}]},
 }
 PACKAGE_REQUIREMENTS = [
     "Publish only validated manifest entries.",
@@ -1389,8 +1377,8 @@ def self_test(repo: Path) -> None:
     # it) and restored afterwards; worktree indexes are not shared.
     factories_path = "crates/hyprstream/src/services/factories.rs"
     attribute_swap = text(repo, factories_path, None).replace(
-        'schema = "../../../hyprstream-rpc-std/schema/registry.capnp", metadata = crate::services::generated::registry_client::schema_metadata',
-        'schema = "../../../hyprstream-rpc-std/schema/model.capnp", metadata = crate::services::generated::model_client::schema_metadata', 1)
+        'schema = "../../../hyprstream-rpc-std/schema/registry.capnp", metadata = hyprstream_rpc_std::registry_client::schema_metadata',
+        'schema = "../../../hyprstream-rpc-std/schema/model.capnp", metadata = hyprstream_rpc_std::model_client::schema_metadata', 1)
     expect_failure("factory schema/metadata attribute swap", repo, copy.deepcopy(catalog), corpus, schemas,
                    source_services(repo, {factories_path: attribute_swap}), {factories_path: attribute_swap})
     vfs_mount = "crates/hyprstream-rpc-std/src/vfs_mount.rs"
@@ -1435,7 +1423,7 @@ def self_test(repo: Path) -> None:
     bad["source_commit"] = stale_base
     bad["source_tree"] = git(repo, "rev-parse", f"{stale_base}^{{tree}}")
     expect_failure("declared tree predates audited input", repo, bad, corpus, schemas, consumers)
-    bad = copy.deepcopy(catalog); bad["schemas"][0]["license"] = "MIT"
+    bad = copy.deepcopy(catalog); bad["schemas"][0]["license"] = "AGPL-3.0-or-later"
     expect_failure("manifest license", repo, bad, corpus, schemas, consumers)
     bad = copy.deepcopy(catalog)
     settlement = next(entry for entry in bad["schemas"] if entry["path"].endswith("settlement.capnp"))
@@ -1478,7 +1466,7 @@ def self_test(repo: Path) -> None:
         mutated = raw_cli[:inside[0]] + "if false" + raw_cli[inside[0] + len(builder_guard):]
         expect_failure(label, repo, copy.deepcopy(catalog), corpus, schemas,
                        source_services(repo, {cli_path: mutated}), {cli_path: mutated})
-    worker_path = "crates/hyprstream-workers/schema/worker.capnp"
+    worker_path = "crates/hyprstream-rpc-std/schema/worker.capnp"
     hidden_removed = text(repo, worker_path, None).replace("$cliHidden ", "", 1)
     expect_failure("schema hidden annotation", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: hidden_removed})
     hidden_comment = text(repo, worker_path, None).replace("$cliHidden", "# $cliHidden", 1)
@@ -1489,45 +1477,46 @@ def self_test(repo: Path) -> None:
     required("worker.container.attach" not in schema_method_metadata(repo, catalog["schemas"], {worker_path: hidden_literal})["cli_hidden"],
              "literal-only hidden annotation drift")
     expect_failure("schema hidden literal decoy", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: hidden_literal})
-    discovery_build = "crates/hyprstream-discovery/build.rs"
-    discovery_source = text(repo, discovery_build, None)
-    whitespace = discovery_source.replace("hyprstream_rpc_build::compile_schemas(", "hyprstream_rpc_build :: compile_schemas (", 1)
-    required(cgr_inventory(discovery_build, whitespace) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
+    canonical_build = "crates/hyprstream-rpc-std/build.rs"
+    canonical_source = text(repo, canonical_build, None)
+    whitespace = canonical_source.replace("hyprstream_rpc_build::compile_schemas(", "hyprstream_rpc_build :: compile_schemas (", 1)
+    required(cgr_inventory(canonical_build, whitespace) == EXPECTED_CGR_INVOCATIONS[canonical_build]["invocations"],
              "CGR whitespace normalization drift")
-    aliased = ("use hyprstream_rpc_build::compile_schemas as compile;\n" + discovery_source
+    aliased = ("use hyprstream_rpc_build::compile_schemas as compile;\n" + canonical_source
                .replace("hyprstream_rpc_build::compile_schemas(", "compile(", 1))
-    required(cgr_inventory(discovery_build, aliased) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
+    required(cgr_inventory(canonical_build, aliased) == EXPECTED_CGR_INVOCATIONS[canonical_build]["invocations"],
              "CGR function-alias normalization drift")
-    module_aliased = ("use hyprstream_rpc_build as rpc_build;\n" + discovery_source
+    module_aliased = ("use hyprstream_rpc_build as rpc_build;\n" + canonical_source
                       .replace("hyprstream_rpc_build::compile_schemas(", "rpc_build::compile_schemas(", 1))
-    required(cgr_inventory(discovery_build, module_aliased) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
+    required(cgr_inventory(canonical_build, module_aliased) == EXPECTED_CGR_INVOCATIONS[canonical_build]["invocations"],
              "CGR module-alias normalization drift")
-    grouped_aliased = ("use hyprstream_rpc_build::{nested::{SchemaMetadata}, compile_schemas as compile, SchemaMetadata};\n" + discovery_source
+    grouped_aliased = ("use hyprstream_rpc_build::{nested::{SchemaMetadata}, compile_schemas as compile, SchemaMetadata};\n" + canonical_source
                        .replace("hyprstream_rpc_build::compile_schemas(", "compile(", 1))
-    required(cgr_inventory(discovery_build, grouped_aliased) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
+    required(cgr_inventory(canonical_build, grouped_aliased) == EXPECTED_CGR_INVOCATIONS[canonical_build]["invocations"],
              "CGR grouped function-alias normalization drift")
-    lifetime_extra = discovery_source + "\nfn marker<'a>() {}\n" + discovery_source[discovery_source.find("hyprstream_rpc_build::compile_schemas("):]
-    required(len(cgr_inventory(discovery_build, lifetime_extra)) == 2,
+    lifetime_extra = canonical_source + "\nfn marker<'a>() {}\n" + canonical_source[canonical_source.find("hyprstream_rpc_build::compile_schemas("):]
+    required(len(cgr_inventory(canonical_build, lifetime_extra)) == 2,
              "CGR lifetime tokenization hid an invocation")
-    comment_extra = discovery_source + "\n/* // still block comment */\n" + discovery_source[discovery_source.find("hyprstream_rpc_build::compile_schemas("):]
-    required(len(cgr_inventory(discovery_build, comment_extra)) == 2,
+    comment_extra = canonical_source + "\n/* // still block comment */\n" + canonical_source[canonical_source.find("hyprstream_rpc_build::compile_schemas("):]
+    required(len(cgr_inventory(canonical_build, comment_extra)) == 2,
              "CGR block-comment tokenization hid an invocation")
-    raw_string = discovery_source + '\nlet marker = br###"hyprstream_rpc_build::compile_schemas("###;\n'
-    required(cgr_inventory(discovery_build, raw_string) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
+    raw_string = canonical_source + '\nlet marker = br###"hyprstream_rpc_build::compile_schemas("###;\n'
+    required(cgr_inventory(canonical_build, raw_string) == EXPECTED_CGR_INVOCATIONS[canonical_build]["invocations"],
              "CGR byte-raw string tokenization drift")
-    diagnostic_string = discovery_source + '\nlet diagnostic = r#"let schema_dir = Path::new(\\"elsewhere\\");"#;\n'
-    required(cgr_inventory(discovery_build, diagnostic_string) == EXPECTED_CGR_INVOCATIONS[discovery_build]["invocations"],
+    diagnostic_string = canonical_source + '\nlet diagnostic = r#"let schema_dir = Path::new(\\"elsewhere\\");"#;\n'
+    required(cgr_inventory(canonical_build, diagnostic_string) == EXPECTED_CGR_INVOCATIONS[canonical_build]["invocations"],
              "CGR diagnostic literal binding drift")
-    expect_cgr_failure("CGR unresolved alias", discovery_build,
-                       discovery_source.replace("hyprstream_rpc_build::compile_schemas(", "unknown::compile_schemas(", 1))
-    expect_cgr_failure("CGR alias reassignment", discovery_build,
+    expect_cgr_failure("CGR unresolved alias", canonical_build,
+                       canonical_source.replace("hyprstream_rpc_build::compile_schemas(", "unknown::compile_schemas(", 1))
+    expect_cgr_failure("CGR alias reassignment", canonical_build,
                        aliased + "\ncompile = other_compile;\n")
-    expect_cgr_failure("CGR mutable binding", discovery_build,
-                       discovery_source.replace("let rpc_schema_dir", "let mut rpc_schema_dir", 1))
+    expect_cgr_failure("CGR mutable binding", canonical_build,
+                       canonical_source.replace("let rpc_schema_dir", "let mut rpc_schema_dir", 1))
     required(cgr_inventory("crates/unrelated/build.rs", 'fn main() { println!("compile_schemas"); }') == [],
              "CGR string-only producer false positive")
-    root_changed = text(repo, discovery_build, None).replace("../hyprstream-rpc/schema", "../unrelated/schema", 1)
-    expect_failure("CGR source import root", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {discovery_build: root_changed})
+    root_changed = text(repo, canonical_build, None).replace(
+        '.join("../hyprstream-rpc/schema")', '.join("../unrelated/schema")', 1)
+    expect_failure("CGR source import root", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {canonical_build: root_changed})
     fixture_build = "crates/hyprstream-rpc-build/build.rs"
     fixture_drift = text(repo, fixture_build, None).replace(".file(&schema)", '.file("tests/other.capnp")', 1)
     expect_failure("capnp-only compiler input", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {fixture_build: fixture_drift})
@@ -1542,47 +1531,54 @@ def self_test(repo: Path) -> None:
     expect_failure("capnp-only effective shadow binding", repo, copy.deepcopy(catalog), corpus,
                    schemas, consumers, {fixture_build: fixture_shadow})
     tui_build = "crates/hyprstream-tui/build.rs"
-    required(capnp_only_inputs(tui_build, text(repo, tui_build, None)) == ["crates/hyprstream/schema/compositor_ipc.capnp"],
+    required(capnp_only_inputs(tui_build, text(repo, tui_build, None)) == [],
+             "TUI build unexpectedly compiles a canonical schema")
+    join_fixture = '\n'.join([
+        'let schema_dir = Path::new("../hyprstream-rpc-std/schema");',
+        'let schema = schema_dir.join("compositor_ipc.capnp");',
+        'capnpc::CompilerCommand::new().file(&schema).run();',
+    ])
+    required(capnp_only_inputs(tui_build, join_fixture) == ["crates/hyprstream-rpc-std/schema/compositor_ipc.capnp"],
              "capnp-only join-binding resolution drift")
-    direct_drift = text(repo, discovery_build, None).replace(
+    direct_drift = text(repo, canonical_build, None).replace(
         "\n}", '\n    capnpc::CompilerCommand::new().file("../hyprstream-pay/schema/settlement.capnp").run();\n}', 1
     )
     expect_failure("direct capnpc compiles uncompiled schema", repo, copy.deepcopy(catalog), corpus,
-                   schemas, consumers, {discovery_build: direct_drift})
-    chained_drift = text(repo, discovery_build, None).replace(
+                   schemas, consumers, {canonical_build: direct_drift})
+    chained_drift = text(repo, canonical_build, None).replace(
         "\n}",
         '\n    capnpc::CompilerCommand::new().file("{manifest}/../hyprstream-rpc/schema/nine.capnp").file("../hyprstream-pay/schema/settlement.capnp").run().expect("chained");\n}', 1
     )
     expect_failure("chained capnpc supplies uncompiled schema", repo, copy.deepcopy(catalog), corpus,
-                   schemas, consumers, {discovery_build: chained_drift})
-    aliased_drift = text(repo, discovery_build, None).replace(
+                   schemas, consumers, {canonical_build: chained_drift})
+    aliased_drift = text(repo, canonical_build, None).replace(
         "\n}",
         '\n}\n\nuse capnpc::CompilerCommand as CapnpCmd;\n\nfn extra() {\n    CapnpCmd::new().file("../hyprstream-pay/schema/settlement.capnp").run().expect("aliased");\n}', 1
     )
     expect_failure("imported capnpc compiles uncompiled schema", repo, copy.deepcopy(catalog), corpus,
-                   schemas, consumers, {discovery_build: aliased_drift})
-    module_drift = text(repo, discovery_build, None).replace(
+                   schemas, consumers, {canonical_build: aliased_drift})
+    module_drift = text(repo, canonical_build, None).replace(
         "\n}",
         '\n}\n\nuse capnpc as cp;\n\nfn extra() {\n    cp::CompilerCommand::new().file("../hyprstream-pay/schema/settlement.capnp").run().expect("module-aliased");\n}', 1
     )
     expect_failure("module-aliased capnpc compiles uncompiled schema", repo, copy.deepcopy(catalog), corpus,
-                   schemas, consumers, {discovery_build: module_drift})
-    module_drift = text(repo, discovery_build, None).replace(
+                   schemas, consumers, {canonical_build: module_drift})
+    module_drift = text(repo, canonical_build, None).replace(
         "\n}",
         '\n}\n\nuse capnpc as cp;\n\nfn extra() {\n    cp::CompilerCommand::new().file("../hyprstream-pay/schema/settlement.capnp").run().expect("module-aliased");\n}', 1
     )
     expect_failure("module-aliased capnpc compiles uncompiled schema", repo, copy.deepcopy(catalog), corpus,
-                   schemas, consumers, {discovery_build: module_drift})
-    shadowed = text(repo, discovery_build, None).replace(
+                   schemas, consumers, {canonical_build: module_drift})
+    shadowed = text(repo, canonical_build, None).replace(
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");',
         'let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");\n    let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-workers/schema");',
     )
-    expect_failure("CGR shadowed binding", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {discovery_build: shadowed})
-    commented = text(repo, discovery_build, None).replace("../hyprstream-rpc/schema", "../hyprstream-workers/schema", 1) + '\n// let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");\n'
-    expect_failure("CGR commented declaration", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {discovery_build: commented})
-    extra = text(repo, discovery_build, None).replace("\n}", '\n    hyprstream_rpc_build::compile_schemas(schema_dir, Path::new(&out_dir), &[], &["extra"]);\n}', 1)
-    expect_failure("CGR additional invocation", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {discovery_build: extra})
-    extra_producer = {'crates/unrelated/build.rs': discovery_source}
+    expect_failure("CGR shadowed binding", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {canonical_build: shadowed})
+    commented = text(repo, canonical_build, None).replace('.join("../hyprstream-rpc/schema")', '.join("../hyprstream-workers/schema")', 1) + '\n// let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");\n'
+    expect_failure("CGR commented declaration", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {canonical_build: commented})
+    extra = text(repo, canonical_build, None).replace("\n}", '\n    hyprstream_rpc_build::compile_schemas(schema_dir, Path::new(&out_dir), &[], &["extra"]);\n}', 1)
+    expect_failure("CGR additional invocation", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {canonical_build: extra})
+    extra_producer = {'crates/unrelated/build.rs': canonical_source}
     expect_failure("CGR additional producer", repo, copy.deepcopy(catalog), corpus, schemas, consumers, extra_producer)
     model_path = "crates/hyprstream-rpc-std/schema/model.capnp"
     model_drift = text(repo, model_path, None).replace("generateStream @1 :StreamInfo", "generateStream @1 :Text", 1)

@@ -466,7 +466,7 @@ struct DeepResponse { union {
 
     def test_commented_hidden_field_stops_before_next_field(self):
         actual = catalog.read_json(ROOT / "docs/schema-catalog.json", ROOT)
-        path = "crates/hyprstream-workers/schema/worker.capnp"
+        path = "crates/hyprstream-rpc-std/schema/worker.capnp"
         source = catalog.text(ROOT, path, None)
         baseline = catalog.schema_method_metadata(ROOT, actual["schemas"], None)
         self.assertIn("worker.container.attach", baseline["cli_hidden"])
@@ -476,6 +476,33 @@ struct DeepResponse { union {
                 methods = catalog.schema_method_metadata(ROOT, actual["schemas"], {path: changed})
                 self.assertNotIn("worker.container.attach", methods["cli_hidden"])
                 self.assertIn("worker.container.detach", methods["cli_hidden"])
+
+    def test_canonical_schema_producers_and_staging_only_consumers(self):
+        actual = catalog.read_json(ROOT / "docs/schema-catalog.json", ROOT)
+        catalog.check_cgr(actual, ROOT, actual["schemas"], None)
+        for build in ["crates/hyprstream-discovery/build.rs", "crates/hyprstream-workers/build.rs",
+                      "crates/hyprstream-tui/build.rs"]:
+            with self.subTest(build=build):
+                source = catalog.text(ROOT, build, None)
+                self.assertEqual(catalog.cgr_inventory(build, source), [])
+                self.assertEqual(catalog.capnp_only_inputs(build, source), [])
+                added = source + '\nfn extra() { let schema_dir = Path::new("schema"); hyprstream_rpc_build::compile_schemas(schema_dir, Path::new("out"), &[], &["extra"]); }'
+                with self.assertRaisesRegex(catalog.CatalogError, "producer inventory drift"):
+                    catalog.check_cgr(actual, ROOT, actual["schemas"], {build: added})
+        build = "crates/hyprstream-rpc-std/build.rs"
+        source = catalog.text(ROOT, build, None)
+        for schema in ["worker", "workflow", "discovery", "tui", "compositor_ipc"]:
+            with self.subTest(schema=schema):
+                changed = source.replace(f'        "{schema}",', '', 1)
+                self.assertNotEqual(changed, source)
+                with self.assertRaisesRegex(catalog.CatalogError, "invocation inventory drift"):
+                    catalog.check_cgr(actual, ROOT, actual["schemas"], {build: changed})
+                entry = next(item for item in actual["schemas"] if item["path"].endswith(f"/{schema}.capnp"))
+                self.assertEqual(catalog.owner_manifest(ROOT, entry["path"], actual["owner_directories"]),
+                                 ("crates/hyprstream-rpc-std/schema", "hyprstream-rpc-std", "Apache-2.0"))
+                self.assertEqual(entry["owner"], "hyprstream-rpc-std")
+                self.assertEqual(entry["license"], "Apache-2.0")
+                self.assertEqual(entry["cgr_producers"], [build])
 
     def test_workflow_contract(self):
         source = (ROOT / ".github/workflows/docs-catalog.yml").read_text()

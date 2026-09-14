@@ -472,7 +472,7 @@
   |   +------------------------------------------+
   |   | [release]                                |
   |   | version = "0.1.0"                        |
-  |   | libtorch_version = "2.10.0"              |
+  |   | libtorch_version = "2.11.0"              |
   |   | abi = "pre-cxx11"                        |
   |   |                                          |
   |   | [variants]                               |

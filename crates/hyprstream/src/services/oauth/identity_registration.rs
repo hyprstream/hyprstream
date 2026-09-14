@@ -686,6 +686,33 @@ fn verify_resumable_signup_publication(
                 .is_ok_and(|head| head == commit_cid.to_string()),
         "published hosted signup repo genesis is incomplete or inconsistent"
     );
+    // Native-only publications predate the public sidecar. Resume the exact
+    // already-verified transaction and identity; XRPC derives its public form
+    // later through the original account custody. Never sign with the fresh
+    // retry candidate's key, or treat a present invalid artifact as absent.
+    let public_path = account_dir.join("repo/public-commit.cbor");
+    match std::fs::symlink_metadata(&public_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("checking published hosted public repo genesis"),
+        Ok(metadata) => ensure!(
+            metadata.file_type().is_file(),
+            "public repo genesis is not a regular file"
+        ),
+    }
+    let public_commit_bytes = read_authority_artifact(&public_path)
+        .context("reading published hosted public repo genesis")?;
+    let public_commit = hyprstream_pds::commit::Commit::from_atproto_dag_cbor(&public_commit_bytes)
+        .context("verifying published hosted public repo genesis")?;
+    public_commit
+        .verify_atproto(&record.atproto_verifying_key()?)
+        .context("published hosted public repo signature is invalid")?;
+    ensure!(
+        public_commit.did == expected_name.did()
+            && public_commit.data == commit.data
+            && public_commit.rev == commit.rev
+            && public_commit.prev.is_none(),
+        "published hosted public repo genesis does not match native genesis state"
+    );
     Ok(())
 }
 
@@ -697,6 +724,10 @@ fn write_repo_genesis(account_dir: &Path, repo: &hyprstream_pds::HostedRepoGenes
         write_private_file(&blocks_dir.join(format!("{cid}.cbor")), bytes)?;
     }
     write_private_file(&repo_dir.join("commit.cbor"), repo.commit_bytes())?;
+    write_private_file(
+        &repo_dir.join("public-commit.cbor"),
+        repo.public_commit_bytes(),
+    )?;
     write_private_file(
         &repo_dir.join("head"),
         repo.commit_cid().to_string().as_bytes(),
@@ -1680,8 +1711,8 @@ mod tests {
         (
             Arc::new(OAuthState::new(
                 &config,
-                crate::services::PolicyClient::new(make_client()),
-                crate::services::DiscoveryClient::new(make_client()),
+                hyprstream_rpc_std::policy_client::PolicyClient::new(make_client()),
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(make_client()),
                 signing_key.verifying_key().to_bytes(),
             )),
             cors,
@@ -1787,8 +1818,8 @@ mod tests {
         let state = Arc::new(
             OAuthState::new(
                 &oauth,
-                crate::services::PolicyClient::new(make_client()),
-                crate::services::DiscoveryClient::new(make_client()),
+                hyprstream_rpc_std::policy_client::PolicyClient::new(make_client()),
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(make_client()),
                 signing_key.verifying_key().to_bytes(),
             )
             .with_identity_registration_api(api),
@@ -1974,6 +2005,7 @@ mod tests {
         assert!(published.join("genesis.didop.cbor").is_file());
         assert!(published.join("did-document.json").is_file());
         assert!(published.join("repo/commit.cbor").is_file());
+        assert!(published.join("repo/public-commit.cbor").is_file());
     }
 
     #[test]
@@ -1999,10 +2031,236 @@ mod tests {
             .join("pds/accounts.example.com/accounts/alice");
         assert!(account.join("account-record.cbor").is_file());
         assert!(account.join("repo/commit.cbor").is_file());
+        assert!(account.join("repo/public-commit.cbor").is_file());
         let transaction: serde_json::Value =
             serde_json::from_slice(&std::fs::read(account.join(SIGNUP_TRANSACTION_FILE)).unwrap())
                 .unwrap();
         assert_eq!(transaction["transaction_id"], "SHA256:vault-key");
+    }
+
+    #[test]
+    fn production_legacy_signup_resume_preserves_original_identity_and_transaction() {
+        let fixture = production_router_fixture();
+        let api = fixture.state.identity_registration_api.as_ref().unwrap();
+        let first = api
+            .mint_for_oauth_signup("alice", "verified-dpop-jkt", "SHA256:vault-key")
+            .unwrap();
+        let account = fixture
+            .storage
+            .path()
+            .join("pds/accounts.example.com/accounts/alice");
+        let files = [
+            "account-record.cbor",
+            "genesis.didop.cbor",
+            "did-document.json",
+            hyprstream_pds::ATPROTO_SIGNING_KEY_FILE,
+            "repo/commit.cbor",
+            "repo/head",
+            SIGNUP_TRANSACTION_FILE,
+        ];
+        let original: Vec<_> = files
+            .iter()
+            .map(|file| std::fs::read(account.join(file)).unwrap())
+            .collect();
+        std::fs::remove_file(account.join("repo/public-commit.cbor")).unwrap();
+        let resumed = api
+            .mint_for_oauth_signup("alice", "verified-dpop-jkt", "SHA256:vault-key")
+            .unwrap();
+        assert_eq!(resumed, first);
+        assert!(!account.join("repo/public-commit.cbor").exists());
+        for (file, bytes) in files.iter().zip(&original) {
+            assert_eq!(&std::fs::read(account.join(file)).unwrap(), bytes, "{file}");
+        }
+        assert!(matches!(
+            api.mint_for_oauth_signup("alice", "verified-dpop-jkt", "SHA256:different-key"),
+            Err(IdentityApiError::HandleUnavailable)
+        ));
+        // Present invalid bytes must not take the legacy absence path.
+        std::fs::write(
+            account.join("repo/public-commit.cbor"),
+            b"corrupt public genesis",
+        )
+        .unwrap();
+        assert!(api
+            .mint_for_oauth_signup("alice", "verified-dpop-jkt", "SHA256:vault-key")
+            .is_err());
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(account.join("repo/public-commit.cbor")).unwrap();
+            std::os::unix::fs::symlink("missing-target", account.join("repo/public-commit.cbor"))
+                .unwrap();
+            assert!(api
+                .mint_for_oauth_signup("alice", "verified-dpop-jkt", "SHA256:vault-key")
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn production_legacy_signup_resume_still_requires_native_authority_closure() {
+        for artifact in [
+            "account-record.cbor",
+            "genesis.didop.cbor",
+            "did-document.json",
+            "repo/commit.cbor",
+            "repo/head",
+            "root-block",
+            SIGNUP_TRANSACTION_FILE,
+            "missing-native",
+        ] {
+            let fixture = production_router_fixture();
+            let api = fixture.state.identity_registration_api.as_ref().unwrap();
+            api.mint_for_oauth_signup("alice", "verified-dpop-jkt", "SHA256:vault-key")
+                .unwrap();
+            let account = fixture
+                .storage
+                .path()
+                .join("pds/accounts.example.com/accounts/alice");
+            std::fs::remove_file(account.join("repo/public-commit.cbor")).unwrap();
+            let path = if artifact == "root-block" {
+                let native = hyprstream_pds::commit::Commit::from_dag_cbor(
+                    &std::fs::read(account.join("repo/commit.cbor")).unwrap(),
+                )
+                .unwrap();
+                account.join(format!("repo/blocks/{}.cbor", native.data))
+            } else {
+                account.join(artifact)
+            };
+            if artifact == "missing-native" {
+                std::fs::remove_file(account.join("repo/commit.cbor")).unwrap();
+            } else {
+                std::fs::write(path, b"corrupt native authority").unwrap();
+            }
+            assert!(
+                api.mint_for_oauth_signup("alice", "verified-dpop-jkt", "SHA256:vault-key")
+                    .is_err(),
+                "{artifact}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn production_mac_published_genesis_supports_hosted_reads_and_writes() {
+        use crate::mac::audit::{AuditError, AuditRecord, AuditSink, DecisionReason};
+        use crate::services::public_repo::{
+            hosted_tests, HostedAccountPublicRepoWriter, HostedAccountSelfAuthorizer,
+            PublicRepoStore,
+        };
+        use tower::ServiceExt;
+        #[derive(Default)]
+        struct CaptureAudit(parking_lot::Mutex<Vec<AuditRecord>>);
+        impl AuditSink for CaptureAudit {
+            fn record(&self, record: &AuditRecord) -> Result<(), AuditError> {
+                self.0.lock().push(record.clone());
+                Ok(())
+            }
+        }
+        for legacy in [false, true] {
+            let mut fixture = production_router_fixture();
+            fixture
+                .state
+                .identity_registration_api
+                .as_ref()
+                .unwrap()
+                .mint_for_oauth_signup("alice", "verified-dpop-jkt", "SHA256:vault-key")
+                .unwrap();
+            let root = fixture.storage.path().join("pds");
+            if legacy {
+                std::fs::remove_file(
+                    root.join("accounts.example.com/accounts/alice/repo/public-commit.cbor"),
+                )
+                .unwrap();
+            }
+            let audit = Arc::new(CaptureAudit::default());
+            // Real descriptor-bound directory mount, Enrollment clearance,
+            // structural labels and mandatory audited PEP; no permit substitute.
+            let accounts = crate::mac::production_pds_account_record_store(
+                Arc::new(crate::mac::PdsDirectoryMount::open(&root).unwrap()),
+                audit.clone(),
+            );
+            let authority = hyprstream_rpc::Subject::new(
+                hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+            );
+            accounts.refresh_hosted_did_index(&authority).await.unwrap();
+            let store = Arc::new(
+                PublicRepoStore::open(&fixture.storage.path().join("public-repos")).unwrap(),
+            );
+            let writer = Arc::new(HostedAccountPublicRepoWriter::new(
+                store.clone(),
+                accounts,
+                authority,
+                Arc::new(HostedAccountSelfAuthorizer),
+            ));
+            let state = Arc::get_mut(&mut fixture.state).unwrap();
+            state.hosted_account_zone = Some(AccountZone::new("accounts.example.com").unwrap());
+            state.hosted_public_repo_writer = Some(writer.clone());
+            let app = super::super::xrpc::xrpc_routes().with_state(fixture.state.clone());
+            let description = app
+                .clone()
+                .oneshot(get(&format!(
+                    "/xrpc/com.atproto.repo.describeRepo?repo={}",
+                    hosted_tests::DID
+                )))
+                .await
+                .unwrap();
+            assert_eq!(description.status(), StatusCode::OK, "legacy={legacy}");
+            let body = axum::body::to_bytes(description.into_body(), 65536)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["did"], hosted_tests::DID);
+            assert_eq!(body["collections"], serde_json::json!([]));
+            let genesis = store.snapshot(hosted_tests::DID).unwrap().unwrap().commit;
+            let exported = app
+                .clone()
+                .oneshot(get(&format!(
+                    "/xrpc/com.atproto.sync.getRepo?did={}",
+                    hosted_tests::DID
+                )))
+                .await
+                .unwrap();
+            assert_eq!(exported.status(), StatusCode::OK);
+            assert!(!axum::body::to_bytes(exported.into_body(), 2 * 1024 * 1024)
+                .await
+                .unwrap()
+                .is_empty());
+            let record = writer
+                .create_record(
+                    hosted_tests::request(1),
+                    Some(&genesis.cid_atproto().unwrap().to_string()),
+                )
+                .await
+                .unwrap();
+            let snapshot = store.snapshot(hosted_tests::DID).unwrap().unwrap();
+            assert_eq!(snapshot.commit.prev, Some(genesis.cid_atproto().unwrap()));
+            assert_eq!(snapshot.commit.cid_atproto().unwrap(), record.commit_cid);
+            let get_record = app.oneshot(get(&format!("/xrpc/com.atproto.repo.getRecord?repo={}&collection=app.bsky.feed.post&rkey=post-1", hosted_tests::DID))).await.unwrap();
+            assert_eq!(get_record.status(), StatusCode::OK);
+            let records = audit.0.lock();
+            let artifacts: &[&str] = if legacy {
+                &["repo/commit.cbor", hyprstream_pds::ATPROTO_SIGNING_KEY_FILE]
+            } else {
+                &[
+                    "repo/commit.cbor",
+                    "repo/public-commit.cbor",
+                    hyprstream_pds::ATPROTO_SIGNING_KEY_FILE,
+                ]
+            };
+            for artifact in artifacts {
+                let path = format!("/pds/accounts.example.com/accounts/alice/{artifact}");
+                assert!(
+                    records
+                        .iter()
+                        .any(|record| record.object_id.as_deref() == Some(path.as_str())
+                            && record.subject_id.as_deref()
+                                == Some(hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT)
+                            && record.reason == DecisionReason::Permit),
+                    "missing actual audited permit: {path}"
+                );
+            }
+            assert!(records
+                .iter()
+                .all(|record| record.reason == DecisionReason::Permit));
+        }
     }
 
     #[tokio::test]

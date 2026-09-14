@@ -15,7 +15,8 @@ use super::token_store::TokenStore;
 use super::user_service::UserService;
 use crate::auth::user_store::UserStore;
 use crate::config::OAuthConfig;
-use crate::services::{DiscoveryClient, PolicyClient};
+use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+use hyprstream_rpc_std::policy_client::PolicyClient;
 use hyprstream_util::{InsertIfAbsentNoEvictResult, TtlCache};
 
 use super::replay_key::ReplayKey;
@@ -1168,6 +1169,13 @@ pub struct OAuthState {
     /// Optional native-authorized public repository writer. No public write
     /// routes are mounted while this is absent.
     pub public_repo_writer: Option<Arc<crate::services::public_repo::PublicRepoWriter>>,
+    /// Production hosted-account writer. It resolves the requested DID and
+    /// signs through AccountRecordStore without exposing private key bytes.
+    pub hosted_public_repo_writer:
+        Option<Arc<crate::services::public_repo::HostedAccountPublicRepoWriter>>,
+    /// Optional native account resolver for the protected standard
+    /// `com.atproto.server.getSession` route.
+    pub atproto_session_resolver: Option<Arc<dyn super::xrpc::AtprotoSessionResolver>>,
     /// When `true`, the XRPC read-slice routes (`/xrpc/…`) are mounted on the
     /// OAuth router (#1112). Copied from `OAuthConfig::xrpc_read_slice`.
     pub xrpc_read_slice: bool,
@@ -1362,6 +1370,8 @@ impl OAuthState {
             sessions: super::session::SessionStore::default(),
             xrpc_repos: Arc::new(super::xrpc::XrpcRepoStore::new()),
             public_repo_writer: None,
+            hosted_public_repo_writer: None,
+            atproto_session_resolver: None,
             xrpc_read_slice: config.xrpc_read_slice,
             deployment_well_known_dir: config.deployment_well_known_dir.clone(),
             rsa_encoding_key: None,
@@ -1438,6 +1448,25 @@ impl OAuthState {
         writer: Arc<crate::services::public_repo::PublicRepoWriter>,
     ) -> Self {
         self.public_repo_writer = Some(writer);
+        self
+    }
+
+    pub fn with_hosted_public_repo_writer(
+        mut self,
+        writer: Arc<crate::services::public_repo::HostedAccountPublicRepoWriter>,
+    ) -> Self {
+        self.hosted_public_repo_writer = Some(writer);
+        self
+    }
+
+    /// Install the explicit native account resolver used by standard
+    /// `com.atproto.server.getSession`. The resolver owns handle, DID-document
+    /// and lifecycle truth; no session route is mounted without it.
+    pub fn with_atproto_session_resolver(
+        mut self,
+        resolver: Arc<dyn super::xrpc::AtprotoSessionResolver>,
+    ) -> Self {
+        self.atproto_session_resolver = Some(resolver);
         self
     }
 
@@ -2253,14 +2282,16 @@ pub fn canonical_issuer_origin(issuer_url: &str) -> Option<String> {
 }
 
 /// Convert the configured OAuth URL to the host-form `did:web` service DID
-/// used by ATProto service-auth audiences.
+/// used by public identity documents, discovery verification, and ATProto
+/// service-auth audiences. This conversion is stateless and does not resolve
+/// or mint hosted account identities.
 ///
 /// For supported DNS/IPv4 origins this mirrors the browser's
 /// `originToDidWeb`: URL parsing normalizes an explicit default port away,
 /// while a non-default port is retained and its domain-segment separator is
 /// encoded as `%3A`. IPv6 is rejected until client and server share one
 /// canonical DID representation for it.
-pub(super) fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
+pub(crate) fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
     let url = url::Url::parse(issuer_url).ok()?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()

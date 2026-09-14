@@ -11,7 +11,7 @@ use super::qwen3_5_vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 use super::{ModelArchitecture, ModelOperations};
 use crate::runtime::device_pool::LayerDeviceMap;
 use crate::runtime::kv_cache::KVCacheManager;
-use crate::runtime::KVQuantType;
+use hyprstream_rpc_std::model_client::KVQuantType;
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::rope::RoPE;
 use crate::runtime::tensor_helpers::{dims3, dims4};
@@ -177,20 +177,29 @@ fn cat_projs(projs: Vec<LinearProjection>) -> LinearProjection {
     let any_fp8 = projs.iter().any(|p| is_fp8(p.weight.kind()));
 
     if all_fp8 {
-        // All FP8: cat weights + scales directly, lazy dequant via apply().
-        let weight_refs: Vec<&Tensor> = projs.iter().map(|p| &p.weight).collect();
+        // Consume sources before rebuilding derived metadata, dropping each
+        // source rowwise copy before the fused copy is allocated.
+        let mut weights = Vec::with_capacity(projs.len());
+        let mut scales = Vec::with_capacity(projs.len());
+        for LinearProjection { weight, scale, .. } in projs {
+            weights.push(weight);
+            scales.push(scale);
+        }
+        let weight_refs: Vec<&Tensor> = weights.iter().collect();
         let fused_weight = Tensor::cat(&weight_refs, 1);
-        let has_scale = projs.iter().any(|p| p.scale.is_some());
-        let scale = if has_scale {
+        let scale = if scales.iter().any(Option::is_some) {
             #[allow(clippy::expect_used)] // all_fp8 invariant: every proj has a scale
-            let scale_refs: Vec<&Tensor> = projs.iter()
-                .map(|p| p.scale.as_ref().expect("FP8 projection missing scale"))
+            let scale_refs: Vec<&Tensor> = scales.iter()
+                .map(|scale| scale.as_ref().expect("FP8 projection missing scale"))
                 .collect();
             Some(Tensor::cat(&scale_refs, 1))
         } else {
             None
         };
-        LinearProjection { weight: fused_weight, bias: None, scale }
+        match scale {
+            Some(s) => LinearProjection::with_scale(fused_weight, s),
+            None => LinearProjection::new(fused_weight),
+        }
     } else if any_fp8 {
         // Mixed FP8/BF16: dequantize FP8 projections to BF16 before catting.
         // Occurs for small gating projections in hybrid layers; memory impact is minor.
@@ -645,8 +654,9 @@ impl GatedDeltaNetLayer {
                 // First call: zero-pad left by kernel_size-1
                 let pad = Tensor::zeros([batch, conv_dim, ks - 1], (dtype, device));
                 let padded = Tensor::cat(&[&pad, &x_t], 2);
-                let new_state = x_t.narrow(2, (seq - (ks - 1)).max(0), (ks - 1).min(seq))
-                    .contiguous();
+                // Retain the left padding when the first prompt is shorter
+                // than the convolution history, so the next decode has all taps.
+                let new_state = padded.narrow(2, seq, ks - 1).contiguous();
                 (padded, new_state)
             }
         };
@@ -758,8 +768,11 @@ impl GatedDeltaNetLayer {
             let g_h = g.permute([0, 2, 1]);                 // [B, nv, T]
             let b_h = b_f.permute([0, 2, 1]);               // [B, nv, T]
 
-            let init = if rec_state.is_some() { rec_state.as_ref() } else { None };
-            let (out_h, new_state) = chunked_delta_rule(&q_h, &k_h, &v_h, &g_h, &b_h, init, device)?;
+            // The previous state was moved out above. Use that owned state
+            // for cached multi-token continuation, just as single-token decode does.
+            let (out_h, new_state) = chunked_delta_rule(
+                &q_h, &k_h, &v_h, &g_h, &b_h, Some(&state_init), device,
+            )?;
             // out_h: [B, nv, T, hv]
             *rec_state = Some(new_state);
 
@@ -1023,7 +1036,7 @@ impl Qwen3_5FullAttention {
                 // Causal mask for a possibly-cached forward: query row i sits at
                 // absolute position (kv_len - q_len) + i, so it may attend keys
                 // 0..=(kv_len - q_len + i). tril(0) would mask out all history
-                // whenever start_pos > 0 (e.g. partial prefill on a prefix hit).
+                // whenever start_pos > 0 (partial prefill, speculative verify).
                 let mask = Tensor::ones([q_len, kv_len], (Kind::Float, device)).tril(kv_len - q_len);
                 let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
                 scores = scores.masked_fill(&mask.eq(0.0), -10000.0f64);
@@ -1352,6 +1365,96 @@ unsafe impl Send for Qwen3_5Layer {}
 unsafe impl Sync for Qwen3_5Layer {}
 
 // ============================================================================
+// MTP (multi-token prediction) head — self-speculative draft module
+// ============================================================================
+
+/// Qwen3.5/3.8 dense checkpoints ship a 1-layer MTP head that predicts token
+/// t+2 from the pair (main-model hidden after token t, embedding of token t+1):
+///
+/// ```text
+/// e = pre_fc_norm_embedding(embed(token_ids[i]))
+/// h = pre_fc_norm_hidden(hiddens[i])
+/// x = fc(cat([e, h], -1))            # embedding FIRST, hidden second
+/// x = mtp_layer(x)                   # full-attention decoder block (never GDN)
+/// logits = lm_head(mtp.norm(x))      # shared embed_tokens/lm_head
+/// ```
+///
+/// Slot `i` runs at the RoPE/KV position of the main-model token whose hidden
+/// state it consumes (`base + i`). The block has its own KV cache stored in the
+/// shared [`KVCacheManager`] at layer index `num_hidden_layers` (right after the
+/// main layers), so manager-wide `clear_all`/`truncate_to`/session swaps cover
+/// it automatically. FP8 checkpoints carry `_scale_inv` block scales for the 7
+/// attention/MLP linears (handled lazily by [`LinearProjection`]) but NOT for
+/// `mtp.fc`, which stays BF16.
+///
+/// v1 is dense-only: MoE checkpoints carry a full MoE MLP in the MTP block
+/// (~785 tensors) which is a deliberate follow-up — the loader falls back to
+/// non-speculative decode there.
+struct Qwen3_5MtpHead {
+    pre_fc_norm_hidden: Qwen3_5RMSNorm,
+    pre_fc_norm_embedding: Qwen3_5RMSNorm,
+    fc: LinearProjection,           // in: 2*hidden, out: hidden (no bias)
+    attn: Qwen3_5FullAttention,
+    mlp: LlamaMLP,                  // dense SwiGLU
+    input_layernorm: Qwen3_5RMSNorm,
+    post_attention_layernorm: Qwen3_5RMSNorm,
+    final_norm: Qwen3_5RMSNorm,     // mtp.norm — before the shared lm_head
+}
+
+unsafe impl Send for Qwen3_5MtpHead {}
+unsafe impl Sync for Qwen3_5MtpHead {}
+
+impl Qwen3_5MtpHead {
+    /// Load the dense MTP head, consuming all `mtp.*` keys from `weights`.
+    /// Caller must have already rejected MoE configs (checked by `from_weights`).
+    fn load(weights: &mut HashMap<String, Tensor>, cfg: &Qwen3_5TextConfig) -> Result<Self> {
+        fn take_norm(
+            weights: &mut HashMap<String, Tensor>,
+            name: &str,
+            eps: f32,
+        ) -> Result<Qwen3_5RMSNorm> {
+            let w = weights
+                .remove(name)
+                .ok_or_else(|| anyhow!("Missing weight: {name}"))?;
+            Ok(Qwen3_5RMSNorm::new(w, eps))
+        }
+
+        let layer_prefix = "mtp.layers.0";
+        // The MTP block is always a full-attention layer (never GatedDeltaNet).
+        // Give it layer_idx = num_hidden_layers so its RoPE cache entry and KV
+        // slot sit right after the main layers.
+        let attn = Qwen3_5FullAttention::load(
+            weights,
+            &format!("{layer_prefix}.self_attn"),
+            cfg,
+            cfg.num_hidden_layers as usize,
+        )?;
+        let mlp_prefix = format!("{layer_prefix}.mlp");
+        let mlp = LlamaMLP {
+            gate_proj: LinearProjection::take(weights, &format!("{mlp_prefix}.gate_proj.weight"))?,
+            up_proj: LinearProjection::take(weights, &format!("{mlp_prefix}.up_proj.weight"))?,
+            down_proj: LinearProjection::take(weights, &format!("{mlp_prefix}.down_proj.weight"))?,
+            activation: "silu".to_owned(),
+            layer_idx: cfg.num_hidden_layers as usize,
+        };
+        let eps = cfg.rms_norm_eps;
+
+        Ok(Self {
+            pre_fc_norm_hidden: take_norm(weights, "mtp.pre_fc_norm_hidden.weight", eps)?,
+            pre_fc_norm_embedding: take_norm(weights, "mtp.pre_fc_norm_embedding.weight", eps)?,
+            fc: LinearProjection::take(weights, "mtp.fc.weight")?,
+            attn,
+            mlp,
+            input_layernorm: take_norm(weights, &format!("{layer_prefix}.input_layernorm.weight"), eps)?,
+            post_attention_layernorm: take_norm(weights, &format!(
+                "{layer_prefix}.post_attention_layernorm.weight"
+            ), eps)?,
+            final_norm: take_norm(weights, "mtp.norm.weight", eps)?,
+        })
+    }
+}
+
+// ============================================================================
 // Top-level model
 // ============================================================================
 
@@ -1385,6 +1488,9 @@ pub struct Qwen3_5Model {
     conv_states: Arc<parking_lot::Mutex<Vec<Option<Tensor>>>>,
     rec_states: Arc<parking_lot::Mutex<Vec<Option<Tensor>>>>,
     kv_cache: Option<Arc<parking_lot::Mutex<KVCacheManager>>>,
+    /// MTP draft head (dense checkpoints only). Its KV cache lives in the shared
+    /// manager at layer index `num_hidden_layers` (see [`Qwen3_5MtpHead`]).
+    mtp: Option<Qwen3_5MtpHead>,
     // Vision encoder (optional — None for text-only weights)
     vision_encoder: Option<Qwen3_5VisionEncoder>,
     // Linear projection: vision out_hidden_size → text hidden_size
@@ -1395,13 +1501,17 @@ unsafe impl Send for Qwen3_5Model {}
 unsafe impl Sync for Qwen3_5Model {}
 
 impl Qwen3_5Model {
+    /// Construct from caller-owned tensors. Disabled speculation discards any
+    /// MTP tensors already supplied; use ModelFactory to filter them before
+    /// materialization and avoid their temporary device allocation as well.
     pub fn from_weights(
         weights: &mut HashMap<String, Tensor>,
         cfg: Qwen3_5TextConfig,
         vision_cfg: Option<Qwen3_5VisionConfig>,
         device: &Device,
         dtype: Kind,
-        _kv_quant_type: KVQuantType,
+        kv_quant_type: KVQuantType,
+        speculative_decoding: bool,
     ) -> Result<Self> {
         // Normalize weight key prefixes:
         // Qwen3.5 Instruct weights use "model.language_model." and "model.visual." prefixes
@@ -1468,8 +1578,40 @@ impl Qwen3_5Model {
             (None, None)
         };
 
-        // Remove MTP (multi-token prediction) weights silently
-        weights.retain(|k, _| !k.starts_with("mtp."));
+        // MTP (multi-token prediction) head: 1-layer self-speculative draft module.
+        // v1 loads dense checkpoints only; MoE MTP blocks (~785 tensors) are a
+        // documented follow-up — fall back to non-speculative decode there.
+        let mtp = if !speculative_decoding || kv_quant_type != KVQuantType::None {
+            // Factory loading filters these before device allocation. Direct
+            // callers may supply already-materialized tensors; discard them
+            // here too rather than retaining a disabled/unusable draft head.
+            weights.retain(|k, _| !k.starts_with("mtp."));
+            None
+        } else if weights.keys().any(|k| k.starts_with("mtp.")) {
+            if cfg.is_moe {
+                info!("MTP head present but MoE MTP is not yet supported; skipping mtp.* weights (non-speculative decode)");
+                weights.retain(|k, _| !k.starts_with("mtp."));
+                None
+            } else if weights.keys().any(|k| k.starts_with("mtp.layers.1.")) {
+                info!("Multi-layer MTP (mtp_num_hidden_layers > 1) is not supported; skipping mtp.* weights");
+                weights.retain(|k, _| !k.starts_with("mtp."));
+                None
+            } else {
+                match Qwen3_5MtpHead::load(weights, &cfg) {
+                    Ok(head) => {
+                        info!("Loaded Qwen3.5 MTP draft head (self-speculative decoding available)");
+                        Some(head)
+                    }
+                    Err(e) => {
+                        info!("MTP head load failed ({e}); continuing without speculative decoding");
+                        weights.retain(|k, _| !k.starts_with("mtp."));
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
 
         // #405: place top-level weights on `device`, mirroring the
         // `into_device` move that `stage_from_weights_with_config` applies.
@@ -1532,12 +1674,15 @@ impl Qwen3_5Model {
             (0..num_layers).map(|_| None::<Tensor>).collect::<Vec<_>>(),
         ));
 
-        // Create KV cache for full-attention layers (same pattern as LlamaModel)
+        // Create KV cache for full-attention layers (same pattern as LlamaModel).
+        // When an MTP head is loaded, one extra layer slot (index num_layers)
+        // holds the MTP block's KV, so manager-wide clear/truncate/session-swap
+        // cover it without special casing.
         let kv_cache = Some(Arc::new(parking_lot::Mutex::new(
             crate::runtime::kv_cache::KVCacheManager::new(
-                num_layers,
+                num_layers + usize::from(mtp.is_some()),
                 cfg.max_position_embeddings as usize,
-                _kv_quant_type,
+                kv_quant_type,
             ),
         )));
 
@@ -1560,6 +1705,7 @@ impl Qwen3_5Model {
             conv_states,
             rec_states,
             kv_cache,
+            mtp,
             vision_encoder,
             vision_projector,
         })
@@ -1588,15 +1734,17 @@ impl Qwen3_5Model {
             let mut down_s_vecs: Vec<Tensor> = Vec::with_capacity(n);
             for e in 0..n {
                 let ep = format!("{prefix}.experts.{e}");
-                let g = LinearProjection::take(weights, &format!("{ep}.gate_proj.weight"))?;
-                let u = LinearProjection::take(weights, &format!("{ep}.up_proj.weight"))?;
-                let d = LinearProjection::take(weights, &format!("{ep}.down_proj.weight"))?;
-                gate_w_vecs.push(g.weight.unsqueeze(0));
-                if let Some(s) = g.scale { gate_s_vecs.push(s.unsqueeze(0)); }
-                up_w_vecs.push(u.weight.unsqueeze(0));
-                if let Some(s) = u.scale { up_s_vecs.push(s.unsqueeze(0)); }
-                down_w_vecs.push(d.weight.unsqueeze(0));
-                if let Some(s) = d.scale { down_s_vecs.push(s.unsqueeze(0)); }
+                // These tensors go straight into batched stacks, never apply().
+                // Avoid constructing per-projection acceleration metadata.
+                let (g, gs) = LinearProjection::take_weight_and_scale(weights, &format!("{ep}.gate_proj.weight"))?;
+                let (u, us) = LinearProjection::take_weight_and_scale(weights, &format!("{ep}.up_proj.weight"))?;
+                let (d, ds) = LinearProjection::take_weight_and_scale(weights, &format!("{ep}.down_proj.weight"))?;
+                gate_w_vecs.push(g.unsqueeze(0));
+                if let Some(s) = gs { gate_s_vecs.push(s.unsqueeze(0)); }
+                up_w_vecs.push(u.unsqueeze(0));
+                if let Some(s) = us { up_s_vecs.push(s.unsqueeze(0)); }
+                down_w_vecs.push(d.unsqueeze(0));
+                if let Some(s) = ds { down_s_vecs.push(s.unsqueeze(0)); }
             }
             // Stack: [num_experts, in, out] (FP8) + optional [num_experts, in/128, out/128] scale
             let expert_gate_w     = Tensor::cat(&gate_w_vecs.iter().collect::<Vec<_>>(), 0);
@@ -1852,6 +2000,9 @@ impl Qwen3_5Model {
             conv_states,
             rec_states,
             kv_cache,
+            // Pipeline stages never own the MTP head (v1: whole-model loads only),
+            // so speculative decoding is unavailable on multi-device splits.
+            mtp: None,
             vision_encoder: None,
             vision_projector: None,
         })
@@ -2279,6 +2430,114 @@ impl Qwen3_5Model {
 
         Ok(logits.reshape([batch, seq, -1]))
     }
+
+    // ========================================================================
+    // MTP self-speculative decoding support
+    // ========================================================================
+
+    /// Whether a usable MTP draft head was loaded (dense checkpoints only).
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    /// KV-cache slot of the MTP block: right after the main layers.
+    fn mtp_kv_slot(&self) -> usize {
+        self.config.num_hidden_layers as usize
+    }
+
+    /// Like [`ModelOperations::forward_with_cache`] but also returns the
+    /// pre-final-norm hidden states for ALL forwarded positions — the MTP head
+    /// consumes them as its `h` input. With `last_logits_only` the LM head runs
+    /// over the last position only (the #201 prefill optimization); otherwise
+    /// every position's logits are returned (the 2-token verify step needs both).
+    ///
+    /// Returns `(logits [1, seq|1, vocab], hidden [1, seq, hidden])`.
+    pub fn forward_with_cache_hidden(
+        &self,
+        input: &Tensor,
+        start_pos: usize,
+        last_logits_only: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let hidden = self.forward_inner(Some(input), None, start_pos, None)?;
+        let seq_len = hidden.size()[1];
+        anyhow::ensure!(seq_len > 0, "forward_with_cache_hidden: empty token sequence (seq_len=0)");
+        let logits = if last_logits_only {
+            let last = hidden.narrow(1, seq_len - 1, 1);
+            let normed = self.norm.forward(&last)?;
+            self.lm_head_apply(&normed)?
+        } else {
+            let normed = self.norm.forward(&hidden)?;
+            self.lm_head_apply(&normed)?
+        };
+        Ok((logits, hidden))
+    }
+
+    /// Run the MTP draft head over `seq` consecutive slots.
+    ///
+    /// Slot `i` pairs `hiddens[.., i, ..]` (the main model's pre-norm hidden
+    /// after some token x_t) with `embed(token_ids[.., i])` (the next token
+    /// x_{t+1}) at absolute RoPE/KV position `base + i`, predicting x_{t+2}.
+    /// Every slot's KV is written to the MTP cache slot (keeping it contiguous
+    /// with prior drafts); only the LAST slot's logits are returned — that is
+    /// the draft for the position after the last consumed token.
+    ///
+    /// Returns logits `[1, 1, vocab]`.
+    pub fn mtp_forward(
+        &self,
+        token_ids: &Tensor,
+        hiddens: &Tensor,
+        base: usize,
+    ) -> Result<Tensor> {
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| anyhow!("MTP head not loaded (dense checkpoints only)"))?;
+        let (batch, seq, hidden_sz) = dims3(hiddens)?;
+        anyhow::ensure!(seq > 0, "mtp_forward: empty slot sequence");
+        anyhow::ensure!(
+            token_ids.size() == [batch, seq],
+            "mtp_forward: token_ids shape {:?} does not match hiddens shape {:?}",
+            token_ids.size(),
+            hiddens.size()
+        );
+
+        let emb = self.embed_tokens(token_ids)?;
+        let e = mtp.pre_fc_norm_embedding.forward(&emb)?;
+        let h = mtp.pre_fc_norm_hidden.forward(hiddens)?;
+        // Embedding FIRST, hidden second (checkpoint fc weight layout).
+        let x = Tensor::cat(&[e, h], -1).reshape([batch * seq, 2 * hidden_sz]);
+        let x = mtp.fc.apply(&x).reshape([batch, seq, hidden_sz]);
+
+        let position_ids = Tensor::arange_start(
+            base as i64,
+            base as i64 + seq,
+            (Kind::Int64, x.device()),
+        );
+
+        // Decoder block (pre-norm attention + pre-norm MLP, dense only).
+        let residual = x.shallow_clone();
+        let normed = mtp.input_layernorm.forward(&x)?;
+        let attn_out = if let Some(ref cache_arc) = self.kv_cache {
+            let kv = cache_arc.lock();
+            kv.with_layer_cache(self.mtp_kv_slot(), |lc| {
+                mtp.attn.forward(&normed, Some(&position_ids), Some(lc), base, None)
+            })
+            .ok_or_else(|| anyhow!("No KV cache for MTP slot {}", self.mtp_kv_slot()))??
+        } else {
+            mtp.attn.forward(&normed, Some(&position_ids), None, base, None)?
+        };
+        let x = residual + attn_out;
+
+        let residual2 = x.shallow_clone();
+        let normed2 = mtp.post_attention_layernorm.forward(&x)?;
+        let mlp_out = mtp.mlp.forward(&normed2, None)?;
+        let x = residual2 + mlp_out;
+
+        // Only the last slot produces a draft; earlier slots just fill MTP KV.
+        let last = x.narrow(1, seq - 1, 1);
+        let normed = mtp.final_norm.forward(&last)?;
+        self.lm_head_apply(&normed)
+    }
 }
 
 // ============================================================================
@@ -2408,6 +2667,12 @@ impl ModelOperations for Qwen3_5Model {
     }
 
     fn set_kv_cache(&mut self, cache: Arc<parking_lot::Mutex<KVCacheManager>>) {
+        // Session caches are created from the registry's layer count, which may
+        // predate the model install and lack the MTP slot. Insert it on swap so
+        // `mtp_forward` never finds its slot missing.
+        if self.mtp.is_some() {
+            cache.lock().ensure_layer_cache(self.mtp_kv_slot());
+        }
         self.kv_cache = Some(cache);
     }
 
@@ -2477,12 +2742,12 @@ mod pipeline_tests {
     use super::*;
     use crate::runtime::device_pool::LayerDeviceMap;
 
-    const HIDDEN: i64 = 16;
-    const HEADS: i64 = 2;
-    const KV_HEADS: i64 = 2;
-    const HEAD_DIM: i64 = 8;
-    const INTER: i64 = 32;
-    const VOCAB: i64 = 48;
+    pub(super) const HIDDEN: i64 = 16;
+    pub(super) const HEADS: i64 = 2;
+    pub(super) const KV_HEADS: i64 = 2;
+    pub(super) const HEAD_DIM: i64 = 8;
+    pub(super) const INTER: i64 = 32;
+    pub(super) const VOCAB: i64 = 48;
     const LAYERS: usize = 4;
     // GatedDeltaNet dims (kept tiny + symmetric: num_k_heads == num_v_heads).
     const LIN_K_HEADS: usize = 1;
@@ -2491,7 +2756,159 @@ mod pipeline_tests {
     const LIN_V_DIM: usize = 4;
     const CONV_KERNEL: usize = 4;
 
-    fn tiny_config() -> Qwen3_5TextConfig {
+    /// Child-process probe for the FP8 causal gate test. Starting with
+    /// `HYPRSTREAM_FP8_GEMM=1` is essential because `with_scale` caches that
+    /// env decision for the process. This is an ownership/allocation probe:
+    /// it verifies source rowwise pairs are released before fusion builds the
+    /// fused pair, rather than merely checking a field exists afterwards.
+    #[test]
+    #[allow(clippy::print_stderr)]
+    fn fp8_fused_projection_metadata_probe() {
+        if std::env::var_os("HYPRSTREAM_QWEN_FP8_PROBE").is_none() {
+            return;
+        }
+        assert!(crate::config::default_fp8_gemm());
+        let w1 = Tensor::zeros([256, 256], (Kind::Float, Device::Cpu)).to_kind(Kind::Float8e4m3fn);
+        let w2 = Tensor::zeros([256, 256], (Kind::Float, Device::Cpu)).to_kind(Kind::Float8e4m3fn);
+        let s1 = Tensor::ones([2, 2], (Kind::Float, Device::Cpu));
+        let s2 = Tensor::ones([2, 2], (Kind::Float, Device::Cpu));
+        crate::runtime::architectures::llama::reset_rowwise_requant_peak();
+        let fused = cat_projs(vec![
+            LinearProjection::with_scale(w1, s1),
+            LinearProjection::with_scale(w2, s2),
+        ]);
+        assert_eq!(fused.weight.size(), [256, 512]);
+        assert_eq!(fused.scale.as_ref().expect("fused FP8 scale").size(), [2, 4]);
+        assert_eq!(fused.scale_v2.as_ref().expect("fused packed scale").size(), [4, 4]);
+        assert_eq!(crate::runtime::architectures::llama::rowwise_requant_live(), 1,
+            "fusion did not leave exactly its one derived rowwise allocation alive");
+        assert_eq!(crate::runtime::architectures::llama::rowwise_requant_peak(), 2,
+            "source rowwise allocations overlapped with fused rowwise construction");
+        eprintln!("Qwen fused FP8 allocation probe: source rowwise copies dropped before fused allocation");
+    }
+
+    /// Exercise the actual expert loader in a fresh process: the FP8 gate is
+    /// cached, and allocation witnesses must not include parallel tests.
+    #[test]
+    fn fp8_moe_loading_avoids_transient_requant() {
+        if std::env::var_os("HYPRSTREAM_QWEN_MOE_LOADING_PROBE").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime::architectures::qwen3_5::pipeline_tests::fp8_moe_loading_avoids_transient_requant", "--nocapture"])
+                .env("HYPRSTREAM_FP8_GEMM", "1")
+                .env("HYPRSTREAM_FP8_DEQUANT_LOAD", "0")
+                .env("HYPRSTREAM_QWEN_MOE_LOADING_PROBE", "1")
+                .output().expect("spawn MoE allocation probe");
+            let transcript = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success() && transcript.contains("1 passed"),
+                "MoE allocation probe did not pass: {transcript}");
+            return;
+        }
+        use crate::runtime::architectures::llama::{reset_rowwise_requant_peak, rowwise_requant_live, rowwise_requant_peak};
+        assert!(crate::config::default_fp8_gemm());
+        let mut cfg = tiny_config();
+        cfg.is_moe = true;
+        cfg.num_experts = 3;
+        cfg.num_experts_per_tok = 1;
+        let mut weights = HashMap::new();
+        weights.insert("mlp.gate.weight".to_owned(), Tensor::zeros([3, 128], (Kind::Float, Device::Cpu)));
+        for (name, shape) in [("gate_proj", [256, 128]), ("up_proj", [256, 128]), ("down_proj", [128, 256])] {
+            weights.insert(format!("mlp.shared_expert.{name}.weight"), Tensor::zeros(shape, (Kind::Float, Device::Cpu)));
+        }
+        let mut expected = Vec::new();
+        for e in 0..cfg.num_experts {
+            for (name, shape) in [("gate_proj", [256, 128]), ("up_proj", [256, 128]), ("down_proj", [128, 256])] {
+                let key = format!("mlp.experts.{e}.{name}.weight");
+                let weight = (Tensor::arange(shape[0] * shape[1], (Kind::Float, Device::Cpu)) * 0.01 + e as f64)
+                    .sin().reshape(shape).to_kind(Kind::Float8e4m3fn);
+                let scale = Tensor::from_slice(&[0.5f32 + e as f32, 1.5 + e as f32]).reshape([shape[0] / 128, shape[1] / 128]);
+                expected.push((name, e as i64, weight.transpose(0, 1).to_kind(Kind::Float), scale.transpose(0, 1).contiguous()));
+                weights.insert(key.clone(), weight);
+                weights.insert(format!("{key}_scale_inv"), scale);
+            }
+        }
+        reset_rowwise_requant_peak();
+        let Qwen3_5Mlp::Sparse(loaded) = Qwen3_5Model::load_mlp(&mut weights, "mlp", &cfg, 0).unwrap() else {
+            panic!("fixture must load sparse experts");
+        };
+        assert!(weights.is_empty(), "loader must consume checkpoint tensors");
+        assert_eq!(rowwise_requant_live(), 0);
+        assert_eq!(rowwise_requant_peak(), 0, "transient batched experts must never construct discarded rowwise copies");
+        for (name, e, weight, scale) in expected {
+            let (stacked_w, stacked_s) = match name {
+                "gate_proj" => (&loaded.expert_gate_w, &loaded.expert_gate_scale),
+                "up_proj" => (&loaded.expert_up_w, &loaded.expert_up_scale),
+                _ => (&loaded.expert_down_w, &loaded.expert_down_scale),
+            };
+            assert_eq!(stacked_w.kind(), Kind::Float8e4m3fn);
+            assert!(stacked_w.get(e).to_kind(Kind::Float).equal(&weight));
+            assert!(stacked_s.as_ref().unwrap().get(e).equal(&scale));
+        }
+        // A normal retained projection still builds the accelerated metadata;
+        // the zero expert peak must not be obtained by disabling the gate.
+        let retained = LinearProjection::with_scale(
+            Tensor::zeros([128, 256], (Kind::Float, Device::Cpu)).to_kind(Kind::Float8e4m3fn),
+            Tensor::ones([1, 2], (Kind::Float, Device::Cpu)),
+        );
+        assert!(retained.scale_v2.is_some());
+        assert_eq!(rowwise_requant_live(), 1);
+        assert_eq!(rowwise_requant_peak(), 1);
+    }
+
+    #[test]
+    fn gdn_chunked_continuation_preserves_recurrent_history() {
+        let mut weights = tiny_weights();
+        let layer = GatedDeltaNetLayer::load(
+            &mut weights, "model.layers.0.linear_attn", &tiny_config(), 0,
+        ).unwrap();
+        let input = (Tensor::arange(2 * HIDDEN, (Kind::Float, Device::Cpu)) * 0.13)
+            .sin().reshape([1, 2, HIDDEN]);
+        let initial = Tensor::full(
+            [1, LIN_V_HEADS as i64, LIN_K_DIM as i64, LIN_V_DIM as i64],
+            3.0, (Kind::Float, Device::Cpu),
+        );
+        let conv = Tensor::zeros([1, layer.conv_dim as i64, layer.kernel_size as i64 - 1],
+            (Kind::Float, Device::Cpu));
+        let mut serial_conv = Some(conv.copy());
+        let mut serial_outputs = Vec::new();
+        let mut serial_rec = Some(initial.copy());
+        for position in 0..2 {
+            serial_outputs.push(layer.forward(
+                &input.narrow(1, position, 1), &mut serial_conv, &mut serial_rec, None,
+            ).unwrap());
+        }
+        let mut chunk_conv = Some(conv.copy());
+        let mut chunk_rec = Some(initial);
+        let chunk_output = layer.forward(&input, &mut chunk_conv, &mut chunk_rec, None).unwrap();
+        let mut zero_conv = Some(conv);
+        let mut zero_rec = None;
+        let _ = layer.forward(&input, &mut zero_conv, &mut zero_rec, None).unwrap();
+        let expected = serial_rec.unwrap();
+        assert!(!expected.allclose(&zero_rec.unwrap(), 1e-4, 1e-4, false),
+            "fixture must distinguish preserved history from an empty recurrent state");
+        assert!(chunk_output.allclose(&Tensor::cat(&serial_outputs, 1), 1e-4, 1e-4, false),
+            "chunked outputs must match serial continuation");
+        let actual = chunk_rec.unwrap();
+        assert!(actual.allclose(&expected, 1e-4, 1e-4, false),
+            "chunked continuation lost recurrent history; max difference {}",
+            (&actual - &expected).abs().max().double_value(&[]));
+    }
+
+    #[test]
+    fn gdn_short_prefill_keeps_full_convolution_history() {
+        let mut weights = tiny_weights();
+        let layer = GatedDeltaNetLayer::load(
+            &mut weights, "model.layers.0.linear_attn", &tiny_config(), 0,
+        ).unwrap();
+        let input = Tensor::ones([1, 1, HIDDEN], (Kind::Float, Device::Cpu));
+        let mut conv = None;
+        let mut recurrent = None;
+        for _ in 0..2 {
+            let _ = layer.forward(&input, &mut conv, &mut recurrent, None).unwrap();
+            assert_eq!(conv.as_ref().unwrap().size()[2], layer.kernel_size as i64 - 1);
+        }
+    }
+
+    pub(super) fn tiny_config() -> Qwen3_5TextConfig {
         // Default hybrid pattern: layer (i+1)%4==0 is full attention, rest GDN.
         // With LAYERS=4 → [GDN, GDN, GDN, FullAttn]; a split at 2 puts the full-
         // attention layer in the second stage, exercising both mixer kinds across
@@ -2540,7 +2957,7 @@ mod pipeline_tests {
     /// diverge between the whole-model and staged paths; a fixed sin-of-index
     /// pattern is byte-identical regardless of scheduling. HF stores projections
     /// as `[out, in]` (LinearProjection::take transposes to `[in, out]`).
-    fn tiny_weights() -> HashMap<String, Tensor> {
+    pub(super) fn tiny_weights() -> HashMap<String, Tensor> {
         let opt = (Kind::Float, Device::Cpu);
         let mut w = HashMap::new();
         // Bounded small values in roughly [-0.05, 0.05], offset per-tensor so
@@ -2607,6 +3024,7 @@ mod pipeline_tests {
         let mut w = tiny_weights();
         Qwen3_5Model::from_weights(
             &mut w, tiny_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+            false,
         )
         .unwrap()
     }
@@ -2876,6 +3294,7 @@ mod pipeline_tests {
         }
         let model = Qwen3_5Model::from_weights(
             &mut w, tiny_config(), None, &Device::Cpu, dtype, KVQuantType::None,
+            false,
         )
         .unwrap();
 
@@ -2908,6 +3327,399 @@ mod pipeline_tests {
         assert!(stage.forward_layers_train(&emb, 2..LAYERS, None).is_ok(), "owned range ok");
     }
 
+    // ========================================================================
+    // Session prefix-cache rewind: GDN conv/rec state must be rewound alongside
+    // the KV cache on a prefix hit, or multi-turn sessions decode with the
+    // previous turn's recurrent state.
+    // ========================================================================
+
+    use parking_lot::Mutex;
+
+    fn session_cache() -> Arc<Mutex<KVCacheManager>> {
+        Arc::new(Mutex::new(KVCacheManager::new(LAYERS, 64, KVQuantType::None)))
+    }
+
+    /// Greedy argmax of a `[1, 1, vocab]` logits tensor.
+    fn greedy_next(logits: &Tensor) -> i64 {
+        logits
+            .select(0, 0)
+            .select(0, 0)
+            .argmax(0, false)
+            .int64_value(&[])
+    }
+
+    /// Drive one session turn the way `TextStream` does: prefill
+    /// `prompt[prefill_start..]` at `prefill_start`, then greedily decode
+    /// `n_decode` tokens. Returns the generated token IDs, the per-step decode
+    /// logits (`[vocab]` each), and the SSM (conv/rec) snapshot as of
+    /// end-of-prefill.
+    fn run_turn(
+        model: &Qwen3_5Model,
+        prompt: &[i64],
+        prefill_start: usize,
+        n_decode: usize,
+    ) -> (
+        Vec<i64>,
+        Vec<Tensor>,
+        (Vec<Option<Tensor>>, Vec<Option<Tensor>>),
+    ) {
+        let _g = tch::no_grad_guard();
+        let prefill = Tensor::from_slice(&prompt[prefill_start..])
+            .reshape([1, (prompt.len() - prefill_start) as i64]);
+        let logits = model.forward_with_cache(&prefill, prefill_start).unwrap();
+        // Engine captures the SSM snapshot here (TextStream::sample_next_token),
+        // before decode advances the recurrent state.
+        let ssm = model.snapshot_ssm_states();
+
+        let mut out = Vec::with_capacity(n_decode);
+        let mut step_logits = Vec::with_capacity(n_decode);
+        let mut next = greedy_next(&logits);
+        out.push(next);
+        step_logits.push(logits.select(0, 0).select(0, 0));
+        for pos in prompt.len()..prompt.len() + n_decode - 1 {
+            let step = Tensor::from_slice(&[next]).reshape([1, 1]);
+            let logits = model.forward_with_cache(&step, pos).unwrap();
+            next = greedy_next(&logits);
+            out.push(next);
+            step_logits.push(logits.select(0, 0).select(0, 0));
+        }
+        (out, step_logits, ssm)
+    }
+
+    /// Assert two per-step logit traces match step-for-step.
+    fn assert_logits_match(actual: &[Tensor], expected: &[Tensor], context: &str) {
+        assert_eq!(actual.len(), expected.len(), "{context}: step count");
+        for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+            let max_diff = (a - e).abs().max().double_value(&[]);
+            assert!(
+                a.allclose(e, 1e-5, 1e-5, false),
+                "{context}: decode step {i} logits diverged (max_diff={max_diff})"
+            );
+        }
+    }
+
+    /// Bug characterization (non-vacuity guard for the regression test below):
+    /// the pre-fix hit path — `truncate_to` only, no SSM rewind — leaves the
+    /// GDN conv/rec state reflecting turn 1's generation, and turn 2's decode
+    /// MUST diverge from a fresh-cache reference. If this ever stops
+    /// diverging, the fixture no longer exercises the bug and
+    /// `session_prefix_hit_restores_ssm_state_matches_fresh_cache` is vacuous.
+    /// (Logits are compared directly: with tiny random weights the argmax can
+    /// coincide even when the state is wrong.)
+    #[test]
+    fn session_prefix_hit_without_ssm_rewind_diverges_from_fresh_cache() {
+        let prompt1 = [1i64, 5, 9, 2, 7, 3];
+        let suffix = [8i64, 4];
+        let prompt2: Vec<i64> = prompt1.iter().chain(&suffix).copied().collect();
+
+        // Session model: turn 1, then turn 2 with the old truncate-only hit path.
+        let model = whole_model();
+        let cache = session_cache();
+        let mut m = model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, cache.clone());
+        let model = m;
+
+        let (_gen1, _logits1, _ssm1) = run_turn(&model, &prompt1, 0, 3);
+        cache.lock().set_cached_tokens(prompt1.to_vec());
+
+        let prefix_len = cache.lock().prefix_match_len(&prompt2);
+        assert_eq!(prefix_len, prompt1.len());
+        cache.lock().truncate_to(prefix_len);
+        let (_gen2_stale, logits2_stale, _ssm2) = run_turn(&model, &prompt2, prefix_len, 4);
+
+        // Reference: fresh model + fresh cache, full prefill of turn 2's prompt.
+        let ref_model = whole_model();
+        let ref_cache = session_cache();
+        let mut m = ref_model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, ref_cache);
+        let ref_model = m;
+        let (_gen2_ref, logits2_ref, _ssm_ref) = run_turn(&ref_model, &prompt2, 0, 4);
+
+        let max_diff: f64 = logits2_stale
+            .iter()
+            .zip(&logits2_ref)
+            .map(|(a, e)| (a - e).abs().max().double_value(&[]))
+            .fold(0.0, f64::max);
+        assert!(
+            max_diff > 1e-5,
+            "stale-state fixture must diverge from fresh cache (max_diff={max_diff}); \
+             otherwise the rewind regression test proves nothing"
+        );
+    }
+
+    /// Regression test: a session prefix-cache hit must rewind the GDN conv/rec
+    /// state (via the end-of-prefill snapshot saved with the cached tokens)
+    /// alongside the KV truncation. The rewound run must reproduce, to
+    /// bit-exact tolerance, the oracle computation "prefill the cached prompt,
+    /// then continue with the new suffix" (split-prefill ground truth), and
+    /// its greedy tokens must match a monolithic fresh-cache prefill
+    /// token-for-token. Exercises the production rewind seam
+    /// `torch_engine::rewind_session_state`.
+    #[test]
+    fn session_prefix_hit_restores_ssm_state_matches_fresh_cache() {
+        let prompt1 = [1i64, 5, 9, 2, 7, 3];
+        let suffix = [8i64, 4];
+        let prompt2: Vec<i64> = prompt1.iter().chain(&suffix).copied().collect();
+
+        // Session model: turn 1, save tokens + end-of-prefill SSM snapshot.
+        let model = whole_model();
+        let cache = session_cache();
+        let mut m = model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, cache.clone());
+        let model = m;
+
+        let (_gen1, _logits1, ssm1) = run_turn(&model, &prompt1, 0, 3);
+        cache
+            .lock()
+            .set_cached_tokens_with_ssm(prompt1.to_vec(), Some(ssm1));
+
+        // Turn 2: full cached prefix matches — the production rewind must
+        // restore the snapshot and reuse the prefix.
+        let prefix_len = cache.lock().prefix_match_len(&prompt2);
+        assert_eq!(prefix_len, prompt1.len());
+        let start = crate::runtime::torch_engine::rewind_session_state(&model, prefix_len);
+        assert_eq!(start, prompt1.len(), "full cached prefix must be reusable");
+        let (gen2, logits2, _ssm2) = run_turn(&model, &prompt2, start, 4);
+
+        // Oracle: fresh model, genuinely prefill prompt1 (no decode), then
+        // continue with the suffix — the exact computation the rewind is
+        // supposed to reproduce.
+        let oracle_model = whole_model();
+        let oracle_cache = session_cache();
+        let mut m = oracle_model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, oracle_cache);
+        let oracle_model = m;
+        {
+            let _g = tch::no_grad_guard();
+            let prefill1 = Tensor::from_slice(&prompt1).reshape([1, prompt1.len() as i64]);
+            let _ = oracle_model.forward_with_cache(&prefill1, 0).unwrap();
+        }
+        let (gen2_oracle, logits2_oracle, _ssm_o) =
+            run_turn(&oracle_model, &prompt2, prompt1.len(), 4);
+
+        assert_eq!(gen2, gen2_oracle, "rewound run must match split-prefill oracle");
+        assert_logits_match(&logits2, &logits2_oracle, "rewound run vs split-prefill oracle");
+
+        // Contract-level check: greedy tokens must also match a monolithic
+        // fresh-cache prefill of turn 2's full prompt. (Logits are NOT
+        // compared here: split vs monolithic prefill legitimately differ by
+        // float reassociation, exactly as for pure-attention KV prefix reuse.)
+        let ref_model = whole_model();
+        let ref_cache = session_cache();
+        let mut m = ref_model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, ref_cache);
+        let ref_model = m;
+        let (gen2_ref, _logits2_ref, _ssm_ref) = run_turn(&ref_model, &prompt2, 0, 4);
+        assert_eq!(
+            gen2, gen2_ref,
+            "prefix-hit decode must match a fresh-cache run token-for-token"
+        );
+    }
+
+    /// A PARTIAL prefix match (divergence inside the cached sequence) cannot
+    /// rewind the Markovian recurrent state to an intermediate position, so
+    /// the production rewind must discard the cache and force a full recompute
+    /// — which must then match a fresh-cache reference exactly.
+    #[test]
+    fn session_partial_prefix_match_forces_full_recompute() {
+        let prompt1 = [1i64, 5, 9, 2, 7, 3];
+        // Shares only the first 3 tokens with prompt1.
+        let prompt2 = [1i64, 5, 9, 4, 8, 6, 2];
+
+        let model = whole_model();
+        let cache = session_cache();
+        let mut m = model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, cache.clone());
+        let model = m;
+
+        let (_gen1, _logits1, ssm1) = run_turn(&model, &prompt1, 0, 3);
+        cache
+            .lock()
+            .set_cached_tokens_with_ssm(prompt1.to_vec(), Some(ssm1));
+
+        let prefix_len = cache.lock().prefix_match_len(&prompt2);
+        assert!(0 < prefix_len && prefix_len < prompt1.len());
+        let start = crate::runtime::torch_engine::rewind_session_state(&model, prefix_len);
+        assert_eq!(start, 0, "partial prefix match must force full recompute");
+        // The rewind must also have reset the live SSM state (no leakage of
+        // turn 1's recurrent state into the recomputed prefill).
+        assert!(model.conv_states.lock().iter().all(Option::is_none));
+        assert!(model.rec_states.lock().iter().all(Option::is_none));
+
+        let (gen2, logits2, _ssm2) = run_turn(&model, &prompt2, 0, 4);
+
+        let ref_model = whole_model();
+        let ref_cache = session_cache();
+        let mut m = ref_model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, ref_cache);
+        let ref_model = m;
+        let (gen2_ref, logits2_ref, _ssm_ref) = run_turn(&ref_model, &prompt2, 0, 4);
+
+        assert_eq!(gen2, gen2_ref);
+        assert_logits_match(&logits2, &logits2_ref, "recomputed prefill vs fresh cache");
+    }
+
+    /// Prefix MISS / stateless reset guard: `clear_kv_cache` (what the engine
+    /// calls on a miss and for non-session requests) must fully reset the GDN
+    /// conv/rec state, so no recurrent state leaks across requests.
+    #[test]
+    fn clear_kv_cache_fully_resets_ssm_state() {
+        let prompt = [1i64, 5, 9, 2, 7, 3];
+
+        let model = whole_model();
+        let cache = session_cache();
+        let mut m = model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, cache);
+        let model = m;
+
+        let _ = run_turn(&model, &prompt, 0, 2);
+        assert!(model.conv_states.lock().iter().any(Option::is_some));
+        assert!(model.rec_states.lock().iter().any(Option::is_some));
+
+        <Qwen3_5Model as ModelOperations>::clear_kv_cache(&model);
+        assert!(
+            model.conv_states.lock().iter().all(Option::is_none),
+            "conv state must be reset on cache clear"
+        );
+        assert!(
+            model.rec_states.lock().iter().all(Option::is_none),
+            "rec state must be reset on cache clear"
+        );
+
+        // And a post-clear run must match a fresh-model run exactly.
+        let (gen, logits, _ssm) = run_turn(&model, &prompt, 0, 3);
+        let ref_model = whole_model();
+        let ref_cache = session_cache();
+        let mut m = ref_model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, ref_cache);
+        let ref_model = m;
+        let (gen_ref, logits_ref, _ssm_ref) = run_turn(&ref_model, &prompt, 0, 3);
+        assert_eq!(gen, gen_ref);
+        assert_logits_match(&logits, &logits_ref, "post-clear run vs fresh model");
+    }
+
+    /// Bug characterization (non-vacuity guard for the exact-repeat regression
+    /// below): routing an EXACT-prompt repeat (`prefix_len == prompt_len`)
+    /// through the snapshot restore re-runs the FULL prompt with the GDN
+    /// recurrence starting from the previous turn's end-of-prefill state
+    /// instead of zero — this is what the pre-fix hit path effectively did,
+    /// because `sample_next_token` falls through to a full prefill when no
+    /// suffix remains to prefill. The first re-forwarded row is then
+    /// conditioned on turn 1's recurrent state and MUST diverge from a
+    /// fresh-cache prefill. (The divergence decays across rows as the
+    /// delta-rule recurrence forgets the restored state, so it is asserted on
+    /// the FIRST row; the last row lands near the fixture's float-reassociation
+    /// noise floor and proves nothing.)
+    #[test]
+    fn session_exact_prompt_hit_restored_reforward_diverges_from_fresh_cache() {
+        // Long enough cached history that the restored end-of-prefill state is
+        // appreciable at the first re-forwarded row.
+        let prompt: Vec<i64> = [1i64, 5, 9, 2, 7, 3, 8, 4]
+            .iter()
+            .cycle()
+            .take(24)
+            .copied()
+            .collect();
+
+        // Session model: turn 1, save tokens + end-of-prefill SSM snapshot.
+        let model = whole_model();
+        let cache = session_cache();
+        let mut m = model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, cache.clone());
+        let model = m;
+
+        let (_gen1, _logits1, ssm1) = run_turn(&model, &prompt, 0, 3);
+        cache
+            .lock()
+            .set_cached_tokens_with_ssm(prompt.clone(), Some(ssm1));
+
+        // The pre-fix exact-hit path: restore the snapshot, then re-run the
+        // whole prompt at position 0. Row-wise logits of that re-forward (row
+        // i is conditioned on the recurrence as of position i).
+        let row_logits = |m: &Qwen3_5Model| -> Tensor {
+            let _g = tch::no_grad_guard();
+            let ids = Tensor::from_slice(&prompt).reshape([1, prompt.len() as i64]);
+            let emb = m.embed_tokens(&ids).unwrap();
+            let h = m.forward_layers(&emb, 0..m.num_layers(), 0, None).unwrap();
+            let h = m.apply_final_norm(&h).unwrap();
+            m.lm_head(&h).unwrap() // [1, seq, V]
+        };
+        let prefix_len = cache.lock().prefix_match_len(&prompt);
+        assert_eq!(prefix_len, prompt.len(), "exact repeat must fully match");
+        let start = crate::runtime::torch_engine::rewind_session_state(&model, prefix_len);
+        assert_eq!(start, prompt.len(), "rewind alone still reports the full hit");
+        let broken_rows = row_logits(&model);
+
+        // Reference: fresh model + fresh cache, same row-wise prefill.
+        let ref_model = whole_model();
+        let ref_cache = session_cache();
+        let mut m = ref_model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, ref_cache);
+        let ref_model = m;
+        let fresh_rows = row_logits(&ref_model);
+
+        let first_row_diff = (&broken_rows.select(1, 0).reshape([-1i64])
+            - &fresh_rows.select(1, 0).reshape([-1i64]))
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(
+            first_row_diff > 1e-4,
+            "restore-then-reforward on an exact repeat must condition the first row on the \
+             previous turn's recurrent state and diverge from a fresh prefill \
+             (first-row max_diff={first_row_diff}); otherwise the cleared-recompute \
+             regression test proves nothing"
+        );
+    }
+
+    /// Regression test (exact-prompt repeat): when the new prompt is IDENTICAL
+    /// to the cached one, the production reuse decision must NOT route the hit
+    /// through the end-of-prefill snapshot restore — there is no suffix left
+    /// to prefill, and sampling the first token needs a fresh forward, which
+    /// would double-advance the restored GDN recurrence (see the
+    /// characterization test above). `resolve_session_prefill_start` must
+    /// clear the cache and return 0, and the recomputed turn must then match
+    /// a fresh-cache reference token-for-token and logit-for-logit.
+    #[test]
+    fn session_exact_prompt_repeat_forces_cleared_recompute() {
+        let prompt = [1i64, 5, 9, 2, 7, 3];
+
+        let model = whole_model();
+        let cache = session_cache();
+        let mut m = model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, cache.clone());
+        let model = m;
+
+        let (_gen1, _logits1, ssm1) = run_turn(&model, &prompt, 0, 3);
+        cache
+            .lock()
+            .set_cached_tokens_with_ssm(prompt.to_vec(), Some(ssm1));
+
+        let prefix_len = cache.lock().prefix_match_len(&prompt);
+        assert_eq!(prefix_len, prompt.len(), "exact repeat must fully match");
+        let start = crate::runtime::torch_engine::resolve_session_prefill_start(
+            &model,
+            prefix_len,
+            prompt.len(),
+        );
+        assert_eq!(start, 0, "exact-prompt repeat must force full recompute");
+        // Cleared state: neither the restored snapshot nor turn 1's live GDN
+        // recurrence may leak into the recomputed prefill.
+        assert!(model.conv_states.lock().iter().all(Option::is_none));
+        assert!(model.rec_states.lock().iter().all(Option::is_none));
+
+        let (gen2, logits2, _ssm2) = run_turn(&model, &prompt, start, 4);
+
+        let ref_model = whole_model();
+        let ref_cache = session_cache();
+        let mut m = ref_model;
+        <Qwen3_5Model as ModelOperations>::set_kv_cache(&mut m, ref_cache);
+        let ref_model = m;
+        let (gen2_ref, logits2_ref, _ssm_ref) = run_turn(&ref_model, &prompt, 0, 4);
+
+        assert_eq!(gen2, gen2_ref);
+        assert_logits_match(&logits2, &logits2_ref, "recomputed exact repeat vs fresh cache");
+    }
     /// Regression guard for the causal-mask offset in cached multi-token
     /// forwards: with `q_len > 1` and `start_pos > 0` the mask must be
     /// `tril(kv_len - q_len)`, not `tril(0)` — otherwise every cached row
@@ -2959,6 +3771,7 @@ mod pipeline_tests {
             }
             Qwen3_5Model::from_weights(
                 &mut w, allattn_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+                false,
             )
             .unwrap()
         };
@@ -2985,6 +3798,563 @@ mod pipeline_tests {
         let h = cached.forward_layers(&emb, 0..cached.num_layers(), pos, None).unwrap();
         let h = cached.apply_final_norm(&h).unwrap();
         let logits2 = cached.lm_head(&h).unwrap(); // [1, 2, V]
+
+        for (row, ref_l) in [(0i64, &ref1), (1, &ref2)] {
+            let got = logits2.select(1, row).reshape([-1i64]);
+            let want = ref_l.reshape([-1i64]);
+            let max_diff = (&got - &want).abs().max().double_value(&[]);
+            assert!(
+                got.allclose(&want, 1e-4, 1e-4, false),
+                "cached 2-token forward row {row} diverged from the serial decode step \
+                 (max_diff={max_diff}); the causal mask must keep kv_len - q_len history, \
+                 not tril(0)"
+            );
+            assert_eq!(
+                got.argmax(-1, false).int64_value(&[]),
+                want.argmax(-1, false).int64_value(&[]),
+                "row {row} argmax differs",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+pub(crate) mod mtp_tests {
+    //! Correctness gate for MTP self-speculative decoding (k=1, greedy).
+    //!
+    //! Speculative greedy output must equal the serial (non-speculative) greedy
+    //! output token-for-token on a tiny deterministic dense Qwen3.5 model on
+    //! CPU — including across a session prefix-cache hit, under forced draft
+    //! rejection (the KV/SSM rewind path), and under oracle drafts (the accept
+    //! path). The drivers below mirror `TextStream::sample_speculative_tokens`
+    //! and `sample_next_token` at the model level (plain argmax, no repeat
+    //! penalty), the same style as `batched_ragged_decode_matches_serial`.
+    //!
+    //! With near-random weights the MTP head's natural acceptance is ~0 — that
+    //! is fine: correctness is the gate here, acceptance is measured on GPU.
+    use super::pipeline_tests::{tiny_config, tiny_weights, HEAD_DIM, HEADS, HIDDEN, INTER, KV_HEADS, VOCAB};
+    use super::*;
+
+    /// tiny_weights plus the 15 dense `mtp.*` tensors (HF `[out, in]` layout).
+    fn tiny_weights_mtp() -> HashMap<String, Tensor> {
+        let mut w = tiny_weights();
+        let opt = (Kind::Float, Device::Cpu);
+        // Same deterministic sin-of-index pattern as tiny_weights, distinct offset.
+        let mut seed: i64 = 10_000;
+        let mut pat = |dims: &[i64]| -> Tensor {
+            let n: i64 = dims.iter().product();
+            seed += 7;
+            (Tensor::arange(n, opt) * 0.017 + seed as f64 * 0.013)
+                .sin()
+                .reshape(dims)
+                * 0.05
+        };
+
+        w.insert("mtp.pre_fc_norm_hidden.weight".to_owned(), pat(&[HIDDEN]));
+        w.insert("mtp.pre_fc_norm_embedding.weight".to_owned(), pat(&[HIDDEN]));
+        w.insert("mtp.fc.weight".to_owned(), pat(&[HIDDEN, 2 * HIDDEN]));
+        let lp = "mtp.layers.0";
+        w.insert(format!("{lp}.input_layernorm.weight"), pat(&[HIDDEN]));
+        w.insert(format!("{lp}.post_attention_layernorm.weight"), pat(&[HIDDEN]));
+        let ap = format!("{lp}.self_attn");
+        w.insert(format!("{ap}.q_proj.weight"), pat(&[HEADS * HEAD_DIM * 2, HIDDEN]));
+        w.insert(format!("{ap}.k_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
+        w.insert(format!("{ap}.v_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
+        w.insert(format!("{ap}.o_proj.weight"), pat(&[HIDDEN, HEADS * HEAD_DIM]));
+        w.insert(format!("{ap}.q_norm.weight"), pat(&[HEAD_DIM]));
+        w.insert(format!("{ap}.k_norm.weight"), pat(&[HEAD_DIM]));
+        let mp = format!("{lp}.mlp");
+        w.insert(format!("{mp}.gate_proj.weight"), pat(&[INTER, HIDDEN]));
+        w.insert(format!("{mp}.up_proj.weight"), pat(&[INTER, HIDDEN]));
+        w.insert(format!("{mp}.down_proj.weight"), pat(&[HIDDEN, INTER]));
+        w.insert("mtp.norm.weight".to_owned(), pat(&[HIDDEN]));
+        w
+    }
+
+    pub(crate) fn whole_model_mtp() -> Qwen3_5Model {
+        let mut w = tiny_weights_mtp();
+        Qwen3_5Model::from_weights(
+            &mut w, tiny_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mtp_head_obeys_explicit_toml_runtime_setting() {
+        for enabled in [false, true] {
+            let configured = crate::config::RuntimeConfig {
+                speculative_decoding: enabled,
+                use_gpu: false,
+                ..Default::default()
+            };
+            let toml = toml::to_string(&configured).unwrap();
+            let runtime: crate::config::RuntimeConfig = toml::from_str(&toml).unwrap();
+            let mut weights = tiny_weights_mtp();
+            let model = Qwen3_5Model::from_weights(
+                &mut weights, tiny_config(), None, &Device::Cpu, Kind::Float,
+                KVQuantType::None, runtime.speculative_decoding,
+            ).unwrap();
+            assert_eq!(model.has_mtp(), enabled);
+            assert!(!weights.keys().any(|name| name.starts_with("mtp.")));
+        }
+    }
+
+    #[test]
+    fn mtp_quantized_direct_model_drops_head() {
+        for kv in [
+            KVQuantType::None,
+            KVQuantType::Int8,
+            KVQuantType::Nf4,
+            KVQuantType::Fp4,
+        ] {
+            let mut weights = tiny_weights_mtp();
+            let model = Qwen3_5Model::from_weights(
+                &mut weights,
+                tiny_config(),
+                None,
+                &Device::Cpu,
+                Kind::Float,
+                kv,
+                true,
+            )
+            .unwrap();
+            assert_eq!(model.has_mtp(), kv == KVQuantType::None, "KV mode {kv:?}");
+            assert!(!weights.keys().any(|name| name.starts_with("mtp.")));
+        }
+    }
+
+    /// Greedy argmax of a single position's logits (any leading dims).
+    fn argmax1(logits: &Tensor) -> i64 {
+        logits.reshape([-1i64]).argmax(-1, false).int64_value(&[])
+    }
+
+    /// Serial reference: the trusted batch=1 path (prefill + one-token decode
+    /// steps), plain argmax. `prefill_from` > 0 simulates a session
+    /// prefix-cache hit: only the prompt suffix is forwarded.
+    fn serial_generate(
+        model: &Qwen3_5Model,
+        prompt: &[i64],
+        gen_tokens: usize,
+        prefill_from: usize,
+    ) -> Vec<i64> {
+        let _g = tch::no_grad_guard();
+        let (slice, start_pos) = if prefill_from > 0 {
+            (&prompt[prefill_from..], prefill_from)
+        } else {
+            (prompt, 0)
+        };
+        let prompt_t = Tensor::from_slice(slice).reshape([1, slice.len() as i64]);
+        let logits = model.forward_with_cache(&prompt_t, start_pos).unwrap();
+        let mut out = Vec::with_capacity(gen_tokens);
+        let mut last = argmax1(&logits);
+        out.push(last);
+        let mut pos = prompt.len();
+        while out.len() < gen_tokens {
+            let dec = Tensor::from_slice(&[last]).reshape([1, 1]);
+            let logits = model.forward_with_cache(&dec, pos).unwrap();
+            last = argmax1(&logits);
+            out.push(last);
+            pos += 1;
+        }
+        out
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DraftMode {
+        /// Use the MTP head's own drafts (near-random weights → ~0 acceptance).
+        Natural,
+        /// Corrupt every draft before the verify forward, forcing the reject
+        /// rewind path each round.
+        ForceReject,
+        /// Draft the true next token (from a precomputed serial run), forcing
+        /// the accept path each round.
+        Oracle,
+    }
+
+    /// Speculative driver mirroring `TextStream::sample_speculative_tokens` at
+    /// the model level. Returns (tokens, accepted, rejected).
+    fn spec_generate(
+        model: &Qwen3_5Model,
+        prompt: &[i64],
+        gen_tokens: usize,
+        prefill_from: usize,
+        mode: DraftMode,
+        oracle: Option<&[i64]>,
+    ) -> (Vec<i64>, u64, u64) {
+        let _g = tch::no_grad_guard();
+        let (slice, start_pos) = if prefill_from > 0 {
+            (&prompt[prefill_from..], prefill_from)
+        } else {
+            (prompt, 0)
+        };
+
+        // Prefill with hidden capture, then MTP prompt prefill + first draft.
+        let prompt_t = Tensor::from_slice(slice).reshape([1, slice.len() as i64]);
+        let (logits, hidden) = model.forward_with_cache_hidden(&prompt_t, start_pos, true).unwrap();
+        let mut out: Vec<i64> = Vec::with_capacity(gen_tokens);
+        let mut last = argmax1(&logits);
+        out.push(last);
+        let mut mtp_tokens: Vec<i64> = slice[1..].to_vec();
+        mtp_tokens.push(last);
+        let mtp_in = Tensor::from_slice(&mtp_tokens).reshape([1, mtp_tokens.len() as i64]);
+        let mut pending = argmax1(&model.mtp_forward(&mtp_in, &hidden, start_pos).unwrap());
+
+        let mut pos = prompt.len();
+        let (mut accepted, mut rejected) = (0u64, 0u64);
+        while out.len() < gen_tokens {
+            let draft = match mode {
+                DraftMode::Natural => pending,
+                DraftMode::ForceReject => (pending + 1) % VOCAB,
+                DraftMode::Oracle => oracle.expect("oracle mode needs the serial output")[out.len()],
+            };
+
+            let snapshot = model.snapshot_ssm_states();
+            let verify_in = Tensor::from_slice(&[last, draft]).reshape([1, 2]);
+            let (logits, hidden) = model.forward_with_cache_hidden(&verify_in, pos, false).unwrap();
+            let v1 = argmax1(&logits.select(1, 0));
+
+            if v1 == draft {
+                // Accept: emit draft + bonus token, re-draft from both new slots.
+                let v2 = argmax1(&logits.select(1, 1));
+                let mtp_in = Tensor::from_slice(&[v1, v2]).reshape([1, 2]);
+                pending = argmax1(&model.mtp_forward(&mtp_in, &hidden, pos).unwrap());
+                out.push(v1);
+                out.push(v2);
+                last = v2;
+                pos += 2;
+                accepted += 1;
+            } else {
+                // Reject: rewind SSM + KV, re-forward the verified token alone
+                // to re-sync GDN state, emit only the correction token.
+                model.restore_ssm_states(snapshot.0, snapshot.1);
+                model.get_kv_cache().unwrap().lock().truncate_to(pos + 1);
+                let re_in = Tensor::from_slice(&[last]).reshape([1, 1]);
+                let (_, hidden2) = model.forward_with_cache_hidden(&re_in, pos, true).unwrap();
+                let mtp_in = Tensor::from_slice(&[v1]).reshape([1, 1]);
+                pending = argmax1(&model.mtp_forward(&mtp_in, &hidden2, pos).unwrap());
+                out.push(v1);
+                last = v1;
+                pos += 1;
+                rejected += 1;
+            }
+        }
+        out.truncate(gen_tokens);
+        (out, accepted, rejected)
+    }
+
+    const PROMPT: [i64; 6] = [1, 5, 9, 2, 7, 3];
+    const GEN: usize = 12;
+
+    /// The core gate: natural MTP drafts, speculative == serial token-for-token.
+    #[test]
+    fn mtp_decode_matches_serial() {
+        let reference = serial_generate(&whole_model_mtp(), &PROMPT, GEN, 0);
+        let (spec, accepted, rejected) =
+            spec_generate(&whole_model_mtp(), &PROMPT, GEN, 0, DraftMode::Natural, None);
+        assert_eq!(spec, reference, "speculative output diverged from serial greedy");
+        assert!(accepted + rejected > 0, "no speculative rounds ran");
+    }
+
+    /// Forced-reject: every draft is corrupted before verify, so every round
+    /// exercises the SSM-restore + KV-truncate + re-forward rewind path.
+    #[test]
+    fn mtp_decode_forced_reject_matches_serial() {
+        let reference = serial_generate(&whole_model_mtp(), &PROMPT, GEN, 0);
+        let (spec, _accepted, rejected) =
+            spec_generate(&whole_model_mtp(), &PROMPT, GEN, 0, DraftMode::ForceReject, None);
+        assert_eq!(spec, reference, "forced-reject rewind diverged from serial greedy");
+        assert!(rejected > 0, "forced-reject mode never rejected — rewind path untested");
+    }
+
+    /// Oracle drafts: acceptance is ~100%, exercising the 2-token accept path
+    /// (bonus token emission + two-slot re-draft).
+    #[test]
+    fn mtp_decode_oracle_accept_matches_serial() {
+        let reference = serial_generate(&whole_model_mtp(), &PROMPT, GEN, 0);
+        let (spec, accepted, _rejected) = spec_generate(
+            &whole_model_mtp(),
+            &PROMPT,
+            GEN,
+            0,
+            DraftMode::Oracle,
+            Some(&reference),
+        );
+        assert_eq!(spec, reference, "oracle-accept output diverged from serial greedy");
+        assert!(accepted > 0, "oracle drafts never accepted — accept path untested");
+    }
+
+    /// Context-boundary regression: when only one KV slot remains
+    /// (`kv_position == max_seq_len - 1`), the 2-token verify forward would
+    /// exceed LayerKVCache::update's hard `end_pos <= max_seq_len` bound and
+    /// kill the stream with a cache-overflow error. The speculative driver must
+    /// fall back to a serial single-token step for that round (only that
+    /// round), yielding the same final token the serial path produces.
+    ///
+    /// Mirrors `TextStream::sample_speculative_tokens`' boundary check at the
+    /// model level with forced-reject drafts (deterministic positions: every
+    /// round advances exactly one slot, so a round provably starts at
+    /// `cap - 1`). The KV manager is swapped for a small-capacity one so the
+    /// KV bound — not the RoPE table range (both default to
+    /// max_position_embeddings) — is the operative limit, matching production
+    /// with a `max_context` override.
+    #[test]
+    fn mtp_decode_falls_back_to_serial_at_context_boundary() {
+        let _g = tch::no_grad_guard();
+        const CAP: usize = 12; // prompt (6) + exactly 6 forwards fit
+        let build = || {
+            let mut w = tiny_weights_mtp();
+            let mut model = Qwen3_5Model::from_weights(
+                &mut w, tiny_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+                true,
+            )
+            .unwrap();
+            let layers = model.num_layers();
+            model.set_kv_cache(std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::runtime::kv_cache::KVCacheManager::new(layers + 1, CAP, KVQuantType::None),
+            )));
+            model
+        };
+
+        // Serial reference: decode until the cache overflows; keep the tokens.
+        let serial_until_error = |model: &Qwen3_5Model| -> (Vec<i64>, Option<String>) {
+            let prompt_t = Tensor::from_slice(&PROMPT).reshape([1, PROMPT.len() as i64]);
+            let mut out = Vec::new();
+            match model.forward_with_cache(&prompt_t, 0) {
+                Ok(l) => out.push(argmax1(&l)),
+                Err(e) => return (out, Some(e.to_string())),
+            }
+            let mut pos = PROMPT.len();
+            loop {
+                let dec = Tensor::from_slice(&[*out.last().unwrap()]).reshape([1, 1]);
+                match model.forward_with_cache(&dec, pos) {
+                    Ok(l) => {
+                        out.push(argmax1(&l));
+                        pos += 1;
+                    }
+                    Err(e) => return (out, Some(e.to_string())),
+                }
+            }
+        };
+
+        // Speculative driver with the boundary fallback, mirroring
+        // `sample_speculative_tokens` (forced-reject drafts for determinism).
+        // `fallback_enabled = false` reproduces the pre-fix behavior.
+        let spec_until_error = |model: &Qwen3_5Model, fallback_enabled: bool| -> (Vec<i64>, u64, Option<String>) {
+            let prompt_t = Tensor::from_slice(&PROMPT).reshape([1, PROMPT.len() as i64]);
+            let mut out: Vec<i64> = Vec::new();
+            let mut fallbacks = 0u64;
+            let (logits, hidden) = match model.forward_with_cache_hidden(&prompt_t, 0, true) {
+                Ok(v) => v,
+                Err(e) => return (out, fallbacks, Some(e.to_string())),
+            };
+            let mut last = argmax1(&logits);
+            out.push(last);
+            let mut mtp_tokens: Vec<i64> = PROMPT[1..].to_vec();
+            mtp_tokens.push(last);
+            let mtp_in = Tensor::from_slice(&mtp_tokens).reshape([1, mtp_tokens.len() as i64]);
+            let mut pending = argmax1(&model.mtp_forward(&mtp_in, &hidden, 0).unwrap());
+
+            let mut pos = PROMPT.len();
+            loop {
+                if fallback_enabled && pos + 2 > CAP {
+                    // Boundary fallback: serial single-token step, this round only.
+                    let dec = Tensor::from_slice(&[last]).reshape([1, 1]);
+                    match model.forward_with_cache(&dec, pos) {
+                        Ok(l) => {
+                            last = argmax1(&l);
+                            out.push(last);
+                            pos += 1;
+                            fallbacks += 1;
+                        }
+                        Err(e) => return (out, fallbacks, Some(e.to_string())),
+                    }
+                    continue;
+                }
+                let draft = (pending + 1) % VOCAB; // forced reject
+                let snapshot = model.snapshot_ssm_states();
+                let verify_in = Tensor::from_slice(&[last, draft]).reshape([1, 2]);
+                let (logits, hidden) = match model.forward_with_cache_hidden(&verify_in, pos, false) {
+                    Ok(v) => v,
+                    Err(e) => return (out, fallbacks, Some(e.to_string())),
+                };
+                let v1 = argmax1(&logits.select(1, 0));
+                if v1 == draft {
+                    // Accidental accept: same handling as the accept path.
+                    let v2 = argmax1(&logits.select(1, 1));
+                    let mtp_in = Tensor::from_slice(&[v1, v2]).reshape([1, 2]);
+                    pending = argmax1(&model.mtp_forward(&mtp_in, &hidden, pos).unwrap());
+                    out.push(v1);
+                    out.push(v2);
+                    last = v2;
+                    pos += 2;
+                } else {
+                    model.restore_ssm_states(snapshot.0, snapshot.1);
+                    model.get_kv_cache().unwrap().lock().truncate_to(pos + 1);
+                    let re_in = Tensor::from_slice(&[last]).reshape([1, 1]);
+                    let (_, hidden2) = model.forward_with_cache_hidden(&re_in, pos, true).unwrap();
+                    let mtp_in = Tensor::from_slice(&[v1]).reshape([1, 1]);
+                    pending = argmax1(&model.mtp_forward(&mtp_in, &hidden2, pos).unwrap());
+                    out.push(v1);
+                    last = v1;
+                    pos += 1;
+                }
+            }
+        };
+
+        let (serial_out, serial_err) = serial_until_error(&build());
+        assert!(
+            serial_err.as_deref().is_some_and(|e| e.contains("Cache overflow")),
+            "serial driver must end at the context boundary, got {serial_err:?}"
+        );
+        assert_eq!(serial_out.len(), 7, "prefill token + forwards at pos 6..=11");
+
+        // Pre-fix behavior (no fallback): the 2-token verify at pos = CAP-1
+        // overflows and the stream dies one token earlier than serial.
+        let (old_out, _, old_err) = spec_until_error(&build(), false);
+        assert!(
+            old_err.as_deref().is_some_and(|e| e.contains("Cache overflow")),
+            "pre-fix behavior must overflow, got {old_err:?}"
+        );
+        assert!(
+            old_out.len() < serial_out.len(),
+            "pre-fix driver must lose the final token (old={}, serial={})",
+            old_out.len(),
+            serial_out.len()
+        );
+
+        // Fixed behavior: the boundary round falls back to a serial step and
+        // yields the same tokens as serial, erroring only at the true boundary.
+        let (spec_out, fallbacks, spec_err) = spec_until_error(&build(), true);
+        assert_eq!(spec_out, serial_out, "boundary fallback diverged from serial");
+        assert!(fallbacks >= 1, "serial fallback never engaged at the boundary");
+        assert!(
+            spec_err.as_deref().is_some_and(|e| e.contains("Cache overflow")),
+            "spec driver must end at the true boundary like serial, got {spec_err:?}"
+        );
+    }
+
+    /// Same gate across a session prefix-cache hit: turn 2 shares turn 1's
+    /// prompt prefix, so only the suffix is prefilled. Both drivers get the
+    /// identical treatment (KV truncated to the prefix; GDN conv/rec state is
+    /// NOT restored by a prefix hit — reset to empty on both sides here), so
+    /// speculative must still equal serial token-for-token.
+    #[test]
+    fn mtp_decode_matches_serial_across_prefix_cache_hit() {
+        let model_serial = whole_model_mtp();
+        let model_spec = whole_model_mtp();
+
+        // Turn 1: full prefill + generation.
+        let s1 = serial_generate(&model_serial, &PROMPT, GEN, 0);
+        let (p1, _, _) = spec_generate(&model_spec, &PROMPT, GEN, 0, DraftMode::Natural, None);
+        assert_eq!(p1, s1, "turn 1: speculative diverged from serial");
+
+        // Session save/restore: the engine saves prompt tokens only, so the
+        // next turn's prefix hit truncates KV to the prompt prefix. A prefix
+        // hit does not restore GDN SSM state; reset it identically on both
+        // drivers so both see the same (KV-only) resumed state.
+        let prefix_len = PROMPT.len();
+        for m in [&model_serial, &model_spec] {
+            m.get_kv_cache().unwrap().lock().truncate_to(prefix_len);
+            let n = m.num_layers();
+            // Tensor is not Clone — build the two empty state vectors separately.
+            let empty_conv: Vec<Option<Tensor>> = (0..n).map(|_| None).collect();
+            let empty_rec: Vec<Option<Tensor>> = (0..n).map(|_| None).collect();
+            m.restore_ssm_states(empty_conv, empty_rec);
+        }
+
+        // Turn 2: shared prefix + new suffix, partial prefill from prefix_len.
+        let prompt2: [i64; 9] = [1, 5, 9, 2, 7, 3, 4, 8, 6];
+        let s2 = serial_generate(&model_serial, &prompt2, GEN, prefix_len);
+        let (p2, _, _) = spec_generate(&model_spec, &prompt2, GEN, prefix_len, DraftMode::Natural, None);
+        assert_eq!(p2, s2, "turn 2 (prefix hit): speculative diverged from serial");
+    }
+
+    /// Loading without `mtp.*` keys (or with an unconsumable head) must fall
+    /// back to plain non-speculative decode — `has_mtp() == false`, no error.
+    #[test]
+    fn mtp_head_absent_falls_back_to_serial() {
+        let mut w = tiny_weights();
+        let model = Qwen3_5Model::from_weights(
+            &mut w, tiny_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+            true,
+        )
+        .unwrap();
+        assert!(!model.has_mtp(), "model without mtp.* weights must not speculate");
+    }
+
+    /// Regression guard for the causal-mask offset in cached multi-token
+    /// forwards (the speculative verify path): with `q_len > 1` and
+    /// `start_pos > 0` the mask must be `tril(kv_len - q_len)`, not `tril(0)` —
+    /// otherwise every cached row attends only to the first `i+1` keys and all
+    /// of the prompt history is masked out. Compares LOGITS (not just argmax):
+    /// the token-level spec==serial gates alone are insensitive to this on a
+    /// tiny model because the residual stream dominates the attention delta.
+    ///
+    /// Uses an all-full-attention variant of the tiny model so the only
+    /// divergence source is attention itself (the hybrid GDN stack adds
+    /// ~1e-3 chunked-vs-recurrent kernel noise, too loose for this guard).
+    #[test]
+    fn cached_two_token_forward_matches_serial_decode_steps() {
+        let _g = tch::no_grad_guard();
+        let allattn_config = || {
+            let mut cfg = tiny_config();
+            cfg.layer_types = (0..cfg.num_hidden_layers)
+                .map(|_| "full_attention".to_owned())
+                .collect();
+            cfg
+        };
+        let build = || {
+            let mut w = tiny_weights_mtp();
+            let cfg = allattn_config();
+            // Replace GDN mixers with full-attention ones (deterministic pattern).
+            let opt = (Kind::Float, Device::Cpu);
+            let mut seed: i64 = 20_000;
+            let mut pat = |dims: &[i64]| -> Tensor {
+                let n: i64 = dims.iter().product();
+                seed += 7;
+                (Tensor::arange(n, opt) * 0.017 + seed as f64 * 0.013)
+                    .sin()
+                    .reshape(dims)
+                    * 0.05
+            };
+            for i in 0..cfg.num_hidden_layers as usize {
+                if (i + 1) % 4 == 0 {
+                    continue; // already full-attention in tiny_weights
+                }
+                let p = format!("model.layers.{i}");
+                w.retain(|k, _| !k.starts_with(&format!("{p}.linear_attn.")));
+                let ap = format!("{p}.self_attn");
+                w.insert(format!("{ap}.q_proj.weight"), pat(&[HEADS * HEAD_DIM * 2, HIDDEN]));
+                w.insert(format!("{ap}.k_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
+                w.insert(format!("{ap}.v_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
+                w.insert(format!("{ap}.o_proj.weight"), pat(&[HIDDEN, HEADS * HEAD_DIM]));
+                w.insert(format!("{ap}.q_norm.weight"), pat(&[HEAD_DIM]));
+                w.insert(format!("{ap}.k_norm.weight"), pat(&[HEAD_DIM]));
+            }
+            Qwen3_5Model::from_weights(
+                &mut w, allattn_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+                true,
+            )
+            .unwrap()
+        };
+
+        // Serial reference: prefill, then two one-token decode steps.
+        let serial = build();
+        let prompt_t = Tensor::from_slice(&PROMPT).reshape([1, PROMPT.len() as i64]);
+        let _ = serial.forward_with_cache(&prompt_t, 0).unwrap();
+        let pos = PROMPT.len();
+        let step1 = Tensor::from_slice(&[11i64]).reshape([1, 1]);
+        let ref1 = serial.forward_with_cache(&step1, pos).unwrap(); // [1, 1, V]
+        let step2 = Tensor::from_slice(&[13i64]).reshape([1, 1]);
+        let ref2 = serial.forward_with_cache(&step2, pos + 1).unwrap();
+
+        // Cached two-token forward (the verify shape): same model state, [11, 13] at pos.
+        let cached = build();
+        let _ = cached.forward_with_cache(&prompt_t, 0).unwrap();
+        let pair = Tensor::from_slice(&[11i64, 13]).reshape([1, 2]);
+        let (logits2, _) = cached.forward_with_cache_hidden(&pair, pos, false).unwrap();
 
         for (row, ref_l) in [(0i64, &ref1), (1, &ref2)] {
             let got = logits2.select(1, row).reshape([-1i64]);

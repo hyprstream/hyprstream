@@ -33,10 +33,10 @@ use hyprstream_rpc::Subject;
 use hyprstream_vfs::Namespace;
 
 use super::fs::{SyntheticNode, SyntheticTree};
-use super::generated::model_client::ModelClient;
+use hyprstream_rpc_std::model_client::ModelClient;
+use hyprstream_rpc_std::registry_client::RegistryClient;
 use super::remote_mount::RemoteModelMount;
 use super::remote_registry_mount::RemoteRegistryMount;
-use super::RegistryClient;
 
 /// Inputs that legitimately differ between the CLI shell and TUI ChatApp
 /// call sites. Everything else about the recipe is fixed by

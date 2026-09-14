@@ -30,6 +30,7 @@ mod account_worker;
 mod account_tls;
 
 pub mod auth;
+pub(crate) mod atproto_session;
 pub mod authorize;
 pub mod browser_session;
 pub mod challenge;
@@ -88,7 +89,7 @@ use tokio::sync::Notify;
 use tracing::info;
 
 use crate::config::{CredentialsBackend, OAuthConfig};
-use crate::services::PolicyClient;
+use hyprstream_rpc_std::policy_client::PolicyClient;
 use state::OAuthState;
 
 /// Service name for registry and logging
@@ -240,8 +241,13 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(userinfo::userinfo).post(userinfo::userinfo),
         )
         .merge(authority_router)
-        .merge(if state.public_repo_writer.is_some() {
+        .merge(if state.public_repo_writer.is_some() || state.hosted_public_repo_writer.is_some() {
             xrpc::xrpc_write_routes()
+        } else {
+            Router::new()
+        })
+        .merge(if state.atproto_session_resolver.is_some() {
+            xrpc::xrpc_session_routes()
         } else {
             Router::new()
         });
@@ -717,7 +723,7 @@ async fn resolve_account_http_tls(
 #[cfg(test)]
 fn runtime_clients(
     signing_key: &ed25519_dalek::SigningKey,
-) -> anyhow::Result<(PolicyClient, crate::services::DiscoveryClient)> {
+) -> anyhow::Result<(PolicyClient, hyprstream_rpc_std::discovery_client::DiscoveryClient)> {
     let trust = hyprstream_service::global_trust_store();
     let policy_key = trust
         .resolve_one("policy")
@@ -819,7 +825,7 @@ impl Spawnable for OAuthService {
                 }
             };
             let policy_client = if hyprstream_discovery::native_network_required() {
-                PolicyClient::from_resolver(self.signing_key.clone(), None)
+                PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, self.signing_key.clone(), None)
                     .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create PolicyClient: {e}")))?
             } else {
                 PolicyClient::for_local_transport_bootstrap(
@@ -841,10 +847,10 @@ impl Spawnable for OAuthService {
                 }
             };
             let discovery_client = if hyprstream_discovery::native_network_required() {
-                crate::services::DiscoveryClient::from_resolver(self.signing_key.clone(), None)
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, self.signing_key.clone(), None)
                     .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create DiscoveryClient: {e}")))?
             } else {
-                crate::services::DiscoveryClient::for_local_transport_bootstrap(
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_transport_bootstrap(
                     &self.discovery_transport,
                     self.signing_key.clone(),
                     discovery_vk,
@@ -1083,12 +1089,43 @@ impl Spawnable for OAuthService {
             if let Some(api) = &self.identity_registration_api {
                 oauth_state = oauth_state.with_identity_registration_api(Arc::clone(api));
             }
-            match self.account_config.resolve_zone() {
-                Ok(zone) => oauth_state = oauth_state.with_hosted_account_zone(zone),
-                Err(error) => tracing::warn!(
-                    %error,
-                    "OAuth user-token minting disabled: no deployment account zone"
-                ),
+            if self.config.xrpc_read_slice {
+                if let (Some(store), Some(root)) = (&hosted_account_store, &self.pds_root) {
+                    let public_root = root.join("public-repositories");
+                    let public_store = crate::services::public_repo::PublicRepoStore::open(&public_root)
+                        .map_err(|error| hyprstream_rpc::error::RpcError::SpawnFailed(format!("open public repository store {}: {error}", public_root.display())))?;
+                    oauth_state = oauth_state.with_hosted_public_repo_writer(Arc::new(
+                        crate::services::public_repo::HostedAccountPublicRepoWriter::new(
+                            Arc::new(public_store),
+                            Arc::clone(store),
+                            hyprstream_rpc::Subject::new(hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT),
+                            Arc::new(crate::services::public_repo::HostedAccountSelfAuthorizer),
+                        ),
+                    ));
+                }
+            }
+            let account_zone = match self.account_config.resolve_zone() {
+                Ok(zone) => {
+                    oauth_state = oauth_state.with_hosted_account_zone(zone.clone());
+                    Some(zone)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "OAuth user-token minting disabled: no deployment account zone"
+                    );
+                    None
+                }
+            };
+            if let (Some(store), Some(zone)) = (&hosted_account_store, &account_zone) {
+                let resolver = Arc::new(
+                    crate::services::oauth::atproto_session::NativeAtprotoSessionResolver::new(
+                        user_store.clone_inner(),
+                        Arc::clone(store),
+                        zone.clone(),
+                    ),
+                );
+                oauth_state = oauth_state.with_atproto_session_resolver(resolver);
             }
             oauth_state = oauth_state.with_user_store(user_store);
             if let Some(ds) = device_store_opt {
@@ -1745,11 +1782,11 @@ mod tests {
             "DiscoveryClient::for_local_transport_bootstrap(\n                    &self.discovery_transport,"
         ));
         assert!(
-            run.contains("if hyprstream_discovery::native_network_required() {\n                PolicyClient::from_resolver("),
+            run.contains("if hyprstream_discovery::native_network_required() {\n                PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, "),
             "Required profile must resolve Policy through the checkpoint resolver"
         );
         assert!(
-            run.contains("if hyprstream_discovery::native_network_required() {\n                crate::services::DiscoveryClient::from_resolver("),
+            run.contains("if hyprstream_discovery::native_network_required() {\n                hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, "),
             "Required profile must resolve Discovery through the checkpoint resolver"
         );
         assert!(
@@ -2218,8 +2255,10 @@ mod tests {
         use super::token_store::RocksDbTokenStore;
         use crate::auth::rocksdb_store::RocksDbUserStore;
         use crate::auth::{PolicyManager, UserProfile, UserStore};
-        use crate::services::generated::policy_client::{IssueToken, IssueTokenProfile};
-        use crate::services::{DiscoveryClient, PolicyClient, PolicyService};
+        use hyprstream_rpc_std::policy_client::{IssueToken, IssueTokenProfile};
+        use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+        use hyprstream_rpc_std::policy_client::PolicyClient;
+        use crate::services::PolicyService;
 
         const ISSUER: &str = "https://pds.example.test:8443";
         const GENERIC_ISSUER: &str = "https://pds.example.test:8443/configured/path";

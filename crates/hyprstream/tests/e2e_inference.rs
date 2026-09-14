@@ -766,7 +766,7 @@ async fn e6_gpu_load_and_stream_tokens() {
 
     // Streaming generation: collect chunks until the stream ends, then read the
     // final stats. This is the exact path a Moq token subscriber consumes.
-    let request = hyprstream_core::runtime::GenerationRequest {
+    let request = hyprstream_rpc_std::inference_client::GenerationRequest {
         prompt: "The capital of France is".to_owned(),
         max_tokens: Some(16),
         temperature: Some(0.0), // greedy — deterministic, fast, stable

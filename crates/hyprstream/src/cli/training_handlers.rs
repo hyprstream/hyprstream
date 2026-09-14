@@ -21,12 +21,13 @@ use crate::config::{
     TTTTrainingConfig,
 };
 use crate::runtime::model_config::ModelConfig;
-use crate::services::generated::inference_client::{ChatMessage, ChatTemplateRequest};
-use crate::services::generated::registry_client::{
+use hyprstream_rpc_std::inference_client::{ChatMessage, ChatTemplateRequest};
+use hyprstream_rpc_std::registry_client::{
     BranchRequest, CreateWorktreeRequest, StageFilesRequest, CommitRequest, PushRequest,
 };
-use crate::services::{InferenceServiceConfig, RegistryClient, WorktreeClient, INFERENCE_ENDPOINT};
-use crate::services::generated::inference_client::InferenceClient;
+use hyprstream_rpc_std::registry_client::{RegistryClient, WorktreeClient};
+use crate::services::{InferenceServiceConfig, WorktreeClientExt, INFERENCE_ENDPOINT};
+use hyprstream_rpc_std::inference_client::InferenceClient;
 use crate::storage::ModelRef;
 use hyprstream_rpc::{SigningKey, VerifyingKey};
 use hyprstream_service::ServiceSpawner;
@@ -455,7 +456,7 @@ pub async fn handle_training_infer(
         use hyprstream_rpc::streaming::StreamPayload;
         use std::io::Write;
         let mut handle = {
-            use crate::services::generated::inference_client::InferenceRpc;
+            use hyprstream_rpc_std::inference_client::InferenceRpc;
             InferenceRpc::generate_stream(&client, &request).await?
         };
         println!();
@@ -507,11 +508,11 @@ fn ensure_ttt_enabled(model_path: &std::path::Path) -> Result<()> {
 /// Replaces the removed `InferenceZmqClient::generate()` sync method.
 async fn collect_inference_stream(
     client: &InferenceClient,
-    request: &crate::runtime::GenerationRequest,
+    request: &hyprstream_rpc_std::inference_client::GenerationRequest,
 ) -> Result<crate::config::GenerationResult> {
     use hyprstream_rpc::streaming::StreamPayload;
 
-    use crate::services::generated::inference_client::InferenceRpc;
+    use hyprstream_rpc_std::inference_client::InferenceRpc;
     let mut handle = InferenceRpc::generate_stream(client, request).await?;
     let mut text = String::new();
 
@@ -737,7 +738,7 @@ pub async fn handle_training_batch(
             _ => chunk.clone(), // "text" format - use as-is
         };
 
-        let request = crate::runtime::GenerationRequest {
+        let request = hyprstream_rpc_std::inference_client::GenerationRequest {
             prompt,
             max_tokens: Some(max_tokens as u32),
             temperature: Some(0.7),

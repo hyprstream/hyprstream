@@ -112,3 +112,43 @@ ci_phase_end() {
     printf '[INFO] phase %s finished in %dm%02ds\n' \
         "$label" $(( elapsed / 60 )) $(( elapsed % 60 ))
 }
+
+# Check the library installation itself, not a caller-supplied version label.
+# Wheel installs lack build-version, but carry the same C++ version header.
+libtorch_version_header() {
+    if [[ -s "$1/include/torch/headeronly/version.h" ]]; then
+        printf '%s\n' include/torch/headeronly/version.h
+    else
+        printf '%s\n' include/torch/csrc/api/include/torch/version.h
+    fi
+}
+
+require_libtorch_version() {
+    local dir="$1" expected="$2" actual header archive_version
+    header="$dir/$(libtorch_version_header "$dir")"
+    [[ "$expected" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && -s "$header" &&
+       -s "$dir/lib/libtorch.so" && -s "$dir/lib/libtorch_cpu.so" ]] || {
+        echo "libtorch: incomplete installation at $dir" >&2
+        return 1
+    }
+    # 2.11 moves the definition to headeronly/version.h and splits the
+    # string across a preprocessor continuation; 2.10 defines it inline.
+    actual=$(sed ':join; /\\$/ { N; s/\\\n[[:space:]]*/ /; b join; }' "$header" |
+        sed -n 's/^#define TORCH_VERSION[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p')
+    [[ "$actual" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\+[A-Za-z0-9._-]+)?$ && "${actual%%+*}" == "$expected" ]] || {
+        echo "libtorch: expected $expected, header reports $actual at $dir" >&2
+        return 1
+    }
+    if [[ -e "$dir/build-version" ]]; then
+        archive_version=$(cat "$dir/build-version")
+        [[ "$archive_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\+[A-Za-z0-9._-]+)?$ && "${archive_version%%+*}" == "$expected" ]] || {
+            echo "libtorch: build-version disagrees with $expected at $dir" >&2
+            return 1
+        }
+    fi
+}
+
+# One version/variant identity for extraction and every packaging consumer.
+libtorch_variant_dir() {
+    printf '%s\n' "${HYPRSTREAM_LIBTORCH_DIR:-$LIBTORCH_CACHE_DIR/$LIBTORCH_VERSION-$1/libtorch}"
+}

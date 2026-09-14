@@ -366,7 +366,7 @@ pub fn generate_body_decoder(service_name: &str, resolved: &ResolvedSchema) -> T
     let capnp_mod = format_ident!("{}_capnp", service_name);
     let req_snake = format_ident!("{}", to_snake_case(&format!("{pascal}Request")));
     let decode_fn = format_ident!("decode_{}_request_body", to_snake_case(&pascal));
-    let root_mod = quote! { crate::#capnp_mod::#req_snake };
+    let root_mod = quote! { #capnp_mod::#req_snake };
 
     let arms = decoder_arms(
         resolved,
@@ -680,7 +680,7 @@ fn decoder_arms(
                 Some((inner_sdef, inner_variants, inner_scopes)) => {
                     let inner_mod_ident =
                         format_ident!("{}", to_capnp_module_name(&inner_sdef.name));
-                    let inner_mod = quote! { crate::#capnp_mod::#inner_mod_ident };
+                    let inner_mod = quote! { #capnp_mod::#inner_mod_ident };
                     let inner_arms = decoder_arms(
                         resolved,
                         capnp_mod,

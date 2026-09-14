@@ -15,8 +15,10 @@ use crate::error::{Result, WorkerError};
 
 use super::admission::{self, AdmissionTracker};
 use super::backend::SandboxBackend;
-use super::client::{KeyValue, LinuxContainerResources};
-use super::{PodSandbox, PodSandboxConfig, PodSandboxState};
+use hyprstream_rpc_std::worker_client::{
+    KeyValue, LinuxContainerResources, PodSandboxConfig, PodSandboxState,
+};
+use super::PodSandbox;
 use hyprstream_vfs::Subject;
 
 /// Sandbox pool for warm sandbox management
@@ -670,7 +672,7 @@ mod tests {
 mod admission_tests {
     use super::*;
     use crate::runtime::backend::SandboxHandle;
-    use crate::runtime::client::KeyValue;
+    use hyprstream_rpc_std::worker_client::KeyValue;
     use parking_lot::Mutex as StdMutex;
     use std::any::Any;
     use std::collections::HashMap as StdHashMap;

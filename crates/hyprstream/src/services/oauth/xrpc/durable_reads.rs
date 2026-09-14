@@ -1,7 +1,7 @@
 //! Public reads from the configured durable writer. Never populate or fall
 //! back to the independent hosted-model snapshot cache for this repository.
 use super::*;
-use crate::services::public_repo::{PublicRepoSnapshot, PublicRepoWriter};
+use crate::services::public_repo::{PublicRepoReader, PublicRepoSnapshot};
 use hyprstream_pds::dag_cbor::DagCbor;
 
 fn internal_error() -> Response {
@@ -44,7 +44,7 @@ fn record_json(value: &DagCbor) -> anyhow::Result<Value> {
 
 pub(super) async fn get_record(
     store: &XrpcRepoStore,
-    writer: Arc<PublicRepoWriter>,
+    writer: PublicRepoReader,
     collection: &str,
     rkey: &str,
     cid: Option<&str>,
@@ -63,22 +63,22 @@ pub(super) async fn get_record(
     let collection = collection.to_owned();
     let rkey = rkey.to_owned();
     let cid = cid.map(str::to_owned);
-    let result=tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Option<Value>>> {
+    let result=writer.read(move |snapshot| -> anyhow::Result<Option<Option<Value>>> {
         let _permit = permit;
-        let Some((snapshot,_))=writer.public_snapshot()? else { return Ok(None); };
+        let Some((snapshot,_))=snapshot else { return Ok(None); };
         let key=match AtprotoRecordKey::new(rkey) { Ok(key)=>key, Err(_)=>return Ok(Some(None)) };
         let Some(record)=snapshot.records.get(&(collection,key)) else { return Ok(Some(None)); };
         if cid.is_some_and(|cid| cid != record.cid().to_string()) { return Ok(Some(None)); }
         Ok(Some(Some(json!({"uri":record.uri(&snapshot.did),"cid":record.cid().to_string(),"value":record_json(record.value())?}))))
     }).await;
     match result {
-        Ok(Ok(Some(Some(value)))) => axum::Json(value).into_response(),
-        Ok(Ok(Some(None))) => xrpc_error(
+        Ok(Some(Some(value))) => axum::Json(value).into_response(),
+        Ok(Some(None)) => xrpc_error(
             StatusCode::BAD_REQUEST,
             errors::RECORD_NOT_FOUND,
             "public record not found",
         ),
-        Ok(Ok(None)) => missing_repo(),
+        Ok(None) => missing_repo(),
         _ => internal_error(),
     }
 }
@@ -127,7 +127,7 @@ fn repo_car(snapshot: &PublicRepoSnapshot) -> anyhow::Result<Vec<u8>> {
 
 pub(super) async fn get_repo(
     store: &XrpcRepoStore,
-    writer: Arc<PublicRepoWriter>,
+    writer: PublicRepoReader,
     since_present: bool,
 ) -> Response {
     if since_present {
@@ -145,18 +145,18 @@ pub(super) async fn get_repo(
         Ok(permit) => permit,
         Err(_) => return internal_error(),
     };
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let _work_permit = work_permit;
-        let bytes = writer
-            .public_snapshot()?
-            .map(|(snapshot, _)| repo_car(&snapshot))
-            .transpose()?;
-        Ok((bytes, permit))
-    })
-    .await;
+    let result = writer
+        .read(move |snapshot| -> anyhow::Result<_> {
+            let _work_permit = work_permit;
+            let bytes = snapshot
+                .map(|(snapshot, _)| repo_car(&snapshot))
+                .transpose()?;
+            Ok((bytes, permit))
+        })
+        .await;
     let (bytes, permit) = match result {
-        Ok(Ok((Some(bytes), permit))) => (bytes, permit),
-        Ok(Ok((None, _))) => return missing_repo(),
+        Ok((Some(bytes), permit)) => (bytes, permit),
+        Ok((None, _)) => return missing_repo(),
         _ => return internal_error(),
     };
     // Only export admission survives through body EOF/drop. Snapshot-work
@@ -173,23 +173,30 @@ pub(super) async fn get_repo(
         .into_response()
 }
 
-pub(super) async fn describe_repo(state: &OAuthState, writer: Arc<PublicRepoWriter>) -> Response {
-    let handle = state
-        .xrpc_repos
-        .get_public(writer.did())
-        .await
-        .map(|snapshot| snapshot.handle.clone());
-    // No trusted account handle exists for some PLC/non-issuer repositories.
-    // Use the protocol's invalid-handle sentinel without inventing a binding.
-    let handle = handle.or_else(|| {
-        (state.atproto_service_did().as_deref() == Some(writer.did()))
-            .then(|| {
-                url::Url::parse(&state.issuer_url)
-                    .ok()
-                    .and_then(|url| url.host_str().map(str::to_owned))
+pub(super) async fn describe_repo(state: &OAuthState, writer: PublicRepoReader) -> Response {
+    let handle = match &writer {
+        // Hosted selection already validated this exact host against AccountZone.
+        // Legacy model metadata must not override the native account identity.
+        PublicRepoReader::Hosted { did, .. } => did.strip_prefix("did:web:").map(str::to_owned),
+        PublicRepoReader::Local(_) => {
+            let handle = state
+                .xrpc_repos
+                .get_public(writer.did())
+                .await
+                .map(|snapshot| snapshot.handle.clone());
+            // No trusted handle exists for some PLC/non-issuer repositories.
+            // Preserve the issuer fallback and invalid-handle sentinel policy.
+            handle.or_else(|| {
+                (state.atproto_service_did().as_deref() == Some(writer.did()))
+                    .then(|| {
+                        url::Url::parse(&state.issuer_url)
+                            .ok()
+                            .and_then(|url| url.host_str().map(str::to_owned))
+                    })
+                    .flatten()
             })
-            .flatten()
-    });
+        }
+    };
     let handle_is_correct = handle.is_some();
     let handle = handle.unwrap_or_else(|| "handle.invalid".to_owned());
     let permit = match state.xrpc_repos.acquire_snapshot_work_owned().await {
@@ -197,9 +204,9 @@ pub(super) async fn describe_repo(state: &OAuthState, writer: Arc<PublicRepoWrit
         Err(_) => return internal_error(),
     };
     let issuer = state.issuer_url.clone();
-    let result=tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let result=writer.read(move |snapshot| -> anyhow::Result<_> {
         let _permit = permit;
-        let Some((snapshot,key))=writer.public_snapshot()? else { return Ok(None); };
+        let Some((snapshot,key))=snapshot else { return Ok(None); };
         let collections:std::collections::BTreeSet<_>=snapshot.records.keys().map(|(collection,_)|collection.as_str()).collect();
         let identity=AtprotoIdentity {p256_vk:&key,handle:&handle,drain:None,lead:None};
         let mut did_doc=build_did_document(&snapshot.did,&issuer,&[],Some(&identity),&[],None,None);
@@ -209,8 +216,8 @@ pub(super) async fn describe_repo(state: &OAuthState, writer: Arc<PublicRepoWrit
         Ok(Some(json!({"handle":handle,"did":snapshot.did,"didDoc":did_doc,"collections":collections,"handleIsCorrect":handle_is_correct})))
     }).await;
     match result {
-        Ok(Ok(Some(value))) => axum::Json(value).into_response(),
-        Ok(Ok(None)) => missing_repo(),
+        Ok(Some(value)) => axum::Json(value).into_response(),
+        Ok(None) => missing_repo(),
         _ => internal_error(),
     }
 }

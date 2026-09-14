@@ -3,8 +3,8 @@
 use crate::config::{
     FinishReason, GenerationConfig, GenerationResult, RuntimeConfig,
 };
-use crate::runtime::GenerationRequest;
-use crate::runtime::ModelInfo;
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::inference_client::ModelInfo;
 use crate::runtime::tensor_sampling::TensorSampler;
 use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
 use crate::runtime::architectures::ModelOperations;
@@ -264,7 +264,7 @@ impl TorchEngine {
         &mut self,
         num_layers: usize,
         max_seq_len: usize,
-        quant_type: crate::runtime::KVQuantType,
+        quant_type: hyprstream_rpc_std::model_client::KVQuantType,
         memory_budget: Option<usize>,
     ) {
         let config = crate::runtime::kv_cache::CacheConfig::new(num_layers, max_seq_len)
@@ -953,10 +953,10 @@ impl TorchEngine {
                     WeightIdentity, KV_COMPAT_FORMAT_VERSION,
                 };
                 let kv_quant = match self.config.kv_quant_type {
-                    crate::runtime::KVQuantType::None => KvQuantMode::None,
-                    crate::runtime::KVQuantType::Int8 => KvQuantMode::Int8,
-                    crate::runtime::KVQuantType::Nf4 => KvQuantMode::Nf4,
-                    crate::runtime::KVQuantType::Fp4 => KvQuantMode::Fp4,
+                    hyprstream_rpc_std::model_client::KVQuantType::None => KvQuantMode::None,
+                    hyprstream_rpc_std::model_client::KVQuantType::Int8 => KvQuantMode::Int8,
+                    hyprstream_rpc_std::model_client::KVQuantType::Nf4 => KvQuantMode::Nf4,
+                    hyprstream_rpc_std::model_client::KVQuantType::Fp4 => KvQuantMode::Fp4,
                 };
                 // `model_name` is a display label for mismatch messages; the
                 // authoritative weight identity is the content digest above.
@@ -1049,6 +1049,7 @@ impl TorchEngine {
             self.config.kv_quant_type,
             self.device_pool.as_deref(),
             self.config.fp8_dequant_load,
+            self.config.speculative_decoding,
         ).await?;
         let factory_time = factory_start.elapsed();
         info!("✅ Model weights loaded in {:.2}s", factory_time.as_secs_f64());
@@ -1585,6 +1586,88 @@ impl TorchEngine {
         }
     }
 
+    // ========================================================================
+    // MTP self-speculative decoding (Qwen3.5, v1: dense + greedy + batch=1)
+    // ========================================================================
+
+    /// Whether the loaded model can self-speculate: a Qwen3.5 with a loaded
+    /// (dense) MTP draft head. Pipeline/multi-device stage loads never own the
+    /// MTP head, so this is false there too.
+    pub fn speculative_supported(&self) -> bool {
+        let Some(model_arc) = &self.persistent_model else { return false };
+        let model = model_arc.lock();
+        model
+            .as_any()
+            .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()
+            .is_some_and(crate::runtime::architectures::qwen3_5::Qwen3_5Model::has_mtp)
+    }
+
+    /// Speculative prefill/verify forward: returns per-position logits plus the
+    /// pre-final-norm hidden states the MTP head consumes.
+    ///
+    /// Never delta-adapted: speculation is disabled for tenant-delta streams at
+    /// stream construction, so this always runs the base model.
+    ///
+    /// Returns `(logits [1, seq|1, vocab], hidden [1, seq, hidden_size])`.
+    pub fn forward_speculative(
+        &self,
+        input_ids: &[i64],
+        start_pos: usize,
+        last_logits_only: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        let input_tensor = Tensor::from_slice(input_ids)
+            .to_kind(tch::Kind::Int64)
+            .to_device(self.device)
+            .unsqueeze(0);
+
+        let model = model_arc.lock();
+        let q35 = model
+            .as_any()
+            .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()
+            .ok_or_else(|| anyhow!("Speculative decoding requires a Qwen3.5 model"))?;
+        let _no_grad = tch::no_grad_guard();
+        q35.forward_with_cache_hidden(&input_tensor, start_pos, last_logits_only)
+    }
+
+    /// MTP draft forward over `token_ids.len()` consecutive slots. Slot `i`
+    /// pairs `hiddens[.., i, ..]` with `embed(token_ids[i])` at absolute
+    /// position `base + i`. Returns the last slot's logits `[1, 1, vocab]`.
+    pub fn forward_mtp_draft(
+        &self,
+        token_ids: &[i64],
+        hiddens: &Tensor,
+        base: usize,
+    ) -> Result<Tensor> {
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        let ids_tensor = Tensor::from_slice(token_ids)
+            .to_kind(tch::Kind::Int64)
+            .to_device(self.device)
+            .unsqueeze(0);
+
+        let model = model_arc.lock();
+        let q35 = model
+            .as_any()
+            .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()
+            .ok_or_else(|| anyhow!("Speculative decoding requires a Qwen3.5 model"))?;
+        let _no_grad = tch::no_grad_guard();
+        q35.mtp_forward(&ids_tensor, hiddens, base)
+    }
+
     /// Sample next token using bundled parameters with tiered repeat penalty.
     fn sample_token_with_params(
         &self,
@@ -1602,6 +1685,91 @@ impl TorchEngine {
             previous_tokens,
             penalty_exempt_tokens,
         )
+    }
+}
+
+/// Rewind the model's installed session cache to a matched prefix.
+///
+/// Pure-attention models: truncating the KV cache to `prefix_len` is exact, so
+/// any prefix length is reusable (unchanged behavior).
+///
+/// Hybrid recurrent models (Qwen3.5): the GDN conv/rec state is Markovian and
+/// cannot be truncated to an arbitrary position — it can only be restored to
+/// the end-of-prefill snapshot stored with the cached tokens (see
+/// [`KVCacheManager::set_cached_tokens_with_ssm`]). A prefix hit is therefore
+/// reusable only when the FULL cached sequence matched
+/// (`prefix_len == cached_token_count()`) and a snapshot is present; anything
+/// else discards KV + SSM state and forces a full recompute, because decoding
+/// from a truncated KV with stale recurrent state silently produces tokens
+/// conditioned on the wrong context.
+///
+/// Returns the number of reusable prefix tokens (0 = cache cleared, full
+/// prefill required). The caller must guarantee a strict partial hit
+/// (`prefix_len < prompt_len`); the exact-prompt-repeat decision lives in
+/// [`resolve_session_prefill_start`].
+pub(crate) fn rewind_session_state(model: &dyn ModelOperations, prefix_len: usize) -> usize {
+    let Some(cache) = model.get_kv_cache() else {
+        return 0;
+    };
+    let q35 = model
+        .as_any()
+        .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>();
+    let Some(q35) = q35 else {
+        cache.lock().truncate_to(prefix_len);
+        return prefix_len;
+    };
+
+    let snapshot = {
+        let cache_guard = cache.lock();
+        if prefix_len == cache_guard.cached_token_count() {
+            cache_guard.ssm_snapshot()
+        } else {
+            None
+        }
+    };
+    match snapshot {
+        Some((conv_snap, rec_snap)) => {
+            cache.lock().truncate_to(prefix_len);
+            q35.restore_ssm_states(conv_snap, rec_snap);
+            prefix_len
+        }
+        None => {
+            // Partial prefix match (or no snapshot): recurrent state cannot be
+            // rewound to an intermediate position — recompute from scratch.
+            model.clear_kv_cache();
+            0
+        }
+    }
+}
+
+/// Decide the prefill start position for a session-cache prefix match.
+///
+/// A strict partial hit (`0 < prefix_len < prompt_len`) is reusable: there is
+/// a nonempty suffix left to prefill, and [`rewind_session_state`] puts the
+/// cache and model into the exact end-of-prefix state.
+///
+/// An exact-prompt repeat (`prefix_len == prompt_len` — the session resending
+/// its previous prompt verbatim, `prefix_len == cached_token_count()`) is NOT
+/// reusable even though the full cached sequence matched: no tokens remain to
+/// prefill, and sampling the first new token needs logits for the last prompt
+/// position, which the cache does not retain. The engine must re-run the whole
+/// prompt, and that re-run must start from CLEARED state — prefilling onto the
+/// restored KV plus end-of-prefill GDN snapshot would advance the recurrent
+/// state over the prompt a second time, producing wrong logits (and a wrong
+/// end-of-prefill snapshot for the next turn). A miss (`prefix_len == 0`)
+/// clears and starts fresh as before.
+///
+/// Returns the prefill start position (0 = cache cleared, full prefill).
+pub(crate) fn resolve_session_prefill_start(
+    model: &dyn ModelOperations,
+    prefix_len: usize,
+    prompt_len: usize,
+) -> usize {
+    if prefix_len > 0 && prefix_len < prompt_len {
+        rewind_session_state(model, prefix_len)
+    } else {
+        model.clear_kv_cache();
+        0
     }
 }
 
@@ -1945,7 +2113,7 @@ impl TorchEngine {
     /// # Example
     /// ```no_run
     /// use futures::StreamExt;
-    /// use hyprstream_core::runtime::GenerationRequest;
+    /// use hyprstream_rpc_std::inference_client::GenerationRequest;
     ///
     /// # async fn example(engine: &hyprstream_core::runtime::torch_engine::TorchEngine) -> anyhow::Result<()> {
     /// let request = GenerationRequest::default();
@@ -2552,12 +2720,48 @@ impl Drop for TorchEngine {
 }
 
 #[cfg(test)]
+#[path = "torch_engine_mtp_session_tests.rs"]
+mod mtp_session_tests;
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use parking_lot::Mutex;
     use std::io::Write;
     use std::sync::Arc;
+
+    #[test]
+    fn mtp_bonus_sampling_matches_serial_repetition_window() {
+        let engine = TorchEngine::new(RuntimeConfig {
+            use_gpu: false, speculative_decoding: false, ..Default::default()
+        }).unwrap();
+        const TOKENIZER: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"oldest":0,"recent":1,"accepted":2,"[UNK]":3},"unk_token":"[UNK]"}}"#;
+        *engine.tokenizer.lock() = Some(Tokenizer::from_bytes(TOKENIZER.as_bytes()).unwrap());
+        let request = GenerationRequest {
+            prompt: "recent".into(), temperature: Some(0.0), repeat_penalty: Some(2.0),
+            repeat_last_n: Some(2), ..Default::default()
+        };
+        let mut stream = TextStream::new(&engine, request).unwrap();
+        stream.recent_tokens = VecDeque::from([0, 1]);
+        // The accepted first token makes serial evict token 0. Penalizing that
+        // stale token changes the bonus argmax from 0 to 3 in this fixture.
+        let logits = Tensor::from_slice(&[10.0_f32, 0.0, 0.0, 7.0]);
+        let serial = engine.sample_token_with_params(
+            &logits.copy(), &stream.sampling_params, &[1, 2], &stream.penalty_exempt_tokens,
+        ).unwrap();
+        let stale = engine.sample_token_with_params(
+            &logits.copy(), &stream.sampling_params, &[0, 1, 2], &stream.penalty_exempt_tokens,
+        ).unwrap();
+        assert_ne!(stale, serial, "fixture must detect the pre-fix history");
+        let bonus = stream.sample_spec_position(&logits.copy(), &[2]).unwrap();
+        assert_eq!(bonus as usize, serial);
+        assert_eq!(stream.recent_tokens_buffer, vec![1, 2]);
+        assert_eq!(stream.recent_tokens, VecDeque::from([0, 1]));
+        // More round-local tokens than the configured window still stay bounded.
+        stream.sample_spec_position(&logits.copy(), &[2, 3, 1]).unwrap();
+        assert_eq!(stream.recent_tokens_buffer, vec![3, 1]);
+    }
 
     // ===== #1253: prompt/token text must never reach process logs =====
 
@@ -2595,6 +2799,213 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             CapturingWriter(self.0.clone())
         }
+    }
+
+    // ===== Session-cache recording vs cancellation-before-first-poll =====
+
+    /// Minimal `ArchitectureConfig` for the recording stub below: no model
+    /// math is exercised, only the configuration surface the trait requires.
+    struct StubArchConfig;
+    impl crate::runtime::architectures::ArchitectureConfig for StubArchConfig {
+        fn num_attention_heads(&self) -> usize { 4 }
+        fn num_key_value_heads(&self) -> usize { 4 }
+        fn hidden_size(&self) -> usize { 16 }
+        fn intermediate_size(&self) -> usize { 32 }
+        fn vocab_size(&self) -> usize { 16 }
+        fn max_position_embeddings(&self) -> usize { 64 }
+        fn rope_theta(&self) -> Option<f32> { None }
+        fn rope_dim(&self) -> Option<usize> { None }
+        fn layer_norm_eps(&self) -> f32 { 1e-5 }
+        fn use_rms_norm(&self) -> bool { true }
+    }
+
+    /// Model stub for cache-recording tests: holds a real (empty)
+    /// `KVCacheManager` and serves it to the engine's save path via
+    /// `get_kv_cache`. No forward is ever called — these tests exercise stream
+    /// construction, drop, and cache recording only, so every compute method
+    /// stays on the trait's `Err`/no-op defaults.
+    struct RecordingStubModel {
+        cache: Option<Arc<Mutex<crate::runtime::KVCacheManager>>>,
+    }
+    impl ModelOperations for RecordingStubModel {
+        fn architecture(&self) -> crate::runtime::architectures::ModelArchitecture {
+            crate::runtime::architectures::ModelArchitecture::Llama { version: 3 }
+        }
+        fn config(&self) -> &dyn crate::runtime::architectures::ArchitectureConfig {
+            &StubArchConfig
+        }
+        fn forward(&self, _input: &Tensor, _past_kv: Option<&Tensor>) -> Result<Tensor> {
+            Err(anyhow!("recording tests never poll the stream"))
+        }
+        fn reshape_for_attention(&self, tensor: &Tensor, _is_key_value: bool) -> Result<Tensor> {
+            Ok(tensor.shallow_clone())
+        }
+        fn apply_rope(&self, tensor: &Tensor, _position_ids: &Tensor) -> Result<Tensor> {
+            Ok(tensor.shallow_clone())
+        }
+        fn normalize(&self, tensor: &Tensor) -> Result<Tensor> {
+            Ok(tensor.shallow_clone())
+        }
+        fn get_attention_mask(&self, _seq_len: usize, _past_kv_len: usize) -> Result<Tensor> {
+            Err(anyhow!("recording tests never poll the stream"))
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn get_kv_cache(
+            &self,
+        ) -> Option<Arc<Mutex<crate::runtime::KVCacheManager>>> {
+            self.cache.clone()
+        }
+        fn set_kv_cache(&mut self, cache: Arc<Mutex<crate::runtime::KVCacheManager>>) {
+            self.cache = Some(cache);
+        }
+        fn clear_kv_cache(&self) {
+            // Same shape as the real architectures: route the clear through
+            // the installed KVCacheManager so the metadata contract under
+            // test is the production `clear_all` path.
+            if let Some(cache) = &self.cache {
+                let mut guard = cache.lock();
+                guard.clear_all();
+            }
+        }
+    }
+
+    /// Regression (cancellation before first poll): dropping a stream that was
+    /// never polled must NOT record its prompt IDs into the session cache.
+    /// Exact-hit/miss resolution in `TextStream::new` clears the cache at
+    /// generation setup, before any forward — recording IDs over that empty
+    /// state would let a later extending prompt claim a prefix_len against KV
+    /// that does not exist (the pure-attention hit path would partial-prefill
+    /// from mid-prompt with no history behind it). `prefill_time_ms` is Some
+    /// exactly when the first prefill forward completed, so it gates recording.
+    #[test]
+    fn drop_before_first_poll_does_not_record_session_cache() {
+        let mut engine = TorchEngine::new(RuntimeConfig {
+            use_gpu: false,
+            ..RuntimeConfig::default()
+        })
+        .expect("CPU engine should construct without a model");
+
+        // In-memory tokenizer (same pattern as the log-redaction tests);
+        // "hello world" → [0, 1].
+        *engine.tokenizer.lock() = Some(redact_test_tokenizer());
+
+        // A real empty KV cache served by the stub model — the recording target.
+        let cache: Arc<Mutex<crate::runtime::KVCacheManager>> =
+            Arc::new(Mutex::new(crate::runtime::KVCacheManager::new(
+            2,
+            64,
+            crate::runtime::KVQuantType::None,
+        )));
+        engine.persistent_model = Some(Arc::new(Mutex::new(Box::new(RecordingStubModel {
+            cache: Some(cache.clone()),
+        }))));
+
+        let request = GenerationRequest {
+            prompt: "hello world".to_owned(),
+            ..Default::default()
+        };
+        let stream = TextStream::new(&engine, request).expect("stream should construct");
+        // Cancellation: dropped before the first poll — no prefill ever ran.
+        drop(stream);
+
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            0,
+            "a drop before the first poll must not record prompt IDs over the cleared cache"
+        );
+
+        // The downstream hazard: a later extending prompt must not claim a
+        // reusable prefix over state that was never prefilled.
+        let extended = vec![0i64, 1, 5, 9];
+        assert_eq!(
+            cache.lock().prefix_match_len(&extended),
+            0,
+            "no prefix may be claimed over cache state that was never computed"
+        );
+    }
+
+    /// Regression (prior-session metadata vs cancellation): a cache populated
+    /// by an earlier turn (prompt IDs + end-of-prefill SSM snapshot) must not
+    /// retain that metadata after the set-up clear that a later turn's exact
+    /// hit or miss performs at generation setup. That clear runs before any
+    /// forward; if the turn is then cancelled before its first poll, nothing
+    /// new is recorded — so a subsequent extending prompt would otherwise
+    /// claim a prefix (and, for hybrid models, restore a stale snapshot)
+    /// against KV that no longer exists.
+    #[test]
+    fn setup_clear_drops_prior_session_metadata_on_cancelled_turn() {
+        let mut engine = TorchEngine::new(RuntimeConfig {
+            use_gpu: false,
+            ..RuntimeConfig::default()
+        })
+        .expect("CPU engine should construct without a model");
+        *engine.tokenizer.lock() = Some(redact_test_tokenizer());
+
+        // Registry + session owner so the swap path engages: the set-up clear
+        // then runs through resolve_session_prefill_start exactly as the
+        // production prefix-detection branch drives it.
+        let registry = Arc::new(crate::runtime::kv_cache::KVCacheRegistry::new(
+            crate::runtime::kv_cache::CacheConfig {
+                num_layers: 2,
+                max_seq_len: 64,
+                quant_type: crate::runtime::KVQuantType::None,
+                paged: false,
+            },
+            None,
+        ));
+        let owner = crate::runtime::kv_cache::CacheOwner::Session("s1".to_owned());
+        let prior = registry.get_or_create(owner.clone());
+        // Stamp the cache compatibly so the #1277 reuse policy keeps it and
+        // prefix detection actually sees the prior metadata.
+        let mut desc = crate::runtime::kv_compat::KvCompatDescriptor::default();
+        desc.weights.base_revision = "test-base".to_owned();
+        desc.set_tokenizer(16, Some("test-tok-hash".to_owned()));
+        *engine.kv_compat.lock() = Some(desc);
+        {
+            let mut prior_guard = prior.lock();
+            prior_guard.set_compat_fingerprint(engine.kv_compat_fingerprint_for(0).unwrap());
+            let opt = (tch::Kind::Float, Device::Cpu);
+            let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
+            let rec = vec![Some(Tensor::zeros([4], opt)), None];
+            // Prior turn's prompt [0, 1, 7] strictly extends this turn's
+            // ("hello world" → [0, 1]): the request is an exact hit, whose
+            // set-up clear routes through resolve_session_prefill_start →
+            // model.clear_kv_cache() — the production boundary under test.
+            prior_guard.set_cached_tokens_with_ssm(vec![0, 1, 7], Some((conv, rec)));
+        }
+        engine.kv_cache_registry = Some(registry);
+        *engine.active_cache_owner.lock() = Some(owner);
+        engine.persistent_model = Some(Arc::new(Mutex::new(Box::new(RecordingStubModel {
+            cache: None,
+        }))));
+
+        let request = GenerationRequest {
+            prompt: "hello world".to_owned(),
+            ..Default::default()
+        };
+        let stream = TextStream::new(&engine, request).expect("stream should construct");
+        // Cancelled before the first poll: the set-up clear has run, and no
+        // new recording can happen.
+        drop(stream);
+
+        // `prior` is the same Arc the swap installed into the model.
+        let guard = prior.lock();
+        assert_eq!(
+            guard.cached_token_count(),
+            0,
+            "prior prompt IDs must not survive the set-up clear"
+        );
+        assert!(
+            guard.ssm_snapshot().is_none(),
+            "prior end-of-prefill SSM snapshot must not survive the set-up clear"
+        );
+        assert_eq!(
+            guard.prefix_match_len(&[0, 1, 7, 4]),
+            0,
+            "an extending prompt must not claim a prefix over cleared KV"
+        );
     }
 
     /// Run `f` under a thread-local TRACE subscriber whose output is captured.
@@ -3211,6 +3622,12 @@ pub struct GenerationStats {
     pub inference_tokens_per_sec: f32,
     /// Exponential moving average (responsive for real-time adaptive batching)
     pub inference_tokens_per_sec_ema: f32,
+
+    // MTP self-speculative decoding outcomes (0 when speculation is off)
+    /// Draft tokens accepted by greedy exact-match verify this request
+    pub speculative_accepted: u64,
+    /// Draft tokens rejected (and rewound) this request
+    pub speculative_rejected: u64,
 }
 
 /// Stream that yields decoded UTF-8 text chunks during generation.
@@ -3254,6 +3671,12 @@ pub struct TextStream<'a> {
     prompt_len: usize,
     /// Position from which prefill should start (0 = full prefill, >0 = partial via prefix cache hit)
     prefill_start_pos: usize,
+    /// SSM (conv/rec) state snapshot captured at end-of-prefill (hybrid
+    /// recurrent models only; `None` for pure-attention models). Saved into
+    /// the session cache by `save_cached_tokens` so a later prefix hit can
+    /// rewind the recurrent state alongside the KV truncation
+    /// (`rewind_session_state`).
+    prefill_ssm_snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>,
     /// KV cache position tracking for this stream
     /// Each stream has exclusive access via &mut self, so no atomic needed
     kv_cache_position: usize,
@@ -3303,6 +3726,22 @@ pub struct TextStream<'a> {
     /// Opaque (hashed) tenant id for token-burn metric attributes — never the
     /// raw request subject (#1253). `None` when no tenant is in scope.
     tenant_hash: Option<u64>,
+
+    // MTP self-speculative decoding state (v1: greedy, batch=1, dense Qwen3.5).
+    /// Whether this stream decodes via MTP draft + verify. Decided once at
+    /// construction from the engine config, model capability, and request
+    /// sampling params (see `new_with_delta`).
+    speculative: bool,
+    /// Draft token proposed by the MTP head for the position after
+    /// `last_generated`; always `Some` between speculative decode rounds.
+    spec_pending_draft: Option<u32>,
+    /// Accepted tokens from the current speculative round not yet consumed by
+    /// `poll_next` (1 on reject, up to 2 on accept).
+    spec_out_queue: VecDeque<u32>,
+    /// Draft outcome counters for this request (OTel `record_speculative` at
+    /// drop + `GenerationStats`). Plain fields, never gated on collect_metrics.
+    spec_accepted: u64,
+    spec_rejected: u64,
 }
 
 impl<'a> TextStream<'a> {
@@ -3400,15 +3839,20 @@ impl<'a> TextStream<'a> {
             };
 
             if prefix_len > 0 && prefix_len <= prompt_len {
-                // Truncate cache to the matched prefix (discard stale suffix from prior turn)
+                // Resolve the hit: a strict partial prefix rewinds cached
+                // state (KV truncation; hybrid recurrent models additionally
+                // restore the end-of-prefill GDN conv/rec snapshot). An
+                // exact-prompt repeat (`prefix_len == prompt_len`) must
+                // recompute from cleared state instead — there is no suffix
+                // left to prefill, and the fresh forward would double-advance
+                // restored recurrent state. Both decisions live in
+                // `resolve_session_prefill_start`.
                 if let Some(model_arc) = &engine.persistent_model {
                     let model = model_arc.lock();
-                    if let Some(cache) = model.get_kv_cache() {
-                        let cache_guard = cache.lock();
-                        cache_guard.truncate_to(prefix_len);
-                    }
+                    resolve_session_prefill_start(model.as_ref(), prefix_len, prompt_len)
+                } else {
+                    0
                 }
-                prefix_len
             } else {
                 // No match — clear and start fresh
                 engine.clear_kv_cache();
@@ -3478,6 +3922,34 @@ impl<'a> TextStream<'a> {
         // PERF: Cache vocab_size to avoid lock acquisition per token
         let vocab_size = engine.get_vocab_size();
 
+        // MTP self-speculative decoding (v1): opt-in via config, and only when
+        // every correctness prerequisite holds. Reasons are logged once here
+        // (counts/config only — never content, #1253).
+        let speculative = if !engine.config.speculative_decoding {
+            false
+        } else if delta.is_some() {
+            // The MTP head is never delta-adapted, so acceptance would degrade
+            // under a tenant delta. Correctness would be preserved (verify runs
+            // the delta'd model), but v1 keeps the two features disjoint.
+            info!("Speculative decoding disabled: tenant LoRA delta active (MTP head is not delta-adapted)");
+            false
+        } else if engine.config.kv_quant_type != crate::runtime::KVQuantType::None {
+            // Quantized LayerKVCache::truncate_to falls back to a full clear(),
+            // which would silently break the reject rewind.
+            info!("Speculative decoding disabled: quantized KV cache (reject rewind needs O(1) truncate)");
+            false
+        } else if sampling_params.temperature > 0.01 {
+            // Greedy-only v1: exact-match verify is only exact under argmax.
+            info!("Speculative decoding disabled: non-greedy sampling (v1 is greedy-only)");
+            false
+        } else if !engine.speculative_supported() {
+            info!("Speculative decoding disabled: model has no dense MTP draft head");
+            false
+        } else {
+            info!("Speculative decoding enabled (MTP self-draft, k=1, greedy)");
+            true
+        };
+
         Ok(Self {
             engine,
             delta,
@@ -3491,6 +3963,7 @@ impl<'a> TextStream<'a> {
             decode_stream,
             prompt_len,
             prefill_start_pos,
+            prefill_ssm_snapshot: None, // Captured after successful serial or speculative prefill
             // KV cache starts with prompt already in it after first forward
             kv_cache_position: prompt_len,
             tokens_generated: 0,
@@ -3512,6 +3985,11 @@ impl<'a> TextStream<'a> {
             ema_tokens_per_sec: 0.0,
             model_label,
             tenant_hash,
+            speculative,
+            spec_pending_draft: None,
+            spec_out_queue: VecDeque::new(),
+            spec_accepted: 0,
+            spec_rejected: 0,
         })
     }
 
@@ -3574,6 +4052,9 @@ impl<'a> TextStream<'a> {
             inference_time_ms,
             inference_tokens_per_sec,
             inference_tokens_per_sec_ema,
+
+            speculative_accepted: self.spec_accepted,
+            speculative_rejected: self.spec_rejected,
         }
     }
 
@@ -3584,7 +4065,24 @@ impl<'a> TextStream<'a> {
     /// Save the current token sequence (prompt + generated) to the session KV cache.
     ///
     /// Called when generation finishes so the next turn can detect prefix overlap.
-    fn save_cached_tokens(&self) {
+    /// For hybrid recurrent models (Qwen3.5) the end-of-prefill SSM snapshot
+    /// captured by either prefill path is stored alongside the tokens, making
+    /// the next turn's prefix hit rewindable (`rewind_session_state`).
+    fn save_cached_tokens(&mut self) {
+        // Session-cache recording describes the model's live KV/SSM state,
+        // which exists only once this stream's first prefill completed. A drop
+        // before the first poll (cancellation, client disconnect) reaches this
+        // Drop with the cache already cleared — exact-hit/miss resolution runs
+        // at generation setup, before any forward — and a failed first prefill
+        // can leave partial forward state matching no token count. Recording
+        // prompt IDs in either case lets a later extending prompt claim a
+        // prefix_len over missing or wrong state (a pure-attention partial
+        // prefill would then resume with no history behind it). `prefill_time_ms`
+        // is set exactly when the first prefill forward returned successfully
+        // on either decoding path, so it is the fail-safe recording gate.
+        if self.prefill_time_ms.is_none() {
+            return;
+        }
         if let Some(model_arc) = &self.engine.persistent_model {
             let model = model_arc.lock();
             if let Some(cache) = model.get_kv_cache() {
@@ -3593,7 +4091,10 @@ impl<'a> TextStream<'a> {
                 // We only save the prompt (not generated tokens) because the next turn's
                 // prompt will include the assistant's response via the chat template —
                 // so the entire current prompt becomes a prefix of the next turn's prompt.
-                cache_guard.set_cached_tokens(self.prompt_tokens.clone());
+                cache_guard.set_cached_tokens_with_ssm(
+                    self.prompt_tokens.clone(),
+                    self.prefill_ssm_snapshot.take(),
+                );
                 tracing::debug!(
                     "Saved {} cached tokens for prefix matching on next turn",
                     cache_guard.cached_token_count()
@@ -3673,6 +4174,13 @@ impl<'a> TextStream<'a> {
                 }
             };
             let prefill_elapsed = prefill_start.elapsed();
+
+            // Hybrid recurrent models (Qwen3.5): capture the SSM conv/rec state
+            // as of end-of-prefill, before decode advances it. `save_cached_tokens`
+            // stores it with the prompt tokens so a later session prefix hit can
+            // rewind the recurrent state (KV truncation alone cannot). This is a
+            // cheap downcast returning `None` for pure-attention models.
+            self.prefill_ssm_snapshot = self.engine.snapshot_ssm_states();
 
             // Store prefill timing
             self.prefill_time_ms = Some(prefill_elapsed.as_millis() as u64);
@@ -3870,6 +4378,241 @@ impl<'a> TextStream<'a> {
 
         Ok(next_token as u32)
     }
+
+    /// Sample one token for the speculative path with the standard tiered
+    /// repeat penalty. `extra_window` holds tokens accepted earlier in the
+    /// current round but not yet pushed to `recent_tokens` by `poll_next`, so
+    /// the penalty window matches what serial decoding would see at this
+    /// position. Mirrors the sampling section of `sample_next_token`.
+    fn sample_spec_position(&mut self, logits: &Tensor, extra_window: &[i64]) -> Result<u32> {
+        let vocab_size = self.vocab_size;
+
+        // PERF: Cache model_vocab_size on first call (from logits shape)
+        let model_vocab_size = if self.model_vocab_size == 0 {
+            let logits_shape = logits.size();
+            let size = logits_shape[logits_shape.len() - 1] as usize;
+            self.model_vocab_size = size;
+            size
+        } else {
+            self.model_vocab_size
+        };
+
+        if vocab_size == 0 {
+            return Err(anyhow::anyhow!(
+                "Cannot sample tokens: tokenizer vocabulary size is 0 (tokenizer not loaded)"
+            ));
+        }
+
+        let params = self.sampling_params;
+        // Reuse the PERF buffer: recent_tokens (penalty window) + round-local extras.
+        self.recent_tokens_buffer.clear();
+        self.recent_tokens_buffer.extend(self.recent_tokens.iter().copied());
+        self.recent_tokens_buffer.extend(extra_window.iter().copied());
+        let excess = self.recent_tokens_buffer.len().saturating_sub(self.repeat_last_n);
+        self.recent_tokens_buffer.drain(..excess);
+        let next_token = self.engine.sample_token_with_params(
+            logits, &params, &self.recent_tokens_buffer, &self.penalty_exempt_tokens,
+        )?;
+
+        if model_vocab_size > 0 && next_token >= model_vocab_size {
+            return Err(anyhow::anyhow!(
+                "Generated out-of-bounds token {}: exceeds model vocab size {}",
+                next_token,
+                model_vocab_size
+            ));
+        }
+        if next_token >= vocab_size {
+            tracing::warn!(
+                "⚠️ Sampled token {} is beyond tokenizer vocab ({}) but within model vocab ({}). This may indicate a vocab mismatch.",
+                next_token, vocab_size, model_vocab_size
+            );
+        }
+        Ok(next_token as u32)
+    }
+
+    /// Greedy argmax of draft logits `[1, 1, vocab]` (no repeat penalty — the
+    /// draft only proposes; the penalty-applied verify decides acceptance).
+    fn spec_argmax_draft(draft_logits: &Tensor) -> u32 {
+        draft_logits.reshape([-1i64]).argmax(-1, false).int64_value(&[]) as u32
+    }
+
+    /// One speculative decode step (MTP self-draft, k=1, greedy exact-match
+    /// verify). Returns the 1–2 tokens accepted this round, in order.
+    ///
+    /// Round structure (decode phase; `last_generated` = x_pos is emitted but
+    /// not yet forwarded, `kv_cache_position` = pos, and `spec_pending_draft`
+    /// holds the MTP head's candidate for position pos+1):
+    ///
+    /// 1. Snapshot the GDN conv/rec state (before the verify forward mutates it).
+    /// 2. Verify: one main forward over `[x_pos, draft]` at `pos`. Logits at
+    ///    position 0 check the draft; logits at position 1 yield the bonus
+    ///    token when the draft matches.
+    /// 3. Accept (draft == verifier's token): emit both tokens; the verify
+    ///    forward already consumed exactly the true sequence, so KV and SSM
+    ///    state are consistent. Draft the next round from the two new slots.
+    ///    Reject: emit only the verifier's correction token, restore the SSM
+    ///    snapshot, truncate KV to `pos + 1` (dropping the rejected draft's
+    ///    KV), then re-forward `x_pos` alone — the 2-token verify advanced the
+    ///    GDN state through the rejected draft as well, so the restore alone
+    ///    would leave SSM one accepted token behind the kept KV. Re-draft from
+    ///    the correction token's slot.
+    ///
+    /// Invariants: `last_generated`/`tokens_generated`/`recent_tokens`/
+    /// `decode_stream` advance only per accepted token (the rejected draft
+    /// never enters the penalty window or decode stream);
+    /// `kv_cache_position` advances by exactly the accepted count.
+    fn sample_speculative_tokens(&mut self) -> Result<Vec<u32>> {
+        if self.tokens_generated == 0 {
+            // ---- PREFILL (full, or partial on a session prefix-cache hit) ----
+            let prefill_start = std::time::Instant::now();
+            let prompt_len = self.prompt_tokens.len();
+            let partial = self.prefill_start_pos > 0 && self.prefill_start_pos < prompt_len;
+            // Owned copy: the forward + sampling below need `&mut self`.
+            let (slice, start_pos) = if partial {
+                tracing::info!(
+                    "Partial prefill: processing {} new tokens (skipped {} cached)",
+                    prompt_len - self.prefill_start_pos,
+                    self.prefill_start_pos
+                );
+                (self.prompt_tokens[self.prefill_start_pos..].to_vec(), self.prefill_start_pos)
+            } else {
+                (self.prompt_tokens.clone(), 0)
+            };
+
+            let (logits, hidden) = self.engine.forward_speculative(&slice, start_pos, true)?;
+
+            // Retain the prompt's recurrent state before verification advances
+            // it beyond the emitted-token queue. Session Drop persists this
+            // deep snapshot alongside the prompt IDs, just like serial prefill.
+            self.prefill_ssm_snapshot = self.engine.snapshot_ssm_states();
+
+            let prefill_elapsed = prefill_start.elapsed();
+            self.prefill_time_ms = Some(prefill_elapsed.as_millis() as u64);
+            self.first_token_time = Some(std::time::Instant::now());
+            tracing::info!(
+                "PREFILL: {} tokens in {:?} ({:.2} tok/sec){} [speculative]",
+                slice.len(),
+                prefill_elapsed,
+                if prefill_elapsed.as_secs_f32() > 0.0 {
+                    slice.len() as f32 / prefill_elapsed.as_secs_f32()
+                } else {
+                    0.0
+                },
+                if partial {
+                    format!(" [prefix cached: {} tokens]", self.prefill_start_pos)
+                } else {
+                    String::new()
+                },
+            );
+
+            let next = self.sample_spec_position(&logits, &[])?;
+
+            // MTP prompt prefill + first draft in one call: slot t pairs
+            // (hidden after x_t, embed(x_{t+1})); the final slot pairs the
+            // last hidden with the just-sampled token, yielding the draft for
+            // the following position. On a prefix-cache hit the pre-hit slots
+            // keep the swapped-in cache's contents (stale or zero entries only
+            // degrade acceptance, never correctness — the verify is decisive).
+            let mut mtp_tokens: Vec<i64> = slice[1..].to_vec();
+            mtp_tokens.push(next as i64);
+            let draft_logits = self.engine.forward_mtp_draft(&mtp_tokens, &hidden, start_pos)?;
+            self.spec_pending_draft = Some(Self::spec_argmax_draft(&draft_logits));
+
+            Ok(vec![next])
+        } else {
+            // ---- VERIFY ROUND ----
+            let pos = self.kv_cache_position;
+
+            // Context boundary: the 2-token verify forward writes KV at `pos`
+            // and `pos + 1`, and LayerKVCache::update hard-errors past
+            // max_seq_len. When fewer than two slots remain, the serial path
+            // can still forward `last` in the final slot — fall back to a
+            // single-token step for THIS round (not a permanent latch; the
+            // next round re-checks and ends exactly as the serial path would).
+            if let Some(cap) = self.spec_kv_capacity() {
+                if pos + 2 > cap {
+                    let token = self.sample_next_token()?;
+                    // poll_next's per-token increment is skipped on the
+                    // speculative path, so advance here like a serial step.
+                    self.kv_cache_position += 1;
+                    return Ok(vec![token]);
+                }
+            }
+
+            let last = self.last_generated.ok_or_else(|| {
+                anyhow::anyhow!("Internal error: last_generated not set after {} tokens", self.tokens_generated)
+            })?;
+            let draft = self.spec_pending_draft.take().ok_or_else(|| {
+                anyhow::anyhow!("Internal error: speculative round without a pending draft")
+            })?;
+
+            let snapshot = self.engine.snapshot_ssm_states();
+
+            let (logits, hidden) =
+                self.engine.forward_speculative(&[last, draft as i64], pos, false)?;
+            let v1 = self.sample_spec_position(&logits.select(1, 0), &[])?;
+
+            if v1 == draft {
+                // ACCEPT: the draft was the verifier's own greedy choice, so the
+                // verify forward consumed exactly the true sequence (KV + SSM
+                // consistent). Emit the verified draft plus the bonus token.
+                let v2 = self.sample_spec_position(&logits.select(1, 1), &[v1 as i64])?;
+                let next_draft_logits =
+                    self.engine.forward_mtp_draft(&[v1 as i64, v2 as i64], &hidden, pos)?;
+                self.spec_pending_draft = Some(Self::spec_argmax_draft(&next_draft_logits));
+                self.kv_cache_position += 2;
+                self.spec_accepted += 1;
+                Ok(vec![v1, v2])
+            } else {
+                // REJECT: emit only the verifier's correction token and rewind.
+                self.engine.restore_ssm_states(snapshot);
+                // Drop the rejected draft's KV; the +1 keeps the KV the verify
+                // forward wrote for `last`. The MTP slot lags one position
+                // behind the main cache (it never consumed the rejected draft),
+                // so this manager-wide truncate is a no-op for it.
+                if let Some(model_arc) = &self.engine.persistent_model {
+                    let model = model_arc.lock();
+                    if let Some(cache) = model.get_kv_cache() {
+                        cache.lock().truncate_to(pos + 1);
+                    }
+                }
+                // Re-forward `last` alone to re-sync the GDN conv/rec state
+                // with the kept KV (see fn docs); rewrites identical KV at pos.
+                let (_logits, hidden2) = self.engine.forward_speculative(&[last], pos, true)?;
+                let next_draft_logits =
+                    self.engine.forward_mtp_draft(&[v1 as i64], &hidden2, pos)?;
+                self.spec_pending_draft = Some(Self::spec_argmax_draft(&next_draft_logits));
+                self.kv_cache_position += 1;
+                self.spec_rejected += 1;
+                Ok(vec![v1])
+            }
+        }
+    }
+
+    /// Next token from the speculative path: drains the current round's
+    /// accepted-token queue, running a new speculative round when empty.
+    /// `kv_cache_position` is advanced inside `sample_speculative_tokens`
+    /// (per accepted token), so unlike the serial path no increment happens here.
+    fn next_speculative_token(&mut self) -> Result<u32> {
+        if self.spec_out_queue.is_empty() {
+            let tokens = self.sample_speculative_tokens()?;
+            self.spec_out_queue.extend(tokens);
+        }
+        self.spec_out_queue
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("Speculative sampler produced no tokens"))
+    }
+
+    /// KV capacity (max sequence length) of the model's cache manager — the
+    /// hard bound `LayerKVCache::update` enforces. `None` when no model/cache
+    /// is installed (caller then skips the boundary check).
+    fn spec_kv_capacity(&self) -> Option<usize> {
+        let model_arc = self.engine.persistent_model.as_ref()?;
+        let model = model_arc.lock();
+        let cache = model.get_kv_cache()?;
+        let cap = cache.lock().max_seq_len();
+        Some(cap)
+    }
 }
 
 // SAFETY: TextStream can be Send because:
@@ -3914,19 +4657,34 @@ impl<'a> Stream for TextStream<'a> {
             }
 
             // Sample next token
-            let next_token = match self.sample_next_token() {
-                Ok(token) => {
-                    // FIX: Increment KV cache position after successful token sampling
-                    // This ensures KV cache stays synchronized with generation state
-                    if self.tokens_generated > 0 {  // Don't increment on initial prompt
-                        self.kv_cache_position += 1;
+            // The `!self.collect_metrics` guard keeps metrics-collecting
+            // (training-quality) requests on the serial path: the speculative
+            // sampler does not replicate the per-token logprob/entropy
+            // accumulator block from `sample_next_token`.
+            let next_token = if self.speculative && !self.collect_metrics {
+                match self.next_speculative_token() {
+                    Ok(token) => token,
+                    Err(e) => {
+                        self.finished = true;
+                        self.finish_reason = Some(FinishReason::Error(e.to_string()));
+                        return Poll::Ready(Some(Err(e)));
                     }
-                    token
-                },
-                Err(e) => {
-                    self.finished = true;
-                    self.finish_reason = Some(FinishReason::Error(e.to_string()));
-                    return Poll::Ready(Some(Err(e)));
+                }
+            } else {
+                match self.sample_next_token() {
+                    Ok(token) => {
+                        // FIX: Increment KV cache position after successful token sampling
+                        // This ensures KV cache stays synchronized with generation state
+                        if self.tokens_generated > 0 {  // Don't increment on initial prompt
+                            self.kv_cache_position += 1;
+                        }
+                        token
+                    },
+                    Err(e) => {
+                        self.finished = true;
+                        self.finish_reason = Some(FinishReason::Error(e.to_string()));
+                        return Poll::Ready(Some(Err(e)));
+                    }
                 }
             };
 
@@ -4033,6 +4791,13 @@ impl<'a> Drop for TextStream<'a> {
             &self.model_label,
             self.tenant_hash,
             self.prompt_len as u64 + generated,
+        );
+        // MTP self-speculative draft outcomes (integer counts only, #1253).
+        meter.record_speculative(
+            &self.model_label,
+            self.tenant_hash,
+            self.spec_accepted,
+            self.spec_rejected,
         );
     }
 }

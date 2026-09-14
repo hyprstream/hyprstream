@@ -61,9 +61,8 @@ use std::sync::Arc;
 use hyprstream_vfs::Subject;
 
 use crate::error::Result;
-use crate::runtime::{
-    KeyValue, PodSandboxConfig, PodSandboxMetadata, SandboxPool, ANN_GPU_REQUEST, ANN_GROUP,
-};
+use crate::runtime::{SandboxPool, ANN_GPU_REQUEST, ANN_GROUP};
+use hyprstream_rpc_std::worker_client::{KeyValue, PodSandboxConfig, PodSandboxMetadata};
 
 use super::parser::{JobResources, RunsOn};
 
@@ -223,9 +222,10 @@ mod tests {
     use super::*;
     use crate::config::PoolConfig;
     use crate::runtime::{
-        AdmissionConfig, LinuxContainerResources, PodSandbox, SandboxBackend, SandboxHandle,
+        AdmissionConfig, PodSandbox, SandboxBackend, SandboxHandle,
         StaticGroupMembership,
     };
+    use hyprstream_rpc_std::worker_client::LinuxContainerResources;
     use async_trait::async_trait;
     use std::any::Any;
     use std::collections::HashMap;

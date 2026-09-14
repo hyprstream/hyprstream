@@ -8,7 +8,7 @@ use anyhow::{bail, Result};
 use std::io::{self, Write};
 use tracing::info;
 
-use crate::services::worker::{
+use hyprstream_rpc_std::worker_client::{
     ContainerConfig, ContainerFilter, ContainerStatsFilter,
     ContainerState, ContainerStats, KeyValue, Timestamp,
     ImageSpec, PodSandboxConfig, PodSandboxFilter,
@@ -18,9 +18,9 @@ use crate::services::worker::{
     ContainerStatusRequest, ExecSyncRequest,
     ImageFilter, ImageStatusRequest, PullImageRequest,
 };
-use hyprstream_workers::runtime::ContainerMetadata;
+use hyprstream_rpc_std::worker_client::ContainerMetadata;
 
-use hyprstream_workers::runtime::WorkerClient;
+use hyprstream_rpc_std::worker_client::WorkerClient;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // List Command
@@ -515,8 +515,8 @@ pub async fn handle_worker_terminal(
     info!(container_id = %container_id, "Attaching to container terminal");
 
     // Attach RPC — DH keypair, SUB socket, and HMAC verification all managed internally.
-    use hyprstream_workers::generated::worker_client::ContainerRpc;
-    let mut stream_handle = ContainerRpc::attach(&client.container(), &crate::services::worker::AttachRequest {
+use hyprstream_rpc_std::worker_client::ContainerRpc;
+    let mut stream_handle = ContainerRpc::attach(&client.container(), &hyprstream_rpc_std::worker_client::AttachRequest {
         container_id: container_id.to_owned(),
         fds: vec![],
     }).await?;
@@ -693,7 +693,7 @@ pub async fn handle_images_pull(
     };
 
     let auth = match (username, password) {
-        (Some(u), Some(p)) => crate::services::worker::AuthConfig {
+        (Some(u), Some(p)) => hyprstream_rpc_std::worker_client::AuthConfig {
             username: u,
             password: p,
             auth: String::new(),

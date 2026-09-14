@@ -15,9 +15,10 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use hyprstream_vfs::Subject;
+use hyprstream_rpc::events::EventSubscriber;
 
 use crate::error::Result;
-use crate::events::{EventSubscriber, ReceivedEvent};
+use crate::events::ReceivedEvent;
 
 use super::adapter::SubscriberAdapter;
 use super::service::WorkflowService;
@@ -273,7 +274,7 @@ impl SubscriberAdapter for GitHubActionsAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::EventSubscriber;
+    use hyprstream_rpc::events::EventSubscriber;
     use hyprstream_vfs::Subject;
     use std::path::PathBuf;
 
