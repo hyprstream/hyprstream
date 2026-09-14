@@ -559,6 +559,20 @@ impl LinearProjection {
     /// use during `apply()`. This keeps memory at FP8 size (e.g. 7.4 GB for 35B),
     /// which is necessary when the BF16 equivalent would exceed VRAM (e.g. 70 GB > 64 GB).
     pub(crate) fn take(weights: &mut HashMap<String, Tensor>, key: &str) -> Result<Self> {
+        let (weight, scale) = Self::take_weight_and_scale(weights, key)?;
+        Ok(match scale {
+            Some(s) => Self::with_scale(weight, s),
+            None => Self::new(weight),
+        })
+    }
+
+    /// Remove and orient checkpoint tensors without constructing projection
+    /// metadata. Batched MoE experts consume only these originals; deriving
+    /// packed scales or rowwise weights here would be discarded work.
+    pub(crate) fn take_weight_and_scale(
+        weights: &mut HashMap<String, Tensor>,
+        key: &str,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let weight = weights
             .remove(key)
             .ok_or_else(|| anyhow!("Missing weight tensor: {}", key))?
@@ -568,10 +582,7 @@ impl LinearProjection {
         let scale = weights
             .remove(&format!("{key}_scale_inv"))
             .map(|s| s.transpose(0, 1).contiguous());
-        Ok(match scale {
-            Some(s) => Self::with_scale(weight, s),
-            None => Self::new(weight),
-        })
+        Ok((weight, scale))
     }
 
     /// Like `take`, but also attaches an optional bias tensor (not transposed).
