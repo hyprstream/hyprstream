@@ -177,20 +177,29 @@ fn cat_projs(projs: Vec<LinearProjection>) -> LinearProjection {
     let any_fp8 = projs.iter().any(|p| is_fp8(p.weight.kind()));
 
     if all_fp8 {
-        // All FP8: cat weights + scales directly, lazy dequant via apply().
-        let weight_refs: Vec<&Tensor> = projs.iter().map(|p| &p.weight).collect();
+        // Consume sources before rebuilding derived metadata, dropping each
+        // source rowwise copy before the fused copy is allocated.
+        let mut weights = Vec::with_capacity(projs.len());
+        let mut scales = Vec::with_capacity(projs.len());
+        for LinearProjection { weight, scale, .. } in projs {
+            weights.push(weight);
+            scales.push(scale);
+        }
+        let weight_refs: Vec<&Tensor> = weights.iter().collect();
         let fused_weight = Tensor::cat(&weight_refs, 1);
-        let has_scale = projs.iter().any(|p| p.scale.is_some());
-        let scale = if has_scale {
+        let scale = if scales.iter().any(Option::is_some) {
             #[allow(clippy::expect_used)] // all_fp8 invariant: every proj has a scale
-            let scale_refs: Vec<&Tensor> = projs.iter()
-                .map(|p| p.scale.as_ref().expect("FP8 projection missing scale"))
+            let scale_refs: Vec<&Tensor> = scales.iter()
+                .map(|scale| scale.as_ref().expect("FP8 projection missing scale"))
                 .collect();
             Some(Tensor::cat(&scale_refs, 1))
         } else {
             None
         };
-        LinearProjection { weight: fused_weight, bias: None, scale }
+        match scale {
+            Some(s) => LinearProjection::with_scale(fused_weight, s),
+            None => LinearProjection::new(fused_weight),
+        }
     } else if any_fp8 {
         // Mixed FP8/BF16: dequantize FP8 projections to BF16 before catting.
         // Occurs for small gating projections in hybrid layers; memory impact is minor.
@@ -1725,15 +1734,17 @@ impl Qwen3_5Model {
             let mut down_s_vecs: Vec<Tensor> = Vec::with_capacity(n);
             for e in 0..n {
                 let ep = format!("{prefix}.experts.{e}");
-                let g = LinearProjection::take(weights, &format!("{ep}.gate_proj.weight"))?;
-                let u = LinearProjection::take(weights, &format!("{ep}.up_proj.weight"))?;
-                let d = LinearProjection::take(weights, &format!("{ep}.down_proj.weight"))?;
-                gate_w_vecs.push(g.weight.unsqueeze(0));
-                if let Some(s) = g.scale { gate_s_vecs.push(s.unsqueeze(0)); }
-                up_w_vecs.push(u.weight.unsqueeze(0));
-                if let Some(s) = u.scale { up_s_vecs.push(s.unsqueeze(0)); }
-                down_w_vecs.push(d.weight.unsqueeze(0));
-                if let Some(s) = d.scale { down_s_vecs.push(s.unsqueeze(0)); }
+                // These tensors go straight into batched stacks, never apply().
+                // Avoid constructing per-projection acceleration metadata.
+                let (g, gs) = LinearProjection::take_weight_and_scale(weights, &format!("{ep}.gate_proj.weight"))?;
+                let (u, us) = LinearProjection::take_weight_and_scale(weights, &format!("{ep}.up_proj.weight"))?;
+                let (d, ds) = LinearProjection::take_weight_and_scale(weights, &format!("{ep}.down_proj.weight"))?;
+                gate_w_vecs.push(g.unsqueeze(0));
+                if let Some(s) = gs { gate_s_vecs.push(s.unsqueeze(0)); }
+                up_w_vecs.push(u.unsqueeze(0));
+                if let Some(s) = us { up_s_vecs.push(s.unsqueeze(0)); }
+                down_w_vecs.push(d.unsqueeze(0));
+                if let Some(s) = ds { down_s_vecs.push(s.unsqueeze(0)); }
             }
             // Stack: [num_experts, in, out] (FP8) + optional [num_experts, in/128, out/128] scale
             let expert_gate_w     = Tensor::cat(&gate_w_vecs.iter().collect::<Vec<_>>(), 0);
@@ -2744,6 +2755,104 @@ mod pipeline_tests {
     const LIN_K_DIM: usize = 4;
     const LIN_V_DIM: usize = 4;
     const CONV_KERNEL: usize = 4;
+
+    /// Child-process probe for the FP8 causal gate test. Starting with
+    /// `HYPRSTREAM_FP8_GEMM=1` is essential because `with_scale` caches that
+    /// env decision for the process. This is an ownership/allocation probe:
+    /// it verifies source rowwise pairs are released before fusion builds the
+    /// fused pair, rather than merely checking a field exists afterwards.
+    #[test]
+    #[allow(clippy::print_stderr)]
+    fn fp8_fused_projection_metadata_probe() {
+        if std::env::var_os("HYPRSTREAM_QWEN_FP8_PROBE").is_none() {
+            return;
+        }
+        assert!(crate::config::default_fp8_gemm());
+        let w1 = Tensor::zeros([256, 256], (Kind::Float, Device::Cpu)).to_kind(Kind::Float8e4m3fn);
+        let w2 = Tensor::zeros([256, 256], (Kind::Float, Device::Cpu)).to_kind(Kind::Float8e4m3fn);
+        let s1 = Tensor::ones([2, 2], (Kind::Float, Device::Cpu));
+        let s2 = Tensor::ones([2, 2], (Kind::Float, Device::Cpu));
+        crate::runtime::architectures::llama::reset_rowwise_requant_peak();
+        let fused = cat_projs(vec![
+            LinearProjection::with_scale(w1, s1),
+            LinearProjection::with_scale(w2, s2),
+        ]);
+        assert_eq!(fused.weight.size(), [256, 512]);
+        assert_eq!(fused.scale.as_ref().expect("fused FP8 scale").size(), [2, 4]);
+        assert_eq!(fused.scale_v2.as_ref().expect("fused packed scale").size(), [4, 4]);
+        assert_eq!(crate::runtime::architectures::llama::rowwise_requant_live(), 1,
+            "fusion did not leave exactly its one derived rowwise allocation alive");
+        assert_eq!(crate::runtime::architectures::llama::rowwise_requant_peak(), 2,
+            "source rowwise allocations overlapped with fused rowwise construction");
+        eprintln!("Qwen fused FP8 allocation probe: source rowwise copies dropped before fused allocation");
+    }
+
+    /// Exercise the actual expert loader in a fresh process: the FP8 gate is
+    /// cached, and allocation witnesses must not include parallel tests.
+    #[test]
+    fn fp8_moe_loading_avoids_transient_requant() {
+        if std::env::var_os("HYPRSTREAM_QWEN_MOE_LOADING_PROBE").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime::architectures::qwen3_5::pipeline_tests::fp8_moe_loading_avoids_transient_requant", "--nocapture"])
+                .env("HYPRSTREAM_FP8_GEMM", "1")
+                .env("HYPRSTREAM_FP8_DEQUANT_LOAD", "0")
+                .env("HYPRSTREAM_QWEN_MOE_LOADING_PROBE", "1")
+                .output().expect("spawn MoE allocation probe");
+            let transcript = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success() && transcript.contains("1 passed"),
+                "MoE allocation probe did not pass: {transcript}");
+            return;
+        }
+        use crate::runtime::architectures::llama::{reset_rowwise_requant_peak, rowwise_requant_live, rowwise_requant_peak};
+        assert!(crate::config::default_fp8_gemm());
+        let mut cfg = tiny_config();
+        cfg.is_moe = true;
+        cfg.num_experts = 3;
+        cfg.num_experts_per_tok = 1;
+        let mut weights = HashMap::new();
+        weights.insert("mlp.gate.weight".to_owned(), Tensor::zeros([3, 128], (Kind::Float, Device::Cpu)));
+        for (name, shape) in [("gate_proj", [256, 128]), ("up_proj", [256, 128]), ("down_proj", [128, 256])] {
+            weights.insert(format!("mlp.shared_expert.{name}.weight"), Tensor::zeros(shape, (Kind::Float, Device::Cpu)));
+        }
+        let mut expected = Vec::new();
+        for e in 0..cfg.num_experts {
+            for (name, shape) in [("gate_proj", [256, 128]), ("up_proj", [256, 128]), ("down_proj", [128, 256])] {
+                let key = format!("mlp.experts.{e}.{name}.weight");
+                let weight = (Tensor::arange(shape[0] * shape[1], (Kind::Float, Device::Cpu)) * 0.01 + e as f64)
+                    .sin().reshape(shape).to_kind(Kind::Float8e4m3fn);
+                let scale = Tensor::from_slice(&[0.5f32 + e as f32, 1.5 + e as f32]).reshape([shape[0] / 128, shape[1] / 128]);
+                expected.push((name, e as i64, weight.transpose(0, 1).to_kind(Kind::Float), scale.transpose(0, 1).contiguous()));
+                weights.insert(key.clone(), weight);
+                weights.insert(format!("{key}_scale_inv"), scale);
+            }
+        }
+        reset_rowwise_requant_peak();
+        let Qwen3_5Mlp::Sparse(loaded) = Qwen3_5Model::load_mlp(&mut weights, "mlp", &cfg, 0).unwrap() else {
+            panic!("fixture must load sparse experts");
+        };
+        assert!(weights.is_empty(), "loader must consume checkpoint tensors");
+        assert_eq!(rowwise_requant_live(), 0);
+        assert_eq!(rowwise_requant_peak(), 0, "transient batched experts must never construct discarded rowwise copies");
+        for (name, e, weight, scale) in expected {
+            let (stacked_w, stacked_s) = match name {
+                "gate_proj" => (&loaded.expert_gate_w, &loaded.expert_gate_scale),
+                "up_proj" => (&loaded.expert_up_w, &loaded.expert_up_scale),
+                _ => (&loaded.expert_down_w, &loaded.expert_down_scale),
+            };
+            assert_eq!(stacked_w.kind(), Kind::Float8e4m3fn);
+            assert!(stacked_w.get(e).to_kind(Kind::Float).equal(&weight));
+            assert!(stacked_s.as_ref().unwrap().get(e).equal(&scale));
+        }
+        // A normal retained projection still builds the accelerated metadata;
+        // the zero expert peak must not be obtained by disabling the gate.
+        let retained = LinearProjection::with_scale(
+            Tensor::zeros([128, 256], (Kind::Float, Device::Cpu)).to_kind(Kind::Float8e4m3fn),
+            Tensor::ones([1, 2], (Kind::Float, Device::Cpu)),
+        );
+        assert!(retained.scale_v2.is_some());
+        assert_eq!(rowwise_requant_live(), 1);
+        assert_eq!(rowwise_requant_peak(), 1);
+    }
 
     #[test]
     fn gdn_chunked_continuation_preserves_recurrent_history() {

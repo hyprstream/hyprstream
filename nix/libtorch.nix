@@ -12,7 +12,7 @@
 { lib, stdenv, fetchurl, unzip, autoAddDriverRunpath, patchelf, zlib }:
 
 let
-  version = "2.10.0";
+  version = "2.11.0";
 
   mkLibtorchVariant = { variant, url, sha256, nativeBuildInputs ? [], postInstall ? "" }:
     let
@@ -49,7 +49,7 @@ in {
   cpu = mkLibtorchVariant {
     variant = "cpu";
     url = "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${version}%2Bcpu.zip";
-    sha256 = "c5bf8efda9224a2d971b19d1ef6cf3ba6fee8ab53e69c49427db003d1d300496";
+    sha256 = "ee3f453f6c3e3d934339875d76a2b04d6a1731554c016fc82be1f4b8d1d4ae62";
   };
 
   # CUDA 12.8: autoAddDriverRunpath patches bundled .so files to find libcuda.so.1
@@ -57,7 +57,7 @@ in {
   cuda128 = mkLibtorchVariant {
     variant = "cuda128";
     url = "https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-${version}%2Bcu128.zip";
-    sha256 = "429aa9fead3cf3d557e7c310442a1fae3879cdc14a469ff452043b39b61666a9";
+    sha256 = "e4732501926848c1fdec7411bf78952cd60b353ed990439eefacfebd34bc1351";
     nativeBuildInputs = [ autoAddDriverRunpath ];
   };
 
@@ -65,7 +65,7 @@ in {
   cuda130 = mkLibtorchVariant {
     variant = "cuda130";
     url = "https://download.pytorch.org/libtorch/cu130/libtorch-shared-with-deps-${version}%2Bcu130.zip";
-    sha256 = "7ca9216c5eecc39d61ef550cd50988f651bbe3982a2dcf4fd5982dc5dfce4ca0";
+    sha256 = "a163eff74ffc1eaf3827e808c8bad3a88338ca68b5733d0974c1cbc9bc033295";
     nativeBuildInputs = [ autoAddDriverRunpath ];
   };
 
@@ -75,7 +75,7 @@ in {
   rocm71 = mkLibtorchVariant {
     variant = "rocm71";
     url = "https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-${version}%2Brocm7.1.zip";
-    sha256 = "605532aeea2e22b639c2c4c239d2994f040457adff1a22cfb4c6d12b4b9641f7";
+    sha256 = "6d1bee01dea19ceb46c846c3fc7a2b71c816dabcfbc5da9b4266a41b1dc9f5eb";
     nativeBuildInputs = [ patchelf ];
     postInstall = ''
       # Match both unversioned (.so) and versioned (.so.1, .so.1.2, ...) sonames,

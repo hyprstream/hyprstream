@@ -98,6 +98,7 @@ jobs:
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
+            bash .github/scripts/verify-libtorch.sh
             cargo clippy --workspace --all-targets -- -D warnings
             # The workspace lint builds default features only, so the
             # RDS-backed PDS record store (#1257, `pds-postgres`) is cfg-gated

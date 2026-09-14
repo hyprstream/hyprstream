@@ -9,6 +9,8 @@
 # escaped inline heredoc.
 set -euo pipefail
 
+bash "$(dirname "${BASH_SOURCE[0]}")/verify-libtorch.sh"
+
 # The rust toolchain lives under root's home in the image; the workflow made it
 # a+rwX and created this ci user. CARGO_HOME/RUSTUP_HOME point back at it.
 export PATH="/root/.cargo/bin:/usr/local/bin:${PATH}"
