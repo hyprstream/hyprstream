@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use crate::auth::PolicyManager;
 use crate::auth::policy_templates;
 use crate::services::{EnvelopeContext, RequestService};
-use crate::services::generated::policy_client::{
-    ErrorInfo, PolicyHandler, PolicyResponseVariant, TokenInfo, ScopeList,
+use hyprstream_rpc_std::policy_client::{
+    ErrorInfo, PolicyResponseVariant, TokenInfo, ScopeList,
     PolicyCheck, PolicyCheckBatch, PolicyCheckBatchResult, IssueToken, IssueTokenProfile,
     ApplyTemplate, ApplyDraft, RollbackPolicy, GetHistory, GetDiff,
     PolicyInfo, PolicyRule, Grouping,
@@ -20,7 +20,9 @@ use crate::services::generated::policy_client::{
     RefreshServiceTokenRequest, ExchangeWit, ExchangeDelegated,
     RevokeCredential, CheckCredentialRevocation,
     RegisterSession, RevokeSession, CheckSession,
-    dispatch_policy, serialize_response,
+};
+use crate::services::generated::policy_client::{
+    PolicyHandler, dispatch_policy, serialize_response,
 };
 use anyhow::{anyhow, Result};
 use git2db::{Git2DB, RepoId};
@@ -39,7 +41,7 @@ use tracing::{debug, info, trace, warn};
 /// in its signed envelope so PolicyService can independently verify both the
 /// user and the hosted-account tenant.
 pub(crate) async fn check_with_verified_bearer(
-    client: &crate::services::PolicyClient,
+    client: &hyprstream_rpc_std::policy_client::PolicyClient,
     request: &PolicyCheck,
     bearer: Option<&str>,
     upstream_subject: &Subject,
@@ -4777,7 +4779,7 @@ mod tests {
                 .with_client_id("hyprstream-oauth-client-1"),
             &policy_key,
         );
-        let client = crate::services::PolicyClient::for_local_endpoint_bootstrap(
+        let client = hyprstream_rpc_std::policy_client::PolicyClient::for_local_endpoint_bootstrap(
             &format!("inproc://{endpoint}"),
             actor_key,
             policy_key.verifying_key(),

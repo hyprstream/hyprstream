@@ -2,8 +2,8 @@
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use crate::services::RegistryClient;
-use crate::services::generated::registry_client::{
+use hyprstream_rpc_std::registry_client::RegistryClient;
+use hyprstream_rpc_std::registry_client::{
     AddRemoteRequest, RemoveRemoteRequest, SetRemoteUrlRequest, RenameRemoteRequest,
 };
 use anyhow::Result;

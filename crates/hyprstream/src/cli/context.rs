@@ -5,7 +5,7 @@
 //! in an idiomatic Rust way.
 
 use crate::config::HyprConfig;
-use crate::services::RegistryClient;
+use hyprstream_rpc_std::registry_client::RegistryClient;
 use std::sync::Arc;
 
 /// Application context passed to all command handlers
@@ -17,7 +17,7 @@ use std::sync::Arc;
 /// # Example
 ///
 /// ```rust,ignore
-/// use crate::services::RegistryClient;
+/// use hyprstream_rpc_std::registry_client::RegistryClient;
 ///
 /// // Start registry service ONCE at CLI level
 /// let client: RegistryClient = RegistryClient::new(

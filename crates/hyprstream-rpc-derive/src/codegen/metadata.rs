@@ -7,9 +7,28 @@ use crate::resolve::ResolvedSchema;
 use crate::schema::types::*;
 use crate::util::*;
 
-/// Generate schema metadata + render_doc only (no JSON dispatcher).
-/// Used by `generate_rpc_client!` (client-only, compiles on all targets).
+/// Generate schema metadata + render_doc only for a server-side projection.
+/// Used by `generate_rpc_server!` (the contract crate owns the client).
 pub fn generate_metadata_client_only(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+    generate_metadata_client_projection(service_name, resolved, types_crate, false)
+}
+
+/// Generate the public client metadata, including the transport-agnostic JSON
+/// dispatcher used by schema-driven SDK tooling.
+pub fn generate_metadata_client_with_dispatch(
+    service_name: &str,
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    generate_metadata_client_projection(service_name, resolved, types_crate, true)
+}
+
+fn generate_metadata_client_projection(
+    service_name: &str,
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+    include_json_dispatcher: bool,
+) -> TokenStream {
     let metadata_structs = generate_metadata_structs();
     let pascal = to_pascal_case(service_name);
     let schema_metadata = generate_schema_metadata_fn(
@@ -20,6 +39,20 @@ pub fn generate_metadata_client_only(service_name: &str, resolved: &ResolvedSche
         resolved,
         &resolved.raw.scoped_clients,
     );
+    // This dispatcher only invokes methods on the generated transport-agnostic
+    // client. Keeping it here makes schema-driven tooling available from the
+    // Apache SDK without pulling in an implementation/service crate.
+    let json_dispatcher = if include_json_dispatcher {
+        generate_json_dispatcher(
+            &pascal,
+            &resolved.raw.request_variants,
+            &resolved.raw.response_variants,
+            resolved,
+            &resolved.raw.scoped_clients,
+        )
+    } else {
+        TokenStream::new()
+    };
     let scoped_client_tree = generate_scoped_client_tree(&resolved.raw.scoped_clients, types_crate);
     let render_doc = generate_render_doc(
         service_name,
@@ -31,6 +64,7 @@ pub fn generate_metadata_client_only(service_name: &str, resolved: &ResolvedSche
     quote! {
         #metadata_structs
         #schema_metadata
+        #json_dispatcher
         #scoped_client_tree
         #render_doc
     }
@@ -359,6 +393,21 @@ fn generate_json_method_dispatch_arm(
                 Ok(serde_json::to_value(&result)?)
             }
         },
+        _ if ct == CapnpType::Bool || ct.is_numeric() => {
+            let rust_ty = rust_type_tokens(&ct.rust_owned_type());
+            quote! {
+                #method_name_str => {
+                    let __value = args
+                        .get(#method_name_str)
+                        .or_else(|| args.get("value"))
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("missing argument for {}", #method_name_str))?;
+                    let value: #rust_ty = serde_json::from_value(__value)?;
+                    let result = self.#method_name(value).await?;
+                    Ok(serde_json::to_value(&result)?)
+                }
+            }
+        }
         _ => {
             if let Some(sdef) = resolved.find_struct(&v.type_name) {
                 let nuf: Vec<_> = sdef.non_union_fields().collect();
@@ -1121,3 +1170,56 @@ fn doc_first_sentence(desc: &str) -> &str {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod primitive_json_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn bool_and_numeric_arguments_generate_typed_json_calls() {
+        for (capnp_type, rust_type) in [
+            ("Bool", "bool"),
+            ("UInt8", "u8"),
+            ("UInt16", "u16"),
+            ("UInt32", "u32"),
+            ("UInt64", "u64"),
+            ("Int8", "i8"),
+            ("Int16", "i16"),
+            ("Int32", "i32"),
+            ("Int64", "i64"),
+            ("Float32", "f32"),
+            ("Float64", "f64"),
+        ] {
+            let variant: UnionVariant = serde_json::from_value(serde_json::json!({
+                "name": "setValue", "type_name": capnp_type, "description": "",
+                "scope": "write", "cli_hidden": false, "doc_example": ""
+            }))
+            .expect("primitive request variant");
+            let schema = ParsedSchema {
+                request_variants: vec![variant],
+                response_variants: vec![],
+                structs: vec![],
+                scoped_clients: vec![],
+                enums: vec![],
+                request_struct: None,
+                response_struct: None,
+            };
+            let resolved = ResolvedSchema::from(&schema);
+            for scoped in [false, true] {
+                let arm = generate_json_method_dispatch_arm(
+                    &schema.request_variants[0],
+                    &[],
+                    scoped,
+                    &resolved,
+                );
+                let text = arm.to_string();
+                assert!(text.contains(&format!("let value : {rust_type}")), "{text}");
+                assert!(text.contains("serde_json :: from_value"), "{text}");
+                assert!(text.contains("self . set_value (value) . await"), "{text}");
+                assert!(!text.contains("struct type not found"), "{text}");
+                syn::parse2::<syn::Expr>(quote! { match method { #arm _ => unreachable!() } })
+                    .expect("primitive dispatch arm is valid Rust syntax");
+            }
+        }
+    }
+}

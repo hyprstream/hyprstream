@@ -45,13 +45,13 @@ pub const SERVICE_NAME: &str = "flight";
 /// Flight's gRPC authentication and tenant-policy adapter.
 pub struct TenantFlightAuthorizer {
     auth: crate::server::state::ResourceAuthState,
-    policy_client: crate::services::PolicyClient,
+    policy_client: hyprstream_rpc_std::policy_client::PolicyClient,
 }
 
 impl TenantFlightAuthorizer {
     pub fn new(
         auth: crate::server::state::ResourceAuthState,
-        policy_client: crate::services::PolicyClient,
+        policy_client: hyprstream_rpc_std::policy_client::PolicyClient,
     ) -> Self {
         Self {
             auth,
@@ -116,7 +116,7 @@ impl hyprstream_flight::FlightAuthorizer for TenantFlightAuthorizer {
         })?;
         let upstream_subject =
             hyprstream_rpc::envelope::Subject::new(identity.user.clone());
-        let request = crate::services::generated::policy_client::PolicyCheck {
+        let request = hyprstream_rpc_std::policy_client::PolicyCheck {
             subject: identity.user,
             domain,
             resource: resource.to_owned(),

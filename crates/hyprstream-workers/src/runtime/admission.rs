@@ -76,7 +76,7 @@ use hyprstream_vfs::Subject;
 
 use crate::error::{Result, WorkerError};
 
-use super::client::{KeyValue, PodSandboxConfig};
+use hyprstream_rpc_std::worker_client::{KeyValue, PodSandboxConfig};
 
 /// Annotation key: per-request GPU count demand (a plain non-negative
 /// integer string, e.g. `"1"`). Independent of `oci_backend`'s existing

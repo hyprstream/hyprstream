@@ -1053,16 +1053,9 @@ pub async fn create_record(
             )
         }
     };
-    let expected_prev = match object.get("swapCommit") {
-        None => None,
-        Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
-        Some(_) => {
-            return xrpc_error(
-                StatusCode::BAD_REQUEST,
-                errors::INVALID_REQUEST,
-                "swapCommit must be a non-empty CID string when present",
-            )
-        }
+    let expected_prev = match parse_swap_commit(object.get("swapCommit")) {
+        Ok(value) => value,
+        Err(message) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message),
     };
     let validate = match object.get("validate") {
         None => true, // Both collections in this posting slice have known schemas.
@@ -1075,16 +1068,9 @@ pub async fn create_record(
             )
         }
     };
-    let return_record = match object.get("returnRecord") {
-        None => false,
-        Some(Value::Bool(value)) => *value,
-        Some(_) => {
-            return xrpc_error(
-                StatusCode::BAD_REQUEST,
-                errors::INVALID_REQUEST,
-                "returnRecord must be a boolean when present",
-            )
-        }
+    let return_record = match parse_return_record(object.get("returnRecord")) {
+        Ok(value) => value,
+        Err(message) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message),
     };
     let mut idempotency_keys = headers.get_all("Idempotency-Key").iter();
     let request_id = match idempotency_keys.next() {
@@ -1291,6 +1277,23 @@ pub async fn create_record(
     (StatusCode::OK, axum::Json(response)).into_response()
 }
 
+fn parse_swap_commit(value: Option<&Value>) -> Result<Option<&str>, &'static str> {
+    match value {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.as_str())),
+        Some(Value::String(_)) => Err("swapCommit must be a non-empty CID"),
+        Some(_) => Err("swapCommit must be a string"),
+    }
+}
+
+fn parse_return_record(value: Option<&Value>) -> Result<bool, &'static str> {
+    match value {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err("returnRecord must be a boolean"),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1341,6 +1344,17 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn create_record_optional_fields_reject_wrong_types() {
+        assert_eq!(parse_swap_commit(None).unwrap(), None);
+        assert_eq!(parse_swap_commit(Some(&json!("bafyhead"))).unwrap(), Some("bafyhead"));
+        assert_eq!(parse_swap_commit(Some(&json!(""))).unwrap_err(), "swapCommit must be a non-empty CID");
+        assert_eq!(parse_swap_commit(Some(&json!(42))).unwrap_err(), "swapCommit must be a string");
+        assert!(!parse_return_record(None).unwrap());
+        assert!(parse_return_record(Some(&Value::Bool(true))).unwrap());
+        assert_eq!(parse_return_record(Some(&json!("yes"))).unwrap_err(), "returnRecord must be a boolean");
     }
 
     // ── Finding 1: lazy CAR + owned permit held until EOF ───────────────────
@@ -1697,7 +1711,8 @@ mod tests {
     // ── Router-mounted tests (findings 1 + 2) ─────────────────────────────────
 
     use crate::config::OAuthConfig;
-    use crate::services::{DiscoveryClient, PolicyClient};
+    use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+    use hyprstream_rpc_std::policy_client::PolicyClient;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use axum::Router;

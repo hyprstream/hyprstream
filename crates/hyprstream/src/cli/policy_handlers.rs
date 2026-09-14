@@ -13,7 +13,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::auth::{jwt, Claims};
-use crate::services::generated::policy_client::{
+use hyprstream_rpc_std::policy_client::{
     PolicyClient, GetHistory, GetDiff, ApplyDraft, RollbackPolicy, PolicyCheck, ApplyTemplate,
     AddGrouping, RemoveGrouping,
 };
@@ -33,7 +33,7 @@ use std::process::Command;
 /// `podman exec` process that did not start the PolicyService itself.
 pub(crate) fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
     if hyprstream_discovery::native_network_required() {
-        return PolicyClient::from_resolver(signing_key.clone(), None);
+        return PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), None);
     }
     let registry = hyprstream_rpc::registry::try_global()
         .ok_or_else(|| anyhow::anyhow!("EndpointRegistry not initialized"))?;

@@ -1,7 +1,7 @@
 //! CLI handlers for adaptive ML inference server
 
-use crate::services::RegistryClient;
-use crate::services::generated::registry_client::CreateTagRequest;
+use hyprstream_rpc_std::registry_client::RegistryClient;
+use hyprstream_rpc_std::registry_client::CreateTagRequest;
 use crate::training::{CheckpointManager, WeightFormat, WeightSnapshot};
 use ::config::{Config, File};
 use reqwest::Client;

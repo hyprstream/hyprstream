@@ -12,6 +12,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
+# The settlement/tariff protocol is intentionally MIT.  Re-exporting it below
+# keeps the public RPC catalog discoverable without relicensing the protocol or
+# pulling the AGPL service implementation into this crate.
+hyprstream-pay = { path = "../hyprstream-pay" }
 
 capnp = { workspace = true }
 anyhow = { workspace = true }

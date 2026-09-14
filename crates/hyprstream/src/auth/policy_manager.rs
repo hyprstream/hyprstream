@@ -33,10 +33,11 @@
 
 use crate::auth::policy_templates::{base_policies_to_csv, base_policies_to_vec, ServiceGrouping, ServicePolicyRule};
 use crate::auth::Operation;
+use crate::auth::policy_file_adapter::PolicyFileAdapter;
 use casbin::function_map::{dynamic_to_str, OperatorFunction};
 use casbin::rhai::Dynamic;
 use casbin::{
-    CoreApi, DefaultModel, Enforcer, FileAdapter, MemoryAdapter, MgmtApi, RbacApi,
+    CoreApi, DefaultModel, Enforcer, MemoryAdapter, MgmtApi, RbacApi,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -536,7 +537,7 @@ impl PolicyManager {
             .map_err(|e| PolicyError::ModelLoadError(e.to_string()))?;
 
         // Create enforcer with file adapter
-        let adapter = FileAdapter::new(policy_path.to_string_lossy().to_string());
+        let adapter = PolicyFileAdapter::new(policy_path.clone());
         let mut enforcer = Enforcer::new(model, adapter)
             .await
             .map_err(|e| PolicyError::PolicyLoadError(e.to_string()))?;

@@ -25,6 +25,7 @@ mod cipher_glue;
 pub mod pglite_store;
 #[cfg(feature = "postgres")]
 pub mod postgres_store;
+mod policy_file_adapter;
 mod policy_manager;
 pub mod policy_migration;
 pub mod policy_templates;

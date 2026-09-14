@@ -8,6 +8,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
+use hyprstream_rpc_std::inference_client::{GenerationRequest, ModelInfo};
+
+// Preserve the public runtime API while sharing the canonical RPC enum.
+pub use hyprstream_rpc_std::model_client::KVQuantType;
 
 // Re-export everything from the unified config
 pub use crate::config::{
@@ -15,27 +19,16 @@ pub use crate::config::{
     ModelConfig, RuntimeConfig,
 };
 
-/// Generation request — uses the generated Cap'n Proto struct directly.
-///
-/// All sampling parameters are `Option<T>` to represent "not specified",
-/// enabling clean precedence: Server defaults → Model defaults → User overrides.
-/// The engine resolves `None` to defaults at generation time.
-pub use crate::services::generated::inference_client::GenerationRequest;
-
-/// Model information — uses the generated Cap'n Proto struct directly.
-pub use crate::services::generated::inference_client::ModelInfo;
-
 pub mod architectures; // Architecture-specific model implementations (includes Janus placeholder utils)
 pub mod ttn_profile;  // TTN analysis pipeline: adaptive layer profiling + embedded profiles
 pub mod batched_lora; // Batched multi-tenant LoRA forward pass
 // REMOVED: pub mod conversation_router; // Dead code - VDB TemporalStreamingLayer removed
 pub mod generation_metrics; // Quality metrics for self-supervised training
 pub mod token_metrics; // OpenTelemetry token-burn metering (prompt + generated tokens per request)
-// KV cache quantization — re-export the generated Cap'n Proto enum as canonical type
-pub use crate::services::generated::model_client::KVQuantType;
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling
 pub mod device_pool; // Multi-GPU device abstraction (DevicePool) — Send+Sync, holds only Device values
 pub mod image_utils; // Image loading and preprocessing for multimodal models
+pub mod inference_stage; // Thread-local execution boundary for one decoder stage
 pub mod inference_profile; // Explicit inference isolation/deployment scheduling profile
 pub mod kv_cache; // Key-Value caching for efficient autoregressive generation
 pub mod kv_compat; // KV-cache compatibility fingerprint + rejection policy (#1277)
@@ -50,6 +43,9 @@ pub mod torch_utils; // Utilities for safe PyTorch operations with OOM handling
 pub mod weight_provider; // Weight provider for streaming large models
 
 // Primary exports - use TorchEngine as default
+pub use inference_stage::{
+    InferenceStage, StageContract, StageInput, StageOutput, StageSequence, StageTensor,
+};
 pub use torch_engine::{TorchEngine, TextStream, GenerationStats};
 
 // Multi-GPU device abstraction

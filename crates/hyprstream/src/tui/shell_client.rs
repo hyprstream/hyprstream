@@ -3,7 +3,7 @@
 //! Thin wrappers around generated `TuiClient` typed methods for ergonomic
 //! call-site usage: spawnShell, pollStdin, focusWindow, spawnChatApp, closeWindow.
 
-use crate::services::generated::tui_client::{
+use hyprstream_rpc_std::tui_client::{
     SpawnShellRequest, SpawnChatAppRequest, TuiClient,
 };
 

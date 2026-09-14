@@ -11,7 +11,7 @@ use super::qwen3_5_vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 use super::{ModelArchitecture, ModelOperations};
 use crate::runtime::device_pool::LayerDeviceMap;
 use crate::runtime::kv_cache::KVCacheManager;
-use crate::runtime::KVQuantType;
+use hyprstream_rpc_std::model_client::KVQuantType;
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::rope::RoPE;
 use crate::runtime::tensor_helpers::{dims3, dims4};
@@ -1510,7 +1510,7 @@ impl Qwen3_5Model {
         vision_cfg: Option<Qwen3_5VisionConfig>,
         device: &Device,
         dtype: Kind,
-        _kv_quant_type: KVQuantType,
+        kv_quant_type: KVQuantType,
         speculative_decoding: bool,
     ) -> Result<Self> {
         // Normalize weight key prefixes:
@@ -1581,10 +1581,10 @@ impl Qwen3_5Model {
         // MTP (multi-token prediction) head: 1-layer self-speculative draft module.
         // v1 loads dense checkpoints only; MoE MTP blocks (~785 tensors) are a
         // documented follow-up — fall back to non-speculative decode there.
-        let mtp = if !speculative_decoding {
+        let mtp = if !speculative_decoding || kv_quant_type != KVQuantType::None {
             // Factory loading filters these before device allocation. Direct
             // callers may supply already-materialized tensors; discard them
-            // here too rather than retaining a disabled draft head.
+            // here too rather than retaining a disabled/unusable draft head.
             weights.retain(|k, _| !k.starts_with("mtp."));
             None
         } else if weights.keys().any(|k| k.starts_with("mtp.")) {
@@ -1682,7 +1682,7 @@ impl Qwen3_5Model {
             crate::runtime::kv_cache::KVCacheManager::new(
                 num_layers + usize::from(mtp.is_some()),
                 cfg.max_position_embeddings as usize,
-                _kv_quant_type,
+                kv_quant_type,
             ),
         )));
 
@@ -3828,6 +3828,30 @@ pub(crate) mod mtp_tests {
                 KVQuantType::None, runtime.speculative_decoding,
             ).unwrap();
             assert_eq!(model.has_mtp(), enabled);
+            assert!(!weights.keys().any(|name| name.starts_with("mtp.")));
+        }
+    }
+
+    #[test]
+    fn mtp_quantized_direct_model_drops_head() {
+        for kv in [
+            KVQuantType::None,
+            KVQuantType::Int8,
+            KVQuantType::Nf4,
+            KVQuantType::Fp4,
+        ] {
+            let mut weights = tiny_weights_mtp();
+            let model = Qwen3_5Model::from_weights(
+                &mut weights,
+                tiny_config(),
+                None,
+                &Device::Cpu,
+                Kind::Float,
+                kv,
+                true,
+            )
+            .unwrap();
+            assert_eq!(model.has_mtp(), kv == KVQuantType::None, "KV mode {kv:?}");
             assert!(!weights.keys().any(|name| name.starts_with("mtp.")));
         }
     }

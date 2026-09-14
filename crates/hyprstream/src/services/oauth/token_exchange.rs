@@ -21,7 +21,7 @@ use subtle::ConstantTimeEq as _;
 
 use super::state::{DpopJtiAdmission, OAuthState};
 use crate::mac::exchange::{GrantDecision, GrantError, GrantRequest, GrantedAccess};
-use crate::services::generated::policy_client::{IssueToken, IssueTokenProfile};
+use hyprstream_rpc_std::policy_client::{IssueToken, IssueTokenProfile};
 use hyprstream_pds::repo_authority::is_path_form_did_web;
 // #1425: the browser RFC 8693 sender-bound contract. The public client_id is
 // the single source of truth shared with the WASM client (`hyprstream-rpc`),
@@ -2019,7 +2019,8 @@ mod tests {
 
     fn mint_test_state() -> Arc<OAuthState> {
         use crate::config::OAuthConfig;
-        use crate::services::{DiscoveryClient, PolicyClient};
+        use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+        use hyprstream_rpc_std::policy_client::PolicyClient;
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
         use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
