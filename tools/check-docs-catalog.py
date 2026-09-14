@@ -206,6 +206,96 @@ def mcp_registrations(source: str) -> tuple[list[str], dict[str, list[dict[str, 
     return list(dict.fromkeys(service for _, service in sorted(ordered))), roots
 
 
+def rust_block_span(source: str, start: int, label: str) -> tuple[str, int]:
+    """Return a brace-delimited code block and the index after its close."""
+    opening = source.find("{", start)
+    required(opening >= 0, f"{label} has no block")
+    index, depth = opening, 1
+    while depth:
+        index += 1
+        required(index < len(source), f"unterminated {label} block")
+        depth += (source[index] == "{") - (source[index] == "}")
+    return source[opening + 1:index], index + 1
+
+
+def direct_matches(body: str, pattern: str) -> list[re.Match[str]]:
+    """Matches at direct block scope; nested dead branches cannot satisfy policy."""
+    matches = []
+    for match in re.finditer(pattern, body):
+        depth = 0
+        for char in body[:match.start()]:
+            depth += (char == "{") - (char == "}")
+        if depth == 0:
+            matches.append(match)
+    return matches
+
+
+def direct_call_only(body: str, pattern: str, label: str) -> bool:
+    """Accept one direct call expression and no preceding/following branch control flow."""
+    calls = direct_matches(body, pattern)
+    if len(calls) != 1 or body[:calls[0].start()].strip():
+        return False
+    opening = body.find("(", calls[0].start())
+    if opening < 0:
+        return False
+    index, depth = opening, 1
+    while depth:
+        index += 1
+        if index >= len(body):
+            return False
+        depth += (body[index] == "(") - (body[index] == ")")
+    tail = body[index + 1:]
+    return tail.startswith(";") and not tail[1:].strip()
+
+
+def mcp_loop_policy(body: str, label: str) -> tuple[bool, bool]:
+    """Verify the effective hidden and streaming branches of one method loop."""
+    loops = list(re.finditer(r"\bfor\s+method\s+in\s+methods\s*\{", body))
+    required(len(loops) == 1, f"ambiguous MCP {label} method loop")
+    loop, _ = rust_block_span(body, loops[0].start(), f"MCP {label} method loop")
+    hidden = direct_matches(loop, r"\bif\s+method\.hidden\s*\{")
+    required(len(hidden) == 1, f"MCP {label} hidden guard must be direct and unique")
+    hidden_body, _ = rust_block_span(loop, hidden[0].start(), f"MCP {label} hidden guard")
+    hidden_effective = hidden_body.strip() == "continue;"
+    streaming = direct_matches(loop, r"\bif\s+method\.is_streaming\s*\{")
+    required(len(streaming) == 1, f"MCP {label} streaming branch must be direct and unique")
+    hidden_effective = hidden_effective and hidden[0].start() < streaming[0].start()
+    streaming_body, end = rust_block_span(loop, streaming[0].start(), f"MCP {label} streaming branch")
+    else_match = re.match(r"\s*else\s*\{", loop[end:])
+    if else_match is None:
+        return hidden_effective, False
+    sync_body, _ = rust_block_span(loop, end + else_match.start(), f"MCP {label} synchronous branch")
+    if label == "top-level":
+        streaming_effective = (direct_call_only(streaming_body, r"\bregister_streaming_tool\s*\(", label)
+                               and direct_call_only(sync_body, r"\bregister_sync_tool\s*\(", label))
+    else:
+        def scoped_registration(branch: str, flag: str) -> bool:
+            registrations = direct_matches(branch, r"\breg\.register\s*\(\s*ToolEntry\s*\{")
+            if not direct_call_only(branch, r"\breg\.register\s*\(", label) or len(registrations) != 1:
+                return False
+            entry, _ = rust_block_span(branch, registrations[0].start(), f"MCP {label} ToolEntry")
+            return len(direct_matches(entry, rf"\bstreaming\s*:\s*{flag}\s*,")) == 1
+        streaming_effective = scoped_registration(streaming_body, "true") and scoped_registration(sync_body, "false")
+    return hidden_effective, streaming_effective
+
+
+def mcp_method_policy(source: str) -> dict[str, str]:
+    """Derive policy from the two runtime registration loops, not token counts."""
+    code = strip_rust_noncode(source)
+    roots = list(re.finditer(r"\bfn register_schema_tools(?=\s*\()", code))
+    helpers = list(re.finditer(r"\bfn register_scoped_tools_recursive(?=\s*\()", code))
+    required(len(roots) == 1, "missing or ambiguous MCP registration root")
+    required(len(helpers) == 1, "missing or ambiguous MCP scoped registration helper")
+    top, _ = rust_block_span(code, roots[0].start(), "MCP registration root")
+    scoped, _ = rust_block_span(code, helpers[0].start(), "MCP scoped registration helper")
+    top_hidden, top_streaming = mcp_loop_policy(top, "top-level")
+    scoped_hidden, scoped_streaming = mcp_loop_policy(scoped, "scoped")
+    return {
+        "hidden": "excluded" if top_hidden and scoped_hidden else "unknown",
+        "streaming": "included" if top_streaming and scoped_streaming else "unknown",
+    }
+
+
 def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict[str, dict[str, Any]]:
     cli_source = text(repo, "crates/hyprstream/src/cli/schema_cli.rs", mutations)
     mcp_source = text(repo, "crates/hyprstream/src/services/mcp_service.rs", mutations)
@@ -314,14 +404,12 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
             "source": CONSUMER_SOURCE_PATHS["mcp"],
             "services": mcp_services,
             "registrations": mcp_roots,
-            "method_policy": {
-                "hidden": "excluded" if len(re.findall(r"if\s+method\.hidden\s*\{", mcp)) == 2 else "unknown",
-                "streaming": "included" if len(re.findall(r"if\s+method\.is_streaming\s*\{", mcp)) == 2 else "unknown",
-            },
+            "method_policy": mcp_method_policy(mcp_source),
         },
         "factory": {"source": CONSUMER_SOURCE_PATHS["factory"], "services": factory_services, "feature_conditions": features, "schema_attributes": schema_attributes},
         "vfs": {"source": CONSUMER_SOURCE_PATHS["vfs"], "services": vfs_services, "dispatches": vfs_dispatches},
-        "typescript": {"tracked_sources": ts_sources},
+        "typescript": {"tracked_sources": ts_sources,
+                       "schema_imports": typescript_schema_imports(repo, mutations)},
     }
 
 
@@ -773,13 +861,18 @@ TS_SPECIFIER_MARKER = re.compile(r"@hyprstream/docs|codegen-out|\.capnp$")
 TS_DEPENDENCY = re.compile(r"(?:\brequire\s*\(\s*|\bimport\s*\(\s*|\bimport\s+|\bfrom\s+)(['\"`]\0+['\"`])")
 
 
-def ts_source_is_consumer(source: str) -> bool:
+def ts_dependency_specifiers(source: str) -> list[str]:
     code, strings = js_code_and_strings(source)
+    specifiers = []
     for match in TS_DEPENDENCY.finditer(code):
         specifier = strings.get(match.start(1) + 1)
-        if specifier is not None and TS_SPECIFIER_MARKER.search(specifier):
-            return True
-    return False
+        if specifier is not None:
+            specifiers.append(specifier)
+    return specifiers
+
+
+def ts_source_is_consumer(source: str) -> bool:
+    return any(TS_SPECIFIER_MARKER.search(specifier) for specifier in ts_dependency_specifiers(source))
 
 
 def is_package_manifest(path: str) -> bool:
@@ -803,6 +896,26 @@ def typescript_schema_sources(repo: Path, mutations: dict[str, str] | None = Non
     candidates = candidates if candidates is not None else tracked(repo, *("*" + suffix for suffix in TS_SOURCE_SUFFIXES), "package.json", "**/package.json")
     return sorted(path for path in candidates if not deleted(path, mutations)
                   and typescript_consumer(path, text(repo, path, mutations)))
+
+
+def typescript_schema_imports(repo: Path, mutations: dict[str, str] | None = None) -> list[str]:
+    """Resolve concrete Cap'n Proto imports to one tracked catalog source each."""
+    schema_paths = tracked(repo, "*.capnp")
+    by_name: dict[str, list[str]] = {}
+    for path in schema_paths:
+        by_name.setdefault(Path(path).name, []).append(path)
+    resolved = []
+    for path in typescript_schema_sources(repo, mutations):
+        if is_package_manifest(path):
+            continue
+        for specifier in ts_dependency_specifiers(text(repo, path, mutations)):
+            if not specifier.endswith(".capnp"):
+                continue
+            candidates = by_name.get(Path(specifier).name, [])
+            required(len(candidates) == 1,
+                     f"TypeScript consumer {path} has unresolved or ambiguous schema import {specifier}")
+            resolved.append(candidates[0])
+    return sorted(set(resolved))
 
 
 def split_top_level(value: str) -> list[str]:
@@ -1125,8 +1238,9 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
     owner_directories = check_owner_directories(catalog, repo)
     inventories = check_cgr(catalog, repo, schemas, mutations)
     for entry in schemas:
-        for key in ("owner", "license", "kind", "exclusions"):
+        for key in ("owner", "license", "kind"):
             required(bool(entry.get(key)), f"{entry['path']} lacks {key}")
+        required(isinstance(entry.get("exclusions"), dict), f"{entry['path']} exclusions must be an object")
         _, owner, license_id = owner_manifest(repo, entry["path"], owner_directories)
         required(entry["owner"] == owner, f"{entry['path']} owner differs from path-derived package")
         required(entry["license"] == license_id, f"{entry['path']} license differs from owner manifest")
@@ -1205,6 +1319,12 @@ def check_schema_catalog(catalog: dict[str, Any], repo: Path, schema_paths: list
         if surface == "vfs":
             required(record.get("dispatches") == actual.get("dispatches"), "VFS generated-module binding drift")
         if surface == "typescript":
+            required(record.get("schema_imports") == actual.get("schema_imports"),
+                     "TypeScript concrete schema import inventory drift")
+            by_path = {entry["path"]: entry for entry in schemas}
+            for path in actual["schema_imports"]:
+                required(path in by_path and "typescript" in by_path[path].get("surfaces", []),
+                         f"{path} imported by TypeScript but excluded from TypeScript surface")
             continue
         for service in record[key]:
             if service not in by_service:
@@ -1721,6 +1841,29 @@ def self_test(repo: Path) -> None:
     regex_literal = {"web/regex.ts": 'const dependency_decoy = /require("fixture.capnp")/;\n'}
     required(typescript_schema_sources(repo, regex_literal, ["web/regex.ts"]) == [],
              "regex-literal schema marker counted as a consumer")
+    ts_path = ".github/scripts/verify-rpc-std-wasm-package.mjs"
+    concrete_import = {ts_path: text(repo, ts_path, None) + '\nimport "./registry.capnp";\n'}
+    concrete_consumers = source_services(repo, concrete_import)
+    required(concrete_consumers["typescript"]["schema_imports"] == ["crates/hyprstream-rpc-std/schema/registry.capnp"],
+             "concrete TypeScript schema import inventory drift")
+    bad = copy.deepcopy(catalog)
+    bad["consumer_sets"]["typescript"] = {
+        "state": "active", "tracked_sources": [ts_path],
+        "schema_imports": ["crates/hyprstream-rpc-std/schema/registry.capnp"],
+    }
+    expect_failure("TypeScript concrete schema surface", repo, bad, corpus, schemas,
+                   concrete_consumers, concrete_import)
+    positive = copy.deepcopy(catalog)
+    positive["consumer_sets"]["typescript"] = {
+        "state": "active", "tracked_sources": [ts_path],
+        "schema_imports": ["crates/hyprstream-rpc-std/schema/registry.capnp"],
+    }
+    registry = next(entry for entry in positive["schemas"]
+                    if entry["path"] == "crates/hyprstream-rpc-std/schema/registry.capnp")
+    registry["surfaces"].append("typescript")
+    registry["exclusions"].pop("typescript")
+    expect_success("TypeScript concrete schema surface declared", repo, positive, corpus, schemas,
+                   concrete_import)
     mcp_path = "crates/hyprstream/src/services/mcp_service.rs"
     for label, needle in [("hidden policy", "if method.hidden {"),
                           ("streaming policy", "if method.is_streaming {")]:
@@ -1728,6 +1871,30 @@ def self_test(repo: Path) -> None:
             mutated = replace_nth(text(repo, mcp_path, None), needle, "if false {", occurrence)
             expect_failure(f"MCP {path_name} {label}", repo, copy.deepcopy(catalog), corpus, schemas,
                            source_services(repo, {mcp_path: mutated}), {mcp_path: mutated})
+    for label, before, after in [
+        ("hidden guard is effective", "if method.hidden {\n                    continue;",
+         "if method.hidden {}\n                if false { continue;"),
+        ("streaming branch is effective", "if method.is_streaming {",
+         "if method.is_streaming {}\n                if false {"),
+    ]:
+        mutated = replace_nth(text(repo, mcp_path, None), before, after, 1)
+        expect_failure(f"MCP top-level {label}", repo, copy.deepcopy(catalog), corpus, schemas,
+                       source_services(repo, {mcp_path: mutated}), {mcp_path: mutated})
+    nested_stream = text(repo, mcp_path, None).replace(
+        "register_streaming_tool(\n", "if false { register_streaming_tool(\n", 1
+    ).replace("                } else {\n                    register_sync_tool(",
+              "                }\n                } else {\n                    register_sync_tool(", 1)
+    expect_failure("MCP nested streaming registration", repo, copy.deepcopy(catalog), corpus, schemas,
+                   source_services(repo, {mcp_path: nested_stream}), {mcp_path: nested_stream})
+    precontinued_stream = text(repo, mcp_path, None).replace(
+        "if method.is_streaming {\n", "if method.is_streaming {\n                    continue;\n", 1)
+    expect_failure("MCP precontinued streaming registration", repo, copy.deepcopy(catalog), corpus, schemas,
+                   source_services(repo, {mcp_path: precontinued_stream}), {mcp_path: precontinued_stream})
+    delayed_hidden = ("for method in methods {\n"
+                      "if method.is_streaming { register_streaming_tool(); } else { register_sync_tool(); }\n"
+                      "if method.hidden { continue; }\n}")
+    required(mcp_loop_policy(delayed_hidden, "top-level") == (False, True),
+             "MCP hidden guard after registration is accepted")
     # Scoped roots are a separate projection even when their service also
     # has top-level tools. Their removal or rebinding must update the catalog.
     scoped_source = text(repo, mcp_path, None)
