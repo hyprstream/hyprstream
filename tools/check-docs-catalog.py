@@ -185,14 +185,22 @@ def mcp_registrations(source: str) -> tuple[list[str], dict[str, list[dict[str, 
     raw = source[start:start + len(body)]
     roots: dict[str, list[dict[str, str]]] = {"top_level": [], "scoped": []}
     ordered = []
-    for match in re.finditer(r"\bregister_top_level!\s*\(", body):
+    top_level_calls = list(re.finditer(r"\bregister_top_level!\s*\(", body))
+    scoped_calls = list(re.finditer(r"\bregister_scoped_tools_recursive\s*\(", body))
+    direct_top_level = direct_matches(body, r"\bregister_top_level!\s*\(")
+    direct_scoped = direct_matches(body, r"\bregister_scoped_tools_recursive\s*\(")
+    required(len(top_level_calls) == len(direct_top_level),
+             "MCP top-level registration roots must be direct")
+    required(len(scoped_calls) == len(direct_scoped),
+             "MCP scoped registration roots must be direct")
+    for match in direct_top_level:
         args = re.match(r"\s*reg\s*,\s*([A-Za-z_][\w:]*)::schema_metadata\s*\(\s*\)\s*,?\s*\)", body[match.end():])
         required(args is not None, "unresolved MCP top-level registration")
         module = args.group(1)
         service = module.rsplit("::", 1)[-1].removesuffix("_client")
         roots["top_level"].append({"service": service, "module": module})
         ordered.append((match.start(), service))
-    for match in re.finditer(r"\bregister_scoped_tools_recursive\s*\(", body):
+    for match in direct_scoped:
         first = re.match(r"\s*reg\s*,\s*", body[match.end():])
         required(first is not None, "unresolved MCP scoped registration registry")
         service, end = rust_string(raw, match.end() + first.end(), "MCP scoped service")
@@ -296,6 +304,21 @@ def mcp_method_policy(source: str) -> dict[str, str]:
     }
 
 
+def cli_method_policy(source: str) -> bool:
+    """Each CLI builder must directly exclude hidden and streaming methods."""
+    code = strip_rust_noncode(source)
+    for builder in CLI_BUILDERS:
+        body = rust_fn_body(code, builder)
+        loops = list(re.finditer(r"\bfor\s+method\s+in\s+&?methods\s*\{", body))
+        required(len(loops) == 1, f"CLI {builder} method loop must be unique")
+        loop, _ = rust_block_span(body, loops[0].start(), f"CLI {builder} method loop")
+        guards = direct_matches(loop, r"\bif\s+method\.cli_hidden\s*\|\|\s*method\.is_streaming\s*\{")
+        required(len(guards) == 1, f"CLI {builder} guard must be direct and unique")
+        guard_body, _ = rust_block_span(loop, guards[0].start(), f"CLI {builder} guard")
+        required(guard_body.strip() == "continue;", f"CLI {builder} guard must continue")
+    return True
+
+
 def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict[str, dict[str, Any]]:
     cli_source = text(repo, "crates/hyprstream/src/cli/schema_cli.rs", mutations)
     mcp_source = text(repo, "crates/hyprstream/src/services/mcp_service.rs", mutations)
@@ -344,8 +367,7 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
         registrations.append((match.start(), service, methods, None))
     registrations.sort()
     cli_services = [service for _, service, _, _ in registrations]
-    guard = "if method.cli_hidden || method.is_streaming"
-    cli_guarded = all(guard in rust_fn_body(cli, name) for name in CLI_BUILDERS)
+    cli_guarded = cli_method_policy(cli_source)
     manual_services = {service: methods for _, service, methods, _ in registrations if methods is not None}
     cli_modules = {service: modules for _, service, _, modules in registrations if modules is not None}
     mcp_services, mcp_roots = mcp_registrations(mcp_source)
@@ -423,12 +445,12 @@ def audited_input(repo: Path, event: str | None = None, revision: str | None = N
     event = event or os.environ.get("DOCS_CATALOG_EVENT", "local")
     revision = revision or os.environ.get("DOCS_CATALOG_AUDITED_COMMIT")
     head = git(repo, "rev-parse", "HEAD")
-    if event in {"pull_request", "push"}:
+    if event in {"pull_request", "merge_group", "push"}:
         expected_head = os.environ.get("DOCS_CATALOG_AUDITED_HEAD")
         required(expected_head in {None, head}, "checkout is not the workflow-supplied head")
         if os.environ.get("GITHUB_ACTIONS") == "true":
             required(expected_head == head and revision is not None, "hosted event lacks exact head/base binding")
-        if event == "pull_request":
+        if event in {"pull_request", "merge_group"}:
             boundary = revision or git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
         else:
             boundary = revision or git(repo, "rev-parse", "HEAD^")
@@ -438,6 +460,10 @@ def audited_input(repo: Path, event: str | None = None, revision: str | None = N
             # The base branch can advance after the PR forks. Bind its exact
             # tree as the trust anchor without requiring it in head ancestry.
             git(repo, "merge-base", boundary, head)
+        elif event == "merge_group":
+            required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", boundary, head],
+                                    capture_output=True).returncode == 0,
+                     "merge-group audited input is not reachable from synthetic HEAD")
         else:
             required(boundary != head, "push audited input must precede pushed HEAD")
             required(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", boundary, head],
@@ -1088,17 +1114,34 @@ def capnp_only_inputs(build_file: str, source: str) -> list[str]:
     constructor = re.compile(r"\b(?:[A-Za-z_]\w*\s*::\s*)?CompilerCommand\s*::\s*(?:new|default)\s*\(")
     inputs: list[str] = []
     statement_starts: set[int] = set()
-    for match in recognized.finditer(code):
-        statement_starts.add(match.start())
-        end = code.find(";", match.end())
+    commands: list[tuple[int, int]] = [(match.start(), match.end()) for match in recognized.finditer(code)]
+    type_patterns = [r"capnpc\s*::\s*CompilerCommand"]
+    type_patterns += [rf"(?<![:\w]){re.escape(name)}" for name in sorted(constructors)]
+    type_patterns += [rf"(?<![:\w]){re.escape(alias)}\s*::\s*CompilerCommand" for alias in sorted(module_aliases)]
+    compiler_type = "|".join(f"(?:{pattern})" for pattern in type_patterns)
+    typed_default = re.compile(
+        rf"\blet\s+(?:mut\s+)?(?P<binding>[A-Za-z_]\w*)\s*:\s*(?:{compiler_type})\s*=\s*"
+        rf"(?:Default\s*::\s*default\s*\(\s*\)|<\s*(?:{compiler_type})\s+as\s*"
+        rf"(?:std\s*::\s*default\s*::\s*)?Default\s*>\s*::\s*default\s*\(\s*\))\s*;")
+    for match in typed_default.finditer(code):
+        binding_name = match.group("binding")
+        required(re.search(rf"\b{re.escape(binding_name)}\s*=", code[match.end():]) is None,
+                 f"{build_file} mutates typed-default CompilerCommand binding {binding_name}")
+        command = re.match(rf"\s*{re.escape(binding_name)}\s*\.\s*file\s*\(", code[match.end():])
+        required(command is not None,
+                 f"{build_file} typed-default CompilerCommand binding lacks an immediate input")
+        commands.append((match.start(), match.end() + command.end()))
+    for start, after_constructor in commands:
+        statement_starts.add(start)
+        end = code.find(";", after_constructor)
         required(end >= 0, f"{build_file} has unterminated capnp-only compiler command")
-        calls = list(re.finditer(r'\.file\s*\(\s*', code[match.start():end]))
+        calls = list(re.finditer(r'\.file\s*\(\s*', code[start:end]))
         required(calls, f"{build_file} capnp-only compiler command lacks an input")
         for call in calls:
-            at = match.start() + call.end()
+            at = start + call.end()
             argument = re.match(r'&([A-Za-z_]\w*)\s*[,)]', source[at:])
             if argument is not None:
-                position = match.start() + call.start()
+                position = start + call.start()
                 choices = [entry for entry in bindings.get(argument.group(1), []) if entry[0] < position]
                 resolved = resolve(choices[-1]) if choices else None
                 required(resolved is not None,
@@ -1191,8 +1234,11 @@ def schema_method_metadata(repo: Path, schemas: list[dict[str, Any]],
         # from the same offsets with only comments masked. Valid comment gaps
         # before the path or semicolon must behave exactly like whitespace.
         for match in re.finditer(r"\busing\s+(\w+)\s*=\s*import\b", source):
-            imported = re.match(r'\s*"(/?streaming\.capnp)"\s*;', import_source[match.end():])
-            if imported:
+            direct = re.match(r'\s*"/?streaming\.capnp"\s*\.\s*StreamInfo\s*;', import_source[match.end():])
+            imported = re.match(r'\s*"/?streaming\.capnp"\s*;', import_source[match.end():])
+            if direct:
+                stream_types.add(match.group(1))
+            elif imported:
                 stream_types.add(f"{match.group(1)}.StreamInfo")
         pascal = "".join(part.capitalize() for part in service.split("-"))
         if f"struct {pascal}Request" not in source:
@@ -1609,7 +1655,11 @@ def self_test(repo: Path) -> None:
         ("CLI hidden policy", "crates/hyprstream/src/cli/schema_cli.rs", "if method.cli_hidden || method.is_streaming", "if method.cli_hidden"),
     ]:
         mutated = text(repo, path, None).replace(before, after)
-        expect_failure(name, repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, {path: mutated}))
+        try:
+            mutated_consumers = source_services(repo, {path: mutated})
+        except CatalogError:
+            continue
+        expect_failure(name, repo, copy.deepcopy(catalog), corpus, schemas, mutated_consumers, {path: mutated})
     renamed = text(repo, cli_path, None).replace('Command::new("discovery")', 'Command::new("settlement")', 1)
     expect_failure("manual CLI rename", repo, copy.deepcopy(catalog), corpus, schemas, source_services(repo, {cli_path: renamed}))
     removed = text(repo, cli_path, None).replace("tool = tool.subcommand(discovery);", "// manual discovery registration removed", 1)
@@ -1618,6 +1668,14 @@ def self_test(repo: Path) -> None:
     builder_guard = "if method.cli_hidden || method.is_streaming"
     guard_offsets = [item.start() for item in re.finditer(re.escape(builder_guard), raw_cli)]
     required(len(guard_offsets) == 2, "unexpected CLI builder guard count")
+    def expect_cli_failure(name: str, mutated: str) -> None:
+        mutation = {cli_path: mutated}
+        try:
+            mutated_consumers = source_services(repo, mutation)
+        except CatalogError:
+            return
+        expect_failure(name, repo, copy.deepcopy(catalog), corpus, schemas,
+                       mutated_consumers, mutation)
     for label, builder in [("CLI service builder policy", "fn build_service_command"),
                            ("CLI scoped builder policy", "fn build_scoped_command_from_node")]:
         fn_at = raw_cli.find(builder)
@@ -1626,8 +1684,7 @@ def self_test(repo: Path) -> None:
         inside = [offset for offset in guard_offsets if fn_at < offset < span_end]
         required(len(inside) == 1, f"{builder} guard not uniquely located")
         mutated = raw_cli[:inside[0]] + "if false" + raw_cli[inside[0] + len(builder_guard):]
-        expect_failure(label, repo, copy.deepcopy(catalog), corpus, schemas,
-                       source_services(repo, {cli_path: mutated}), {cli_path: mutated})
+        expect_cli_failure(label, mutated)
     worker_path = "crates/hyprstream-rpc-std/schema/worker.capnp"
     hidden_removed = text(repo, worker_path, None).replace("$cliHidden ", "", 1)
     expect_failure("schema hidden annotation", repo, copy.deepcopy(catalog), corpus, schemas, consumers, {worker_path: hidden_removed})
@@ -1702,6 +1759,20 @@ def self_test(repo: Path) -> None:
     ])
     required(capnp_only_inputs(tui_build, join_fixture) == ["crates/hyprstream-rpc-std/schema/compositor_ipc.capnp"],
              "capnp-only join-binding resolution drift")
+    typed_default_fixture = '\n'.join([
+        'let mut command: capnpc::CompilerCommand = Default::default();',
+        'command.file("crates/hyprstream-rpc-std/schema/compositor_ipc.capnp").run();',
+    ])
+    required(capnp_only_inputs(tui_build, typed_default_fixture)
+             == ["crates/hyprstream-rpc-std/schema/compositor_ipc.capnp"],
+             "typed Default::default capnp compiler resolution drift")
+    qualified_default_fixture = '\n'.join([
+        'let mut command: capnpc::CompilerCommand = <capnpc::CompilerCommand as Default>::default();',
+        'command.file("crates/hyprstream-rpc-std/schema/compositor_ipc.capnp").run();',
+    ])
+    required(capnp_only_inputs(tui_build, qualified_default_fixture)
+             == ["crates/hyprstream-rpc-std/schema/compositor_ipc.capnp"],
+             "fully-qualified Default capnp compiler resolution drift")
     direct_drift = text(repo, canonical_build, None).replace(
         "\n}", '\n    capnpc::CompilerCommand::new().file("../hyprstream-pay/schema/settlement.capnp").run();\n}', 1
     )
@@ -1754,6 +1825,15 @@ def self_test(repo: Path) -> None:
              "qualified streaming type changes method identity")
     expect_success("qualified streaming import", repo, catalog, corpus, schemas,
                    {model_path: qualified_model})
+    direct_alias_model = text(repo, model_path, None).replace(
+        'using import "/streaming.capnp".StreamInfo;',
+        'using SI = import "/streaming.capnp".StreamInfo;',
+    ).replace(":StreamInfo", ":SI")
+    required(schema_method_metadata(repo, catalog["schemas"], {model_path: direct_alias_model})
+             == schema_method_metadata(repo, catalog["schemas"], None),
+             "direct streaming type alias changes method identity")
+    expect_success("direct streaming type alias", repo, catalog, corpus, schemas,
+                   {model_path: direct_alias_model})
     # A new qualified leaf must require a catalog update independently of
     # provenance, including comments on either side of the imported path.
     for name, declaration in [
@@ -1865,12 +1945,28 @@ def self_test(repo: Path) -> None:
     expect_success("TypeScript concrete schema surface declared", repo, positive, corpus, schemas,
                    concrete_import)
     mcp_path = "crates/hyprstream/src/services/mcp_service.rs"
+    def expect_mcp_failure(name: str, mutated: str) -> None:
+        mutation = {mcp_path: mutated}
+        try:
+            mutated_consumers = source_services(repo, mutation)
+        except CatalogError:
+            return
+        expect_failure(name, repo, copy.deepcopy(catalog), corpus, schemas,
+                       mutated_consumers, mutation)
+    nested_top_level_root = text(repo, mcp_path, None).replace(
+        "register_top_level!(reg, model_client::schema_metadata());",
+        "if false { register_top_level!(reg, model_client::schema_metadata()); }", 1)
+    expect_mcp_failure("MCP nested top-level registration root", nested_top_level_root)
+    nested_scoped_root = text(repo, mcp_path, None).replace(
+        "register_scoped_tools_recursive(\n        reg,",
+        "if false { register_scoped_tools_recursive(\n        reg,", 1).replace(
+        '        &[],\n    );', '        &[],\n    ); }', 1)
+    expect_mcp_failure("MCP nested scoped registration root", nested_scoped_root)
     for label, needle in [("hidden policy", "if method.hidden {"),
                           ("streaming policy", "if method.is_streaming {")]:
         for occurrence, path_name in [(1, "top-level"), (2, "scoped")]:
             mutated = replace_nth(text(repo, mcp_path, None), needle, "if false {", occurrence)
-            expect_failure(f"MCP {path_name} {label}", repo, copy.deepcopy(catalog), corpus, schemas,
-                           source_services(repo, {mcp_path: mutated}), {mcp_path: mutated})
+            expect_mcp_failure(f"MCP {path_name} {label}", mutated)
     for label, before, after in [
         ("hidden guard is effective", "if method.hidden {\n                    continue;",
          "if method.hidden {}\n                if false { continue;"),
@@ -1878,18 +1974,15 @@ def self_test(repo: Path) -> None:
          "if method.is_streaming {}\n                if false {"),
     ]:
         mutated = replace_nth(text(repo, mcp_path, None), before, after, 1)
-        expect_failure(f"MCP top-level {label}", repo, copy.deepcopy(catalog), corpus, schemas,
-                       source_services(repo, {mcp_path: mutated}), {mcp_path: mutated})
+        expect_mcp_failure(f"MCP top-level {label}", mutated)
     nested_stream = text(repo, mcp_path, None).replace(
         "register_streaming_tool(\n", "if false { register_streaming_tool(\n", 1
     ).replace("                } else {\n                    register_sync_tool(",
               "                }\n                } else {\n                    register_sync_tool(", 1)
-    expect_failure("MCP nested streaming registration", repo, copy.deepcopy(catalog), corpus, schemas,
-                   source_services(repo, {mcp_path: nested_stream}), {mcp_path: nested_stream})
+    expect_mcp_failure("MCP nested streaming registration", nested_stream)
     precontinued_stream = text(repo, mcp_path, None).replace(
         "if method.is_streaming {\n", "if method.is_streaming {\n                    continue;\n", 1)
-    expect_failure("MCP precontinued streaming registration", repo, copy.deepcopy(catalog), corpus, schemas,
-                   source_services(repo, {mcp_path: precontinued_stream}), {mcp_path: precontinued_stream})
+    expect_mcp_failure("MCP precontinued streaming registration", precontinued_stream)
     delayed_hidden = ("for method in methods {\n"
                       "if method.is_streaming { register_streaming_tool(); } else { register_sync_tool(); }\n"
                       "if method.hidden { continue; }\n}")

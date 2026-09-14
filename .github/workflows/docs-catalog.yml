@@ -2,6 +2,7 @@ name: Docs catalog
 
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
 
@@ -15,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Load builder image pin
@@ -25,11 +26,11 @@ jobs:
       - name: Bind audited input revision
         shell: bash
         env:
-          AUDIT_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-          AUDIT_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          AUDIT_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
+          AUDIT_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
         run: |
           case "$GITHUB_EVENT_NAME" in
-            pull_request|push)
+            pull_request|merge_group|push)
               printf 'DOCS_CATALOG_EVENT=%s\nDOCS_CATALOG_AUDITED_COMMIT=%s\nDOCS_CATALOG_AUDITED_HEAD=%s\n' \
                 "$GITHUB_EVENT_NAME" "$AUDIT_BASE" "$AUDIT_HEAD" >> "$GITHUB_ENV" ;;
             *) exit 1 ;;
