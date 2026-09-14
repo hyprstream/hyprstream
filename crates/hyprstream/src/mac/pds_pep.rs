@@ -52,7 +52,9 @@ fn pds_account_label() -> SecurityLabel {
 /// reads only the exact publication marker below a validated tenant and
 /// account label. The account-specific `#atproto` secret is labeled for the
 /// fixed internal OAuth authority's service-auth signer, but no scoped
-/// account-reader API exposes it. Other paths remain unlabeled and deny.
+/// account-reader API exposes it. The two nested repo genesis artifacts have
+/// the same label; repo directories, arbitrary blocks and other paths remain
+/// unlabeled and deny.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PdsAccountObjectLabelResolver;
 
@@ -87,6 +89,14 @@ impl ObjectLabelResolver for PdsAccountObjectLabelResolver {
                             | PDS_ACCOUNT_DID_DOCUMENT_FILE
                             | PDS_ACCOUNT_DID_LOG_FILE
                     ) =>
+            {
+                Some(pds_account_label())
+            }
+            ["pds", tenant, accounts, account, "repo", file]
+                if valid_tenant_component(tenant)
+                    && *accounts == PDS_ACCOUNTS_DIRECTORY
+                    && valid_account_component(account)
+                    && matches!(*file, "commit.cbor" | "public-commit.cbor") =>
             {
                 Some(pds_account_label())
             }
@@ -1093,6 +1103,77 @@ mod tests {
                 .unwrap(),
             attenuated
         );
+    }
+
+    #[test]
+    fn production_genesis_pep_permits_exact_artifacts_and_audits_denials() {
+        let sink = Arc::new(SpySink::default());
+        let pep = production_pds_account_read_authorizer(sink.clone());
+        let oauth = Subject::new(OAUTH_ACCOUNT_RESOLVER_SUBJECT);
+        for file in ["commit.cbor", "public-commit.cbor"] {
+            let object = format!("/pds/acme/accounts/alice/repo/{file}");
+            assert_eq!(
+                pep.check_read(&oauth, Some("acme"), None, &object),
+                MacDecision::Permit
+            );
+            let records = sink.records.lock();
+            let record = records.last().unwrap();
+            assert_eq!(record.object_id.as_deref(), Some(object.as_str()));
+            assert_eq!(
+                record.subject_id.as_deref(),
+                Some(OAUTH_ACCOUNT_RESOLVER_SUBJECT)
+            );
+            assert_eq!(record.object_label, pds_account_label());
+            assert_eq!(record.reason, DecisionReason::Permit);
+        }
+        for object in [
+            "/pds/acme/accounts/alice/repo",
+            "/pds/acme/accounts/alice/repo/head",
+            "/pds/acme/accounts/alice/repo/blocks/block.cbor",
+            "/pds/acme/accounts/alice/repo/private-key",
+            "/pds/acme/accounts/alice/repo/commit.cbor/child",
+            "/pds/acme/accounts/alice/repo/../commit.cbor",
+            "/pds/../accounts/alice/repo/commit.cbor",
+            "/pds/*/accounts/alice/repo/commit.cbor",
+            "/pds/acme/accounts/ALICE/repo/commit.cbor",
+            "/pds/acme/accounts/-alice/repo/commit.cbor",
+        ] {
+            assert_eq!(
+                pep.check_read(&oauth, Some("acme"), None, object),
+                MacDecision::Deny(MacDenyReason::UnlabeledObject),
+                "{object}"
+            );
+            let records = sink.records.lock();
+            let record = records.last().unwrap();
+            assert_eq!(record.object_id.as_deref(), Some(object));
+            assert_eq!(record.decision, Decision::Deny);
+            assert_eq!(record.reason, DecisionReason::UnlabeledObject);
+        }
+        let object = "/pds/acme/accounts/alice/repo/commit.cbor";
+        assert_eq!(
+            pep.check_read(&Subject::new("alice"), Some("acme"), None, object),
+            MacDecision::Deny(MacDenyReason::NoClearance)
+        );
+        let attenuated =
+            SecurityContext::from_clearance(label(Level::Public), VerifiedKeyMaterial::Classical);
+        assert_eq!(
+            pep.check_read(
+                &Subject::new("alice"),
+                Some("acme"),
+                Some(&attenuated),
+                object
+            ),
+            MacDecision::Deny(MacDenyReason::FloorDeny)
+        );
+        let failing = Arc::new(FailingSink::default());
+        let pep = production_pds_account_read_authorizer(failing.clone());
+        assert_eq!(
+            pep.check_read(&oauth, Some("acme"), None, object),
+            MacDecision::Deny(MacDenyReason::FloorDeny)
+        );
+        let records = failing.records.lock();
+        assert_eq!(records[0].decision, Decision::Permit);
+        assert_eq!(records[1].reason, DecisionReason::AuditFailClosed);
     }
 
     #[tokio::test]
