@@ -2936,9 +2936,8 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
         .oauth_issuer_url()
         .map(str::to_owned)
         .unwrap_or_else(|| config.oauth.issuer_url());
-    let authority = crate::services::oauth::did_document::issuer_authority(&issuer)
-        .context("OAuth issuer has no did:web authority")?;
-    let node_did = format!("did:web:{authority}");
+    let node_did = crate::services::oauth::state::atproto_service_did_for_origin(&issuer)
+        .context("OAuth issuer has no supported service DID")?;
     let record_resolver = std::sync::Arc::new(
         crate::services::discovery::PdsRecordResolver::new(pds_store)
             .with_es256_rotation(es256_store, node_did),
