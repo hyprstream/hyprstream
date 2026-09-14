@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from contextlib import contextmanager
 import fnmatch
 import hashlib
 import json
@@ -12,6 +13,7 @@ import os
 import re
 import subprocess
 import stat
+import tempfile
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -134,6 +136,50 @@ def text(repo: Path, path: str, mutations: dict[str, str] | None) -> str:
     return read_regular(repo, path).decode("utf-8")
 
 
+def unique_cli_bindings(cli: str, pattern: str) -> dict[str, tuple[str, int, tuple[int, ...]]]:
+    """Supported subset: each referenced let name is unique in the file.
+
+    Reject shadowing, even in an unused helper, instead of guessing Rust name
+    resolution. Also retain declaration position/scope for registration checks.
+    Count other let-pattern definitions too, not just recognized RHS forms.
+    """
+    bindings = {}
+    declarations = list(re.finditer(r'\blet\s+([^;=]+)=', cli))
+    for match in re.finditer(pattern, cli):
+        name = match.group("binding")
+        occurrences = sum(bool(re.search(rf'\b{re.escape(name)}\b', item.group(1))) for item in declarations)
+        # Function/closure parameters are bindings too. Refuse these names
+        # conservatively rather than treating an outer let as their authority.
+        parameters = re.findall(r'\bfn\s+\w+[^{{;]*', cli)
+        parameters += re.findall(r'\|([^|;{}]*)\|', cli)
+        shadowed_parameter = any(re.search(rf'\b{re.escape(name)}\b', value)
+                                 for value in parameters)
+        required(name not in bindings and occurrences == 1 and not shadowed_parameter,
+                 f"ambiguous CLI binding {name}")
+        bindings[name] = (match.group("module"), match.start(), rust_lexical_scope(cli, match.start()))
+    return bindings
+
+
+def rust_lexical_scope(code: str, position: int) -> tuple[int, ...]:
+    scopes = []
+    for index, char in enumerate(code[:position]):
+        if char == "{": scopes.append(index)
+        elif char == "}":
+            required(bool(scopes), "unbalanced CLI source scope")
+            scopes.pop()
+    return tuple(scopes)
+
+
+def visible_cli_binding(cli: str, bindings: dict[str, tuple[str, int, tuple[int, ...]]],
+                        name: str, position: int, service: str) -> str:
+    required(name in bindings, f"CLI registration for {service} uses an unbound argument {name}")
+    module, declaration, scope = bindings[name]
+    call_scope = rust_lexical_scope(cli, position)
+    required(declaration < position and call_scope[:len(scope)] == scope,
+             f"CLI binding {name} is not visible at registration for {service}")
+    return module
+
+
 def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict[str, dict[str, Any]]:
     cli_source = text(repo, "crates/hyprstream/src/cli/schema_cli.rs", mutations)
     mcp_source = text(repo, "crates/hyprstream/src/services/mcp_service.rs", mutations)
@@ -143,20 +189,12 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
     factories, vfs = strip_rust_noncode(factories_source), strip_rust_noncode(vfs_source)
 
     registrations: list[tuple[int, str, list[str] | None, dict[str, str] | None]] = []
-    metadata_bindings = {
-        match.group("binding"): match.group("module")
-        for match in re.finditer(
-            r'\blet\s+(?P<binding>[a-zA-Z_]\w*)\s*=\s*extract_methods!\s*\(\s*'
-            r'(?P<module>[A-Za-z_][\w:]*)::schema_metadata\s*\(\s*\)\s*\)\s*;', cli
-        )
-    }
-    scoped_tree_bindings = {
-        match.group("binding"): match.group("module")
-        for match in re.finditer(
-            r'\blet\s+(?P<binding>[a-zA-Z_]\w*)\s*=\s*'
-            r'(?P<module>[A-Za-z_][\w:]*)::scoped_client_tree\s*\(\s*\)\s*;', cli
-        )
-    }
+    metadata_bindings = unique_cli_bindings(cli,
+        r'\blet\s+(?P<binding>[a-zA-Z_]\w*)\s*=\s*extract_methods!\s*\(\s*'
+        r'(?P<module>[A-Za-z_][\w:]*)::schema_metadata\s*\(\s*\)\s*\)\s*;')
+    scoped_tree_bindings = unique_cli_bindings(cli,
+        r'\blet\s+(?P<binding>[a-zA-Z_]\w*)\s*=\s*'
+        r'(?P<module>[A-Za-z_][\w:]*)::scoped_client_tree\s*\(\s*\)\s*;')
     for match in re.finditer(r'\bbuild_service_command\s*\(\s*', cli):
         if re.match(r'"', cli_source[match.end():]) is None:
             continue
@@ -167,13 +205,9 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
         )
         required(arguments is not None, f"CLI registration for {service} lacks metadata/tree bindings")
         metadata, tree = arguments.group("metadata"), arguments.group("tree")
-        required(metadata in metadata_bindings,
-                 f"CLI registration for {service} uses an unbound metadata argument {metadata}")
-        required(tree in scoped_tree_bindings,
-                 f"CLI registration for {service} uses an unbound scoped-tree argument {tree}")
         registrations.append((match.start(), service, None, {
-            "metadata": metadata_bindings[metadata],
-            "scoped_tree": scoped_tree_bindings[tree],
+            "metadata": visible_cli_binding(cli, metadata_bindings, metadata, match.start(), service),
+            "scoped_tree": visible_cli_binding(cli, scoped_tree_bindings, tree, match.start(), service),
         }))
     for match in re.finditer(
         r'\blet\s+(?P<binding>[a-zA-Z_]\w*)\s*=\s*Command::new\s*\(\s*', cli
@@ -348,7 +382,7 @@ def selected_input_paths(paths: list[str], read: Callable[[str], bytes], corpus:
                 and any(path_matches(path, item["glob"]) for item in corpus.get("public_prose", [])) \
                 and not any(path_matches(path, item["glob"]) for item in corpus.get("excluded", [])):
             selected.add(path)
-        elif path.endswith((".ts", ".tsx", ".js", ".jsx")) or path == "package.json":
+        elif path.endswith((".ts", ".tsx", ".js", ".jsx")) or is_package_manifest(path):
             if typescript_consumer(path, read(path).decode("utf-8")):
                 selected.add(path)
     return sorted(selected)
@@ -618,73 +652,92 @@ def strip_capnp_noncode(source: str, mask_literals: bool = True) -> str:
 
 
 def js_code_and_strings(source: str) -> tuple[str, dict[int, str]]:
-    """Offset-preserving JS/TS lexer for dependency extraction.
+    """Offset-preserving dependency lexer, including executable ${...} code.
 
-    Comments and regex literals are blanked, while string bodies are masked and
-    retained by output offset so the dependency grammar can inspect only real
-    quoted specifiers. This is intentionally a small lexer, not a JS parser.
+    Template text stays inert. Balanced substitutions recursively lex code;
+    only templates without substitutions are recorded as static specifiers.
+    Comments, quoted braces and regex bodies cannot terminate substitutions.
     """
-    out: list[str] = []
-    strings: dict[int, str] = {}
-    cursor, index, length = 0, 0, len(source)
-    can_start_regex = True
+    out, strings, length = list(source), {}, len(source)
     expression_keywords = {"case", "delete", "do", "else", "in", "instanceof", "new", "return", "throw", "typeof", "void", "yield", "await"}
-    def blank(value: str) -> str:
-        return "".join("\n" if char == "\n" else " " for char in value)
-    while index < length:
-        char = source[index]
-        pair = source[index:index + 2]
-        if pair == "//" or pair == "/*":
-            end = source.find("\n", index) if pair == "//" else source.find("*/", index + 2)
-            end = length if end < 0 else end if pair == "//" else end + 2
-            masked = blank(source[index:end])
-            out.append(masked); cursor += len(masked); index = end; continue
-        if char == "/" and can_start_regex:
-            end, character_class = index + 1, False
-            while end < length:
-                current = source[end]
-                if current == "\\":
-                    end += 2; continue
-                if current == "[":
-                    character_class = True
-                elif current == "]":
-                    character_class = False
-                elif current == "/" and not character_class:
-                    end += 1
-                    while end < length and source[end].isalpha():
+
+    def mask(start: int, end: int) -> None:
+        out[start:end] = ["\n" if char == "\n" else " " for char in source[start:end]]
+
+    def quoted(start: int) -> int:
+        end, quote = start + 1, source[start]
+        while end < length:
+            if source[end] == "\\": end = min(end + 2, length); continue
+            end += 1
+            if source[end - 1] == quote: break
+        closed = source[end - 1:end] == quote
+        body_end = end - 1 if closed else end
+        out[start + 1:body_end] = ["\0"] * (body_end - start - 1)
+        if closed:
+            strings[start + 1] = source[start + 1:body_end]
+        return end
+
+    def template(start: int) -> int:
+        index, segment, substituted = start + 1, start, False
+        while index < length:
+            if source[index] == "\\": index = min(index + 2, length); continue
+            if source[index] == "`":
+                if not substituted:
+                    return quoted(start)
+                mask(segment, index + 1)
+                return index + 1
+            if source[index:index + 2] == "${":
+                substituted = True
+                mask(segment, index + 1)  # Keep the brace as an expression boundary.
+                index = code(index + 2, substitution=True)
+                segment = index
+                continue
+            index += 1
+        mask(segment, length)
+        return length
+
+    def code(index: int, substitution: bool = False) -> int:
+        can_start_regex, depth = True, 0
+        while index < length:
+            char, pair = source[index], source[index:index + 2]
+            if pair in {"//", "/*"}:
+                end = source.find("\n", index) if pair == "//" else source.find("*/", index + 2)
+                end = length if end < 0 else end if pair == "//" else end + 2
+                mask(index, end); index = end; continue
+            if char == "/" and can_start_regex:
+                end, character_class = index + 1, False
+                while end < length:
+                    current = source[end]
+                    if current == "\\": end = min(end + 2, length); continue
+                    if current == "[": character_class = True
+                    elif current == "]": character_class = False
+                    elif current == "/" and not character_class:
                         end += 1
-                    break
-                elif current == "\n":
-                    break
-                end += 1
-            masked = blank(source[index:end])
-            out.append(masked); cursor += len(masked); index = end; can_start_regex = False; continue
-        if char in "'\"`":
-            end = index + 1
-            while end < length:
-                if source[end] == "\\":
-                    end += 2; continue
-                end += 1
-                if source[end - 1] == char:
-                    break
-            body = source[index + 1:end - 1] if source[end - 1:end] == char else source[index + 1:end]
-            out.append(char + "\0" * len(body) + char)
-            strings[cursor + 1] = body
-            cursor += len(body) + 2
-            index = end; can_start_regex = False; continue
-        identifier = re.match(r"[A-Za-z_$][\w$]*", source[index:])
-        if identifier:
-            value = identifier.group(0)
-            out.append(value); cursor += len(value); index += len(value)
-            can_start_regex = value in expression_keywords
-            continue
-        out.append(char); cursor += 1; index += 1
-        if char in ")]}":
-            can_start_regex = False
-        elif char == ".":
-            can_start_regex = False
-        elif not char.isspace():
-            can_start_regex = True
+                        while end < length and source[end].isalpha(): end += 1
+                        break
+                    elif current == "\n": break
+                    end += 1
+                mask(index, end); index = end; can_start_regex = False; continue
+            if char in "'\"":
+                index = quoted(index); can_start_regex = False; continue
+            if char == "`":
+                index = template(index); can_start_regex = False; continue
+            if char == "}":
+                if substitution and depth == 0:
+                    return index + 1
+                depth -= 1
+            elif char == "{":
+                depth += 1
+            identifier = re.match(r"[A-Za-z_$][\w$]*", source[index:])
+            if identifier:
+                value = identifier.group(0)
+                index += len(value); can_start_regex = value in expression_keywords; continue
+            index += 1
+            if char in ")]}.": can_start_regex = False
+            elif not char.isspace(): can_start_regex = True
+        return index
+
+    code(0)
     return "".join(out), strings
 
 
@@ -701,8 +754,12 @@ def ts_source_is_consumer(source: str) -> bool:
     return False
 
 
+def is_package_manifest(path: str) -> bool:
+    return Path(path).name == "package.json"
+
+
 def typescript_consumer(path: str, source: str) -> bool:
-    if path == "package.json":
+    if is_package_manifest(path):
         try:
             package = json.loads(source)
         except json.JSONDecodeError as error:
@@ -715,7 +772,7 @@ def typescript_consumer(path: str, source: str) -> bool:
 
 def typescript_schema_sources(repo: Path, mutations: dict[str, str] | None = None,
                               candidates: list[str] | None = None) -> list[str]:
-    candidates = candidates if candidates is not None else tracked(repo, "*.ts", "*.tsx", "*.js", "*.jsx", "package.json")
+    candidates = candidates if candidates is not None else tracked(repo, "*.ts", "*.tsx", "*.js", "*.jsx", "package.json", "**/package.json")
     return sorted(path for path in candidates if not deleted(path, mutations)
                   and typescript_consumer(path, text(repo, path, mutations)))
 
@@ -1240,6 +1297,54 @@ def expect_cgr_failure(name: str, build_file: str, source: str) -> None:
     raise AssertionError(f"CGR mutation probe {name} unexpectedly passed")
 
 
+@contextmanager
+def isolated_index(repo: Path):
+    """Copy the exact caller index; all probe writes target only this copy.
+
+    Preserve absent entries, unmerged stages and index extensions/flags without
+    reconstructing entries. The environment is restored even if setup fails.
+    A preexisting GIT_INDEX_FILE is the caller index and is never overwritten.
+    """
+    caller = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+    previous = os.environ.get("GIT_INDEX_FILE")
+    with tempfile.TemporaryDirectory(prefix="docs-catalog-index-") as temporary:
+        index = Path(temporary) / "index"
+        if caller.exists():
+            index.write_bytes(caller.read_bytes())
+        try:
+            os.environ["GIT_INDEX_FILE"] = str(index)
+            if not index.exists():
+                git(repo, "read-tree", "--empty")
+            yield
+        finally:
+            if previous is None: os.environ.pop("GIT_INDEX_FILE", None)
+            else: os.environ["GIT_INDEX_FILE"] = previous
+
+
+def probe_staged_removal(repo: Path, check_removed: Callable[[], None]) -> None:
+    removed_schema = "crates/hyprstream-rpc/schema/optional.capnp"
+    unrelated_schema = "crates/hyprstream-rpc/schema/common.capnp"
+    def staged_entries(path: str) -> list[str]:
+        return git(repo, "ls-files", "--stage", "--", path).splitlines()
+    def stage_edit(path: str) -> str:
+        original = read_regular(repo, path).decode("utf-8")
+        blob = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+                              input=original + "\n# staged schema edit\n", text=True,
+                              capture_output=True, check=True).stdout.strip()
+        git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}")
+        return blob
+    with isolated_index(repo):
+        optional_blob = stage_edit(removed_schema)
+        common_blob = stage_edit(unrelated_schema)
+        git(repo, "rm", "--cached", "--force", "--quiet", removed_schema)
+        check_removed()
+        git(repo, "update-index", "--add", "--cacheinfo", f"100644,{optional_blob},{removed_schema}")
+        for path, expected in [(removed_schema, optional_blob), (unrelated_schema, common_blob)]:
+            entries = staged_entries(path)
+            required(len(entries) == 1 and entries[0].split()[1] == expected,
+                     f"removal probe changed its staged input {path}")
+
+
 def self_test(repo: Path) -> None:
     catalog, corpus = read_json(repo / "docs/schema-catalog.json", repo), read_json(repo / "docs/corpus-sources.json", repo)
     schemas, consumers = tracked(repo, "*.capnp"), source_services(repo)
@@ -1304,43 +1409,9 @@ def self_test(repo: Path) -> None:
     probe_catalog = copy.deepcopy(catalog)
     probe_catalog["schemas"] = [entry for entry in probe_catalog["schemas"] if entry["path"] != removed_schema]
     pruned = [path for path in schemas if path != removed_schema]
-    def staged_entries(path: str) -> list[str]:
-        out = subprocess.run(["git", "-C", str(repo), "ls-files", "--stage", path],
-                             capture_output=True, text=True).stdout.strip()
-        return [line for line in out.splitlines() if line]
-    def stage_edit(path: str, suffix: str) -> str:
-        original = (repo / path).read_text()
-        blob = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
-                              input=original + suffix, text=True, capture_output=True, check=True).stdout.strip()
-        subprocess.run(["git", "-C", str(repo), "update-index", "--cacheinfo", f"100644,{blob},{path}"], check=True)
-        return blob
-    unrelated_schema = "crates/hyprstream-rpc/schema/common.capnp"
-    optional_prior = staged_entries(removed_schema)
-    common_prior = staged_entries(unrelated_schema)
-    optional_blob = stage_edit(removed_schema, "\n// staged schema edit\n")
-    common_blob = stage_edit(unrelated_schema, "\n// staged schema edit\n")
-    try:
-        subprocess.run(["git", "-C", str(repo), "rm", "--cached", "--force", "--quiet", removed_schema], check=True)
-        try:
-            expect_failure("declared tree attests removed input", repo, probe_catalog, corpus, pruned,
-                           consumers, {removed_schema: None})
-        finally:
-            if optional_prior:
-                subprocess.run(["git", "-C", str(repo), "update-index", "--add", "--cacheinfo",
-                                f"100644,{optional_blob},{removed_schema}"], check=True)
-        restored = staged_entries(removed_schema)
-        required(restored and restored[0].split()[1] == optional_blob,
-                 "removal probe did not preserve the caller's staged index entry")
-        after = staged_entries(unrelated_schema)
-        required(after and after[0].split()[1] == common_blob,
-                 "removal probe unstaged an unrelated schema change")
-        if optional_prior:
-            mode, sha = optional_prior[0].split()[:2]
-            subprocess.run(["git", "-C", str(repo), "update-index", "--cacheinfo", f"{mode},{sha},{removed_schema}"], check=True)
-    finally:
-        if common_prior:
-            mode, sha = common_prior[0].split()[:2]
-            subprocess.run(["git", "-C", str(repo), "update-index", "--cacheinfo", f"{mode},{sha},{unrelated_schema}"], check=True)
+    probe_staged_removal(repo, lambda: expect_failure(
+        "declared tree attests removed input", repo, probe_catalog, corpus, pruned,
+        consumers, {removed_schema: None}))
     committed = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--quiet", "--",
                                 "docs/schema-catalog.json", "docs/corpus-sources.json"]).returncode == 0
     bad = copy.deepcopy(catalog); bad["source_commit"] = git(repo, "rev-parse", "HEAD"); bad["source_tree"] = git(repo, "rev-parse", "HEAD^{tree}")

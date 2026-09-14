@@ -242,8 +242,178 @@ class ProvenanceTests(unittest.TestCase):
         with self.assertRaises(catalog.CatalogError):
             catalog.read_regular(self.repo, "nested/outside")
 
+    def test_nested_package_inventory_and_provenance(self):
+        for section in ["dependencies", "devDependencies", "peerDependencies"]:
+            with self.subTest(section=section):
+                manifests = ["package.json", "packages/client/package.json", "web/deep/client/package.json"]
+                for path in manifests:
+                    self.write(self.repo, path, json.dumps({section: {"@hyprstream/docs": "1"}}))
+                self.write(self.repo, "packages/unrelated/package.json", '{"dependencies":{"other":"1"}}')
+                self.commit(self.repo)
+                paths = catalog.provenance_paths(self.repo, self.corpus)
+                self.assertEqual(catalog.typescript_schema_sources(self.repo), sorted(manifests))
+                self.assertTrue(set(manifests) <= set(paths))
+                tree = self.git(self.repo, "rev-parse", "HEAD^{tree}")
+                self.assertEqual(set(paths), catalog.attested_tree_universe(self.repo, tree, self.corpus))
+                before = catalog.input_digest(self.repo, paths)
+                self.write(self.repo, manifests[1], json.dumps({section: {"@hyprstream/docs": "2"}}))
+                self.assertNotEqual(before, catalog.input_digest(self.repo, paths))
+                self.assertEqual(before, catalog.input_digest(self.repo, paths, tree=tree))
+
+    def test_nested_manifest_symlink_rejected_live_and_tree(self):
+        path = "packages/client/package.json"
+        target = self.repo / path
+        target.parent.mkdir(parents=True)
+        target.symlink_to("../../schema.capnp")
+        self.commit(self.repo)
+        with self.assertRaises(catalog.CatalogError):
+            catalog.provenance_paths(self.repo, self.corpus)
+        tree = self.git(self.repo, "rev-parse", "HEAD^{tree}")
+        with self.assertRaisesRegex(catalog.CatalogError, "not a regular file"):
+            catalog.attested_tree_universe(self.repo, tree, self.corpus)
+
+    def test_template_dependency_enters_live_and_tree_provenance(self):
+        path = "packages/client/src/render.ts"
+        self.write(self.repo, path, 'const x = `${import("@hyprstream/docs")}`;')
+        source = self.commit(self.repo)
+        tree = self.git(self.repo, "rev-parse", source + "^{tree}")
+        paths = catalog.provenance_paths(self.repo, self.corpus)
+        self.assertIn(path, paths)
+        self.assertIn(path, catalog.typescript_schema_sources(self.repo))
+        self.assertEqual(set(paths), catalog.attested_tree_universe(self.repo, tree, self.corpus))
+        self.write(self.repo, path, 'const x = `inert @hyprstream/docs`;')
+        self.assertNotIn(path, catalog.provenance_paths(self.repo, self.corpus))
+
+    def test_index_probes_preserve_caller_bytes(self):
+        optional = "crates/hyprstream-rpc/schema/optional.capnp"
+        common = "crates/hyprstream-rpc/schema/common.capnp"
+        for path in [optional, common]:
+            self.write(self.repo, path, "# original\n")
+        self.commit(self.repo)
+        index = self.repo / ".git/index"
+        for deletion in [None, optional, common]:
+            for failure in [None, "second stage", "probe"]:
+                with self.subTest(deletion=deletion, failure=failure):
+                    self.git(self.repo, "reset", "--mixed", "HEAD")
+                    if deletion:
+                        self.git(self.repo, "rm", "--cached", "--quiet", deletion)
+                    self.write(self.repo, "staged.txt", "unrelated staged edit\n")
+                    self.git(self.repo, "add", "staged.txt")
+                    self.git(self.repo, "update-index", "--assume-unchanged", "schema.capnp")
+                    # Preserve unmerged stages too, not just stage0 rows/flags.
+                    oid = self.git(self.repo, "rev-parse", "HEAD:schema.capnp")
+                    subprocess.run(["git", "-C", str(self.repo), "update-index", "--index-info"],
+                                   input=f"100644 {oid} 1\tconflicted.capnp\n100644 {oid} 2\tconflicted.capnp\n",
+                                   text=True, env=self.env, check=True, capture_output=True)
+                    before = index.read_bytes()
+                    original_run = subprocess.run
+                    stage_count = 0
+                    def injected(args, **kwargs):
+                        nonlocal stage_count
+                        if "update-index" in args and "--cacheinfo" in args:
+                            stage_count += 1
+                            if failure == "second stage" and stage_count == 2:
+                                raise RuntimeError("injected second stage failure")
+                        return original_run(args, **kwargs)
+                    def probe():
+                        if failure == "probe":
+                            raise RuntimeError("injected probe failure")
+                        self.assertNotIn(optional, catalog.tracked(self.repo))
+                    try:
+                        with patch.object(catalog.subprocess, "run", side_effect=injected):
+                            if failure:
+                                with self.assertRaisesRegex(RuntimeError, "injected"):
+                                    catalog.probe_staged_removal(self.repo, probe)
+                            else:
+                                catalog.probe_staged_removal(self.repo, probe)
+                    finally:
+                        self.assertEqual(index.read_bytes(), before, "caller index changed")
+                        self.assertNotIn("GIT_INDEX_FILE", os.environ)
+
+
+    def test_explicit_split_index_is_untouched(self):
+        for path in ["crates/hyprstream-rpc/schema/optional.capnp", "crates/hyprstream-rpc/schema/common.capnp"]:
+            self.write(self.repo, path, "# source\n")
+        self.commit(self.repo)
+        original = (self.repo / ".git/index").read_bytes()
+        alternate = self.root / "caller.index"
+        alternate.write_bytes(original)
+        with patch.dict(os.environ, {"GIT_INDEX_FILE": str(alternate)}):
+            catalog.git(self.repo, "update-index", "--split-index")
+            catalog.git(self.repo, "rm", "--cached", "--quiet", "crates/hyprstream-rpc/schema/common.capnp")
+            before = alternate.read_bytes()
+            catalog.probe_staged_removal(self.repo, lambda: None)
+            self.assertEqual(alternate.read_bytes(), before)
+            self.assertEqual(os.environ["GIT_INDEX_FILE"], str(alternate))
+        self.assertEqual((self.repo / ".git/index").read_bytes(), original)
+
+
 
 class ExtractorTests(unittest.TestCase):
+    def test_template_interpolation_dependencies(self):
+        positives = [
+            'const x = `${import("@hyprstream/docs")}`;',
+            'const x = `${require("./generated/foo.capnp")}`;',
+            'const x = `${`nested ${require("./generated/foo.capnp")}`}`;',
+            'const x = `${({a: "}", b: /[{}]/, c: /* } */ import("@hyprstream/docs")})}`;',
+            'const x = `${1 + 2} text ${import("@hyprstream/docs")}`;',
+            'import(`@hyprstream/docs`);',
+        ]
+        negatives = [
+            'const x = `inert import("@hyprstream/docs")`;',
+            r'const x = `\${import("@hyprstream/docs")}`;',
+            'const x = `${/require("fixture.capnp")/.test(x)}`;',
+            'const x = `${ /* import("@hyprstream/docs") */ 1}`;',
+            '''const x = `${'import("@hyprstream/docs")'}`;''',
+            'const x = `${`nested inert require("fixture.capnp")`}`;',
+        ]
+        for expected, cases in [(True, positives), (False, negatives)]:
+            for source in cases:
+                with self.subTest(source=source):
+                    self.assertEqual(catalog.ts_source_is_consumer(source), expected)
+                    code, strings = catalog.js_code_and_strings(source)
+                    self.assertEqual(len(code), len(source))
+                    for offset, body in strings.items():
+                        self.assertEqual(source[offset:offset + len(body)], body)
+
+    def test_cli_ambiguous_bindings_fail_closed(self):
+        path = "crates/hyprstream/src/cli/schema_cli.rs"
+        original = catalog.text(ROOT, path, None)
+        catalog.source_services(ROOT)  # Existing supported declarations stay valid.
+        for name, expression in [
+            ("registry_methods", "extract_methods!(model_client::schema_metadata())"),
+            ("registry_tree", "model_client::scoped_client_tree()"),
+        ]:
+            declaration = f"let {name} = {expression};"
+            for label, source in [
+                ("unused later helper", original + f"\nfn unused() {{ {declaration} }}\n"),
+                ("later same-scope shadow", original),
+                ("nested-block shadow", original.replace("    let registry_methods", f"    {{ {declaration} }}\n    let registry_methods", 1)),
+                ("unsupported shadow expression", original + f"\nfn unused() {{ let {name} = other(); }}\n"),
+                ("function parameter", original + f"\nfn unused({name}: Fake) {{}}\n"),
+                ("closure parameter", original + f"\nfn unused() {{ let f = |{name}| 1; }}\n"),
+            ]:
+                if label == "later same-scope shadow":
+                    # Insert after the earlier registry registration, regardless
+                    # of neighboring comments/registration formatting.
+                    insertion = original.index("    let model_methods")
+                    source = original[:insertion] + f"    {declaration}\n" + original[insertion:]
+                with self.subTest(binding=name, case=label):
+                    self.assertNotEqual(source, original)
+                    with self.assertRaisesRegex(catalog.CatalogError, "ambiguous CLI binding"):
+                        catalog.source_services(ROOT, {path: source})
+
+    def test_cli_binding_must_precede_and_share_lexical_scope(self):
+        path = "crates/hyprstream/src/cli/schema_cli.rs"
+        original = catalog.text(ROOT, path, None)
+        declaration = "let registry_methods = extract_methods!(registry_client::schema_metadata());"
+        for label, source in [
+            ("later", original.replace(declaration, "", 1).replace("    let model_methods", f"    {declaration}\n    let model_methods", 1)),
+            ("unrelated scope", original.replace(declaration, "", 1) + f"\nfn unused() {{ {declaration} }}\n"),
+        ]:
+            with self.subTest(case=label), self.assertRaisesRegex(catalog.CatalogError, "not visible"):
+                catalog.source_services(ROOT, {path: source})
+
     def test_exclusion_records(self):
         catalog.check_publication_policy(CORPUS)
         for reason in [None, "", "  ", 1]:
