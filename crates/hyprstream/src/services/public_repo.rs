@@ -27,6 +27,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 const RECORD_PREFIX: &str = "public-rk\0";
+const GENESIS_PREFIX: &str = "public-genesis\0";
 const COMMIT_PREFIX: &str = "public-commit\0";
 const COMMIT_BLOCK_PREFIX: &str = "public-commit-block\0";
 const INTENT_PREFIX: &str = "public-intent\0";
@@ -483,6 +484,17 @@ impl PublicRepoStore {
         }))
     }
 
+    fn public_genesis_bytes(&self, did: &str) -> Result<Option<Vec<u8>>> {
+        let bytes = self.db.get_pinned(format!("{GENESIS_PREFIX}{did}"))?;
+        if let Some(bytes) = &bytes {
+            ensure!(
+                bytes.len() <= MAX_PUBLIC_RECORD_BYTES,
+                "public genesis exceeds byte budget"
+            );
+        }
+        Ok(bytes.map(|bytes| bytes.to_vec()))
+    }
+
     pub fn seed_public_genesis(
         &self,
         did: &str,
@@ -520,6 +532,13 @@ impl PublicRepoStore {
         );
         let bytes = commit.to_atproto_dag_cbor()?;
         let cid = commit.cid_atproto()?;
+        let cached = self.public_genesis_bytes(did)?;
+        if let Some(cached) = &cached {
+            ensure!(
+                cached == &bytes,
+                "public genesis cache differs from immutable archive"
+            );
+        }
         if let Some(existing) = self.snapshot(did)? {
             existing.commit.verify_atproto(verifying_key)?;
             let archived = self.db.get(commit_block_key(did, &cid.to_string()))?;
@@ -527,6 +546,13 @@ impl PublicRepoStore {
                 archived.as_deref() == Some(bytes.as_slice()),
                 "public repository has no matching immutable genesis"
             );
+            if cached.is_none() {
+                // Upgrade stores seeded before the explicit genesis locator existed.
+                let mut options = rocksdb::WriteOptions::default();
+                options.set_sync(true);
+                self.db
+                    .put_opt(format!("{GENESIS_PREFIX}{did}"), &bytes, &options)?;
+            }
             return Ok(());
         }
         ensure!(
@@ -535,6 +561,7 @@ impl PublicRepoStore {
         );
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(commit_block_key(did, &cid.to_string()), &bytes);
+        batch.put(format!("{GENESIS_PREFIX}{did}"), &bytes);
         batch.put(commit_key(did), bytes);
         let mut options = rocksdb::WriteOptions::default();
         options.set_sync(true);
@@ -1334,6 +1361,33 @@ impl HostedAccountPublicRepoWriter {
             .is_some())
     }
 
+    // Called while holding the per-DID external transaction admission. The
+    // locator avoids custody signing on every legacy read; the authority still
+    // verifies it against native genesis and never hides a corrupt sidecar.
+    async fn genesis_bytes(
+        &self,
+        did: &str,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, PublicRepoWriteError> {
+        let store = Arc::clone(&self.store);
+        let accounts = Arc::clone(&self.account_store);
+        let authority = self.authority.clone();
+        let did = did.to_owned();
+        let runtime = tokio::runtime::Handle::current();
+        blocking_public_work(move || {
+            let cached = store.public_genesis_bytes(&did)?;
+            // Account reads are async, but verification and optional custody
+            // signing must not consume a Tokio request worker.
+            runtime
+                .block_on(accounts.hosted_repo_genesis_with_cached_public(
+                    &authority,
+                    &did,
+                    cached.as_deref(),
+                ))
+                .map_err(|error| PublicRepoWriteError::Internal(anyhow!(error)))
+        })
+        .await
+    }
+
     pub async fn create_record(
         &self,
         request: PublicCreateRequest,
@@ -1386,13 +1440,11 @@ impl HostedAccountPublicRepoWriter {
                 PublicRepoWriteError::Authorization(anyhow!("hosted account is not locally owned"))
             })?;
         let (native_bytes, public_bytes) = self
-            .account_store
-            .hosted_repo_genesis_for_hosted_did(&self.authority, &request.did)
-            .await
-            .map_err(|error| PublicRepoWriteError::Internal(anyhow!(error)))?
+            .genesis_bytes(&request.did)
+            .await?
             .ok_or_else(|| {
                 PublicRepoWriteError::Authorization(anyhow!(
-                    "hosted account has no dual-format repository genesis"
+                    "hosted account has no repository genesis"
                 ))
             })?;
         let store = Arc::clone(&self.store);
@@ -1486,14 +1538,36 @@ impl PublicRepoReader {
                 tokio::task::spawn_blocking(move || encode(writer.public_snapshot()?)).await?
             }
             Self::Hosted { writer, did } => {
+                let store = Arc::clone(&writer.store);
+                let lock_did = did.clone();
+                let admission = blocking_public_work(move || {
+                    let mut accounts = store.accounts.lock();
+                    Ok(Arc::clone(
+                        &accounts.entry(lock_did).or_default().external_write,
+                    ))
+                })
+                .await?;
+                let _admission = admission.lock_owned().await;
                 let key = writer
                     .account_store
                     .verifying_key_for_hosted_did(&writer.authority, &did)
                     .await?;
+                let genesis = if key.is_some() {
+                    writer.genesis_bytes(&did).await?
+                } else {
+                    None
+                };
                 tokio::task::spawn_blocking(move || {
-                    let Some(key) = key else {
+                    let (Some(key), Some((_, public))) = (key, genesis) else {
                         return encode(None);
                     };
+                    // Seed validates both genesis and any existing immutable
+                    // archive under active_key; it never rewinds a later head.
+                    writer.store.seed_public_genesis(
+                        &did,
+                        Commit::from_atproto_dag_cbor(&public)?,
+                        &key,
+                    )?;
                     let account = {
                         let mut accounts = writer.store.accounts.lock();
                         Arc::clone(accounts.entry(did.clone()).or_default())

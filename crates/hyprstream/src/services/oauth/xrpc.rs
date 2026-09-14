@@ -1284,7 +1284,9 @@ pub async fn create_record(
     };
     let expected_prev = match parse_swap_commit(object.get("swapCommit")) {
         Ok(value) => value,
-        Err(message) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message),
+        Err(message) => {
+            return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message)
+        }
     };
     let validate = match object.get("validate") {
         None => true, // Both collections in this posting slice have known schemas.
@@ -1299,7 +1301,9 @@ pub async fn create_record(
     };
     let return_record = match parse_return_record(object.get("returnRecord")) {
         Ok(value) => value,
-        Err(message) => return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message),
+        Err(message) => {
+            return xrpc_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message)
+        }
     };
     let mut idempotency_keys = headers.get_all("Idempotency-Key").iter();
     let request_id = match idempotency_keys.next() {
@@ -1344,16 +1348,21 @@ pub async fn create_record(
     } else {
         resolve_handle_did(&state.xrpc_repos, &state.issuer_url, repo).await
     };
-    if state.hosted_public_repo_writer.is_none() {
-        if let Some(writer) = state.public_repo_writer.as_ref() {
-            if repo.as_deref() != Some(writer.did()) {
-                return xrpc_error(
-                    StatusCode::FORBIDDEN,
-                    "AuthRequired",
-                    "the request repo is not owned by this writer",
-                );
-            }
-        }
+    let hosted_target = repo
+        .as_deref()
+        .and_then(|did| hosted_repo_did(&state, did))
+        .is_some();
+    if !hosted_target
+        && !state
+            .public_repo_writer
+            .as_ref()
+            .is_some_and(|writer| repo.as_deref() == Some(writer.did()))
+    {
+        return xrpc_error(
+            StatusCode::FORBIDDEN,
+            "AuthRequired",
+            "the request repo is not owned by this writer",
+        );
     }
     let collection = match object.get("collection").and_then(Value::as_str) {
         Some(collection)
@@ -1463,7 +1472,11 @@ pub async fn create_record(
     };
     // Authorization remains inside the transaction before any store access.
     // Native locks, RocksDB, signing and sync writes must not occupy Tokio workers.
-    let result = if let Some(writer) = state.hosted_public_repo_writer.as_ref() {
+    let result = if let Some(writer) = state
+        .hosted_public_repo_writer
+        .as_ref()
+        .filter(|_| hosted_target)
+    {
         writer
             .create_record(request, expected_prev.as_deref())
             .await
@@ -2274,6 +2287,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_router_corrupt_genesis_reads_are_sanitized_without_cache_fallback() {
+        use crate::services::public_repo::{hosted_tests, PublicRepoStore};
+        for mode in [
+            hosted_tests::GenesisFixture::CorruptNative,
+            hosted_tests::GenesisFixture::InvalidNativeSignature,
+            hosted_tests::GenesisFixture::CorruptPublic,
+            hosted_tests::GenesisFixture::WrongKey,
+        ] {
+            let (accounts, _) = hosted_tests::authority_fixture_with(mode).await;
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
+            let mut state = build_test_state(true).await;
+            let writable = Arc::get_mut(&mut state).unwrap();
+            writable.hosted_account_zone =
+                Some(crate::account::AccountZone::new("accounts.example.com").unwrap());
+            writable.hosted_public_repo_writer =
+                Some(Arc::new(hosted_tests::hosted(store.clone(), accounts)));
+            writable
+                .xrpc_repos
+                .put(sample_snapshot(
+                    hosted_tests::DID,
+                    "alice.accounts.example.com",
+                    true,
+                ))
+                .await
+                .unwrap();
+            let app = build_production_app_from_state(state).await;
+            for route in [
+                format!(
+                    "/xrpc/com.atproto.repo.describeRepo?repo={}",
+                    hosted_tests::DID
+                ),
+                format!("/xrpc/com.atproto.sync.getRepo?did={}", hosted_tests::DID),
+            ] {
+                let response = app.clone().oneshot(read_request(&route)).await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "{mode:?}"
+                );
+                assert_eq!(
+                    body_json(response).await,
+                    json!({"error":"InternalServerError", "message":"public repository read failed"})
+                );
+            }
+            assert!(store.snapshot(hosted_tests::DID).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn hosted_router_writes_reads_retries_and_fails_closed() {
         use crate::services::public_repo::{hosted_tests, PublicRepoStore};
         if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
@@ -2281,7 +2344,8 @@ mod tests {
                 hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
             ));
         }
-        let (accounts, native_reads) = hosted_tests::authority_fixture().await;
+        let (accounts, native_reads) =
+            hosted_tests::authority_fixture_with(hosted_tests::GenesisFixture::Legacy).await;
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(PublicRepoStore::open(dir.path()).unwrap());
         let mut state = build_test_state(true).await;
@@ -2294,6 +2358,18 @@ mod tests {
             store.clone(),
             accounts.clone(),
         )));
+        // Installing hosted support must not steal the exact local DID's writes.
+        let local_did = "did:web:local.example.com";
+        let local_gate = Arc::new(WriteInputGate::default());
+        writable.public_repo_writer = Some(Arc::new(
+            crate::services::public_repo::PublicRepoWriter::new(
+                store.clone(),
+                local_did,
+                SigningKey::random(&mut OsRng),
+                local_gate.clone(),
+            )
+            .unwrap(),
+        ));
         let issuer = state.atproto_issuer_url();
         let now = chrono::Utc::now().timestamp();
         let key = SigningKey::random(&mut OsRng);
@@ -2305,15 +2381,14 @@ mod tests {
         .jkt();
         let nonce = state.issue_dpop_nonce().await;
         state.mark_dpop_client_nonced(&jkt).await;
-        let claims =
-            hyprstream_rpc::auth::Claims::new(hosted_tests::DID.to_owned(), now, now + 3600)
-                .with_issuer(issuer.clone())
-                .with_audience(Some(issuer.clone()))
-                .with_tenant("tenant".to_owned())
-                .with_client_id("hosted-tests")
-                .with_scope(Some("atproto".to_owned()))
-                .with_cnf_jkt_thumbprint(jkt)
-                .with_jti();
+        let claims = hyprstream_rpc::auth::Claims::new(hosted_tests::DID.to_owned(), now, now + 3600)
+            .with_issuer(issuer.clone())
+            .with_audience(Some(issuer.clone()))
+            .with_tenant("tenant".to_owned())
+            .with_client_id("hosted-tests")
+            .with_scope(Some("atproto".to_owned()))
+            .with_cnf_jkt_thumbprint(jkt)
+            .with_jti();
         let token = WriteAccess {
             token: hyprstream_rpc::auth::jwt::encode(&claims, &signing_key),
             claims,
@@ -2336,6 +2411,81 @@ mod tests {
             .snapshot("did:web:bob.accounts.example.com")
             .unwrap()
             .is_none());
+        // Foreign targets are rejected without calling either native writer.
+        input["repo"] = json!("did:web:foreign.example.com");
+        assert_eq!(
+            app.clone()
+                .oneshot(write_http_request(&token, &input, HeaderMap::new()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(native_reads.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(local_gate.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let local_calls_before = local_gate.0.load(std::sync::atomic::Ordering::SeqCst);
+        let mut local_token = token.clone();
+        local_token.claims.sub = local_did.to_owned();
+        local_token.token = hyprstream_rpc::auth::jwt::encode(&local_token.claims, &signing_key);
+        input["repo"] = json!(local_did);
+        let local_response = app
+            .clone()
+            .oneshot(write_http_request(&local_token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(local_response.status(), StatusCode::OK);
+        assert!(local_gate.0.load(std::sync::atomic::Ordering::SeqCst) > local_calls_before);
+        assert_eq!(native_reads.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(store.snapshot(local_did).unwrap().unwrap().records.len(), 1);
+        *local_gate.1.lock() = Some("private local denial".into());
+        input["rkey"] = json!(Tid::from_raw(2).encode());
+        let denied_local = app
+            .clone()
+            .oneshot(write_http_request(&local_token, &input, HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(denied_local.status(), StatusCode::FORBIDDEN);
+        assert!(!body_json(denied_local)
+            .await
+            .to_string()
+            .contains("private local denial"));
+        assert_eq!(native_reads.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        *local_gate.1.lock() = None;
+        input["rkey"] = json!(Tid::from_raw(1).encode());
+        let local_calls = local_gate.0.load(std::sync::atomic::Ordering::SeqCst);
+        // The authority has published a real empty repo even before any record.
+        let description = app
+            .clone()
+            .oneshot(read_request(&format!(
+                "/xrpc/com.atproto.repo.describeRepo?repo={}",
+                hosted_tests::DID,
+            )))
+            .await
+            .unwrap();
+        assert_eq!(description.status(), StatusCode::OK);
+        let description = body_json(description).await;
+        assert_eq!(description["did"], hosted_tests::DID);
+        assert_eq!(description["collections"], json!([]));
+        let genesis = store.snapshot(hosted_tests::DID).unwrap().unwrap().commit;
+        let export = app
+            .clone()
+            .oneshot(read_request(&format!(
+                "/xrpc/com.atproto.sync.getRepo?did={}",
+                hosted_tests::DID,
+            )))
+            .await
+            .unwrap();
+        assert_eq!(export.status(), StatusCode::OK);
+        assert!(!axum::body::to_bytes(export.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(native_reads.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            local_gate.0.load(std::sync::atomic::Ordering::SeqCst),
+            local_calls
+        );
+        input["swapCommit"] = json!(genesis.cid_atproto().unwrap().to_string());
         input["repo"] = json!("alice.accounts.example.com");
         let mut headers = HeaderMap::new();
         headers.insert("Idempotency-Key", "first".parse().unwrap());
@@ -2353,6 +2503,7 @@ mod tests {
             .unwrap();
         assert_eq!(retry.status(), StatusCode::OK);
         assert_eq!(body_json(retry).await, first);
+        input.as_object_mut().unwrap().remove("swapCommit");
         input["rkey"] = json!(Tid::from_raw(2).encode());
         assert_eq!(
             app.clone()
@@ -2363,7 +2514,10 @@ mod tests {
             StatusCode::OK
         );
         for repo in [hosted_tests::DID, "alice.accounts.example.com"] {
-            let uri = format!("/xrpc/com.atproto.repo.getRecord?repo={repo}&collection=app.bsky.feed.post&rkey={}", Tid::from_raw(1).encode());
+            let uri = format!(
+                "/xrpc/com.atproto.repo.getRecord?repo={repo}&collection=app.bsky.feed.post&rkey={}",
+                Tid::from_raw(1).encode()
+            );
             let response = app
                 .clone()
                 .oneshot(
@@ -2387,7 +2541,16 @@ mod tests {
             ))
             .await
             .unwrap();
-        let resolved = app.clone().oneshot(HttpRequest::builder().uri("/xrpc/com.atproto.identity.resolveHandle?handle=alice.accounts.example.com").body(Body::empty()).unwrap()).await.unwrap();
+        let resolved = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/xrpc/com.atproto.identity.resolveHandle?handle=alice.accounts.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resolved.status(), StatusCode::OK);
         assert_eq!(body_json(resolved).await["did"], hosted_tests::DID);
         let description = app
@@ -2415,9 +2578,7 @@ mod tests {
         );
         let native_key = accounts
             .verifying_key_for_hosted_did(
-                &hyprstream_rpc::Subject::new(
-                    hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
-                ),
+                &hyprstream_rpc::Subject::new(hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT),
                 hosted_tests::DID,
             )
             .await
@@ -2439,9 +2600,9 @@ mod tests {
         assert_eq!(alias_description.status(), StatusCode::OK);
         assert_eq!(body_json(alias_description).await, description);
         let alias_record = app.clone().oneshot(read_request(&format!(
-            "/xrpc/com.atproto.repo.getRecord?repo=other.example.com&collection=app.bsky.feed.post&rkey={}",
-            Tid::from_raw(1).encode(),
-        ))).await.unwrap();
+                "/xrpc/com.atproto.repo.getRecord?repo=other.example.com&collection=app.bsky.feed.post&rkey={}",
+                Tid::from_raw(1).encode(),
+            ))).await.unwrap();
         assert_eq!(alias_record.status(), StatusCode::OK);
         assert_eq!(body_json(alias_record).await["cid"], first["cid"]);
         let export = app
@@ -2466,21 +2627,21 @@ mod tests {
             .insert_snapshot_budget_fixture_for_test(hosted_tests::DID, 257, 1)
             .unwrap();
         for uri in [hosted_tests::DID, "alice.accounts.example.com", "other.example.com"]
-            .into_iter().flat_map(|repo| [
-                format!("/xrpc/com.atproto.repo.describeRepo?repo={repo}"),
-                format!("/xrpc/com.atproto.repo.getRecord?repo={repo}&collection=app.bsky.feed.post&rkey={}", Tid::from_raw(1).encode()),
-                format!("/xrpc/com.atproto.sync.getRepo?did={repo}"),
-            ]) {
+                .into_iter().flat_map(|repo| [
+                    format!("/xrpc/com.atproto.repo.describeRepo?repo={repo}"),
+                    format!("/xrpc/com.atproto.repo.getRecord?repo={repo}&collection=app.bsky.feed.post&rkey={}", Tid::from_raw(1).encode()),
+                    format!("/xrpc/com.atproto.sync.getRepo?did={repo}"),
+                ]) {
 
-            assert_eq!(
-                app.clone()
-                    .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
-                    .await
-                    .unwrap()
-                    .status(),
-                StatusCode::INTERNAL_SERVER_ERROR
-            );
-        }
+                assert_eq!(
+                    app.clone()
+                        .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::INTERNAL_SERVER_ERROR
+                );
+            }
     }
 
     fn write_input(id: u64) -> Value {
@@ -2496,11 +2657,7 @@ mod tests {
         })
     }
 
-    fn write_http_request(
-        token: &WriteAccess,
-        input: &Value,
-        headers: HeaderMap,
-    ) -> HttpRequest<Body> {
+    fn write_http_request(token: &WriteAccess, input: &Value, headers: HeaderMap) -> HttpRequest<Body> {
         let mut request = HttpRequest::builder()
             .method("POST")
             .uri("/xrpc/com.atproto.repo.createRecord")
