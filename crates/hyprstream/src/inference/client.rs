@@ -4,8 +4,8 @@
 //! Implementations can be in-process (channels) or remote (gRPC, etc.).
 
 use crate::config::GenerationResult;
-use crate::runtime::GenerationRequest;
-use crate::runtime::ModelInfo;
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::inference_client::ModelInfo;
 use crate::training::TenantDeltaConfig;
 use async_trait::async_trait;
 use std::path::Path;

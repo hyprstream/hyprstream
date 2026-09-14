@@ -154,7 +154,7 @@ async fn network_roundtrip() -> Result<()> {
     let _ = hyprstream_rpc::envelope::install_verify_config(hyprstream_rpc::envelope::EnvelopeVerifyConfig {
         policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid, pq_store: Some(Arc::new(request_keys)),
     });
-    let discovery_client = crate::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
+    let discovery_client = hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
         "discovery", "discovery", None, model.clone(), None, bootstrap_resolver.clone(),
     )?));
     tokio::time::timeout(Duration::from_secs(10), discovery_client.announce(&announcement(&model_state, "model", &model, &policy))).await??;
@@ -173,7 +173,7 @@ async fn network_roundtrip() -> Result<()> {
     let event_endpoint = IrohSubstrate::new(event_carrier.to_bytes(), RefuseHandler::new("reach fixture"), RefuseHandler::new("Event has no RPC")).await?;
     let mut event_announcement = announcement(&event_state, "event", &event, &policy);
     event_announcement.capabilities = vec!["hyprstream-moq/1".to_owned()];
-    let event_discovery_client = crate::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
+    let event_discovery_client = hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
         "discovery", "discovery", None, event.clone(), None, bootstrap_resolver,
     )?));
     event_discovery_client.announce(&event_announcement).await?;

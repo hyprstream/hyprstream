@@ -21,7 +21,7 @@ use git2db::Git2DB;
 use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::config::TokenConfig;
 use hyprstream_core::services::PolicyService;
-use hyprstream_core::services::generated::policy_client::PolicyClient;
+use hyprstream_rpc_std::policy_client::PolicyClient;
 use hyprstream_core::services::revocation::PolicyAuthorityRevocationStore;
 
 use hyprstream_rpc::auth::{

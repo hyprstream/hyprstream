@@ -72,7 +72,8 @@ use std::sync::Arc;
 
 use hyprstream_9p::{AccessDecider, Action, ReferenceMonitorDenyReason};
 use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext, SecurityLabel};
-use hyprstream_workers::runtime::{KataBackend, PodSandbox, PodSandboxConfig, SandboxBackend};
+use hyprstream_workers::runtime::{KataBackend, PodSandbox, SandboxBackend};
+use hyprstream_rpc_std::worker_client::PodSandboxConfig;
 use hyprstream_workers::{HypervisorType, ImageConfig, PoolConfig, RafsStore};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;

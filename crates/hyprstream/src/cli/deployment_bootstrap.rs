@@ -20,6 +20,82 @@ use crate::services::discovery::{At9pStateIngest, PdsRecordStore};
 /// Machine-readable manifest schema emitted by `--roster-export`.
 const VERIFIED_ROSTER_SCHEMA: &str = "hyprstream/verified-service-roster@1";
 
+/// Open the deployment checkpoint store on the CONFIGURED backend (#1257).
+///
+/// With an RDS binding resolved (`[rds]` TOML, the role-scoped env vars, or
+/// the shared credentials directory), the store is the shared RDS Postgres
+/// instance — the bootstrap flow must write/read the same accepted states the
+/// RDS-backed services and the QUIC checkpoint gate read; opening the local
+/// RocksDB instead would provision states no RDS-backed reader ever sees.
+/// With no binding resolved, `directory` is the local RocksDB path.
+///
+/// The at9p duplicity alarm WAL stays host-local under `directory` in both
+/// modes (it is a per-host tamper journal, not shared state). In RDS posture
+/// the local directory may hold only that WAL — never a record store.
+fn open_checkpoint_store(
+    config: &HyprConfig,
+    directory: &Path,
+    readonly: bool,
+) -> Result<PdsRecordStore> {
+    let rds = config.rds.resolved_from_env()?;
+    if rds.is_configured() {
+        #[cfg(feature = "pds-postgres")]
+        return PdsRecordStore::open_postgres(&rds, readonly)
+            .context("open RDS-backed deployment checkpoint store");
+        #[cfg(not(feature = "pds-postgres"))]
+        anyhow::bail!(
+            "RDS is configured ([rds] section or HYPRSTREAM_RECORDS_URL_FILE) but this \
+             binary was not built with the `pds-postgres` feature — refusing to silently \
+             use the local checkpoint store. Rebuild with --features pds-postgres."
+        );
+    }
+    if readonly {
+        PdsRecordStore::open_readonly(directory)
+    } else {
+        PdsRecordStore::open(directory)
+    }
+}
+
+/// Explicitly create the empty deployment checkpoint store for a newly
+/// provisioned deployment, on the configured backend (#1257).
+///
+/// Local backend: delegates to
+/// [`hyprstream_discovery::initialize_deployment_checkpoint_store`] (creates
+/// the RocksDB store and writes the first-boot marker; refuses an existing
+/// store).
+///
+/// RDS backend: proves the shared store holds no accepted states — refusing
+/// to "initialize" over live security history, mirroring the local guard —
+/// then writes the first-boot provisioning marker into Postgres. The registry
+/// deletes the marker in the same transaction as its first accepted-state
+/// commit, and the QUIC startup gate reads it from the same shared store.
+pub fn init_checkpoint_store(config: &HyprConfig) -> Result<()> {
+    let rds = config.rds.resolved_from_env()?;
+    if rds.is_configured() {
+        #[cfg(feature = "pds-postgres")]
+        {
+            let verifier = hyprstream_discovery::authenticate_local_deployment_registry()?;
+            let directory = hyprstream_service::deployment_data_dir()?.join("pds-store");
+            let store = open_checkpoint_store(config, &directory, false)?
+                .with_at9p_deployment_verifier(verifier);
+            ensure!(
+                store.accepted_at9p_states()?.is_empty(),
+                "refusing to initialize: the RDS-backed checkpoint store already \
+                 holds accepted states"
+            );
+            store.mark_first_boot()?;
+            return Ok(());
+        }
+        #[cfg(not(feature = "pds-postgres"))]
+        anyhow::bail!(
+            "RDS is configured ([rds] section or HYPRSTREAM_RECORDS_URL_FILE) but this \
+             binary was not built with the `pds-postgres` feature — refusing to silently \
+             initialize the local checkpoint store. Rebuild with --features pds-postgres."
+        );
+    }
+    hyprstream_discovery::initialize_deployment_checkpoint_store()
+}
+
 /// One public roster member projected from the checkpoint-verified accepted
 /// state read back from the store after admission. Contains no secret
 /// material: only the admitted DID, epoch, bounded validity, and the
@@ -79,15 +155,17 @@ pub fn provision_services(
         })
         .collect::<Result<Vec<_>>>()?;
     let directory = hyprstream_service::deployment_data_dir()?.join("pds-store");
-    let probe =
-        PdsRecordStore::open_readonly(&directory)?.with_at9p_deployment_verifier(verifier.clone());
+    let probe = open_checkpoint_store(config, &directory, true)?
+        .with_at9p_deployment_verifier(verifier.clone());
     ensure!(
         probe.first_boot_pending()? || !probe.accepted_at9p_states()?.is_empty(),
         "empty unmarked checkpoint store requires explicit initialization or recovery"
     );
     drop(probe);
-    let store =
-        Arc::new(PdsRecordStore::open(&directory)?.with_at9p_deployment_verifier(verifier.clone()));
+    let store = Arc::new(
+        open_checkpoint_store(config, &directory, false)?
+            .with_at9p_deployment_verifier(verifier.clone()),
+    );
     let audit = hyprstream_rpc::node_identity::derive_purpose_key(
         &acceptance,
         "hyprstream-at9p-audit-ed25519-v1",
@@ -132,7 +210,7 @@ pub fn inspect_services(config: &HyprConfig, services: &[String]) -> Result<Vec<
     let secrets = provisioning_secrets_dir(config)?;
     let keys = load_roster_keys(&secrets, services)?;
     let directory = hyprstream_service::deployment_data_dir()?.join("pds-store");
-    let store = PdsRecordStore::open_readonly(&directory)?
+    let store = open_checkpoint_store(config, &directory, true)?
         .with_at9p_deployment_verifier(verifier);
     inspect_verified_roster(&store, &keys, &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true))
 }
@@ -559,6 +637,114 @@ mod tests {
         let custom_secrets = tempfile::tempdir()?.path().join("custom-secrets");
         config.secrets.path = Some(custom_secrets.clone());
         assert_eq!(provisioning_secrets_dir(&config)?, custom_secrets);
+        Ok(())
+    }
+
+    /// A config with an explicit (TOML-level) records-role binding: URL and CA
+    /// files rendered under `dir`, so resolution never consults process env.
+    fn rds_bound_config(dir: &Path, url: &str) -> Result<HyprConfig> {
+        std::fs::write(dir.join("records-url"), format!("{url}\n"))?;
+        std::fs::write(dir.join("rds-ca.pem"), b"test-ca-pem")?;
+        let mut config = HyprConfig::default();
+        config.rds = crate::config::RdsConfig {
+            url_file: Some(dir.join("records-url")),
+            root_cert_file: Some(dir.join("rds-ca.pem")),
+            cell_id: "test-cell".to_owned(),
+        };
+        Ok(config)
+    }
+
+    /// Slice one top-level item out of this file: from `marker` to the first
+    /// column-0 item/comment/attribute line that follows it. (Owned return,
+    /// no lifetime parameters: a `'` token desyncs the loopback-burndown
+    /// test-region skipper, which is not a full lexer.)
+    fn top_level_body(source: &str, marker: &str) -> String {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("item exists: {marker}"));
+        let rest = &source[start + marker.len()..];
+        let end = ["\nfn ", "\npub fn", "\n///", "\n//", "\n#["]
+            .iter()
+            .filter_map(|needle| rest.find(needle))
+            .min()
+            .unwrap_or(rest.len());
+        rest[..end].to_owned()
+    }
+
+    #[test]
+    fn bootstrap_paths_route_through_the_backend_selecting_open() {
+        let source = include_str!("deployment_bootstrap.rs");
+        for marker in ["pub fn provision_services(", "pub fn inspect_services("] {
+            let body = top_level_body(source, marker);
+            assert!(
+                body.contains("open_checkpoint_store("),
+                "{marker} must open the configured backend"
+            );
+            assert!(
+                !body.contains("PdsRecordStore::open_readonly(")
+                    && !body.contains("PdsRecordStore::open("),
+                "{marker} must not open the local store directly"
+            );
+        }
+        let init = top_level_body(source, "pub fn init_checkpoint_store(");
+        assert!(init.contains("resolved_from_env()?"));
+        assert!(init.contains("open_checkpoint_store("));
+        assert!(init.contains("mark_first_boot"));
+    }
+
+    /// RDS-configured bootstrap paths must fail closed and never silently
+    /// open the local store — even when a valid local store exists. The
+    /// failure here is deterministic (the contract rejects a loopback URL
+    /// before any network I/O), and it must come from the RDS contract path,
+    /// proving the RDS branch was taken.
+    #[cfg(feature = "pds-postgres")]
+    #[test]
+    fn rds_configured_bootstrap_store_fails_closed_and_never_touches_local() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_dir = dir.path().join("pds-store");
+        // A valid local store exists: a silent local fallback would succeed.
+        drop(PdsRecordStore::open(&store_dir)?);
+        let creds = tempfile::tempdir()?;
+        let config = rds_bound_config(
+            creds.path(),
+            "postgresql://127.0.0.1/records?sslmode=verify-full",
+        )?;
+        for readonly in [true, false] {
+            let err = open_checkpoint_store(&config, &store_dir, readonly)
+                .err()
+                .context("RDS-configured open must fail closed, not fall back to local")?;
+            assert!(
+                format!("{err:?}").contains("loopback"),
+                "the failure must come from the RDS contract path: {err}"
+            );
+        }
+        assert!(init_checkpoint_store(&config).is_err());
+        Ok(())
+    }
+
+    /// Without the `pds-postgres` feature an RDS-configured bootstrap path is
+    /// a hard error naming the missing feature — never a silent local store.
+    #[cfg(not(feature = "pds-postgres"))]
+    #[test]
+    fn rds_configured_without_feature_bails_on_bootstrap_paths() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_dir = dir.path().join("pds-store");
+        drop(PdsRecordStore::open(&store_dir)?);
+        let creds = tempfile::tempdir()?;
+        let config = rds_bound_config(
+            creds.path(),
+            "postgresql://db.internal.example/records?sslmode=verify-full",
+        )?;
+        for readonly in [true, false] {
+            let err = open_checkpoint_store(&config, &store_dir, readonly)
+                .err()
+                .context("RDS-configured open must fail closed without the feature")?;
+            assert!(
+                err.to_string().contains("pds-postgres"),
+                "the failure must name the missing feature: {err}"
+            );
+        }
+        assert!(init_checkpoint_store(&config).is_err());
         Ok(())
     }
 

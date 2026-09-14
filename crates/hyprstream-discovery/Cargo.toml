@@ -25,6 +25,7 @@ valkey = ["dep:fred"]
 [dependencies]
 # Workspace crates
 hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }
 hyprstream-service = { path = "../hyprstream-service" }
 # K4c (#787) — optional, only for the `k8s` feature's placement→PodSpec map.
 hyprstream-k8s = { path = "../hyprstream-k8s", optional = true }
@@ -96,12 +97,6 @@ hyprstream-crypto = { path = "../hyprstream-crypto" }
 proptest = { workspace = true }
 serde_yaml = { workspace = true }
 tempfile = { workspace = true }
-
-[build-dependencies]
-capnpc = { workspace = true }
-capnp = { workspace = true }
-serde_json = { workspace = true }
-hyprstream-rpc-build = { workspace = true }
 
 [lints]
 workspace = true

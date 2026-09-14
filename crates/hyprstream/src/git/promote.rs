@@ -55,7 +55,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
-use crate::services::generated::registry_client::{CommitWithAuthorRequest, WorktreeClient};
+use hyprstream_rpc_std::registry_client::{CommitWithAuthorRequest, WorktreeClient};
 
 /// An error from the promote saga.
 #[derive(Debug)]

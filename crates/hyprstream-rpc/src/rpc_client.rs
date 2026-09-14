@@ -1222,6 +1222,23 @@ pub trait RpcClient: Send + Sync {
     fn next_id(&self) -> u64;
 }
 
+/// Application-supplied construction seam for generated service clients.
+///
+/// The contract/client crates depend only on this trait; deployment-specific
+/// resolver authority (for example, checkpoint-backed Discovery) implements it
+/// in the service/application crate. This keeps production endpoint discovery
+/// out of permissively licensed SDK packages while still allowing callers to
+/// construct typed clients from a single provider.
+pub trait RpcClientProvider: Send + Sync {
+    /// Build an object-safe RPC client bound to `service_name`.
+    fn rpc_client(
+        &self,
+        service_name: &str,
+        signing_key: crate::crypto::SigningKey,
+        token: Option<String>,
+    ) -> Result<Arc<dyn RpcClient>>;
+}
+
 /// Blanket impl: any `RpcClientImpl<S, T>` satisfies `RpcClient`.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]

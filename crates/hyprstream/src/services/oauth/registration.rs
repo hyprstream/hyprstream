@@ -404,7 +404,7 @@ pub(crate) async fn check_federation_register_for_client_auth(
 /// PolicyService outage → reject, with operator-visible error. Security
 /// posture is preserved over availability of new federation registrations.
 async fn check_federation_register(state: &OAuthState, origin: &str) -> Result<(), String> {
-    use crate::services::generated::policy_client::PolicyCheck;
+    use hyprstream_rpc_std::policy_client::PolicyCheck;
     let resource = crate::auth::federation_registration_resource(origin)
         .map_err(|error| format!("invalid federation origin policy resource: {error}"))?;
     match state
