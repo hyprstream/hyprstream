@@ -193,6 +193,9 @@ def mcp_registrations(source: str) -> tuple[list[str], dict[str, list[dict[str, 
              "MCP top-level registration roots must be direct")
     required(len(scoped_calls) == len(direct_scoped),
              "MCP scoped registration roots must be direct")
+    first_root = min(match.start() for match in direct_top_level + direct_scoped)
+    required(re.search(r"\breturn\b", body[:first_root]) is None,
+             "MCP registration roots may not follow an early exit")
     for match in direct_top_level:
         args = re.match(r"\s*reg\s*,\s*([A-Za-z_][\w:]*)::schema_metadata\s*\(\s*\)\s*,?\s*\)", body[match.end():])
         required(args is not None, "unresolved MCP top-level registration")
@@ -316,6 +319,9 @@ def cli_method_policy(source: str) -> bool:
         required(len(guards) == 1, f"CLI {builder} guard must be direct and unique")
         guard_body, _ = rust_block_span(loop, guards[0].start(), f"CLI {builder} guard")
         required(guard_body.strip() == "continue;", f"CLI {builder} guard must continue")
+        registrations = direct_matches(loop, r"\bcmd\s*=\s*cmd\.subcommand\s*\(")
+        required(len(registrations) == 1 and guards[0].start() < registrations[0].start(),
+                 f"CLI {builder} guard must precede method registration")
     return True
 
 
@@ -334,9 +340,17 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
     scoped_tree_bindings = unique_cli_bindings(cli,
         r'\blet\s+(?P<binding>[a-zA-Z_]\w*)\s*=\s*'
         r'(?P<module>[A-Za-z_][\w:]*)::scoped_client_tree\s*\(\s*\)\s*;')
+    tool_root = list(re.finditer(r"\bfn\s+build_tool_command\s*\(", cli))
+    required(len(tool_root) == 1, "missing or ambiguous CLI tool registration root")
+    tool_body = rust_fn_body(cli, "build_tool_command")
+    tool_start = cli.find("{", tool_root[0].start()) + 1
+    direct_services = {tool_start + match.start()
+                       for match in direct_matches(tool_body, r"\bbuild_service_command\s*\(")}
     for match in re.finditer(r'\bbuild_service_command\s*\(\s*', cli):
         if re.match(r'"', cli_source[match.end():]) is None:
             continue
+        required(match.start() in direct_services,
+                 "CLI service registration must be at direct tool-root scope")
         service, end = rust_string(cli_source, match.end(), "CLI service registration")
         arguments = re.match(
             r'\s*,\s*&(?P<metadata>[a-zA-Z_]\w*)\s*,\s*(?P<tree>[a-zA-Z_]\w*)\s*,?\s*\)',
@@ -1120,7 +1134,7 @@ def capnp_only_inputs(build_file: str, source: str) -> list[str]:
     type_patterns += [rf"(?<![:\w]){re.escape(alias)}\s*::\s*CompilerCommand" for alias in sorted(module_aliases)]
     compiler_type = "|".join(f"(?:{pattern})" for pattern in type_patterns)
     typed_default = re.compile(
-        rf"\blet\s+(?:mut\s+)?(?P<binding>[A-Za-z_]\w*)\s*:\s*(?:{compiler_type})\s*=\s*"
+        rf"\blet\s+(?:mut\s+)?(?P<binding>[A-Za-z_]\w*)\s*(?::\s*(?:{compiler_type}))?\s*=\s*"
         rf"(?:Default\s*::\s*default\s*\(\s*\)|<\s*(?:{compiler_type})\s+as\s*"
         rf"(?:std\s*::\s*default\s*::\s*)?Default\s*>\s*::\s*default\s*\(\s*\))\s*;")
     for match in typed_default.finditer(code):
@@ -1773,6 +1787,13 @@ def self_test(repo: Path) -> None:
     required(capnp_only_inputs(tui_build, qualified_default_fixture)
              == ["crates/hyprstream-rpc-std/schema/compositor_ipc.capnp"],
              "fully-qualified Default capnp compiler resolution drift")
+    inferred_default_fixture = '\n'.join([
+        'let mut command = <capnpc::CompilerCommand as Default>::default();',
+        'command.file("crates/hyprstream-rpc-std/schema/compositor_ipc.capnp").run();',
+    ])
+    required(capnp_only_inputs(tui_build, inferred_default_fixture)
+             == ["crates/hyprstream-rpc-std/schema/compositor_ipc.capnp"],
+             "inferred fully-qualified Default capnp compiler resolution drift")
     direct_drift = text(repo, canonical_build, None).replace(
         "\n}", '\n    capnpc::CompilerCommand::new().file("../hyprstream-pay/schema/settlement.capnp").run();\n}', 1
     )
@@ -1957,6 +1978,10 @@ def self_test(repo: Path) -> None:
         "register_top_level!(reg, model_client::schema_metadata());",
         "if false { register_top_level!(reg, model_client::schema_metadata()); }", 1)
     expect_mcp_failure("MCP nested top-level registration root", nested_top_level_root)
+    early_exit_root = text(repo, mcp_path, None).replace(
+        "    register_top_level!(reg, model_client::schema_metadata());",
+        "    if std::hint::black_box(true) { return; }\n    register_top_level!(reg, model_client::schema_metadata());", 1)
+    expect_mcp_failure("MCP early exit before registration roots", early_exit_root)
     nested_scoped_root = text(repo, mcp_path, None).replace(
         "register_scoped_tools_recursive(\n        reg,",
         "if false { register_scoped_tools_recursive(\n        reg,", 1).replace(
