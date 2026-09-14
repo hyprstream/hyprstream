@@ -104,6 +104,13 @@ run_phase "native release build" cargo build --release
 run_phase "Metrics release build" cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features metrics
 run_phase "Metrics typed handler tests" cargo test -p hyprstream --locked --lib --no-default-features --features metrics services::metrics::tests::
 
+# The RDS-backed PDS record store (#1257) is feature-gated and absent from
+# the default-feature build above; check its full target set and run its
+# contract/unit tests. Live DB tests skip themselves green unless
+# HYPRSTREAM_POSTGRES_TEST_URL_FILE points at a scratch database.
+run_phase "pds-postgres feature check" cargo check -p hyprstream --locked --all-targets --features pds-postgres
+run_phase "pds-postgres contract tests" cargo test -p hyprstream --locked --lib --features pds-postgres -- services::pds_record_pg:: services::discovery::pg_tests:: config::tests::rds
+
 # wasm guest artifacts for the sandbox/mount tests (deny-on-missing-guest guard).
 # cd INTO each guest crate so cargo reads its .cargo/config.toml (the python guest
 # needs getrandom_backend="custom" for wasm32-unknown-unknown; see #1013).
