@@ -78,6 +78,14 @@
             });
         };
 
+        # Fixed-output native payload from the same artifact crate as Cargo.lock.
+        # Explicit provisioning keeps dependency builds offline and HOME-independent.
+        pglite = import ./nix/pglite.nix {
+          inherit (pkgs) lib stdenvNoCC fetchurl;
+          inherit system;
+          cargoLock = builtins.fromTOML (builtins.readFile ./Cargo.lock);
+        };
+
         # Common args shared by all variants
         commonArgs = {
           inherit src cargoVendorDir;
@@ -96,6 +104,7 @@
           ];
 
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          PGLITE_LIB_DIR = "${pglite}/lib";
 
           buildInputs = with pkgs; [
             openssl
@@ -222,6 +231,7 @@
             # works without requiring sccache and the /var/cache/sccache path.
             unset RUSTC_WRAPPER SCCACHE_DIR SCCACHE_CACHE_SIZE
             export LIBTORCH="${devLibtorch}"
+            export PGLITE_LIB_DIR="${pglite}/lib"
             export LD_LIBRARY_PATH="${devLibtorch}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             export LIBTORCH_BYPASS_VERSION_CHECK=1
             export CARGO_NET_GIT_FETCH_WITH_CLI=true
@@ -231,6 +241,7 @@
         };
 
         checks = {
+          pglite-payload = pglite;
           hyprstream-cpu = self.packages.${system}.hyprstream-cpu;
         };
       });
