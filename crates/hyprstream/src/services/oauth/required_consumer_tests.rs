@@ -16,6 +16,22 @@ use hyprstream_rpc::transport::TransportConfig;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
+// A replacement server has the same authenticated identity but new sockets.
+// MemoryLookup::add_endpoint_info augments hints, retaining retired addresses;
+// replace them atomically so classifier controls do not race stale routing.
+fn replace_endpoint_hint(lookup: &iroh::address_lookup::memory::MemoryLookup, server: &IrohSubstrate) {
+    let current = iroh::EndpointAddr::from_parts(
+        server.endpoint_id(),
+        server.endpoint().bound_sockets().into_iter().map(iroh::TransportAddr::Ip),
+    );
+    assert!(lookup.set_endpoint_info(current.clone()).is_some());
+    assert_eq!(
+        lookup.get_endpoint_info(server.endpoint_id()).unwrap().into_endpoint_addr(),
+        current,
+        "replacement fixture must publish only its current sockets",
+    );
+}
+
 struct OaiTestNinePDecider;
 
 impl hyprstream_9p::AccessDecider for OaiTestNinePDecider {
@@ -862,14 +878,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
             IrohRpcProtocolHandler::new(model_bridge, model.clone()),
         )
         .await?;
-        lookup.add_endpoint_info(iroh::EndpointAddr::from_parts(
-            model_server.endpoint_id(),
-            model_server
-                .endpoint()
-                .bound_sockets()
-                .into_iter()
-                .map(iroh::TransportAddr::Ip),
-        ));
+        replace_endpoint_hint(&lookup, &model_server);
         let registry_status = Arc::new(Mutex::new("healthy".to_owned()));
         let registry_bridge = LocalServiceBridge::spawn(
             RegistryReadinessResponder {
@@ -889,14 +898,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
             IrohRpcProtocolHandler::new(registry_bridge, registry.clone()),
         )
         .await?;
-        lookup.add_endpoint_info(iroh::EndpointAddr::from_parts(
-            registry_server.endpoint_id(),
-            registry_server
-                .endpoint()
-                .bound_sockets()
-                .into_iter()
-                .map(iroh::TransportAddr::Ip),
-        ));
+        replace_endpoint_hint(&lookup, &registry_server);
 
         for response in [
             ModelReadinessResponse::Error {
@@ -980,16 +982,25 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
             std::time::Duration::from_millis(250),
         );
         tokio::pin!(timeout_check);
-        tokio::select! {
-            _ = model_entered.notified() => {}
-            result = &mut timeout_check => {
-                panic!("blocked Model probe completed before timeout: {result:?}");
+        // Arm the whole-readiness deadline, then deliberately delay this
+        // caller's next poll past it. A loaded executor may observe the
+        // deadline before (or together with) the remote handler notification.
+        // That is a valid fail-closed result, not a requirement that transport
+        // and authentication complete inside the readiness budget. The
+        // separate cancellation control above proves entered + not-ready.
+        let result = match futures::poll!(timeout_check.as_mut()) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                timeout_check.await
             }
-        }
-        let timeout = timeout_check
-            .await
-            .expect_err("bounded OAI native readiness must time out");
-        assert!(timeout.to_string().contains("timed out"));
+        };
+        let timeout = result.expect_err("bounded OAI native readiness must time out");
+        assert!(matches!(
+            timeout,
+            hyprstream_rpc::error::RpcError::SpawnFailed(ref message)
+                if message == "OAI native dependency readiness timed out after 250 milliseconds"
+        ), "unexpected readiness failure: {timeout}");
         model_release.notify_one();
 
         *model_response.lock() = ModelReadinessResponse::ExpectedTenantDenial;
@@ -1009,7 +1020,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
         let unhealthy = crate::services::oai_healthy_registry(&registry_client)
             .await
             .expect_err("non-healthy Registry response must withhold OAI readiness");
-        assert!(unhealthy.to_string().contains("degraded"));
+        assert!(unhealthy.to_string().contains("degraded"), "unexpected Registry readiness failure: {unhealthy}");
         *registry_status.lock() = "healthy".to_owned();
         let unauthenticated = hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
             SigningKey::from_bytes(&[0x7f; 32]),

@@ -418,6 +418,7 @@ mod tests {
         mst_root: hyprstream_pds::Cid,
         mst_blocks: Vec<(hyprstream_pds::Cid, Vec<u8>)>,
         commit: Vec<u8>,
+        public_commit: Vec<u8>,
     }
 
     #[derive(Default)]
@@ -441,6 +442,7 @@ mod tests {
                 mst_root: publication.repo().mst_root(),
                 mst_blocks: publication.repo().mst_blocks().to_vec(),
                 commit: publication.repo().commit_bytes().to_vec(),
+                public_commit: publication.repo().public_commit_bytes().to_vec(),
             };
             self.published
                 .set(published)
@@ -518,10 +520,21 @@ mod tests {
             .any(|(cid, bytes)| *cid == published.mst_root
                 && hyprstream_pds::Cid::from_dag_cbor(bytes) == *cid));
         let commit = hyprstream_pds::commit::Commit::from_dag_cbor(&published.commit).unwrap();
+        let public_commit = hyprstream_pds::commit::Commit::from_atproto_dag_cbor(
+            &published.public_commit,
+        )
+        .unwrap();
         let record = AccountRecord::from_dag_cbor(&published.account_record).unwrap();
         commit
             .verify(&record.atproto_verifying_key().unwrap())
             .unwrap();
+        public_commit
+            .verify_atproto(&record.atproto_verifying_key().unwrap())
+            .unwrap();
+        assert_eq!(public_commit.did, commit.did);
+        assert_eq!(public_commit.data, commit.data);
+        assert_eq!(public_commit.rev, commit.rev);
+        assert_eq!(public_commit.prev, commit.prev);
         assert_eq!(document.did(), record.name().did());
         assert_eq!(document.cid(), record.doc_cid());
         assert_eq!(genesis.cid().unwrap(), record.genesis_op());

@@ -61,6 +61,8 @@ pub enum AccountReadError {
     InvalidVerifiedTenant(String),
     #[error("invalid hosted account label {0:?}")]
     InvalidAccountLabel(String),
+    #[error("invalid hosted repository artifact name {0:?}")]
+    InvalidRepositoryArtifact(String),
     #[error("PDS hosted-account tenant resolution denied for {0:?}")]
     UnauthorizedTenantResolver(String),
     #[error("PDS account read denied for {subject:?} on {object:?}: {reason:?}")]
@@ -536,6 +538,158 @@ impl AccountRecordStore {
         Ok(Some(signature.to_bytes().to_vec()))
     }
 
+    /// Read the public `#atproto` verification key for one authority-owned
+    /// hosted DID without exposing its private signing material. The same
+    /// bounded index, exact account-record checks, and fixed OAuth authority
+    /// used by [`Self::sign_for_hosted_did`] are applied.
+    pub async fn verifying_key_for_hosted_did(
+        &self,
+        authority: &Subject,
+        did: &str,
+    ) -> Result<Option<p256::ecdsa::VerifyingKey>, AccountReadError> {
+        let resolved = self.resolve_tenant_for_hosted_did(authority, did).await?;
+        let Some(tenant) = resolved else {
+            return Ok(None);
+        };
+        let Some(label) = hosted_account_label(did)? else {
+            return Ok(None);
+        };
+        let record_components = [
+            tenant.as_str(),
+            PDS_ACCOUNTS_DIRECTORY,
+            label,
+            PDS_ACCOUNT_RECORD_FILE,
+        ];
+        let record_bytes = read_file(
+            self.pds_mount.as_ref(),
+            self.read_authorizer.as_ref(),
+            &record_components,
+            authority,
+            Some(tenant.as_str()),
+            None,
+            self.max_record_bytes,
+        )
+        .await?;
+        let record =
+            AccountRecord::from_dag_cbor(&record_bytes).map_err(AccountReadError::InvalidRecord)?;
+        if record.name().label() != label {
+            return Err(AccountReadError::RecordLabelMismatch {
+                requested: label.to_owned(),
+                stored: record.name().label().to_owned(),
+            });
+        }
+        if record.name().did() != did {
+            return Err(AccountReadError::RecordDidMismatch {
+                requested: did.to_owned(),
+                stored: record.name().did().to_owned(),
+            });
+        }
+        record
+            .atproto_verifying_key()
+            .map(Some)
+            .map_err(AccountReadError::InvalidRecord)
+    }
+
+    /// Resolve an owned account's public genesis, including legacy conversion.
+    pub async fn hosted_repo_genesis_for_hosted_did(
+        &self,
+        authority: &Subject,
+        did: &str,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, AccountReadError> {
+        self.hosted_repo_genesis_with_cached_public(authority, did, None)
+            .await
+    }
+
+    /// Read the verified native/public empty genesis pair for an owned DID.
+    /// Older accounts may have only the native artifact. In that case reuse a
+    /// caller's durable public genesis after verification, or convert through
+    /// account signing custody. Neither a corrupt artifact nor a progressed
+    /// native commit is eligible for conversion. Private keys never escape.
+    pub async fn hosted_repo_genesis_with_cached_public(
+        &self,
+        authority: &Subject,
+        did: &str,
+        cached_public: Option<&[u8]>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, AccountReadError> {
+        use hyprstream_pds::{commit::Commit, mst::Node};
+        let resolved = self.resolve_tenant_for_hosted_did(authority, did).await?;
+        let Some(tenant) = resolved else {
+            return Ok(None);
+        };
+        let Some(label) = hosted_account_label(did)? else {
+            return Ok(None);
+        };
+        let native_bytes = match self
+            .read_hosted_repo_artifact(authority, &tenant, label, "commit.cbor", 64 * 1024)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(AccountReadError::Mount(MountError::NotFound(_))) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Some(key) = self.verifying_key_for_hosted_did(authority, did).await? else {
+            return Ok(None);
+        };
+        let native = (|| -> anyhow::Result<Commit> {
+            let native = Commit::from_dag_cbor(&native_bytes)?;
+            native.verify(&key)?;
+            let (empty, _) = Node::empty().to_node_data_with_blocks_atproto()?;
+            anyhow::ensure!(
+                native.did == did && native.prev.is_none() && native.data == empty.cid_atproto()?,
+                "invalid native empty genesis"
+            );
+            Ok(native)
+        })()
+        .map_err(AccountReadError::InvalidRecord)?;
+        let public_bytes = match self
+            .read_hosted_repo_artifact(authority, &tenant, label, "public-commit.cbor", 64 * 1024)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(AccountReadError::Mount(MountError::NotFound(_))) => {
+                if let Some(bytes) = cached_public {
+                    // Treat cache bytes as untrusted until the common checks below.
+                    if bytes.len() > DEFAULT_MAX_RECORD_BYTES {
+                        return Err(AccountReadError::RecordTooLarge {
+                            limit: DEFAULT_MAX_RECORD_BYTES,
+                        });
+                    }
+                    bytes.to_vec()
+                } else {
+                    let unsigned = native.unsigned();
+                    let input = unsigned
+                        .to_atproto_dag_cbor()
+                        .map_err(AccountReadError::InvalidRecord)?;
+                    let signature = self
+                        .sign_for_hosted_did(authority, did, &input)
+                        .await?
+                        .ok_or_else(|| AccountReadError::SigningKeyUnavailable(did.to_owned()))?;
+                    Commit::from_atproto_signature(&unsigned, signature, &key)
+                        .and_then(|commit| commit.to_atproto_dag_cbor())
+                        .map_err(AccountReadError::InvalidRecord)?
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        (|| -> anyhow::Result<()> {
+            let public = Commit::from_atproto_dag_cbor(&public_bytes)?;
+            public.verify_atproto(&key)?;
+            anyhow::ensure!(
+                public.unsigned() == native.unsigned(),
+                "public genesis differs from native genesis"
+            );
+            if let Some(cached) = cached_public {
+                anyhow::ensure!(
+                    cached == public_bytes,
+                    "public genesis differs from durable genesis"
+                );
+            }
+            Ok(())
+        })()
+        .map_err(AccountReadError::InvalidRecord)?;
+        Ok(Some((native_bytes, public_bytes)))
+    }
+
     #[cfg(test)]
     fn with_max_record_bytes(mut self, max_record_bytes: usize) -> Self {
         self.max_record_bytes = max_record_bytes;
@@ -555,6 +709,30 @@ impl AccountRecordStore {
         validate_tenant_component(tenant)?;
         validate_account_label(label)?;
         let components = [tenant, PDS_ACCOUNTS_DIRECTORY, label, file];
+        read_file(
+            self.pds_mount.as_ref(),
+            self.read_authorizer.as_ref(),
+            &components,
+            authority,
+            Some(tenant),
+            None,
+            limit,
+        )
+        .await
+    }
+
+    pub(crate) async fn read_hosted_repo_artifact(
+        &self,
+        authority: &Subject,
+        tenant: &str,
+        label: &str,
+        file: &str,
+        limit: usize,
+    ) -> Result<Vec<u8>, AccountReadError> {
+        validate_tenant_component(tenant)?;
+        validate_account_label(label)?;
+        ensure_repo_artifact_name(file)?;
+        let components = [tenant, PDS_ACCOUNTS_DIRECTORY, label, "repo", file];
         read_file(
             self.pds_mount.as_ref(),
             self.read_authorizer.as_ref(),
@@ -657,6 +835,14 @@ fn validate_account_label(label: &str) -> Result<(), AccountReadError> {
         Ok(())
     } else {
         Err(AccountReadError::InvalidAccountLabel(label.to_owned()))
+    }
+}
+
+fn ensure_repo_artifact_name(file: &str) -> Result<(), AccountReadError> {
+    if matches!(file, "commit.cbor" | "public-commit.cbor") {
+        Ok(())
+    } else {
+        Err(AccountReadError::InvalidRepositoryArtifact(file.to_owned()))
     }
 }
 

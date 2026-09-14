@@ -158,6 +158,45 @@ impl Commit {
         Ok(commit)
     }
 
+    /// Build a public commit from a signature produced by an external signer.
+    ///
+    /// The signer receives the exact canonical unsigned bytes and the supplied
+    /// verifying key is checked before the commit is marked as eligible for
+    /// public publication. This keeps private key material outside the repo
+    /// storage boundary while retaining the same signature and provenance
+    /// checks as [`Self::sign_atproto`].
+    pub fn from_atproto_signature(
+        unsigned: &UnsignedCommit,
+        signature: Vec<u8>,
+        verifying_key: &VerifyingKey,
+    ) -> Result<Self> {
+        use p256::ecdsa::signature::Verifier;
+        ensure!(
+            unsigned.version == COMMIT_VERSION,
+            "unsupported public commit version {} (expected {COMMIT_VERSION})",
+            unsigned.version
+        );
+        let parsed = Signature::from_slice(&signature)
+            .map_err(|error| anyhow!("invalid public ES256 signature bytes: {error}"))?;
+        verifying_key
+            .verify(&unsigned.to_atproto_dag_cbor()?, &parsed)
+            .map_err(|error| {
+                anyhow!("public ATProto ES256 signature verification failed: {error}")
+            })?;
+        let mut commit = Commit {
+            did: unsigned.did.clone(),
+            version: unsigned.version,
+            data: unsigned.data,
+            rev: unsigned.rev,
+            prev: unsigned.prev,
+            sig: signature,
+            atproto_signature: true,
+            atproto_canonical_bytes: None,
+        };
+        commit.atproto_canonical_bytes = Some(commit.to_atproto_dag_cbor()?);
+        Ok(commit)
+    }
+
     /// DAG-CBOR encode the (signed) commit. The `sig` field is a byte string.
     pub fn to_dag_cbor(&self) -> Vec<u8> {
         self.to_value().encode()
