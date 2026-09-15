@@ -82,23 +82,6 @@ jobs:
     - name: Pull builder image
       run: podman pull "$BUILDER_IMAGE"
 
-    # `build` is the sole required merge-queue check. Validate the catalog
-    # against this synthetic candidate here, rather than relying on the
-    # separately named advisory workflow status.
-    - name: Validate docs catalog for merge candidate
-      if: github.event_name == 'merge_group'
-      env:
-        DOCS_CATALOG_EVENT: merge_group
-        DOCS_CATALOG_AUDITED_COMMIT: ${{ github.event.merge_group.base_sha }}
-        DOCS_CATALOG_AUDITED_HEAD: ${{ github.event.merge_group.head_sha }}
-      run: |
-        podman run --rm \
-          -v "$PWD":/build:Z -w /build \
-          -e DOCS_CATALOG_EVENT -e DOCS_CATALOG_AUDITED_COMMIT -e DOCS_CATALOG_AUDITED_HEAD \
-          "$BUILDER_IMAGE" bash -euo pipefail -c '
-            python3 -B tools/check-docs-catalog.py --recover-source-objects
-          '
-
     - name: Run Clippy (in rust-builder container)
       run: |
         # Runner boot labels this target subtree container_file_t; leave the
@@ -124,6 +107,26 @@ jobs:
             # single-quoted, and an apostrophe would terminate it early.
             cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings
             sccache --show-stats
+          '
+
+    # `build` is the sole required merge-queue check. Validate the catalog
+    # against this synthetic candidate here, rather than relying on the
+    # separately named advisory workflow status. Runs AFTER the workspace
+    # lint: check_rust_workflow_matrix.py binds the clippy job's quoted
+    # container script by its first occurrence, so the lint step must come
+    # first in this job.
+    - name: Validate docs catalog for merge candidate
+      if: github.event_name == 'merge_group'
+      env:
+        DOCS_CATALOG_EVENT: merge_group
+        DOCS_CATALOG_AUDITED_COMMIT: ${{ github.event.merge_group.base_sha }}
+        DOCS_CATALOG_AUDITED_HEAD: ${{ github.event.merge_group.head_sha }}
+      run: |
+        podman run --rm \
+          -v "$PWD":/build:Z -w /build \
+          -e DOCS_CATALOG_EVENT -e DOCS_CATALOG_AUDITED_COMMIT -e DOCS_CATALOG_AUDITED_HEAD \
+          "$BUILDER_IMAGE" bash -euo pipefail -c '
+            python3 -B tools/check-docs-catalog.py --recover-source-objects
           '
 
   deny:
