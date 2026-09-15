@@ -222,20 +222,6 @@
     }
   ],
   "hosted_allowlist": {
-    "appimage.yml": {
-      "build-x86_64": {
-        "target_class": "amd64-release",
-        "reason": "x86_64 AppImage matrix (cpu/cuda128/cuda130/rocm71); gated on AMD64 pool liveness probe + N1.2 pinned amd64 builder image"
-      },
-      "package-universal-x86_64": {
-        "target_class": "amd64-release",
-        "reason": "compiler-free universal packaging; migrates with the x86 matrix legs"
-      },
-      "release": {
-        "target_class": "amd64-release",
-        "reason": "tagged-release publish (contents:write) — keep isolated from untrusted PR code per N1.1 when migrating"
-      }
-    },
     "archlinux.yml": {
       "pkgbuild": {
         "target_class": "amd64-release",

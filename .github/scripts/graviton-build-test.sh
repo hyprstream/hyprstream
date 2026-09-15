@@ -53,6 +53,11 @@ require_guest_artifact() {
 export TMPDIR="${PWD}/.citmp"
 mkdir -p "${TMPDIR}"
 
+# Final sccache stats on ANY exit path (bash runs EXIT traps on SIGTERM as
+# well; only SIGKILL loses them — the per-phase stats in run_phase are the
+# backstop for hard kills).
+trap 'sccache --show-stats || true' EXIT
+
 run_phase() {
   local label="$1"
   shift
@@ -66,6 +71,13 @@ run_phase() {
     status=$?
   fi
   local elapsed=$((SECONDS - started))
+  # Cumulative sccache stats after every phase. When a run is slow or gets
+  # killed, these are the only surviving evidence of cache misses / write
+  # errors: the 2026-09-14 140-min timeout (run 34867497318) destroyed the
+  # end-of-script stats that would have explained the run, costing hours of
+  # forensics (resolved only via the re-run's surviving stats — 3,288 misses,
+  # 2,261 write errors).
+  sccache --show-stats || true
   echo "ci-phase name=${label@Q} elapsed_seconds=${elapsed} status=${status}"
   echo "::endgroup::"
   return "${status}"
@@ -99,12 +111,12 @@ run_phase "browser WASM real execution" bash .github/scripts/browser-wasm-test-c
 # aarch64 wheel at /opt/libtorch, so NO download-libtorch feature here.
 run_phase "native release build" cargo build --release
 
-# Metrics is a supported standalone profile with the encrypted-account admission
-# marker and without PGlite. Exercise both its production binary and typed
-# handler tests in the required merge/preflight path; the default build above
-# cannot compile this mutually exclusive profile.
-run_phase "Metrics release build" cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features metrics
-run_phase "Metrics typed handler tests" cargo test -p hyprstream --locked --lib --no-default-features --features metrics services::metrics::tests::
+# The `metrics` standalone profile (DuckDB-backed; mutually exclusive with the
+# default PGlite build at link time) was removed from the required gate on
+# 2026-09-14: nothing ships or deploys that profile today and its two serial
+# phases cost ~19 min of every merge candidate. Compile + typed-handler-test
+# coverage continues in .github/workflows/metrics-profile-nightly.yml; restore
+# both phases here if the metrics service becomes production.
 
 # The RDS-backed PDS record store (#1257) is feature-gated and absent from
 # the default-feature build above; check its full target set and run its
