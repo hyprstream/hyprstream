@@ -1179,19 +1179,31 @@ impl Spawnable for OAuthService {
             // The token store is decoupled from the account backend: a pglite
             // UserStore does not imply a pglite TokenStore — refresh tokens
             // always go to RocksDB or Valkey.
+            #[cfg(feature = "rocksdb")]
             let token_db_path = credentials_dir.join("oauth-tokens");
             let token_store: Option<Arc<dyn crate::services::oauth::token_store::TokenStore>> = match credentials_config.backend {
                 // Pglite account store falls through to RocksDB for tokens.
                 CredentialsBackend::Pglite | CredentialsBackend::Rocksdb => {
-                    match crate::services::oauth::token_store::RocksDbTokenStore::open(&token_db_path) {
-                        Ok(s) => {
-                            info!("Refresh token store (RocksDB) opened at {:?}", token_db_path);
-                            Some(Arc::new(s))
+                    #[cfg(feature = "rocksdb")]
+                    {
+                        match crate::services::oauth::token_store::RocksDbTokenStore::open(&token_db_path) {
+                            Ok(s) => {
+                                info!("Refresh token store (RocksDB) opened at {:?}", token_db_path);
+                                Some(Arc::new(s))
+                            }
+                            Err(e) => {
+                                tracing::warn!("Could not open refresh token store (tokens will not survive restart): {}", e);
+                                None
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!("Could not open refresh token store (tokens will not survive restart): {}", e);
-                            None
-                        }
+                    }
+                    // Same tolerance as the valkey arm: without the `rocksdb`
+                    // feature there is no persistent token store, and startup
+                    // proceeds with refresh tokens non-durable.
+                    #[cfg(not(feature = "rocksdb"))]
+                    {
+                        tracing::warn!("No refresh token store available (tokens will not survive restart): this binary lacks the rocksdb feature");
+                        None
                     }
                 }
                 CredentialsBackend::Valkey => {
@@ -2217,6 +2229,8 @@ mod tests {
     /// #1113 r5 handler-level conformance suite. Every HTTP exchange goes
     /// through the production create_app router and token issuance traverses
     /// a real in-process PolicyService.
+    // The in-process harness opens RocksDB-backed user + refresh-token stores.
+    #[cfg(feature = "rocksdb")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn oauth_handler_atproto_and_legacy_conformance() -> anyhow::Result<()> {
         crate::mac::install_explicit_test_dispatch_pep();

@@ -352,6 +352,7 @@ pub struct RegistryService {
     /// Publishes/advances a repo's `ai.hyprstream.model` PDS record on
     /// register + commit (#910a). `None` means this node has no PDS
     /// configured — register/commit proceed exactly as before.
+    #[cfg(feature = "rocksdb")]
     pds_publisher: Option<Arc<crate::services::discovery::PdsPublisher>>,
 }
 
@@ -436,6 +437,7 @@ impl RegistryService {
             jwt_key_source: None,
             xet_provenance,
             cas_pep: Arc::new(crate::mac::CasPep::fail_closed()),
+            #[cfg(feature = "rocksdb")]
             pds_publisher: None,
         };
 
@@ -451,6 +453,7 @@ impl RegistryService {
     /// Wire in the PDS publisher (#910a). Registration and
     /// `commitWithAuthor` (the RPC promote also drives) will publish/advance
     /// the repo's `ai.hyprstream.model` record through it.
+    #[cfg(feature = "rocksdb")]
     pub fn with_pds_publisher(mut self, publisher: crate::services::discovery::PdsPublisher) -> Self {
         self.pds_publisher = Some(Arc::new(publisher));
         self
@@ -458,6 +461,7 @@ impl RegistryService {
 
     /// Like [`Self::with_pds_publisher`] but takes an already-`Arc`'d publisher,
     /// so the caller can retain a weak clone for the ES256 promotion hook (#918).
+    #[cfg(feature = "rocksdb")]
     pub fn with_pds_publisher_arc(
         mut self,
         publisher: Arc<crate::services::discovery::PdsPublisher>,
@@ -474,6 +478,7 @@ impl RegistryService {
     /// contract `git::promote` documents for the (still-stubbed, cross-node)
     /// pointer-advance path. A missed local publish is caught up by the next
     /// successful register/commit on the same repo.
+    #[cfg(feature = "rocksdb")]
     fn publish_pds_record(&self, repo_id: &RepoId, current_oid: &str) {
         let Some(publisher) = &self.pds_publisher else { return };
         if let Err(e) = publisher.publish(&repo_id.to_string(), current_oid) {
@@ -483,6 +488,10 @@ impl RegistryService {
             );
         }
     }
+
+    /// No-PDS twin: `None` means register/commit proceed exactly as before.
+    #[cfg(not(feature = "rocksdb"))]
+    fn publish_pds_record(&self, _repo_id: &RepoId, _current_oid: &str) {}
 
     /// Set the JWT key source for token verification.
     pub fn with_jwt_key_source(
@@ -1969,6 +1978,16 @@ impl RegistryHandler for RegistryService {
     async fn handle_ingest_at9p_candidate(&self, _ctx: &EnvelopeContext, _request_id: u64,
         data: &At9pCandidateRequest,
     ) -> Result<RegistryResponseVariant> {
+        // Fail closed: accepted-state ingest requires the concrete publisher.
+        #[cfg(not(feature = "rocksdb"))]
+        {
+            let _ = (_ctx, _request_id, data);
+            return Ok(reg_error(
+                "accepted did:at9p ingest requires the `rocksdb` feature",
+            ));
+        }
+        #[cfg(feature = "rocksdb")]
+        {
         let result = async {
             anyhow::ensure!(!data.did.is_empty(), "did is required");
             anyhow::ensure!(!data.record_bytes.is_empty(), "candidate bytes are required");
@@ -1995,6 +2014,7 @@ impl RegistryHandler for RegistryService {
             Ok(info) => RegistryResponseVariant::IngestAt9pCandidateResult(info),
             Err(error) => reg_error(&format!("at9p candidate rejected: {error}")),
         })
+        }
     }
 
 }
@@ -3667,6 +3687,7 @@ mod tests {
         let _ = handle.stop().await;
     }
 
+    #[cfg(feature = "rocksdb")]
     #[tokio::test]
     async fn registry_rpc_is_live_at9p_candidate_boundary() {
         crate::mac::install_explicit_test_dispatch_pep();

@@ -30,6 +30,11 @@ mod policy_manager;
 pub mod policy_migration;
 pub mod policy_templates;
 mod production_user_store;
+// The legacy RocksDB credential/device store (the `rocksdb` feature, valkey
+// precedent). Production UserStore admission is PGlite under credential-pds;
+// the rocksdb-backed DeviceStore and refresh-token store remain the only
+// local persistence backends and ride the same feature.
+#[cfg(feature = "rocksdb")]
 pub mod rocksdb_store;
 pub mod service_enrollment;
 pub mod service_jwt;
@@ -61,6 +66,7 @@ pub use policy_templates::{
     get_template, get_templates, PolicyTemplate, ServicePolicyRule, SERVICE_BASE_POLICIES,
 };
 pub use production_user_store::ProductionUserStore;
+#[cfg(feature = "rocksdb")]
 pub use rocksdb_store::RocksDbUserStore;
 pub use user_store::{
     decode_pubkey_base64, pubkey_fingerprint, AccountKeyCustody, DeviceRecord, DeviceStore,

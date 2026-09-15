@@ -101,6 +101,7 @@ fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock
 /// `<config_dir>/users.db` convention. The registry service (the sole
 /// publisher) opens it read-write; the discovery service (the resolver)
 /// opens it read-only — see `services::discovery::PdsRecordStore`.
+#[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
 pub(crate) fn pds_store_dir(ctx: &ServiceContext) -> anyhow::Result<std::path::PathBuf> {
     Ok(ctx.deployment_data_dir()?.join("pds-store"))
 }
@@ -122,6 +123,7 @@ pub(crate) fn pds_store_dir(ctx: &ServiceContext) -> anyhow::Result<std::path::P
 /// `readonly` selects the resolver (`true`) vs publisher (`false`) posture.
 /// The D2 invariant (signed bytes verbatim, SQL = projection-free KV) is
 /// enforced by the Postgres backend regardless of this flag.
+#[cfg(feature = "rocksdb")]
 fn open_pds_record_store(
     ctx: &ServiceContext,
     readonly: bool,
@@ -132,6 +134,7 @@ fn open_pds_record_store(
 /// [`open_pds_record_store`] for callers that hold no `ServiceContext` (the
 /// QUIC startup gate's announcement refresh): the local-backend directory is
 /// passed explicitly and consulted only when no RDS binding resolves.
+#[cfg(feature = "rocksdb")]
 fn open_pds_record_store_at(
     store_dir: &std::path::Path,
     readonly: bool,
@@ -213,6 +216,7 @@ pub enum PdsBootState {
 /// Only [`PdsBootState::FirstBoot`] may enter a QUIC deferral path; every
 /// other outcome either proceeds with checkpointed announcements or fails
 /// startup.
+#[cfg(feature = "rocksdb")]
 pub fn classify_pds_store_for_quic(ctx: &ServiceContext) -> anyhow::Result<PdsBootState> {
     if load_config()?.rds.resolved_from_env()?.is_configured() {
         // RDS posture: lifecycle evidence lives in the shared store. The
@@ -275,6 +279,14 @@ pub fn classify_pds_store_for_quic(ctx: &ServiceContext) -> anyhow::Result<PdsBo
     )
 }
 
+/// Fail-closed twin: without the `rocksdb` feature there is no PDS store to
+/// classify, so startup never enters a QUIC deferral path.
+#[cfg(not(feature = "rocksdb"))]
+pub fn classify_pds_store_for_quic(_ctx: &ServiceContext) -> anyhow::Result<PdsBootState> {
+    anyhow::bail!("PDS accepted-state store requires the `rocksdb` feature")
+}
+
+#[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
 fn accepted_state_matches_service(
     state: &hyprstream_pds::at9p_duplicity::AcceptedAt9pState,
     service_name: &str,
@@ -295,6 +307,7 @@ fn accepted_state_matches_service(
 /// The checkpoint read honors the configured records backend (#1257): in RDS
 /// posture it reads the shared Postgres store, so the announcement reflects
 /// cross-AZ accepted states — never an absent or stale local RocksDB.
+#[cfg(feature = "rocksdb")]
 pub fn current_native_announcement(
     request: &mut hyprstream_service::NativeAnnouncementRequest,
 ) -> anyhow::Result<hyprstream_rpc_std::discovery_client::ServiceAnnouncement> {
@@ -341,6 +354,15 @@ pub fn current_native_announcement(
     })
 }
 
+/// Fail-closed twin: no checkpoint-verifying PDS read exists without the
+/// `rocksdb` feature.
+#[cfg(not(feature = "rocksdb"))]
+pub fn current_native_announcement(
+    _request: &mut hyprstream_service::NativeAnnouncementRequest,
+) -> anyhow::Result<hyprstream_rpc_std::discovery_client::ServiceAnnouncement> {
+    anyhow::bail!("checkpointed native announcements require the `rocksdb` feature")
+}
+
 /// Whether the checkpoint announcement loop must authorize `service_name`.
 ///
 /// Compatibility checkpoints may legitimately predate a `#discovery`
@@ -349,6 +371,7 @@ pub fn current_native_announcement(
 /// a `#discovery` bundle and demanding one fails startup for pre-upgrade
 /// stores. Required mode keeps the demand because its owned publication path
 /// refuses to publish without the checkpoint bundle.
+#[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
 fn checkpoint_announces_service(iroh_required: bool, service_name: &str) -> bool {
     iroh_required || service_name != "discovery"
 }
@@ -356,6 +379,7 @@ fn checkpoint_announces_service(iroh_required: bool, service_name: &str) -> bool
 /// Populate every ordinary network service announcement from a fresh
 /// checkpoint-verifying PDS read. Missing or ambiguous state fails startup
 /// before any QUIC service can bind and advertise an incomplete bundle.
+#[cfg(feature = "rocksdb")]
 pub fn with_checkpointed_native_announcements(
     mut ctx: ServiceContext,
     service_names: &[String],
@@ -1253,7 +1277,9 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     // rather than failing the registry. The key lives
     // only in the writer's memory — never in the record DB (#910a H1). Paths
     // fail closed rather than fall back to /tmp (H2).
+    #[cfg(feature = "rocksdb")]
     let pds_rds_configured = config.rds.resolved_from_env()?.is_configured();
+    #[cfg(feature = "rocksdb")]
     let pds_publisher = match (|| -> anyhow::Result<crate::services::discovery::PdsPublisher> {
         let store_dir = pds_store_dir(ctx)?;
         let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
@@ -1345,6 +1371,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         registry_service = registry_service.with_expected_audience(issuer.to_owned());
     }
     registry_service = registry_service.with_jwt_key_source(ctx.cluster_key_source());
+    #[cfg(feature = "rocksdb")]
     if let Some(publisher) = pds_publisher {
         // A promotion publishes the former active key as a bounded drain slot;
         // no writer-local re-sign callback is needed, which keeps `--ipc`
@@ -1354,6 +1381,16 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     }
 
     Ok(ctx.into_spawnable_quic(registry_service, config.registry.quic_port))
+}
+
+/// Fail-closed twin: without the `rocksdb` feature there is no
+/// checkpoint-verifying PDS read to populate announcements from.
+#[cfg(not(feature = "rocksdb"))]
+pub fn with_checkpointed_native_announcements(
+    _ctx: ServiceContext,
+    _service_names: &[String],
+) -> anyhow::Result<ServiceContext> {
+    anyhow::bail!("checkpointed native announcements require the `rocksdb` feature")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2849,6 +2886,7 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 /// concurrently on a brand-new install, both may race to bootstrap the same
 /// directory; one loses the RocksDB lock and its factory call fails, which
 /// the service manager will retry.
+#[cfg(feature = "rocksdb")]
 fn open_pds_store_readonly(
     ctx: &ServiceContext,
 ) -> anyhow::Result<crate::services::discovery::PdsRecordStore> {
@@ -2890,8 +2928,14 @@ fn open_pds_store_readonly(
 /// This service exposes the EndpointRegistry so remote clients can discover
 /// registered services, their endpoints, socket kinds, and schemas.
 #[service_factory("discovery", schema = "../../../hyprstream-rpc-std/schema/discovery.capnp", metadata = hyprstream_rpc_std::discovery_client::schema_metadata, depends_on = ["policy"])]
+#[cfg_attr(not(feature = "rocksdb"), allow(unreachable_code, unused_variables))]
 fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating DiscoveryService");
+    // The checkpoint-verifying record resolver (#431/#910a) reads the
+    // RocksDB-backed PDS store; without the `rocksdb` feature the factory
+    // fails closed instead of serving resolver-less discovery.
+    #[cfg(not(feature = "rocksdb"))]
+    anyhow::bail!("discovery service requires the `rocksdb` feature (PDS record resolver)");
 
     let config = load_config()?;
     let sk = ctx.service_signing_key("discovery");
@@ -2920,7 +2964,9 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     // In-process factories share the stable node root. In IPC mode the
     // registry process signs with its stable service credential, whose public
     // key is anchored in the global service trust store.
+    #[cfg(feature = "rocksdb")]
     let at9p_acceptance_identity = hyprstream_discovery::deployment_registry_verifier()?;
+    #[cfg(feature = "rocksdb")]
     let pds_store = std::sync::Arc::new(
         open_pds_store_readonly(ctx)
             .context("failed to open PDS record store (read-only)")?
@@ -2929,15 +2975,20 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     // #918 — the local repo subject is the root did:web authority whose
     // document is fed by this ES256 store. The resolver uses the same bounded
     // publication snapshot, including drain, before placement ingest.
+    #[cfg(feature = "rocksdb")]
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+    #[cfg(feature = "rocksdb")]
     let es256_store =
         crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
+    #[cfg(feature = "rocksdb")]
     let issuer = ctx
         .oauth_issuer_url()
         .map(str::to_owned)
         .unwrap_or_else(|| config.oauth.issuer_url());
+    #[cfg(feature = "rocksdb")]
     let node_did = crate::services::oauth::state::atproto_service_did_for_origin(&issuer)
         .context("OAuth issuer has no supported service DID")?;
+    #[cfg(feature = "rocksdb")]
     let record_resolver = std::sync::Arc::new(
         crate::services::discovery::PdsRecordResolver::new(pds_store)
             .with_es256_rotation(es256_store, node_did),
@@ -2962,10 +3013,13 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
         .join()
         .map_err(|_| anyhow::anyhow!("Discovery state bootstrap thread panicked"))??
     })
-    .with_auth_provider(Box::new(auth_provider))
-    .with_record_resolver(std::sync::Arc::clone(&record_resolver)
-        as std::sync::Arc<dyn hyprstream_discovery::RecordResolver>);
-    discovery_service.attach_process_accepted_state_source()?;
+    .with_auth_provider(Box::new(auth_provider));
+    #[cfg(feature = "rocksdb")]
+    {
+        discovery_service = discovery_service.with_record_resolver(std::sync::Arc::clone(&record_resolver)
+            as std::sync::Arc<dyn hyprstream_discovery::RecordResolver>);
+        discovery_service.attach_process_accepted_state_source()?;
+    }
     if let Some(issuer) = ctx.oauth_issuer_url() {
         discovery_service = discovery_service.with_oauth_issuer(issuer.to_owned());
         // Use the issuer URL as the audience for discovery tokens
