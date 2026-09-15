@@ -21,6 +21,11 @@ test-fixtures = []
 # Native shared/tiered Discovery state. The dependency itself is target-gated
 # below so enabling the feature never pulls sockets into a WASM graph.
 valkey = ["dep:fred"]
+# Checkpointed PDS accepted-state store (local RocksDB backend). The
+# dependency is target-gated to non-wasm32 below: on wasm32 the feature may be
+# enabled but pulls nothing, and all rocksdb code is gated
+# `#[cfg(all(feature = "rocksdb", not(target_arch = "wasm32")))]`.
+rocksdb = ["dep:rocksdb"]
 
 [dependencies]
 # Workspace crates
@@ -72,7 +77,7 @@ p256 = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Production accepted-state authority is read directly from the concrete
 # checkpointed PDS store. No downstream callback/trait can supply authority.
-rocksdb = "0.23"
+rocksdb = { version = "0.23", optional = true }
 fred = { version = "9", optional = true, features = ["i-scripts", "enable-rustls-ring"] }
 tokio = { workspace = true }
 

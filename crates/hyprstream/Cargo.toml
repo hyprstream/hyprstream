@@ -157,7 +157,7 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 libc = "0.2"  # For system calls in overlay2 driver
 reflink-copy = "0.1"  # COW file copying (reflink when available)
 hyprstream-containedfs.workspace = true  # Path-contained filesystem operations
-rocksdb = "0.23"  # User credential store (RocksDbUserStore)
+rocksdb = { version = "0.23", optional = true }  # Local RocksDB backends (rocksdb feature): RocksDbUserStore/DeviceStore, refresh-token store, PDS record-store local backend
 fred = { version = "9", optional = true, features = ["i-scripts"] }  # Async Redis/Valkey client (ValkeyUserStore, ValkeyTokenStore)
 hyprstream-tui = { path = "../hyprstream-tui" }  # Setup wizard TUI (WizardBackend trait + WizardApp)
 hyprstream-compositor = { path = "../hyprstream-compositor" }  # Pure TUI compositor (chrome state machine)
@@ -242,7 +242,15 @@ discovery-valkey = ["hyprstream-discovery/valkey"]  # Shared/tiered Discovery st
 pglite = ["dep:pglite-rs"]  # Enable PGlite embedded relational UserStore (#1376)
 postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots"]  # Networked Postgres UserStore for RDS (#1401)
 encrypted-account-admission = []  # Mandatory source-level policy: no plaintext account UserStore in production
-credential-pds = ["encrypted-account-admission", "pglite"]  # Production credential/PDS service profile; intentionally excludes metrics/DuckDB
+# Local RocksDB persistence (same shape as the `valkey` precedent): the
+# legacy RocksDbUserStore/DeviceStore, the OAuth refresh-token store, and the
+# PDS record store's local backend (hyprstream-discovery's checkpointed PDS
+# store). Production (credential-pds) implies it — refresh tokens and the
+# anonymous-device store are RocksDB in every production posture — but minimal
+# feature sets (the credential-pds negative gate lane) compile without the
+# rocksdb C++ subtree.
+rocksdb = ["dep:rocksdb", "hyprstream-discovery/rocksdb"]
+credential-pds = ["encrypted-account-admission", "pglite", "rocksdb"]  # Production credential/PDS service profile; intentionally excludes metrics/DuckDB
 credential-pds-postgres = ["postgres"]  # Production credential/PDS with RDS Postgres backend (#1401)
 metrics = ["encrypted-account-admission", "dep:hyprstream-metrics", "dep:hyprstream-flight"]  # Separate DuckDB-backed metrics/inference/Flight service build
 bnb = ["hyprstream-inference/bnb"]  # bitsandbytes KV cache quantization (gated code lives in hyprstream-inference)
