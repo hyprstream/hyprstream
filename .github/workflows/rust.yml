@@ -386,7 +386,10 @@ jobs:
             # assert a write to a read-only dir is rejected, but root bypasses file
             # permissions, so they pass only as non-root (the old ubuntu-latest gate
             # ran non-root). Make the toolchain usable by ci and hand it the workspace.
-            useradd -m ci
+            # R4: the builder image may bake the ci user + toolchain perms
+            # (Dockerfile builder-cpu-arm64); older digests do not. Create
+            # ci only when it is absent so either image works.
+            id -u ci >/dev/null 2>&1 || useradd -m ci
             chmod a+rx /root
             chmod -R a+rwX /root/.cargo /root/.rustup
             chown -R ci:ci /build
@@ -459,7 +462,10 @@ jobs:
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
-            useradd -m ci
+            # R4: the builder image may bake the ci user + toolchain perms
+            # (Dockerfile builder-cpu-arm64); older digests do not. Create
+            # ci only when it is absent so either image works.
+            id -u ci >/dev/null 2>&1 || useradd -m ci
             chmod a+rx /root
             chmod -R a+rwX /root/.cargo /root/.rustup
             chown -R ci:ci /build
