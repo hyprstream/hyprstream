@@ -89,11 +89,6 @@ run_phase() {
 # browser-facing rpc + vfs + rpc-std package set used by www.
 run_phase "browser WASM check" bash .github/scripts/browser-wasm-check.sh
 
-# Prove the production credential profile is causal: omitting it must fail the
-# build, never silently skip the deployable target.
-run_phase "credential-pds negative build gate" \
-  bash .github/scripts/credential-pds-build-gate.sh
-
 # #1425 r4: the compile-only check above cannot catch a regression in the
 # actual browser-fetch runtime behavior (JS callback, Request/Response, nonce
 # retry, response rejection) — only real execution can. Chromium + a matching
@@ -107,23 +102,15 @@ run_phase "credential-pds negative build gate" \
 # actually launches a browser for the synthetic merge candidate.
 run_phase "browser WASM real execution" bash .github/scripts/browser-wasm-test-ci.sh
 
-# Default features (parity with the former x86 gate); libtorch is the image's
-# aarch64 wheel at /opt/libtorch, so NO download-libtorch feature here.
-run_phase "native release build" cargo build --release
-
-# The `metrics` standalone profile (DuckDB-backed; mutually exclusive with the
-# default PGlite build at link time) was removed from the required gate on
-# 2026-09-14: nothing ships or deploys that profile today and its two serial
-# phases cost ~19 min of every merge candidate. Compile + typed-handler-test
-# coverage continues in .github/workflows/metrics-profile-nightly.yml; restore
-# both phases here if the metrics service becomes production.
-
-# The RDS-backed PDS record store (#1257) is feature-gated and absent from
-# the default-feature build above; check its full target set and run its
-# contract/unit tests. Live DB tests skip themselves green unless
-# HYPRSTREAM_POSTGRES_TEST_URL_FILE points at a scratch database.
-run_phase "pds-postgres feature check" cargo check -p hyprstream --locked --all-targets --features pds-postgres
-run_phase "pds-postgres contract tests" cargo test -p hyprstream --locked --lib --features pds-postgres -- services::pds_record_pg:: services::discovery::pg_tests:: config::tests::rds
+# TEST LANE FIRST (2026-09-15 merge-queue spike): run everything the test
+# suite consumes before any release/feature lane. nextest and doctests need
+# ONLY the guest .wasm artifacts (verified: no test reads the release
+# binaries — only HYPRSTREAM_PYGUEST_WASM / HYPRSTREAM_FSGUEST_WASM cross
+# this boundary), and test failures were previously discovered after ~50 min
+# of release-lane work they never consumed. Ordering the test lane second
+# surfaces the most common failure class (2026-09-13/14 samples: 2 of 4 red
+# candidates were nextest failures found at 63-68 min) at ~25 min instead.
+# Green-run wall time is unchanged — the same phases run serially either way.
 
 # wasm guest artifacts for the sandbox/mount tests (deny-on-missing-guest guard).
 # cd INTO each guest crate so cargo reads its .cargo/config.toml (the python guest
@@ -147,6 +134,32 @@ run_phase "nextest" cargo nextest run --cargo-profile ci-test --profile ci
 # acceptance criterion: a measured 318s doctest phase was paying release LTO
 # for almost no runtime win on doc examples. Parity with the nextest profile.
 run_phase "doctests" cargo test --profile ci-test --doc
+
+# RELEASE / FEATURE LANES (last): none of these feed the test suite above.
+
+# Default features (parity with the former x86 gate); libtorch is the image's
+# aarch64 wheel at /opt/libtorch, so NO download-libtorch feature here.
+run_phase "native release build" cargo build --release
+
+# The `metrics` standalone profile (DuckDB-backed; mutually exclusive with the
+# default PGlite build at link time) was removed from the required gate on
+# 2026-09-14: nothing ships or deploys that profile today and its two serial
+# phases cost ~19 min of every merge candidate. Compile + typed-handler-test
+# coverage continues in .github/workflows/metrics-profile-nightly.yml; restore
+# both phases here if the metrics service becomes production.
+
+# The RDS-backed PDS record store (#1257) is feature-gated and absent from
+# the default-feature build above; check its full target set and run its
+# contract/unit tests. Live DB tests skip themselves green unless
+# HYPRSTREAM_POSTGRES_TEST_URL_FILE points at a scratch database.
+run_phase "pds-postgres feature check" cargo check -p hyprstream --locked --all-targets --features pds-postgres
+run_phase "pds-postgres contract tests" cargo test -p hyprstream --locked --lib --features pds-postgres -- services::pds_record_pg:: services::discovery::pg_tests:: config::tests::rds
+
+# Prove the production credential profile is causal: omitting it must fail the
+# build, never silently skip the deployable target. Compile-only and negative
+# (its pass condition is a failure), so it runs last.
+run_phase "credential-pds negative build gate" \
+  bash .github/scripts/credential-pds-build-gate.sh
 
 echo "::group::sccache statistics"
 sccache --show-stats
