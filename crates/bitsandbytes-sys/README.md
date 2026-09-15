@@ -31,7 +31,10 @@ Or build from source for ROCm:
 ```bash
 git clone https://github.com/bitsandbytes-foundation/bitsandbytes
 cd bitsandbytes
-cmake -DCOMPUTE_BACKEND=hip -DBNB_ROCM_ARCH="gfx90a;gfx942;gfx1100" -S . -B build
+# Match BNB_ROCM_ARCH to your GPU (rocminfo | grep gfx). gfx1151 covers
+# Strix Halo / Radeon 8060S; kernels built for the wrong ISA fail to load
+# at runtime and silently degrade to CPU.
+cmake -DCOMPUTE_BACKEND=hip -DBNB_ROCM_ARCH="gfx90a;gfx942;gfx1100;gfx1151" -S . -B build
 cmake --build build
 ```
 

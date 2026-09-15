@@ -220,12 +220,14 @@ case "$BACKEND" in
 esac
 
 # ROCm-specific environment
-if [[ "$BACKEND" == "rocm71" ]]; then
+if [[ "$BACKEND" == rocm* ]]; then
     # Use system ROCm if available, otherwise bundled
     if [[ -d /opt/rocm ]]; then
         export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
     fi
-    export PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH:-gfx90a;gfx1100;gfx1101}"
+    # gfx1151 = Strix Halo / Radeon 8060S (#228 family: never force the wrong ISA —
+    # a stale list here is how GPU builds silently degrade on newer APUs).
+    export PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH:-gfx90a;gfx1100;gfx1101;gfx1151}"
 fi
 
 log_debug "Launching hyprstream with backend: $BACKEND"

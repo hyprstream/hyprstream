@@ -583,9 +583,7 @@ impl TorchEngine {
                     Device::Cuda(id) => id,
                     _ => 0,
                 };
-                if std::env::var("HIP_VISIBLE_DEVICES").is_ok()
-                    || std::path::Path::new("../libtorch/lib/libtorch_hip.so").exists()
-                {
+                if tch::utils::has_hip() {
                     info!("🚀 Using ROCm/HIP GPU {} acceleration", device_id);
                 } else {
                     info!("🚀 Using CUDA GPU {} acceleration", device_id);

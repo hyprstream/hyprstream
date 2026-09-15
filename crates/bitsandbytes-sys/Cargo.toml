@@ -8,6 +8,12 @@ repository = "https://github.com/hyprstream/hyprstream.git"
 keywords = ["quantization", "llm", "cuda", "rocm", "ffi"]
 categories = ["external-ffi-bindings", "science"]
 
+# This crate is excluded from the hyprstream workspace (root Cargo.toml
+# `workspace.exclude`) and is consumed as a plain path dependency. Marking it
+# its own workspace root keeps standalone `cargo` runs inside this directory
+# from walking up and colliding with an enclosing workspace.
+[workspace]
+
 [features]
 default = []
 # Backend selection - only one should be enabled
