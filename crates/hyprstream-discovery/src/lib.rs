@@ -43,12 +43,15 @@ pub use state_store::{
     DiscoveryState, DiscoveryStateBackend, DiscoveryStateConfig, MemoryStateConfig,
     TieredStateConfig, ValkeyStateConfig,
 };
-#[cfg(not(target_arch = "wasm32"))]
+// The checkpointed PDS store reads its accepted-state authority directly from
+// RocksDB, so it only compiles when the `rocksdb` feature carries the
+// dependency (the dependency itself stays target-gated to non-wasm32).
+#[cfg(all(feature = "rocksdb", not(target_arch = "wasm32")))]
 mod checkpointed_pds;
 
 /// Create the empty checkpoint store for an explicitly provisioned fresh node.
 /// Ordinary resolver startup never calls this, so missing history fails closed.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "rocksdb", not(target_arch = "wasm32")))]
 pub fn initialize_deployment_checkpoint_store() -> anyhow::Result<()> {
     checkpointed_pds::initialize_deployment_store()
 }
@@ -58,7 +61,7 @@ pub fn initialize_deployment_checkpoint_store() -> anyhow::Result<()> {
 /// the same `WriteBatch` as its first accepted-state commit. Re-exported so
 /// the app crate's QUIC startup gate and registry writer can share the exact
 /// key.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "rocksdb", not(target_arch = "wasm32")))]
 pub use checkpointed_pds::FIRST_BOOT_KEY;
 
 /// #893 (at9p D1) — `did:at9p` capsule resolver: turns a GATE-verified capsule

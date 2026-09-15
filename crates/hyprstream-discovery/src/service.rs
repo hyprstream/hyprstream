@@ -3,15 +3,15 @@
 //! Allows remote clients to discover registered services, their endpoints,
 //! socket kinds, and schemas via the standard REQ/REP transport.
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "rocksdb", not(target_arch = "wasm32")))]
 #[path = "network_bootstrap_tests.rs"]
 mod network_bootstrap_tests;
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "rocksdb", not(target_arch = "wasm32")))]
 #[path = "event_network_bootstrap_tests.rs"]
 mod event_network_bootstrap_tests;
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "rocksdb", not(target_arch = "wasm32")))]
 #[path = "moql_checkpoint_admission_tests.rs"]
 mod moql_checkpoint_admission_tests;
 
@@ -1320,6 +1320,9 @@ impl DiscoveryService {
     /// }
     /// ```
     #[cfg(not(target_arch = "wasm32"))]
+    // Without `rocksdb` every authority arm fails closed before any use, so
+    // the remainder of this body is intentionally unreachable there.
+    #[cfg_attr(not(feature = "rocksdb"), allow(unreachable_code, unused_variables))]
     fn bootstrap_authenticated_process(
         authority: ProcessBootstrapAuthority,
         discovery_client: hyprstream_rpc_std::discovery_client::DiscoveryClient,
@@ -1341,18 +1344,29 @@ impl DiscoveryService {
             ProcessAcceptanceIdentity::Test(_) => None,
         };
         let source: Arc<dyn AcceptedStateSource> = match authority.acceptance_identity {
+            #[cfg(feature = "rocksdb")]
             ProcessAcceptanceIdentity::Deployment(identity) => Arc::new(
                 crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
                     &authority.store_path,
                     identity,
                 )?.with_network_bootstrap(authority.network_required),
             ),
-            #[cfg(test)]
+            // Fail closed: without the `rocksdb` feature there is no concrete
+            // accepted-state authority — never a silent empty resolver.
+            #[cfg(not(feature = "rocksdb"))]
+            ProcessAcceptanceIdentity::Deployment(_) => anyhow::bail!(
+                "checkpointed PDS accepted-state authority requires the `rocksdb` feature"
+            ),
+            #[cfg(all(test, feature = "rocksdb"))]
             ProcessAcceptanceIdentity::Test(identity) => Arc::new(
                 crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open_test(
                     &authority.store_path,
                     identity,
                 )?,
+            ),
+            #[cfg(all(test, not(feature = "rocksdb")))]
+            ProcessAcceptanceIdentity::Test(_) => anyhow::bail!(
+                "checkpointed PDS accepted-state authority requires the `rocksdb` feature"
             ),
         };
         PROCESS_ACCEPTED_STATE_SOURCE
@@ -1441,6 +1455,7 @@ fn accepted_expiry_unix_ms(
 
 /// Fixed bootstrap roles use only checkpoint-authenticated capsule contents.
 /// Carrier addresses and caller-provided public keys never mint authority.
+#[cfg_attr(all(not(feature = "rocksdb"), not(test)), allow(dead_code))]
 pub(super) fn project_bootstrap_endpoint(
     states: &[hyprstream_pds::at9p_duplicity::AcceptedAt9pState],
     service_name: &str,
@@ -3468,6 +3483,9 @@ fn authenticate_registry_deployment_credentials(
     })
 }
 
+// `store_path` is consumed by the checkpointed-store constructors, which are
+// gated on `rocksdb`; without that feature the field is intentionally unread.
+#[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
 struct ProcessBootstrapAuthority {
     store_path: std::path::PathBuf,
     acceptance_identity: ProcessAcceptanceIdentity,
@@ -3553,6 +3571,9 @@ fn install_local_discovery_client(
 ///   REQUIRE a successful signed liveness ping before installing — a dead or
 ///   wrong-key endpoint refuses the boot.
 #[cfg(not(target_arch = "wasm32"))]
+// Without `rocksdb` the accepted-state authority construction fails closed,
+// leaving the verifier binding unused in that configuration.
+#[cfg_attr(not(feature = "rocksdb"), allow(unused_variables))]
 pub async fn bootstrap_deployment_process(
     signing_key: SigningKey,
     trust_source: crate::DeploymentTrustSource,
@@ -3582,9 +3603,17 @@ pub async fn bootstrap_deployment_process(
                     #[cfg(test)]
                     ProcessAcceptanceIdentity::Test(_) => anyhow::bail!("native bootstrap requires deployment authority"),
                 };
+                #[cfg(feature = "rocksdb")]
                 let source = Arc::new(crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
                     &authority.store_path, verifier.clone(),
                 )?.with_network_bootstrap(true));
+                // Fail closed: without the `rocksdb` feature there is no
+                // concrete accepted-state authority to bootstrap against.
+                #[cfg(not(feature = "rocksdb"))]
+                let source: Arc<dyn AcceptedStateSource> =
+                    Err(anyhow::anyhow!(
+                        "checkpointed PDS accepted-state authority requires the `rocksdb` feature"
+                    ))?;
                 // Authenticate the fixed bootstrap roles now, but defer I/O:
                 // Discovery and Policy have not necessarily bound yet.
                 source.bootstrap_endpoints("discovery")?;
@@ -6872,6 +6901,7 @@ mod resolver_tests {
         assert!(!witness.verifier.matches(&caller.verifying_key()));
     }
 
+    #[cfg(feature = "rocksdb")]
     #[test]
     fn process_bootstrap_precedes_first_generated_client() {
         const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_BOOTSTRAP_CHILD";
@@ -6934,6 +6964,7 @@ mod resolver_tests {
         );
     }
 
+    #[cfg(feature = "rocksdb")]
     #[test]
     fn authenticated_process_bootstrap_has_exactly_one_concurrent_consumer() {
         const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_CONCURRENT_CHILD";
@@ -6986,6 +7017,7 @@ mod resolver_tests {
         assert!(status.success());
     }
 
+    #[cfg(feature = "rocksdb")]
     #[test]
     fn authenticated_process_bootstrap_failure_is_terminal() {
         const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_FAILURE_CHILD";

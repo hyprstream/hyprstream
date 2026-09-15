@@ -15,6 +15,10 @@ pub mod gpu_detect;
 pub mod handlers;
 pub mod policy_handlers;
 pub mod pds_handlers;
+// Deployment-roster provisioning/inspection reads the checkpointed PDS
+// store; the concrete type is rocksdb-only today (pure-RDS-without-rocksdb
+// is future work).
+#[cfg(feature = "rocksdb")]
 pub mod deployment_bootstrap;
 pub mod quick;
 pub mod bootstrap_manager;

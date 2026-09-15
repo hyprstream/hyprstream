@@ -19,6 +19,7 @@ use base64::{
 use hyprstream_pds::atproto_cbor::{AtprotoRecord, AtprotoRecordKey};
 use hyprstream_pds::commit::{Commit, UnsignedCommit};
 use hyprstream_pds::dag_cbor::DagCbor;
+#[cfg(feature = "rocksdb")]
 use hyprstream_pds::mst::Node;
 use hyprstream_pds::repo_authority::accept_repo_authority;
 use hyprstream_pds::tid::Tid;
@@ -285,6 +286,7 @@ impl PublicHeadCondition {
 /// and key namespace so native signed artifacts are never re-encoded as public
 /// bytes.
 pub struct PublicRepoStore {
+    #[cfg(feature = "rocksdb")]
     db: Arc<rocksdb::DB>,
     // Held only to find/insert a shared account state, never during account
     // locking, cryptography or database access. Unrelated DIDs can progress.
@@ -298,7 +300,7 @@ impl std::fmt::Debug for PublicRepoStore {
 }
 
 impl PublicRepoStore {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "rocksdb"))]
     pub(crate) fn insert_snapshot_budget_fixture_for_test(
         &self,
         did: &str,
@@ -328,7 +330,7 @@ impl PublicRepoStore {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "rocksdb"))]
     pub(crate) fn insert_unverified_blob_for_test(&self, did: &str) -> Result<()> {
         let account = self
             .accounts
@@ -370,7 +372,7 @@ impl PublicRepoStore {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "rocksdb"))]
     pub(crate) fn with_account_lock_for_test(&self, did: &str, held: impl FnOnce()) -> Result<()> {
         let account = self
             .accounts
@@ -383,7 +385,7 @@ impl PublicRepoStore {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "rocksdb"))]
     pub(crate) fn insert_malformed_record_for_test(
         &self,
         did: &str,
@@ -395,6 +397,7 @@ impl PublicRepoStore {
         Ok(())
     }
 
+#[cfg(feature = "rocksdb")]
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)
             .with_context(|| format!("failed to create public repo store at {path:?}"))?;
@@ -408,6 +411,13 @@ impl PublicRepoStore {
         })
     }
 
+    /// Fail-closed twin: no durable public repository store without rocksdb.
+    #[cfg(not(feature = "rocksdb"))]
+    pub fn open(_path: &Path) -> Result<Self> {
+        anyhow::bail!("public repository store requires the `rocksdb` feature")
+    }
+
+#[cfg(feature = "rocksdb")]
     pub fn snapshot(&self, did: &str) -> Result<Option<PublicRepoSnapshot>> {
         validate_did(did)?;
         // Iteration and the head lookup must observe the same database
@@ -484,6 +494,12 @@ impl PublicRepoStore {
         }))
     }
 
+    #[cfg(not(feature = "rocksdb"))]
+    pub fn snapshot(&self, _did: &str) -> Result<Option<PublicRepoSnapshot>> {
+        anyhow::bail!("public repository store requires the `rocksdb` feature")
+    }
+
+#[cfg(feature = "rocksdb")]
     fn public_genesis_bytes(&self, did: &str) -> Result<Option<Vec<u8>>> {
         let bytes = self.db.get_pinned(format!("{GENESIS_PREFIX}{did}"))?;
         if let Some(bytes) = &bytes {
@@ -495,6 +511,12 @@ impl PublicRepoStore {
         Ok(bytes.map(|bytes| bytes.to_vec()))
     }
 
+    #[cfg(not(feature = "rocksdb"))]
+    fn public_genesis_bytes(&self, _did: &str) -> Result<Option<Vec<u8>>> {
+        anyhow::bail!("public repository store requires the `rocksdb` feature")
+    }
+
+#[cfg(feature = "rocksdb")]
     pub fn seed_public_genesis(
         &self,
         did: &str,
@@ -571,6 +593,17 @@ impl PublicRepoStore {
         Ok(())
     }
 
+    #[cfg(not(feature = "rocksdb"))]
+    pub fn seed_public_genesis(
+        &self,
+        _did: &str,
+        _commit: Commit,
+        _verifying_key: &p256::ecdsa::VerifyingKey,
+    ) -> Result<()> {
+        anyhow::bail!("public repository store requires the `rocksdb` feature")
+    }
+
+#[cfg(feature = "rocksdb")]
     fn intent(&self, did: &str, request_id: &str) -> Result<Option<PublicationIntent>> {
         let Some(bytes) = self.db.get(intent_key(did, request_id))? else {
             return Ok(None);
@@ -580,6 +613,12 @@ impl PublicRepoStore {
         ))
     }
 
+    #[cfg(not(feature = "rocksdb"))]
+    fn intent(&self, _did: &str, _request_id: &str) -> Result<Option<PublicationIntent>> {
+        anyhow::bail!("public repository store requires the `rocksdb` feature")
+    }
+
+#[cfg(feature = "rocksdb")]
     fn write_transaction(
         &self,
         did: &str,
@@ -608,6 +647,17 @@ impl PublicRepoStore {
             .write_opt(batch, &options)
             .context("public repo transaction failed")?;
         Ok(())
+    }
+
+    #[cfg(not(feature = "rocksdb"))]
+    fn write_transaction(
+        &self,
+        _did: &str,
+        _record: &AtprotoRecord,
+        _commit: &Commit,
+        _intent: &PublicationIntent,
+    ) -> Result<()> {
+        anyhow::bail!("public repository store requires the `rocksdb` feature")
     }
 }
 
@@ -795,6 +845,7 @@ impl PublicRepoWriter {
         self.prepare_external_record_locked(request, condition, None)
     }
 
+#[cfg(feature = "rocksdb")]
     fn prepare_external_record_locked(
         &self,
         request: PublicCreateRequest,
@@ -982,6 +1033,18 @@ impl PublicRepoWriter {
         )))
     }
 
+    #[cfg(not(feature = "rocksdb"))]
+    fn prepare_external_record_locked(
+        &self,
+        _request: PublicCreateRequest,
+        _condition: PublicHeadCondition,
+        _proposed_rkey: Option<AtprotoRecordKey>,
+    ) -> Result<PublicCreatePreparation, PublicRepoWriteError> {
+        Err(PublicRepoWriteError::Internal(anyhow::anyhow!(
+            "public repository store requires the `rocksdb` feature",
+        )))
+    }
+
     pub fn finish_external_record(
         &self,
         preparation: PublicPendingCreate,
@@ -1058,6 +1121,7 @@ impl PublicRepoWriter {
     /// Old blocks and publication intents remain immutable for original retries.
     /// This in-process boundary does not subscribe to external key rotations;
     /// account lifecycle wiring must route promotion through it.
+#[cfg(feature = "rocksdb")]
     pub fn promote_signing_key(
         &self,
         principal: &str,
@@ -1099,6 +1163,16 @@ impl PublicRepoWriter {
         Ok(head)
     }
 
+    #[cfg(not(feature = "rocksdb"))]
+    pub fn promote_signing_key(
+        &self,
+        _principal: &str,
+        _expected_active: &p256::ecdsa::VerifyingKey,
+        _candidate: p256::ecdsa::SigningKey,
+    ) -> Result<Option<Cid>> {
+        anyhow::bail!("public repository store requires the `rocksdb` feature")
+    }
+
     pub fn create_record(
         &self,
         request: PublicCreateRequest,
@@ -1107,6 +1181,7 @@ impl PublicRepoWriter {
         self.create_record_with_condition(request, condition)
     }
 
+#[cfg(feature = "rocksdb")]
     fn create_record_with_condition(
         &self,
         request: PublicCreateRequest,
@@ -1276,6 +1351,17 @@ impl PublicRepoWriter {
             cid: record.cid(),
             commit_cid,
         })
+    }
+
+    #[cfg(not(feature = "rocksdb"))]
+    fn create_record_with_condition(
+        &self,
+        _request: PublicCreateRequest,
+        _condition: PublicHeadCondition,
+    ) -> Result<PublicCommitResult, PublicRepoWriteError> {
+        Err(PublicRepoWriteError::Internal(anyhow::anyhow!(
+            "public repository store requires the `rocksdb` feature",
+        )))
     }
 
     /// XRPC creation with an optional base32 CID head condition. Unlike the
@@ -1714,7 +1800,7 @@ fn next_revision(previous: Option<Tid>) -> Tid {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rocksdb"))]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing)]
 
@@ -3153,5 +3239,5 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rocksdb"))]
 pub(crate) mod hosted_tests;

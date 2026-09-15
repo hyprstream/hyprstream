@@ -2655,6 +2655,7 @@ fn main() -> Result<()> {
     // create log files), endpoint/runtime initialization and all bootstrap/key
     // generation paths. Buffer the complete verified roster before stdout.
     if let Some(("pds", pds)) = matches.subcommand() {
+        #[cfg(feature = "rocksdb")]
         if let Some(("inspect-services", inspect)) = pds.subcommand() {
             let services = inspect.get_many::<String>("service")
                 .context("service roster is required")?.cloned().collect::<Vec<_>>();
@@ -2917,11 +2918,13 @@ fn main() -> Result<()> {
     // newly provisioned host before local services are running.
     if let Some(("pds", sub_m)) = matches.subcommand() {
         match sub_m.subcommand() {
+            #[cfg(feature = "rocksdb")]
             Some(("init-deployment-store", _)) => {
                 hyprstream_core::cli::deployment_bootstrap::init_checkpoint_store(&config)?;
                 println!("initialized empty deployment checkpoint store");
                 return Ok(());
             }
+            #[cfg(feature = "rocksdb")]
             Some(("provision-services", provision_m)) => {
                 let services = provision_m.get_many::<String>("service")
                     .context("service roster is required")?.cloned().collect::<Vec<_>>();

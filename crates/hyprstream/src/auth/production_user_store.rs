@@ -112,7 +112,7 @@ impl ProductionUserStore {
                 )
             }
             CredentialsBackend::Rocksdb => {
-                #[cfg(not(feature = "encrypted-account-admission"))]
+                #[cfg(all(not(feature = "encrypted-account-admission"), feature = "rocksdb"))]
                 {
                     let store =
                         super::RocksDbUserStore::open_admitted(credentials_dir, &Self::permit())
@@ -120,6 +120,15 @@ impl ProductionUserStore {
                     Ok(Self {
                         inner: Arc::new(store),
                     })
+                }
+                #[cfg(all(
+                    not(feature = "encrypted-account-admission"),
+                    not(feature = "rocksdb")
+                ))]
+                {
+                    anyhow::bail!(
+                        "credentials.backend = \"rocksdb\" but this binary lacks the rocksdb feature"
+                    )
                 }
                 #[cfg(feature = "encrypted-account-admission")]
                 unreachable!("encrypted-account-admission policy admitted RocksDB")
@@ -161,7 +170,7 @@ impl ProductionUserStore {
     ) -> Result<(Self, Option<Arc<dyn super::DeviceStore>>)> {
         config.backend.ensure_allowed_for_build()?;
 
-        #[cfg(not(feature = "encrypted-account-admission"))]
+        #[cfg(all(not(feature = "encrypted-account-admission"), feature = "rocksdb"))]
         if config.backend == CredentialsBackend::Rocksdb {
             let store = Arc::new(
                 super::RocksDbUserStore::open_admitted(credentials_dir, &Self::permit())
@@ -176,6 +185,10 @@ impl ProductionUserStore {
         }
 
         let account_store = Self::open_with_config(credentials_dir, config).await?;
+        // The anonymous-device store is the one RocksDB handle that every
+        // production posture shares; a build without the `rocksdb` feature
+        // has no device store (already tolerated as `None` downstream).
+        #[cfg(feature = "rocksdb")]
         let device_store = super::RocksDbUserStore::open_admitted(credentials_dir, &Self::permit())
             .map(|store| Arc::new(store) as Arc<dyn super::DeviceStore>)
             .map_err(|error| {
@@ -183,6 +196,8 @@ impl ProductionUserStore {
                 error
             })
             .ok();
+        #[cfg(not(feature = "rocksdb"))]
+        let device_store: Option<Arc<dyn super::DeviceStore>> = None;
         Ok((account_store, device_store))
     }
 

@@ -629,6 +629,7 @@ mod tests {
     /// #1113 r5: the default production backend must retain the mapped DID,
     /// and the real account lookup (keys + profile) must reach the success
     /// path after closing and reopening RocksDB.
+    #[cfg(feature = "rocksdb")]
     #[tokio::test]
     async fn atproto_eligibility_succeeds_after_rocksdb_roundtrip() {
         use crate::auth::rocksdb_store::RocksDbUserStore;

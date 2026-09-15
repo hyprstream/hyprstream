@@ -107,6 +107,11 @@ pub mod worker;
 // the source of truth, SQL is a projection-free KV shell.
 #[cfg(feature = "pds-postgres")]
 pub(crate) mod pds_record_pg;
+// The PDS record store's local RocksDB backend + publisher/resolver/ingest
+// stack (the `rocksdb` feature, valkey precedent). Re-exported through
+// `services::discovery` so callers keep their paths.
+#[cfg(feature = "rocksdb")]
+pub(crate) mod pds_record_rocksdb;
 
 /// Phase-1 cellular-ledger local-enforcer (epic #922, #925). Gated behind the
 /// `ledger` cargo feature, default off — the scheduler quota path is unchanged

@@ -1,9 +1,9 @@
 {
  "schema_version": 1,
  "provenance_version": 2,
- "source_commit": "d70a73fc95b26a1e0aa31934000e8849c91f8dd5",
- "source_tree": "54c1c276dcb348569931a2a8120d034c68066802",
- "source_input_digest": "49a61d1d43a4eb71accbea4245ec513f06e238ebbae294cdd0eb63722e3c19ce",
+ "source_commit": "b9a8e1d01d210ba7e37bcf607e327419e5616b85",
+ "source_tree": "6253fe6d61fffe07e7e3dbf2141415ca279f3628",
+ "source_input_digest": "a72d8ad0117ee7a94358ac971a01ec416a26a2f7dfea7ddc3525b6c1d779dab4",
  "authority": "docs/system-ontology.md",
  "tracked_schema_command": "git ls-files '*.capnp'",
  "owner_directories": [

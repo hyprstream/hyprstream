@@ -2138,6 +2138,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "rocksdb")]
     #[tokio::test]
     async fn production_mac_published_genesis_supports_hosted_reads_and_writes() {
         use crate::mac::audit::{AuditError, AuditRecord, AuditSink, DecisionReason};

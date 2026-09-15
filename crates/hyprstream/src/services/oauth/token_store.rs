@@ -1,12 +1,16 @@
 //! Persistent refresh token store abstraction.
 //!
-//! `TokenStore` is the trait. `RocksDbTokenStore` wraps the existing rocksdb::DB.
-//! A Valkey implementation is provided when the `valkey` feature is enabled.
+//! `TokenStore` is the trait. `RocksDbTokenStore` (the `rocksdb` feature)
+//! wraps the existing rocksdb::DB. A Valkey implementation is provided when
+//! the `valkey` feature is enabled.
 
+#[cfg(any(feature = "rocksdb", feature = "valkey"))]
 use std::sync::Arc;
+#[cfg(feature = "rocksdb")]
 use std::path::Path;
 use anyhow::Result;
 use async_trait::async_trait;
+#[cfg(feature = "rocksdb")]
 use parking_lot::Mutex;
 
 use super::state::RefreshTokenEntry;
@@ -22,11 +26,14 @@ pub trait TokenStore: Send + Sync {
     async fn delete(&self, token: &str) -> Result<()>;
 }
 
+/// RocksDB-backed refresh token store (requires the `rocksdb` feature).
+#[cfg(feature = "rocksdb")]
 pub struct RocksDbTokenStore {
     db: Arc<rocksdb::DB>,
     take_lock: Mutex<()>,
 }
 
+#[cfg(feature = "rocksdb")]
 impl RocksDbTokenStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut opts = rocksdb::Options::default();
@@ -39,6 +46,7 @@ impl RocksDbTokenStore {
     }
 }
 
+#[cfg(feature = "rocksdb")]
 #[async_trait]
 impl TokenStore for RocksDbTokenStore {
     async fn put(&self, token: &str, entry: &RefreshTokenEntry, _ttl_secs: u64) -> Result<()> {
@@ -156,6 +164,7 @@ impl TokenStore for ValkeyTokenStore {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "rocksdb")]
     #[tokio::test]
     async fn rocksdb_take_allows_exactly_one_claim() {
         let dir = tempfile::tempdir().unwrap();
