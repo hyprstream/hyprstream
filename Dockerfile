@@ -291,7 +291,9 @@ RUN cd /tmp/tc \
     && rustup component add clippy rustfmt \
     && rustup target add wasm32-unknown-unknown wasm32-wasip1 \
     && rustup target list --installed | grep -qx wasm32-wasip1 \
-    && rm -rf /tmp/tc
+    && rm -rf /tmp/tc \
+    && chmod a+rx /root \
+    && chmod -R a+rwX /root/.cargo /root/.rustup
 
 # R4 (#1425): bake the merge-gate's per-run container setup so the `build`
 # job's container step stops paying it on every candidate (~150-215 s of
@@ -302,16 +304,19 @@ RUN cd /tmp/tc \
 #     WASM job and the preflight keep working unchanged.
 #   - the non-root `ci` user the gate runs as (several fail-closed tests
 #     assert a write to a read-only dir is rejected, which only holds as
-#     non-root), with the toolchain made usable by it: /root traversable and
-#     cargo+rustup writable. This replaces the runtime useradd/chmod dance.
-#     The per-run `chown -R ci:ci /build` of the bind-mounted checkout stays
-#     in the workflow — the mount is per-run and cannot be baked.
+#     non-root). This replaces the runtime useradd dance; the per-run
+#     `chown -R ci:ci /build` of the bind-mounted checkout stays in the
+#     workflow — the mount is per-run and cannot be baked.
+#
+# The toolchain chmod lives in the rustup RUN above, and it MUST stay there:
+# a metadata-only chmod in a later layer forces an overlay copy-up of the
+# whole /root/.cargo + /root/.rustup tree into that layer (~2-3 GB), which
+# exhausts the publisher's small root disk (observed: the standalone chmod
+# layer failed to commit with "no space left on device"). Same-RUN chmods
+# edit files already in the current layer and cost nothing.
 RUN apt-get update && apt-get install -y chromium chromium-driver \
-    && rm -rf /var/lib/apt/lists/* && apt-get clean
-
-RUN useradd -m ci \
-    && chmod a+rx /root \
-    && chmod -R a+rwX /root/.cargo /root/.rustup \
+    && rm -rf /var/lib/apt/lists/* && apt-get clean \
+    && useradd -m ci \
     && command -v chromium \
     && command -v chromedriver
 
