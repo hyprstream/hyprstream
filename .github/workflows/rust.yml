@@ -373,25 +373,17 @@ jobs:
           -e BROWSER_ATTEST_NONCE \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
-            # #1425 r4: install the real headless-browser dependency as root,
-            # before switching to the non-root ci user below — graviton-build-
-            # test.sh runs as ci and cannot apt-get/dnf install. This makes the
-            # required merge-group build path actually launch a browser for the
-            # wasm_browser_fetch conformance test, not just compile-check it.
-            bash /build/.github/scripts/install-chromium.sh
-
-            # cargo-nextest, git-lfs, the wasm targets and clippy are baked into the
-            # builder image (BUILDER_IMAGE, Dockerfile builder-cpu-arm64) — no runtime
-            # installs here. Only set up the NON-ROOT user: several fail-closed tests
-            # assert a write to a read-only dir is rejected, but root bypasses file
-            # permissions, so they pass only as non-root (the old ubuntu-latest gate
-            # ran non-root). Make the toolchain usable by ci and hand it the workspace.
-            # R4: the builder image may bake the ci user + toolchain perms
-            # (Dockerfile builder-cpu-arm64); older digests do not. Create
-            # ci only when it is absent so either image works.
-            id -u ci >/dev/null 2>&1 || useradd -m ci
-            chmod a+rx /root
-            chmod -R a+rwX /root/.cargo /root/.rustup
+            # R4 (#1425): chromium + chromium-driver, the non-root ci user and
+            # the toolchain perms (/root a+rx, /root/.cargo + /root/.rustup
+            # a+rwX) are baked into the builder image (Dockerfile builder-
+            # cpu-arm64) — the former runtime install-chromium / useradd /
+            # chmod dance is gone (it cost every candidate ~150-215 s of apt
+            # install plus an overlay copy-up permission walk). What remains
+            # is per-run only: hand the freshly bind-mounted checkout to ci
+            # (the mount is per-run and cannot be baked), then run the gate
+            # as that non-root user (several fail-closed tests assert a write
+            # to a read-only dir is rejected, which holds only as non-root —
+            # root bypasses file permissions).
             chown -R ci:ci /build
             runuser -u ci -- bash -euo pipefail /build/.github/scripts/graviton-build-test.sh
           '
