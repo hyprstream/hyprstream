@@ -71,6 +71,8 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
           aws-region: ${{ vars.AWS_SCCACHE_REGION }}
+          # 4h session: builds outlive the 3600s default (see rust.yml note).
+          role-session-duration: 14400
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9

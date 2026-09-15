@@ -108,6 +108,12 @@ jobs:
       with:
         role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
         aws-region: ${{ vars.AWS_SCCACHE_REGION }}
+        # The merge gate runs 70-140 min; the 3600s default session expired at
+        # ~60 min and every sccache S3 write after that failed (2026-09-14/15:
+        # 2,261 then 813 cache write errors, all in late phases — verified via
+        # the per-phase sccache stats). The role's MaxSessionDuration is now
+        # 14400; request it explicitly so the action does not default to 3600.
+        role-session-duration: 14400
 
     - name: Pull builder image
       run: podman pull "$BUILDER_IMAGE"
