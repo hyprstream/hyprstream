@@ -425,12 +425,8 @@ pub fn ensure_branch(repo: &Repository, name: &str) -> Result<()> {
 
 // === Utility ===
 
-/// COW-aware file copy (uses reflink when filesystem supports it, falls back to regular copy).
-pub fn cow_copy(src: &Path, dst: &Path) -> Result<()> {
-    reflink_copy::reflink_or_copy(src, dst)
-        .map(|_| ())
-        .map_err(|e| anyhow!("cow_copy failed: {}", e))
-}
+// NOTE: `cow_copy` moved to `hyprstream-inference` (`worktree_ext`) with its only
+// caller, the training checkpoint path (Wave B decomposition).
 
 /// Sanitize a string for use as a Git tag name
 pub fn sanitize_tag_name(name: &str) -> String {

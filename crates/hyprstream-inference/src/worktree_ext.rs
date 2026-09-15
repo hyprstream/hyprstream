@@ -5,12 +5,28 @@
 //! convenience methods that sent entire files in a single message.
 
 use hyprstream_rpc_std::registry_client::WorktreeClient;
-use crate::services::types::{OREAD, OWRITE, DMDIR};
 use hyprstream_rpc_std::registry_client::{
     NpWalk, NpOpen, NpCreate, NpRead, NpWrite, NpClunk, NpRemove, NpStatReq,
 };
 use anyhow::Result;
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+// 9P open-mode flags (mirrors the daemon-side constants in `services::types`;
+// the wire encoding is fixed by 9P, so these are protocol constants, not
+// shared state).
+const OREAD: u8 = 0;
+const OWRITE: u8 = 1;
+const DMDIR: u32 = 0x80000000;
+
+/// COW-aware file copy (uses reflink when the filesystem supports it, falls
+/// back to a regular copy). Carved out of the main crate's `git::ops` with the
+/// training checkpoint path — its only caller.
+pub fn cow_copy(src: &Path, dst: &Path) -> Result<()> {
+    reflink_copy::reflink_or_copy(src, dst)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("cow_copy failed: {}", e))
+}
 
 /// Atomic counter for allocating client-side fids.
 static NEXT_CLIENT_FID: AtomicU32 = AtomicU32::new(100);
@@ -36,13 +52,26 @@ pub struct StatResult {
     pub modified_at: i64,
 }
 
+/// Directory entry returned by [`WorktreeClientExt::list_dir_path`].
+pub struct DirEntryInfo {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
 /// High-level 9P helpers for the generated Registry worktree client.
 ///
 /// The client itself is owned by `hyprstream-rpc-std`; keeping these
 /// implementation-specific convenience operations as an extension trait lets
 /// the AGPL daemon add ergonomics without defining an inherent impl for an
-/// external type.
-pub(crate) trait WorktreeClientExt:
+/// external type. Public here so the main crate (which consumes this crate)
+/// can keep implementing/training flows against it.
+//
+// AFIT is intentional (same style as the generated `*Rpc` traits); the
+// auto-trait-bounds caveat is accepted because every caller drives this over
+// a known-Send client within one runtime.
+#[allow(async_fn_in_trait)]
+pub trait WorktreeClientExt:
     hyprstream_rpc_std::registry_client::WorktreeRpc
 {
     /// Read at most `limit` bytes without transferring the rest of a file.
@@ -266,7 +295,7 @@ pub(crate) trait WorktreeClientExt:
     /// This replaces the old `list_dir(path)` method. Returns directory entries
     /// by walking to the directory, opening it, and reading the dir entries.
     /// For now, implemented via walk + stat on the directory.
-    async fn list_dir_path(&self, path: &str) -> Result<Vec<super::FsDirEntryInfo>> {
+    async fn list_dir_path(&self, path: &str) -> Result<Vec<DirEntryInfo>> {
         // Walk to the directory and open it for reading
         let fid = next_fid();
         let wnames = split_path(path);
@@ -303,7 +332,7 @@ pub(crate) trait WorktreeClientExt:
                     resp.data[cursor..cursor + 8].try_into().unwrap_or([0; 8])
                 );
                 cursor += 8;
-                entries.push(super::FsDirEntryInfo { name, is_dir, size });
+                entries.push(DirEntryInfo { name, is_dir, size });
             }
             offset += resp.data.len() as u64;
         }

@@ -6863,7 +6863,6 @@ dependencies = [
  "base64 0.22.1",
  "bincode",
  "bitflags 2.11.0",
- "bitsandbytes-sys",
  "blake3",
  "bs58",
  "bytes",
@@ -6900,6 +6899,7 @@ dependencies = [
  "hyprstream-crypto",
  "hyprstream-discovery",
  "hyprstream-flight",
+ "hyprstream-inference",
  "hyprstream-ledger",
  "hyprstream-metrics",
  "hyprstream-p2p",
@@ -7175,6 +7175,45 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "users",
+]
+
+[[package]]
+name = "hyprstream-inference"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bitsandbytes-sys",
+ "chrono",
+ "dashmap",
+ "fastrand 2.3.0",
+ "futures",
+ "git2db",
+ "hex",
+ "hyprstream-rpc",
+ "hyprstream-rpc-std",
+ "image",
+ "json-threat-protection",
+ "libc",
+ "memmap2",
+ "minijinja",
+ "once_cell",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "parking_lot 0.12.4",
+ "reflink-copy",
+ "regex",
+ "safetensors 0.4.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tch",
+ "tempfile",
+ "tokenizers",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

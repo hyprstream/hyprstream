@@ -15,7 +15,7 @@ pub use hyprstream_rpc_std::model_client::KVQuantType;
 
 // Re-export everything from the unified config
 pub use crate::config::{
-    FinishReason, GenerationConfig, GenerationResult, HyprConfig,
+    FinishReason, GenerationConfig, GenerationResult,
     ModelConfig, RuntimeConfig,
 };
 

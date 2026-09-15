@@ -39,14 +39,17 @@ pub mod events;
 pub mod git;
 pub mod inference;
 pub mod mac;
-pub mod runtime;
+// runtime and training moved to the `hyprstream-inference` crate (Wave B decomposition);
+// re-exported as modules so every existing `crate::runtime` / `crate::training` path
+// keeps resolving.
+pub use hyprstream_inference::runtime;
 pub mod schema;
 pub mod server;
 pub mod services;
 pub mod storage;
 #[cfg(unix)]
 pub mod systemd;
-pub mod training;
+pub use hyprstream_inference::training;
 pub mod tui;
 
 // Storage exports removed

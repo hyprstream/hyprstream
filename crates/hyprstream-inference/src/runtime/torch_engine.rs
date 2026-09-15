@@ -2113,7 +2113,7 @@ impl TorchEngine {
     /// use futures::StreamExt;
     /// use hyprstream_rpc_std::inference_client::GenerationRequest;
     ///
-    /// # async fn example(engine: &hyprstream_core::runtime::torch_engine::TorchEngine) -> anyhow::Result<()> {
+    /// # async fn example(engine: &hyprstream_inference::runtime::torch_engine::TorchEngine) -> anyhow::Result<()> {
     /// let request = GenerationRequest::default();
     /// let mut stream = engine.generate(request)?;
     ///

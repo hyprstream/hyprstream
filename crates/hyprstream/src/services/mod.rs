@@ -61,10 +61,12 @@
 
 mod core;
 mod types;
-mod worktree_helpers;
 use hyprstream_rpc_std::{discovery_client::DiscoveryClient, policy_client::PolicyClient};
-pub use worktree_helpers::StatResult;
-pub(crate) use worktree_helpers::WorktreeClientExt;
+// 9P worktree convenience helpers moved to `hyprstream-inference` with the
+// training checkpoint path (Wave B); re-exported so existing
+// `crate::services::{StatResult, WorktreeClientExt}` paths keep resolving.
+pub use hyprstream_inference::worktree_ext::StatResult;
+pub(crate) use hyprstream_inference::worktree_ext::WorktreeClientExt;
 // contained_root replaced by hyprstream-containedfs crate
 pub mod discovery;
 pub mod editing;

@@ -47,7 +47,7 @@ use super::tenant_delta::{
 };
 use crate::runtime::kv_cache::KVCacheRegistry;
 use hyprstream_rpc_std::registry_client::WorktreeClient;
-use crate::services::WorktreeClientExt;
+use crate::worktree_ext::WorktreeClientExt;
 use hyprstream_rpc::Subject;
 
 /// Maximum snapshot size in bytes (512 MB). Deltas exceeding this are not snapshotted on eviction.
