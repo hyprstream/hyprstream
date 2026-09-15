@@ -336,8 +336,8 @@ def check_rust_text(text: str) -> None:
     # linting only default features — or failing spuriously — again.
     clippy_script = _podman_quoted_script(job_blocks["clippy"], "clippy")
     _assert(
-        "cargo clippy --workspace --all-targets -- -D warnings" in clippy_script,
-        "rust.yml: job 'clippy' must run the workspace lint inside the builder container",
+        "cargo clippy --all-targets -- -D warnings" in clippy_script,
+        "rust.yml: job 'clippy' must run the default-members lint inside the builder container",
     )
     _assert(
         "cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings"

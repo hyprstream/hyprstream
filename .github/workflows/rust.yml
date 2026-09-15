@@ -105,7 +105,11 @@ jobs:
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
             bash .github/scripts/verify-libtorch.sh
-            cargo clippy --workspace --all-targets -- -D warnings
+            # Lint the default-members set: hyprstream-metrics/hyprstream-flight are
+            # excluded from default builds (non-production DuckDB profile; compile
+            # coverage continues in metrics-profile-nightly.yml), so the workspace-wide
+            # lint would pull the whole DuckDB/DataFusion tree into every PR check.
+            cargo clippy --all-targets -- -D warnings
             # The workspace lint builds default features only, so the
             # RDS-backed PDS record store (#1257, `pds-postgres`) is cfg-gated
             # out of it. Lint it explicitly so the module and its tests
