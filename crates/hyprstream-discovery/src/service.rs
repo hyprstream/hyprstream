@@ -3,15 +3,15 @@
 //! Allows remote clients to discover registered services, their endpoints,
 //! socket kinds, and schemas via the standard REQ/REP transport.
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "rocksdb", not(target_arch = "wasm32")))]
 #[path = "network_bootstrap_tests.rs"]
 mod network_bootstrap_tests;
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "rocksdb", not(target_arch = "wasm32")))]
 #[path = "event_network_bootstrap_tests.rs"]
 mod event_network_bootstrap_tests;
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "rocksdb", not(target_arch = "wasm32")))]
 #[path = "moql_checkpoint_admission_tests.rs"]
 mod moql_checkpoint_admission_tests;
 
