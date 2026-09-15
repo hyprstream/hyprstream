@@ -293,6 +293,28 @@ RUN cd /tmp/tc \
     && rustup target list --installed | grep -qx wasm32-wasip1 \
     && rm -rf /tmp/tc
 
+# R4 (#1425): bake the merge-gate's per-run container setup so the `build`
+# job's container step stops paying it on every candidate (~150-215 s of
+# apt install + permission walks):
+#   - chromium + chromium-driver: the headless browser the wasm_browser_fetch
+#     conformance test launches. Mirrors .github/scripts/install-chromium.sh's
+#     exact package set; that script no-ops once `chromium` is on PATH, so the
+#     WASM job and the preflight keep working unchanged.
+#   - the non-root `ci` user the gate runs as (several fail-closed tests
+#     assert a write to a read-only dir is rejected, which only holds as
+#     non-root), with the toolchain made usable by it: /root traversable and
+#     cargo+rustup writable. This replaces the runtime useradd/chmod dance.
+#     The per-run `chown -R ci:ci /build` of the bind-mounted checkout stays
+#     in the workflow — the mount is per-run and cannot be baked.
+RUN apt-get update && apt-get install -y chromium chromium-driver \
+    && rm -rf /var/lib/apt/lists/* && apt-get clean
+
+RUN useradd -m ci \
+    && chmod a+rx /root \
+    && chmod -R a+rwX /root/.cargo /root/.rustup \
+    && command -v chromium \
+    && command -v chromedriver
+
 #############################################
 # CUDA 13.0 Builder (aarch64 / arm64) — reconnaissance only
 #############################################
