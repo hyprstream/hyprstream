@@ -362,18 +362,29 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
             "metadata": visible_cli_binding(cli, metadata_bindings, metadata, match.start(), service),
             "scoped_tree": visible_cli_binding(cli, scoped_tree_bindings, tree, match.start(), service),
         }))
+    # Manual registrations follow the same direct-scope rule as build_service_command
+    # above: a binding or its `tool = tool.subcommand(...)` attachment hidden inside
+    # a conditional (dead or not) must not count as an active registration.
+    manual_lets = {match.start(): match.group("binding")
+                   for match in direct_matches(
+                       tool_body, r'\blet\s+(?P<binding>[a-zA-Z_]\w*)\s*=\s*Command::new\s*\(')}
+    direct_attachments = list(direct_matches(
+        tool_body, r'\btool\s*=\s*tool\.subcommand\s*\(\s*(?P<binding>[a-zA-Z_]\w*)\s*\)\s*;'))
     for match in re.finditer(
         r'\blet\s+(?P<binding>[a-zA-Z_]\w*)\s*=\s*Command::new\s*\(\s*', cli
     ):
         if re.match(r'"', cli_source[match.end():]) is None:
             continue
+        body_pos = match.start() - tool_start
+        required(0 <= body_pos < len(tool_body) and body_pos in manual_lets,
+                 "manual CLI registration must be at direct tool-root scope")
         service, end = rust_string(cli_source, match.end(), "manual CLI registration")
-        subcommand = re.search(
-            rf'\btool\s*=\s*tool\.subcommand\(\s*{re.escape(match.group("binding"))}\s*\)\s*;', cli[end:]
-        )
+        binding = match.group("binding")
+        subcommand = next((candidate for candidate in direct_attachments
+                           if candidate.start() > body_pos and candidate.group("binding") == binding), None)
         if subcommand is None:
             continue
-        body = cli[end:end + subcommand.start()]
+        body = cli[end:tool_start + subcommand.start()]
         methods = [
             rust_string(cli_source, end + command.end(), "manual CLI method")[0]
             for command in re.finditer(r'\bCommand::new\s*\(\s*', body)
@@ -386,12 +397,32 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
     cli_modules = {service: modules for _, service, _, modules in registrations if modules is not None}
     mcp_services, mcp_roots = mcp_registrations(mcp_source)
     factory_services, features, schema_attributes = [], {}, {}
-    cfgs: list[tuple[int, int, str]] = []
-    for match in re.finditer(r'#\s*\[\s*cfg\s*\(\s*feature\s*=\s*', factories):
-        feature, end = rust_string(factories_source, match.end(), "factory feature condition")
-        close = re.match(r'\s*\)\s*\]', factories[end:])
-        if close is not None:
-            cfgs.append((match.start(), end + close.end(), feature))
+    # Every item-level cfg attribute adjacent to a factory must be understood:
+    # recognized cfg(feature = "...") becomes the factory's feature condition;
+    # any other cfg form (cfg(any()), cfg(not(...)), cfg(unix), ...) guards the
+    # inventory submission away from some builds, so fail closed instead of
+    # silently recording the service as unconditionally active.
+    cfgs: list[tuple[int, int, str | None]] = []
+    for match in re.finditer(r'#\s*\[\s*cfg\s*\(', factories):
+        depth, index = 1, match.end()
+        while depth:
+            required(index < len(factories), "unterminated factory cfg attribute")
+            depth += (factories[index] == "(") - (factories[index] == ")")
+            index += 1
+        close = re.match(r'\s*\]', factories[index:])
+        required(close is not None, "unterminated factory cfg attribute")
+        span_end = index + close.end()
+        feature: str | None = None
+        feature_match = re.match(r'\s*feature\s*=\s*', factories[match.end():])
+        if feature_match is not None:
+            try:
+                value, after = rust_string(factories_source, match.end() + feature_match.end(),
+                                           "factory feature condition")
+                if re.match(r'\s*\)', factories[after:]):
+                    feature = value
+            except CatalogError:
+                feature = None
+        cfgs.append((match.start(), span_end, feature))
     for match in re.finditer(r'#\s*\[\s*service_factory\s*\(\s*', factories):
         depth, index = 1, match.end()
         while depth:
@@ -412,11 +443,16 @@ def source_services(repo: Path, mutations: dict[str, str] | None = None) -> dict
             required(found is not None, f"factory {name} metadata attribute is not a module path")
             metadata_value = found.group(0)
         schema_attributes[name] = {"schema": schema_value, "metadata": metadata_value}
-        prior = [feature for _, end, feature in cfgs
-                 if end <= match.start() and factories[end:match.start()].strip() == ""]
-        if prior:
-            required(len(prior) == 1, f"ambiguous feature condition for factory {name}")
-            features[name] = f"feature={prior[0]}"
+        adjacent = [(guard_start, guard_end, guard)
+                    for guard_start, guard_end, guard in cfgs
+                    if guard_end <= match.start() and factories[guard_end:match.start()].strip() == ""]
+        if adjacent:
+            required(len(adjacent) == 1, f"ambiguous feature condition for factory {name}")
+            guard_start, _, guard = adjacent[0]
+            required(guard is not None,
+                     f"factory {name} has an unsupported cfg guard; "
+                     "only cfg(feature = \"...\") conditions are catalogued")
+            features[name] = f"feature={guard}"
     vfs_services, vfs_dispatches = [], {}
     for match in re.finditer(r'\bimpl_service_dispatch!\s*\(\s*([A-Za-z_]\w*)\s*,\s*', vfs):
         name, end = rust_string(vfs_source, match.end(), "VFS service registration")
@@ -1111,13 +1147,13 @@ def capnp_only_inputs(build_file: str, source: str) -> list[str]:
         for found in re.finditer(r"(?:^|[,{]\s*)CompilerCommand(?:\s+as\s+([A-Za-z_]\w*))?\s*(?=,|}|$)", code[start:index - 1]):
             constructors.add(found.group(1) or "CompilerCommand")
     for name in constructors:
-        required(not re.search(rf"\blet\s+(?:mut\s+)?{re.escape(name)}\b|\b{re.escape(name)}\s*=", code),
+        required(not re.search(rf"\blet\s+(?:mut\s+)?{re.escape(name)}\b|(?<!::)\b{re.escape(name)}\s*=", code),
                  f"{build_file} shadows the imported CompilerCommand alias {name}")
     module_aliases: set[str] = set()
     for match in re.finditer(r"\buse\s+capnpc\s+as\s+([A-Za-z_]\w*)\s*;", code):
         module_aliases.add(match.group(1))
     for alias in module_aliases:
-        required(not re.search(rf"\blet\s+(?:mut\s+)?{re.escape(alias)}\b|\b{re.escape(alias)}\s*=", code),
+        required(not re.search(rf"\blet\s+(?:mut\s+)?{re.escape(alias)}\b|(?<!::)\b{re.escape(alias)}\s*=", code),
                  f"{build_file} shadows the capnpc module alias {alias}")
         foreign = [path for path in re.findall(rf"\buse\s+([A-Za-z_][\w:]*)\s+as\s+{re.escape(alias)}\s*;", code) if path != "capnpc"]
         required(not foreign, f"{build_file} has an ambiguous module alias {alias}")

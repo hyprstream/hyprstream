@@ -581,6 +581,56 @@ struct DeepResponse { union {
         with self.assertRaises(catalog.CatalogError):
             catalog.capnp_only_inputs(build, source.replace('capnpc::CompilerCommand::new()', 'unknown::CompilerCommand::default()', 1))
 
+    def test_manual_registration_scope_factory_guards_typed_default(self):
+        cli_path = "crates/hyprstream/src/cli/schema_cli.rs"
+        source = catalog.text(ROOT, cli_path, None)
+        baseline = catalog.source_services(ROOT)["cli"]
+        self.assertIn("discovery", baseline["manual_services"])
+        # A subcommand attachment hidden behind a conditional (dead or not) is
+        # not an active registration; neither is a hidden Command::new binding.
+        dead_attachment = source.replace("tool = tool.subcommand(discovery);",
+                                         "if false { tool = tool.subcommand(discovery); }", 1)
+        self.assertNotEqual(dead_attachment, source)
+        self.assertNotIn("discovery",
+                         catalog.source_services(ROOT, {cli_path: dead_attachment})["cli"]["manual_services"])
+        dead_binding = source.replace(
+            "    let discovery = Command::new(\"discovery\")\n"
+            "        .about(\"Discovery health check\")\n"
+            "        .subcommand(Command::new(\"ping\").about(\"Health check\"))\n"
+            "        .subcommand_required(true)\n"
+            "        .arg_required_else_help(true);\n"
+            "    tool = tool.subcommand(discovery);",
+            "    if false {\n"
+            "    let discovery = Command::new(\"discovery\")\n"
+            "        .about(\"Discovery health check\")\n"
+            "        .subcommand(Command::new(\"ping\").about(\"Health check\"))\n"
+            "        .subcommand_required(true)\n"
+            "        .arg_required_else_help(true);\n"
+            "    }\n"
+            "    tool = tool.subcommand(discovery);", 1)
+        self.assertNotEqual(dead_binding, source)
+        with self.assertRaisesRegex(catalog.CatalogError, "direct tool-root scope"):
+            catalog.source_services(ROOT, {cli_path: dead_binding})
+        # Any cfg guard other than cfg(feature = "...") compiles the inventory
+        # submission away on some builds; it must fail closed, not count as
+        # unconditionally active.
+        factories_path = "crates/hyprstream/src/services/factories.rs"
+        factories_source = catalog.text(ROOT, factories_path, None)
+        at = factories_source.index('#[service_factory("event")]')
+        guarded = factories_source[:at] + '#[cfg(any())]\n' + factories_source[at:]
+        with self.assertRaisesRegex(catalog.CatalogError, "unsupported cfg guard"):
+            catalog.source_services(ROOT, {factories_path: guarded})
+        # The module-qualified typed Default construction is a valid capnpc
+        # build-script shape and must resolve, not trip the alias-shadow guard.
+        build = "crates/hyprstream-rpc-build/build.rs"
+        build_source = catalog.text(ROOT, build, None)
+        expected = catalog.capnp_only_inputs(build, build_source)
+        typed = build_source.replace(
+            "    capnpc::CompilerCommand::new()\n        .file(&schema)",
+            "    let mut command: capnpc::CompilerCommand = Default::default();\n    command.file(&schema)", 1)
+        self.assertNotEqual(typed, build_source)
+        self.assertEqual(catalog.capnp_only_inputs(build, typed), expected)
+
     def test_workflow_contract(self):
         source = (ROOT / ".github/workflows/docs-catalog.yml").read_text()
         for required in ["[self-hosted, linux, arm64, graviton, hyprstream-merge-gate]", "load-builder-image.sh",
