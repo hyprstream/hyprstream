@@ -267,7 +267,10 @@ pub struct InferenceInstanceId {
 }
 
 /// Domain-separated carrier-key purpose for one opaque service instance.
-pub(crate) fn inference_iroh_key_purpose(service_name: &str) -> String {
+///
+/// Public: consumed by the main crate's inference service wiring across the
+/// `hyprstream-inference` boundary.
+pub fn inference_iroh_key_purpose(service_name: &str) -> String {
     format!("hyprstream-inference-iroh-v1/{service_name}")
 }
 

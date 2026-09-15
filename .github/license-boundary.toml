@@ -13,6 +13,7 @@ agpl_packages = [
   "hyprstream-appview",
   "hyprstream-discovery",
   "hyprstream-flight",
+  "hyprstream-inference",
   "hyprstream-k8s-pds",
   "hyprstream-ledger",
   "hyprstream-metrics",

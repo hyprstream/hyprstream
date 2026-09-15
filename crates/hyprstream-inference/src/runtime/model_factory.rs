@@ -17,7 +17,7 @@ use hyprstream_rpc_std::model_client::KVQuantType;
 use super::model_config::{ModelArchitecture, ModelConfig};
 use super::torch_utils::{safe_to_device, estimate_tensor_size_mb};
 use hyprstream_rpc_std::registry_client::WorktreeClient;
-use crate::services::WorktreeClientExt;
+use crate::worktree_ext::WorktreeClientExt;
 
 /// Strict-loader opt-in (#315): when set truthy, multi-shard models that lack a
 /// `model.safetensors.index.json` manifest are rejected instead of silently

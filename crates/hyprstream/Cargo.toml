@@ -61,6 +61,7 @@ hyprstream-util = { path = "../hyprstream-util" }  # Generic shared primitives (
 moq-net.workspace = true  # moq-lite streaming for cross-process subscriber (M2b)
 ml-dsa = { workspace = true }  # ML-DSA-65 — always compiled (runtime CryptoPolicy selects PQ). See M3 #152.
 hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }  # Standard service schemas + clients
+hyprstream-inference = { path = "../hyprstream-inference" }  # Torch runtime + training (Wave B decomposition)
 hyprstream-discovery = { path = "../hyprstream-discovery" }  # Service discovery
 hyprstream-pds = { path = "../hyprstream-pds" }  # atproto PDS record store: DAG-CBOR + MST + signed commit + CAR proof (#392/#431)
 hyprstream-pds-service = { path = "../hyprstream-pds-service" }  # authority-owned hosted-account tenant lookup
@@ -125,7 +126,6 @@ rayon.workspace = true  # Parallel processing for tensor operations
 memmap2.workspace = true
 rand.workspace = true
 tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hyprstream-libtorch-211" }
-bitsandbytes-sys = { path = "../bitsandbytes-sys", optional = true }  # KV cache quantization
 
 # Candle ML Framework - REMOVED: Fully migrated to Tch (PyTorch Rust bindings)
 # candle-core = "0.9.1"
@@ -245,14 +245,14 @@ encrypted-account-admission = []  # Mandatory source-level policy: no plaintext 
 credential-pds = ["encrypted-account-admission", "pglite"]  # Production credential/PDS service profile; intentionally excludes metrics/DuckDB
 credential-pds-postgres = ["postgres"]  # Production credential/PDS with RDS Postgres backend (#1401)
 metrics = ["encrypted-account-admission", "dep:hyprstream-metrics", "dep:hyprstream-flight"]  # Separate DuckDB-backed metrics/inference/Flight service build
-bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
-xet = ["git2db/xet-storage"]  # Enable XET large file storage
+bnb = ["hyprstream-inference/bnb"]  # bitsandbytes KV cache quantization (gated code lives in hyprstream-inference)
+xet = ["git2db/xet-storage", "hyprstream-inference/xet"]  # Enable XET large file storage
 # NOTE: plain dependency names (not `dep:`) — cargo rejects `dep:` references
 # to target-specific optional dependencies, and the otel stack is target-gated
 # to non-wasm (#1305, see the target table below). On wasm32 the feature may be
 # enabled but pulls nothing; all otel code is gated
 # `#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]`.
-otel = ["tracing-opentelemetry", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "opentelemetry-semantic-conventions", "opentelemetry-stdout"]
+otel = ["tracing-opentelemetry", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "opentelemetry-semantic-conventions", "opentelemetry-stdout", "hyprstream-inference/otel"]
 gittorrent = ["dep:hyprstream-p2p", "git2db/gittorrent-transport"]  # Enable P2P model sharing via hyprstream-p2p transport (feature name kept for compat)
 download-libtorch = ["tch/download-libtorch"]
 overlayfs = ["git2db/overlayfs"]  # Enable overlayfs-backed worktrees (delegated to git2db)

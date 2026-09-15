@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use hyprstream_rpc_std::registry_client::{RepositoryClient, WorktreeClient};
-use crate::services::WorktreeClientExt;
+use crate::worktree_ext::WorktreeClientExt;
 
 /// Checkpoint request sent to background worker
 #[derive(Debug, Clone)]
@@ -305,7 +305,7 @@ impl CheckpointManager {
                     if metadata.file_type().is_symlink() {
                         return Err(anyhow!("Source path {:?} is a symlink; refusing to copy", source));
                     }
-                    crate::git::ops::cow_copy(source, &checkpoint_path)?;
+                    crate::worktree_ext::cow_copy(source, &checkpoint_path)?;
                 }
                 WeightSnapshot::Diff {
                     base_step,
@@ -358,7 +358,7 @@ impl CheckpointManager {
         fs::create_dir_all(&adapters_dir).await?;
 
         let adapter_path = adapters_dir.join(format!("{adapter_name}.safetensors"));
-        crate::git::ops::cow_copy(checkpoint_path, &adapter_path)?;
+        crate::worktree_ext::cow_copy(checkpoint_path, &adapter_path)?;
 
         tracing::info!(
             "Updated target adapter: {}",
@@ -667,7 +667,7 @@ impl CheckpointManager {
                         WeightFormat::AdapterBin => "checkpoint_adapter.bin",
                     };
                     let dest = checkpoint_dir.join(filename);
-                    crate::git::ops::cow_copy(source, &dest)?;
+                    crate::worktree_ext::cow_copy(source, &dest)?;
                     dest
                 }
                 WeightSnapshot::Diff {
