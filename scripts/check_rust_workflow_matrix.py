@@ -273,7 +273,7 @@ def check_rust_text(text: str) -> None:
         )
 
     jobs = _jobs_if_map(text)
-    for name in ("clippy", "deny", "loopback-burndown", "wasm", "build"):
+    for name in ("clippy", "deny", "loopback-burndown", "wasm", "build", "build-release"):
         _assert(name in jobs, f"rust.yml: required job {name!r} missing; got {sorted(jobs)}")
 
     skip_merge_group = "github.event_name!='merge_group'"
@@ -289,12 +289,14 @@ def check_rust_text(text: str) -> None:
         jobs.get("deny") is None,
         f"rust.yml: 'deny' must run on every supported event (if={jobs.get('deny')!r})",
     )
-    build_if = jobs.get("build")
-    _assert(
-        _normalized_condition(build_if) == "github.event_name!='pull_request'",
-        f"rust.yml: 'build' condition must be exactly the pull_request skip "
-        f"(if={build_if!r})",
-    )
+    pull_request_skip = "github.event_name!='pull_request'"
+    for name in ("build", "build-release"):
+        cond = jobs.get(name)
+        _assert(
+            _normalized_condition(cond) == pull_request_skip,
+            f"rust.yml: job {name!r} condition must be exactly the pull_request "
+            f"skip (if={cond!r})",
+        )
 
     # The merge-gate runners provision a dedicated cache EBS volume at this
     # path. Every Rust container must bind it and direct Cargo's target there;
@@ -305,7 +307,7 @@ def check_rust_text(text: str) -> None:
         "-e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream",
     )
     job_blocks = _job_blocks(text)
-    for name in ("clippy", "wasm", "build"):
+    for name in ("clippy", "wasm", "build", "build-release"):
         block = job_blocks[name]
         for argument in required_cache_args:
             _assert(
@@ -461,6 +463,19 @@ def _rust_mutations(rust_text: str) -> list[tuple[str, str]]:
         (
             "rename build job (removing the required gate)",
             rust_text.replace("  build:\n", "  build_renamed:\n", 1),
+        ),
+        (
+            "rename build-release job (removing the release lane gate)",
+            rust_text.replace("  build-release:\n", "  build_release_renamed:\n", 1),
+        ),
+        (
+            "make build-release skip merge_group",
+            rust_text.replace(
+                "  build-release:\n    # MERGE GATE, release/feature-lane half",
+                "  build-release:\n    if: github.event_name == 'merge_group'\n"
+                "    # MERGE GATE, release/feature-lane half",
+                1,
+            ),
         ),
         (
             "drop merge-gate cache mount",

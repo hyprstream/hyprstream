@@ -135,31 +135,12 @@ run_phase "nextest" cargo nextest run --cargo-profile ci-test --profile ci
 # for almost no runtime win on doc examples. Parity with the nextest profile.
 run_phase "doctests" cargo test --profile ci-test --doc
 
-# RELEASE / FEATURE LANES (last): none of these feed the test suite above.
-
-# Default features (parity with the former x86 gate); libtorch is the image's
-# aarch64 wheel at /opt/libtorch, so NO download-libtorch feature here.
-run_phase "native release build" cargo build --release
-
-# The `metrics` standalone profile (DuckDB-backed; mutually exclusive with the
-# default PGlite build at link time) was removed from the required gate on
-# 2026-09-14: nothing ships or deploys that profile today and its two serial
-# phases cost ~19 min of every merge candidate. Compile + typed-handler-test
-# coverage continues in .github/workflows/metrics-profile-nightly.yml; restore
-# both phases here if the metrics service becomes production.
-
-# The RDS-backed PDS record store (#1257) is feature-gated and absent from
-# the default-feature build above; check its full target set and run its
-# contract/unit tests. Live DB tests skip themselves green unless
-# HYPRSTREAM_POSTGRES_TEST_URL_FILE points at a scratch database.
-run_phase "pds-postgres feature check" cargo check -p hyprstream --locked --all-targets --features pds-postgres
-run_phase "pds-postgres contract tests" cargo test -p hyprstream --locked --lib --features pds-postgres -- services::pds_record_pg:: services::discovery::pg_tests:: config::tests::rds
-
-# Prove the production credential profile is causal: omitting it must fail the
-# build, never silently skip the deployable target. Compile-only and negative
-# (its pass condition is a failure), so it runs last.
-run_phase "credential-pds negative build gate" \
-  bash .github/scripts/credential-pds-build-gate.sh
+# RELEASE / FEATURE LANES moved to the parallel build-release job
+# (.github/scripts/graviton-release-lanes.sh) on 2026-09-15: the native
+# release build, pds-postgres lanes, and credential-pds negative gate
+# consume nothing the test suite produces and vice versa (verified: no test
+# reads the release binaries). This job is the test lane — browser
+# conformance, guest WASM artifacts, nextest, doctests.
 
 echo "::group::sccache statistics"
 sccache --show-stats
