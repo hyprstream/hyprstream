@@ -19447,8 +19447,6 @@ dependencies = [
  "cc",
  "chrono",
  "cipher",
- "clap",
- "clap_builder",
  "compact_str 0.9.0",
  "concurrent-queue",
  "const-oid 0.10.2",
