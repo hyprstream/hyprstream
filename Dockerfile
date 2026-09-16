@@ -401,13 +401,20 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 #   - /root/.cargo/registry: Cargo crate registry
 #   - /root/.cargo/git: Git dependencies
 #   - /sccache: Compiled artifacts (sccache)
+#
+# CI (oci-runtime-validate.yml) mounts the host cache volume and redirects the
+# target dir via `-e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream-oci`
+# so the tens of GB of intermediate objects land on the large cache disk rather
+# than the runner's small root disk. The cp therefore resolves the binary from
+# CARGO_TARGET_DIR when set, defaulting to the in-container /build/target for
+# every other invocation (docker-build.yml, build-image.yml).
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sccache \
     --mount=type=cache,target=/build/target,sharing=locked \
     OPENSSL_NO_VENDOR=1 cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features otel,gittorrent,xet,credential-pds \
     && mkdir -p /out \
-    && cp /build/target/release/hyprstream /out/hyprstream
+    && cp "${CARGO_TARGET_DIR:-/build/target}/release/hyprstream" /out/hyprstream
 
 #############################################
 # Runtime Stage Selection
