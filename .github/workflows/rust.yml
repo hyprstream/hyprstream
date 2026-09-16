@@ -164,6 +164,18 @@ jobs:
           bash -euo pipefail -c '
             unset RUSTC_WRAPPER
             cargo deny check bans licenses
+            # workspace-hack drift gate (Wave D): regenerate hakari output and
+            # fail if the committed copy is stale. Deliberately NOT
+            # `cargo hakari verify`: it reports false drift in this workspace
+            # (resolver-v2 build-dep isolation; guppy-rs/guppy#69). The
+            # ungate/gate round trip re-applies scripts/hack_wasm_gate.py
+            # because manage-deps re-emits ungated edges and its lockfile
+            # regeneration cannot parse gated ones.
+            python3 scripts/hack_wasm_gate.py --ungate
+            cargo hakari generate
+            cargo hakari manage-deps --yes
+            python3 scripts/hack_wasm_gate.py
+            git diff --exit-code -- workspace-hack Cargo.toml Cargo.lock crates
             python3 scripts/check_rust_workflow_matrix.py
             python3 -m unittest discover -s scripts/tests -p "test_check_license_boundary.py"
             python3 scripts/check_license_boundary.py
