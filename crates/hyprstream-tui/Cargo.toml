@@ -55,3 +55,7 @@ crossterm = { version = "0.29", default-features = false }
 [profile.release]
 opt-level = "s"
 lto = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

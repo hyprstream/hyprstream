@@ -75,6 +75,7 @@ hex = { workspace = true }
 p256 = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 # Production accepted-state authority is read directly from the concrete
 # checkpointed PDS store. No downstream callback/trait can supply authority.
 rocksdb = { version = "0.23", optional = true }

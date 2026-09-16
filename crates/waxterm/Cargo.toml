@@ -24,3 +24,7 @@ optional = true
 version = "1"
 features = ["rt", "sync"]
 optional = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

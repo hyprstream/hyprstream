@@ -47,6 +47,7 @@ apache_packages = [
   "hyprstream-workers-wasmtime",
   "hyprstream-workers-wasmtime-fsguest",
   "waxterm",
+  "workspace-hack",
 ]
 
 # Cargo metadata is authoritative for workspace membership. These packages are
@@ -87,4 +88,5 @@ permissive_roots = [
   "hyprstream-workers-wasmtime",
   "hyprstream-workers-wasmtime-fsguest",
   "waxterm",
+  "workspace-hack",
 ]

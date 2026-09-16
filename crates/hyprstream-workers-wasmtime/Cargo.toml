@@ -50,3 +50,7 @@ wasi-rand = { package = "rand", version = "0.10", default-features = false }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 parking_lot = "0.12"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

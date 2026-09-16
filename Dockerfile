@@ -280,6 +280,21 @@ RUN curl -fsSL -o /tmp/cargo-deny.tar.gz \
     && rm -f /tmp/cargo-deny.tar.gz \
     && test "$(cargo-deny --version | awk '{print $1, $2}')" = "cargo-deny ${CARGO_DENY_VERSION}"
 
+# cargo-hakari from the pinned upstream release (same pattern as cargo-deny
+# above). Baked because the deny job's container script runs the
+# workspace-hack regeneration-drift gate (scripts/hack_wasm_gate.py round
+# trip) — the gate must install nothing ad hoc at runtime, matching the
+# no-runtime-fetch rule. Upstream ships a single flat binary in the tarball
+# (no versioned directory, hence no --strip-components).
+ARG CARGO_HAKARI_VERSION=0.9.38
+ARG CARGO_HAKARI_SHA256=0076ddafb28c373125b30a8c04d6f4b7e4b59bf141fd51b6f47f89dc66922d34
+RUN curl -fsSL -o /tmp/cargo-hakari.tar.gz \
+        "https://github.com/guppy-rs/guppy/releases/download/cargo-hakari-${CARGO_HAKARI_VERSION}/cargo-hakari-${CARGO_HAKARI_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+    && echo "${CARGO_HAKARI_SHA256}  /tmp/cargo-hakari.tar.gz" | sha256sum -c - \
+    && tar zxf /tmp/cargo-hakari.tar.gz -C /root/.cargo/bin \
+    && rm -f /tmp/cargo-hakari.tar.gz \
+    && test "$(cargo-hakari --version | awk '{print $1, $2}')" = "cargo-hakari ${CARGO_HAKARI_VERSION}"
+
 # Pre-provision the repo's pinned Rust toolchain (channel + components + targets)
 # from rust-toolchain.toml so the merge gate does NOT rustup-download it at
 # runtime. Channel is read from the file (no version duplication); the component/
