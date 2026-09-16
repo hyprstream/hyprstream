@@ -29,7 +29,7 @@ use hyprstream_rpc_std::inference_client::GenerationRequest;
 use hyprstream_rpc_std::inference_client::ModelInfo;
 use crate::training::TenantDeltaConfig;
 use crate::runtime::kv_cache::CacheOwner;
-use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
+use crate::runtime::{create_engine, RuntimeConfig, RuntimeEngine, TorchEngine};
 
 use super::client::{InferenceClient, InferenceError};
 use super::request::InferenceRequest;
@@ -125,7 +125,7 @@ impl LocalInferenceService {
         config: RuntimeConfig,
         requests: mpsc::UnboundedReceiver<InferenceRequest>,
     ) -> Result<Self, anyhow::Error> {
-        let mut engine = TorchEngine::new(config.clone())?;
+        let mut engine = create_engine(&config)?;
         engine.load_model(&model_path).await?;
 
         // Initialize KV cache registry for session-based cache isolation
