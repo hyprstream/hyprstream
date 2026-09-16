@@ -1,3 +1,4 @@
+// Leaf-path timing probe: wave D finish-line measurement (comment-only change).
 // Rustdoc quality lane pilot (docs/rustdoc-quality.md): this crate opted in
 // to `missing_docs` for its public API. The lint is scoped here rather than in
 // `[workspace.lints]` so each crate measures its own baseline and opts in
