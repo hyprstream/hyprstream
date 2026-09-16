@@ -31,6 +31,14 @@ platforms = [
 #   (non-production DuckDB/Polars profile, compiled only in the metrics
 #   nightly). Unifying their closures would drag polars/duckdb into every
 #   workspace build, defeating the default-members trim.
+# - hyprstream-rpc-derive, hyprstream-rpc-build: host-triple-only crates (a
+#   proc-macro and a build helper). They compile for the host triple, where
+#   cfg(not(target_arch = "wasm32")) always holds, so a workspace-hack edge
+#   here leaks the hack's native union into the wasm browser build (the
+#   leak #1644's review fix removed by dropping those edges). Excluding them
+#   keeps `cargo tree --target wasm32-unknown-unknown -p hyprstream-rpc -i
+#   workspace-hack` empty AND makes manage-deps stop re-adding the edges the
+#   drift gate would otherwise trip over.
 # - hyprstream-inference, hyprstream: the torch lane. hyprstream-inference is
 #   the one member that legitimately carries tch/libtorch (Wave B), and the
 #   main crate keeps a normal dependency on it for the
@@ -56,4 +64,6 @@ workspace-members = [
     "hyprstream-inference",
     "hyprstream-flight",
     "hyprstream-metrics",
+    "hyprstream-rpc-derive",
+    "hyprstream-rpc-build",
 ]
