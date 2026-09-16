@@ -26,28 +26,6 @@ fn main() {
 
     // Compile Cap'n Proto schemas
     compile_capnp_schemas();
-
-    // If using Python PyTorch or download-libtorch, tch-rs handles libtorch setup
-    if env::var("LIBTORCH_USE_PYTORCH").is_ok() || env::var("LIBTORCH").is_err() {
-        // tch-rs will handle libtorch setup
-        return;
-    }
-
-    let libtorch_path = match env::var("LIBTORCH") {
-        Ok(path) => path,
-        Err(_) => return, // Early return, should not happen due to check above
-    };
-
-    // Validate libtorch exists
-    let libtorch_dir = Path::new(&libtorch_path);
-    if !libtorch_dir.exists() {
-        panic!("libtorch directory not found at {libtorch_path}");
-    }
-
-    // Configure linking
-    println!("cargo:rustc-link-search=native={libtorch_path}/lib");
-    println!("cargo:rustc-env=LIBTORCH_STATIC=0");
-    println!("cargo:rustc-env=LIBTORCH_BYPASS_VERSION_CHECK=1");
 }
 
 fn compile_capnp_schemas() {

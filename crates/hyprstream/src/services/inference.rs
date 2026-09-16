@@ -39,7 +39,7 @@ use hyprstream_rpc_std::inference_client::GenerationRequest;
 use hyprstream_rpc_std::inference_client::ModelInfo;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::model_config::ModelConfig;
-use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
+use crate::runtime::{create_engine, RuntimeConfig, RuntimeEngine, TorchEngine};
 
 use crate::services::EnvelopeContext;
 use hyprstream_rpc_std::registry_client::WorktreeClient;
@@ -493,7 +493,7 @@ impl InferenceService {
         // Capture runtime handle for reuse in handlers
         let runtime_handle = Handle::current();
 
-        let mut engine = TorchEngine::new(config.clone())?;
+        let mut engine = create_engine(&config)?;
         RuntimeEngine::load_model(&mut engine, &model_path).await?;
 
         // Initialize KV cache registry

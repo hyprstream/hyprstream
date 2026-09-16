@@ -125,7 +125,9 @@ thiserror.workspace = true
 rayon.workspace = true  # Parallel processing for tensor operations
 memmap2.workspace = true
 rand.workspace = true
-tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hyprstream-libtorch-211" }
+# tch/libtorch lives only in `hyprstream-inference` now (Wave B dependency
+# inversion): the main crate drives inference through the RuntimeEngine trait
+# and never names torch types, so it must not link libtorch directly.
 
 # Candle ML Framework - REMOVED: Fully migrated to Tch (PyTorch Rust bindings)
 # candle-core = "0.9.1"
@@ -262,7 +264,7 @@ xet = ["git2db/xet-storage", "hyprstream-inference/xet"]  # Enable XET large fil
 # `#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]`.
 otel = ["tracing-opentelemetry", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "opentelemetry-semantic-conventions", "opentelemetry-stdout", "hyprstream-inference/otel"]
 gittorrent = ["dep:hyprstream-p2p", "git2db/gittorrent-transport"]  # Enable P2P model sharing via hyprstream-p2p transport (feature name kept for compat)
-download-libtorch = ["tch/download-libtorch"]
+download-libtorch = ["hyprstream-inference/download-libtorch"]  # tch lives in hyprstream-inference (Wave B)
 overlayfs = ["git2db/overlayfs"]  # Enable overlayfs-backed worktrees (delegated to git2db)
 systemd = ["hyprstream-rpc/systemd", "hyprstream-service/systemd", "hyprstream-workers/systemd", "dep:listenfd"]  # Systemd integration (socket activation, service units)
 oci-image = ["hyprstream-workers/oci-image"]  # Universal mountable OCI/RAFS image filesystem service (ImageFs, an FsMount); composable by any backend (#633)
@@ -306,6 +308,12 @@ hyprstream-rpc-build.workspace = true  # Shared annotation extraction
 [dev-dependencies]
 hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 hyprstream-discovery = { path = "../hyprstream-discovery", features = ["test-fixtures"] }
+# Test-only: the e2e_inference integration suite drives torch devices
+# directly (DevicePool/LayerDeviceMap planning + GPU smoke tests over the
+# full service stack). The runtime dependency edge is gone (Wave B: tch
+# lives in hyprstream-inference); torch-sys is already in this crate's test
+# build graph through that dependency, so this adds no compile or link cost.
+tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hyprstream-libtorch-211" }
 criterion.workspace = true
 proptest.workspace = true  # S5 #571 M2: differential faithfulness property tests
 tempfile.workspace = true

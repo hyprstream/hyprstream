@@ -183,7 +183,7 @@ async fn init_adapter_at_path(
     model_ref_str: &str,
     fs: Option<&WorktreeClient>,
 ) -> Result<()> {
-    use crate::runtime::{RuntimeEngine, TorchEngine};
+    use crate::runtime::{create_engine, RuntimeEngine};
     use crate::storage::AdapterManager;
 
     let adapter_manager = if let Some(fs_ref) = fs {
@@ -214,7 +214,7 @@ async fn init_adapter_at_path(
     // Load model to get proper dimensions
     info!("Loading model to determine LoRA structure");
     let config = crate::config::RuntimeConfig::default();
-    let mut engine = TorchEngine::new(config)?;
+    let mut engine = create_engine(&config)?;
     RuntimeEngine::load_model(&mut engine, model_path).await?;
 
     // Create LoRA configuration
