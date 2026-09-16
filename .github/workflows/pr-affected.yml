@@ -31,7 +31,7 @@ jobs:
     name: pr-affected (informational + blocking for touched crates)
     if: github.event_name == 'pull_request'
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
     - uses: actions/checkout@v4
       with:
