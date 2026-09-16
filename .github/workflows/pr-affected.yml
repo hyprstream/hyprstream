@@ -60,23 +60,22 @@ jobs:
       run: |
         # Tests run as the image-baked unprivileged ci user (same as the
         # merge-gate build job): root ignores directory permissions, which
-        # breaks the auth identity-store read-only-credential tests. The
-        # PR cache namespace is chowned too so a root-created dir from an
-        # earlier run cannot block the ci user. The container script stays
-        # apostrophe-free and comment-free: comments cannot live inside
-        # continued shell commands, and the script itself is single-quoted.
+        # breaks the auth identity-store read-only-credential tests, so the
+        # script chowns the checkout and drops to ci via runuser. sccache
+        # scratch lives in the chowned checkout; the durable cache is
+        # SCCACHE_BUCKET (S3). This container script must stay apostrophe-free
+        # and comment-free: it is single-quoted and continued, so comments
+        # inside it are argument-breaking syntax errors, not notes.
         podman run --rm \
           -v "$PWD":/build:Z -w /build \
           -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \
           -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION \
+          -e SCCACHE_DIR=/build/.sccache \
           -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
           -e AWS_REGION -e AWS_DEFAULT_REGION \
           -e LIBTORCH=/opt/libtorch -e LD_LIBRARY_PATH=/opt/libtorch/lib \
           -e LIBTORCH_BYPASS_VERSION_CHECK=1 -e OPENSSL_NO_VENDOR=1 \
           -e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream-pr \
-          # sccache scratch inside the chowned checkout; the real cache is
-          # SCCACHE_BUCKET (S3), matching every other job on the pool.
-          -e SCCACHE_DIR=/build/.sccache \
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
           -e BASE_SHA -e HEAD_SHA \
           "$BUILDER_IMAGE" \
