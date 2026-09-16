@@ -62,6 +62,11 @@ version = "*"
 allow = ["AGPL-3.0-only"]
 
 [[licenses.exceptions]]
+name = "hyprstream-inference"
+version = "*"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
 name = "hyprstream-metrics"
 version = "*"
 allow = ["AGPL-3.0-only"]
