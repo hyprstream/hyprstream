@@ -23,6 +23,10 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
+      # The generated workspace-hack is COPY'd into the release builder stage,
+      # so a hack-only change (e.g. hakari config) can alter or break the
+      # image without touching crates/.
+      - 'workspace-hack/**'
       - 'rust-toolchain.toml'
   workflow_dispatch:
 

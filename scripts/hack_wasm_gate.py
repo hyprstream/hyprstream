@@ -71,8 +71,13 @@ def strip_own_gated_tables(text: str) -> str:
     return pattern.sub("\n", text)
 
 
-def gate_manifest(path: Path) -> bool:
-    """Normalize the workspace-hack edge into a not(wasm32) table."""
+def gate_manifest(path: Path, write: bool = True) -> bool:
+    """Normalize the workspace-hack edge into a not(wasm32) table.
+
+    With write=False (check mode) the computed content is compared but not
+    persisted: the function still returns True when the manifest would
+    change, so --check can fail without dirtying the tree.
+    """
     original = path.read_text()
 
     text, hack_line = strip_hack_lines(strip_own_gated_tables(original))
@@ -93,13 +98,19 @@ def gate_manifest(path: Path) -> bool:
         gated = text + sep + GATED + "\n" + hack_line + "\n"
 
     if gated != original:
-        path.write_text(gated)
+        if write:
+            path.write_text(gated)
         return True
     return False
 
 
-def ungate_manifest(path: Path) -> bool:
-    """Restore hakari's canonical ungated edge in [dependencies]."""
+def ungate_manifest(path: Path, write: bool = True) -> bool:
+    """Restore hakari's canonical ungated edge in [dependencies].
+
+    With write=False (check mode) the computed content is compared but not
+    persisted: the function still returns True when the manifest would
+    change, so --check can fail without dirtying the tree.
+    """
     original = path.read_text()
 
     text, _ = strip_hack_lines(strip_own_gated_tables(original))
@@ -127,7 +138,8 @@ def ungate_manifest(path: Path) -> bool:
             ungated = text + "\n" + UNGATED_TABLE + "\n" + line + "\n"
 
     if ungated != original:
-        path.write_text(ungated)
+        if write:
+            path.write_text(ungated)
         return True
     return False
 
@@ -141,7 +153,7 @@ def main() -> int:
     for manifest in sorted(ROOT.glob("crates/*/Cargo.toml")):
         if "workspace-hack" not in manifest.read_text():
             continue
-        if verb(manifest):
+        if verb(manifest, write=not check):
             changed.append(str(manifest.relative_to(ROOT)))
     if changed:
         for name in changed:

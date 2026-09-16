@@ -7531,7 +7531,6 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
- "workspace-hack",
 ]
 
 [[package]]
@@ -7545,7 +7544,6 @@ dependencies = [
  "serde",
  "serde_json",
  "syn 2.0.111",
- "workspace-hack",
 ]
 
 [[package]]
