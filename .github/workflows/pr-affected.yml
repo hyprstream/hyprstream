@@ -58,6 +58,11 @@ jobs:
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       run: |
+        # Tests run as the image-baked unprivileged ci user (same as the
+        # merge-gate build job): root ignores directory permissions, which
+        # breaks the auth identity-store read-only-credential tests. The
+        # PR cache namespace is chowned too so a root-created dir from an
+        # earlier run cannot block the ci user.
         podman run --rm \
           -v "$PWD":/build:Z -w /build \
           -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \
@@ -71,5 +76,9 @@ jobs:
           -e BASE_SHA -e HEAD_SHA \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
-            python3 -B .github/scripts/pr_affected.py
+            mkdir -p /mnt/hypr-ci-cache/target/hyprstream-pr
+            chown -R ci:ci /build /mnt/hypr-ci-cache/target/hyprstream-pr
+            runuser -u ci -- bash -euo pipefail -c '
+              python3 -B .github/scripts/pr_affected.py
+            '
           '
