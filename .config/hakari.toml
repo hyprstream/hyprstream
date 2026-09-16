@@ -1,0 +1,59 @@
+# This file contains settings for `cargo hakari`.
+# See https://docs.rs/cargo-hakari/latest/cargo_hakari/config for a full list of options.
+
+hakari-package = "workspace-hack"
+
+# Format version for hakari's output. Version 4 requires cargo-hakari 0.9.22 or above.
+dep-format-version = "4"
+
+# The root workspace already sets resolver = "2"; hakari unifies much better
+# under the v2+ feature resolver.
+resolver = "2"
+
+# Platforms this workspace is built on natively: aarch64-unknown-linux-gnu
+# (the self-hosted graviton CI pool and merge gate) and x86_64-unknown-linux-gnu
+# (workstation hosts). wasm32 is deliberately NOT listed: the hack is native
+# only — scripts/hack_wasm_gate.py gates every workspace-hack dependency edge
+# behind cfg(not(target_arch = "wasm32")) so wasm resolves never see it, and
+# its (native-shaped) dependency union would not be wasm-buildable anyway.
+platforms = [
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+]
+
+# Write out exact versions rather than a semver range. (Defaults to false.)
+# exact-versions = true
+
+# Excluded from hakari's graph traversal (their transitive dependency closures
+# stay out of the unified feature set unless another member reaches them):
+#
+# - hyprstream-metrics, hyprstream-flight: deliberately outside default-members
+#   (non-production DuckDB/Polars profile, compiled only in the metrics
+#   nightly). Unifying their closures would drag polars/duckdb into every
+#   workspace build, defeating the default-members trim.
+# - hyprstream-inference, hyprstream: the torch lane. hyprstream-inference is
+#   the one member that legitimately carries tch/libtorch (Wave B), and the
+#   main crate keeps a normal dependency on it for the
+#   download-libtorch/bnb/xet/otel feature pass-throughs. Traversing either
+#   would put tch/torch-sys into workspace-hack, forcing every leaf-crate
+#   build to compile the full torch stack — the exact opposite of the fast
+#   leaf-crate PR feedback this hack exists for. These four members also do
+#   NOT receive a workspace-hack dependency (hakari manage-deps skips excluded
+#   members); they build with their own feature sets, and the merge gate
+#   covers them as one heavyweight unit.
+#
+# NOTE on `cargo hakari verify`: it does NOT pass in this workspace and is not
+# used as a gate. Even with no excludes at all and the hack applied to every
+# member, verify reports ~39 dependencies with residual second feature sets —
+# resolver-v2 isolates build-dependency/proc-macro subgraphs, so transitive
+# deps (aead, aes, tokio, ...) can keep a second, unhackable feature set.
+# Upstream tracks verify-vs-generate disagreements in guppy-rs/guppy#69. CI
+# instead gates on regeneration drift: `cargo hakari generate` followed by
+# `git diff --exit-code -- workspace-hack` in the cargo-deny job.
+[traversal-excludes]
+workspace-members = [
+    "hyprstream",
+    "hyprstream-inference",
+    "hyprstream-flight",
+    "hyprstream-metrics",
+]

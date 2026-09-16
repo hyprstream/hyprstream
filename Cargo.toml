@@ -36,10 +36,10 @@ members = [
     "crates/hyprstream-ledger",
     "crates/hyprstream-pay",
     "crates/hyprstream-resource",
+    "workspace-hack",
 ]
 default-members = [
     "crates/hyprstream",
-    "crates/hyprstream-inference",
     "crates/hyprstream-inference",
     "crates/git2db",
     "crates/git-xet-filter",
@@ -73,6 +73,7 @@ default-members = [
     "crates/hyprstream-ledger",
     "crates/hyprstream-pay",
     "crates/hyprstream-resource",
+    "workspace-hack",
 ]
 # bitsandbytes-sys is standalone - only built when bnb feature is enabled.
 # The wasm guests (hyprstream-workers-python-guest = wasm32-unknown-unknown cdylib; the

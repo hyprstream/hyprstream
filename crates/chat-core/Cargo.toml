@@ -25,3 +25,7 @@ wasm = ["wasm-bindgen"]
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

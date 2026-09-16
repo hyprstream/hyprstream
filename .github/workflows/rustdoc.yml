@@ -46,7 +46,13 @@ jobs:
   rustdoc-util:
     name: rustdoc (hyprstream-util pilot)
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
-    timeout-minutes: 20
+    # The workspace-hack (cargo-hakari, Wave D) puts the union dependency
+    # closure behind every leaf crate, so even `cargo doc --no-deps` must
+    # build that closure's metadata — and the evidence step re-runs the doc
+    # a second time with -D warnings. Both passes at CARGO_BUILD_JOBS=2 on
+    # the shared runner exceed the former 20-minute budget (two consecutive
+    # attempts died at exactly 20m), hence 45.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
