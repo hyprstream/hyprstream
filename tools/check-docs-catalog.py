@@ -2113,7 +2113,13 @@ def self_test(repo: Path) -> None:
     # tree predates this PR's new docs files) supplies only ancestry. The
     # declared pair — not the boundary tree — carries the attestation, so the
     # landing validates even though the boundary omits attested paths.
-    landing_boundary = pr_base if has_pr_boundary else git(repo, "rev-parse", "HEAD~1")
+    pushed = git(repo, "rev-parse", "HEAD")
+    # A hosted push of main checks out origin/main itself, so the merge-base
+    # degenerates to HEAD and cannot model the pre-landing boundary. The
+    # previous main commit is then the boundary, exactly what the push event
+    # binds as its audited input for this repository's merge landings.
+    landing_boundary = pr_base if has_pr_boundary and pr_base != pushed \
+        else git(repo, "rev-parse", "HEAD~1")
     validate(repo, catalog, corpus, schemas, consumers, event="push", revision=landing_boundary)
     # Missing/forged source objects are never accepted on digest alone. Real
     # recovery and trusted inheritance are exercised in the isolated fixtures.

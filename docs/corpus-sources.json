@@ -1,9 +1,9 @@
 {
  "schema_version": 1,
  "provenance_version": 2,
- "source_commit": "6aa908dea93501d1b0b552c0680248c0766810b8",
- "source_tree": "55362dee6bdef12196bf18c2224e1e4de6ddcc64",
- "source_input_digest": "cd40523d01edfbf918b38e397d890a52366000a847f53d6285bd6583b2623c05",
+ "source_commit": "428188c1e88d9b0b97804023036c0dea6bfb7658",
+ "source_tree": "52a9a8afc069020e2fcdd1f9934d93e68c9e8b8d",
+ "source_input_digest": "fea4da21e9d611d3cb728e33266cb3496f90569a5e984c598f088190b8a454a0",
  "authority": "docs/system-ontology.md",
  "api_manifest": {
   "version": 1,
