@@ -75,10 +75,10 @@ jobs:
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
           -e BASE_SHA -e HEAD_SHA \
           "$BUILDER_IMAGE" \
+          # Keep this script apostrophe-free (single-quoted); the inner
+          # command is a file-backed invocation, so runuser needs no -c.
           bash -euo pipefail -c '
             mkdir -p /mnt/hypr-ci-cache/target/hyprstream-pr
             chown -R ci:ci /build /mnt/hypr-ci-cache/target/hyprstream-pr
-            runuser -u ci -- bash -euo pipefail -c '
-              python3 -B .github/scripts/pr_affected.py
-            '
+            runuser -u ci -- python3 -B .github/scripts/pr_affected.py
           '
