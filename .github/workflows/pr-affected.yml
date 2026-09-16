@@ -62,7 +62,9 @@ jobs:
         # merge-gate build job): root ignores directory permissions, which
         # breaks the auth identity-store read-only-credential tests. The
         # PR cache namespace is chowned too so a root-created dir from an
-        # earlier run cannot block the ci user.
+        # earlier run cannot block the ci user. The container script stays
+        # apostrophe-free and comment-free: comments cannot live inside
+        # continued shell commands, and the script itself is single-quoted.
         podman run --rm \
           -v "$PWD":/build:Z -w /build \
           -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \
@@ -75,8 +77,6 @@ jobs:
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
           -e BASE_SHA -e HEAD_SHA \
           "$BUILDER_IMAGE" \
-          # Keep this script apostrophe-free (single-quoted); the inner
-          # command is a file-backed invocation, so runuser needs no -c.
           bash -euo pipefail -c '
             mkdir -p /mnt/hypr-ci-cache/target/hyprstream-pr
             chown -R ci:ci /build /mnt/hypr-ci-cache/target/hyprstream-pr
