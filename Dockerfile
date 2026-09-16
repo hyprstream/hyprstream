@@ -381,6 +381,11 @@ WORKDIR /build
 COPY Cargo.toml ./
 COPY Cargo.lock ./
 COPY crates ./crates
+# workspace-hack sits at the workspace root and is referenced by member
+# manifests (cas-serve, ...), so the manifest graph cannot load without it
+# even for -p hyprstream. The .config/hakari.toml config is not needed here:
+# builds only consume the generated crate.
+COPY workspace-hack ./workspace-hack
 # Compile-time include_str! inputs for the pinned AT Protocol schema validator.
 COPY lexicons/upstream/atproto ./lexicons/upstream/atproto
 
