@@ -105,7 +105,15 @@ def main() -> int:
         args += ["-p", p]
 
     print(f"::group::cargo nextest run {' '.join(args)}")
-    rc = subprocess.run(["cargo", "nextest", "run", *args]).returncode
+    # Mirror the merge gate's invocation exactly (--cargo-profile ci-test,
+    # --profile ci: the ci profile carries the flake quarantine, slow-timeout
+    # caps, and test-group scheduling; ci-test compiles far lighter than dev).
+    # --no-fail-fast: one load-sensitive deadline test must not cancel the
+    # remaining thousands of results; the full signal is the point here.
+    rc = subprocess.run(
+        ["cargo", "nextest", "run", "--cargo-profile", "ci-test", "--profile", "ci",
+         "--no-fail-fast", *args]
+    ).returncode
     print("::endgroup::")
     if rc != 0:
         print(f"cargo nextest run failed with exit {rc}", file=sys.stderr)
