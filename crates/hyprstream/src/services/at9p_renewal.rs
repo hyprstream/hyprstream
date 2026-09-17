@@ -1,8 +1,11 @@
 //! In-daemon at9p service-identity renewal timer (design O-Ia).
 //!
 //! The registry daemon is the deployment's sole read-write record-store
-//! owner, so it hosts one periodic task that renews EVERY accepted at9p
-//! service identity itself (O-Ia), reusing the boot provisioner's mint core
+//! owner, so it hosts one periodic task that renews every DEPLOYMENT service
+//! identity itself (O-Ia) — the accepted states whose `#service` entries
+//! name daemon services (`hyprstream_service::get_factory`), not generic
+//! at9p records admitted through the public RPC — reusing the boot
+//! provisioner's mint core
 //! ([`crate::cli::deployment_bootstrap::provision_one`]) against the daemon's
 //! LIVE `PdsRecordStore`/`At9pStateIngest` handles. It must never call
 //! `provision_services` as-is — that re-opens the store (self-conflicting on
