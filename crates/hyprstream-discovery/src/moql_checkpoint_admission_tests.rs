@@ -287,12 +287,12 @@ async fn roundtrip() -> Result<()> {
         hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
     )?;
     let authority = production_moql_accepted_state_authority()?;
-    // #1652: the tenant resolver is DERIVED from the live authority (accepted
-    // state ∩ factory roster ⇒ local). There is no config tenant map: the
-    // "streams"/"reader" capsule service entries resolve through the
-    // admission-only test factory roster registered in admission_roster's
-    // tests (same test binary).
-    let resolver = crate::admission_roster::derived_tenant_resolver(Arc::clone(&authority));
+    // #1652: the tenant resolver is DERIVED from the live roster source
+    // (accepted state ∩ factory roster, uniquely held ⇒ local). There is no
+    // config tenant map: the "streams"/"reader" capsule service entries
+    // resolve through the admission-only test factory roster registered in
+    // admission_roster's tests (same test binary).
+    let resolver = crate::admission_roster::derived_tenant_resolver(production_deployment_roster()?);
     let server_identity = public_identity(&server_state, &server_signer)?;
     let server_identity_proof = MoqlServerIdentityProof {
         identity: server_identity.clone(),
@@ -510,6 +510,47 @@ async fn roundtrip() -> Result<()> {
     .await
     .context("successor DID must admit after churn without restart or config change")?;
     successor_client.shutdown().await?;
+
+    // Foreign name-squatting (review round 1): a self-certifying foreign
+    // capsule ingested into the same store claiming the SAME service entry
+    // ("#reader") must not be able to self-select into the derived tenant.
+    // Beside the genuine identity the name is ambiguous, so BOTH deny —
+    // fail-closed, not escalation. Removing the squatter restores admission.
+    let squatter_signer = SigningKey::from_bytes(&[0x79; 32]);
+    let squatter_state = admitted("reader", &squatter_signer)?;
+    write_test_state(&store, &squatter_state, &registry)?;
+    for (label, squatter_proof_state, signer) in [
+        ("genuine", &successor_state, &reinit_signer),
+        ("squatter", &squatter_state, &squatter_signer),
+    ] {
+        let deny_client = client(if label == "genuine" { 0x39 } else { 0x3A }).await?;
+        let deny_connection = deny_client.connect(direct(&server), ALPN_MOQ_LITE).await?;
+        let deny_proof = proof(squatter_proof_state, signer, server_identity.clone());
+        assert!(
+            prove_moql_admission(
+                &deny_connection,
+                &deny_proof,
+                *deny_client.endpoint_id().as_bytes(),
+                IO_TIMEOUT,
+            )
+            .await
+            .is_err(),
+            "{label} identity unexpectedly admitted while the service name is ambiguous"
+        );
+        deny_client.shutdown().await?;
+    }
+    remove_test_state(&store, &squatter_state)?;
+    let restored_client = client(0x3B).await?;
+    let restored_connection = restored_client.connect(direct(&server), ALPN_MOQ_LITE).await?;
+    prove_moql_admission(
+        &restored_connection,
+        &successor_proof,
+        *restored_client.endpoint_id().as_bytes(),
+        IO_TIMEOUT,
+    )
+    .await
+    .context("genuine identity must admit again once the squatter leaves the store")?;
+    restored_client.shutdown().await?;
 
     rotated.shutdown().await?;
     admitted_client.shutdown().await?;

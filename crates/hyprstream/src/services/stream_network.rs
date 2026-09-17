@@ -2,7 +2,7 @@
 //! authentication and MAC authorization performed by the producing RPC service.
 use crate::config::QuicConfig;
 use anyhow::{Context, Result};
-use hyprstream_discovery::admission_roster;
+use hyprstream_discovery::admission_roster::{self, DeploymentRosterSource};
 use hyprstream_rpc::transport::iroh_moq::{MoqAuthzConfig, SharedIngressAuthorizer};
 use hyprstream_rpc::transport::moql_admission::{
     AcceptedStateAuthority, MoqlAdmissionAuthenticator,
@@ -10,39 +10,63 @@ use hyprstream_rpc::transport::moql_admission::{
 use std::sync::Arc;
 
 /// Current accepted identity and derived tenant assignment, never carrier
-/// identity. The tenant resolver runs over the live accepted-state authority
-/// (#1652): accepted state ∩ factory roster ⇒ `local`, everything else
-/// unresolved/deny — no DID-valued config to go stale at identity churn.
+/// identity. Authentication runs on the per-DID accepted-state authority;
+/// the tenant resolver runs over the roster-wide derivation (#1652): a
+/// factory service entry held UNIQUELY across the store ⇒ `local`,
+/// everything else — foreign records, ambiguous names — unresolved/deny. No
+/// DID-valued config to go stale at identity churn.
 pub fn production_stream_admission() -> Result<Arc<MoqlAdmissionAuthenticator>> {
-    Ok(stream_admission(
+    Ok(stream_admission_over(
         hyprstream_discovery::production_moql_accepted_state_authority()?,
+        hyprstream_discovery::production_deployment_roster()?,
     ))
 }
 
-pub(crate) fn stream_admission(
+pub(crate) fn stream_admission_over(
     authority: Arc<dyn AcceptedStateAuthority>,
+    roster: Arc<dyn DeploymentRosterSource>,
 ) -> Arc<MoqlAdmissionAuthenticator> {
     Arc::new(MoqlAdmissionAuthenticator::new(
-        Arc::clone(&authority),
-        admission_roster::derived_tenant_resolver(authority),
+        authority,
+        admission_roster::derived_tenant_resolver(roster),
     ))
+}
+
+/// Test/fixture entry: both halves over one roster (the roster carries every
+/// projected state, so the per-DID authority is a lookup into it).
+#[cfg(test)]
+pub(crate) fn stream_admission(
+    roster: Arc<dyn DeploymentRosterSource>,
+) -> Arc<MoqlAdmissionAuthenticator> {
+    let authority: Arc<dyn AcceptedStateAuthority> = {
+        let roster = Arc::clone(&roster);
+        Arc::new(move |did: &str| {
+            roster
+                .roster()
+                .into_iter()
+                .find(|(d, _)| d == did)
+                .map(|(_, state)| state)
+        })
+    };
+    stream_admission_over(authority, roster)
 }
 
 /// Tenant admission never grants publishing. `quic.stream_publishers` is a
 /// deliberately-empty DID set (no production writer; empty = read-only, and
 /// an empty set cannot go stale — #1652 leaves it untouched). The tenant
-/// itself is re-derived from live accepted state, so removing a peer from the
-/// deployment roster is effective on the next recheck without a restart.
+/// itself is re-derived from the live roster on every check, so removing a
+/// peer from the deployment roster — or a squatter making its name ambiguous
+/// — is effective on the next recheck without a restart.
 pub fn stream_ingress_authorizer(
     config: &QuicConfig,
-    authority: Arc<dyn AcceptedStateAuthority>,
+    roster: Arc<dyn DeploymentRosterSource>,
 ) -> SharedIngressAuthorizer {
     let publishers = config.stream_publishers.clone();
     Arc::new(
         move |peer: &hyprstream_rpc::moq_authz::PeerIdentity, tenant: &str| {
             peer.subject.as_deref().is_some_and(|did| {
                 publishers.contains(did)
-                    && admission_roster::authority_tenant(&authority, did).as_deref()
+                    && admission_roster::roster_tenant(&roster.roster(), did).as_deref()
                         == Some(tenant)
             })
         },
@@ -51,7 +75,7 @@ pub fn stream_ingress_authorizer(
 
 fn stream_handler(
     config: &QuicConfig,
-    authority: Arc<dyn AcceptedStateAuthority>,
+    roster: Arc<dyn DeploymentRosterSource>,
     origin: &hyprstream_rpc::moq_stream::MoqStreamOrigin,
     admission: Arc<MoqlAdmissionAuthenticator>,
 ) -> hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler {
@@ -63,7 +87,7 @@ fn stream_handler(
     .with_authz(
         MoqAuthzConfig::default()
             .with_admission(admission)
-            .with_ingress_authorizer(stream_ingress_authorizer(config, authority)),
+            .with_ingress_authorizer(stream_ingress_authorizer(config, roster)),
     )
 }
 
@@ -86,14 +110,17 @@ impl StreamsNetworkService {
         // process's own DID to the Streams service. Refusal fails the spawn
         // (fail-closed) — the same refuse-to-start shape as the former empty
         // tenant map, now bound to live store state instead of config.
-        let authority = hyprstream_discovery::production_moql_accepted_state_authority()?;
-        admission_roster::require_service_self_binding(&authority, "streams", &proof)?;
+        let roster = hyprstream_discovery::production_deployment_roster()?;
+        admission_roster::require_service_self_binding(&roster, "streams", &proof)?;
         let key = hyprstream_rpc::node_identity::derive_purpose_key(
             &ctx.service_signing_key("streams"),
             "hyprstream-iroh-transport-v1",
         );
         let node_id = key.verifying_key().to_bytes();
-        let admission = stream_admission(Arc::clone(&authority));
+        let admission = stream_admission_over(
+            hyprstream_discovery::production_moql_accepted_state_authority()?,
+            Arc::clone(&roster),
+        );
         admission.install_server_identity(
             hyprstream_rpc::transport::moql_admission::MoqlServerIdentityProof::from_local_admission_proof(&proof)?, node_id)?;
         let origin = hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
@@ -102,7 +129,7 @@ impl StreamsNetworkService {
         Ok(Self {
             secret: key.to_bytes(),
             node_id,
-            handler: stream_handler(&config.quic, authority, &origin, admission),
+            handler: stream_handler(&config.quic, roster, &origin, admission),
             announce: ctx.native_iroh_announcement_callback("streams")?,
         })
     }
@@ -220,11 +247,11 @@ mod tests {
         )
     }
 
-    fn live_authority(
+    fn live_roster(
         states: &Arc<parking_lot::RwLock<std::collections::BTreeMap<String, AcceptedIdentityState>>>,
-    ) -> Arc<dyn hyprstream_rpc::transport::moql_admission::AcceptedStateAuthority> {
+    ) -> Arc<dyn hyprstream_discovery::admission_roster::DeploymentRosterSource> {
         let states = Arc::clone(states);
-        Arc::new(move |did: &str| states.read().get(did).cloned())
+        Arc::new(move || states.read().clone().into_iter().collect::<Vec<_>>())
     }
 
     fn direct(server: &IrohSubstrate) -> iroh::EndpointAddr {
@@ -335,7 +362,7 @@ mod tests {
         let mut config = QuicConfig::default();
         config.stream_publishers.insert(publisher.did.clone());
         config.event_publishers.insert("policy".to_owned());
-        let admission = stream_admission(live_authority(&states));
+        let admission = stream_admission(live_roster(&states));
         let secret = [65; 32];
         admission.install_server_identity(
             MoqlServerIdentityProof::from_local_admission_proof(&server_proof)?,
@@ -344,7 +371,7 @@ mod tests {
         let origin = hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone().build();
         let server = IrohSubstrate::new(
             secret,
-            stream_handler(&config, live_authority(&states), &origin, admission),
+            stream_handler(&config, live_roster(&states), &origin, admission),
             RefuseHandler::new("streams no rpc"),
         )
         .await?;
@@ -537,7 +564,7 @@ mod tests {
         // The config object is built ONCE, before the churn, and never
         // touched again — there is no tenant map to touch.
         let config = QuicConfig::default();
-        let admission = stream_admission(live_authority(&states));
+        let admission = stream_admission(live_roster(&states));
         let secret = [75; 32];
         admission.install_server_identity(
             MoqlServerIdentityProof::from_local_admission_proof(&server_proof)?,
@@ -546,7 +573,7 @@ mod tests {
         let origin = hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone().build();
         let server = IrohSubstrate::new(
             secret,
-            stream_handler(&config, live_authority(&states), &origin, admission),
+            stream_handler(&config, live_roster(&states), &origin, admission),
             RefuseHandler::new("streams no rpc"),
         )
         .await?;
@@ -624,7 +651,7 @@ mod tests {
                 (model_proof.did.clone(), model_state.clone()),
             ],
         )));
-        let admission = stream_admission(live_authority(&states));
+        let admission = stream_admission(live_roster(&states));
         admission.install_server_identity(
             MoqlServerIdentityProof::from_local_admission_proof(&server_proof)?,
             [83; 32],

@@ -8,33 +8,57 @@
 //! pinned to stale DIDs until the boot projector re-wrote the file AND every
 //! container restarted. The tenant is a pure roster projection — metal writes
 //! `did = "local"` uniformly for all eight services — so it is now DERIVED:
-//! DID → accepted state → capsule `#<name>` service entries ∩ the registered
-//! factory roster ⇒ tenant [`LOCAL_TENANT`]; everything else ⇒ unresolved,
-//! deny. The membership filter is the same rule as the offline provisioner's
-//! `validate_service_roster` and the renewal set, so foreign at9p records
-//! admitted through the public `ingestAt9pCandidate` RPC (arbitrary `#id`
-//! entries that are not deployment identities) never derive a tenant.
+//! DID → accepted state → capsule `#<name>` service entry ∩ the registered
+//! factory roster, held UNIQUELY across the store ⇒ tenant [`LOCAL_TENANT`];
+//! everything else ⇒ unresolved, deny.
 //!
-//! Resolution runs through the SAME per-call authority read the admission
-//! exchange already performs, and the live-session recheck re-runs this
-//! resolver, so a roster change is effective without restart — including
-//! closing previously admitted sessions when a subject stops resolving.
+//! # Why unique-holder, not name-match alone
+//!
+//! The store is not a pure deployment roster: the public `ingestAt9pCandidate`
+//! RPC admits foreign, self-certifying capsules whose `#id` entries are
+//! arbitrary strings, and provisioned and ingested states share one write
+//! path — provenance is not distinguishable in the store. A foreign capsule
+//! that NAMES a factory service (e.g. `#event`) therefore cannot be told
+//! apart from a deployment identity by its content. The derivation closes
+//! that self-selection the only way store data allows:
+//!
+//! - a name admits a tenant only while EXACTLY ONE accepted state in the
+//!   whole store derives it — beside the genuine identity a squatter makes
+//!   the name ambiguous, and ambiguity denies (fail-closed, loud: the
+//!   collision is warned so an operator sees the injected record). This is
+//!   the offline roster validator's cross-state uniqueness `ensure!`, and
+//!   `project_bootstrap_endpoint`'s ambiguity rule, applied per lookup;
+//! - the deriving state must carry the deployment invariants the offline
+//!   provisioner guarantees and foreign genesis-only records lack: successor
+//!   epoch (`epoch > 0`) and a bounded expiry.
+//!
+//! Residual (deliberate, flagged in #1652): if a deployment name has NO
+//! genuine accepted state (decommissioned service) and an attacker ingests a
+//! capsule claiming it, that name derives for the attacker. Operating with
+//! names in `quic.event_publishers` that have no live deployment state is a
+//! deployment inconsistency this PR refuses at Event spawn
+//! ([`require_publisher_roster`]) and the tenant grant remains bounded to the
+//! fixed local namespace. Fully distinguishing provenance needs a
+//! provisioner-signed roster the admission path can verify — a maintainer
+//! design decision recorded in #1652, not something this change invents.
+//!
+//! Resolution enumerates the store per lookup (roster-sized: the deployment
+//! roster plus foreign records) through the same verification as the per-DID
+//! admission read, and the live-session recheck re-runs it, so roster changes
+//! — renewal, churn, revocation, or a new squatter — are all effective
+//! without restart.
 //!
 //! This mirrors the hosted-account tenant index
 //! (`HostedAccountStore::resolve_tenant_for_hosted_did`) and the
 //! `MoqConnectAuthz` resolver-closure shape: the tenant never comes from the
 //! peer, its proof, or a token — only server-side resolution over verified
-//! accepted state. With ≤8 roster entries the per-call read the moql authority
-//! already does makes an in-memory index unnecessary. Failure inheritance is
-//! identical to authentication: a store read failure is indistinguishable
-//! from an unknown identity (`None`), and `None` denies.
+//! accepted state. Failure inheritance is identical to authentication: a
+//! store read failure yields an empty roster, and an empty roster denies.
 
 use anyhow::Result;
 use hyprstream_rpc::moq_authz::PeerIdentity;
 use hyprstream_rpc::transport::iroh_moq::PeerTenantResolver;
-use hyprstream_rpc::transport::moql_admission::{
-    AcceptedIdentityState, AcceptedStateAuthority, MoqlAdmissionProof,
-};
+use hyprstream_rpc::transport::moql_admission::{AcceptedIdentityState, MoqlAdmissionProof};
 use std::sync::Arc;
 
 /// The single tenant of the fixed native Event/Streams namespace. The Event
@@ -42,15 +66,42 @@ use std::sync::Arc;
 /// service identity maps to it and no other tenant is derivable.
 pub const LOCAL_TENANT: &str = "local";
 
+/// One projected accepted state, keyed by its DID: the roster universe the
+/// derivation enumerates (provisioned deployment identities and foreign
+/// ingested records alike).
+pub type RosterEntry = (String, AcceptedIdentityState);
+
+/// The deployment-roster side of the accepted-state authority: enumerates
+/// every verified accepted state so grant derivation can enforce the
+/// cross-store uniqueness a per-DID read cannot see. Implemented by the
+/// process's pinned checkpoint source; a blanket `Fn` impl covers fixtures.
+pub trait DeploymentRosterSource: Send + Sync {
+    fn roster(&self) -> Vec<RosterEntry>;
+}
+
+impl<F> DeploymentRosterSource for F
+where
+    F: Fn() -> Vec<RosterEntry> + Send + Sync,
+{
+    fn roster(&self) -> Vec<RosterEntry> {
+        self()
+    }
+}
+
 /// The deployment service name an accepted state proves, if any.
 ///
 /// Capsule `#<name>` service entries ∩ the registered factory roster
-/// (`hyprstream_service::get_factory`), which must match exactly ONE service.
-/// Zero matches — a foreign record's arbitrary `#id` entries, or a capsule
-/// with no service entries — and ambiguous matches both resolve to `None`:
-/// deny, never a best-effort pick (the offline roster validator's uniqueness
-/// `ensure!`, applied per admission lookup).
+/// (`hyprstream_service::get_factory`), which must match exactly ONE service,
+/// and the state must carry the deployment invariants (successor epoch > 0
+/// and a bounded expiry — the offline provisioner always stacks a bounded
+/// successor, so genesis-only/unbounded states are not deployment-shaped).
+/// Zero matches — foreign `#id` entries, no service entries — ambiguous
+/// matches, and invariant-violating states all resolve to `None`: deny,
+/// never a best-effort pick.
 pub fn derived_service_name(state: &AcceptedIdentityState) -> Option<&str> {
+    if state.epoch == 0 || state.expires_at_unix_ms.is_none() {
+        return None;
+    }
     let mut matched = None;
     for id in &state.service_ids {
         let Some(name) = id.strip_prefix('#') else {
@@ -66,57 +117,66 @@ pub fn derived_service_name(state: &AcceptedIdentityState) -> Option<&str> {
     matched
 }
 
-/// DID → deployment service name through the live authority. A store read
-/// failure maps to `None` (the production projection's fail-closed
-/// inheritance): no state, no name, no grant.
-pub fn authority_service_name(
-    authority: &Arc<dyn AcceptedStateAuthority>,
-    did: &str,
-) -> Option<String> {
-    authority
-        .accepted_state(did)
-        .as_ref()
-        .and_then(derived_service_name)
-        .map(str::to_owned)
+/// Resolve `did` to its deployment service name against the live roster,
+/// enforcing unique holdership: the DID's state must derive a name, and no
+/// OTHER state may derive the same name. A collision is warned loudly —
+/// an ingested record squatting a deployment name is an operator-visible
+/// event, not a silent deny.
+pub fn roster_service_name(roster: &[RosterEntry], did: &str) -> Option<String> {
+    let name = derived_service_name(&roster.iter().find(|(d, _)| d == did)?.1)?;
+    let holders = roster
+        .iter()
+        .filter(|(_, state)| derived_service_name(state) == Some(name))
+        .count();
+    if holders != 1 {
+        tracing::warn!(
+            service = name,
+            holders,
+            "accepted-state store holds multiple identities deriving service; denying until unique"
+        );
+        return None;
+    }
+    Some(name.to_owned())
 }
 
-/// DID → derived tenant through the live authority: [`LOCAL_TENANT`] iff the
-/// subject is a current deployment service identity, `None` otherwise.
-pub fn authority_tenant(authority: &Arc<dyn AcceptedStateAuthority>, did: &str) -> Option<String> {
-    authority_service_name(authority, did).map(|_| LOCAL_TENANT.to_owned())
+/// DID → derived tenant against the live roster: [`LOCAL_TENANT`] iff the
+/// subject uniquely proves a deployment service identity.
+pub fn roster_tenant(roster: &[RosterEntry], did: &str) -> Option<String> {
+    roster_service_name(roster, did).map(|_| LOCAL_TENANT.to_owned())
 }
 
 /// The admission tenant resolver: tenant [`LOCAL_TENANT`] iff the verified
-/// subject is a current deployment service identity.
+/// subject is a current, uniquely-held deployment service identity.
 ///
 /// The peer is only ever the ALREADY-VERIFIED admission subject; the tenant is
 /// resolved server-side from live accepted state, never read from the peer or
-/// its proof. Re-ridden by the live-session recheck, so roster removal or
-/// service-name reassignment closes previously admitted sessions.
-pub fn derived_tenant_resolver(authority: Arc<dyn AcceptedStateAuthority>) -> PeerTenantResolver {
+/// its proof. Re-ridden by the live-session recheck, so roster removal,
+/// service-name reassignment, or a new ambiguous squatter closes previously
+/// admitted sessions.
+pub fn derived_tenant_resolver(roster: Arc<dyn DeploymentRosterSource>) -> PeerTenantResolver {
     Arc::new(move |peer: &PeerIdentity| {
         peer.subject
             .as_deref()
-            .and_then(|did| authority_tenant(&authority, did))
+            .and_then(|did| roster_tenant(&roster.roster(), did))
     })
 }
 
-/// Spawn-time self-binding (#1652): the authority must resolve the process's
-/// OWN admission proof to exactly this service. Refusal propagates and the
-/// service never spawns — the fail-closed shape of the former empty-tenant-map
-/// refusal, now "the checkpoint store must bind my DID to my name". The store
-/// is guaranteed present at spawn (the accepted-state source refuses to open
-/// without it), so failure here is a provisioning mismatch, not a degraded
-/// mode to run in.
+/// Spawn-time self-binding (#1652): the live roster must resolve the
+/// process's OWN admission proof to exactly this service. Refusal propagates
+/// and the service never spawns — the fail-closed shape of the former
+/// empty-tenant-map refusal, now "the checkpoint store must bind my DID to my
+/// name". The store is guaranteed present at spawn (the accepted-state source
+/// refuses to open without it), so failure here is a provisioning mismatch,
+/// not a degraded mode to run in.
 pub fn require_service_self_binding(
-    authority: &Arc<dyn AcceptedStateAuthority>,
+    roster: &Arc<dyn DeploymentRosterSource>,
     service_name: &str,
     proof: &MoqlAdmissionProof,
 ) -> Result<()> {
-    let resolved = authority_service_name(authority, &proof.did);
+    let resolved = roster_service_name(&roster.roster(), &proof.did);
     anyhow::ensure!(
         resolved.as_deref() == Some(service_name),
-        "native {} identity {} does not resolve to accepted deployment service '{}' in the checkpoint store",
+        "native {} identity {} does not uniquely resolve to accepted deployment service '{}' in the checkpoint store",
         service_name,
         proof.did,
         service_name
@@ -125,19 +185,42 @@ pub fn require_service_self_binding(
 }
 
 /// Client-side membership self-check: the process's own proof must resolve to
-/// SOME deployment service. CLI/embedded processes bootstrap with one of the
-/// deployment identities (whichever the process was provisioned as), so —
-/// like the former `require_event_tenant`, which accepted any local-bound DID
-/// — the check is roster membership, not equality with a specific service.
+/// SOME uniquely-held deployment service. CLI/embedded processes bootstrap
+/// with one of the deployment identities (whichever the process was
+/// provisioned as), so — like the former `require_event_tenant`, which
+/// accepted any local-bound DID — the check is roster membership, not
+/// equality with a specific service.
 pub fn require_admitted_service_binding(
-    authority: &Arc<dyn AcceptedStateAuthority>,
+    roster: &Arc<dyn DeploymentRosterSource>,
     proof: &MoqlAdmissionProof,
 ) -> Result<()> {
     anyhow::ensure!(
-        authority_service_name(authority, &proof.did).is_some(),
-        "Event identity {} is not an accepted deployment service identity in the checkpoint store",
+        roster_service_name(&roster.roster(), &proof.did).is_some(),
+        "Event identity {} is not a uniquely-held accepted deployment service identity in the checkpoint store",
         proof.did
     );
+    Ok(())
+}
+
+/// Spawn-time Event publisher roster check (#1652): every name in
+/// `quic.event_publishers` must be carried by a live, uniquely-held
+/// deployment state. A configured name with no genuine state is exactly the
+/// hole a foreign capsule claiming that name would fill (the residual in the
+/// module doc), so the Event service refuses to spawn instead of running
+/// with a squat-able grant.
+pub fn require_publisher_roster(
+    roster: &Arc<dyn DeploymentRosterSource>,
+    publishers: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let live = roster.roster();
+    for name in publishers {
+        anyhow::ensure!(
+            live.iter()
+                .any(|(_, state)| derived_service_name(state) == Some(name.as_str())),
+            "quic.event_publishers lists '{}' but no live accepted state uniquely carries that service; refusing to run with a squat-able grant",
+            name
+        );
+    }
     Ok(())
 }
 
@@ -186,8 +269,8 @@ mod tests {
                 ed25519: [2; 32],
                 ml_dsa_65: vec![3; 1952],
             }],
-            service_ids: service_ids.iter().map(ToString::to_string).collect(),
-            expires_at_unix_ms: None,
+            service_ids: service_ids.iter().map(|id| (*id).to_owned()).collect(),
+            expires_at_unix_ms: Some(i64::MAX),
         }
     }
 
@@ -197,7 +280,8 @@ mod tests {
 
     #[test]
     fn factory_service_entries_resolve_and_foreign_entries_do_not() {
-        // A deployment-shaped capsule: exactly one factory service entry.
+        // A deployment-shaped capsule: exactly one factory service entry,
+        // successor epoch, bounded expiry.
         assert_eq!(derived_service_name(&state(&["#event"])), Some("event"));
         assert_eq!(derived_service_name(&state(&["#streams"])), Some("streams"));
         // Foreign public-RPC records carry arbitrary #id entries.
@@ -212,6 +296,14 @@ mod tests {
         assert_eq!(derived_service_name(&state(&["#event", "#streams"])), None);
         // Non-# entries are skipped, not matched.
         assert_eq!(derived_service_name(&state(&["event"])), None);
+        // Deployment invariants: genesis (epoch 0) and unbounded states never
+        // derive — foreign genesis-only ingests are not deployment-shaped.
+        let mut genesis = state(&["#event"]);
+        genesis.epoch = 0;
+        assert_eq!(derived_service_name(&genesis), None);
+        let mut unbounded = state(&["#event"]);
+        unbounded.expires_at_unix_ms = None;
+        assert_eq!(derived_service_name(&unbounded), None);
     }
 
     #[test]
@@ -223,11 +315,11 @@ mod tests {
                 (did.to_owned(), state(&["#event"])),
                 (foreign.to_owned(), state(&["#ns"])),
             ])));
-        let authority: Arc<dyn AcceptedStateAuthority> = {
+        let roster: Arc<dyn DeploymentRosterSource> = {
             let states = Arc::clone(&states);
-            Arc::new(move |lookup: &str| states.read().get(lookup).cloned())
+            Arc::new(move || states.read().clone().into_iter().collect::<Vec<_>>())
         };
-        let resolver = derived_tenant_resolver(Arc::clone(&authority));
+        let resolver = derived_tenant_resolver(Arc::clone(&roster));
         assert_eq!(resolver(&peer(did)).as_deref(), Some(LOCAL_TENANT));
         // Foreign record present in the store but not a factory service: deny.
         assert_eq!(resolver(&peer(foreign)), None);
@@ -250,21 +342,38 @@ mod tests {
     }
 
     #[test]
+    fn name_squatting_is_denied_not_escalated() {
+        // A foreign record claiming a factory service name BESIDE the genuine
+        // identity: the name becomes ambiguous and BOTH derive nothing —
+        // fail-closed. This is the property a name-only filter lacks.
+        let genuine = "did:at9p:genuine-model";
+        let squatter = "did:at9p:foreign-model";
+        let roster: Vec<RosterEntry> = vec![
+            (genuine.to_owned(), state(&["#model"])),
+            (squatter.to_owned(), state(&["#model"])),
+        ];
+        assert_eq!(roster_tenant(&roster, genuine), None);
+        assert_eq!(roster_tenant(&roster, squatter), None);
+        // With the squatter gone the genuine identity derives again.
+        let clean: Vec<RosterEntry> = vec![(genuine.to_owned(), state(&["#model"]))];
+        assert_eq!(roster_tenant(&clean, genuine).as_deref(), Some(LOCAL_TENANT));
+    }
+
+    #[test]
     fn store_read_failure_denies_like_unknown_identity() {
-        // The production projection maps source errors to None; a resolver
-        // over such an authority inherits deny-all, exactly like UnknownIdentity.
-        let authority: Arc<dyn AcceptedStateAuthority> =
-            Arc::new(|_did: &str| -> Option<AcceptedIdentityState> { None });
-        let resolver = derived_tenant_resolver(Arc::clone(&authority));
+        // The production roster maps source errors to an empty roster; a
+        // resolver over such a source inherits deny-all, exactly like
+        // UnknownIdentity.
+        let roster: Arc<dyn DeploymentRosterSource> = Arc::new(Vec::new);
+        let resolver = derived_tenant_resolver(roster);
         assert_eq!(resolver(&peer("did:at9p:anything")), None);
     }
 
     #[test]
     fn self_binding_requires_the_services_own_name() {
         let did = "did:at9p:streams";
-        let authority: Arc<dyn AcceptedStateAuthority> = Arc::new(move |lookup: &str| {
-            (lookup == did).then(|| state(&["#streams"]))
-        });
+        let roster: Arc<dyn DeploymentRosterSource> =
+            Arc::new(move || vec![(did.to_owned(), state(&["#streams"]))]);
         let proof = MoqlAdmissionProof {
             did: did.to_owned(),
             ed25519: ed25519_dalek::SigningKey::from_bytes(&[4; 32]),
@@ -278,16 +387,30 @@ mod tests {
                 ml_dsa65: vec![3; 1952],
             },
         };
-        require_service_self_binding(&authority, "streams", &proof)
+        require_service_self_binding(&roster, "streams", &proof)
             .expect("own service name must bind");
-        let mismatch = require_service_self_binding(&authority, "event", &proof)
+        let mismatch = require_service_self_binding(&roster, "event", &proof)
             .expect_err("a different service name must refuse");
         assert!(
-            mismatch.to_string().contains("does not resolve"),
+            mismatch.to_string().contains("does not uniquely resolve"),
             "unexpected error: {mismatch}"
         );
         // Client-side membership form accepts the deployment identity itself.
-        require_admitted_service_binding(&authority, &proof)
+        require_admitted_service_binding(&roster, &proof)
             .expect("membership self-check must accept a deployment service DID");
+    }
+
+    #[test]
+    fn publisher_roster_refuses_names_without_a_live_identity() {
+        let did = "did:at9p:event";
+        let roster: Arc<dyn DeploymentRosterSource> =
+            Arc::new(move || vec![(did.to_owned(), state(&["#event"]))]);
+        require_publisher_roster(
+            &roster,
+            &["event".to_owned(), "model".to_owned()].into_iter().collect(),
+        )
+        .expect_err("a configured publisher with no live state must refuse spawn");
+        require_publisher_roster(&roster, &["event".to_owned()].into_iter().collect())
+            .expect("a carried publisher name must pass");
     }
 }

@@ -3595,12 +3595,12 @@ fn main() -> Result<()> {
                                         // The ingress authorizer only runs alongside
                                         // admission (it decides on already-admitted peers),
                                         // so it is constructed under the same guard and
-                                        // resolves tenants from the same live accepted-state
-                                        // authority (#1652).
+                                        // derives tenants from the same live roster
+                                        // source (#1652).
                                         moq_ingress_authorizer: if moq_admission_proof.is_some() {
                                             Some(hyprstream_core::services::stream_network::stream_ingress_authorizer(
                                                 &qc,
-                                                hyprstream_discovery::production_moql_accepted_state_authority()?,
+                                                hyprstream_discovery::production_deployment_roster()?,
                                             ))
                                         } else { None },
                                         moq_admission_proof,

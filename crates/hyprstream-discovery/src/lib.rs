@@ -145,6 +145,7 @@ pub use service::{
     authenticate_local_deployment_registry,
     native_network_required, installed_bootstrap_discovery_client,
     production_moq_event_target, production_moql_accepted_state_authority,
+    production_deployment_roster,
     bootstrap_deployment_process, deployment_registry_verifier, resolve_and_authenticate_did_anchors,
     AuthorizationProvider, DiscoveryService, DiscoverySelfAnnouncer, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
     production_browser_currentness_verifier, production_browser_provisioning,

@@ -1,11 +1,11 @@
 //! Native Event transport bootstrap. Identity admission and MAC are independent.
 use anyhow::{Context, Result};
-use hyprstream_discovery::admission_roster;
+use hyprstream_discovery::admission_roster::{
+    self, DeploymentRosterSource,
+};
 use hyprstream_rpc::moq_authz::PeerIdentity;
 use hyprstream_rpc::transport::iroh_moq::SharedIngressAuthorizer;
-use hyprstream_rpc::transport::moql_admission::{
-    AcceptedStateAuthority, MoqlAdmissionProof,
-};
+use hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -14,8 +14,8 @@ use std::sync::Arc;
 /// — resolved from the live checkpoint store (#1652), never from a DID-valued
 /// config binding that could go stale at identity churn.
 pub fn require_event_tenant(proof: &MoqlAdmissionProof) -> Result<()> {
-    let authority = hyprstream_discovery::production_moql_accepted_state_authority()?;
-    admission_roster::require_admitted_service_binding(&authority, proof)
+    let roster = hyprstream_discovery::production_deployment_roster()?;
+    admission_roster::require_admitted_service_binding(&roster, proof)
 }
 
 /// Initialize both CLI and service Event clients according to the deployment
@@ -54,13 +54,13 @@ pub fn ensure_event_origin_for_profile() -> Result<()> {
 }
 
 /// The Event ingress grant: the already-admitted peer's verified DID resolves
-/// (through the same live accepted-state authority admission used) to a
+/// (through the same live accepted-state roster admission used) to a
 /// deployment service NAME, which must be a member of the operator's
 /// name-keyed `quic.event_publishers` set (#1652). Names survive identity
 /// churn, so the grant never goes stale when a service's DID changes; an
 /// empty set denies every peer — read-only, never all-publishers.
 pub fn event_ingress_authorizer(
-    authority: Arc<dyn AcceptedStateAuthority>,
+    roster: Arc<dyn DeploymentRosterSource>,
     publishers: Arc<BTreeSet<String>>,
 ) -> SharedIngressAuthorizer {
     Arc::new(move |peer: &PeerIdentity, tenant: &str| {
@@ -68,7 +68,7 @@ pub fn event_ingress_authorizer(
             && peer
                 .subject
                 .as_deref()
-                .and_then(|did| admission_roster::authority_service_name(&authority, did))
+                .and_then(|did| admission_roster::roster_service_name(&roster.roster(), did))
                 .is_some_and(|name| publishers.contains(name.as_str()))
     })
 }
@@ -91,14 +91,18 @@ pub fn event_handler(
         .moql_admission_proof("event")?
         .context("native Event server proof missing")?;
     // Self-binding: the checkpoint store must resolve THIS process's own DID
-    // to THIS service. Refusal fails the spawn (fail-closed), replacing the
-    // former empty-tenant-map refusal.
-    let authority = hyprstream_discovery::production_moql_accepted_state_authority()?;
-    admission_roster::require_service_self_binding(&authority, "event", &proof)?;
+    // to THIS service, and every configured publisher name must be carried by
+    // a live deployment identity. Refusal fails the spawn (fail-closed),
+    // replacing the former empty-tenant-map refusal.
+    let roster = hyprstream_discovery::production_deployment_roster()?;
+    admission_roster::require_service_self_binding(&roster, "event", &proof)?;
+    admission_roster::require_publisher_roster(&roster, &config.quic.event_publishers)?;
     hyprstream_rpc::events::install_network_event_identity(&proof)?;
+    // Authentication stays on the per-DID authority; only grant resolution
+    // runs over the roster (uniqueness needs the whole store).
     let admission = MoqlAdmissionAuthenticator::new(
-        Arc::clone(&authority),
-        admission_roster::derived_tenant_resolver(Arc::clone(&authority)),
+        hyprstream_discovery::production_moql_accepted_state_authority()?,
+        admission_roster::derived_tenant_resolver(Arc::clone(&roster)),
     );
     admission.install_server_identity(
         MoqlServerIdentityProof::from_local_admission_proof(&proof)?,
@@ -115,7 +119,7 @@ pub fn event_handler(
         MoqAuthzConfig::default()
             .with_admission(Arc::new(admission))
             .with_ingress_authorizer(event_ingress_authorizer(
-                authority,
+                roster,
                 Arc::new(config.quic.event_publishers),
             )),
     ))
@@ -368,7 +372,9 @@ mod tests {
                 ml_dsa_65: vec![3; 1952],
             }],
             service_ids: service_ids.iter().map(ToString::to_string).collect(),
-            expires_at_unix_ms: None,
+            // Deployment invariants: successor epoch + bounded expiry — the
+            // derivation rejects genesis-only/unbounded states.
+            expires_at_unix_ms: Some(hyprstream_rpc::envelope::current_timestamp() + 3_600_000),
         }
     }
 
@@ -381,25 +387,28 @@ mod tests {
     /// the name-keyed grant keeps admitting that service in the SAME process,
     /// no restart, no config change. Under the former DID-keyed set the new
     /// DID was silently unlisted (read-only) until config was re-projected
-    /// and every container restarted.
+    /// and every container restarted. A foreign record squatting the service
+    /// name beside the genuine identity denies BOTH (fail-closed), instead of
+    /// self-selecting into the grant.
     #[test]
     fn event_ingress_follows_service_names_across_did_churn() {
-        use hyprstream_rpc::transport::moql_admission::AcceptedStateAuthority;
+        use hyprstream_discovery::admission_roster::DeploymentRosterSource;
         use std::collections::BTreeMap;
         let original = "did:at9p:original";
         let successor = "did:at9p:successor";
         let foreign = "did:at9p:foreign-record";
+        let squatter = "did:at9p:squatter";
         let states = Arc::new(parking_lot::RwLock::new(BTreeMap::from([
             (original.to_owned(), state_with_services(&["#event"])),
             (foreign.to_owned(), state_with_services(&["#ns"])),
         ])));
-        let authority: Arc<dyn AcceptedStateAuthority> = {
+        let roster: Arc<dyn DeploymentRosterSource> = {
             let states = Arc::clone(&states);
-            Arc::new(move |did: &str| states.read().get(did).cloned())
+            Arc::new(move || states.read().clone().into_iter().collect::<Vec<_>>())
         };
         let publishers: Arc<std::collections::BTreeSet<String>> =
             Arc::new(["event".to_owned()].into());
-        let authorizer = event_ingress_authorizer(authority, publishers);
+        let authorizer = event_ingress_authorizer(roster, publishers);
 
         assert!(authorizer.authorize_ingress(&peer_of(original), "local"));
         // Fail-closed matrix: foreign store record, unknown DID, wrong tenant.
@@ -419,12 +428,22 @@ mod tests {
             "successor DID keeps ingress through the name-keyed grant, no restart"
         );
 
+        // Name squatting: a foreign record claiming "#event" beside the
+        // genuine identity makes the name ambiguous — deny both, escalate to
+        // neither (the store cannot distinguish provenance; uniqueness is the
+        // discriminator).
+        states.write().insert(squatter.to_owned(), state_with_services(&["#event"]));
+        assert!(!authorizer.authorize_ingress(&peer_of(successor), "local"));
+        assert!(!authorizer.authorize_ingress(&peer_of(squatter), "local"));
+
         // Empty set = read-only for everyone, including deployment identities.
+        states.write().remove(squatter);
         let empty: Arc<std::collections::BTreeSet<String>> = Arc::default();
         let deny_all = event_ingress_authorizer(
-            Arc::new(|_did: &str| -> Option<hyprstream_rpc::transport::moql_admission::AcceptedIdentityState> {
-                Some(state_with_services(&["#event"]))
-            }),
+            {
+                let states = Arc::clone(&states);
+                Arc::new(move || states.read().clone().into_iter().collect::<Vec<_>>())
+            },
             empty,
         );
         assert!(!deny_all.authorize_ingress(&peer_of(successor), "local"));

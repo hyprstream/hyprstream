@@ -152,6 +152,15 @@ impl super::service::AcceptedStateSource for CheckpointedPdsAcceptedStateSource 
         self.accepted_state(did)
     }
 
+    /// Every verified accepted state in the store — the roster universe the
+    /// derived-admission uniqueness rule (#1652) enumerates. This is the
+    /// deployment's provisioned identities AND any foreign record admitted
+    /// through the public ingest RPC; provenance is not distinguishable in
+    /// the store, so membership alone is never deployment authorization.
+    fn accepted_states(&self) -> Result<Vec<AcceptedAt9pState>> {
+        self.bootstrap_states()
+    }
+
     fn bootstrap_endpoints(&self, service_name: &str) -> Result<Option<Vec<crate::state_store::AnnouncedEndpoint>>> {
         if !self.network_bootstrap || !matches!(service_name, "discovery" | "policy") {
             return Ok(None);

@@ -637,6 +637,12 @@ pub(super) trait AcceptedStateSource: Send + Sync {
         did: &str,
     ) -> Result<Option<hyprstream_pds::at9p_duplicity::AcceptedAt9pState>>;
 
+    /// Every verified accepted state in the store (the full roster universe:
+    /// provisioned deployment identities and foreign ingested records alike).
+    /// Required — there is deliberately no silent empty default — because the
+    /// #1652 derived-admission uniqueness rule enumerates it per lookup.
+    fn accepted_states(&self) -> Result<Vec<hyprstream_pds::at9p_duplicity::AcceptedAt9pState>>;
+
     fn bootstrap_endpoints(&self, _service_name: &str) -> Result<Option<Vec<AnnouncedEndpoint>>> {
         Ok(None)
     }
@@ -1880,30 +1886,70 @@ pub async fn production_moq_event_target() -> Result<(TransportConfig, hyprstrea
     }))
 }
 
+/// Project one checkpoint-verified accepted state into the admission-facing
+/// [`AcceptedIdentityState`], or `None` when it does not parse into a bounded
+/// valid projection. Shared by the per-DID admission authority and the
+/// roster-wide derivation source (#1652) so both see identical projections.
+pub(crate) fn project_accepted_identity_state(
+    state: &hyprstream_pds::at9p_duplicity::AcceptedAt9pState,
+) -> Option<hyprstream_rpc::transport::moql_admission::AcceptedIdentityState> {
+    use hyprstream_rpc::transport::moql_admission::{AcceptedIdentityState, AcceptedSubjectKey};
+    let expires = chrono::DateTime::parse_from_rfc3339(state.expires_at.as_deref()?)
+        .ok()?
+        .timestamp_millis();
+    let subject_keys = state.current.subject_keys.iter().map(|key| {
+        Some(AcceptedSubjectKey {
+            ed25519: key.ed25519_pub.as_slice().try_into().ok()?,
+            ml_dsa_65: (!key.mldsa65_pub.is_empty()).then(|| key.mldsa65_pub.clone())?,
+        })
+    }).collect::<Option<Vec<_>>>()?;
+    // Project the capsule's `#<name>` service ids verbatim (#1652): the
+    // state is already in hand, so DID→service-name derivation at the
+    // admission sites costs zero extra store reads.
+    let service_ids = state.current.services.iter().map(|service| service.id.clone()).collect::<Vec<_>>();
+    (!subject_keys.is_empty()).then_some(AcceptedIdentityState {
+        epoch: state.epoch, head_digest: state.head_digest, subject_keys,
+        service_ids,
+        expires_at_unix_ms: Some(expires),
+    })
+}
+
 /// Project only bounded, valid checkpoint state into the MoQL authority.
 /// Every admission and live-session recheck rereads the pinned source.
 pub fn production_moql_accepted_state_authority() -> Result<Arc<dyn hyprstream_rpc::transport::moql_admission::AcceptedStateAuthority>> {
     let source = PROCESS_ACCEPTED_STATE_SOURCE.get().cloned()
         .ok_or_else(|| anyhow::anyhow!("production accepted-state authority is not installed"))?;
     Ok(Arc::new(move |did: &str| {
-        use hyprstream_rpc::transport::moql_admission::{AcceptedIdentityState, AcceptedSubjectKey};
         let state = source.accepted_state(did).ok().flatten()?;
-        let expires = chrono::DateTime::parse_from_rfc3339(state.expires_at.as_deref()?).ok()?.timestamp_millis();
-        let subject_keys = state.current.subject_keys.iter().map(|key| {
-            Some(AcceptedSubjectKey {
-                ed25519: key.ed25519_pub.as_slice().try_into().ok()?,
-                ml_dsa_65: (!key.mldsa65_pub.is_empty()).then(|| key.mldsa65_pub.clone())?,
+        project_accepted_identity_state(&state)
+    }))
+}
+
+/// The process's deployment-roster source for #1652 derived admission:
+/// enumerates every verified accepted state (with DIDs) so grant derivation
+/// can enforce cross-store uniqueness — the one property a per-DID read
+/// cannot see. Sourced from the same pinned checkpoint store as the
+/// per-DID authority; a read failure yields an empty roster, which denies.
+pub fn production_deployment_roster() -> Result<
+    Arc<dyn crate::admission_roster::DeploymentRosterSource>,
+> {
+    let source = PROCESS_ACCEPTED_STATE_SOURCE.get().cloned()
+        .ok_or_else(|| anyhow::anyhow!("production accepted-state authority is not installed"))?;
+    Ok(Arc::new(move || {
+        source
+            .accepted_states()
+            .ok()
+            .map(|states| {
+                states
+                    .iter()
+                    .filter_map(|state| {
+                        project_accepted_identity_state(state).map(|projected| {
+                            (state.did.clone(), projected)
+                        })
+                    })
+                    .collect::<Vec<_>>()
             })
-        }).collect::<Option<Vec<_>>>()?;
-        // Project the capsule's `#<name>` service ids verbatim (#1652): the
-        // state is already in hand, so DID→service-name derivation at the
-        // admission sites costs zero extra store reads.
-        let service_ids = state.current.services.iter().map(|service| service.id.clone()).collect::<Vec<_>>();
-        (!subject_keys.is_empty()).then_some(AcceptedIdentityState {
-            epoch: state.epoch, head_digest: state.head_digest, subject_keys,
-            service_ids,
-            expires_at_unix_ms: Some(expires),
-        })
+            .unwrap_or_default()
     }))
 }
 
@@ -4098,6 +4144,9 @@ pub mod test_fixtures {
         fn accepted_state(&self, did: &str) -> Result<Option<AcceptedAt9pState>> {
             Ok(self.0.lock().get(did).cloned())
         }
+        fn accepted_states(&self) -> Result<Vec<AcceptedAt9pState>> {
+            Ok(self.0.lock().values().cloned().collect())
+        }
     }
 
     #[derive(Clone)]
@@ -5519,6 +5568,9 @@ mod resolver_tests {
     impl AcceptedStateSource for MutableAcceptedState {
         fn accepted_state(&self, _did: &str) -> Result<Option<AcceptedAt9pState>> {
             Ok(self.0.lock().clone())
+        }
+        fn accepted_states(&self) -> Result<Vec<AcceptedAt9pState>> {
+            Ok(self.0.lock().clone().into_iter().collect())
         }
     }
 
