@@ -375,13 +375,16 @@ pub fn require_admitted_service_binding(
 }
 
 /// Spawn-time Event publisher roster check (#1652): every name in
-/// `quic.event_publishers` must be carried by a live accepted state. This
-/// catches deployment misconfiguration — a configured publisher name with no
-/// state at all (typo, decommissioned service) — by refusing to spawn. It
-/// does NOT establish provenance: a sole foreign claimant of an unheld name
-/// satisfies it exactly as it satisfies the derivation, which is the
-/// maintainer provenance-binding decision recorded in #1652 (see the module
-/// doc residual); closing that here is not possible from store data alone.
+/// `quic.event_publishers` must be carried by EXACTLY ONE live accepted
+/// state — the same unique-holder rule the runtime resolution enforces, so
+/// spawn fails loudly instead of starting with a publisher that every lookup
+/// would deny (a name with no holder is a deployment misconfiguration —
+/// typo, decommissioned service; a name with two holders is an ingested
+/// squatter beside the genuine identity). It does NOT establish provenance:
+/// a sole foreign claimant of an unheld name satisfies it exactly as it
+/// satisfies the derivation, which is the maintainer provenance-binding
+/// decision recorded in #1652 (see the module doc residual); closing that
+/// here is not possible from store data alone.
 pub fn require_publisher_roster(
     roster: &Arc<dyn DeploymentRosterSource>,
     publishers: &std::collections::BTreeSet<String>,
@@ -389,11 +392,15 @@ pub fn require_publisher_roster(
     let live = roster.roster();
     let now = hyprstream_rpc::envelope::current_timestamp();
     for name in publishers {
+        let holders = live
+            .iter()
+            .filter(|(_, state)| derived_service_name(state, now) == Some(name.as_str()))
+            .count();
         anyhow::ensure!(
-            live.iter()
-                .any(|(_, state)| derived_service_name(state, now) == Some(name.as_str())),
-            "quic.event_publishers lists '{}' but no live accepted state uniquely carries that service; refusing to run with a squat-able grant",
-            name
+            holders == 1,
+            "quic.event_publishers lists '{}' but {} live accepted states derive that service (runtime resolution requires exactly one); refusing to spawn",
+            name,
+            holders
         );
     }
     Ok(())
@@ -697,6 +704,19 @@ mod tests {
         )
         .expect_err("a configured publisher with no live state must refuse spawn");
         require_publisher_roster(&roster, &["event".to_owned()].into_iter().collect())
-            .expect("a carried publisher name must pass");
+            .expect("a uniquely carried publisher name must pass");
+        // Ambiguous holders (genuine identity + ingested squatter both
+        // deriving the configured name) must refuse spawn: runtime lookups
+        // would deny both, so a passing check would advertise a publisher
+        // that cannot work (review round 7).
+        let did = "did:at9p:event";
+        let ambiguous: Arc<dyn DeploymentRosterSource> = Arc::new(move || {
+            vec![
+                (did.to_owned(), state(&["#event"])),
+                ("did:at9p:squatter".to_owned(), state(&["#event"])),
+            ]
+        });
+        require_publisher_roster(&ambiguous, &["event".to_owned()].into_iter().collect())
+            .expect_err("an ambiguously held publisher name must refuse spawn");
     }
 }
