@@ -93,18 +93,41 @@ pub(crate) fn spawn_at9p_renewal_task(
                 );
                 break;
             };
-            let now = Utc::now();
-            if let Err(error) = run_renewal_tick(
-                publisher.as_ref(),
-                &secrets_dir,
-                valid_for_seconds,
-                roster_export.as_deref(),
-                now,
-            ) {
-                tracing::warn!(
-                    %error,
-                    "at9p service-identity renewal tick failed; retrying next interval"
-                );
+            // The tick is fully synchronous RocksDB/Postgres + ML-DSA work;
+            // run it on the blocking pool (the `ingestAt9pCandidate` handler
+            // uses spawn_blocking for the same ingest operations) instead of
+            // stalling an async worker — the immediate startup tick or a due
+            // renewal would otherwise block unrelated registry requests.
+            let tick_publisher = Arc::clone(&publisher);
+            let tick_secrets = secrets_dir.clone();
+            let tick_roster = roster_export.clone();
+            let tick = tokio::task::spawn_blocking(move || {
+                run_renewal_tick(
+                    tick_publisher.as_ref(),
+                    &tick_secrets,
+                    valid_for_seconds,
+                    tick_roster.as_deref(),
+                    Utc::now(),
+                )
+            })
+            .await;
+            match tick {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        %error,
+                        "at9p service-identity renewal tick failed; retrying next interval"
+                    );
+                }
+                Err(join_error) => {
+                    // The blocking task itself failed (panic); retried on the
+                    // next interval like any tick error.
+                    let error = anyhow::anyhow!(join_error);
+                    tracing::warn!(
+                        %error,
+                        "at9p service-identity renewal tick task failed; retrying next interval"
+                    );
+                }
             }
             drop(publisher);
             interval.tick().await;
@@ -156,12 +179,19 @@ pub(crate) fn renewal_tick(
 }
 
 /// Renew every accepted at9p service identity whose remaining life is below
-/// the half-TTL window, deriving the roster from what the store actually
-/// holds (every `#service` entry in every accepted state — no baked-in
-/// service list). Keys are loaded, never generated: a missing sibling key on
-/// the shared credentials volume is an error naming the service, retried on
-/// the next tick. Inside the half-TTL window `provision_one` is a verified
-/// no-op returning the current state unchanged.
+/// the half-TTL window. The renewal set is the intersection of the accepted
+/// states with the daemon's own service vocabulary
+/// (`hyprstream_service::get_factory` — the same membership test the offline
+/// provisioner's `validate_service_roster` applies): the store may also hold
+/// generic at9p records admitted through the public `ingestAt9pCandidate`
+/// RPC (arbitrary `#id` service entries that are NOT deployment identities),
+/// and those must neither be renewed nor abort the tick — a foreign entry
+/// with no credentials directory would otherwise fail every tick and starve
+/// the real deployment identities past expiry, where renewal is impossible.
+/// For the deployment's own services, keys are loaded, never generated: a
+/// missing sibling key on the shared credentials volume is an error naming
+/// the service, retried on the next tick. Inside the half-TTL window
+/// `provision_one` is a verified no-op returning the current state unchanged.
 pub(crate) fn renew_due_service_identities(
     store: &PdsRecordStore,
     ingest: &At9pStateIngest,
@@ -173,15 +203,23 @@ pub(crate) fn renew_due_service_identities(
     let mut service_epochs: BTreeMap<String, u64> = BTreeMap::new();
     for state in &states {
         for entry in &state.current.services {
+            let Some(name) = entry.id.strip_prefix('#') else {
+                continue;
+            };
+            if hyprstream_service::get_factory(name).is_none() {
+                tracing::debug!(
+                    service = name,
+                    "accepted at9p state is not a deployment service identity; not renewed"
+                );
+                continue;
+            }
             service_epochs.insert(entry.id.clone(), state.epoch);
         }
     }
     // BTreeMap iteration is deterministic ('#' sorts before alphanumerics).
     let mut admitted = Vec::with_capacity(service_epochs.len());
     for (service_id, epoch_before) in &service_epochs {
-        let name = service_id
-            .strip_prefix('#')
-            .context("accepted service entry id is not #<name>")?;
+        let name = service_id.strip_prefix('#').unwrap_or(service_id);
         let key =
             load_existing_service_signing_key(secrets_dir, name, SecretsProfile::SharedDirectory)
                 .with_context(|| format!("loading existing signing key for service {name}"))?;
@@ -413,6 +451,60 @@ mod tests {
         assert!(!secrets.path().join("event").join("signing-key").exists());
         assert_eq!(sorted_states(&store)?.len(), 2);
         assert!(!roster.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn renewal_tick_skips_foreign_at9p_records_without_aborting() -> Result<()> {
+        let (_dir, store, ingest, secrets, _key, now) = provisioned_fixture(600)?;
+        // Admit a generic at9p capsule (public-RPC shape) whose service id is
+        // NOT a deployment service: it has no credentials directory and must
+        // neither be renewed nor fail the tick — a hard failure here would
+        // starve the deployment identities past expiry on every retry.
+        use hyprstream_pds::at9p::{
+            CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
+        };
+        use hyprstream_pds::at9p_sign::sign_capsule;
+        use hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes;
+        let foreign = SigningKey::from_bytes(&[0x78; 32]);
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&foreign);
+        let pair = HybridKeyPair::new(
+            foreign.verifying_key().to_bytes().to_vec(),
+            ml_dsa_sk_to_vk_bytes(&pq),
+        )?;
+        let endpoint = ServiceEndpoint::new(
+            Transport::Iroh,
+            format!("iroh://{}", hex::encode([0x79; 32])),
+        )?;
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint)?;
+        let body = CapsuleBody::new(vec![pair], vec![service])?;
+        let capsule = sign_capsule(body, &foreign, &pq)?;
+        let foreign_did = format!("did:at9p:{}", capsule.cid512()?);
+        let foreign_state = ingest.ingest_genesis(&foreign_did, &capsule.to_dag_cbor()?)?;
+        assert_eq!(foreign_state.epoch, 0);
+        // Past the deployment half-TTL: both deployment identities renew and
+        // the roster exports exactly the two deployment members.
+        let out = tempfile::tempdir()?;
+        let roster = out.path().join("roster.json");
+        let later = now + Duration::seconds(301);
+        renewal_tick(&store, &ingest, secrets.path(), 900, Some(&roster), later)?;
+        let states = sorted_states(&store)?;
+        assert_eq!(states.len(), 3);
+        let foreign_after = states
+            .iter()
+            .find(|state| state.did == foreign_did)
+            .expect("foreign record still accepted");
+        assert_eq!(foreign_after.epoch, 0, "foreign record must not be renewed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&roster)?)?;
+        let services = parsed["services"].as_array().expect("services");
+        assert_eq!(services.len(), 2);
+        assert!(
+            services
+                .iter()
+                .all(|entry| entry["did"].as_str() != Some(foreign_did.as_str())),
+            "foreign record must not appear in the deployment roster"
+        );
         Ok(())
     }
 
