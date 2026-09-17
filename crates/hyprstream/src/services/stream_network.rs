@@ -41,11 +41,11 @@ pub(crate) fn stream_admission(
     let authority: Arc<dyn AcceptedStateAuthority> = {
         let roster = Arc::clone(&roster);
         Arc::new(move |did: &str| {
-            roster
-                .roster()
-                .into_iter()
+            let snapshot = roster.roster();
+            snapshot
+                .iter()
                 .find(|(d, _)| d == did)
-                .map(|(_, state)| state)
+                .map(|(_, state)| state.clone())
         })
     };
     stream_admission_over(authority, roster)
@@ -66,13 +66,16 @@ pub fn stream_ingress_authorizer(
         move |peer: &hyprstream_rpc::moq_authz::PeerIdentity, tenant: &str| {
             peer.subject.as_deref().is_some_and(|did| {
                 publishers.contains(did)
-                    && admission_roster::roster_tenant(
-                        &roster.roster(),
-                        did,
-                        hyprstream_rpc::envelope::current_timestamp(),
-                    )
-                    .as_deref()
-                        == Some(tenant)
+                    && {
+                        let snapshot = roster.roster();
+                        admission_roster::roster_tenant(
+                            &snapshot,
+                            did,
+                            hyprstream_rpc::envelope::current_timestamp(),
+                        )
+                        .as_deref()
+                            == Some(tenant)
+                    }
             })
         },
     )

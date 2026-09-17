@@ -79,17 +79,21 @@ pub type RosterEntry = (String, AcceptedIdentityState);
 /// The deployment-roster side of the accepted-state authority: enumerates
 /// every verified accepted state so grant derivation can enforce the
 /// cross-store uniqueness a per-DID read cannot see. Implemented by the
-/// process's pinned checkpoint source; a blanket `Fn` impl covers fixtures.
+/// process's cached projection; a blanket `Fn` impl covers fixtures.
+///
+/// The snapshot is shared as an `Arc`: the 100 ms live-session recheck must
+/// not deep-copy the roster (ML-DSA key buffers included) per poll —
+/// consumers borrow the slice.
 pub trait DeploymentRosterSource: Send + Sync {
-    fn roster(&self) -> Vec<RosterEntry>;
+    fn roster(&self) -> Arc<Vec<RosterEntry>>;
 }
 
 impl<F> DeploymentRosterSource for F
 where
     F: Fn() -> Vec<RosterEntry> + Send + Sync,
 {
-    fn roster(&self) -> Vec<RosterEntry> {
-        self()
+    fn roster(&self) -> Arc<Vec<RosterEntry>> {
+        Arc::new(self())
     }
 }
 
@@ -143,8 +147,8 @@ impl CachedRoster {
 }
 
 impl DeploymentRosterSource for CachedRoster {
-    fn roster(&self) -> Vec<RosterEntry> {
-        self.current().as_ref().clone()
+    fn roster(&self) -> Arc<Vec<RosterEntry>> {
+        self.current()
     }
 }
 
@@ -224,7 +228,8 @@ pub fn roster_tenant(roster: &[RosterEntry], did: &str, now_unix_ms: i64) -> Opt
 pub fn derived_tenant_resolver(roster: Arc<dyn DeploymentRosterSource>) -> PeerTenantResolver {
     Arc::new(move |peer: &PeerIdentity| {
         peer.subject.as_deref().and_then(|did| {
-            roster_tenant(&roster.roster(), did, hyprstream_rpc::envelope::current_timestamp())
+            let snapshot = roster.roster();
+            roster_tenant(&snapshot, did, hyprstream_rpc::envelope::current_timestamp())
         })
     })
 }
@@ -241,7 +246,8 @@ pub fn require_service_self_binding(
     service_name: &str,
     proof: &MoqlAdmissionProof,
 ) -> Result<()> {
-    let resolved = roster_service_name(&roster.roster(), &proof.did, hyprstream_rpc::envelope::current_timestamp());
+    let snapshot = roster.roster();
+    let resolved = roster_service_name(&snapshot, &proof.did, hyprstream_rpc::envelope::current_timestamp());
     anyhow::ensure!(
         resolved.as_deref() == Some(service_name),
         "native {} identity {} does not uniquely resolve to accepted deployment service '{}' in the checkpoint store",
@@ -262,8 +268,9 @@ pub fn require_admitted_service_binding(
     roster: &Arc<dyn DeploymentRosterSource>,
     proof: &MoqlAdmissionProof,
 ) -> Result<()> {
+    let snapshot = roster.roster();
     anyhow::ensure!(
-        roster_service_name(&roster.roster(), &proof.did, hyprstream_rpc::envelope::current_timestamp())
+        roster_service_name(&snapshot, &proof.did, hyprstream_rpc::envelope::current_timestamp())
             .is_some(),
         "Event identity {} is not a uniquely-held accepted deployment service identity in the checkpoint store",
         proof.did

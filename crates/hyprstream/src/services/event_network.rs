@@ -69,8 +69,9 @@ pub fn event_ingress_authorizer(
                 .subject
                 .as_deref()
                 .and_then(|did| {
+                    let snapshot = roster.roster();
                     admission_roster::roster_service_name(
-                        &roster.roster(),
+                        &snapshot,
                         did,
                         hyprstream_rpc::envelope::current_timestamp(),
                     )
