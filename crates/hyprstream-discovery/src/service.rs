@@ -1895,8 +1895,13 @@ pub fn production_moql_accepted_state_authority() -> Result<Arc<dyn hyprstream_r
                 ml_dsa_65: (!key.mldsa65_pub.is_empty()).then(|| key.mldsa65_pub.clone())?,
             })
         }).collect::<Option<Vec<_>>>()?;
+        // Project the capsule's `#<name>` service ids verbatim (#1652): the
+        // state is already in hand, so DID→service-name derivation at the
+        // admission sites costs zero extra store reads.
+        let service_ids = state.current.services.iter().map(|service| service.id.clone()).collect::<Vec<_>>();
         (!subject_keys.is_empty()).then_some(AcceptedIdentityState {
             epoch: state.epoch, head_digest: state.head_digest, subject_keys,
+            service_ids,
             expires_at_unix_ms: Some(expires),
         })
     }))

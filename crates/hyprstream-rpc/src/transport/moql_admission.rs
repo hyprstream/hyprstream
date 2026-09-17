@@ -212,6 +212,12 @@ pub struct AcceptedIdentityState {
     pub head_digest: [u8; 64],
     /// The accepted current subject keys (a published SET, not positional).
     pub subject_keys: Vec<AcceptedSubjectKey>,
+    /// The accepted capsule's `#<name>` service entry ids, projected verbatim
+    /// so admission-side DID → deployment-service-name derivation (#1652)
+    /// needs zero extra store reads. Empty when the capsule carries no service
+    /// entries; foreign records may carry ids that match no deployment service
+    /// (consumers apply their own factory-roster membership filter).
+    pub service_ids: Vec<String>,
     /// Successor expiry (unix ms). `None` = genesis, current until a successor
     /// is accepted (mirrors `AcceptedAt9pState::ensure_fresh`).
     pub expires_at_unix_ms: Option<i64>,
@@ -1271,6 +1277,7 @@ mod tests {
                 ed25519: ed.verifying_key().to_bytes(),
                 ml_dsa_65: crate::crypto::pq::ml_dsa_sk_to_vk_bytes(pq),
             }],
+            service_ids: vec![],
             expires_at_unix_ms: None,
         }
     }

@@ -4,7 +4,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use super::*;
-use crate::checkpointed_pds::write_test_state;
+use crate::checkpointed_pds::{remove_test_state, write_test_state};
 use bytes::Bytes;
 use hyprstream_pds::at9p::{
     CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
@@ -13,7 +13,6 @@ use hyprstream_pds::at9p_duplicity::{AcceptedAt9pState, DuplicityGuard, InMemory
 use hyprstream_pds::at9p_gate::verify_genesis_capsule;
 use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
 use hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes;
-use hyprstream_rpc::moq_authz::PeerIdentity;
 use hyprstream_rpc::node_identity::{derive_mesh_mldsa_key, derive_purpose_key};
 use hyprstream_rpc::rpc_client::{CallOptions, RpcClient};
 use hyprstream_rpc::stream_consumer::StreamHandle;
@@ -24,7 +23,6 @@ use hyprstream_rpc::transport::moql_admission::{
 };
 use iroh::{EndpointAddr, TransportAddr};
 use moq_net::{Client, Group, Origin, Track};
-use std::collections::BTreeMap;
 use web_transport_iroh::Session;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -289,16 +287,12 @@ async fn roundtrip() -> Result<()> {
         hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
     )?;
     let authority = production_moql_accepted_state_authority()?;
-    let tenants = BTreeMap::from([
-        (server_state.did.clone(), "local".to_owned()),
-        (client_state.did.clone(), "local".to_owned()),
-    ]);
-    let resolver = Arc::new(move |peer: &PeerIdentity| {
-        peer.subject
-            .as_deref()
-            .and_then(|did| tenants.get(did))
-            .cloned()
-    });
+    // #1652: the tenant resolver is DERIVED from the live authority (accepted
+    // state ∩ factory roster ⇒ local). There is no config tenant map: the
+    // "streams"/"reader" capsule service entries resolve through the
+    // admission-only test factory roster registered in admission_roster's
+    // tests (same test binary).
+    let resolver = crate::admission_roster::derived_tenant_resolver(Arc::clone(&authority));
     let server_identity = public_identity(&server_state, &server_signer)?;
     let server_identity_proof = MoqlServerIdentityProof {
         identity: server_identity.clone(),
@@ -331,6 +325,9 @@ async fn roundtrip() -> Result<()> {
 
     for (name, candidate) in [
         (
+            // Foreign record: present in the store (public ingest shape) with
+            // an `#id` entry that is no deployment service — the ∩ factory
+            // roster filter denies it a tenant.
             "unmapped",
             proof(&unmapped_state, &unmapped_signer, server_identity.clone()),
         ),
@@ -433,7 +430,7 @@ async fn roundtrip() -> Result<()> {
     retry.shutdown().await?;
     let rotated = client(0x36).await?;
     let rotated_connection = rotated.connect(direct(&server), ALPN_MOQ_LITE).await?;
-    let rotated_proof = proof(&advanced_client_state, &rotated_client, server_identity);
+    let rotated_proof = proof(&advanced_client_state, &rotated_client, server_identity.clone());
     prove_moql_admission(
         &rotated_connection,
         &rotated_proof,
@@ -467,6 +464,52 @@ async fn roundtrip() -> Result<()> {
         tokio::time::timeout(IO_TIMEOUT, rotated_group.read_frame()).await??,
         Some(Bytes::from_static(b"checkpoint-authorized payload"))
     );
+
+    // #1652 THE CHURN CASE against the real checkpoint store: a service
+    // identity re-initialization (R1 shape) re-binds the SAME service name
+    // ("#reader") to a brand-new DID with new keys. The successor state is
+    // written and the superseded one removed — in the SAME process, with the
+    // same resolver closure. Admission for the successor DID succeeds and the
+    // superseded DID is denied: under the former DID-keyed config map both
+    // outcomes required a re-projected config.toml plus a restart of every
+    // container.
+    let reinit_signer = SigningKey::from_bytes(&[0x78; 32]);
+    let successor_state = admitted("reader", &reinit_signer)?;
+    remove_test_state(&store, &client_state)?;
+    remove_test_state(&store, &advanced_client_state)?;
+    write_test_state(&store, &successor_state, &registry)?;
+
+    let stale_client = client(0x37).await?;
+    let stale_connection = stale_client.connect(direct(&server), ALPN_MOQ_LITE).await?;
+    assert!(
+        prove_moql_admission(
+            &stale_connection,
+            &admitted_proof,
+            *stale_client.endpoint_id().as_bytes(),
+            IO_TIMEOUT,
+        )
+        .await
+        .is_err(),
+        "superseded DID was admitted after identity churn"
+    );
+    stale_client.shutdown().await?;
+
+    let successor_client = client(0x38).await?;
+    let successor_connection = successor_client.connect(direct(&server), ALPN_MOQ_LITE).await?;
+    let successor_proof = proof(
+        &successor_state,
+        &reinit_signer,
+        server_identity.clone(),
+    );
+    prove_moql_admission(
+        &successor_connection,
+        &successor_proof,
+        *successor_client.endpoint_id().as_bytes(),
+        IO_TIMEOUT,
+    )
+    .await
+    .context("successor DID must admit after churn without restart or config change")?;
+    successor_client.shutdown().await?;
 
     rotated.shutdown().await?;
     admitted_client.shutdown().await?;

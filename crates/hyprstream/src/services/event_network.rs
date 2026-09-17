@@ -1,22 +1,21 @@
 //! Native Event transport bootstrap. Identity admission and MAC are independent.
 use anyhow::{Context, Result};
-use hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof;
+use hyprstream_discovery::admission_roster;
+use hyprstream_rpc::moq_authz::PeerIdentity;
+use hyprstream_rpc::transport::iroh_moq::SharedIngressAuthorizer;
+use hyprstream_rpc::transport::moql_admission::{
+    AcceptedStateAuthority, MoqlAdmissionProof,
+};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-/// The fixed Event tree belongs only to the explicitly provisioned local tenant.
-pub fn require_event_tenant(
-    config: &crate::config::QuicConfig,
-    proof: &MoqlAdmissionProof,
-) -> Result<()> {
-    anyhow::ensure!(
-        config
-            .moql_subject_tenants
-            .get(&proof.did)
-            .is_some_and(|t| t == "local"),
-        "Event identity {} requires explicit quic.moql_subject_tenants binding to local",
-        proof.did
-    );
-    Ok(())
+/// The fixed Event tree belongs only to the provisioned local tenant. The
+/// process's own proof must be a current accepted deployment service identity
+/// — resolved from the live checkpoint store (#1652), never from a DID-valued
+/// config binding that could go stale at identity churn.
+pub fn require_event_tenant(proof: &MoqlAdmissionProof) -> Result<()> {
+    let authority = hyprstream_discovery::production_moql_accepted_state_authority()?;
+    admission_roster::require_admitted_service_binding(&authority, proof)
 }
 
 /// Initialize both CLI and service Event clients according to the deployment
@@ -30,7 +29,7 @@ pub fn ensure_event_origin_for_profile() -> Result<()> {
     let proof = hyprstream_rpc::moq_stream::global_moq_admission_proof()
         .context("native Event client requires an installed checkpointed admission proof")?
         .clone();
-    require_event_tenant(&config.quic, &proof)?;
+    require_event_tenant(&proof)?;
     hyprstream_rpc::events::install_network_event_identity(&proof)?;
     if let Some(origin) = hyprstream_rpc::moq_event::install_event_network_client_origin() {
         tokio::spawn(async move {
@@ -54,6 +53,26 @@ pub fn ensure_event_origin_for_profile() -> Result<()> {
     Ok(())
 }
 
+/// The Event ingress grant: the already-admitted peer's verified DID resolves
+/// (through the same live accepted-state authority admission used) to a
+/// deployment service NAME, which must be a member of the operator's
+/// name-keyed `quic.event_publishers` set (#1652). Names survive identity
+/// churn, so the grant never goes stale when a service's DID changes; an
+/// empty set denies every peer — read-only, never all-publishers.
+pub fn event_ingress_authorizer(
+    authority: Arc<dyn AcceptedStateAuthority>,
+    publishers: Arc<BTreeSet<String>>,
+) -> SharedIngressAuthorizer {
+    Arc::new(move |peer: &PeerIdentity, tenant: &str| {
+        tenant == admission_roster::LOCAL_TENANT
+            && peer
+                .subject
+                .as_deref()
+                .and_then(|did| admission_roster::authority_service_name(&authority, did))
+                .is_some_and(|name| publishers.contains(name.as_str()))
+    })
+}
+
 /// Build the Event-owned admission authenticator and the independent explicit
 /// ingress grant. An absent MAC policy still denies every Event source.
 pub fn event_handler(
@@ -71,18 +90,15 @@ pub fn event_handler(
     let proof = ctx
         .moql_admission_proof("event")?
         .context("native Event server proof missing")?;
-    require_event_tenant(&config.quic, &proof)?;
+    // Self-binding: the checkpoint store must resolve THIS process's own DID
+    // to THIS service. Refusal fails the spawn (fail-closed), replacing the
+    // former empty-tenant-map refusal.
+    let authority = hyprstream_discovery::production_moql_accepted_state_authority()?;
+    admission_roster::require_service_self_binding(&authority, "event", &proof)?;
     hyprstream_rpc::events::install_network_event_identity(&proof)?;
-    let tenants = config.quic.moql_subject_tenants.clone();
-    let publishers = config.quic.event_publishers.clone();
     let admission = MoqlAdmissionAuthenticator::new(
-        hyprstream_discovery::production_moql_accepted_state_authority()?,
-        Arc::new(move |peer| {
-            peer.subject
-                .as_ref()
-                .and_then(|did| tenants.get(did))
-                .cloned()
-        }),
+        Arc::clone(&authority),
+        admission_roster::derived_tenant_resolver(Arc::clone(&authority)),
     );
     admission.install_server_identity(
         MoqlServerIdentityProof::from_local_admission_proof(&proof)?,
@@ -98,14 +114,9 @@ pub fn event_handler(
     .with_authz(
         MoqAuthzConfig::default()
             .with_admission(Arc::new(admission))
-            .with_ingress_authorizer(Arc::new(
-                move |peer: &hyprstream_rpc::moq_authz::PeerIdentity, tenant: &str| {
-                    tenant == "local"
-                        && peer
-                            .subject
-                            .as_ref()
-                            .is_some_and(|did| publishers.contains(did))
-                },
+            .with_ingress_authorizer(event_ingress_authorizer(
+                authority,
+                Arc::new(config.quic.event_publishers),
             )),
     ))
 }
@@ -223,7 +234,7 @@ pub async fn probe_event_network(timeout: std::time::Duration) -> Result<()> {
         anyhow::ensure!(config.quic.iroh_required() || hyprstream_discovery::native_network_required(), "Event network probe requires network-iroh-required");
         let mut proof = hyprstream_rpc::moq_stream::global_moq_admission_proof()
             .context("Event probe requires a checkpointed client proof")?.clone();
-        require_event_tenant(&config.quic, &proof)?;
+        require_event_tenant(&proof)?;
         let (transport, identity) = hyprstream_discovery::production_moq_event_target().await?;
         proof.expected_server = identity;
         let stream = hyprstream_rpc::dial::dial_stream_authenticated(&transport, &proof).await?;
@@ -345,5 +356,77 @@ mod tests {
             "required failure installed a local origin"
         );
         Ok(())
+    }
+
+    fn state_with_services(service_ids: &[&str]) -> hyprstream_rpc::transport::moql_admission::AcceptedIdentityState {
+        use hyprstream_rpc::transport::moql_admission::{AcceptedIdentityState, AcceptedSubjectKey};
+        AcceptedIdentityState {
+            epoch: 1,
+            head_digest: [1; 64],
+            subject_keys: vec![AcceptedSubjectKey {
+                ed25519: [2; 32],
+                ml_dsa_65: vec![3; 1952],
+            }],
+            service_ids: service_ids.iter().map(ToString::to_string).collect(),
+            expires_at_unix_ms: None,
+        }
+    }
+
+    fn peer_of(did: &str) -> hyprstream_rpc::moq_authz::PeerIdentity {
+        hyprstream_rpc::moq_authz::PeerIdentity::authenticated(did.to_owned())
+    }
+
+    /// #1652 churn test (Event ingress grant): when a service's DID changes —
+    /// same service name re-bound to a new DID, as at an R1 store re-init —
+    /// the name-keyed grant keeps admitting that service in the SAME process,
+    /// no restart, no config change. Under the former DID-keyed set the new
+    /// DID was silently unlisted (read-only) until config was re-projected
+    /// and every container restarted.
+    #[test]
+    fn event_ingress_follows_service_names_across_did_churn() {
+        use hyprstream_rpc::transport::moql_admission::AcceptedStateAuthority;
+        use std::collections::BTreeMap;
+        let original = "did:at9p:original";
+        let successor = "did:at9p:successor";
+        let foreign = "did:at9p:foreign-record";
+        let states = Arc::new(parking_lot::RwLock::new(BTreeMap::from([
+            (original.to_owned(), state_with_services(&["#event"])),
+            (foreign.to_owned(), state_with_services(&["#ns"])),
+        ])));
+        let authority: Arc<dyn AcceptedStateAuthority> = {
+            let states = Arc::clone(&states);
+            Arc::new(move |did: &str| states.read().get(did).cloned())
+        };
+        let publishers: Arc<std::collections::BTreeSet<String>> =
+            Arc::new(["event".to_owned()].into());
+        let authorizer = event_ingress_authorizer(authority, publishers);
+
+        assert!(authorizer.authorize_ingress(&peer_of(original), "local"));
+        // Fail-closed matrix: foreign store record, unknown DID, wrong tenant.
+        assert!(!authorizer.authorize_ingress(&peer_of(foreign), "local"));
+        assert!(!authorizer.authorize_ingress(&peer_of("did:at9p:unknown"), "local"));
+        assert!(!authorizer.authorize_ingress(&peer_of(original), "other"));
+
+        // Identity churn: the same service name now lives at a new DID.
+        states.write().remove(original);
+        states.write().insert(successor.to_owned(), state_with_services(&["#event"]));
+        assert!(
+            !authorizer.authorize_ingress(&peer_of(original), "local"),
+            "superseded DID must lose the grant"
+        );
+        assert!(
+            authorizer.authorize_ingress(&peer_of(successor), "local"),
+            "successor DID keeps ingress through the name-keyed grant, no restart"
+        );
+
+        // Empty set = read-only for everyone, including deployment identities.
+        let empty: Arc<std::collections::BTreeSet<String>> = Arc::default();
+        let deny_all = event_ingress_authorizer(
+            Arc::new(|_did: &str| -> Option<hyprstream_rpc::transport::moql_admission::AcceptedIdentityState> {
+                Some(state_with_services(&["#event"]))
+            }),
+            empty,
+        );
+        assert!(!deny_all.authorize_ingress(&peer_of(successor), "local"));
     }
 }

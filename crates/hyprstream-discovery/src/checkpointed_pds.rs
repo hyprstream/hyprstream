@@ -411,6 +411,21 @@ pub(super) fn write_test_state(path: &Path, state: &AcceptedAt9pState, identity:
     Ok(())
 }
 
+/// Remove one accepted state from the test store — the store-wipe half of a
+/// simulated service-identity re-initialization (#1652 churn tests: the
+/// successor state is then written by [`write_test_state`]).
+#[cfg(test)]
+pub(super) fn remove_test_state(path: &Path, state: &AcceptedAt9pState) -> Result<()> {
+    let mut options = rocksdb::Options::default();
+    options.create_if_missing(true);
+    let db = rocksdb::DB::open(&options, path)?;
+    let mut batch = rocksdb::WriteBatch::default();
+    batch.delete(state_key(&state.subject_cid512));
+    batch.delete(checkpoint_key(&state.subject_cid512));
+    db.write(batch)?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {

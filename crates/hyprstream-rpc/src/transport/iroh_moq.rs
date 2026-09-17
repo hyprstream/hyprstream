@@ -700,18 +700,22 @@ mod tests {
         let server_state = AcceptedIdentityState {
             epoch: 1, head_digest: [0x75; 64], expires_at_unix_ms: Some(expiry),
             subject_keys: vec![AcceptedSubjectKey { ed25519: server_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&server_pq) }],
+            service_ids: vec![],
         };
         let producer_state = AcceptedIdentityState {
             epoch: 1, head_digest: [0x76; 64], expires_at_unix_ms: Some(expiry),
             subject_keys: vec![AcceptedSubjectKey { ed25519: producer_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&producer_pq) }],
+            service_ids: vec![],
         };
         let subscriber_state = AcceptedIdentityState {
             epoch: 1, head_digest: [0x77; 64], expires_at_unix_ms: Some(expiry),
             subject_keys: vec![AcceptedSubjectKey { ed25519: subscriber_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&subscriber_pq) }],
+            service_ids: vec![],
         };
         let other_state = AcceptedIdentityState {
             epoch: 1, head_digest: [0x78; 64], expires_at_unix_ms: Some(expiry),
             subject_keys: vec![AcceptedSubjectKey { ed25519: other_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&other_pq) }],
+            service_ids: vec![],
         };
         let authority: Arc<dyn crate::transport::moql_admission::AcceptedStateAuthority> = Arc::new(move |did: &str| match did {
             "did:at9p:relay" => Some(server_state.clone()),
@@ -841,10 +845,12 @@ mod tests {
         let server_state = AcceptedIdentityState {
             epoch: 1, head_digest: [0x85; 64], expires_at_unix_ms: Some(expiry),
             subject_keys: vec![AcceptedSubjectKey { ed25519: server_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&server_pq) }],
+            service_ids: vec![],
         };
         let producer_state = AcceptedIdentityState {
             epoch: 1, head_digest: [0x86; 64], expires_at_unix_ms: Some(expiry),
             subject_keys: vec![AcceptedSubjectKey { ed25519: producer_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&producer_pq) }],
+            service_ids: vec![],
         };
         let authority: Arc<dyn crate::transport::moql_admission::AcceptedStateAuthority> = Arc::new(move |did: &str| match did {
             "did:at9p:relay" => Some(server_state.clone()),
@@ -960,6 +966,7 @@ mod tests {
                 ed25519: server_identity.ed25519,
                 ml_dsa_65: server_identity.ml_dsa65.clone(),
             }],
+            service_ids: vec![],
             expires_at_unix_ms: Some(server_identity.expires_at_unix_ms),
         };
         let authority: Arc<dyn crate::transport::moql_admission::AcceptedStateAuthority> =

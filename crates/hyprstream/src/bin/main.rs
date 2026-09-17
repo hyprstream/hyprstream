@@ -3590,9 +3590,19 @@ fn main() -> Result<()> {
                                         // never an application identity.
                                         moq_relay_server_identity: None,
                                         moq_admission: if moq_admission_proof.is_some() {
-                                            Some(hyprstream_core::services::stream_network::production_stream_admission(&qc)?)
+                                            Some(hyprstream_core::services::stream_network::production_stream_admission()?)
                                         } else { None },
-                                        moq_ingress_authorizer: Some(hyprstream_core::services::stream_network::stream_ingress_authorizer(&qc)),
+                                        // The ingress authorizer only runs alongside
+                                        // admission (it decides on already-admitted peers),
+                                        // so it is constructed under the same guard and
+                                        // resolves tenants from the same live accepted-state
+                                        // authority (#1652).
+                                        moq_ingress_authorizer: if moq_admission_proof.is_some() {
+                                            Some(hyprstream_core::services::stream_network::stream_ingress_authorizer(
+                                                &qc,
+                                                hyprstream_discovery::production_moql_accepted_state_authority()?,
+                                            ))
+                                        } else { None },
                                         moq_admission_proof,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             move |request: hyprstream_service::NativeAnnouncementRequest| {

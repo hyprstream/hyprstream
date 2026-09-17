@@ -14,19 +14,25 @@ tracks hosted by other producer services. Readiness follows successful carrier
 bind and initial signed announcement; cancellation shuts down both publication
 and the carrier. A listener being ready is not proof of authorized payload access.
 
-Every native server uses the production live accepted-state authority and an
-explicit `quic.moql_subject_tenants` DID-to-tenant map. Each server receives an
-independent confirmation identity/replay cache; carrier addresses never select
-application identity. Existing accepted-state expiry/rotation/removal checks
-remain active throughout a session.
+Every native server uses the production live accepted-state authority, and
+admission tenants are derived from it (#1652): a capsule service entry that
+matches a registered deployment service derives the `local` tenant, everything
+else — including foreign at9p records admitted through public ingest — is
+unresolved and denied. There is no `quic.moql_subject_tenants` config map to go
+stale at service-identity churn; each server's own DID must resolve to its own
+service name or it refuses to spawn. Each server receives an independent
+confirmation identity/replay cache; carrier addresses never select application
+identity. Existing accepted-state expiry/rotation/removal checks remain active
+throughout a session, and the derived tenant is re-resolved on every recheck.
 
-`quic.stream_publishers` is a distinct explicit DID set, default empty. It grants
-remote stream ingress only for the same DID's configured tenant. Tenant membership
-alone leaves a peer read-only, and `event_publishers` grants no Streams ingress.
-The map and roster are process configuration: changes require restart/reload;
-accepted-state revocation is live. Populate them from verified provisioning
-artifacts and an approved ingress roster, never invented DIDs or labels. The
-central Streams service's own admitted DID requires an explicit `local` binding.
+`quic.stream_publishers` is a distinct explicit DID set, deliberately empty by
+design: no production writer emits it and admitted native peers are read-only
+on Streams. An empty set cannot go stale; it stays DID-keyed until a first real
+use exists. It grants remote stream ingress only for the same DID's derived
+tenant. Tenant membership alone leaves a peer read-only, and `event_publishers`
+(a name-keyed Event grant) never authorizes Streams ingress. Populate any
+non-empty ingress set from verified provisioning artifacts and an approved
+roster, never invented DIDs or labels.
 
 This transport does not grant MAC clearance. Existing producing RPC authorization,
 per-recipient stream key provisioning, payload authentication/encryption and epoch
