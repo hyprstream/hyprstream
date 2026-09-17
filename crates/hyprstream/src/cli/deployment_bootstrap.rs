@@ -384,6 +384,16 @@ fn publish_owned_roster_temp(
 /// expiries after in-daemon renewals. All-or-nothing like the boot export:
 /// any member that fails verification fails the whole snapshot, never a
 /// partial manifest that would hide a sick member from the monitor.
+///
+/// Unlike the boot writer, the periodic path gives its temporary file an
+/// ATTEMPT-UNIQUE name: the boot writer's predictable `.tmp-<pid>` sibling is
+/// deliberately preserved on collision (ownership boundary for a one-shot
+/// command), but a daemon crash between create and rename can leave that
+/// predictable file behind, and a container daemon restarting with the SAME
+/// pid would then fail every periodic export on the preserved leftover — a
+/// permanently stale roster despite healthy renewals. An attempt-unique name
+/// cannot collide with any prior attempt's leftover; a crash leaks one small
+/// stale temp file, never a permanent failure.
 pub(crate) fn export_verified_roster_snapshot(
     store: &PdsRecordStore,
     admitted: &[(String, SigningKey, AcceptedAt9pState)],
@@ -395,7 +405,36 @@ pub(crate) fn export_verified_roster_snapshot(
         .map(|(name, key, state)| (name.as_str(), key, state.clone()))
         .collect::<Vec<_>>();
     let entries = build_verified_roster_entries(store, &borrowed, &now_text)?;
-    write_verified_roster_manifest(path, entries)
+    ensure!(
+        !path.is_dir(),
+        "roster export path is a directory: {}",
+        path.display()
+    );
+    let file_name = path
+        .file_name()
+        .context("roster export path has no file name")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure!(
+        parent.is_dir(),
+        "roster export parent directory does not exist: {}",
+        parent.display()
+    );
+    let bytes = serialize_verified_roster_manifest(entries)?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .with_context(|| format!("create roster export temporary {}", temp.display()))?;
+    publish_owned_roster_temp(file, &temp, path, &bytes)
 }
 
 /// The command is dispatched after `main` has loaded and validated the

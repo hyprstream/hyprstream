@@ -1405,7 +1405,11 @@ fn spawn_registry_at9p_renewal(
     publisher: &Arc<crate::services::discovery::PdsPublisher>,
     config: &crate::config::HyprConfig,
 ) -> anyhow::Result<()> {
-    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+    // Resolve through the ALREADY-LOADED config so an explicit `--config`
+    // `[secrets].path` stays authoritative — a bare resolve_secrets_dir()
+    // here would reload default config and read the wrong credentials tree
+    // on every tick (the CLI provisioning path uses the same _for form).
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir_for(Some(config))?;
     // Cross-validated: the check interval must stay below half the TTL or a
     // schedule exists where an identity expires between due ticks (an expired
     // head can never be renewed). Refuses registry startup, fail-loud.

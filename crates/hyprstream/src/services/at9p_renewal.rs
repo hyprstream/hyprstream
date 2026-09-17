@@ -220,23 +220,67 @@ pub(crate) fn renew_due_service_identities(
         }
     }
     // BTreeMap iteration is deterministic ('#' sorts before alphanumerics).
+    // Failure isolation: a service whose key is missing/corrupt/mismatched or
+    // whose identity is terminal must not starve the identities ordered
+    // after it — the deterministic order would otherwise skip the SAME later
+    // services on every retry until they expire, where renewal is impossible.
+    // Every service is attempted; the first error is reported (with the
+    // failure count) only after the loop, and the roster export below still
+    // fails closed because a failed service cannot be verified.
     let mut admitted = Vec::with_capacity(service_epochs.len());
+    let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
     for (service_id, epoch_before) in &service_epochs {
         let name = service_id.strip_prefix('#').unwrap_or(service_id);
-        let key =
-            load_existing_service_signing_key(secrets_dir, name, SecretsProfile::SharedDirectory)
-                .with_context(|| format!("loading existing signing key for service {name}"))?;
-        let state = provision_one(store, ingest, name, &key, now, valid_for_seconds)
-            .with_context(|| format!("renewing service identity for {name}"))?;
-        if state.epoch > *epoch_before {
-            tracing::info!(
-                service = name,
-                did = %state.did,
-                epoch = state.epoch,
-                "at9p service identity renewed"
-            );
+        let attempt = (|| -> Result<(SigningKey, AcceptedAt9pState)> {
+            let key = load_existing_service_signing_key(
+                secrets_dir,
+                name,
+                SecretsProfile::SharedDirectory,
+            )
+            .with_context(|| format!("loading existing signing key for service {name}"))?;
+            let state = provision_one(store, ingest, name, &key, now, valid_for_seconds)
+                .with_context(|| format!("renewing service identity for {name}"))?;
+            Ok((key, state))
+        })();
+        match attempt {
+            Ok((key, state)) => {
+                if state.epoch > *epoch_before {
+                    tracing::info!(
+                        service = name,
+                        did = %state.did,
+                        epoch = state.epoch,
+                        "at9p service identity renewed"
+                    );
+                }
+                admitted.push((name.to_owned(), key, state));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    service = name,
+                    %error,
+                    "at9p service-identity renewal failed for this service; continuing"
+                );
+                failures.push((name.to_owned(), error));
+            }
         }
-        admitted.push((name.to_owned(), key, state));
+    }
+    if !failures.is_empty() {
+        let failure_count = failures.len();
+        let failed = failures
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (_, error) = failures.swap_remove(0);
+        return Err(error).with_context(|| {
+            format!(
+                "{} of {} service identities failed renewal ({}); the healthy \
+                 identities were still renewed",
+                failure_count,
+                service_epochs.len(),
+                failed
+            )
+        });
     }
     Ok(admitted)
 }
@@ -433,6 +477,65 @@ mod tests {
             .any(|k| { k.ed25519_pub.as_slice() == key.verifying_key().to_bytes().as_slice() }));
         // All-or-nothing export: the failed tick publishes no roster.
         assert!(!roster.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn renewal_tick_continues_past_a_failing_service() -> Result<()> {
+        let (_dir, store, ingest, secrets, _key, now) = provisioned_fixture(600)?;
+        // #event orders before #model and its key is replaced: the loop must
+        // still attempt #model (deterministic order would otherwise starve
+        // every later identity on every retry until it expires unrenewably).
+        let wrong = SigningKey::from_bytes(&[0x76; 32]);
+        write_service_key(secrets.path(), "event", &wrong)?;
+        let out = tempfile::tempdir()?;
+        let roster = out.path().join("roster.json");
+        let later = now + Duration::seconds(301);
+        let error = renewal_tick(&store, &ingest, secrets.path(), 900, Some(&roster), later)
+            .expect_err("failing service must still fail the tick");
+        let chained = format!("{error:#}");
+        assert!(chained.contains("hybrid key does not match"), "{chained}");
+        assert!(
+            chained.contains("healthy identities were still renewed"),
+            "summary must say the healthy services were renewed: {chained}"
+        );
+        let states = sorted_states(&store)?;
+        let model = states
+            .iter()
+            .find(|state| state.current.services.iter().any(|e| e.id == "#model"))
+            .expect("model state");
+        assert_eq!(model.epoch, 2, "model must renew past the failing event");
+        let event = states
+            .iter()
+            .find(|state| state.current.services.iter().any(|e| e.id == "#event"))
+            .expect("event state");
+        assert_eq!(event.epoch, 1, "event refusal leaves it untouched");
+        // The export still fails closed.
+        assert!(!roster.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn renewal_tick_export_survives_a_stale_predictable_temp_sibling() -> Result<()> {
+        let (_dir, store, ingest, secrets, _key, now) = provisioned_fixture(86_400)?;
+        let out = tempfile::tempdir()?;
+        let roster = out.path().join("roster.json");
+        // A prior writer crashed after creating the PREDICTABLE temp name
+        // this process would use (same pid — e.g. PID 1 in a container): the
+        // periodic export's attempt-unique name must not collide with it.
+        let stale = out
+            .path()
+            .join(format!(".roster.json.tmp-{}", std::process::id()));
+        std::fs::write(&stale, b"interrupted earlier attempt")?;
+        renewal_tick(&store, &ingest, secrets.path(), 86_400, Some(&roster), now)?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&roster)?)?;
+        assert_eq!(parsed["services"].as_array().expect("services").len(), 2);
+        assert_eq!(
+            std::fs::read(&stale)?,
+            b"interrupted earlier attempt",
+            "the foreign leftover is never cleanup scope"
+        );
         Ok(())
     }
 
