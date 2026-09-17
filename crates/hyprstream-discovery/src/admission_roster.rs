@@ -100,7 +100,11 @@ where
 /// TTL-bounded cached roster projection (the
 /// `resolve_tenant_for_hosted_did` shape): lookups serve a snapshot for at
 /// most [`ROSTER_CACHE_TTL`], then one refresh runs while concurrent lookups
-/// keep serving the current snapshot (single-flight under the cache mutex).
+/// keep serving the current snapshot. The store scan happens OUTSIDE every
+/// lock a reader takes: the refresher holds only the refresh mutex, and the
+/// snapshot mutex is touched just long enough to read or swap an `Arc` — a
+/// slow scan (a store enlarged through public ingestion) never blocks the
+/// 100 ms currentness ticks of live sessions.
 ///
 /// A refresh that fails loads an EMPTY roster — fail-closed, exactly like an
 /// uncached read failure — and a previously loaded snapshot is never
@@ -109,7 +113,13 @@ where
 /// the first lookup is a fresh load.
 pub struct CachedRoster {
     load: Arc<dyn Fn() -> Vec<RosterEntry> + Send + Sync>,
+    /// `(refreshed_at, snapshot)`; guarded only for the instant of a read or
+    /// a swap — never across a store scan.
     snapshot: parking_lot::Mutex<Option<(std::time::Instant, Arc<Vec<RosterEntry>>)>>,
+    /// Held for the duration of one refresh. Readers try-lock it: whoever
+    /// wins performs the load (outside every other lock); everyone else
+    /// keeps serving the current snapshot instead of blocking on the scan.
+    refresh: parking_lot::Mutex<()>,
     ttl: std::time::Duration,
 }
 
@@ -127,22 +137,49 @@ impl CachedRoster {
         Self {
             load,
             snapshot: parking_lot::Mutex::new(None),
+            refresh: parking_lot::Mutex::new(()),
             ttl,
         }
     }
 
-    fn current(&self) -> Arc<Vec<RosterEntry>> {
-        let mut guard = self.snapshot.lock();
-        if let Some((refreshed_at, entries)) = guard.as_ref() {
-            if refreshed_at.elapsed() <= self.ttl {
-                return Arc::clone(entries);
+    fn fresh(&self) -> Option<Arc<Vec<RosterEntry>>> {
+        let guard = self.snapshot.lock();
+        match guard.as_ref() {
+            Some((refreshed_at, entries)) if refreshed_at.elapsed() <= self.ttl => {
+                Some(Arc::clone(entries))
             }
+            _ => None,
         }
-        // Single-flight: everyone races to this mutex; the loser re-checks
-        // the snapshot after acquiring and serves the winner's refresh.
-        let entries = Arc::new((self.load)());
-        *guard = Some((std::time::Instant::now(), Arc::clone(&entries)));
-        entries
+    }
+
+    fn current(&self) -> Arc<Vec<RosterEntry>> {
+        if let Some(entries) = self.fresh() {
+            return entries;
+        }
+        // Expired (or never loaded). Try to become the refresher without
+        // blocking anyone: the load runs while holding ONLY the refresh
+        // mutex, so concurrent lookups keep serving the current snapshot.
+        if let Some(_refreshing) = self.refresh.try_lock() {
+            // Double-check after winning: a refresh may have completed while
+            // we raced to the lock.
+            if let Some(entries) = self.fresh() {
+                return entries;
+            }
+            let entries = Arc::new((self.load)());
+            *self.snapshot.lock() = Some((std::time::Instant::now(), Arc::clone(&entries)));
+            return entries;
+        }
+        // Another thread is mid-refresh: serve the current snapshot rather
+        // than block on the scan. Only the never-loaded case must wait.
+        if let Some((_, entries)) = self.snapshot.lock().as_ref() {
+            return Arc::clone(entries);
+        }
+        let _refreshed = self.refresh.lock();
+        let guard = self.snapshot.lock();
+        guard
+            .as_ref()
+            .map(|(_, entries)| Arc::clone(entries))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 }
 
@@ -528,6 +565,44 @@ mod tests {
         assert_eq!(cold.roster().len(), 1);
         states.write().clear();
         assert_eq!(cold.roster().len(), 1, "long-TTL cache must keep serving the snapshot");
+    }
+
+    /// A refresh in progress must not block concurrent lookups: readers
+    /// keep serving the current snapshot while the (here deliberately slow)
+    /// loader runs (review round 4).
+    #[test]
+    fn cached_roster_readers_do_not_block_on_a_slow_refresh() {
+        let states: Arc<parking_lot::RwLock<Vec<RosterEntry>>> =
+            Arc::new(parking_lot::RwLock::new(vec![(
+                "did:at9p:event".to_owned(),
+                state(&["#event"]),
+            )]));
+        let load = {
+            let states = Arc::clone(&states);
+            Arc::new(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                states.read().clone()
+            }) as Arc<dyn Fn() -> Vec<RosterEntry> + Send + Sync>
+        };
+        let roster = Arc::new(CachedRoster::new(load, std::time::Duration::from_millis(1)));
+        // Prime the cache, then let the TTL lapse.
+        assert_eq!(roster.current().len(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // One thread starts the slow refresh; 50 ms in, a concurrent lookup
+        // must return the OLD snapshot without waiting for the scan.
+        let refresher = {
+            let roster = Arc::clone(&roster);
+            std::thread::spawn(move || roster.current())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        let served = roster.current();
+        assert_eq!(served.len(), 1, "reader must serve the current snapshot");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "concurrent lookup blocked on the in-flight refresh scan"
+        );
+        refresher.join().expect("refresh thread");
     }
 
     #[test]
