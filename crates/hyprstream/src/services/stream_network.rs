@@ -16,9 +16,18 @@ use std::sync::Arc;
 /// everything else — foreign records, ambiguous names — unresolved/deny. No
 /// DID-valued config to go stale at identity churn.
 pub fn production_stream_admission() -> Result<Arc<MoqlAdmissionAuthenticator>> {
+    let roster = hyprstream_discovery::production_deployment_roster()?;
+    // Prime the cache HERE, synchronously at construction (service startup,
+    // before any runtime serves peers): without this, the first MoQL peer
+    // would pay the synchronous first load — RocksDB open + full store
+    // verification — on the current-thread serving runtime (review round 6).
+    // The Event and standalone-Streams spawn paths prime via their
+    // self-binding checks; this constructor feeds the generic spawner path
+    // (main.rs QuicSharedConfig), which has no such check.
+    let _ = roster.roster();
     Ok(stream_admission_over(
         hyprstream_discovery::production_moql_accepted_state_authority()?,
-        hyprstream_discovery::production_deployment_roster()?,
+        roster,
     ))
 }
 
