@@ -2371,14 +2371,20 @@ impl At9pRenewalConfig {
     }
 
     /// Cross-validated (check interval, renewal TTL) pair: the check interval
-    /// must stay strictly below half the TTL. Liveness argument: an identity
-    /// minted at T with TTL V becomes due at T + V/2; ticks fire every i, so
-    /// the first due tick lands by T + V/2 + i with remaining life V/2 - i —
-    /// positive only while i < V/2. At i ≥ V/2 a schedule exists where the
-    /// head expires before any due tick, and an expired accepted head can
-    /// never be renewed (admission requires a fresh predecessor). Refuses at
-    /// registry startup rather than renewing too slowly to matter.
+    /// must stay strictly below half the TTL AND below the host-side roster
+    /// freshness window (24 h). Liveness argument: an identity minted at T
+    /// with TTL V becomes due at T + V/2; ticks fire every i, so the first
+    /// due tick lands by T + V/2 + i with remaining life V/2 - i — positive
+    /// only while i < V/2. At i ≥ V/2 a schedule exists where the head
+    /// expires before any due tick, and an expired accepted head can never be
+    /// renewed (admission requires a fresh predecessor). The roster freshness
+    /// bound: the projection's `generated_at` refreshes only on a tick, and
+    /// host-side monitoring flags `roster_stale` once it ages past 24 h, so
+    /// an interval of a day or more would report a healthy loop as stale —
+    /// breaking the documented "stale roster means the timer died" signal.
+    /// Refuses at registry startup rather than renewing too slowly to matter.
     pub fn validated(&self) -> anyhow::Result<(std::time::Duration, i64)> {
+        const ROSTER_FRESHNESS_WINDOW_SECS: u64 = 86_400;
         let ttl = self.valid_for_seconds()?;
         let interval = self.check_interval();
         let half_ttl = u64::try_from(ttl / 2).unwrap_or(0);
@@ -2391,6 +2397,15 @@ impl At9pRenewalConfig {
             interval.as_secs(),
             ttl,
             half_ttl
+        );
+        anyhow::ensure!(
+            interval.as_secs() < ROSTER_FRESHNESS_WINDOW_SECS,
+            "[registry.at9p_renewal] check_interval_secs ({}) must be < {}: the roster \
+             projection's generated_at refreshes only on a tick and host-side \
+             monitoring flags roster_stale past 24 h, so a day-or-slower tick \
+             would report a healthy timer as stale",
+            interval.as_secs(),
+            ROSTER_FRESHNESS_WINDOW_SECS
         );
         Ok((interval, ttl))
     }
@@ -3548,6 +3563,29 @@ mod tests {
             Err(error) => panic!("inside window: {error}"),
         };
         assert_eq!(inside_interval.as_secs(), 299);
+        // A two-day interval satisfies the half-TTL bound against the 90 d
+        // default but starves the roster freshness signal: the projection's
+        // generated_at refreshes only on a tick, and host-side monitoring
+        // flags roster_stale past 24 h — refuse at or above a day.
+        let slow_but_renewable = At9pRenewalConfig {
+            check_interval_secs: Some(2 * 86_400),
+            ..Default::default()
+        };
+        let error = match slow_but_renewable.validated() {
+            Ok(_) => panic!("two-day interval must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("roster_stale"), "{error}");
+        let day_boundary = At9pRenewalConfig {
+            check_interval_secs: Some(86_400),
+            ..Default::default()
+        };
+        assert!(day_boundary.validated().is_err());
+        let just_under_a_day = At9pRenewalConfig {
+            check_interval_secs: Some(86_399),
+            ..Default::default()
+        };
+        assert!(just_under_a_day.validated().is_ok());
         // Out-of-range TTL is still refused by the clamp validation.
         let bad_ttl = At9pRenewalConfig {
             valid_for_secs: Some(MAX_SERVICE_IDENTITY_TTL_SECS + 1),
