@@ -176,6 +176,33 @@ fn admitted_with_rotation(
     Ok((current, advanced))
 }
 
+/// Poll the production (TTL-cached, background-refreshed) roster until `did`
+/// resolves to `expect`, bounding the wait at the cache's worst-case
+/// visibility delay (TTL + one scan). Admission follows store changes within
+/// that bound by design; the e2e assertions below must converge on it.
+fn wait_for_roster_resolution(
+    roster: &Arc<dyn crate::admission_roster::DeploymentRosterSource>,
+    did: &str,
+    expect: Option<&str>,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let snapshot = roster.roster();
+        let resolved = crate::admission_roster::roster_service_name(
+            &snapshot,
+            did,
+            hyprstream_rpc::envelope::current_timestamp(),
+        );
+        if resolved.as_deref() == expect {
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("cached roster did not converge for {did}: expected {expect:?}, got {resolved:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -292,7 +319,8 @@ async fn roundtrip() -> Result<()> {
     // config tenant map: the "streams"/"reader" capsule service entries
     // resolve through the admission-only test factory roster registered in
     // admission_roster's tests (same test binary).
-    let resolver = crate::admission_roster::derived_tenant_resolver(production_deployment_roster()?);
+    let roster = production_deployment_roster()?;
+    let resolver = crate::admission_roster::derived_tenant_resolver(Arc::clone(&roster));
     let server_identity = public_identity(&server_state, &server_signer)?;
     let server_identity_proof = MoqlServerIdentityProof {
         identity: server_identity.clone(),
@@ -478,6 +506,10 @@ async fn roundtrip() -> Result<()> {
     remove_test_state(&store, &client_state)?;
     remove_test_state(&store, &advanced_client_state)?;
     write_test_state(&store, &successor_state, &registry)?;
+    // The production roster source is TTL-cached with background refresh:
+    // wait for the churn to become visible (bounded, <= TTL + one scan)
+    // before asserting admission follows it.
+    wait_for_roster_resolution(&roster, &successor_state.did, Some("reader"))?;
 
     let stale_client = client(0x37).await?;
     let stale_connection = stale_client.connect(direct(&server), ALPN_MOQ_LITE).await?;
@@ -519,6 +551,7 @@ async fn roundtrip() -> Result<()> {
     let squatter_signer = SigningKey::from_bytes(&[0x79; 32]);
     let squatter_state = admitted("reader", &squatter_signer)?;
     write_test_state(&store, &squatter_state, &registry)?;
+    wait_for_roster_resolution(&roster, &successor_state.did, None)?;
     for (label, squatter_proof_state, signer) in [
         ("genuine", &successor_state, &reinit_signer),
         ("squatter", &squatter_state, &squatter_signer),
@@ -540,6 +573,7 @@ async fn roundtrip() -> Result<()> {
         deny_client.shutdown().await?;
     }
     remove_test_state(&store, &squatter_state)?;
+    wait_for_roster_resolution(&roster, &successor_state.did, Some("reader"))?;
     let restored_client = client(0x3B).await?;
     let restored_connection = restored_client.connect(direct(&server), ALPN_MOQ_LITE).await?;
     prove_moql_admission(

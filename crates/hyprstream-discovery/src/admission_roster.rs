@@ -97,14 +97,21 @@ where
     }
 }
 
+/// The cached slot: `(refreshed_at, snapshot)`, lock-shared with the
+/// background refresher thread.
+type RosterSlot = parking_lot::Mutex<Option<(std::time::Instant, Arc<Vec<RosterEntry>>)>>;
+
 /// TTL-bounded cached roster projection (the
 /// `resolve_tenant_for_hosted_did` shape): lookups serve a snapshot for at
 /// most [`ROSTER_CACHE_TTL`], then one refresh runs while concurrent lookups
-/// keep serving the current snapshot. The store scan happens OUTSIDE every
-/// lock a reader takes: the refresher holds only the refresh mutex, and the
-/// snapshot mutex is touched just long enough to read or swap an `Arc` — a
-/// slow scan (a store enlarged through public ingestion) never blocks the
-/// 100 ms currentness ticks of live sessions.
+/// keep serving the current snapshot. After the synchronous first load
+/// (spawn path — data must exist before serving), every refresh runs on a
+/// background thread and publishes atomically: the loader opens RocksDB and
+/// verifies every state, the 100 ms currentness watchdog reaches lookups
+/// from async current-thread runtimes, and public ingestion can amplify the
+/// store — so no runtime thread ever executes the scan. Readers never take
+/// a lock across a scan; the snapshot mutex is touched only long enough to
+/// read or swap an `Arc`.
 ///
 /// A refresh that fails loads an EMPTY roster — fail-closed, exactly like an
 /// uncached read failure — and a previously loaded snapshot is never
@@ -113,14 +120,25 @@ where
 /// the first lookup is a fresh load.
 pub struct CachedRoster {
     load: Arc<dyn Fn() -> Vec<RosterEntry> + Send + Sync>,
-    /// `(refreshed_at, snapshot)`; guarded only for the instant of a read or
-    /// a swap — never across a store scan.
-    snapshot: parking_lot::Mutex<Option<(std::time::Instant, Arc<Vec<RosterEntry>>)>>,
-    /// Held for the duration of one refresh. Readers try-lock it: whoever
-    /// wins performs the load (outside every other lock); everyone else
-    /// keeps serving the current snapshot instead of blocking on the scan.
-    refresh: parking_lot::Mutex<()>,
+    /// Guarded only for the instant of a read or a swap — never across a
+    /// store scan. Shared with the background refresher thread.
+    snapshot: Arc<RosterSlot>,
+    /// Single-flight gate for refreshes. Cleared by [`RefreshGate`]'s Drop,
+    /// which runs even if the refresher panics, so a failed refresh can
+    /// never wedge the cache stale forever.
+    refreshing: Arc<std::sync::atomic::AtomicBool>,
     ttl: std::time::Duration,
+}
+
+/// Owns the refreshing gate for the duration of one refresh; Drop releases
+/// it on normal exit AND on panic (the background thread's closure drops
+/// its locals when it unwinds).
+struct RefreshGate(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for RefreshGate {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// How long a roster snapshot is served before the next lookup refreshes it.
@@ -136,8 +154,8 @@ impl CachedRoster {
     ) -> Self {
         Self {
             load,
-            snapshot: parking_lot::Mutex::new(None),
-            refresh: parking_lot::Mutex::new(()),
+            snapshot: Arc::new(parking_lot::Mutex::new(None)),
+            refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ttl,
         }
     }
@@ -152,34 +170,75 @@ impl CachedRoster {
         }
     }
 
+    fn stored(&self) -> Option<Arc<Vec<RosterEntry>>> {
+        self.snapshot.lock().as_ref().map(|(_, e)| Arc::clone(e))
+    }
+
     fn current(&self) -> Arc<Vec<RosterEntry>> {
         if let Some(entries) = self.fresh() {
             return entries;
         }
         // Expired (or never loaded). Try to become the refresher without
-        // blocking anyone: the load runs while holding ONLY the refresh
-        // mutex, so concurrent lookups keep serving the current snapshot.
-        if let Some(_refreshing) = self.refresh.try_lock() {
+        // blocking anyone.
+        if !self
+            .refreshing
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
             // Double-check after winning: a refresh may have completed while
-            // we raced to the lock.
+            // we raced to the gate.
             if let Some(entries) = self.fresh() {
+                self.refreshing
+                    .store(false, std::sync::atomic::Ordering::Release);
                 return entries;
             }
-            let entries = Arc::new((self.load)());
-            *self.snapshot.lock() = Some((std::time::Instant::now(), Arc::clone(&entries)));
+            // First-ever load runs synchronously: the spawn-time callers
+            // (self-binding, publisher roster) MUST have data before the
+            // service starts serving, and at this point no sessions exist
+            // that an inline scan could stall.
+            let gate = RefreshGate(Arc::clone(&self.refreshing));
+            if self.stored().is_none() {
+                let entries = Arc::new((self.load)());
+                *self.snapshot.lock() =
+                    Some((std::time::Instant::now(), Arc::clone(&entries)));
+                drop(gate);
+                return entries;
+            }
+            // Subsequent refreshes run on a background thread and publish
+            // atomically: the loader opens RocksDB and verifies every state,
+            // and the 100 ms currentness watchdog reaches this from async
+            // current-thread runtimes — an inline scan would stall all
+            // network I/O of the service for the scan duration, once per
+            // TTL, on a store whose size public ingestion can amplify. The
+            // caller keeps the (≤ TTL + one scan) stale snapshot meanwhile.
+            let load = Arc::clone(&self.load);
+            let snapshot = Arc::clone(&self.snapshot);
+            std::thread::spawn(move || {
+                let entries = Arc::new((load)());
+                *snapshot.lock() = Some((std::time::Instant::now(), entries));
+                drop(gate);
+            });
+            // Unreachable in practice (checked stored() above); fail-closed
+            // rather than panic if raced.
+            return self.stored().unwrap_or_else(|| Arc::new(Vec::new()));
+        }
+        // Another refresh is in flight: serve the current snapshot rather
+        // than block on the scan. Only the never-loaded case (synchronous
+        // first load at spawn) waits, bounded.
+        if let Some(entries) = self.stored() {
             return entries;
         }
-        // Another thread is mid-refresh: serve the current snapshot rather
-        // than block on the scan. Only the never-loaded case must wait.
-        if let Some((_, entries)) = self.snapshot.lock().as_ref() {
-            return Arc::clone(entries);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.stored().is_none() {
+            if !self.refreshing.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                // Fail-closed, like every other unavailable-roster path.
+                return Arc::new(Vec::new());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let _refreshed = self.refresh.lock();
-        let guard = self.snapshot.lock();
-        guard
-            .as_ref()
-            .map(|(_, entries)| Arc::clone(entries))
-            .unwrap_or_else(|| Arc::new(Vec::new()))
+        self.stored().unwrap_or_else(|| Arc::new(Vec::new()))
     }
 }
 
@@ -549,14 +608,23 @@ mod tests {
             Arc::new(move || states.read().clone()) as Arc<dyn Fn() -> Vec<RosterEntry> + Send + Sync>
         };
         let now = hyprstream_rpc::envelope::current_timestamp();
-        // Zero TTL: every lookup refreshes — churn is visible immediately.
+        // Zero TTL: the first lookup loads synchronously; later refreshes
+        // run in the background and publish — churn becomes visible after at
+        // most one async load (bounded poll here; the loader is instant).
         let hot = CachedRoster::new(Arc::clone(&load), std::time::Duration::ZERO);
         assert_eq!(
             roster_tenant(&hot.roster(), "did:at9p:event", now).as_deref(),
             Some(LOCAL_TENANT)
         );
         states.write().clear();
-        assert_eq!(hot.roster().len(), 0, "zero-TTL cache must observe the wipe");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !hot.roster().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "zero-TTL cache never observed the wipe"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         // Long TTL: the snapshot is served as-is until it expires — the
         // polling recheck path trades bounded staleness for not re-verifying
         // the whole store at 10 Hz per session.
@@ -567,42 +635,55 @@ mod tests {
         assert_eq!(cold.roster().len(), 1, "long-TTL cache must keep serving the snapshot");
     }
 
-    /// A refresh in progress must not block concurrent lookups: readers
-    /// keep serving the current snapshot while the (here deliberately slow)
-    /// loader runs (review round 4).
+    /// A refresh in progress must not block concurrent lookups, and after
+    /// the first load the scan never runs inline on the caller: the caller
+    /// keeps serving the current snapshot while a background thread loads
+    /// and publishes atomically (review rounds 4 and 5).
     #[test]
-    fn cached_roster_readers_do_not_block_on_a_slow_refresh() {
-        let states: Arc<parking_lot::RwLock<Vec<RosterEntry>>> =
-            Arc::new(parking_lot::RwLock::new(vec![(
-                "did:at9p:event".to_owned(),
-                state(&["#event"]),
-            )]));
+    fn cached_roster_readers_never_block_and_refreshes_run_in_background() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let load = {
-            let states = Arc::clone(&states);
+            let calls = Arc::clone(&calls);
             Arc::new(move || {
                 std::thread::sleep(std::time::Duration::from_millis(300));
-                states.read().clone()
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                vec![("did:at9p:event".to_owned(), state(&["#event"])); n]
             }) as Arc<dyn Fn() -> Vec<RosterEntry> + Send + Sync>
         };
         let roster = Arc::new(CachedRoster::new(load, std::time::Duration::from_millis(1)));
-        // Prime the cache, then let the TTL lapse.
+        // First load is synchronous (spawn-path semantics): one call, len 1.
         assert_eq!(roster.current().len(), 1);
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        // One thread starts the slow refresh; 50 ms in, a concurrent lookup
-        // must return the OLD snapshot without waiting for the scan.
-        let refresher = {
-            let roster = Arc::clone(&roster);
-            std::thread::spawn(move || roster.current())
-        };
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::thread::sleep(std::time::Duration::from_millis(10)); // TTL lapses
+        // Expired lookup schedules the refresh on a background thread and
+        // returns the stale snapshot IMMEDIATELY — the 300 ms scan must not
+        // run on this (simulated runtime) thread.
         let started = std::time::Instant::now();
         let served = roster.current();
-        assert_eq!(served.len(), 1, "reader must serve the current snapshot");
+        assert_eq!(served.len(), 1, "caller must serve the stale snapshot");
         assert!(
             started.elapsed() < std::time::Duration::from_millis(200),
+            "expired lookup ran the slow scan inline"
+        );
+        // A concurrent lookup during the in-flight refresh also serves the
+        // stale snapshot without blocking.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        assert_eq!(roster.current().len(), 1);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
             "concurrent lookup blocked on the in-flight refresh scan"
         );
-        refresher.join().expect("refresh thread");
+        // The background refresh publishes; the next lookup observes it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+        while roster.current().len() != 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background refresh never published"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
