@@ -81,6 +81,8 @@ pub mod mcp_service;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod at9p_verify;
+#[cfg(feature = "rocksdb")]
+pub mod at9p_renewal;
 pub mod ninep_bridge;
 pub mod model;
 pub mod oauth;

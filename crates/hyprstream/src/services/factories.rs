@@ -1377,10 +1377,57 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         // no writer-local re-sign callback is needed, which keeps `--ipc`
         // rotation viable when OAuth and registry run in different processes.
         let publisher_arc = Arc::new(publisher);
+        spawn_registry_at9p_renewal(&publisher_arc, &config)?;
         registry_service = registry_service.with_pds_publisher_arc(publisher_arc);
     }
 
     Ok(ctx.into_spawnable_quic(registry_service, config.registry.quic_port))
+}
+
+/// Spawn the in-daemon at9p service-identity renewal timer (design O-Ia: the
+/// registry process renews every sibling identity itself, loading each
+/// service's on-volume key from the shared credentials volume the deployment
+/// mounts wholesale). Spawned only when PDS publisher construction succeeded
+/// — that construction already established the deployment posture (registry
+/// key matches the authenticated deployment verifier; the read-write store
+/// and daemon-owned ingest are open).
+///
+/// The timer reuses the publisher's LIVE handles (never re-opens the store:
+/// the RocksDB directory LOCK excludes the second read-write opener this
+/// process already is) and holds the publisher by weak reference so it cannot
+/// outlive the service (a strong handle would pin the directory LOCK and
+/// block an in-process registry restart). It never re-authenticates the
+/// deployment credential per tick — the credential/UCAN binds at process
+/// starts — so the timer renews for the lifetime of this process, and
+/// restarts still gate on the deployment credential.
+#[cfg(feature = "rocksdb")]
+fn spawn_registry_at9p_renewal(
+    publisher: &Arc<crate::services::discovery::PdsPublisher>,
+    config: &crate::config::HyprConfig,
+) -> anyhow::Result<()> {
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+    let valid_for_seconds = config.registry.at9p_renewal.valid_for_seconds()?;
+    let roster_export = config
+        .registry
+        .at9p_renewal
+        .roster_export
+        .clone()
+        .or_else(crate::services::at9p_renewal::default_roster_export_path);
+    if roster_export.is_none() {
+        tracing::warn!(
+            "at9p renewal: no roster export path resolved; the roster projection will not refresh"
+        );
+    }
+    // Dropping the handle detaches the timer; it exits on its own when the
+    // publisher drops (Weak) or the process runtime shuts down.
+    std::mem::drop(crate::services::at9p_renewal::spawn_at9p_renewal_task(
+        Arc::clone(publisher),
+        secrets_dir,
+        config.registry.at9p_renewal.check_interval(),
+        valid_for_seconds,
+        roster_export,
+    ));
+    Ok(())
 }
 
 /// Fail-closed twin: without the `rocksdb` feature there is no
