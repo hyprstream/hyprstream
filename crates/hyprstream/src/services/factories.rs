@@ -1406,7 +1406,10 @@ fn spawn_registry_at9p_renewal(
     config: &crate::config::HyprConfig,
 ) -> anyhow::Result<()> {
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
-    let valid_for_seconds = config.registry.at9p_renewal.valid_for_seconds()?;
+    // Cross-validated: the check interval must stay below half the TTL or a
+    // schedule exists where an identity expires between due ticks (an expired
+    // head can never be renewed). Refuses registry startup, fail-loud.
+    let (check_interval, valid_for_seconds) = config.registry.at9p_renewal.validated()?;
     let roster_export = config
         .registry
         .at9p_renewal
@@ -1423,7 +1426,7 @@ fn spawn_registry_at9p_renewal(
     std::mem::drop(crate::services::at9p_renewal::spawn_at9p_renewal_task(
         Arc::clone(publisher),
         secrets_dir,
-        config.registry.at9p_renewal.check_interval(),
+        check_interval,
         valid_for_seconds,
         roster_export,
     ));

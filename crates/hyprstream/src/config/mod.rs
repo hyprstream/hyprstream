@@ -2369,6 +2369,31 @@ impl At9pRenewalConfig {
         );
         Ok(ttl)
     }
+
+    /// Cross-validated (check interval, renewal TTL) pair: the check interval
+    /// must stay strictly below half the TTL. Liveness argument: an identity
+    /// minted at T with TTL V becomes due at T + V/2; ticks fire every i, so
+    /// the first due tick lands by T + V/2 + i with remaining life V/2 - i —
+    /// positive only while i < V/2. At i ≥ V/2 a schedule exists where the
+    /// head expires before any due tick, and an expired accepted head can
+    /// never be renewed (admission requires a fresh predecessor). Refuses at
+    /// registry startup rather than renewing too slowly to matter.
+    pub fn validated(&self) -> anyhow::Result<(std::time::Duration, i64)> {
+        let ttl = self.valid_for_seconds()?;
+        let interval = self.check_interval();
+        let half_ttl = u64::try_from(ttl / 2).unwrap_or(0);
+        anyhow::ensure!(
+            interval.as_secs() < half_ttl,
+            "[registry.at9p_renewal] check_interval_secs ({}) must be < half of \
+             valid_for_secs ({}/2 = {}): a slower tick lets an identity pass its \
+             half-TTL window and expire before renewal, and an expired head has \
+             no authorized successor path",
+            interval.as_secs(),
+            ttl,
+            half_ttl
+        );
+        Ok((interval, ttl))
+    }
 }
 
 /// Policy service configuration.
@@ -3482,6 +3507,54 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn at9p_renewal_interval_must_outrun_half_ttl() {
+        // Defaults: 6 h check vs 90 d TTL — comfortably inside the window.
+        let defaults = At9pRenewalConfig::default();
+        let (interval, ttl) = match defaults.validated() {
+            Ok(pair) => pair,
+            Err(error) => panic!("defaults validate: {error}"),
+        };
+        assert_eq!(interval.as_secs(), 6 * 3600);
+        assert_eq!(ttl, MAX_SERVICE_IDENTITY_TTL_SECS);
+        // Minimum supported TTL (600 s → half = 300 s) with the default 6 h
+        // interval lets an identity expire between due ticks: refuse.
+        let slow = At9pRenewalConfig {
+            valid_for_secs: Some(MIN_SERVICE_IDENTITY_TTL_SECS),
+            ..Default::default()
+        };
+        let error = match slow.validated() {
+            Ok(_) => panic!("6h check vs 10m TTL must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("half of valid_for_secs"), "{error}");
+        // Interval at exactly half the TTL still leaves a schedule where the
+        // head expires on the tick boundary: refuse strictly below only.
+        let boundary = At9pRenewalConfig {
+            valid_for_secs: Some(600),
+            check_interval_secs: Some(300),
+            ..Default::default()
+        };
+        assert!(boundary.validated().is_err());
+        // One second inside the window renews with positive remaining life.
+        let inside = At9pRenewalConfig {
+            valid_for_secs: Some(600),
+            check_interval_secs: Some(299),
+            ..Default::default()
+        };
+        let (inside_interval, _) = match inside.validated() {
+            Ok(pair) => pair,
+            Err(error) => panic!("inside window: {error}"),
+        };
+        assert_eq!(inside_interval.as_secs(), 299);
+        // Out-of-range TTL is still refused by the clamp validation.
+        let bad_ttl = At9pRenewalConfig {
+            valid_for_secs: Some(MAX_SERVICE_IDENTITY_TTL_SECS + 1),
+            ..Default::default()
+        };
+        assert!(bad_ttl.validated().is_err());
+    }
 
     #[cfg(feature = "pds-postgres")]
     fn rds_fixture(url: &str) -> (tempfile::TempDir, RdsConfig) {
