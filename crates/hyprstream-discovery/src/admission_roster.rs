@@ -30,7 +30,9 @@
 //!   `project_bootstrap_endpoint`'s ambiguity rule, applied per lookup;
 //! - the deriving state must carry the deployment invariants the offline
 //!   provisioner guarantees and foreign genesis-only records lack: successor
-//!   epoch (`epoch > 0`) and a bounded expiry.
+//!   epoch (`epoch > 0`) and a bounded expiry that has not lapsed (an expired
+//!   state — genuine or foreign — never derives and never counts toward
+//!   uniqueness).
 //!
 //! Residual (deliberate, flagged in #1652): if a deployment name has NO
 //! genuine accepted state (decommissioned service) and an attacker ingests a
@@ -42,11 +44,14 @@
 //! provisioner-signed roster the admission path can verify — a maintainer
 //! design decision recorded in #1652, not something this change invents.
 //!
-//! Resolution enumerates the store per lookup (roster-sized: the deployment
-//! roster plus foreign records) through the same verification as the per-DID
-//! admission read, and the live-session recheck re-runs it, so roster changes
-//! — renewal, churn, revocation, or a new squatter — are all effective
-//! without restart.
+//! Resolution enumerates the store's verified states through the same
+//! verification as the per-DID admission read, behind a TTL cache
+//! ([`CachedRoster`]): the live-session recheck runs every 100 ms per session,
+//! so the polling path serves a bounded-stale snapshot instead of re-verifying
+//! the whole store at 10 Hz per session. Revocation by state REMOVAL stays
+//! immediate (the per-DID admission authority recheck is uncached); the cache
+//! bounds only how quickly roster-side changes — churn re-binding, name
+//! reassignment, squatter arrival — become visible (≤ TTL).
 //!
 //! This mirrors the hosted-account tenant index
 //! (`HostedAccountStore::resolve_tenant_for_hosted_did`) and the
@@ -88,6 +93,61 @@ where
     }
 }
 
+/// TTL-bounded cached roster projection (the
+/// `resolve_tenant_for_hosted_did` shape): lookups serve a snapshot for at
+/// most [`ROSTER_CACHE_TTL`], then one refresh runs while concurrent lookups
+/// keep serving the current snapshot (single-flight under the cache mutex).
+///
+/// A refresh that fails loads an EMPTY roster — fail-closed, exactly like an
+/// uncached read failure — and a previously loaded snapshot is never
+/// resurrected after a failure (that would delay revocation beyond the TTL).
+/// Spawn-time checks ride the same cache; at process start it is empty, so
+/// the first lookup is a fresh load.
+pub struct CachedRoster {
+    load: Arc<dyn Fn() -> Vec<RosterEntry> + Send + Sync>,
+    snapshot: parking_lot::Mutex<Option<(std::time::Instant, Arc<Vec<RosterEntry>>)>>,
+    ttl: std::time::Duration,
+}
+
+/// How long a roster snapshot is served before the next lookup refreshes it.
+/// Bounds the visibility delay of roster-side changes (churn, reassignment,
+/// squatter arrival); state removal is caught immediately by the uncached
+/// per-DID authority recheck regardless.
+pub const ROSTER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl CachedRoster {
+    pub fn new(
+        load: Arc<dyn Fn() -> Vec<RosterEntry> + Send + Sync>,
+        ttl: std::time::Duration,
+    ) -> Self {
+        Self {
+            load,
+            snapshot: parking_lot::Mutex::new(None),
+            ttl,
+        }
+    }
+
+    fn current(&self) -> Arc<Vec<RosterEntry>> {
+        let mut guard = self.snapshot.lock();
+        if let Some((refreshed_at, entries)) = guard.as_ref() {
+            if refreshed_at.elapsed() <= self.ttl {
+                return Arc::clone(entries);
+            }
+        }
+        // Single-flight: everyone races to this mutex; the loser re-checks
+        // the snapshot after acquiring and serves the winner's refresh.
+        let entries = Arc::new((self.load)());
+        *guard = Some((std::time::Instant::now(), Arc::clone(&entries)));
+        entries
+    }
+}
+
+impl DeploymentRosterSource for CachedRoster {
+    fn roster(&self) -> Vec<RosterEntry> {
+        self.current().as_ref().clone()
+    }
+}
+
 /// The deployment service name an accepted state proves, if any.
 ///
 /// Capsule `#<name>` service entries ∩ the registered factory roster
@@ -98,8 +158,16 @@ where
 /// Zero matches — foreign `#id` entries, no service entries — ambiguous
 /// matches, and invariant-violating states all resolve to `None`: deny,
 /// never a best-effort pick.
-pub fn derived_service_name(state: &AcceptedIdentityState) -> Option<&str> {
-    if state.epoch == 0 || state.expires_at_unix_ms.is_none() {
+pub fn derived_service_name(state: &AcceptedIdentityState, now_unix_ms: i64) -> Option<&str> {
+    // Live expiry is enforced here, not just presence: an expired state is
+    // rejected by the admission exchange, and it must not keep participating
+    // in name derivation or uniqueness counting either — otherwise an
+    // expired foreign claim would make the genuine identity ambiguously
+    // denied forever (review round 2).
+    if state.epoch == 0
+        || state.expires_at_unix_ms.is_none()
+        || !state.is_live(now_unix_ms)
+    {
         return None;
     }
     let mut matched = None;
@@ -122,11 +190,11 @@ pub fn derived_service_name(state: &AcceptedIdentityState) -> Option<&str> {
 /// OTHER state may derive the same name. A collision is warned loudly —
 /// an ingested record squatting a deployment name is an operator-visible
 /// event, not a silent deny.
-pub fn roster_service_name(roster: &[RosterEntry], did: &str) -> Option<String> {
-    let name = derived_service_name(&roster.iter().find(|(d, _)| d == did)?.1)?;
+pub fn roster_service_name(roster: &[RosterEntry], did: &str, now_unix_ms: i64) -> Option<String> {
+    let name = derived_service_name(&roster.iter().find(|(d, _)| d == did)?.1, now_unix_ms)?;
     let holders = roster
         .iter()
-        .filter(|(_, state)| derived_service_name(state) == Some(name))
+        .filter(|(_, state)| derived_service_name(state, now_unix_ms) == Some(name))
         .count();
     if holders != 1 {
         tracing::warn!(
@@ -141,8 +209,8 @@ pub fn roster_service_name(roster: &[RosterEntry], did: &str) -> Option<String> 
 
 /// DID → derived tenant against the live roster: [`LOCAL_TENANT`] iff the
 /// subject uniquely proves a deployment service identity.
-pub fn roster_tenant(roster: &[RosterEntry], did: &str) -> Option<String> {
-    roster_service_name(roster, did).map(|_| LOCAL_TENANT.to_owned())
+pub fn roster_tenant(roster: &[RosterEntry], did: &str, now_unix_ms: i64) -> Option<String> {
+    roster_service_name(roster, did, now_unix_ms).map(|_| LOCAL_TENANT.to_owned())
 }
 
 /// The admission tenant resolver: tenant [`LOCAL_TENANT`] iff the verified
@@ -155,9 +223,9 @@ pub fn roster_tenant(roster: &[RosterEntry], did: &str) -> Option<String> {
 /// admitted sessions.
 pub fn derived_tenant_resolver(roster: Arc<dyn DeploymentRosterSource>) -> PeerTenantResolver {
     Arc::new(move |peer: &PeerIdentity| {
-        peer.subject
-            .as_deref()
-            .and_then(|did| roster_tenant(&roster.roster(), did))
+        peer.subject.as_deref().and_then(|did| {
+            roster_tenant(&roster.roster(), did, hyprstream_rpc::envelope::current_timestamp())
+        })
     })
 }
 
@@ -173,7 +241,7 @@ pub fn require_service_self_binding(
     service_name: &str,
     proof: &MoqlAdmissionProof,
 ) -> Result<()> {
-    let resolved = roster_service_name(&roster.roster(), &proof.did);
+    let resolved = roster_service_name(&roster.roster(), &proof.did, hyprstream_rpc::envelope::current_timestamp());
     anyhow::ensure!(
         resolved.as_deref() == Some(service_name),
         "native {} identity {} does not uniquely resolve to accepted deployment service '{}' in the checkpoint store",
@@ -195,7 +263,8 @@ pub fn require_admitted_service_binding(
     proof: &MoqlAdmissionProof,
 ) -> Result<()> {
     anyhow::ensure!(
-        roster_service_name(&roster.roster(), &proof.did).is_some(),
+        roster_service_name(&roster.roster(), &proof.did, hyprstream_rpc::envelope::current_timestamp())
+            .is_some(),
         "Event identity {} is not a uniquely-held accepted deployment service identity in the checkpoint store",
         proof.did
     );
@@ -203,20 +272,23 @@ pub fn require_admitted_service_binding(
 }
 
 /// Spawn-time Event publisher roster check (#1652): every name in
-/// `quic.event_publishers` must be carried by a live, uniquely-held
-/// deployment state. A configured name with no genuine state is exactly the
-/// hole a foreign capsule claiming that name would fill (the residual in the
-/// module doc), so the Event service refuses to spawn instead of running
-/// with a squat-able grant.
+/// `quic.event_publishers` must be carried by a live accepted state. This
+/// catches deployment misconfiguration — a configured publisher name with no
+/// state at all (typo, decommissioned service) — by refusing to spawn. It
+/// does NOT establish provenance: a sole foreign claimant of an unheld name
+/// satisfies it exactly as it satisfies the derivation, which is the
+/// maintainer provenance-binding decision recorded in #1652 (see the module
+/// doc residual); closing that here is not possible from store data alone.
 pub fn require_publisher_roster(
     roster: &Arc<dyn DeploymentRosterSource>,
     publishers: &std::collections::BTreeSet<String>,
 ) -> Result<()> {
     let live = roster.roster();
+    let now = hyprstream_rpc::envelope::current_timestamp();
     for name in publishers {
         anyhow::ensure!(
             live.iter()
-                .any(|(_, state)| derived_service_name(state) == Some(name.as_str())),
+                .any(|(_, state)| derived_service_name(state, now) == Some(name.as_str())),
             "quic.event_publishers lists '{}' but no live accepted state uniquely carries that service; refusing to run with a squat-able grant",
             name
         );
@@ -280,30 +352,37 @@ mod tests {
 
     #[test]
     fn factory_service_entries_resolve_and_foreign_entries_do_not() {
+        let now = hyprstream_rpc::envelope::current_timestamp();
         // A deployment-shaped capsule: exactly one factory service entry,
-        // successor epoch, bounded expiry.
-        assert_eq!(derived_service_name(&state(&["#event"])), Some("event"));
-        assert_eq!(derived_service_name(&state(&["#streams"])), Some("streams"));
+        // successor epoch, bounded unexpired expiry.
+        assert_eq!(derived_service_name(&state(&["#event"]), now), Some("event"));
+        assert_eq!(derived_service_name(&state(&["#streams"]), now), Some("streams"));
         // Foreign public-RPC records carry arbitrary #id entries.
-        assert_eq!(derived_service_name(&state(&["#ns"])), None);
+        assert_eq!(derived_service_name(&state(&["#ns"]), now), None);
         // Unknown factory names never match, with or without foreign siblings.
-        assert_eq!(derived_service_name(&state(&["#bogus"])), None);
-        assert_eq!(derived_service_name(&state(&["#ns", "#bogus"])), None);
+        assert_eq!(derived_service_name(&state(&["#bogus"]), now), None);
+        assert_eq!(derived_service_name(&state(&["#ns", "#bogus"]), now), None);
         // No service entries at all.
-        assert_eq!(derived_service_name(&state(&[])), None);
+        assert_eq!(derived_service_name(&state(&[]), now), None);
         // Ambiguous: a capsule matching two factory services is not
         // deployment-shaped; deny rather than pick.
-        assert_eq!(derived_service_name(&state(&["#event", "#streams"])), None);
+        assert_eq!(derived_service_name(&state(&["#event", "#streams"]), now), None);
         // Non-# entries are skipped, not matched.
-        assert_eq!(derived_service_name(&state(&["event"])), None);
+        assert_eq!(derived_service_name(&state(&["event"]), now), None);
         // Deployment invariants: genesis (epoch 0) and unbounded states never
         // derive — foreign genesis-only ingests are not deployment-shaped.
         let mut genesis = state(&["#event"]);
         genesis.epoch = 0;
-        assert_eq!(derived_service_name(&genesis), None);
+        assert_eq!(derived_service_name(&genesis, now), None);
         let mut unbounded = state(&["#event"]);
         unbounded.expires_at_unix_ms = None;
-        assert_eq!(derived_service_name(&unbounded), None);
+        assert_eq!(derived_service_name(&unbounded, now), None);
+        // EXPIRED states never derive and never count toward uniqueness
+        // (review round 2): an expired foreign claim must not keep the
+        // genuine identity ambiguously denied.
+        let mut expired = state(&["#event"]);
+        expired.expires_at_unix_ms = Some(now - 1);
+        assert_eq!(derived_service_name(&expired, now), None);
     }
 
     #[test]
@@ -343,6 +422,7 @@ mod tests {
 
     #[test]
     fn name_squatting_is_denied_not_escalated() {
+        let now = hyprstream_rpc::envelope::current_timestamp();
         // A foreign record claiming a factory service name BESIDE the genuine
         // identity: the name becomes ambiguous and BOTH derive nothing —
         // fail-closed. This is the property a name-only filter lacks.
@@ -352,11 +432,24 @@ mod tests {
             (genuine.to_owned(), state(&["#model"])),
             (squatter.to_owned(), state(&["#model"])),
         ];
-        assert_eq!(roster_tenant(&roster, genuine), None);
-        assert_eq!(roster_tenant(&roster, squatter), None);
+        assert_eq!(roster_tenant(&roster, genuine, now), None);
+        assert_eq!(roster_tenant(&roster, squatter, now), None);
         // With the squatter gone the genuine identity derives again.
         let clean: Vec<RosterEntry> = vec![(genuine.to_owned(), state(&["#model"]))];
-        assert_eq!(roster_tenant(&clean, genuine).as_deref(), Some(LOCAL_TENANT));
+        assert_eq!(roster_tenant(&clean, genuine, now).as_deref(), Some(LOCAL_TENANT));
+        // An EXPIRED squatter never counts: the genuine identity keeps
+        // deriving while an expired foreign claim sits in the store.
+        let mut expired_squat = state(&["#model"]);
+        expired_squat.expires_at_unix_ms = Some(now - 1);
+        let with_expired: Vec<RosterEntry> = vec![
+            (genuine.to_owned(), state(&["#model"])),
+            (squatter.to_owned(), expired_squat),
+        ];
+        assert_eq!(
+            roster_tenant(&with_expired, genuine, now).as_deref(),
+            Some(LOCAL_TENANT),
+            "expired foreign claim must not make the genuine identity ambiguous"
+        );
     }
 
     #[test]
@@ -398,6 +491,36 @@ mod tests {
         // Client-side membership form accepts the deployment identity itself.
         require_admitted_service_binding(&roster, &proof)
             .expect("membership self-check must accept a deployment service DID");
+    }
+
+    #[test]
+    fn cached_roster_serves_within_ttl_and_refreshes_after() {
+        let states: Arc<parking_lot::RwLock<Vec<RosterEntry>>> =
+            Arc::new(parking_lot::RwLock::new(vec![(
+                "did:at9p:event".to_owned(),
+                state(&["#event"]),
+            )]));
+        let load = {
+            let states = Arc::clone(&states);
+            Arc::new(move || states.read().clone()) as Arc<dyn Fn() -> Vec<RosterEntry> + Send + Sync>
+        };
+        let now = hyprstream_rpc::envelope::current_timestamp();
+        // Zero TTL: every lookup refreshes — churn is visible immediately.
+        let hot = CachedRoster::new(Arc::clone(&load), std::time::Duration::ZERO);
+        assert_eq!(
+            roster_tenant(&hot.roster(), "did:at9p:event", now).as_deref(),
+            Some(LOCAL_TENANT)
+        );
+        states.write().clear();
+        assert_eq!(hot.roster().len(), 0, "zero-TTL cache must observe the wipe");
+        // Long TTL: the snapshot is served as-is until it expires — the
+        // polling recheck path trades bounded staleness for not re-verifying
+        // the whole store at 10 Hz per session.
+        states.write().push(("did:at9p:event".to_owned(), state(&["#event"])));
+        let cold = CachedRoster::new(Arc::clone(&load), std::time::Duration::from_secs(3600));
+        assert_eq!(cold.roster().len(), 1);
+        states.write().clear();
+        assert_eq!(cold.roster().len(), 1, "long-TTL cache must keep serving the snapshot");
     }
 
     #[test]

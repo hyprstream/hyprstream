@@ -1930,27 +1930,34 @@ pub fn production_moql_accepted_state_authority() -> Result<Arc<dyn hyprstream_r
 /// can enforce cross-store uniqueness — the one property a per-DID read
 /// cannot see. Sourced from the same pinned checkpoint store as the
 /// per-DID authority; a read failure yields an empty roster, which denies.
+/// Served through a TTL cache: the live-session recheck runs every 100 ms
+/// per session and must not re-verify the whole store each time.
 pub fn production_deployment_roster() -> Result<
     Arc<dyn crate::admission_roster::DeploymentRosterSource>,
 > {
     let source = PROCESS_ACCEPTED_STATE_SOURCE.get().cloned()
         .ok_or_else(|| anyhow::anyhow!("production accepted-state authority is not installed"))?;
-    Ok(Arc::new(move || {
-        source
-            .accepted_states()
-            .ok()
-            .map(|states| {
-                states
-                    .iter()
-                    .filter_map(|state| {
-                        project_accepted_identity_state(state).map(|projected| {
-                            (state.did.clone(), projected)
+    let load: std::sync::Arc<dyn Fn() -> Vec<crate::admission_roster::RosterEntry> + Send + Sync> =
+        Arc::new(move || {
+            source
+                .accepted_states()
+                .ok()
+                .map(|states| {
+                    states
+                        .iter()
+                        .filter_map(|state| {
+                            project_accepted_identity_state(state).map(|projected| {
+                                (state.did.clone(), projected)
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    }))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+    Ok(Arc::new(crate::admission_roster::CachedRoster::new(
+        load,
+        crate::admission_roster::ROSTER_CACHE_TTL,
+    )))
 }
 
 const DEPLOYMENT_CA_ROOT_PATH: &str = "/etc/hyprstream/trust/deployment-ca.hybrid";

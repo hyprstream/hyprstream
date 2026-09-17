@@ -66,7 +66,12 @@ pub fn stream_ingress_authorizer(
         move |peer: &hyprstream_rpc::moq_authz::PeerIdentity, tenant: &str| {
             peer.subject.as_deref().is_some_and(|did| {
                 publishers.contains(did)
-                    && admission_roster::roster_tenant(&roster.roster(), did).as_deref()
+                    && admission_roster::roster_tenant(
+                        &roster.roster(),
+                        did,
+                        hyprstream_rpc::envelope::current_timestamp(),
+                    )
+                    .as_deref()
                         == Some(tenant)
             })
         },

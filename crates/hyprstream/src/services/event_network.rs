@@ -68,7 +68,13 @@ pub fn event_ingress_authorizer(
             && peer
                 .subject
                 .as_deref()
-                .and_then(|did| admission_roster::roster_service_name(&roster.roster(), did))
+                .and_then(|did| {
+                    admission_roster::roster_service_name(
+                        &roster.roster(),
+                        did,
+                        hyprstream_rpc::envelope::current_timestamp(),
+                    )
+                })
                 .is_some_and(|name| publishers.contains(name.as_str()))
     })
 }
