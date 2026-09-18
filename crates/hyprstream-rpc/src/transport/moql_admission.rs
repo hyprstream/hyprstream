@@ -846,6 +846,9 @@ impl MoqlAdmissionAuthenticator {
         if !self.is_server_identity_current(&server_identity) {
             return Err(MoqlAdmissionError::ServerIdentityNotCurrent);
         }
+        // Advertise the CURRENT accepted epoch/head in the challenge, not the
+        // startup-pinned snapshot — see [`Self::project_server_identity`].
+        let advertised_identity = self.project_server_identity(&server_identity)?;
         let (mut send, mut recv) = conn
             .accept_bi()
             .await
@@ -860,7 +863,7 @@ impl MoqlAdmissionAuthenticator {
             server_nonce: fresh_nonce(),
             epoch: state.epoch,
             head_digest: state.head_digest,
-            server_identity: server_identity.identity.clone(),
+            server_identity: advertised_identity,
         };
         write_frame(&mut send, &encode_challenge(&challenge)).await?;
 
@@ -945,14 +948,53 @@ impl MoqlAdmissionAuthenticator {
         if server.identity.head_digest.len() != 64 {
             return false;
         }
-        let mut head_digest = [0u8; 64];
-        head_digest.copy_from_slice(&server.identity.head_digest);
+        // Possession of the still-accepted subject keys IS the currency
+        // property. The in-daemon at9p renewal timer advances epoch/head
+        // while carrying the SAME subject keys forward, so a proof installed
+        // at process start stays current across routine renewals; a genuine
+        // key rotation removes those keys from the accepted set and still
+        // fails here, fail-closed. The monotonic epoch guard rejects any
+        // authority regression (a proof from an epoch the store no longer
+        // reaches).
         current.is_live(crate::envelope::current_timestamp())
-            && current.epoch == server.identity.epoch
-            && current.head_digest == head_digest
+            && server.identity.epoch <= current.epoch
             && current
                 .subject_key_for(&server.identity.ed25519)
                 .is_some_and(|key| key.ml_dsa_65 == server.identity.ml_dsa65)
+    }
+
+    /// The server identity to advertise in the admission challenge: the
+    /// installed proof's keys projected onto the CURRENT accepted epoch,
+    /// head digest, and expiry. Clients re-project their expected server
+    /// identity from the live accepted state on their link-refresh loop, so
+    /// advertising a startup-pinned epoch after a renewal would mismatch
+    /// every refreshed client forever; advertising the current state
+    /// converges with them. The signing keys never change across renewals
+    /// (the same on-volume key carries forward), so the proof's signatures
+    /// remain valid over the projected identity.
+    fn project_server_identity(
+        &self,
+        server: &MoqlServerIdentityProof,
+    ) -> Result<crate::stream_info::MoqlServerIdentity, MoqlAdmissionError> {
+        let current = self
+            .authority
+            .accepted_state(&server.identity.did)
+            .ok_or(MoqlAdmissionError::ServerIdentityNotCurrent)?;
+        if !self.is_server_identity_current(server) {
+            return Err(MoqlAdmissionError::ServerIdentityNotCurrent);
+        }
+        Ok(crate::stream_info::MoqlServerIdentity {
+            did: server.identity.did.clone(),
+            epoch: current.epoch,
+            head_digest: current.head_digest.to_vec(),
+            // Genesis never lapses; successors always carry a bounded expiry
+            // that both sides project from the same accepted state.
+            expires_at_unix_ms: current
+                .expires_at_unix_ms
+                .unwrap_or(i64::MAX),
+            ed25519: server.identity.ed25519,
+            ml_dsa65: server.identity.ml_dsa65.clone(),
+        })
     }
 
     /// The hello-time decision: identity class, currentness, expiry, and
@@ -1632,5 +1674,96 @@ mod tests {
             matches!(err, MoqlAdmissionError::NotAcceptedIdentity(_)),
             "{err}"
         );
+    }
+
+    /// The in-daemon at9p renewal regression: a key-stable renewal advances
+    /// the SERVER's accepted epoch/head while the service keeps the proof
+    /// installed at process start. The proof must stay current, the
+    /// challenge must advertise the advanced state, an admitted tunnel
+    /// whose PEER state did not advance must survive, and a genuine key
+    /// rotation must still fail closed.
+    #[test]
+    fn server_identity_survives_key_stable_renewal() {
+        const SERVER_DID: &str = "did:at9p:testserver";
+        let (server_ed, server_pq) = keypair(11);
+        let (peer_ed, peer_pq) = keypair(12);
+        // Shared mutable authority: two identities, independently advanced.
+        let server_state = Arc::new(Mutex::new(state_with(&server_ed, &server_pq, 3, 0x31)));
+        let peer_state = Arc::new(Mutex::new(state_with(&peer_ed, &peer_pq, 8, 0x81)));
+        let authority: Arc<dyn AcceptedStateAuthority> = {
+            let (server_state, peer_state) = (Arc::clone(&server_state), Arc::clone(&peer_state));
+            Arc::new(move |did: &str| {
+                if did == SERVER_DID {
+                    Some(server_state.lock().clone())
+                } else if did == "did:at9p:testsubject" {
+                    Some(peer_state.lock().clone())
+                } else {
+                    None
+                }
+            })
+        };
+        let resolver: PeerTenantResolver = Arc::new(|peer: &PeerIdentity| {
+            peer.subject.as_deref().map(|_| "alice".to_owned())
+        });
+        let pinned_identity = crate::stream_info::MoqlServerIdentity {
+            did: SERVER_DID.to_owned(),
+            epoch: 3,
+            head_digest: vec![0x31; 64],
+            expires_at_unix_ms: crate::envelope::current_timestamp() + 60_000,
+            ed25519: server_ed.verifying_key().to_bytes(),
+            ml_dsa65: crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&server_pq),
+        };
+        let pinned_proof = MoqlServerIdentityProof {
+            identity: pinned_identity.clone(),
+            ed25519: server_ed.clone(),
+            ml_dsa_65: server_pq.clone(),
+        };
+        let auth = MoqlAdmissionAuthenticator::new(authority, resolver)
+            .with_server_identity_and_carrier(pinned_proof.clone(), [1; 32]);
+        // A tunnel admitted against the peer's current (unchanged) state.
+        let admitted = AdmittedMoqPeer {
+            peer: PeerIdentity::authenticated(DID.to_owned()),
+            tenant: "alice".to_owned(),
+            epoch: 8,
+            head_digest: [0x81; 64],
+            subject_ed25519: peer_ed.verifying_key().to_bytes(),
+            carrier_node_id: [0; 32],
+        };
+        assert!(auth.is_still_current(&admitted));
+        assert_eq!(auth.project_server_identity(&pinned_proof).unwrap().epoch, 3);
+
+        // ── Renewal: SERVER epoch 4, new head digest, SAME subject keys. ──
+        *server_state.lock() = state_with(&server_ed, &server_pq, 4, 0x44);
+        // (a) A new inbound handshake is admissible: the proof stays current
+        // and the advertised challenge identity carries the advanced
+        // epoch/head (keys unchanged, so the proof's signatures hold).
+        let advertised = auth.project_server_identity(&pinned_proof).unwrap();
+        assert_eq!(advertised.epoch, 4);
+        assert_eq!(advertised.head_digest, vec![0x44; 64]);
+        assert_eq!(advertised.ed25519, pinned_identity.ed25519);
+        assert_eq!(advertised.ml_dsa65, pinned_identity.ml_dsa65);
+        // (b) An existing tunnel whose peer state did not advance is NOT
+        // invalidated by the server's own renewal.
+        assert!(auth.is_still_current(&admitted));
+
+        // ── Fail-closed: a genuine key rotation removes the proof's keys. ──
+        let (rotated_ed, rotated_pq) = keypair(30);
+        *server_state.lock() = state_with(&rotated_ed, &rotated_pq, 5, 0x55);
+        let err = auth
+            .project_server_identity(&pinned_proof)
+            .expect_err("rotated-out server keys must fail closed");
+        assert!(
+            matches!(err, MoqlAdmissionError::ServerIdentityNotCurrent),
+            "{err}"
+        );
+
+        // ── Fail-closed: the authority losing the identity entirely. ──
+        *server_state.lock() = state_with(&server_ed, &server_pq, 4, 0x44);
+        // (control: back to current with the original keys)
+        assert!(auth.project_server_identity(&pinned_proof).is_ok());
+        // Monotonicity: a proof from an epoch the store no longer reaches
+        // (simulated regression below the pinned epoch) is rejected.
+        *server_state.lock() = state_with(&server_ed, &server_pq, 2, 0x22);
+        assert!(auth.project_server_identity(&pinned_proof).is_err());
     }
 }
