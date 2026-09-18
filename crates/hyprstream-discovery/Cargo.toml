@@ -90,6 +90,9 @@ iroh = { workspace = true }
 bytes = { workspace = true }
 moq-net = { workspace = true }
 web-transport-iroh = { workspace = true }
+# #1652 derived-admission tests register admission-only test factories: the
+# factory inventory lives in the app crate, which this crate cannot link.
+inventory = { workspace = true }
 # #431 / #524 — build/verify real CAR proofs in getRecord + placement tests.
 p256 = { workspace = true }
 rand = { workspace = true }

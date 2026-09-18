@@ -15,17 +15,26 @@ existing UDS behavior.
 
 ## Independent authorization boundaries
 
-The deployment must explicitly map each admitted service/client DID to `local`
-in `quic.moql_subject_tenants`. The fixed Event namespace is `local/events`;
-other tenants cannot see or publish it. Carrier EndpointIds do not select tenants.
+Admission tenants are derived, not configured (#1652): each authenticated
+peer DID resolves through the live accepted-state authority, and a capsule
+service entry that matches a registered deployment service derives the
+`local` tenant. The fixed Event namespace is `local/events`; other tenants
+cannot see or publish it, and no other tenant is derivable. Foreign at9p
+records in the store (public ingest; service ids that name no deployment
+service) derive no tenant. Carrier EndpointIds do not select tenants.
 
-A separate `quic.event_publishers` set grants the listed DIDs the ability to seek
-Event ingress. Membership in the tenant map does not imply that grant. On top of
-admission and ingress, the installed Event MAC reference monitor decides the
-allowed sources and directions. The carrier exposes only those source scopes.
-An empty policy table, absent verified clearance, or undeclared source denies.
-Current accepted state, ingress grants, and Event MAC scopes are rechecked while
-the session lives; loss/change of authority closes the connection.
+A separate `quic.event_publishers` set grants the listed service NAMES the
+ability to seek Event ingress; the peer's DID is resolved to its service name
+at admission time through the same authority. Names survive service-identity
+churn, so the grant does not go stale when a service's DID changes. Membership
+in the derived tenant does not imply that grant; an empty set leaves every
+peer read-only, and unknown names fail configuration validation at startup.
+On top of admission and ingress, the installed Event MAC reference monitor
+decides the allowed sources and directions. The carrier exposes only those
+source scopes. An empty policy table, absent verified clearance, or undeclared
+source denies. Current accepted state, derived tenant, ingress grants, and
+Event MAC scopes are rechecked while the session lives; loss/change of
+authority closes the connection.
 
 The temporary source inventory is `system`, `worker`, and `model`. It declares
 source names, **not security labels or clearances**. Per-OID publication paths

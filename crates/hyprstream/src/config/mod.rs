@@ -798,16 +798,31 @@ pub struct QuicConfig {
     #[serde(default)]
     pub native_network_profile: NativeNetworkProfile,
 
-    /// Explicit admitted DID to tenant bindings. Carrier IDs never select a tenant.
-    #[serde(default)]
-    pub moql_subject_tenants: std::collections::BTreeMap<String, String>,
-
-    /// Separate Event producer grants. Tenant membership alone grants no ingress.
+    /// Separate Event producer grants, keyed by service NAME (not DID) so the
+    /// allowlist survives service-identity churn. Admission resolves the peer
+    /// DID → service name through the accepted-state authority, then checks
+    /// name membership. Tenant membership alone grants no ingress; an empty
+    /// set leaves every peer read-only. Names must be registered factory
+    /// services — validation fails at startup otherwise.
+    ///
+    /// #1652: this replaces the DID-valued grant list, and native admission
+    /// tenants are no longer configured at all — the former DID-keyed
+    /// `moql_subject_tenants` map embedded deployment DIDs in this write-once
+    /// file and went stale at every service-identity re-initialization. The
+    /// tenant is now DERIVED at admission time from the checkpointed
+    /// accepted-state store (accepted state ∩ the factory roster ⇒ `local`,
+    /// foreign records denied); see `hyprstream_discovery::admission_roster`.
+    /// A leftover `[quic.moql_subject_tenants]` table in an old file is
+    /// ignored.
     #[serde(default)]
     pub event_publishers: std::collections::BTreeSet<String>,
 
     /// Explicit remote Streams ingress, separate from Event permissions.
-    /// Empty leaves admitted peers read-only.
+    /// Deliberately empty by design (#1652): no production writer emits it, an
+    /// empty set cannot go stale, and admitted native peers stay read-only on
+    /// Streams. Unlike `event_publishers` this stays DID-keyed — it is unused
+    /// policy, so re-keying it by service name is deferred to its first real
+    /// use. Non-empty entries name peer DIDs.
     #[serde(default)]
     pub stream_publishers: std::collections::BTreeSet<String>,
 
@@ -832,7 +847,6 @@ impl Default for QuicConfig {
             key_path: String::new(),
             iroh: default_iroh_enabled(),
             native_network_profile: NativeNetworkProfile::Compatibility,
-            moql_subject_tenants: Default::default(),
             event_publishers: Default::default(),
             stream_publishers: Default::default(),
             relay: String::new(),
@@ -854,6 +868,22 @@ impl QuicConfig {
             anyhow::ensure!(
                 self.iroh,
                 "network-iroh-required rejects [quic] iroh = false"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1652: `event_publishers` is keyed by service NAME. A name that is not
+    /// a registered factory service can never match an admitted peer, so it is
+    /// rejected loudly here — at startup, not as a silent read-only surprise
+    /// (this is also what catches a stale DID-valued list from a pre-#1652
+    /// config file: DIDs are not factory names).
+    pub fn validate_admission_policy(&self) -> anyhow::Result<()> {
+        for name in &self.event_publishers {
+            anyhow::ensure!(
+                hyprstream_service::get_factory(name).is_some(),
+                "quic.event_publishers lists {name:?}, which is not a registered service name; \
+                 entries are factory service names (not DIDs) since #1652"
             );
         }
         Ok(())
@@ -2886,6 +2916,12 @@ impl HyprConfig {
 
     /// Validate the entire configuration
     pub fn validate(&self) -> anyhow::Result<()> {
+        // #1652: name-keyed native admission policy must reference real
+        // factory services. Checked before anything else so a stale
+        // DID-valued event publisher list fails at startup, not as silent
+        // read-only ingress.
+        self.quic.validate_admission_policy()?;
+
         // Ledger production mode (PAY-01): turns the deliberately-inert
         // development defaults into startup failures, so a production node
         // cannot come up with credit enforcement silently disabled or with a
@@ -3897,6 +3933,67 @@ mod tests {
         assert!(serialized.contains("native_network_profile = \"network-iroh-required\""));
         let decoded: QuicConfig = toml::from_str(&serialized)?;
         assert!(decoded.iroh_required());
+        Ok(())
+    }
+
+    /// #1652: the Event ingress grant is name-keyed. Names outside the factory
+    /// roster are rejected at validation — this is the loud startup failure a
+    /// stale pre-#1652 config (DID-valued list, or a typo'd name) must hit.
+    #[test]
+    fn event_publishers_must_be_factory_service_names() -> anyhow::Result<()> {
+        let mut config = QuicConfig::default();
+        config.validate_admission_policy()?;
+
+        for name in ["event", "streams", "model", "oauth"] {
+            config.event_publishers.insert(name.to_owned());
+        }
+        config.validate_admission_policy()?;
+
+        config.event_publishers.insert("not-a-service".to_owned());
+        let error = match config.validate_admission_policy() {
+            Ok(()) => panic!("unknown service name must fail validation"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("not a registered service name"),
+            "unexpected error: {error}"
+        );
+
+        // A pre-#1652 DID-valued list is exactly this failure: DIDs are not
+        // factory service names.
+        config.event_publishers.clear();
+        config
+            .event_publishers
+            .insert("did:at9p:9f7abc".to_owned());
+        assert!(
+            config.validate_admission_policy().is_err(),
+            "DID-valued event_publishers must fail loudly, not become silent read-only"
+        );
+        Ok(())
+    }
+
+    /// #1652 deploy story: a config file from before the derivation still
+    /// carrying a `[quic.moql_subject_tenants]` table loads (the key is gone
+    /// and ignored — tenants are store-derived now), while its DID-valued
+    /// `event_publishers` is rejected by validation.
+    #[test]
+    fn legacy_did_valued_admission_config_fails_loudly_on_publishers_only() -> anyhow::Result<()> {
+        let legacy = r#"
+            [quic]
+            event_publishers = ["did:at9p:legacy-service-did"]
+
+            [quic.moql_subject_tenants]
+            "did:at9p:legacy-service-did" = "local"
+        "#;
+        let config: HyprConfig = toml::from_str(legacy)?;
+        let error = match config.validate() {
+            Ok(()) => panic!("DID-valued event_publishers must fail validation"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("did:at9p:legacy-service-did"),
+            "validation must name the offending entry: {error}"
+        );
         Ok(())
     }
 

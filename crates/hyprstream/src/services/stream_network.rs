@@ -2,44 +2,89 @@
 //! authentication and MAC authorization performed by the producing RPC service.
 use crate::config::QuicConfig;
 use anyhow::{Context, Result};
+use hyprstream_discovery::admission_roster::{self, DeploymentRosterSource};
 use hyprstream_rpc::transport::iroh_moq::{MoqAuthzConfig, SharedIngressAuthorizer};
-use hyprstream_rpc::transport::moql_admission::MoqlAdmissionAuthenticator;
+use hyprstream_rpc::transport::moql_admission::{
+    AcceptedStateAuthority, MoqlAdmissionAuthenticator,
+};
 use std::sync::Arc;
 
-/// Current accepted identity and explicit tenant assignment, never carrier identity.
-pub fn production_stream_admission(config: &QuicConfig) -> Result<Arc<MoqlAdmissionAuthenticator>> {
-    Ok(stream_admission(
-        config,
+/// Current accepted identity and derived tenant assignment, never carrier
+/// identity. Authentication runs on the per-DID accepted-state authority;
+/// the tenant resolver runs over the roster-wide derivation (#1652): a
+/// factory service entry held UNIQUELY across the store ⇒ `local`,
+/// everything else — foreign records, ambiguous names — unresolved/deny. No
+/// DID-valued config to go stale at identity churn.
+pub fn production_stream_admission() -> Result<Arc<MoqlAdmissionAuthenticator>> {
+    let roster = hyprstream_discovery::production_deployment_roster()?;
+    // Prime the cache HERE, synchronously at construction (service startup,
+    // before any runtime serves peers): without this, the first MoQL peer
+    // would pay the synchronous first load — RocksDB open + full store
+    // verification — on the current-thread serving runtime (review round 6).
+    // The Event and standalone-Streams spawn paths prime via their
+    // self-binding checks; this constructor feeds the generic spawner path
+    // (main.rs QuicSharedConfig), which has no such check.
+    let _ = roster.roster();
+    Ok(stream_admission_over(
         hyprstream_discovery::production_moql_accepted_state_authority()?,
+        roster,
     ))
 }
 
-fn stream_admission(
-    config: &QuicConfig,
-    authority: Arc<dyn hyprstream_rpc::transport::moql_admission::AcceptedStateAuthority>,
+pub(crate) fn stream_admission_over(
+    authority: Arc<dyn AcceptedStateAuthority>,
+    roster: Arc<dyn DeploymentRosterSource>,
 ) -> Arc<MoqlAdmissionAuthenticator> {
-    let tenants = config.moql_subject_tenants.clone();
     Arc::new(MoqlAdmissionAuthenticator::new(
         authority,
-        Arc::new(move |peer| {
-            peer.subject
-                .as_ref()
-                .and_then(|did| tenants.get(did))
-                .cloned()
-        }),
+        admission_roster::derived_tenant_resolver(roster),
     ))
 }
 
-/// Tenant admission never grants publishing. Configuration is immutable for the
-/// process lifetime; removing a roster row requires a service reload/restart.
-/// Accepted-state/key revocation is rechecked live by the admission authority.
-pub fn stream_ingress_authorizer(config: &QuicConfig) -> SharedIngressAuthorizer {
+/// Test/fixture entry: both halves over one roster (the roster carries every
+/// projected state, so the per-DID authority is a lookup into it).
+#[cfg(test)]
+pub(crate) fn stream_admission(
+    roster: Arc<dyn DeploymentRosterSource>,
+) -> Arc<MoqlAdmissionAuthenticator> {
+    let authority: Arc<dyn AcceptedStateAuthority> = {
+        let roster = Arc::clone(&roster);
+        Arc::new(move |did: &str| {
+            let snapshot = roster.roster();
+            snapshot
+                .iter()
+                .find(|(d, _)| d == did)
+                .map(|(_, state)| state.clone())
+        })
+    };
+    stream_admission_over(authority, roster)
+}
+
+/// Tenant admission never grants publishing. `quic.stream_publishers` is a
+/// deliberately-empty DID set (no production writer; empty = read-only, and
+/// an empty set cannot go stale — #1652 leaves it untouched). The tenant
+/// itself is re-derived from the live roster on every check, so removing a
+/// peer from the deployment roster — or a squatter making its name ambiguous
+/// — is effective on the next recheck without a restart.
+pub fn stream_ingress_authorizer(
+    config: &QuicConfig,
+    roster: Arc<dyn DeploymentRosterSource>,
+) -> SharedIngressAuthorizer {
     let publishers = config.stream_publishers.clone();
-    let tenants = config.moql_subject_tenants.clone();
     Arc::new(
         move |peer: &hyprstream_rpc::moq_authz::PeerIdentity, tenant: &str| {
-            peer.subject.as_ref().is_some_and(|did| {
-                publishers.contains(did) && tenants.get(did).is_some_and(|bound| bound == tenant)
+            peer.subject.as_deref().is_some_and(|did| {
+                publishers.contains(did)
+                    && {
+                        let snapshot = roster.roster();
+                        admission_roster::roster_tenant(
+                            &snapshot,
+                            did,
+                            hyprstream_rpc::envelope::current_timestamp(),
+                        )
+                        .as_deref()
+                            == Some(tenant)
+                    }
             })
         },
     )
@@ -47,6 +92,7 @@ pub fn stream_ingress_authorizer(config: &QuicConfig) -> SharedIngressAuthorizer
 
 fn stream_handler(
     config: &QuicConfig,
+    roster: Arc<dyn DeploymentRosterSource>,
     origin: &hyprstream_rpc::moq_stream::MoqStreamOrigin,
     admission: Arc<MoqlAdmissionAuthenticator>,
 ) -> hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler {
@@ -58,7 +104,7 @@ fn stream_handler(
     .with_authz(
         MoqAuthzConfig::default()
             .with_admission(admission)
-            .with_ingress_authorizer(stream_ingress_authorizer(config)),
+            .with_ingress_authorizer(stream_ingress_authorizer(config, roster)),
     )
 }
 
@@ -77,20 +123,21 @@ impl StreamsNetworkService {
         let proof = ctx
             .moql_admission_proof("streams")?
             .context("native Streams server proof missing")?;
-        anyhow::ensure!(
-            config
-                .quic
-                .moql_subject_tenants
-                .get(&proof.did)
-                .is_some_and(|tenant| tenant == "local"),
-            "native Streams server requires explicit admitted DID binding to local tenant"
-        );
+        // Self-binding (#1652): the checkpoint store must resolve THIS
+        // process's own DID to the Streams service. Refusal fails the spawn
+        // (fail-closed) — the same refuse-to-start shape as the former empty
+        // tenant map, now bound to live store state instead of config.
+        let roster = hyprstream_discovery::production_deployment_roster()?;
+        admission_roster::require_service_self_binding(&roster, "streams", &proof)?;
         let key = hyprstream_rpc::node_identity::derive_purpose_key(
             &ctx.service_signing_key("streams"),
             "hyprstream-iroh-transport-v1",
         );
         let node_id = key.verifying_key().to_bytes();
-        let admission = production_stream_admission(&config.quic)?;
+        let admission = stream_admission_over(
+            hyprstream_discovery::production_moql_accepted_state_authority()?,
+            Arc::clone(&roster),
+        );
         admission.install_server_identity(
             hyprstream_rpc::transport::moql_admission::MoqlServerIdentityProof::from_local_admission_proof(&proof)?, node_id)?;
         let origin = hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
@@ -99,7 +146,7 @@ impl StreamsNetworkService {
         Ok(Self {
             secret: key.to_bytes(),
             node_id,
-            handler: stream_handler(&config.quic, &origin, admission),
+            handler: stream_handler(&config.quic, roster, &origin, admission),
             announce: ctx.native_iroh_announcement_callback("streams")?,
         })
     }
@@ -180,7 +227,11 @@ mod tests {
     use moq_net::{Client, Group, Origin, Track};
     use std::time::Duration;
 
-    fn identity(name: &str, seed: u8) -> (MoqlAdmissionProof, AcceptedIdentityState) {
+    fn identity(
+        name: &str,
+        seed: u8,
+        service_ids: &[&str],
+    ) -> (MoqlAdmissionProof, AcceptedIdentityState) {
         let ed25519 = SigningKey::from_bytes(&[seed; 32]);
         let ml_dsa_65 = ml_dsa_sk_from_seed(&[seed; 32]);
         let expires_at_unix_ms = hyprstream_rpc::envelope::current_timestamp() + 60_000;
@@ -192,6 +243,7 @@ mod tests {
                 ed25519: ed25519.verifying_key().to_bytes(),
                 ml_dsa_65: ml_dsa_sk_to_vk_bytes(&ml_dsa_65),
             }],
+            service_ids: service_ids.iter().map(ToString::to_string).collect(),
         };
         let expected_server = hyprstream_rpc::stream_info::MoqlServerIdentity {
             did: format!("did:at9p:{name}"),
@@ -210,6 +262,13 @@ mod tests {
             },
             state,
         )
+    }
+
+    fn live_roster(
+        states: &Arc<parking_lot::RwLock<std::collections::BTreeMap<String, AcceptedIdentityState>>>,
+    ) -> Arc<dyn hyprstream_discovery::admission_roster::DeploymentRosterSource> {
+        let states = Arc::clone(states);
+        Arc::new(move || states.read().clone().into_iter().collect::<Vec<_>>())
     }
 
     fn direct(server: &IrohSubstrate) -> iroh::EndpointAddr {
@@ -297,12 +356,12 @@ mod tests {
     }
 
     async fn stream_roundtrip() -> Result<()> {
-        let (server_proof, server_state) = identity("streams", 61);
-        let (mut publisher, publisher_state) = identity("publisher", 62);
-        let (mut reader, reader_state) = identity("reader", 63);
-        let (mut other, other_state) = identity("other", 64);
+        let (server_proof, server_state) = identity("streams", 61, &["#streams"]);
+        let (mut publisher, publisher_state) = identity("publisher", 62, &["#model"]);
+        let (mut reader, reader_state) = identity("reader", 63, &["#policy"]);
+        let (mut foreign, foreign_state) = identity("foreign-record", 64, &["#ns"]);
         let server_identity = server_proof.expected_server.clone();
-        for proof in [&mut publisher, &mut reader, &mut other] {
+        for proof in [&mut publisher, &mut reader, &mut foreign] {
             proof.expected_server = server_identity.clone();
         }
         let states = Arc::new(parking_lot::RwLock::new(std::collections::BTreeMap::from(
@@ -310,25 +369,17 @@ mod tests {
                 (server_proof.did.clone(), server_state),
                 (publisher.did.clone(), publisher_state),
                 (reader.did.clone(), reader_state),
-                (other.did.clone(), other_state),
+                (foreign.did.clone(), foreign_state),
             ],
         )));
-        let authority = Arc::clone(&states);
+        // #1652: no tenant map in config at all — admission derives tenants
+        // from the live authority. The Event ingress set is name-keyed; an
+        // Event grant on the reader's service must never authorize stream
+        // injection.
         let mut config = QuicConfig::default();
-        config.moql_subject_tenants = std::collections::BTreeMap::from([
-            (server_proof.did.clone(), "local".into()),
-            (publisher.did.clone(), "local".into()),
-            (reader.did.clone(), "local".into()),
-            (other.did.clone(), "other".into()),
-        ]);
         config.stream_publishers.insert(publisher.did.clone());
-        config.stream_publishers.insert(other.did.clone());
-        // An Event ingress row must never authorize stream injection.
-        config.event_publishers.insert(reader.did.clone());
-        let admission = stream_admission(
-            &config,
-            Arc::new(move |did: &str| authority.read().get(did).cloned()),
-        );
+        config.event_publishers.insert("policy".to_owned());
+        let admission = stream_admission(live_roster(&states));
         let secret = [65; 32];
         admission.install_server_identity(
             MoqlServerIdentityProof::from_local_admission_proof(&server_proof)?,
@@ -337,7 +388,7 @@ mod tests {
         let origin = hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone().build();
         let server = IrohSubstrate::new(
             secret,
-            stream_handler(&config, &origin, admission),
+            stream_handler(&config, live_roster(&states), &origin, admission),
             RefuseHandler::new("streams no rpc"),
         )
         .await?;
@@ -372,21 +423,21 @@ mod tests {
             .with_consume(read_origin.clone())
             .connect(web_transport_iroh::Session::raw(reader_conn))
             .await?;
-        let other_conn = outsider.connect(direct(&server), ALPN_MOQ_LITE).await?;
-        prove_moql_admission(
-            &other_conn,
-            &other,
-            *outsider.endpoint_id().as_bytes(),
-            Duration::from_secs(2),
-        )
-        .await?;
-        let other_origin = Origin::random().produce();
-        let other_consumer = other_origin.consume();
-        let other_session = Client::new()
-            .with_origin(other_origin.clone())
-            .with_consume(other_origin.clone())
-            .connect(web_transport_iroh::Session::raw(other_conn))
-            .await?;
+        // A foreign at9p record present in the store (arbitrary `#ns`
+        // service entry, not a factory service) must be denied at the
+        // admission exchange itself — the ∩ get_factory filter.
+        let foreign_conn = outsider.connect(direct(&server), ALPN_MOQ_LITE).await?;
+        assert!(
+            prove_moql_admission(
+                &foreign_conn,
+                &foreign,
+                *outsider.endpoint_id().as_bytes(),
+                Duration::from_secs(2),
+            )
+            .await
+            .is_err(),
+            "foreign store record must not derive a tenant"
+        );
         // Exercise the production required-profile reach dialer too, with the
         // authenticated producer witness and an independently provisioned peer.
         let lookup = iroh::address_lookup::memory::MemoryLookup::new();
@@ -458,23 +509,12 @@ mod tests {
         let _injected = read_origin
             .create_broadcast("local/streams/reader-injected")
             .context("reader injection")?;
-        let _cross = other_origin
-            .create_broadcast("local/streams/cross-tenant")
-            .context("cross tenant injection")?;
-        for denied in [
-            "local/streams/reader-injected",
-            "local/streams/cross-tenant",
-        ] {
-            assert!(tokio::time::timeout(
-                Duration::from_millis(250),
-                origin.consumer().announced_broadcast(denied)
-            )
-            .await
-            .is_err());
-        }
+        // An admitted-but-unlisted peer stays read-only: the reader (tenant
+        // local via #policy, absent from stream_publishers, Event grant
+        // notwithstanding) cannot inject into the shared origin.
         assert!(tokio::time::timeout(
             Duration::from_millis(250),
-            other_consumer.announced_broadcast(name)
+            origin.consumer().announced_broadcast("local/streams/reader-injected")
         )
         .await
         .is_err());
@@ -490,11 +530,180 @@ mod tests {
         )
         .await
         .is_err());
-        drop((writer_session, reader_session, other_session));
+        drop((writer_session, reader_session));
         writer.shutdown().await?;
         subscriber.shutdown().await?;
         outsider.shutdown().await?;
         server.shutdown().await?;
+        Ok(())
+    }
+
+    /// #1652 THE CHURN TEST (Streams, full admission exchange): a service's
+    /// DID changes — same service name re-bound to a new DID in the live
+    /// store, exactly the R1 store re-init shape — and admission for that
+    /// service keeps working in the SAME process, no restart, no config
+    /// change. Under the former DID-keyed `quic.moql_subject_tenants` map the
+    /// successor DID had no binding and every admission for it failed until
+    /// config.toml was re-projected and every container restarted.
+    #[test]
+    fn native_stream_admission_survives_did_churn_without_restart() -> Result<()> {
+        const CHILD: &str = "HYPRSTREAM_NATIVE_STREAM_CHURN_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "services::stream_network::tests::native_stream_admission_survives_did_churn_without_restart", "--nocapture"])
+                .env(CHILD, "1").status()?;
+            anyhow::ensure!(
+                status.success(),
+                "isolated native stream churn regression failed"
+            );
+            return Ok(());
+        }
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?
+            .block_on(stream_churn())
+    }
+
+    async fn stream_churn() -> Result<()> {
+        let (server_proof, server_state) = identity("streams", 71, &["#streams"]);
+        let (mut original, original_state) = identity("original-did", 72, &["#model"]);
+        let (mut successor, successor_state) = identity("successor-did", 73, &["#model"]);
+        let server_identity = server_proof.expected_server.clone();
+        original.expected_server = server_identity.clone();
+        successor.expected_server = server_identity.clone();
+        let states = Arc::new(parking_lot::RwLock::new(std::collections::BTreeMap::from(
+            [
+                (server_proof.did.clone(), server_state),
+                (original.did.clone(), original_state),
+            ],
+        )));
+        // The config object is built ONCE, before the churn, and never
+        // touched again — there is no tenant map to touch.
+        let config = QuicConfig::default();
+        let admission = stream_admission(live_roster(&states));
+        let secret = [75; 32];
+        admission.install_server_identity(
+            MoqlServerIdentityProof::from_local_admission_proof(&server_proof)?,
+            *iroh::SecretKey::from_bytes(&secret).public().as_bytes(),
+        )?;
+        let origin = hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone().build();
+        let server = IrohSubstrate::new(
+            secret,
+            stream_handler(&config, live_roster(&states), &origin, admission),
+            RefuseHandler::new("streams no rpc"),
+        )
+        .await?;
+        let client = peer(76).await?;
+
+        // Pre-churn: the original DID admits through derived resolution.
+        let conn = client.connect(direct(&server), ALPN_MOQ_LITE).await?;
+        prove_moql_admission(
+            &conn,
+            &original,
+            *client.endpoint_id().as_bytes(),
+            Duration::from_secs(2),
+        )
+        .await?;
+        drop(conn);
+
+        // Identity churn: the same service name (#model) is re-bound to a new
+        // DID; the superseded DID leaves the store.
+        states.write().remove(&original.did);
+        states
+            .write()
+            .insert(successor.did.clone(), successor_state);
+
+        // Same process, same config: the successor DID admits.
+        let churned = client.connect(direct(&server), ALPN_MOQ_LITE).await?;
+        prove_moql_admission(
+            &churned,
+            &successor,
+            *client.endpoint_id().as_bytes(),
+            Duration::from_secs(2),
+        )
+        .await
+        .context("successor DID must admit after churn without restart or config change")?;
+        drop(churned);
+
+        // The superseded DID is denied.
+        let stale = client.connect(direct(&server), ALPN_MOQ_LITE).await?;
+        assert!(
+            prove_moql_admission(
+                &stale,
+                &original,
+                *client.endpoint_id().as_bytes(),
+                Duration::from_secs(2),
+            )
+            .await
+            .is_err(),
+            "superseded DID must stop admitting"
+        );
+        drop(stale);
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// #1652 revocation-on-recheck: `is_still_current` re-runs the tenant
+    /// resolver on every recheck (moql_admission.rs "removal or reassignment
+    /// closes a previously admitted scoped session"). With the former
+    /// config-cloned map that clause was inert — the map could never change
+    /// within a process. Under derivation a store-side roster edit is
+    /// effective on the next recheck: re-assigning the subject's capsule
+    /// service entry OFF the deployment roster (same DID, same keys, same
+    /// epoch, still live — only the `#service` id changes to a non-factory
+    /// entry) closes the previously admitted session. Reassignment to another
+    /// deployment service keeps the tenant, so the session legitimately
+    /// survives — the tenant, not the service name, is the session binding.
+    #[test]
+    fn derived_tenant_recheck_closes_session_on_roster_removal() -> Result<()> {
+        use hyprstream_rpc::moq_authz::PeerIdentity;
+        use hyprstream_rpc::transport::moql_admission::AdmittedMoqPeer;
+        let (server_proof, server_state) = identity("streams", 81, &["#streams"]);
+        let (model_proof, model_state) = identity("model-service", 82, &["#model"]);
+        let states = Arc::new(parking_lot::RwLock::new(std::collections::BTreeMap::from(
+            [
+                (server_proof.did.clone(), server_state),
+                (model_proof.did.clone(), model_state.clone()),
+            ],
+        )));
+        let admission = stream_admission(live_roster(&states));
+        admission.install_server_identity(
+            MoqlServerIdentityProof::from_local_admission_proof(&server_proof)?,
+            [83; 32],
+        )?;
+        let admitted = AdmittedMoqPeer {
+            peer: PeerIdentity::authenticated(model_proof.did.clone()),
+            tenant: "local".to_owned(),
+            epoch: model_state.epoch,
+            head_digest: model_state.head_digest,
+            subject_ed25519: model_proof.ed25519.verifying_key().to_bytes(),
+            carrier_node_id: [84; 32],
+        };
+        assert!(
+            admission.is_still_current(&admitted),
+            "live deployment identity must remain current"
+        );
+        // Same-tenant reassignment: another deployment service name — the
+        // derived tenant is unchanged, so the session stays current.
+        let mut moved = model_state.clone();
+        moved.service_ids = vec!["#policy".to_owned()];
+        states.write().insert(model_proof.did.clone(), moved);
+        assert!(
+            admission.is_still_current(&admitted),
+            "same-tenant service reassignment must not close the session"
+        );
+        // Off-roster reassignment: a foreign `#ns` entry (public ingest
+        // shape). Keys, epoch, digest and liveness are all unchanged — only
+        // roster membership is gone — and the session must close.
+        let mut off_roster = model_state.clone();
+        off_roster.service_ids = vec!["#ns".to_owned()];
+        states.write().insert(model_proof.did.clone(), off_roster);
+        assert!(
+            !admission.is_still_current(&admitted),
+            "roster removal must close the previously admitted session on recheck"
+        );
         Ok(())
     }
 }

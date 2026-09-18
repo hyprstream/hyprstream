@@ -7127,6 +7127,7 @@ dependencies = [
  "hyprstream-rpc-std",
  "hyprstream-service",
  "hyprstream-util",
+ "inventory",
  "iroh",
  "libc",
  "moq-net",

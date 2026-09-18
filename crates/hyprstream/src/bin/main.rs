@@ -3590,9 +3590,27 @@ fn main() -> Result<()> {
                                         // never an application identity.
                                         moq_relay_server_identity: None,
                                         moq_admission: if moq_admission_proof.is_some() {
-                                            Some(hyprstream_core::services::stream_network::production_stream_admission(&qc)?)
+                                            Some(hyprstream_core::services::stream_network::production_stream_admission()?)
                                         } else { None },
-                                        moq_ingress_authorizer: Some(hyprstream_core::services::stream_network::stream_ingress_authorizer(&qc)),
+                                        // The ingress authorizer only runs alongside
+                                        // admission (it decides on already-admitted peers),
+                                        // so it is constructed under the same guard and
+                                        // derives tenants from the same live roster
+                                        // source (#1652).
+                                        moq_ingress_authorizer: if moq_admission_proof.is_some() {
+                                            // Prime this roster instance synchronously at
+                                            // construction too (review round 7): it is a
+                                            // separate cache from the admission's, and the
+                                            // first publisher ingress would otherwise pay
+                                            // the synchronous first load on the serving
+                                            // runtime.
+                                            let roster = hyprstream_discovery::production_deployment_roster()?;
+                                            let _ = roster.roster();
+                                            Some(hyprstream_core::services::stream_network::stream_ingress_authorizer(
+                                                &qc,
+                                                roster,
+                                            ))
+                                        } else { None },
                                         moq_admission_proof,
                                         native_announcement_publisher: Some(std::sync::Arc::new(
                                             move |request: hyprstream_service::NativeAnnouncementRequest| {

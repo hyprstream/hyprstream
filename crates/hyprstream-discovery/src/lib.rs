@@ -70,6 +70,11 @@ pub use checkpointed_pds::FIRST_BOOT_KEY;
 /// `Resolver::set_global` / network-profile resolver seam (#873).
 pub mod at9p_resolver;
 
+/// #1652 — derived native admission roster: deployment service identities
+/// (and their `local` tenant) resolved from the live accepted-state store at
+/// admission time, replacing the DID-valued `quic.moql_subject_tenants` map.
+pub mod admission_roster;
+
 /// #896 (at9p D4) — `did:web` / `did:key` → `did:at9p` aliasing resolver:
 /// resolves a classical DID to its authoritative `did:at9p` identity via mutual
 /// `alsoKnownAs` attestation + the GATE pipeline. Sibling to `at9p_resolver`.
@@ -140,6 +145,7 @@ pub use service::{
     authenticate_local_deployment_registry,
     native_network_required, installed_bootstrap_discovery_client,
     production_moq_event_target, production_moql_accepted_state_authority,
+    production_deployment_roster,
     bootstrap_deployment_process, deployment_registry_verifier, resolve_and_authenticate_did_anchors,
     AuthorizationProvider, DiscoveryService, DiscoverySelfAnnouncer, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
     production_browser_currentness_verifier, production_browser_provisioning,

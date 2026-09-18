@@ -125,6 +125,7 @@ fn accepted_state(
             ed25519: peer.ed.verifying_key().to_bytes(),
             ml_dsa_65: ml_dsa_sk_to_vk_bytes(&peer.pq),
         }],
+        service_ids: vec![],
         expires_at_unix_ms,
     }
 }
@@ -207,6 +208,7 @@ async fn admission_server_with_identity(
                 ed25519: server_identity.identity.ed25519,
                 ml_dsa_65: server_identity.identity.ml_dsa65.clone(),
             }],
+            service_ids: vec![],
             expires_at_unix_ms: Some(server_identity.identity.expires_at_unix_ms),
         },
     );
