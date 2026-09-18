@@ -36,10 +36,17 @@ the command advances the existing chain through the guard and preserves other
 current keys, service entries and commitments. Ambiguous matching identities,
 uncommitted signers, renewal of terminal identities and invalid checkpoints fail closed.
 
-The default lifetime is 24 hours; accepted values are 600–86400 seconds. This
-command does not install an automatic renewal timer. Operators must renew
-before expiry, either through the authorized live registry successor-ingest
-RPC or in a maintenance window with the registry stopped.
+The default lifetime is 24 hours; accepted values are 600–7776000 seconds
+(90 days). The running registry daemon additionally renews these identities
+itself: an in-daemon timer (`[registry.at9p_renewal]`, 6-hour checks by
+default) reuses this command's mint core against the daemon's live store
+handles, mints an `epoch+1` successor once an identity passes its half-TTL
+window, and re-exports the verified roster projection
+(`<data>/config/native-network/roster.json`) every tick so host-side
+monitoring keeps reading fresh expiries. The offline command remains the
+boot-time exclusive-writer path and must still be ordered before the
+registry opens the store; a daemon restart still requires a current registry
+deployment credential.
 
 In `network-iroh-required` mode, native process bootstrap authenticates the
 OS-owned deployment artifacts and projects Discovery and Policy reach directly

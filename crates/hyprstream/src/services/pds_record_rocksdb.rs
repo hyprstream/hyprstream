@@ -1465,6 +1465,21 @@ impl PdsPublisher {
             .ingest_genesis(did, capsule_bytes)
     }
 
+    /// The sole read-write record store this publisher owns. Exposed for the
+    /// in-daemon at9p renewal timer, which must reuse the LIVE handles —
+    /// never re-open the store (the RocksDB directory LOCK excludes the
+    /// second read-write opener this process already is).
+    pub fn at9p_record_store(&self) -> &Arc<PdsRecordStore> {
+        &self.store
+    }
+
+    /// The daemon-owned accepted-state ingest boundary, when configured.
+    /// Renewal admission goes through this exact boundary (same guard, audit
+    /// WAL, and checkpoint CAS as the RPC path).
+    pub fn at9p_state_ingest(&self) -> Option<&At9pStateIngest> {
+        self.at9p_state.as_ref()
+    }
+
     pub fn ingest_at9p_successor(
         &self,
         did: &str,

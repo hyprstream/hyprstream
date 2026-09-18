@@ -43,6 +43,16 @@ daemon's UTC clock, never caller-supplied time, and the synchronous crypto/
 RocksDB transaction runs on the service's blocking worker pool. Consumers read
 the typed verified PDS seam.
 
+The same daemon also runs the at9p service-identity renewal timer
+(`services::at9p_renewal`): it reuses the boot provisioner's mint core
+against these live handles, never re-opens the store, and never
+re-authenticates the deployment credential per tick — successor admission is
+key-authority only (pre-committed on-volume signer, `epoch+1`, daemon clock),
+so a running process renews identities for its lifetime while every process
+start still gates on the deployment credential. The timer re-exports the
+verified roster projection every tick; a roster whose `generated_at` ages out
+means the timer died, not that nothing was due.
+
 Duplicity alarms use the existing separately fsynced, hybrid-signed alarm WAL.
 An alarm never advances accepted state. Restart eagerly reopens and verifies
 the alarm WAL before ingest becomes available. Accepted-state values are

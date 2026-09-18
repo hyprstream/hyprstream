@@ -20,6 +20,8 @@ use crate::services::discovery::{At9pStateIngest, PdsRecordStore};
 /// Machine-readable manifest schema emitted by `--roster-export`.
 const VERIFIED_ROSTER_SCHEMA: &str = "hyprstream/verified-service-roster@1";
 
+pub use crate::config::{MAX_SERVICE_IDENTITY_TTL_SECS, MIN_SERVICE_IDENTITY_TTL_SECS};
+
 /// Open the deployment checkpoint store on the CONFIGURED backend (#1257).
 ///
 /// With an RDS binding resolved (`[rds]` TOML, the role-scoped env vars, or
@@ -133,8 +135,10 @@ pub fn provision_services(
     roster_export: Option<&Path>,
 ) -> Result<()> {
     ensure!(
-        (600..=86_400).contains(&valid_for_seconds),
-        "service identity lifetime must be 600..86400 seconds"
+        (MIN_SERVICE_IDENTITY_TTL_SECS..=MAX_SERVICE_IDENTITY_TTL_SECS).contains(&valid_for_seconds),
+        "service identity lifetime must be {}..{} seconds",
+        MIN_SERVICE_IDENTITY_TTL_SECS,
+        MAX_SERVICE_IDENTITY_TTL_SECS
     );
     validate_service_roster(services)?;
     let verifier = hyprstream_discovery::authenticate_local_deployment_registry()?;
@@ -273,7 +277,7 @@ fn serialize_verified_roster_manifest(services: Vec<VerifiedServiceRosterEntry>)
 /// Re-read and re-verify every admitted member from the checkpoint store,
 /// projecting only public fields. Any missing, mismatched, expired, or
 /// unbound member fails the whole roster.
-fn build_verified_roster_entries(
+pub(crate) fn build_verified_roster_entries(
     store: &PdsRecordStore,
     admitted: &[(&str, &SigningKey, AcceptedAt9pState)],
     now_text: &str,
@@ -306,7 +310,7 @@ fn build_verified_roster_entries(
 /// temporary file this invocation successfully created is ever removed; if
 /// exclusive creation fails because the predictable sibling already exists,
 /// that preexisting file belongs to someone else and is left untouched.
-fn write_verified_roster_manifest(
+pub(crate) fn write_verified_roster_manifest(
     path: &Path,
     services: Vec<VerifiedServiceRosterEntry>,
 ) -> Result<()> {
@@ -373,6 +377,66 @@ fn publish_owned_roster_temp(
     result
 }
 
+/// Re-export the verified roster projection from the LIVE daemon store: the
+/// same readback-verified entries and atomic writer the boot command uses, so
+/// host-side tooling that reads the roster (the metal renewal monitor, which
+/// flags `roster_stale` when `generated_at` ages past 24 h) observes fresh
+/// expiries after in-daemon renewals. All-or-nothing like the boot export:
+/// any member that fails verification fails the whole snapshot, never a
+/// partial manifest that would hide a sick member from the monitor.
+///
+/// Unlike the boot writer, the periodic path gives its temporary file an
+/// ATTEMPT-UNIQUE name: the boot writer's predictable `.tmp-<pid>` sibling is
+/// deliberately preserved on collision (ownership boundary for a one-shot
+/// command), but a daemon crash between create and rename can leave that
+/// predictable file behind, and a container daemon restarting with the SAME
+/// pid would then fail every periodic export on the preserved leftover — a
+/// permanently stale roster despite healthy renewals. An attempt-unique name
+/// cannot collide with any prior attempt's leftover; a crash leaks one small
+/// stale temp file, never a permanent failure.
+pub(crate) fn export_verified_roster_snapshot(
+    store: &PdsRecordStore,
+    admitted: &[(String, SigningKey, AcceptedAt9pState)],
+    path: &Path,
+) -> Result<()> {
+    let now_text = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let borrowed = admitted
+        .iter()
+        .map(|(name, key, state)| (name.as_str(), key, state.clone()))
+        .collect::<Vec<_>>();
+    let entries = build_verified_roster_entries(store, &borrowed, &now_text)?;
+    ensure!(
+        !path.is_dir(),
+        "roster export path is a directory: {}",
+        path.display()
+    );
+    let file_name = path
+        .file_name()
+        .context("roster export path has no file name")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure!(
+        parent.is_dir(),
+        "roster export parent directory does not exist: {}",
+        parent.display()
+    );
+    let bytes = serialize_verified_roster_manifest(entries)?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .with_context(|| format!("create roster export temporary {}", temp.display()))?;
+    publish_owned_roster_temp(file, &temp, path, &bytes)
+}
+
 /// The command is dispatched after `main` has loaded and validated the
 /// operator-selected configuration. Reusing that exact value keeps an explicit
 /// `--config` `[secrets].path` authoritative rather than reloading defaults.
@@ -380,7 +444,21 @@ fn provisioning_secrets_dir(config: &HyprConfig) -> Result<std::path::PathBuf> {
     HyprConfig::resolve_secrets_dir_for(Some(config))
 }
 
-fn provision_one(
+/// Provision or renew one service identity against ALREADY-OPEN store/ingest
+/// handles. This is the reusable mint core shared by the offline boot command
+/// and the in-daemon renewal timer (`services::at9p_renewal`).
+///
+/// Contract for in-daemon callers: pass the daemon's LIVE `PdsRecordStore` and
+/// `At9pStateIngest` handles — never re-open the store (the RocksDB directory
+/// LOCK excludes the second read-write opener the daemon itself is) and never
+/// re-authenticate the deployment registry per tick (the credential/UCAN
+/// check happens exactly once at process start; reintroducing it per tick
+/// would cap renewal at the delegation's TTL). Every refusal invariant is
+/// preserved verbatim: key mismatch refuses (never substitutes), terminal
+/// identity refuses, a provisioned key absent from `next_key_commitments`
+/// refuses, the same key is carried forward, the successor is `epoch+1`, and
+/// `now` is the caller's (daemon) clock with no skew tolerance.
+pub(crate) fn provision_one(
     store: &PdsRecordStore,
     ingest: &At9pStateIngest,
     service_name: &str,
@@ -620,7 +698,14 @@ mod tests {
     fn deployment_bootstrap_rejects_invalid_roster_and_lifetime_before_credentials() {
         let config = HyprConfig::default();
         assert!(provision_services(&config, &["model".to_owned()], 599, None).is_err());
-        assert!(provision_services(&config, &["model".to_owned()], 86401, None).is_err());
+        assert!(
+            provision_services(&config, &["model".to_owned()], MAX_SERVICE_IDENTITY_TTL_SECS + 1, None)
+                .is_err()
+        );
+        assert!(
+            provision_services(&config, &["model".to_owned()], MAX_SERVICE_IDENTITY_TTL_SECS, None)
+                .is_err()
+        );
         assert!(provision_services(&config, &[], 86400, None).is_err());
         assert!(
             provision_services(&config, &["model".to_owned(), "model".to_owned()], 86400, None)

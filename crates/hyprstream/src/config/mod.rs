@@ -2303,6 +2303,127 @@ pub struct RegistryServiceConfig {
     /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
     #[serde(default)]
     pub quic_port: Option<u16>,
+    /// In-daemon at9p service-identity renewal. The registry is the sole
+    /// record-store writer, so its process hosts the renewal timer.
+    #[serde(default)]
+    pub at9p_renewal: At9pRenewalConfig,
+}
+
+/// Minimum accepted service-identity lifetime: shared by the offline
+/// provisioner's `--valid-for-seconds` clamp and the in-daemon renewal TTL.
+pub const MIN_SERVICE_IDENTITY_TTL_SECS: i64 = 600;
+
+/// Maximum accepted service-identity lifetime: 90 days. The at9p chain layer
+/// has no maximum TTL of its own — this ceiling is provisioner-side policy.
+/// 90 days satisfies the anchor-TTL ≥ 3× worst-case-deploy-gap policy for the
+/// 30-day delegated-signer ceremony cadence, and the in-daemon renewal loop
+/// (`services::at9p_renewal`) renews at the half-TTL point so a live daemon
+/// never approaches it.
+pub const MAX_SERVICE_IDENTITY_TTL_SECS: i64 = 7_776_000;
+
+/// In-daemon at9p service-identity renewal (`[registry.at9p_renewal]`).
+///
+/// The renewal timer reuses the boot provisioner's mint core against the
+/// daemon's LIVE store/ingest handles: same DIDs forever, `epoch+1`
+/// successors, same on-volume key, no-op inside the half-TTL window. The
+/// deployment credential/UCAN is checked exactly once per process start —
+/// never per tick — so a running daemon renews for its process lifetime;
+/// restarts still gate on the deployment credential (unchanged).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct At9pRenewalConfig {
+    /// Check interval in seconds (default 6 h, the JWT key-rotation check
+    /// cadence). Every tick renews due identities AND re-exports the roster
+    /// projection, so `roster_stale` in host-side monitoring means the loop
+    /// died, not merely that nothing was due.
+    #[serde(default)]
+    pub check_interval_secs: Option<u64>,
+    /// TTL stamped onto minted successors, seconds. Defaults to 24 h —
+    /// defensively inside the 86,400-second roster-lifetime bound that
+    /// host-side native-config/monitor tooling still enforces, so an
+    /// unset key can never mint a successor the deployed guard classifies
+    /// as `invalid_roster`. A longer TTL (up to
+    /// [`MAX_SERVICE_IDENTITY_TTL_SECS`], validated against the same range
+    /// as the CLI clamp) is an explicit opt-in that must be paired with the
+    /// host-side guard widening in the same rollout.
+    ///
+    /// Deployments provisioning identities with a longer boot-time
+    /// `--valid-for-seconds` MUST set this key to match: the timer mints
+    /// successors with the CONFIG TTL, so an unset key against 90-day
+    /// boot-minted identities would contract the next renewal window to
+    /// 24 h (still renewed, never expired — but the long margin is lost).
+    #[serde(default)]
+    pub valid_for_secs: Option<i64>,
+    /// Roster.json re-export path. `None` derives
+    /// `<data_dir>/config/native-network/roster.json` — the projection the
+    /// host-side renewal monitor reads. The boot-time
+    /// `--roster-export roster.candidate.json` flow is unaffected: this path
+    /// is the promoted projection, refreshed every tick.
+    #[serde(default)]
+    pub roster_export: Option<std::path::PathBuf>,
+}
+
+impl At9pRenewalConfig {
+    /// Resolved check interval (default 6 h), floor-clamped to 60 s so a
+    /// misconfigured near-zero interval cannot spin the loop.
+    pub fn check_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.check_interval_secs.unwrap_or(6 * 3600).max(60))
+    }
+
+    /// Resolved renewal TTL, validated against the provisioner's clamp range.
+    /// Defaults to 24 h (see the field docs for the defensive rationale).
+    pub fn valid_for_seconds(&self) -> anyhow::Result<i64> {
+        const DEFAULT_RENEWAL_TTL_SECS: i64 = 86_400;
+        let ttl = self
+            .valid_for_secs
+            .unwrap_or(DEFAULT_RENEWAL_TTL_SECS);
+        anyhow::ensure!(
+            (MIN_SERVICE_IDENTITY_TTL_SECS..=MAX_SERVICE_IDENTITY_TTL_SECS).contains(&ttl),
+            "[registry.at9p_renewal] valid_for_secs must be {}..{} seconds",
+            MIN_SERVICE_IDENTITY_TTL_SECS,
+            MAX_SERVICE_IDENTITY_TTL_SECS
+        );
+        Ok(ttl)
+    }
+
+    /// Cross-validated (check interval, renewal TTL) pair: the check interval
+    /// must stay strictly below half the TTL AND below the host-side roster
+    /// freshness window (24 h). Liveness argument: an identity minted at T
+    /// with TTL V becomes due at T + V/2; ticks fire every i, so the first
+    /// due tick lands by T + V/2 + i with remaining life V/2 - i — positive
+    /// only while i < V/2. At i ≥ V/2 a schedule exists where the head
+    /// expires before any due tick, and an expired accepted head can never be
+    /// renewed (admission requires a fresh predecessor). The roster freshness
+    /// bound: the projection's `generated_at` refreshes only on a tick, and
+    /// host-side monitoring flags `roster_stale` once it ages past 24 h, so
+    /// an interval of a day or more would report a healthy loop as stale —
+    /// breaking the documented "stale roster means the timer died" signal.
+    /// Refuses at registry startup rather than renewing too slowly to matter.
+    pub fn validated(&self) -> anyhow::Result<(std::time::Duration, i64)> {
+        const ROSTER_FRESHNESS_WINDOW_SECS: u64 = 86_400;
+        let ttl = self.valid_for_seconds()?;
+        let interval = self.check_interval();
+        let half_ttl = u64::try_from(ttl / 2).unwrap_or(0);
+        anyhow::ensure!(
+            interval.as_secs() < half_ttl,
+            "[registry.at9p_renewal] check_interval_secs ({}) must be < half of \
+             valid_for_secs ({}/2 = {}): a slower tick lets an identity pass its \
+             half-TTL window and expire before renewal, and an expired head has \
+             no authorized successor path",
+            interval.as_secs(),
+            ttl,
+            half_ttl
+        );
+        anyhow::ensure!(
+            interval.as_secs() < ROSTER_FRESHNESS_WINDOW_SECS,
+            "[registry.at9p_renewal] check_interval_secs ({}) must be < {}: the roster \
+             projection's generated_at refreshes only on a tick and host-side \
+             monitoring flags roster_stale past 24 h, so a day-or-slower tick \
+             would report a healthy timer as stale",
+            interval.as_secs(),
+            ROSTER_FRESHNESS_WINDOW_SECS
+        );
+        Ok((interval, ttl))
+    }
 }
 
 /// Policy service configuration.
@@ -3416,6 +3537,84 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn at9p_renewal_interval_must_outrun_half_ttl() {
+        // Defaults: 6 h check vs 24 h TTL — inside every bound, and the
+        // default TTL stays within the 86,400 s roster-lifetime bound that
+        // deployed host-side guards still enforce (an unset key must never
+        // mint a successor the guard classifies invalid_roster).
+        let defaults = At9pRenewalConfig::default();
+        let (interval, ttl) = match defaults.validated() {
+            Ok(pair) => pair,
+            Err(error) => panic!("defaults validate: {error}"),
+        };
+        assert_eq!(interval.as_secs(), 6 * 3600);
+        assert_eq!(ttl, 86_400);
+        // Minimum supported TTL (600 s → half = 300 s) with the default 6 h
+        // interval lets an identity expire between due ticks: refuse.
+        let slow = At9pRenewalConfig {
+            valid_for_secs: Some(MIN_SERVICE_IDENTITY_TTL_SECS),
+            ..Default::default()
+        };
+        let error = match slow.validated() {
+            Ok(_) => panic!("6h check vs 10m TTL must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("half of valid_for_secs"), "{error}");
+        // Interval at exactly half the TTL still leaves a schedule where the
+        // head expires on the tick boundary: refuse strictly below only.
+        let boundary = At9pRenewalConfig {
+            valid_for_secs: Some(600),
+            check_interval_secs: Some(300),
+            ..Default::default()
+        };
+        assert!(boundary.validated().is_err());
+        // One second inside the window renews with positive remaining life.
+        let inside = At9pRenewalConfig {
+            valid_for_secs: Some(600),
+            check_interval_secs: Some(299),
+            ..Default::default()
+        };
+        let (inside_interval, _) = match inside.validated() {
+            Ok(pair) => pair,
+            Err(error) => panic!("inside window: {error}"),
+        };
+        assert_eq!(inside_interval.as_secs(), 299);
+        // A two-day interval satisfies the half-TTL bound against an
+        // explicit 90 d TTL but starves the roster freshness signal: the
+        // projection's generated_at refreshes only on a tick, and
+        // host-side monitoring flags roster_stale past 24 h — refuse at or
+        // above a day.
+        let slow_but_renewable = At9pRenewalConfig {
+            valid_for_secs: Some(MAX_SERVICE_IDENTITY_TTL_SECS),
+            check_interval_secs: Some(2 * 86_400),
+            ..Default::default()
+        };
+        let error = match slow_but_renewable.validated() {
+            Ok(_) => panic!("two-day interval must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("roster_stale"), "{error}");
+        let day_boundary = At9pRenewalConfig {
+            valid_for_secs: Some(MAX_SERVICE_IDENTITY_TTL_SECS),
+            check_interval_secs: Some(86_400),
+            ..Default::default()
+        };
+        assert!(day_boundary.validated().is_err());
+        let just_under_a_day = At9pRenewalConfig {
+            valid_for_secs: Some(MAX_SERVICE_IDENTITY_TTL_SECS),
+            check_interval_secs: Some(86_399),
+            ..Default::default()
+        };
+        assert!(just_under_a_day.validated().is_ok());
+        // Out-of-range TTL is still refused by the clamp validation.
+        let bad_ttl = At9pRenewalConfig {
+            valid_for_secs: Some(MAX_SERVICE_IDENTITY_TTL_SECS + 1),
+            ..Default::default()
+        };
+        assert!(bad_ttl.validated().is_err());
+    }
 
     #[cfg(feature = "pds-postgres")]
     fn rds_fixture(url: &str) -> (tempfile::TempDir, RdsConfig) {
