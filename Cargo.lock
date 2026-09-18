@@ -7105,6 +7105,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-decision"
+version = "0.1.0"
+dependencies = [
+ "arrow-array 56.2.0",
+ "arrow-schema 56.2.0",
+ "blake3",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 1.0.69",
+ "workspace-hack",
+]
+
+[[package]]
 name = "hyprstream-discovery"
 version = "0.1.0"
 dependencies = [
@@ -19492,6 +19506,7 @@ dependencies = [
  "futures-util",
  "generic-array",
  "getrandom 0.2.16",
+ "getrandom 0.3.3",
  "getrandom 0.4.2",
  "gimli",
  "h2 0.4.12",
@@ -19538,6 +19553,7 @@ dependencies = [
  "noq-udp",
  "num-bigint",
  "num-integer",
+ "num-iter",
  "num-traits",
  "object",
  "once_cell",
