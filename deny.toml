@@ -67,11 +67,6 @@ version = "*"
 allow = ["AGPL-3.0-only"]
 
 [[licenses.exceptions]]
-name = "hyprstream-metrics"
-version = "*"
-allow = ["AGPL-3.0-only"]
-
-[[licenses.exceptions]]
 name = "hyprstream-flight"
 version = "*"
 allow = ["AGPL-3.0-only"]
@@ -83,6 +78,11 @@ allow = ["AGPL-3.0-only"]
 
 [[licenses.exceptions]]
 name = "hyprstream-ledger"
+version = "*"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "hyprstream-metrics"
 version = "*"
 allow = ["AGPL-3.0-only"]
 

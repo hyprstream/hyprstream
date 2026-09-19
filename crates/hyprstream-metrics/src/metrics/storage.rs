@@ -117,10 +117,9 @@ pub trait MetricsStorage: Send + Sync + 'static {
     /// Get the underlying storage backend
     fn backend(&self) -> &dyn StorageBackend;
 
-    /// Initialize metrics storage (create tables etc.)
+    /// Initialize metrics storage (create schema-v2 tables, migrate pre-v2 `metrics`).
     async fn init(&self) -> Result<(), Status> {
-        let schema = Self::get_metrics_schema();
-        self.backend().create_table("metrics", &schema).await
+        crate::metrics::create_schema_v2_tables(self.backend()).await
     }
 
     /// Insert metrics into storage
@@ -205,18 +204,12 @@ pub trait MetricsStorage: Send + Sync + 'static {
 
     /// Get the standard schema for metric records
     fn get_metrics_schema() -> Schema {
-        Schema::new(vec![
-            Field::new("metric_id", DataType::Utf8, false),
-            Field::new("timestamp", DataType::Int64, false),
-            Field::new("value_running_window_sum", DataType::Float64, false),
-            Field::new("value_running_window_avg", DataType::Float64, false),
-            Field::new("value_running_window_count", DataType::Int64, false),
-        ])
+        crate::metrics::get_metrics_schema()
     }
 
     /// Generate SQL for inserting metric records
     fn generate_metric_insert_sql() -> String {
-        "INSERT INTO metrics (metric_id, timestamp, value_running_window_sum, value_running_window_avg, value_running_window_count) VALUES (?, ?, ?, ?, ?)".to_owned()
+        "INSERT INTO metrics (metric_id, timestamp, value_running_window_sum, value_running_window_avg, value_running_window_count, labels, tenant_id) VALUES (?, ?, ?, ?, ?, ?, ?)".to_owned()
     }
 
     /// Generate SQL for querying metrics
@@ -234,7 +227,7 @@ pub trait MetricsStorage: Send + Sync + 'static {
         to_timestamp: Option<i64>,
     ) -> String {
         let mut sql = format!(
-            "SELECT {}, {}({}) as value",
+            "SELECT {}, CAST({}({}) AS DOUBLE) as value",
             group_by.columns.join(", "),
             function,
             "value_running_window_avg" // Use avg for now
