@@ -192,10 +192,10 @@ fn build_sql(q: &MetricQuery) -> Result<String> {
 impl MetricsHandler for MetricsService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject().to_string();
-        // Metrics and their DuckDB view registry are node-global: neither
-        // MetricRecord nor view_metadata carries a tenant key. Keep policy
-        // checks in the global domain instead of claiming tenant isolation that
-        // the storage layer does not provide.
+        // Metrics and their DuckDB view registry are node-global. MetricRecord
+        // carries an optional tenant *data* label (schema v2), but authorization
+        // identity still comes from the verified envelope — never from the
+        // record — so policy checks stay in the global domain.
         let request = PolicyCheck {
             subject: subject.clone(),
             domain: "*".to_owned(),
@@ -238,6 +238,16 @@ impl MetricsHandler for MetricsService {
                 value_running_window_sum: r.value_window_sum,
                 value_running_window_avg: r.value_window_avg,
                 value_running_window_count: r.value_window_count,
+                labels: r
+                    .labels
+                    .iter()
+                    .map(|e| (e.key.clone(), e.value.clone()))
+                    .collect(),
+                tenant_id: if r.tenant_id.is_empty() {
+                    None
+                } else {
+                    Some(r.tenant_id.clone())
+                },
             })
             .collect();
 
@@ -937,6 +947,7 @@ mod tests {
             value_running_window_sum: 11.0,
             value_running_window_avg: 11.0,
             value_running_window_count: 1,
+            ..Default::default()
         }])
         .expect("seed record batch");
         backend
@@ -1057,6 +1068,8 @@ mod tests {
                 value_window_sum: 99.0,
                 value_window_avg: 99.0,
                 value_window_count: 1,
+                labels: vec![],
+                tenant_id: String::new(),
             }],
         };
         let error = client
@@ -1178,6 +1191,8 @@ mod tests {
                     value_window_sum: 42.0,
                     value_window_avg: 42.0,
                     value_window_count: 1,
+                    labels: vec![],
+                    tenant_id: String::new(),
                 },
                 CMetricRecord {
                     metric_id: "cpu.usage".to_owned(),
@@ -1185,6 +1200,8 @@ mod tests {
                     value_window_sum: 58.0,
                     value_window_avg: 58.0,
                     value_window_count: 1,
+                    labels: vec![],
+                    tenant_id: String::new(),
                 },
             ],
         };
@@ -1194,6 +1211,96 @@ mod tests {
         let info = client.health().await.expect("health after ingest");
         assert!(info.ok, "expected ok=true after ingest");
         assert_eq!(info.row_count, 2, "expected 2 rows");
+    }
+
+    /// Schema v2: labels and tenant_id survive the ingest → storage → query
+    /// round trip (group_by works on both new columns).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_ingest_with_labels_and_tenant() {
+        let (client, _mgr, _) = start_metrics_service("metrics-labels").await;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        client
+            .ingest(&IngestRequest {
+                records: vec![
+                    CMetricRecord {
+                        metric_id: "p99_latency_ms".to_owned(),
+                        timestamp: now,
+                        value_window_sum: 120.0,
+                        value_window_avg: 120.0,
+                        value_window_count: 1,
+                        labels: vec![GroupEntry {
+                            key: "primitive".to_owned(),
+                            value: "choice".to_owned(),
+                        }],
+                        tenant_id: "tenant-a".to_owned(),
+                    },
+                    CMetricRecord {
+                        metric_id: "p99_latency_ms".to_owned(),
+                        timestamp: now + 1000,
+                        value_window_sum: 95.0,
+                        value_window_avg: 95.0,
+                        value_window_count: 1,
+                        labels: vec![],
+                        tenant_id: "tenant-b".to_owned(),
+                    },
+                ],
+            })
+            .await
+            .expect("ingest");
+
+        let query = MetricQuery {
+            sql: String::new(),
+            metric_id: "p99_latency_ms".to_owned(),
+            window_secs: 0,
+            aggregation: AggregationFunc::Count,
+            group_by: vec!["tenant_id".to_owned()],
+            limit_rows: 0,
+            ephemeral_pubkey: vec![],
+        };
+        let rows = client.query(&query).await.expect("tenant query");
+        assert_eq!(rows.len(), 2, "expected one row per tenant");
+        let mut tenants: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                assert_eq!(r.value as u64, 1, "COUNT per tenant should be 1");
+                r.group_values
+                    .iter()
+                    .find(|g| g.key == "tenant_id")
+                    .expect("tenant_id group value")
+                    .value
+                    .clone()
+            })
+            .collect();
+        tenants.sort();
+        assert_eq!(tenants, vec!["tenant-a".to_owned(), "tenant-b".to_owned()]);
+
+        // Labels land as canonical JSON; the labeled record forms its own group.
+        let rows = client
+            .query(&MetricQuery {
+                group_by: vec!["labels".to_owned()],
+                ..query.clone()
+            })
+            .await
+            .expect("labels query");
+        let groups: Vec<String> = rows
+            .iter()
+            .flat_map(|r| {
+                r.group_values
+                    .iter()
+                    .filter(|g| g.key == "labels")
+                    .map(|g| g.value.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            groups.iter().any(|g| g.contains("\"primitive\":\"choice\"")),
+            "expected canonical label JSON group, got {groups:?}"
+        );
     }
 
     // ── query ─────────────────────────────────────────────────────────────────
@@ -1215,6 +1322,8 @@ mod tests {
                     value_window_sum: 1024.0,
                     value_window_avg: 1024.0,
                     value_window_count: 1,
+                    labels: vec![],
+                    tenant_id: String::new(),
                 }],
             })
             .await
@@ -1272,6 +1381,8 @@ mod tests {
                         value_window_sum: 100.0,
                         value_window_avg: 100.0,
                         value_window_count: 1,
+                        labels: vec![],
+                        tenant_id: String::new(),
                     },
                     CMetricRecord {
                         metric_id: "disk.io".to_owned(),
@@ -1279,6 +1390,8 @@ mod tests {
                         value_window_sum: 200.0,
                         value_window_avg: 200.0,
                         value_window_count: 1,
+                        labels: vec![],
+                        tenant_id: String::new(),
                     },
                 ],
             })
@@ -1421,6 +1534,8 @@ mod tests {
                     value_window_sum: 11.0,
                     value_window_avg: 11.0,
                     value_window_count: 1,
+                    labels: vec![],
+                    tenant_id: String::new(),
                 }],
             })
             .await
@@ -1630,6 +1745,8 @@ mod tests {
                     value_window_sum: 75.0,
                     value_window_avg: 75.0,
                     value_window_count: 1,
+                    labels: vec![],
+                    tenant_id: String::new(),
                 }],
             })
             .await

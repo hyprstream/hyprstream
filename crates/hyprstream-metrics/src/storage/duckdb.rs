@@ -4,7 +4,7 @@
 use crate::storage::cache::{CacheEviction, CacheManager};
 use crate::storage::view::{ViewDefinition, ViewMetadata};
 use crate::storage::{Credentials, StorageBackend};
-use duckdb::arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use duckdb::arrow::array::{Array, ArrayRef, BinaryArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use duckdb::arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use duckdb::{params, Config, Connection};
@@ -92,14 +92,19 @@ impl StorageBackend for DuckDbBackend {
             .prepare(sql)
             .map_err(|e| Status::internal(format!("Failed to prepare statement: {e}")))?;
 
-        // Use query_arrow to get RecordBatch directly
-        let mut arrow_stream = stmt.query_arrow(params![])
-            .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
+        // Use query_arrow to get RecordBatch directly. The stream may yield
+        // several chunks (e.g. one per radix partition of a grouped
+        // aggregate), so concatenate all of them rather than taking the first.
+        let batches: Vec<RecordBatch> = stmt
+            .query_arrow(params![])
+            .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?
+            .collect();
 
-        // Get the first batch (or empty if no results)
-        match arrow_stream.next() {
-            Some(batch) => Ok(batch),
-            None => {
+        if let Some(first) = batches.first() {
+            let schema = first.schema();
+            duckdb::arrow::compute::concat_batches(&schema, batches.iter())
+                .map_err(|e| Status::internal(format!("Failed to concatenate result chunks: {e}")))
+        } else {
                 // Create empty batch with schema from statement
                 let schema = Arc::new(Schema::new(
                     stmt.column_names()
@@ -129,7 +134,6 @@ impl StorageBackend for DuckDbBackend {
                     .collect();
                 RecordBatch::try_new(schema, empty_arrays)
                     .map_err(|e| Status::internal(format!("Failed to create empty batch: {e}")))
-            }
         }
     }
 
@@ -162,6 +166,10 @@ impl StorageBackend for DuckDbBackend {
         self.execute_statement(&sql).await
     }
 
+    async fn execute_ddl(&self, sql: &str) -> Result<(), Status> {
+        self.execute_statement(sql).await
+    }
+
     async fn insert_into_table(&self, table_name: &str, batch: RecordBatch) -> Result<(), Status> {
         let mut conn = self.conn.lock().await;
         let tx = conn.transaction()
@@ -181,17 +189,38 @@ impl StorageBackend for DuckDbBackend {
                     DataType::Int64 => {
                         let array = col.as_any().downcast_ref::<Int64Array>()
                             .ok_or_else(|| Status::internal("Failed to downcast to Int64Array"))?;
-                        params.push(Box::new(array.value(row_idx)));
+                        if array.is_null(row_idx) {
+                            params.push(Box::new(Option::<i64>::None));
+                        } else {
+                            params.push(Box::new(array.value(row_idx)));
+                        }
                     }
                     DataType::Float64 => {
                         let array = col.as_any().downcast_ref::<Float64Array>()
                             .ok_or_else(|| Status::internal("Failed to downcast to Float64Array"))?;
-                        params.push(Box::new(array.value(row_idx)));
+                        if array.is_null(row_idx) {
+                            params.push(Box::new(Option::<f64>::None));
+                        } else {
+                            params.push(Box::new(array.value(row_idx)));
+                        }
                     }
                     DataType::Utf8 => {
                         let array = col.as_any().downcast_ref::<StringArray>()
                             .ok_or_else(|| Status::internal("Failed to downcast to StringArray"))?;
-                        params.push(Box::new(array.value(row_idx).to_owned()));
+                        if array.is_null(row_idx) {
+                            params.push(Box::new(Option::<String>::None));
+                        } else {
+                            params.push(Box::new(array.value(row_idx).to_owned()));
+                        }
+                    }
+                    DataType::Binary => {
+                        let array = col.as_any().downcast_ref::<BinaryArray>()
+                            .ok_or_else(|| Status::internal("Failed to downcast to BinaryArray"))?;
+                        if array.is_null(row_idx) {
+                            params.push(Box::new(Option::<Vec<u8>>::None));
+                        } else {
+                            params.push(Box::new(array.value(row_idx).to_vec()));
+                        }
                     }
                     _ => return Err(Status::invalid_argument("Unsupported data type")),
                 }
@@ -420,5 +449,55 @@ impl StorageBackend for DuckDbBackend {
 impl CacheEviction for DuckDbBackend {
     async fn execute_eviction(&self, query: &str) -> Result<(), Status> {
         self.execute_statement(query).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: query_sql must concatenate every arrow chunk — DuckDB emits
+    /// at most STANDARD_VECTOR_SIZE (2048) rows per chunk, so a first-chunk-only
+    /// read silently truncates any result set larger than that.
+    #[tokio::test]
+    async fn test_query_sql_returns_all_rows_beyond_one_chunk() -> Result<(), Status> {
+        const ROWS: i64 = 5_000;
+        let backend = DuckDbBackend::new_in_memory()?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        backend.create_table("big", &schema).await?;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..ROWS)) as ArrayRef,
+                Arc::new(StringArray::from_iter(
+                    (0..ROWS).map(|i| (i % 7 == 0).then(|| format!("n{i}"))),
+                )) as ArrayRef,
+            ],
+        )
+        .map_err(|e| Status::internal(e.to_string()))?;
+        backend.insert_into_table("big", batch).await?;
+
+        let handle = backend.prepare_sql("SELECT * FROM big").await?;
+        let result = backend.query_sql(&handle).await?;
+        assert_eq!(
+            result.num_rows() as i64,
+            ROWS,
+            "plain SELECT larger than one chunk must return every row"
+        );
+
+        // Grouped results stream one chunk per radix partition.
+        let handle = backend
+            .prepare_sql("SELECT id, COUNT(*) AS n FROM big GROUP BY id")
+            .await?;
+        let result = backend.query_sql(&handle).await?;
+        assert_eq!(
+            result.num_rows() as i64,
+            ROWS,
+            "GROUP BY must return every group"
+        );
+        Ok(())
     }
 }
