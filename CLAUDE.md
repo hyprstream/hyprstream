@@ -83,6 +83,7 @@ Multiple agents may share the one checkout at the repo root. That checkout has a
 | `hyprstream-compositor` | Pure Rust TUI compositor — WASM-compatible chrome state machine |
 | `waxterm` | Run ratatui apps natively and in the browser via WASI |
 | `chat-core` | Chat orchestration state machine — token parsing, tool call detection, agentic loop |
+| `hyprstream-decision` | jev-1 decision/question schema IR, YAML/JSON authoring, canonical serialization, Arrow emission (System One P0.1a) |
 | `bitsandbytes-sys` | bitsandbytes FFI bindings |
 
 Worker-engine crates are always `hyprstream-workers-{engine}`, never `hyprstream-<lang>` (decided, don't relitigate; `hyprstream-tcl` was renamed `hyprstream-workers-tcl` under this rule).
