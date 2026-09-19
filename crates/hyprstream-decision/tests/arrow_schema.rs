@@ -173,6 +173,10 @@ questions:
         .expect("new schema builds");
     let error = DecisionSchema::check_evolution(&old, &new)
         .expect_err("changing the tone label set must fail loudly");
+    let error = match error {
+        hyprstream_decision::EvolutionError::LabelSetChanged(error) => error,
+        other => panic!("label-set change must surface as LabelSetChanged, got {other:?}"),
+    };
     assert_eq!(error.changes.len(), 1);
     assert_eq!(error.changes[0].question_id, "tone");
     assert_eq!(
@@ -185,6 +189,42 @@ questions:
         new.fingerprint(),
         "evolved label sets change the fingerprint"
     );
+}
+
+#[test]
+fn conformal_emission_flip_fails_evolution_like_the_fingerprint() {
+    use hyprstream_decision::EvolutionError;
+
+    let old = DecisionSchema::from_question_set(&fixture_set()).expect("old schema");
+    let new = DecisionSchema::from_question_set(&fixture_set())
+        .expect("new schema")
+        .without_conformal_set();
+    let error = DecisionSchema::check_evolution(&old, &new)
+        .expect_err("flipping conformal-set emission changes the emitted column set");
+    assert_eq!(
+        error,
+        EvolutionError::EmissionShapeChanged {
+            old_conformal_set: true,
+            new_conformal_set: false,
+        }
+    );
+    assert!(error.to_string().contains("new schema version"));
+    assert_ne!(
+        old.fingerprint(),
+        new.fingerprint(),
+        "the fingerprint already treated the flag as schema content; now the check agrees"
+    );
+
+    // The other direction (off -> on) is likewise schema evolution.
+    let error = DecisionSchema::check_evolution(&new, &old)
+        .expect_err("adding the reserved column is also a column-set change");
+    assert!(matches!(
+        error,
+        EvolutionError::EmissionShapeChanged {
+            old_conformal_set: false,
+            new_conformal_set: true,
+        }
+    ));
 }
 
 #[test]
@@ -594,4 +634,90 @@ fn batch_schema_matches_emitted_schema() {
         schema.arrow_schema().fields().len()
     );
     assert_eq!(batch.schema().as_ref(), &schema.arrow_schema());
+}
+
+#[test]
+fn batch_without_conformal_set_encodes() {
+    use hyprstream_decision::EvolutionError;
+
+    let full = DecisionSchema::from_question_set(&fixture_set()).expect("schema builds");
+    let schema = full.clone().without_conformal_set();
+    let rows = vec![row(vec![
+        (
+            "is_refund",
+            QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.7 }),
+        ),
+        (
+            "tone",
+            QuestionAnswer::answered(AnswerValue::Choice {
+                probabilities: vec![0.1, 0.6, 0.3],
+            }),
+        ),
+        (
+            "severity",
+            QuestionAnswer::answered(AnswerValue::Score {
+                probabilities: vec![0.0, 0.7, 0.3],
+            }),
+        ),
+    ])];
+    let batch = schema.build_batch(&version(), &rows).expect("batch builds");
+    assert_eq!(batch.num_columns(), 9, "2 columns per question + version triple");
+    assert_eq!(batch.schema().as_ref(), &schema.arrow_schema());
+    // The flip is schema evolution, so a consumer diffing the two generations fails
+    // loudly rather than silently reading positional columns.
+    assert!(matches!(
+        DecisionSchema::check_evolution(&full, &schema),
+        Err(EvolutionError::EmissionShapeChanged { .. })
+    ));
+}
+
+/// D5 producer tolerance at max cardinality: a 255-wide distribution whose f32 sum
+/// drifts ~7.2e-7 from 1 must still pass the 1e-6 gate. The ramp p_i = (i+1)/32640
+/// (Σ(i+1) = 32640) is deterministic and sits near the realistic worst case the
+/// tolerance was sized for, so this pins the headroom.
+#[test]
+fn max_cardinality_distribution_within_producer_tolerance() {
+    use hyprstream_decision::{ChoiceOption, QuestionBody, QuestionKind, QuestionSpec};
+
+    let options: Vec<ChoiceOption> = (0..255)
+        .map(|i| ChoiceOption {
+            name: format!("opt_{i}"),
+            rubric: None,
+        })
+        .collect();
+    let question = QuestionSpec {
+        id: "wide".to_owned(),
+        kind: QuestionKind::Choice,
+        instructions: None,
+        body: QuestionBody::Choice { options },
+    };
+    let schema = DecisionSchema::new(vec![question]).expect("schema builds");
+
+    let total = 255.0_f64 * 256.0 / 2.0; // 32640
+    let probabilities: Vec<f32> = (0..255).map(|i| ((i + 1) as f64 / total) as f32).collect();
+    let f32_sum = probabilities.iter().fold(0.0_f32, |acc, p| acc + p);
+    let drift = (f32_sum - 1.0).abs();
+    assert!(
+        drift <= hyprstream_decision::confidence::PRODUCER_SUM_TOLERANCE,
+        "ramp drift {drift:e} must stay within the 1e-6 producer tolerance"
+    );
+    assert!(drift > 1e-7, "the ramp should exercise real headroom, got {drift:e}");
+
+    let rows = vec![row(vec![(
+        "wide",
+        QuestionAnswer::answered(AnswerValue::Choice { probabilities }),
+    )])];
+    let batch = schema.build_batch(&version(), &rows).expect("batch builds");
+    let wide = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .expect("probabilities column");
+    assert_eq!(wide.value_length(), 255);
+    let labels = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("labels");
+    assert_eq!(labels.value(0), "opt_254", "argmax of the ramp is the last option");
 }

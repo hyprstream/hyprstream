@@ -80,7 +80,11 @@
 //! trailing anchor section to its options across 255 positions. Format changes swing
 //! frozen-LLM accuracy by up to 76 pp (Sclar et al.), so there is exactly ONE canonical
 //! serialization and it does not change without a schema version bump. Question ids are
-//! caller-facing only and are never serialized to the model.
+//! caller-facing only and are never serialized to the model. Noul questions carry
+//! **exactly one anchor** (not one per outcome): with no per-option rubric blocks, the
+//! single anchor follows the optional true/false criteria blocks and is the position
+//! where the sigmoid readout is taken (P1.1) — the same adjacent-after principle,
+//! applied to the statement's rubric blocks.
 //!
 //! **Acceptance criterion — token budget:** a serialized request (state + all questions)
 //! must fit the **2048-token budget at 2k ctx** ([`serialize::MAX_SERIALIZED_SPEC_TOKENS`]).
@@ -109,7 +113,8 @@
 //! for a question lives in the probabilities column's **Arrow field metadata**
 //! (`jev.labels`, `jev.kind`) — **never in schema metadata**. Label-set evolution is
 //! schema evolution: [`arrow::DecisionSchema::check_evolution`] fails loudly when an
-//! existing question's kind or label set changes; evolving a label set means minting a
+//! existing question's kind or label set changes, or when conformal-set emission flips
+//! (the emitted column set changes either way); evolving either means minting a
 //! new schema version.
 
 pub mod answer;
@@ -123,8 +128,8 @@ pub mod spec;
 
 pub use answer::{AnswerValue, QuestionAnswer, VersionTriple};
 pub use arrow::{
-    AnswerRow, ArrowSchemaError, BatchError, DecisionSchema, EvolutionReport, LabelChange,
-    LabelEvolutionError,
+    AnswerRow, ArrowSchemaError, BatchError, DecisionSchema, EvolutionError, EvolutionReport,
+    LabelChange, LabelEvolutionError,
 };
 pub use author::{parse_json, parse_yaml, MAX_CHOICE_OPTIONS};
 pub use confidence::DistributionError;

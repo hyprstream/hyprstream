@@ -25,6 +25,10 @@
 //!   state at each anchor position, and option-adjacent placement keeps every option's
 //!   local readout structurally identical through the backbone's causal linear-attention
 //!   layers (S6b1).
+//! - **Noul has exactly ONE anchor**, not one per outcome: the noul statement has no
+//!   per-option rubric blocks, so its single anchor follows the (optional) true/false
+//!   criteria blocks and is the position where the sigmoid readout (P1.1) is taken —
+//!   the same adjacent-after principle, applied to the statement's rubric blocks.
 //! - Score levels carry no index and no neighbour context — each level is judged
 //!   independently against the state (upstream behavioral contract, S6a §2.2).
 //! - Question ids are caller-facing only and never appear in the serialization.

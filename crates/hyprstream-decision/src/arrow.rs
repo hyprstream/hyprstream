@@ -23,7 +23,8 @@
 //!   they are rows in the P0.3 metrics tables.
 //! - **Label-set evolution is schema evolution and fails loudly**:
 //!   [`DecisionSchema::check_evolution`] rejects any change to an existing question's kind
-//!   or label set; the remedy is minting a new schema version (the `schema_version`
+//!   or label set — and any flip of conformal-set emission, which changes the emitted
+//!   column set; the remedy is minting a new schema version (the `schema_version`
 //!   triple column), which is what prepared statements pin (P3.5).
 //! - Question ids must be identifier-safe (`[A-Za-z_][A-Za-z0-9_]*`) for the columnar
 //!   surface so emitted columns compose unquoted in SQL (the ADBC path). Wire-level ids
@@ -97,6 +98,31 @@ pub struct LabelChange {
 pub struct LabelEvolutionError {
     /// Every question whose kind or label set changed.
     pub changes: Vec<LabelChange>,
+}
+
+/// Why a schema generation pair fails the evolution check.
+///
+/// Covers everything [`DecisionSchema::fingerprint`] treats as schema content, so the
+/// two drift detectors can never disagree: an evolution the fingerprint would see is an
+/// evolution this check rejects.
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum EvolutionError {
+    /// An existing question's kind or label set changed.
+    #[error(transparent)]
+    LabelSetChanged(#[from] LabelEvolutionError),
+    /// The conformal-set column flag flipped. The emitted Arrow schema gains or loses a
+    /// column per question, breaking positional consumers and prepared statements, so
+    /// this is schema evolution even though no question changed.
+    #[error(
+        "conformal-set emission flipped ({old_conformal_set} -> {new_conformal_set}); \
+         the emitted column set changes, so this requires a new schema version"
+    )]
+    EmissionShapeChanged {
+        /// Prior schema's flag.
+        old_conformal_set: bool,
+        /// New schema's flag.
+        new_conformal_set: bool,
+    },
 }
 
 /// Compatible differences between two schema generations.
@@ -313,10 +339,18 @@ impl DecisionSchema {
         hasher.finalize().to_hex().to_string()
     }
 
-    /// Fail-loud label-set evolution check. Adding or removing questions is compatible
-    /// (reported); changing an existing question's kind or label set is not — mint a new
-    /// schema version instead.
-    pub fn check_evolution(old: &Self, new: &Self) -> Result<EvolutionReport, LabelEvolutionError> {
+    /// Fail-loud schema evolution check. Adding or removing questions is compatible
+    /// (reported); changing an existing question's kind or label set — or flipping
+    /// conformal-set emission, which changes the emitted column set — is not: mint a new
+    /// schema version instead. The rejected inputs are exactly the ones
+    /// [`DecisionSchema::fingerprint`] distinguishes.
+    pub fn check_evolution(old: &Self, new: &Self) -> Result<EvolutionReport, EvolutionError> {
+        if old.emit_conformal_set != new.emit_conformal_set {
+            return Err(EvolutionError::EmissionShapeChanged {
+                old_conformal_set: old.emit_conformal_set,
+                new_conformal_set: new.emit_conformal_set,
+            });
+        }
         let mut changes = Vec::new();
         for old_question in &old.questions {
             if let Some(new_question) = new.questions.iter().find(|q| q.id == old_question.id) {
@@ -334,7 +368,7 @@ impl DecisionSchema {
             }
         }
         if !changes.is_empty() {
-            return Err(LabelEvolutionError { changes });
+            return Err(LabelEvolutionError { changes }.into());
         }
         let report = EvolutionReport {
             added: new
