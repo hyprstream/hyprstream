@@ -6,6 +6,7 @@ members = [
     "crates/git-xet-filter",
     "crates/hyprstream-p2p",
     "crates/hyprstream-metrics",
+    "crates/hyprstream-metrics-api",
     "crates/hyprstream-flight",
     "crates/cas-serve",
     "crates/hyprstream-rpc",

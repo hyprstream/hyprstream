@@ -283,10 +283,12 @@ See: `README.md`, `DEVELOP.md`, `CONTRIBUTING.md`, `crates/git2db/CLAUDE.md`, `d
   `hyprstream-pay`.
 - **AGPL-3.0-only**: the `hyprstream` application plus
   `hyprstream-appview`, `hyprstream-discovery`, `hyprstream-flight`,
-  `hyprstream-k8s-pds`, `hyprstream-ledger`, `hyprstream-metrics`,
-  `hyprstream-pds`, `hyprstream-pds-service`, `hyprstream-service`,
-  `hyprstream-vfs-server`, and `hyprstream-workers`.
-- **Apache-2.0**: every other local Cargo package.
+  `hyprstream-k8s-pds`, `hyprstream-ledger`, `hyprstream-metrics` (the
+  DuckDB/DataFusion serving engine), `hyprstream-pds`,
+  `hyprstream-pds-service`, `hyprstream-service`, `hyprstream-vfs-server`,
+  and `hyprstream-workers`.
+- **Apache-2.0**: every other local Cargo package, including
+  `hyprstream-metrics-api` (the storage-abstract metrics API half).
 
 Those are source-package declarations; third-party dependencies retain their
 own licenses. The exhaustive owner map and reusable permissive-only roots are

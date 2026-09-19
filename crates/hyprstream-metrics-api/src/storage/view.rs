@@ -1,5 +1,5 @@
 use crate::aggregation::{AggregateFunction, GroupBy, TimeWindow};
-use duckdb::arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;

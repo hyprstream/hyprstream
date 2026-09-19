@@ -552,12 +552,14 @@ Licensing is assigned per crate:
 
 **AGPL-3.0-only** — the `hyprstream` application and its service-facing crates:
 `hyprstream-appview`, `hyprstream-discovery`, `hyprstream-flight`,
-`hyprstream-k8s-pds`, `hyprstream-ledger`, `hyprstream-metrics`,
-`hyprstream-pds`, `hyprstream-pds-service`, `hyprstream-service`,
-`hyprstream-vfs-server`, and `hyprstream-workers`.
+`hyprstream-k8s-pds`, `hyprstream-ledger`, `hyprstream-metrics` (the
+DuckDB/DataFusion serving engine), `hyprstream-pds`,
+`hyprstream-pds-service`, `hyprstream-service`, `hyprstream-vfs-server`,
+and `hyprstream-workers`.
 
 **Apache-2.0** — every other local Cargo package: reusable libraries, RPC and
-transport substrate, build tooling, clients, and sandbox guests.
+transport substrate, build tooling, clients, and sandbox guests, including
+`hyprstream-metrics-api` (the storage-abstract metrics API half).
 
 These are source-package declarations; third-party dependencies retain their
 own licenses. Reusable permissive packages are guarded against acquiring an

@@ -12,14 +12,17 @@ using import "/annotations.capnp".mutationSemantics;
 using import "/annotations.capnp".mcpDescription;
 using import "/streaming.capnp".StreamInfo;
 
-# Mirrors hyprstream_metrics::metrics::MetricRecord.
-# Fields reflect running-window aggregation storage — no labels.
+# Mirrors hyprstream_metrics::metrics::MetricRecord (schema v2).
+# Fields reflect running-window aggregation storage plus labels/tenant.
+# labels encodes key/value label pairs (reusing GroupEntry); tenantId empty = node-global.
 struct MetricRecord {
   metricId          @0 :Text;
   timestamp         @1 :Int64;
   valueWindowSum    @2 :Float64;   # value_running_window_sum
   valueWindowAvg    @3 :Float64;   # value_running_window_avg
   valueWindowCount  @4 :Int64;     # value_running_window_count
+  labels            @5 :List(GroupEntry);  # v2: metric labels; empty = unlabeled
+  tenantId          @6 :Text;              # v2: tenant key; empty = no tenant
 }
 
 enum AggregationFunc {

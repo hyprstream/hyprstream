@@ -154,6 +154,13 @@ impl StorageBackend for CachedStorageBackend {
         Ok(())
     }
 
+    async fn execute_ddl(&self, sql: &str) -> Result<(), Status> {
+        // DDL applies to both tiers, like create_table
+        self.cache.execute_ddl(sql).await?;
+        self.store.execute_ddl(sql).await?;
+        Ok(())
+    }
+
     async fn insert_into_table(&self, table_name: &str, batch: RecordBatch) -> Result<(), Status> {
         // Insert into both cache and store
         self.cache.insert_into_table(table_name, batch.clone()).await?;
