@@ -18,7 +18,8 @@ publish = false
 [dependencies]
 aead = { version = "0.5", default-features = false, features = ["alloc", "getrandom"] }
 aes-gcm = { version = "0.10" }
-ahash = { version = "0.8" }
+ahash = { version = "0.8", features = ["serde"] }
+aho-corasick = { version = "1" }
 anyhow = { version = "1" }
 arrayvec = { version = "0.7" }
 axum = { version = "0.7", features = ["macros"] }
@@ -32,7 +33,7 @@ bytes = { version = "1", features = ["serde"] }
 capnp = { version = "0.24", features = ["unaligned"] }
 chrono = { version = "0.4", features = ["serde"] }
 cipher = { version = "0.4", default-features = false, features = ["block-padding", "zeroize"] }
-compact_str = { version = "0.9", default-features = false, features = ["std"] }
+compact_str = { version = "0.9", features = ["serde"] }
 concurrent-queue = { version = "2" }
 const-oid = { version = "0.10", default-features = false, features = ["db"] }
 constant_time_eq = { version = "0.4" }
@@ -55,6 +56,7 @@ elliptic-curve = { version = "0.13", features = ["ecdh", "hazmat", "pem", "std"]
 event-listener = { version = "5" }
 event-listener-strategy = { version = "0.5" }
 fastrand = { version = "2" }
+flate2 = { version = "1" }
 fnv = { version = "1" }
 form_urlencoded = { version = "1" }
 futures = { version = "0.3" }
@@ -113,6 +115,7 @@ petgraph = { version = "0.6" }
 phf_shared = { version = "0.11" }
 pkcs8-93f6ce9d446188ac = { package = "pkcs8", version = "0.10", default-features = false, features = ["encryption", "pem", "std"] }
 pkcs8-a6292c17cd707f01 = { package = "pkcs8", version = "0.11", default-features = false, features = ["pem"] }
+portable-atomic = { version = "1", features = ["serde"] }
 postcard = { version = "1", features = ["experimental-derive", "use-std"] }
 postgres-types = { version = "0.2", default-features = false, features = ["with-chrono-0_4", "with-serde_json-1"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
@@ -184,7 +187,8 @@ zstd-sys = { version = "2", default-features = false, features = ["legacy", "std
 [build-dependencies]
 aead = { version = "0.5", default-features = false, features = ["alloc", "getrandom"] }
 aes-gcm = { version = "0.10" }
-ahash = { version = "0.8" }
+ahash = { version = "0.8", features = ["serde"] }
+aho-corasick = { version = "1" }
 anyhow = { version = "1" }
 arrayvec = { version = "0.7" }
 axum = { version = "0.7", features = ["macros"] }
@@ -199,7 +203,7 @@ capnp = { version = "0.24", features = ["unaligned"] }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 chrono = { version = "0.4", features = ["serde"] }
 cipher = { version = "0.4", default-features = false, features = ["block-padding", "zeroize"] }
-compact_str = { version = "0.9", default-features = false, features = ["std"] }
+compact_str = { version = "0.9", features = ["serde"] }
 concurrent-queue = { version = "2" }
 const-oid = { version = "0.10", default-features = false, features = ["db"] }
 constant_time_eq = { version = "0.4" }
@@ -224,6 +228,7 @@ elliptic-curve = { version = "0.13", features = ["ecdh", "hazmat", "pem", "std"]
 event-listener = { version = "5" }
 event-listener-strategy = { version = "0.5" }
 fastrand = { version = "2" }
+flate2 = { version = "1" }
 fnv = { version = "1" }
 form_urlencoded = { version = "1" }
 futures = { version = "0.3" }
@@ -282,6 +287,7 @@ petgraph = { version = "0.6" }
 phf_shared = { version = "0.11" }
 pkcs8-93f6ce9d446188ac = { package = "pkcs8", version = "0.10", default-features = false, features = ["encryption", "pem", "std"] }
 pkcs8-a6292c17cd707f01 = { package = "pkcs8", version = "0.11", default-features = false, features = ["pem"] }
+portable-atomic = { version = "1", features = ["serde"] }
 postcard = { version = "1", features = ["experimental-derive", "use-std"] }
 postgres-types = { version = "0.2", default-features = false, features = ["with-chrono-0_4", "with-serde_json-1"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
@@ -356,13 +362,15 @@ zstd-sys = { version = "2", default-features = false, features = ["legacy", "std
 ahash = { version = "0.8", default-features = false, features = ["compile-time-rng"] }
 bytemuck = { version = "1", default-features = false, features = ["extern_crate_std"] }
 byteorder = { version = "1", default-features = false, features = ["i128"] }
+bzip2-sys = { version = "0.1", default-features = false, features = ["static"] }
 critical-section = { version = "1", default-features = false, features = ["std"] }
+crossbeam-epoch = { version = "0.9" }
 crossbeam-queue = { version = "0.3" }
 derive_more = { version = "2", default-features = false, features = ["is_variant"] }
 ed25519-7b89eefb6aaa9bf3 = { package = "ed25519", version = "3", default-features = false, features = ["pem", "serde"] }
 ed25519-dalek-e027f7ab589cf689 = { package = "ed25519-dalek", version = "3.0.0-rc.0", features = ["pem", "rand_core", "serde"] }
 enumflags2 = { version = "0.7", default-features = false, features = ["serde"] }
-flate2 = { version = "1", features = ["zlib-ng-compat"] }
+flate2 = { version = "1", default-features = false, features = ["zlib-ng-compat"] }
 fuse-backend-rs = { version = "0.13", features = ["persist", "virtiofs"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
@@ -399,14 +407,16 @@ zeroize = { version = "1", features = ["derive"] }
 ahash = { version = "0.8", default-features = false, features = ["compile-time-rng"] }
 bytemuck = { version = "1", default-features = false, features = ["extern_crate_std"] }
 byteorder = { version = "1", default-features = false, features = ["i128"] }
+bzip2-sys = { version = "0.1", default-features = false, features = ["static"] }
 critical-section = { version = "1", default-features = false, features = ["std"] }
+crossbeam-epoch = { version = "0.9" }
 crossbeam-queue = { version = "0.3" }
 derive_more = { version = "2", default-features = false, features = ["is_variant"] }
 derive_more-impl = { version = "2", default-features = false, features = ["is_variant"] }
 ed25519-7b89eefb6aaa9bf3 = { package = "ed25519", version = "3", default-features = false, features = ["pem", "serde"] }
 ed25519-dalek-e027f7ab589cf689 = { package = "ed25519-dalek", version = "3.0.0-rc.0", features = ["pem", "rand_core", "serde"] }
 enumflags2 = { version = "0.7", default-features = false, features = ["serde"] }
-flate2 = { version = "1", features = ["zlib-ng-compat"] }
+flate2 = { version = "1", default-features = false, features = ["zlib-ng-compat"] }
 fuse-backend-rs = { version = "0.13", features = ["persist", "virtiofs"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
@@ -443,13 +453,15 @@ zeroize = { version = "1", features = ["derive"] }
 ahash = { version = "0.8", default-features = false, features = ["compile-time-rng"] }
 bytemuck = { version = "1", default-features = false, features = ["extern_crate_std"] }
 byteorder = { version = "1", default-features = false, features = ["i128"] }
+bzip2-sys = { version = "0.1", default-features = false, features = ["static"] }
 critical-section = { version = "1", default-features = false, features = ["std"] }
+crossbeam-epoch = { version = "0.9" }
 crossbeam-queue = { version = "0.3" }
 derive_more = { version = "2", default-features = false, features = ["is_variant"] }
 ed25519-7b89eefb6aaa9bf3 = { package = "ed25519", version = "3", default-features = false, features = ["pem", "serde"] }
 ed25519-dalek-e027f7ab589cf689 = { package = "ed25519-dalek", version = "3.0.0-rc.0", features = ["pem", "rand_core", "serde"] }
 enumflags2 = { version = "0.7", default-features = false, features = ["serde"] }
-flate2 = { version = "1", features = ["zlib-ng-compat"] }
+flate2 = { version = "1", default-features = false, features = ["zlib-ng-compat"] }
 fuse-backend-rs = { version = "0.13", features = ["persist", "virtiofs"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
@@ -486,14 +498,16 @@ zeroize = { version = "1", features = ["derive"] }
 ahash = { version = "0.8", default-features = false, features = ["compile-time-rng"] }
 bytemuck = { version = "1", default-features = false, features = ["extern_crate_std"] }
 byteorder = { version = "1", default-features = false, features = ["i128"] }
+bzip2-sys = { version = "0.1", default-features = false, features = ["static"] }
 critical-section = { version = "1", default-features = false, features = ["std"] }
+crossbeam-epoch = { version = "0.9" }
 crossbeam-queue = { version = "0.3" }
 derive_more = { version = "2", default-features = false, features = ["is_variant"] }
 derive_more-impl = { version = "2", default-features = false, features = ["is_variant"] }
 ed25519-7b89eefb6aaa9bf3 = { package = "ed25519", version = "3", default-features = false, features = ["pem", "serde"] }
 ed25519-dalek-e027f7ab589cf689 = { package = "ed25519-dalek", version = "3.0.0-rc.0", features = ["pem", "rand_core", "serde"] }
 enumflags2 = { version = "0.7", default-features = false, features = ["serde"] }
-flate2 = { version = "1", features = ["zlib-ng-compat"] }
+flate2 = { version = "1", default-features = false, features = ["zlib-ng-compat"] }
 fuse-backend-rs = { version = "0.13", features = ["persist", "virtiofs"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
