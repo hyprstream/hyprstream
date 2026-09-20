@@ -4,6 +4,7 @@ members = [
     "crates/hyprstream-inference",
     "crates/git2db",
     "crates/git-xet-filter",
+    "crates/hyprstream-bench",
     "crates/hyprstream-p2p",
     "crates/hyprstream-metrics",
     "crates/hyprstream-metrics-api",

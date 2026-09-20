@@ -7056,6 +7056,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-bench"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hyprstream-decision",
+ "serde",
+ "serde_json",
+ "workspace-hack",
+]
+
+[[package]]
 name = "hyprstream-compositor"
 version = "0.1.0"
 dependencies = [
