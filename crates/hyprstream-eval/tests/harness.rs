@@ -90,9 +90,10 @@ async fn truth_subject_scores_perfectly_on_bench_items() {
     assert!(report.by_stratum.iter().any(|b| b.key == "clean"));
     assert!(report.by_stratum.iter().any(|b| b.key == "nearmiss"));
     assert!(report.by_stratum.iter().any(|b| b.key.starts_with("perm-")));
-    // Truth answers rotate with the options: zero flips.
-    assert!(report.flip_rate.groups > 0);
-    assert_eq!(report.flip_rate.flip_rate, 0.0);
+    // Truth answers rotate with the options: computed, zero flips.
+    let flip = report.flip_rate.as_ref().unwrap();
+    assert!(flip.groups > 0);
+    assert_eq!(flip.flip_rate, 0.0);
     for bucket in &report.by_family {
         assert_eq!(bucket.accuracy, 1.0, "family {}", bucket.key);
     }
@@ -105,14 +106,18 @@ async fn uniform_subject_flips_and_miscalibrates() {
     let report = score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
 
     let gate = report.gate.as_ref().unwrap();
-    // Uniform argmax is always label 0; truth is uniform-ish across labels, so
-    // accuracy is far below 1 and Brier is the analytic uniform value.
+    // Uniform argmax is label 0 under the pinned D6 earliest-index tie-break
+    // (score paths and the calibration internals agree on this); truth is
+    // uniform-ish across labels, so accuracy is far below 1 and Brier is the
+    // analytic uniform value.
     let accuracy = report.accuracy.unwrap();
     assert!(accuracy < 0.8, "uniform accuracy: {accuracy}");
     assert!(gate.macro_brier.mean > 0.3, "uniform Brier: {}", gate.macro_brier.mean);
-    // Uniform argmax picks index 0 everywhere; rotations move the correct
-    // label off index 0, so a label-comparing flip check sees flips.
-    assert!(report.flip_rate.flip_rate > 0.5, "flip rate: {}", report.flip_rate.flip_rate);
+    // Uniform argmax (D6 earliest-index) picks index 0 everywhere; rotations
+    // move the correct label off index 0, so a label-comparing flip check
+    // sees flips.
+    let flip = report.flip_rate.as_ref().unwrap();
+    assert!(flip.flip_rate > 0.5, "flip rate: {}", flip.flip_rate);
 }
 
 #[tokio::test]
@@ -128,4 +133,39 @@ async fn unlabeled_run_reports_no_gate() {
     assert!(report.accuracy.is_none());
     assert_eq!(report.items.len(), 5);
     assert!(report.items.iter().all(|line| line.correct.is_none()));
+    // score_run has no label source: flip rate is "not computed", never a
+    // silent zero.
+    assert!(report.flip_rate.is_none());
+}
+
+#[tokio::test]
+async fn argmax_ties_break_earliest_everywhere() {
+    // D6 regression: a uniform noul [0.5, 0.5] with truth = 1 ("true") must
+    // score as INCORRECT (argmax = index 0, "false") — and the report's
+    // `correct` path must agree with the flip-label path
+    // (`argmax_label_index`) and the calibration internals, all of which use
+    // the pinned earliest-index tie-break.
+    let item = EvalItem {
+        id: "tie-1".into(),
+        family: Some("ties".into()),
+        stratum: None,
+        group: None,
+        state: hyprstream_decision::entry::Entry::Null,
+        question: hyprstream_decision::QuestionSpec {
+            id: "tie_q".into(),
+            kind: hyprstream_decision::QuestionKind::Noul,
+            instructions: None,
+            body: hyprstream_decision::QuestionBody::Noul { criteria: None },
+        },
+        truth: Some(1),
+    };
+    let items = vec![item];
+    let output = Harness.run_items(&items, &UniformSubject).await.unwrap();
+    let obs = &output.observations[0];
+    assert_eq!(obs.probabilities.as_deref(), Some([0.5, 0.5].as_slice()));
+    assert_eq!(obs.argmax_label_index(), Some(0), "flip-label path: D6 earliest");
+
+    let report = score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
+    assert_eq!(report.items[0].correct, Some(false), "D6: argmax = index 0 on a tie");
+    assert_eq!(report.accuracy, Some(0.0));
 }

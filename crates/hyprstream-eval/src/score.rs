@@ -109,22 +109,18 @@ pub struct ScoreReport {
     pub by_family: Vec<BreakdownMetrics>,
     /// Per-stratum breakdown.
     pub by_stratum: Vec<BreakdownMetrics>,
-    /// Option-order flip rate over permutation groups.
-    pub flip_rate: FlipRate,
+    /// Option-order flip rate over permutation groups. `None` = **not
+    /// computed** (labels were not available to the scorer — see
+    /// [`flip_rate_with_labels`]); `Some` with `flip_rate == 0.0` = computed,
+    /// no flips. The distinction matters: an uncomputed rate must never be
+    /// misread as permutation-robustness.
+    pub flip_rate: Option<FlipRate>,
     /// Overall abstention rate.
     pub abstention_rate: f64,
     /// Argmax accuracy over labeled, answered observations.
     pub accuracy: Option<f64>,
     /// Per-item lines.
     pub items: Vec<ItemScore>,
-}
-
-fn argmax(probs: &[f64]) -> Option<usize> {
-    probs
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(index, _)| index)
 }
 
 /// Field key for an observation: the question id for declared questions whose
@@ -178,7 +174,7 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
         let (is_abstained, is_correct) = match (&obs.probabilities, obs.truth) {
             (Some(probs), Some(truth)) => {
                 let probs64: Vec<f64> = probs.iter().map(|p| f64::from(*p)).collect();
-                let hit = argmax(&probs64) == Some(truth);
+                let hit = metrics::argmax(&probs64) == truth;
                 let key = field_key(obs, by_question);
                 let family = obs.family.clone().unwrap_or_else(|| "unknown".to_owned());
                 let entry = fields
@@ -248,7 +244,7 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
         gate,
         by_family: breakdown(&output.observations, |obs| obs.family.clone()),
         by_stratum: breakdown(&output.observations, |obs| obs.stratum.clone()),
-        flip_rate: flip_rate_with_labels(&output.observations, no_labels),
+        flip_rate: None,
         abstention_rate,
         accuracy,
         items,
@@ -278,7 +274,7 @@ fn breakdown(
                 match (&obs.probabilities, obs.truth) {
                     (Some(probs), Some(truth)) => {
                         let probs64: Vec<f64> = probs.iter().map(|p| f64::from(*p)).collect();
-                        if argmax(&probs64) == Some(truth) {
+                        if metrics::argmax(&probs64) == truth {
                             correct += 1;
                         }
                         labeled += 1;
@@ -380,29 +376,23 @@ pub fn flip_rate_with_labels(
     }
 }
 
-/// Flip rate for runs whose labels are id-addressable. `score_run` cannot
-/// reconstruct labels from observations alone (indices rotate under
-/// permutation, so index comparison would report spurious flips — S6b1), so
-/// it leaves the flip rate empty; callers with items in hand must use
-/// [`flip_rate_with_labels`] (or [`score_bench_run`], which does it for them).
-fn no_labels(_: &str) -> Option<Vec<String>> {
-    None
-}
-
 /// Score a bench-shaped run: [`score_run`] plus the exact flip rate computed
-/// with each item's own labels.
+/// with each item's own labels. (`score_run` cannot reconstruct labels from
+/// observations alone — indices rotate under permutation, so index comparison
+/// would report spurious flips, S6b1 — and therefore reports `flip_rate:
+/// None`, "not computed".)
 pub fn score_bench_run(
     output: &RunOutput,
     items: &[crate::run::EvalItem],
     config: &ScoreConfig,
 ) -> Result<ScoreReport, EvalError> {
     let mut report = score_run(output, config)?;
-    report.flip_rate = flip_rate_with_labels(&output.observations, |question_id| {
+    report.flip_rate = Some(flip_rate_with_labels(&output.observations, |question_id| {
         items
             .iter()
             .find(|item| item.question.id == question_id)
             .map(|item| item.question.labels())
-    });
+    }));
     Ok(report)
 }
 
