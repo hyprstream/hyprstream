@@ -321,3 +321,19 @@ async fn nll_by_field_matches_the_analytic_values() {
         .unwrap();
     assert!(nll.abs() < 1e-6, "truth NLL must be ~0, got {nll}");
 }
+
+#[tokio::test]
+async fn untagged_observations_join_the_split_as_unknown() {
+    // Observations with `family: None` score under the "unknown" sentinel;
+    // the shift split must name that family too, or downstream
+    // `is_eval_family` would reject data the gate actually measured.
+    let mut item = noul_item();
+    item.family = None;
+    let items = vec![item];
+    let subject = truth_subject_for(&items);
+    let output = Harness.run_items(&items, &subject).await.unwrap();
+    let report = score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
+    let gate = report.gate.as_ref().unwrap();
+    assert!(gate.fields.iter().all(|f| f.family == "unknown"));
+    assert_eq!(gate.shift_split.eval_families, vec!["unknown".to_owned()]);
+}
