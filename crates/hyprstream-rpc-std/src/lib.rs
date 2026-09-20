@@ -91,6 +91,13 @@ pub mod oauth_capnp {
     include!(concat!(env!("OUT_DIR"), "/oauth_capnp.rs"));
 }
 
+pub mod decision_capnp {
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/decision_capnp.rs"));
+}
+
 pub mod worker_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
@@ -290,6 +297,15 @@ mod contract_compat_tests {
 // ============================================================================
 // WASM exports (browser only)
 // ============================================================================
+
+// ============================================================================
+// System One decision surface (P0.1b): capnp emission for the jev-1 IR
+// ============================================================================
+
+// Hand-written mapping between hyprstream-decision's IR (QuestionSet /
+// AnswerRow / VersionTriple) and the decision_capnp wire types. Native and
+// wasm both: pure data marshalling, no I/O.
+pub mod decision;
 
 // Generic codegen-driven service→9p projection (`ServiceMount`) + stream pipes.
 // Native and wasm both: the same generated dispatch drives the file surface on

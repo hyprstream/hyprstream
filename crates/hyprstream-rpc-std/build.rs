@@ -36,6 +36,9 @@ fn main() {
         "service_events",
         "chat_core",
         "oauth",
+        // System One decision surface data contract (P0.1b). Pure struct
+        // schema; the InferenceService registration that carries it is P3.1.
+        "decision",
         // Cross-crate service contracts.  These schemas are canonical here;
         // AGPL implementation crates consume the generated server-only mode
         // from hyprstream-rpc-derive instead of compiling local copies.

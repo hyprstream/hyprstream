@@ -1,0 +1,420 @@
+//! capnp emission for the jev-1 decision IR (System One P0.1b).
+//!
+//! Marshals [`hyprstream_decision`] types — [`QuestionSet`], [`AnswerRow`],
+//! [`VersionTriple`] — into the `decision.capnp` wire types
+//! ([`crate::decision_capnp`]) and back. The schema is the data contract for
+//! the P3.1 inference-surface extension; the golden-vector conformance tests
+//! (`tests/decision_golden.rs`) pin it against the P0.1a Arrow emission using
+//! the docs' numeric examples (S6a).
+//!
+//! Contract pins (normative in hyprstream-decision; enforced on decode):
+//! - `kind` tag must match the body union discriminant; span/derived (reserved
+//!   v2 types) decode as [`DecodeError::ReservedQuestionType`].
+//! - `OptEntry.none` (key absent) and `some(Entry.null)` (explicit null) are
+//!   distinct, mirroring D3/D4.
+//! - `null` = abstained; an abstained answer must not carry a conformal set.
+
+use hyprstream_decision::{
+    AnswerRow, AnswerValue, ChoiceOption, Entry, NoulCriteria, QuestionAnswer, QuestionBody,
+    QuestionKind, QuestionSet, QuestionSpec, VersionTriple,
+};
+
+use crate::decision_capnp;
+
+/// Errors decoding a `decision.capnp` message into the IR.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum DecodeError {
+    /// capnp-level structural failure (truncated message, bad pointer).
+    #[error("capnp decode failed: {0}")]
+    Capnp(String),
+    /// The `kind` tag disagrees with the body union discriminant.
+    #[error("kind tag {tag} does not match body union for question {question_id}")]
+    KindBodyMismatch {
+        /// The question carrying the mismatch.
+        question_id: String,
+        /// The conflicting tag.
+        tag: String,
+    },
+    /// A reserved v2 question type (span/derived) appeared on the wire.
+    #[error("reserved v2 question type {0} on the wire for question {1}")]
+    ReservedQuestionType(&'static str, String),
+    /// An abstained answer carried a conformal set (abstention already says
+    /// "no commitment").
+    #[error("abstained answer for question {0} carries a conformal set")]
+    AbstainedWithConformalSet(String),
+    /// A noul probability fell outside [0, 1].
+    #[error("noul probability out of range for question {0}: {1}")]
+    NoulProbabilityOutOfRange(String, f32),
+}
+
+impl From<capnp::Error> for DecodeError {
+    fn from(error: capnp::Error) -> Self {
+        Self::Capnp(error.to_string())
+    }
+}
+
+impl From<capnp::NotInSchema> for DecodeError {
+    fn from(error: capnp::NotInSchema) -> Self {
+        Self::Capnp(error.to_string())
+    }
+}
+
+impl From<std::str::Utf8Error> for DecodeError {
+    fn from(error: std::str::Utf8Error) -> Self {
+        Self::Capnp(error.to_string())
+    }
+}
+
+// ============================================================================
+// Entry
+// ============================================================================
+
+fn set_entry(mut builder: decision_capnp::entry::Builder<'_>, entry: &Entry) {
+    match entry {
+        Entry::Null => builder.set_null(()),
+        Entry::Bool(value) => builder.set_bool(*value),
+        Entry::Number(value) => builder.set_number(*value),
+        Entry::Str(text) => builder.set_str(text),
+        Entry::Seq(items) => {
+            let mut list = builder.init_seq(items.len() as u32);
+            for (index, item) in items.iter().enumerate() {
+                set_entry(list.reborrow().get(index as u32), item);
+            }
+        }
+        Entry::Map(pairs) => {
+            let mut list = builder.init_map(pairs.len() as u32);
+            for (index, (key, value)) in pairs.iter().enumerate() {
+                let mut pair = list.reborrow().get(index as u32);
+                pair.set_key(key);
+                set_entry(pair.init_value(), value);
+            }
+        }
+    }
+}
+
+fn get_entry(reader: decision_capnp::entry::Reader<'_>) -> Result<Entry, DecodeError> {
+    Ok(match reader.which()? {
+        decision_capnp::entry::Null(()) => Entry::Null,
+        decision_capnp::entry::Bool(value) => Entry::Bool(value),
+        decision_capnp::entry::Number(value) => Entry::Number(value),
+        decision_capnp::entry::Str(text) => Entry::Str(text?.to_str()?.to_owned()),
+        decision_capnp::entry::Seq(items) => {
+            let items = items?;
+            let mut out = Vec::with_capacity(items.len() as usize);
+            for item in items.iter() {
+                out.push(get_entry(item)?);
+            }
+            Entry::Seq(out)
+        }
+        decision_capnp::entry::Map(pairs) => {
+            let pairs = pairs?;
+            let mut out = Vec::with_capacity(pairs.len() as usize);
+            for pair in pairs.iter() {
+                out.push((
+                    pair.get_key()?.to_str()?.to_owned(),
+                    get_entry(pair.get_value()?)?,
+                ));
+            }
+            Entry::Map(out)
+        }
+    })
+}
+
+fn set_opt_entry(mut builder: decision_capnp::opt_entry::Builder<'_>, entry: Option<&Entry>) {
+    match entry {
+        None => builder.set_none(()),
+        Some(entry) => set_entry(builder.init_some(), entry),
+    }
+}
+
+fn get_opt_entry(reader: decision_capnp::opt_entry::Reader<'_>) -> Result<Option<Entry>, DecodeError> {
+    Ok(match reader.which()? {
+        decision_capnp::opt_entry::None(()) => None,
+        decision_capnp::opt_entry::Some(entry) => Some(get_entry(entry?)?),
+    })
+}
+
+// ============================================================================
+// Question specs
+// ============================================================================
+
+fn question_kind_tag(kind: QuestionKind) -> decision_capnp::QuestionKind {
+    match kind {
+        QuestionKind::Noul => decision_capnp::QuestionKind::Noul,
+        QuestionKind::Choice => decision_capnp::QuestionKind::Choice,
+        QuestionKind::Score => decision_capnp::QuestionKind::Score,
+        QuestionKind::Span => decision_capnp::QuestionKind::Span,
+        QuestionKind::Derived => decision_capnp::QuestionKind::Derived,
+    }
+}
+
+fn set_noul_criteria(
+    mut builder: decision_capnp::noul_criteria::Builder<'_>,
+    criteria: &NoulCriteria,
+) {
+    set_opt_entry(builder.reborrow().init_on_true(), criteria.on_true.as_ref());
+    set_opt_entry(builder.init_on_false(), criteria.on_false.as_ref());
+}
+
+fn set_question_spec(builder: &mut decision_capnp::question_spec::Builder<'_>, spec: &QuestionSpec) {
+    builder.set_id(&spec.id);
+    builder.set_kind(question_kind_tag(spec.kind));
+    set_opt_entry(builder.reborrow().init_instructions(), spec.instructions.as_ref());
+    match &spec.body {
+        QuestionBody::Noul { criteria } => {
+            let mut body = builder.reborrow().init_body();
+            match criteria {
+                None => body.reborrow().init_noul().set_none(()),
+                Some(criteria) => {
+                    let mut opt = body.init_noul();
+                    set_noul_criteria(opt.reborrow().init_some(), criteria);
+                }
+            }
+        }
+        QuestionBody::Choice { options } => {
+            let body = builder.reborrow().init_body();
+            let mut list = body.init_choice(options.len() as u32);
+            for (index, option) in options.iter().enumerate() {
+                let mut item = list.reborrow().get(index as u32);
+                item.set_name(&option.name);
+                set_opt_entry(item.init_rubric(), option.rubric.as_ref());
+            }
+        }
+        QuestionBody::Score { levels } => {
+            let body = builder.reborrow().init_body();
+            let mut list = body.init_score(levels.len() as u32);
+            for (index, level) in levels.iter().enumerate() {
+                set_opt_entry(list.reborrow().get(index as u32), level.as_ref());
+            }
+        }
+    }
+}
+
+fn get_question_spec(
+    reader: decision_capnp::question_spec::Reader<'_>,
+) -> Result<QuestionSpec, DecodeError> {
+    let id = reader.get_id()?.to_str()?.to_owned();
+    let kind = reader.get_kind()?;
+    let instructions = get_opt_entry(reader.get_instructions()?)?;
+    let body = match reader.get_body().which()? {
+        decision_capnp::question_spec::body::Noul(criteria) => {
+            if kind != decision_capnp::QuestionKind::Noul {
+                return Err(DecodeError::KindBodyMismatch {
+                    question_id: id,
+                    tag: format!("{kind:?}"),
+                });
+            }
+            let criteria = match criteria?.which()? {
+                decision_capnp::opt_noul_criteria::None(()) => None,
+                decision_capnp::opt_noul_criteria::Some(reader) => {
+                    let reader = reader?;
+                    Some(NoulCriteria {
+                        on_true: get_opt_entry(reader.get_on_true()?)?,
+                        on_false: get_opt_entry(reader.get_on_false()?)?,
+                    })
+                }
+            };
+            QuestionBody::Noul { criteria }
+        }
+        decision_capnp::question_spec::body::Choice(options) => {
+            if kind != decision_capnp::QuestionKind::Choice {
+                return Err(DecodeError::KindBodyMismatch {
+                    question_id: id,
+                    tag: format!("{kind:?}"),
+                });
+            }
+            let options = options?;
+            let mut out = Vec::with_capacity(options.len() as usize);
+            for option in options.iter() {
+                out.push(ChoiceOption {
+                    name: option.get_name()?.to_str()?.to_owned(),
+                    rubric: get_opt_entry(option.get_rubric()?)?,
+                });
+            }
+            QuestionBody::Choice { options: out }
+        }
+        decision_capnp::question_spec::body::Score(levels) => {
+            if kind != decision_capnp::QuestionKind::Score {
+                return Err(DecodeError::KindBodyMismatch {
+                    question_id: id,
+                    tag: format!("{kind:?}"),
+                });
+            }
+            let levels = levels?;
+            let mut out = Vec::with_capacity(levels.len() as usize);
+            for level in levels.iter() {
+                out.push(get_opt_entry(level)?);
+            }
+            QuestionBody::Score { levels: out }
+        }
+        decision_capnp::question_spec::body::Span(()) => {
+            return Err(DecodeError::ReservedQuestionType("span", id));
+        }
+        decision_capnp::question_spec::body::Derived(()) => {
+            return Err(DecodeError::ReservedQuestionType("derived", id));
+        }
+    };
+    Ok(QuestionSpec {
+        id,
+        kind: match kind {
+            decision_capnp::QuestionKind::Noul => QuestionKind::Noul,
+            decision_capnp::QuestionKind::Choice => QuestionKind::Choice,
+            decision_capnp::QuestionKind::Score => QuestionKind::Score,
+            decision_capnp::QuestionKind::Span => QuestionKind::Span,
+            decision_capnp::QuestionKind::Derived => QuestionKind::Derived,
+        },
+        instructions,
+        body,
+    })
+}
+
+/// Encode a question set as a `QuestionSet` message.
+pub fn question_set_to_message(
+    set: &QuestionSet,
+) -> capnp::message::Builder<capnp::message::HeapAllocator> {
+    let mut message = capnp::message::Builder::new_default();
+    let mut root = message.init_root::<decision_capnp::question_set::Builder<'_>>();
+    set_opt_entry(root.reborrow().init_state(), set.state.as_ref());
+    let mut questions = root.init_questions(set.questions.len() as u32);
+    for (index, spec) in set.questions.iter().enumerate() {
+        let mut item = questions.reborrow().get(index as u32);
+        set_question_spec(&mut item, spec);
+    }
+    message
+}
+
+/// Decode a `QuestionSet` message back into the IR.
+pub fn question_set_from_reader(
+    reader: decision_capnp::question_set::Reader<'_>,
+) -> Result<QuestionSet, DecodeError> {
+    let state = get_opt_entry(reader.get_state()?)?;
+    let questions_reader = reader.get_questions()?;
+    let mut questions = Vec::with_capacity(questions_reader.len() as usize);
+    for spec in questions_reader.iter() {
+        questions.push(get_question_spec(spec)?);
+    }
+    Ok(QuestionSet { state, questions })
+}
+
+// ============================================================================
+// Answers
+// ============================================================================
+
+fn set_answer_value(mut builder: decision_capnp::answer_value::Builder<'_>, value: Option<&AnswerValue>) {
+    match value {
+        None => builder.set_abstained(()),
+        Some(AnswerValue::Noul { p_true }) => builder.set_noul(*p_true),
+        Some(AnswerValue::Choice { probabilities }) | Some(AnswerValue::Score { probabilities }) => {
+            let mut list = if matches!(value, Some(AnswerValue::Choice { .. })) {
+                builder.init_choice(probabilities.len() as u32)
+            } else {
+                builder.init_score(probabilities.len() as u32)
+            };
+            for (index, &p) in probabilities.iter().enumerate() {
+                list.set(index as u32, p);
+            }
+        }
+    }
+}
+
+/// Encode a decision batch (version triple + rows) as a `DecisionBatch` message.
+///
+/// Answers are emitted keyed by question id (capnp has no map type); rows are
+/// emitted in slice order, answers within a row in the row's `BTreeMap` order.
+pub fn batch_to_message(
+    version: &VersionTriple,
+    rows: &[AnswerRow],
+) -> capnp::message::Builder<capnp::message::HeapAllocator> {
+    let mut message = capnp::message::Builder::new_default();
+    let mut root = message.init_root::<decision_capnp::decision_batch::Builder<'_>>();
+    {
+        let mut triple = root.reborrow().init_version();
+        triple.set_schema(&version.schema);
+        triple.set_model(&version.model);
+        if let Some(calib) = &version.calib {
+            triple.set_calib(calib);
+        }
+    }
+    let mut rows_builder = root.init_rows(rows.len() as u32);
+    for (row_index, row) in rows.iter().enumerate() {
+        let row_builder = rows_builder.reborrow().get(row_index as u32);
+        let mut answers = row_builder.init_answers(row.answers.len() as u32);
+        for (answer_index, (question_id, answer)) in row.answers.iter().enumerate() {
+            let mut answer_builder = answers.reborrow().get(answer_index as u32);
+            answer_builder.set_question_id(question_id);
+            set_answer_value(
+                answer_builder.reborrow().init_value(),
+                answer.value.as_ref(),
+            );
+            if let Some(set) = &answer.conformal_set {
+                let mut list = answer_builder.init_conformal_set(set.len() as u32);
+                for (member_index, member) in set.iter().enumerate() {
+                    list.set(member_index as u32, member.as_str());
+                }
+            }
+        }
+    }
+    message
+}
+
+/// Decode a `DecisionBatch` message: the version triple plus one [`AnswerRow`]
+/// per wire row, answers keyed by question id.
+pub fn batch_from_reader(
+    reader: decision_capnp::decision_batch::Reader<'_>,
+) -> Result<(VersionTriple, Vec<AnswerRow>), DecodeError> {
+    let triple = reader.get_version()?;
+    let version = VersionTriple {
+        schema: triple.get_schema()?.to_str()?.to_owned(),
+        model: triple.get_model()?.to_str()?.to_owned(),
+        calib: if triple.has_calib() {
+            Some(triple.get_calib()?.to_str()?.to_owned())
+        } else {
+            None
+        },
+    };
+    let rows_reader = reader.get_rows()?;
+    let mut rows = Vec::with_capacity(rows_reader.len() as usize);
+    for row in rows_reader.iter() {
+        let mut answers = std::collections::BTreeMap::new();
+        for answer in row.get_answers()?.iter() {
+            let question_id = answer.get_question_id()?.to_str()?.to_owned();
+            let conformal_set = if answer.has_conformal_set() {
+                let set = answer.get_conformal_set()?;
+                let mut members = Vec::with_capacity(set.len() as usize);
+                for member in set.iter() {
+                    members.push(member?.to_str()?.to_owned());
+                }
+                Some(members)
+            } else {
+                None
+            };
+            let value = match answer.get_value()?.which()? {
+                decision_capnp::answer_value::Abstained(()) => {
+                    if conformal_set.is_some() {
+                        return Err(DecodeError::AbstainedWithConformalSet(question_id));
+                    }
+                    None
+                }
+                decision_capnp::answer_value::Noul(p_true) => {
+                    if !(0.0..=1.0).contains(&p_true) {
+                        return Err(DecodeError::NoulProbabilityOutOfRange(question_id, p_true));
+                    }
+                    Some(AnswerValue::Noul { p_true })
+                }
+                decision_capnp::answer_value::Choice(probabilities) => {
+                    Some(AnswerValue::Choice {
+                        probabilities: probabilities?.iter().collect(),
+                    })
+                }
+                decision_capnp::answer_value::Score(probabilities) => {
+                    Some(AnswerValue::Score {
+                        probabilities: probabilities?.iter().collect(),
+                    })
+                }
+            };
+            answers.insert(question_id, QuestionAnswer { value, conformal_set });
+        }
+        rows.push(AnswerRow { answers });
+    }
+    Ok((version, rows))
+}
