@@ -18,7 +18,7 @@ use hyprstream_decision::arrow::AnswerRow;
 use hyprstream_decision::confidence::{self, CONSUMER_SUM_TOLERANCE};
 use hyprstream_decision::entry::Entry;
 use hyprstream_decision::spec::{QuestionBody, QuestionSet, QuestionSpec};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::error::EvalError;
 
@@ -40,90 +40,151 @@ pub trait Subject: Send + Sync {
         state: &Entry,
         row: usize,
     ) -> Result<AnswerRow, EvalError>;
+
+    /// The **resolved** model id. Alias resolution is part of the serving
+    /// contract: a server may answer an alias request with a different
+    /// versioned id (`response.model`), and that resolved id — not the
+    /// requested alias — is what runs and persisted batches must record.
+    /// In-process subjects resolve to themselves (the default); HTTP subjects
+    /// return the last resolved id once a response has been seen, falling
+    /// back to the requested string before the first call.
+    fn resolved_model_id(&self) -> String {
+        self.model_id().to_owned()
+    }
 }
 
-/// Convert an IR entry to JSON (insertion order → sorted object keys, the
-/// same canonical map order the P0.7 facade renders).
-fn entry_to_json(entry: &Entry) -> Value {
-    match entry {
-        Entry::Null => Value::Null,
-        Entry::Bool(value) => Value::Bool(*value),
-        Entry::Number(value) => {
-            serde_json::Number::from_f64(*value).map_or(Value::Null, Value::Number)
+/// Ordered JSON for the request wire. serde_json's own `Map` is a BTreeMap in
+/// this workspace (no `preserve_order` feature), and building the request
+/// through it **re-sorts object keys** — destroying declared option order,
+/// which is canonical (D6) and load-bearing: the cyclic-permutation stratum
+/// measures exactly that order, and the answering side's distribution is a
+/// function of it. `serialize_map`/`serialize_seq` emit entries in iteration
+/// order, so this type preserves declared order end to end.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WireJson {
+    /// JSON null.
+    Null,
+    /// JSON bool.
+    Bool(bool),
+    /// JSON number (non-finite values serialize as null, matching serde_json).
+    Number(f64),
+    /// JSON string.
+    Str(String),
+    /// JSON array.
+    Array(Vec<WireJson>),
+    /// JSON object in **insertion order**.
+    Object(Vec<(String, WireJson)>),
+}
+
+impl serde::Serialize for WireJson {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self {
+            Self::Null => serializer.serialize_unit(),
+            Self::Bool(value) => serializer.serialize_bool(*value),
+            Self::Number(value) => match serde_json::Number::from_f64(*value) {
+                Some(number) => number.serialize(serializer),
+                None => serializer.serialize_unit(),
+            },
+            Self::Str(text) => serializer.serialize_str(text),
+            Self::Array(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(item)?;
+                }
+                seq.end()
+            }
+            Self::Object(entries) => {
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
         }
-        Entry::Str(text) => Value::String(text.clone()),
-        Entry::Seq(items) => Value::Array(items.iter().map(entry_to_json).collect()),
-        Entry::Map(pairs) => Value::Object(
+    }
+}
+
+/// Convert an IR entry to wire JSON, preserving map insertion order
+/// recursively (the authoring profile's `Entry` order is meaningful).
+fn entry_to_wire(entry: &Entry) -> WireJson {
+    match entry {
+        Entry::Null => WireJson::Null,
+        Entry::Bool(value) => WireJson::Bool(*value),
+        Entry::Number(value) => WireJson::Number(*value),
+        Entry::Str(text) => WireJson::Str(text.clone()),
+        Entry::Seq(items) => WireJson::Array(items.iter().map(entry_to_wire).collect()),
+        Entry::Map(pairs) => WireJson::Object(
             pairs
                 .iter()
-                .map(|(key, value)| (key.clone(), entry_to_json(value)))
+                .map(|(key, value)| (key.clone(), entry_to_wire(value)))
                 .collect(),
         ),
     }
 }
 
-fn question_to_json(question: &QuestionSpec) -> Value {
-    let mut out = Map::new();
-    out.insert(
+fn question_to_wire(question: &QuestionSpec) -> WireJson {
+    let mut out = vec![(
         "type".to_owned(),
-        Value::String(question.kind.as_str().to_owned()),
-    );
+        WireJson::Str(question.kind.as_str().to_owned()),
+    )];
     if let Some(instructions) = &question.instructions {
-        out.insert("instructions".to_owned(), entry_to_json(instructions));
+        out.push(("instructions".to_owned(), entry_to_wire(instructions)));
     }
     match &question.body {
         QuestionBody::Noul { criteria } => {
             if let Some(criteria) = criteria {
-                let mut map = Map::new();
+                let mut map = Vec::new();
                 if let Some(on_true) = &criteria.on_true {
-                    map.insert("true".to_owned(), entry_to_json(on_true));
+                    map.push(("true".to_owned(), entry_to_wire(on_true)));
                 }
                 if let Some(on_false) = &criteria.on_false {
-                    map.insert("false".to_owned(), entry_to_json(on_false));
+                    map.push(("false".to_owned(), entry_to_wire(on_false)));
                 }
-                out.insert("criteria".to_owned(), Value::Object(map));
+                out.push(("criteria".to_owned(), WireJson::Object(map)));
             }
         }
         QuestionBody::Choice { options } => {
-            let map: Map<String, Value> = options
+            // Declared option order is canonical (D6) — emit in order.
+            let map: Vec<(String, WireJson)> = options
                 .iter()
                 .map(|option| {
                     (
                         option.name.clone(),
-                        option.rubric.as_ref().map_or(Value::Null, entry_to_json),
+                        option.rubric.as_ref().map_or(WireJson::Null, entry_to_wire),
                     )
                 })
                 .collect();
-            out.insert("criteria".to_owned(), Value::Object(map));
+            out.push(("criteria".to_owned(), WireJson::Object(map)));
         }
         QuestionBody::Score { levels } => {
-            out.insert(
+            out.push((
                 "criteria".to_owned(),
-                Value::Array(
+                WireJson::Array(
                     levels
                         .iter()
-                        .map(|level| level.as_ref().map_or(Value::Null, entry_to_json))
+                        .map(|level| level.as_ref().map_or(WireJson::Null, entry_to_wire))
                         .collect(),
                 ),
-            );
+            ));
         }
     }
-    Value::Object(out)
+    WireJson::Object(out)
 }
 
-/// Serialize a request body in the jev-1 wire shape. Exposed for the
-/// wire-floor bench, which pins request/response byte counts.
-pub fn request_to_json(set: &QuestionSet, state: &Entry, model: &str) -> Value {
-    let questions: Map<String, Value> = set
+/// Serialize a request body in the jev-1 wire shape, preserving declared
+/// question and option order. Also the wire-floor bench's size input.
+pub fn request_body(set: &QuestionSet, state: &Entry, model: &str) -> WireJson {
+    let questions: Vec<(String, WireJson)> = set
         .questions
         .iter()
-        .map(|question| (question.id.clone(), question_to_json(question)))
+        .map(|question| (question.id.clone(), question_to_wire(question)))
         .collect();
-    let mut body = Map::new();
-    body.insert("state".to_owned(), entry_to_json(state));
-    body.insert("model".to_owned(), Value::String(model.to_owned()));
-    body.insert("questions".to_owned(), Value::Object(questions));
-    Value::Object(body)
+    WireJson::Object(vec![
+        ("state".to_owned(), entry_to_wire(state)),
+        ("model".to_owned(), WireJson::Str(model.to_owned())),
+        ("questions".to_owned(), WireJson::Object(questions)),
+    ])
 }
 
 /// Parse one answer object from the response `answers` map back into the IR.
@@ -225,6 +286,9 @@ pub struct HttpSubject {
     model: String,
     token: String,
     client: reqwest::Client,
+    /// The server's resolved id (`response.model`), set on the first
+    /// successful decide. `Arc` so clones observe the same resolution.
+    resolved: std::sync::Arc<parking_lot::RwLock<Option<String>>>,
 }
 
 impl HttpSubject {
@@ -241,12 +305,18 @@ impl HttpSubject {
             model: model.into(),
             token: token.into(),
             client: reqwest::Client::new(),
+            resolved: std::sync::Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
     /// The full decide-endpoint URL.
     pub fn endpoint(&self) -> String {
         format!("{}/v1/systemone", self.base_url)
+    }
+
+    /// The requested model string (possibly an alias), as configured.
+    pub fn requested_model(&self) -> &str {
+        &self.model
     }
 }
 
@@ -256,13 +326,20 @@ impl Subject for HttpSubject {
         &self.model
     }
 
+    fn resolved_model_id(&self) -> String {
+        self.resolved
+            .read()
+            .clone()
+            .unwrap_or_else(|| self.model.clone())
+    }
+
     async fn decide(
         &self,
         set: &QuestionSet,
         state: &Entry,
         _row: usize,
     ) -> Result<AnswerRow, EvalError> {
-        let body = request_to_json(set, state, &self.model);
+        let body = request_body(set, state, &self.model);
         let response = self
             .client
             .post(self.endpoint())
@@ -285,6 +362,9 @@ impl Subject for HttpSubject {
         }
         let parsed: Value = serde_json::from_str(&text)
             .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
+        if let Some(model) = parsed.get("model").and_then(Value::as_str) {
+            *self.resolved.write() = Some(model.to_owned());
+        }
         parse_response_answers(set, &parsed)
     }
 }
@@ -463,7 +543,7 @@ questions:
     #[test]
     fn request_json_roundtrips_through_authoring() {
         let set = fixture();
-        let body = request_to_json(&set, &Entry::Str("The box was crushed.".into()), "m");
+        let body = request_body(&set, &Entry::Str("The box was crushed.".into()), "m");
         let text = serde_json::to_string(&body).unwrap();
         // The wire parse path is the stub's; here assert the shape survives
         // the P0.1a authoring layer unchanged (same questions, same order).
@@ -472,6 +552,38 @@ questions:
         assert_eq!(questions.len(), 3);
         assert_eq!(questions["tone"]["criteria"]["angry"], "Hostile message");
         assert_eq!(questions["severity"]["criteria"][1], "usable");
+    }
+
+    #[test]
+    fn request_wire_preserves_declared_option_order() {
+        // D6 / cyclic-permutation regression: serde_json's Map is a BTreeMap
+        // here (no preserve_order), so anything built through it re-sorts —
+        // the wire serializer must not.
+        let set = author::parse_yaml(
+            r#"
+questions:
+  pick:
+    type: choice
+    criteria: { zeta: "rubric z", alpha: ~, mid: ~ }
+"#,
+        )
+        .unwrap();
+        let text = serde_json::to_string(&request_body(&set, &Entry::Null, "m")).unwrap();
+        let zeta = text.find("zeta").unwrap();
+        let alpha = text.find("alpha").unwrap();
+        let mid = text.find("mid").unwrap();
+        assert!(zeta < alpha && alpha < mid, "declared order on the wire: {text}");
+        // …and question order (is_refund before tone before severity) too.
+        let body = serde_json::to_string(&request_body(
+            &fixture(),
+            &Entry::Str("s".into()),
+            "m",
+        ))
+        .unwrap();
+        assert!(
+            body.find("is_refund").unwrap() < body.find("tone").unwrap()
+                && body.find("tone").unwrap() < body.find("severity").unwrap()
+        );
     }
 
     #[tokio::test]
