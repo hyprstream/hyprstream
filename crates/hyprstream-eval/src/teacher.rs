@@ -132,10 +132,19 @@ impl TeacherEnsemble {
                         item_id: item_id.to_owned(),
                         message: error.to_string(),
                     })?;
+            // Teacher rows are averaged raw: a malformed row (missing answer,
+            // wrong cardinality, non-normalized distribution) would silently
+            // corrupt the ensemble, so apply the same ingest rules as runs.
+            crate::run::validate_set_answer_row(set, &answer_row).map_err(|message| {
+                EvalError::InvalidAnswer {
+                    question_id: item_id.to_owned(),
+                    message: format!("teacher `{}`: {message}", teacher.id),
+                }
+            })?;
             teacher_answers.push(TeacherAnswer {
                 teacher_id: teacher.id.clone(),
                 tos_class: teacher.tos_class,
-                model_id: teacher.subject.model_id().to_owned(),
+                model_id: teacher.subject.resolved_model_id(),
                 row: answer_row,
             });
         }
@@ -246,5 +255,60 @@ questions:
     #[tokio::test]
     async fn empty_roster_is_rejected() {
         assert!(TeacherEnsemble::new(vec![]).is_err());
+    }
+
+    /// A teacher emitting a wrong-cardinality distribution must be rejected
+    /// before averaging, not silently zip-truncated into the ensemble.
+    struct WideSubject;
+
+    #[async_trait::async_trait]
+    impl Subject for WideSubject {
+        fn model_id(&self) -> &str {
+            "wide-1"
+        }
+
+        async fn decide(
+            &self,
+            set: &QuestionSet,
+            _state: &Entry,
+            _row: usize,
+        ) -> Result<AnswerRow, EvalError> {
+            let mut answers = std::collections::BTreeMap::new();
+            for question in &set.questions {
+                answers.insert(
+                    question.id.clone(),
+                    hyprstream_decision::answer::QuestionAnswer::answered(
+                        hyprstream_decision::answer::AnswerValue::Choice {
+                            // One more probability than the declared options.
+                            probabilities: vec![0.25; question.cardinality() + 1],
+                        },
+                    ),
+                );
+            }
+            Ok(AnswerRow { answers })
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_teacher_rows_are_rejected_before_averaging() {
+        let set = fixture();
+        let ensemble = TeacherEnsemble::new(vec![
+            teacher("a", 0),
+            Teacher {
+                id: "wide".to_owned(),
+                tos_class: TosClass::Unknown,
+                subject: Box::new(WideSubject),
+            },
+        ])
+        .unwrap();
+        let error = ensemble
+            .decide(&set, &Entry::Null, 0, "item")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, EvalError::InvalidAnswer { .. }),
+            "wrong cardinality must be InvalidAnswer, got {error:?}"
+        );
     }
 }

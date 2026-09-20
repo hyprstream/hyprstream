@@ -279,7 +279,40 @@ impl Harness {
 /// The same row-level answer rules `DecisionSchema::build_batch` enforces,
 /// for one-question item runs (bench question ids are not identifier-safe —
 /// they contain `-` — so they cannot go through the Arrow validator itself).
-fn validate_answer_row(
+pub(crate) fn validate_answer_row(
+    question: &QuestionSpec,
+    row: &hyprstream_decision::arrow::AnswerRow,
+) -> Result<(), String> {
+    let id = &question.id;
+    for answered_id in row.answers.keys() {
+        if answered_id != id {
+            return Err(format!("row answers unknown question `{answered_id}`"));
+        }
+    }
+    validate_one_answer(question, row)
+}
+
+/// The same rules for a full row over a question set (the teacher ensemble's
+/// shape): every answered key must be declared, and every declared question
+/// must be answered per the per-answer rules.
+pub(crate) fn validate_set_answer_row(
+    set: &hyprstream_decision::spec::QuestionSet,
+    row: &hyprstream_decision::arrow::AnswerRow,
+) -> Result<(), String> {
+    for answered_id in row.answers.keys() {
+        if set.question(answered_id).is_none() {
+            return Err(format!("row answers unknown question `{answered_id}`"));
+        }
+    }
+    for question in &set.questions {
+        validate_one_answer(question, row)?;
+    }
+    Ok(())
+}
+
+/// Per-question answer rules: presence, abstention shape, kind match,
+/// cardinality, producer tolerance, conformal labels.
+fn validate_one_answer(
     question: &QuestionSpec,
     row: &hyprstream_decision::arrow::AnswerRow,
 ) -> Result<(), String> {
@@ -292,11 +325,6 @@ fn validate_answer_row(
         .answers
         .get(id)
         .ok_or_else(|| format!("row is missing an answer for question `{id}` (abstain explicitly instead)"))?;
-    for answered_id in row.answers.keys() {
-        if answered_id != id {
-            return Err(format!("row answers unknown question `{answered_id}`"));
-        }
-    }
     let Some(value) = &answer.value else {
         if answer.conformal_set.is_some() {
             return Err("an abstained answer cannot carry a conformal set".to_owned());

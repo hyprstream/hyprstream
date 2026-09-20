@@ -282,6 +282,15 @@ async fn declared_fit_families_drive_the_shift_split() {
         split.eval_families
     );
     assert!(!split.eval_families.is_empty());
+    // Fit-family observations are training data: none of their fields may
+    // enter the held-out gate's macro average (or its NLL sidecar).
+    let gate = report.gate.as_ref().unwrap();
+    assert!(
+        gate.fields.iter().all(|f| f.family != "arith"),
+        "fit-family fields must be excluded from the gate: {:?}",
+        gate.fields.iter().map(|f| &f.field).collect::<Vec<_>>()
+    );
+    assert_eq!(gate.fields.len(), report.nll_by_field.len());
 }
 
 #[tokio::test]

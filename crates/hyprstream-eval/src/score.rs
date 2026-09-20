@@ -39,10 +39,11 @@ pub struct ScoreConfig {
     /// Fit families for the report's shift split: families whose items were
     /// synthesized into training data, used for distillation targets, or used
     /// to fit calibration parameters. Observed families NOT in this list are
-    /// classified as held-out evaluation families; a family on both sides of
-    /// a true shift/zero-shot evaluation must simply not be observed here
-    /// (the protocol's disjointness check still applies to the declared
-    /// split). Defaults to none — a pure-eval report.
+    /// classified as held-out evaluation families, and observations tagged
+    /// with a declared fit family are excluded from the gate's field rows
+    /// entirely — they are training data, and silently macro-averaging them
+    /// into a purported held-out gate would corrupt the measurement. Defaults
+    /// to none — a pure-eval report.
     pub fit_families: Vec<String>,
 }
 
@@ -251,6 +252,12 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
     let mut field_rows = Vec::with_capacity(fields.len());
     let mut nll_by_field = Vec::with_capacity(fields.len());
     for (key, (kind, family, probs, labels)) in &fields {
+        // Declared fit families are training data: their observations must
+        // not enter the held-out gate's macro average (the split metadata
+        // alone does not exclude them).
+        if config.fit_families.contains(family) {
+            continue;
+        }
         let refs: Vec<&[f64]> = probs.iter().map(std::vec::Vec::as_slice).collect();
         let (metrics_row, nll) = field_metrics(key, family, *kind, &refs, labels)?;
         field_rows.push(metrics_row);
