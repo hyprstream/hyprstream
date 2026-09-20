@@ -34,6 +34,10 @@ enum LayerKind {
 ///
 /// The 0.8B hybrid values are read from the checkpoint's own `config.json` at
 /// conversion time; [`Qwen35Config::test_tiny`] provides a miniature for CPU tests.
+/// The serde defaults (linear head dim 128, 16 k-heads / 32 v-heads, rope theta
+/// 10M, partial rotary 0.25) are **placeholders** for when a text-only checkpoint
+/// omits the fields — they are plausible, not verified against a real 0.8B
+/// config.json (none exists in-repo yet).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Qwen35Config {
     pub hidden_size: i64,
@@ -152,7 +156,10 @@ impl Qwen35Config {
 }
 
 /// Qwen3.5 RMSNorm: `norm(x_f32) * (1 + weight)` — checkpoint weights are trained
-/// around zero, so the effective gain is `1 + w`.
+/// around zero, so the effective gain is `1 + w`. This zero-centered convention is
+/// pinned to the Qwen3-Next-style checkpoint family; if the 0.8B hybrid checkpoint
+/// ships unit-centered weights instead, this norm is where the numerics would
+/// diverge (verify at conversion time, P1.4).
 struct RmsNorm {
     weight: Tensor,
     eps: f64,

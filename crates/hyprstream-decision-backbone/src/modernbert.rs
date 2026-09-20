@@ -2,10 +2,15 @@
 //!
 //! Encoder-only implementation of the ModernBERT architecture (Answer.AI 2024):
 //! alternating local/global attention (local sliding window on 2 of every 3
-//! layers), GeGLU MLP, pre-norm blocks, RoPE with separate thetas for local and
-//! global layers, final norm, **no pooler and no MLM head** — the shared scorer
-//! reads anchor states exactly as on the converted hybrid, so gate (b) compares
-//! both arms through an identical harness on identical versioned splits.
+//! layers, `local_attention // 2` per side as in the HF reference), GeGLU MLP,
+//! pre-norm blocks with **bias-free** LayerNorms (`"norm_bias": false` in both
+//! official configs), an `embeddings.norm` LayerNorm after the token lookup,
+//! RoPE with separate thetas for local and global layers, final norm, **no pooler
+//! and no MLM head** — the shared scorer reads anchor states exactly as on the
+//! converted hybrid, so gate (b) compares both arms through an identical harness
+//! on identical versioned splits. `large()` is the real ModernBERT-large shape
+//! (1024/28/16/2624, verified against the live HF config.json); `base()` is the
+//! smaller sibling kept for ablations.
 //!
 //! Parameter names follow the HF layout (`model.layers.{i}.attn.Wqkv.weight`, ...)
 //! so a ModernBERT-large checkpoint loads after dropping its head tensors
@@ -66,13 +71,17 @@ fn default_global_every() -> i64 {
 }
 
 impl ModernBertConfig {
-    /// The ModernBERT-large reference shape (the S3 baseline arm).
+    /// The ModernBERT-large reference shape (the S3 baseline arm), verified against
+    /// the live `answerdotai/ModernBERT-large` config.json: 1024 hidden / 28 layers /
+    /// 16 heads / 2624 intermediate, vocab 50368, `norm_bias: false`,
+    /// `local_attention: 128` (64 per side — the HF mask keeps
+    /// `distance <= local_attention // 2`).
     pub fn large() -> Self {
         Self {
-            hidden_size: 768,
-            num_hidden_layers: 22,
-            num_attention_heads: 12,
-            intermediate_size: 1152,
+            hidden_size: 1024,
+            num_hidden_layers: 28,
+            num_attention_heads: 16,
+            intermediate_size: 2624,
             vocab_size: 50368,
             max_position_embeddings: 8192,
             norm_eps: 1e-5,
@@ -80,6 +89,18 @@ impl ModernBertConfig {
             local_rope_theta: 10_000.0,
             local_attention: 128,
             global_attn_every_n_layers: 3,
+        }
+    }
+
+    /// The ModernBERT-base reference shape (smaller sibling; comparison/ablation
+    /// only — the S3 baseline arm pinned by the plan is `large()`).
+    pub fn base() -> Self {
+        Self {
+            hidden_size: 768,
+            num_hidden_layers: 22,
+            num_attention_heads: 12,
+            intermediate_size: 1152,
+            ..Self::large()
         }
     }
 
@@ -109,10 +130,13 @@ impl ModernBertConfig {
     }
 }
 
-/// LayerNorm with weight + bias (ModernBERT norms are biased, eps 1e-5).
+/// LayerNorm with weight and no bias: both official ModernBERT configs (base and
+/// large) set `"norm_bias": false`, and every reference norm (embedding norm,
+/// attn_norm, mlp_norm, final_norm) is built bias-free. Allocating a bias would
+/// leave checkpoint tensors homeless and add a per-norm additive term the
+/// pretrained weights do not assume.
 struct LayerNorm {
     weight: Tensor,
-    bias: Tensor,
     eps: f64,
 }
 
@@ -120,7 +144,6 @@ impl LayerNorm {
     fn new(path: &nn::Path, dim: i64, eps: f64) -> Self {
         Self {
             weight: path.var("weight", &[dim], Init::Const(1.0)),
-            bias: path.var("bias", &[dim], Init::Const(0.0)),
             eps,
         }
     }
@@ -132,7 +155,7 @@ impl LayerNorm {
         let centered = &x_f - &mean;
         let var = (&centered * &centered).mean_dim(&[-1i64][..], true, Kind::Float);
         let normed = centered * (var + self.eps).rsqrt();
-        (normed * self.weight.to_kind(Kind::Float) + self.bias.to_kind(Kind::Float)).to_kind(dtype)
+        (normed * self.weight.to_kind(Kind::Float)).to_kind(dtype)
     }
 }
 
@@ -248,10 +271,15 @@ struct Layer {
 /// root (`embeddings`, `layers.{i}`, `final_norm`).
 pub struct ModernBertEncoder {
     embeddings: nn::Embedding,
+    /// `embeddings.norm`: the reference applies a full LayerNorm right after the
+    /// token embedding lookup (`drop(norm(tok_embeddings(ids)))`) — this is also
+    /// why layer 0's `attn_norm` is an identity in the reference.
+    embeddings_norm: LayerNorm,
     layers: Vec<Layer>,
     final_norm: LayerNorm,
     rope_global: Rotary,
     rope_local: Rotary,
+    /// `config.local_attention` (the published total window); halved at mask time.
     local_window: i64,
     hidden_dim: i64,
 }
@@ -327,6 +355,11 @@ impl ModernBertEncoder {
         }
         Ok(Self {
             embeddings,
+            embeddings_norm: LayerNorm::new(
+                &path.sub("embeddings").sub("norm"),
+                cfg.hidden_size,
+                cfg.norm_eps,
+            ),
             layers,
             final_norm: LayerNorm::new(&path.sub("final_norm"), cfg.hidden_size, cfg.norm_eps),
             rope_global: Rotary::new(
@@ -354,7 +387,10 @@ impl ModernBertEncoder {
 
     /// Additive `[1, 1, seq, seq]` mask: global layers attend everywhere (this arm
     /// is an encoder — bidirectional is its native mode); local layers add the
-    /// sliding-window band.
+    /// sliding-window band. The per-side window is `local_attention // 2`, matching
+    /// the HF reference (`_update_attention_mask` keeps
+    /// `distance <= config.local_attention // 2` — 64 per side for the published
+    /// 128).
     fn additive_mask(
         &self,
         seq: i64,
@@ -368,7 +404,7 @@ impl ModernBertEncoder {
         }
         let idx = Tensor::arange(seq, (Kind::Int64, device));
         let dist = idx.unsqueeze(0) - idx.unsqueeze(1); // [seq, seq] = q_pos - k_pos
-        let outside = dist.abs().f_greater(self.local_window)?;
+        let outside = dist.abs().f_greater(self.local_window / 2)?;
         Ok(mask.f_masked_fill(&outside.view([1, 1, seq, seq]), f64::NEG_INFINITY)?)
     }
 }
@@ -382,7 +418,9 @@ impl Backbone for ModernBertEncoder {
             )));
         }
         let seq = size[1];
-        let mut hidden = token_ids.apply(&self.embeddings);
+        let mut hidden = self
+            .embeddings_norm
+            .forward(&token_ids.apply(&self.embeddings));
         for layer in &self.layers {
             let normed = match &layer.attn_norm {
                 Some(norm) => norm.forward(&hidden),
@@ -413,11 +451,46 @@ mod tests {
 
     #[test]
     fn large_config_is_the_s3_reference_shape() {
+        // Verified against the live answerdotai/ModernBERT-large config.json:
+        // 1024/28/16/2624, vocab 50368, local_attention 128, norm_bias false.
+        // (ModernBERT-base is 768/22/12/1152 — do not regress to it.)
         let cfg = ModernBertConfig::large();
-        assert_eq!(cfg.hidden_size, 768);
-        assert_eq!(cfg.num_hidden_layers, 22);
-        assert_eq!(cfg.num_attention_heads, 12);
+        assert_eq!(cfg.hidden_size, 1024);
+        assert_eq!(cfg.num_hidden_layers, 28);
+        assert_eq!(cfg.num_attention_heads, 16);
+        assert_eq!(cfg.intermediate_size, 2624);
+        assert_eq!(cfg.vocab_size, 50368);
+        assert_eq!(cfg.local_attention, 128);
         assert_eq!(cfg.head_dim(), 64);
+
+        let base = ModernBertConfig::base();
+        assert_eq!(base.hidden_size, 768);
+        assert_eq!(base.num_hidden_layers, 22);
+        assert_eq!(base.num_attention_heads, 12);
+        assert_eq!(base.intermediate_size, 1152);
+    }
+
+    #[test]
+    fn checkpoint_layout_matches_the_hf_reference() {
+        // Structural parity (review B3/B4): `embeddings.norm` exists and no norm
+        // anywhere owns a bias (`norm_bias: false` in both official configs), so
+        // every tensor in a real checkpoint has a home and vice versa.
+        let vs = nn::VarStore::new(Device::Cpu);
+        let cfg = ModernBertConfig::test_tiny();
+        let _model = ModernBertEncoder::new(&vs.root().sub("model"), &cfg).unwrap();
+        let names: Vec<String> = vs.variables().into_keys().collect();
+        assert!(
+            names.iter().any(|n| n == "model.embeddings.norm.weight"),
+            "embeddings.norm.weight exists: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "model.final_norm.weight"),
+            "final_norm.weight exists"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with(".bias")),
+            "norm_bias:false — no bias tensors anywhere: {names:?}"
+        );
     }
 
     #[test]
@@ -435,7 +508,9 @@ mod tests {
     fn local_attention_masks_outside_the_window() {
         // Layer 0 is global by design (HF ModernBERT: layer_idx % every == 0, and
         // 0 % n == 0), so window invariance is checked on the attention sublayer
-        // itself: position 0 must not see a token 19 positions away with window 8.
+        // itself. The per-side window is `local_attention // 2` (HF
+        // `_update_attention_mask`): 4 per side for the tiny config's 8, so
+        // distance 4 attends and distance 5 is masked.
         let cfg = ModernBertConfig::test_tiny();
         let vs = nn::VarStore::new(Device::Cpu);
         let enc = ModernBertEncoder::new(&vs.root().sub("model"), &cfg).unwrap();
@@ -444,8 +519,8 @@ mod tests {
             .additive_mask(seq, false, Kind::Float, Device::Cpu)
             .unwrap();
         assert_eq!(mask.double_value(&[0, 0, 0, 19]), f64::NEG_INFINITY);
-        assert_eq!(mask.double_value(&[0, 0, 0, 9]), f64::NEG_INFINITY);
-        assert_eq!(mask.double_value(&[0, 0, 0, 8]), 0.0);
+        assert_eq!(mask.double_value(&[0, 0, 0, 5]), f64::NEG_INFINITY);
+        assert_eq!(mask.double_value(&[0, 0, 0, 4]), 0.0);
 
         // The local layer (index 1 in the tiny config) applied directly.
         let local = &enc.layers[1];
@@ -461,7 +536,7 @@ mod tests {
         let rope = &enc.rope_local;
         let out_a = local.attn.forward(&hidden_a, rope, &mask);
         let out_b = local.attn.forward(&hidden_b, rope, &mask);
-        for pos in 0..(seq - cfg.local_attention - 1) {
+        for pos in 0..(seq - cfg.local_attention / 2 - 1) {
             let diff = (out_a.get(0).get(pos) - out_b.get(0).get(pos))
                 .abs()
                 .max()

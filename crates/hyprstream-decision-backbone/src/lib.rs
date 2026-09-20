@@ -75,8 +75,11 @@
 //! tokens/sec reported for the MFU sizing sanity check (S6c: 0.8B bf16, 30–40% MFU →
 //! ~3.8–5.1 days per 10M×2k-token epoch on one group), (4) the optional fla leg —
 //! reported as gated-skipped (Triton ≥ 3.7 gate; not load-bearing). Steps degrade
-//! gracefully on GPU-less hosts (the current inventory flag: both reachable hosts
-//! report no GPUs) so CI can run steps 1–3 on CPU.
+//! gracefully on GPU-less hosts so CI can run steps 1–3 on CPU; on the dev host's
+//! RTX 5090 the CUDA legs execute for real (verified at P1.2: ~430–490 ms per fwd+bwd
+//! step at 2048 ctx, tiny config). The ROCm/MI210 leg remains unexecuted — the S6c
+//! inventory flag (no GPUs on the training hosts) is still open; carry it into P1.4
+//! scheduling.
 //!
 //! ## Baseline arm + pre-priced hybrid fallback
 //!
