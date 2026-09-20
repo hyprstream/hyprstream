@@ -1,0 +1,48 @@
+[package]
+name = "hyprstream-eval"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+description = "Workflow eval harness for the System One program (P0.4): runs any jev-1-shaped subject (our model, frontier LLMs via the adapter, or Jev itself), teacher-ensemble reference client, agreement + calibration scoring, Arrow-batch persistence via the P0.3 metrics API, criterion bench scaffold"
+
+# Permissive-only by policy (license-boundary.toml `permissive_roots`): this is
+# the public falsifiability artifact — a published eval harness with a pinned
+# measurement protocol. It links the Apache P0.1a/P0.2/P0.3-api/P0.6 crates and
+# must never reach an AGPL crate (the DuckDB metrics engine is wired in by the
+# serving process, not here).
+[dependencies]
+hyprstream-decision = { version = "0.1", path = "../hyprstream-decision" }
+hyprstream-calibration = { version = "0.1", path = "../hyprstream-calibration" }
+hyprstream-metrics-api = { version = "0.1", path = "../hyprstream-metrics-api" }
+hyprstream-bench = { version = "0.1", path = "../hyprstream-bench" }
+
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Same major as hyprstream-metrics-api — Status crosses the store boundary.
+tonic = { version = "0.13" }
+
+[dev-dependencies]
+hyprstream-decision-stub = { version = "0.1", path = "../hyprstream-decision-stub" }
+criterion = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "wire_floor"
+harness = false
+
+[[bench]]
+name = "harness_baseline"
+harness = false
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
