@@ -1,0 +1,35 @@
+[package]
+name = "hyprstream-decision-head"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+description = "System One P1.1: question/criteria encoder (tokenizer-bound linearization of the pinned jev-1 serialization) and the shared option-scorer generalist head (tch-rs)"
+
+# Model-side contract library (Apache-2.0 per the v1.7.1 licensing policy): the
+# encoder and scorer are consumed by P1.2 (backbone conversion), P1.4
+# (distillation training), and later the serving nodes. This crate must stay a
+# permissive-only leaf (license-boundary.toml): it depends on the Apache-2.0
+# `hyprstream-decision` contract crate and external crates only, never on an
+# AGPL workspace crate.
+[dependencies]
+hyprstream-decision = { path = "../hyprstream-decision" }
+thiserror = { workspace = true }
+tokenizers = { workspace = true }
+
+# Torch backend, matching the workspace idiom: hyprstream's tch-rs fork; the
+# CPU/CUDA/ROCm backend follows whichever libtorch build LIBTORCH points at
+# when tch compiles/links (see the root Cargo.toml comments). P1.2's conversion
+# consumes this scorer in-workspace through the same fork, so head weights move
+# between this crate and the converted backbone without a format boundary.
+tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hyprstream-libtorch-211" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
