@@ -182,3 +182,28 @@ questions:
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn teacher_answers_record_the_resolved_model_id() {
+    let (address, server) = serve_stub().await;
+    let ensemble = hyprstream_eval::TeacherEnsemble::new(vec![hyprstream_eval::Teacher {
+        id: "stub-teacher".into(),
+        tos_class: hyprstream_eval::TosClass::Distributable,
+        subject: Box::new(HttpSubject::new(
+            format!("http://{address}"),
+            "jev-stub-latest",
+            "t",
+        )),
+    }])
+    .unwrap();
+    let out = ensemble
+        .decide(&fixture(), &Entry::Str("The box was crushed.".into()), 0, "item")
+        .await
+        .unwrap();
+    assert_eq!(
+        out.teacher_answers[0].model_id,
+        hyprstream_decision_stub::mock::STUB_MODEL_VERSION,
+        "TeacherAnswer.model_id is the resolved version, not the alias"
+    );
+    server.abort();
+}
