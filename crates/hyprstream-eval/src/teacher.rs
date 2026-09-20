@@ -16,8 +16,11 @@ use crate::error::EvalError;
 use crate::subject::Subject;
 
 /// Distribution-license class of a teacher's outputs, per the out-of-band
-/// roster decision (plan Q4). Recorded per teacher at roster time; the
-/// harness refuses to construct an ensemble with an unclassified teacher.
+/// roster decision (plan Q4). Recorded per teacher at roster time and carried
+/// on every [`TeacherAnswer`]; the class is **provenance**, not an enforced
+/// gate — P1.3's distributability flags and publication decisions consume it
+/// downstream, and [`TosClass::Unknown`] must be treated as the most
+/// restrictive class there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TosClass {
     /// Outputs may be redistributed in public/Apache artifacts.
