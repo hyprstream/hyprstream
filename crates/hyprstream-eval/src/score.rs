@@ -265,11 +265,13 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
     }
 
     // Held-out eval families = observed families minus declared fit families.
+    // Untagged observations score under the same "unknown" sentinel the field
+    // construction uses, so the split always names every family in the gate.
     let eval_families: Vec<String> = {
         let mut families: Vec<String> = output
             .observations
             .iter()
-            .filter_map(|obs| obs.family.clone())
+            .map(|obs| obs.family.clone().unwrap_or_else(|| "unknown".to_owned()))
             .filter(|family| !config.fit_families.contains(family))
             .collect();
         families.sort();
