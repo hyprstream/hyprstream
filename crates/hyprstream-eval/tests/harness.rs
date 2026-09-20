@@ -169,3 +169,146 @@ async fn argmax_ties_break_earliest_everywhere() {
     assert_eq!(report.items[0].correct, Some(false), "D6: argmax = index 0 on a tie");
     assert_eq!(report.accuracy, Some(0.0));
 }
+
+/// A subject that never answers the declared question (regression: the
+/// harness must reject the row instead of scoring a silent gap).
+struct SilentSubject;
+
+#[async_trait::async_trait]
+impl Subject for SilentSubject {
+    fn model_id(&self) -> &str {
+        "silent-1"
+    }
+
+    async fn decide(
+        &self,
+        _set: &QuestionSet,
+        _state: &Entry,
+        _row: usize,
+    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+        Ok(AnswerRow {
+            answers: std::collections::BTreeMap::new(),
+        })
+    }
+}
+
+/// A subject that answers a noul question with a Choice value (regression:
+/// kind mismatches must be rejected at ingest).
+struct WrongKindSubject;
+
+#[async_trait::async_trait]
+impl Subject for WrongKindSubject {
+    fn model_id(&self) -> &str {
+        "wrong-kind-1"
+    }
+
+    async fn decide(
+        &self,
+        set: &QuestionSet,
+        _state: &Entry,
+        _row: usize,
+    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+        let mut answers = std::collections::BTreeMap::new();
+        for question in &set.questions {
+            let n = question.cardinality();
+            answers.insert(
+                question.id.clone(),
+                QuestionAnswer::answered(AnswerValue::Choice {
+                    probabilities: vec![1.0 / n as f32; n],
+                }),
+            );
+        }
+        Ok(AnswerRow { answers })
+    }
+}
+
+fn noul_item() -> EvalItem {
+    EvalItem {
+        id: "val-1".into(),
+        family: Some("validation".into()),
+        stratum: None,
+        group: None,
+        state: Entry::Null,
+        question: hyprstream_decision::QuestionSpec {
+            id: "val_q".into(),
+            kind: hyprstream_decision::QuestionKind::Noul,
+            instructions: None,
+            body: hyprstream_decision::QuestionBody::Noul { criteria: None },
+        },
+        truth: Some(1),
+    }
+}
+
+#[tokio::test]
+async fn run_items_rejects_a_missing_answer() {
+    let items = vec![noul_item()];
+    let error = Harness.run_items(&items, &SilentSubject).await.err().unwrap();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::InvalidAnswer { .. }),
+        "missing answer must be InvalidAnswer, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn run_items_rejects_a_kind_mismatch() {
+    let items = vec![noul_item()];
+    let error = Harness
+        .run_items(&items, &WrongKindSubject)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::InvalidAnswer { .. }),
+        "kind mismatch must be InvalidAnswer, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn declared_fit_families_drive_the_shift_split() {
+    let items: Vec<EvalItem> = small_items().iter().map(EvalItem::from).collect();
+    let subject = truth_subject_for(&items);
+    let output = Harness.run_items(&items, &subject).await.unwrap();
+    let report = score_bench_run(
+        &output,
+        &items,
+        &ScoreConfig::default().with_fit_families(["arith"]),
+    )
+    .unwrap();
+    let split = &report.gate.as_ref().unwrap().shift_split;
+    assert_eq!(split.fit_families, vec!["arith".to_owned()]);
+    assert!(
+        !split.eval_families.iter().any(|f| f == "arith"),
+        "a declared fit family must not also score as held-out: {:?}",
+        split.eval_families
+    );
+    assert!(!split.eval_families.is_empty());
+}
+
+#[tokio::test]
+async fn nll_by_field_matches_the_analytic_values() {
+    let items = vec![noul_item()];
+    // Uniform [0.5, 0.5] over a 2-label field: NLL = -ln(0.5).
+    let output = Harness.run_items(&items, &UniformSubject).await.unwrap();
+    let report = score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
+    // Item runs key fields by family × kind × cardinality.
+    let (key, nll) = report
+        .nll_by_field
+        .iter()
+        .find(|(key, _)| key.starts_with("validation/"))
+        .unwrap();
+    assert_eq!(key, "validation/noul:2");
+    assert!(
+        (nll - std::f64::consts::LN_2).abs() < 1e-6,
+        "uniform 2-label NLL must be ln 2, got {nll}"
+    );
+    // One-hot truth at the true label: NLL ~ 0.
+    let subject = truth_subject_for(&items);
+    let output = Harness.run_items(&items, &subject).await.unwrap();
+    let report = score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
+    let (_, nll) = report
+        .nll_by_field
+        .iter()
+        .find(|(key, _)| key.starts_with("validation/"))
+        .unwrap();
+    assert!(nll.abs() < 1e-6, "truth NLL must be ~0, got {nll}");
+}

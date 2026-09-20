@@ -17,7 +17,7 @@ use hyprstream_decision::author;
 use hyprstream_decision::entry::Entry;
 use hyprstream_decision_stub::mock::MockDecisionModel;
 use hyprstream_decision_stub::render;
-use hyprstream_eval::subject::request_to_json;
+use hyprstream_eval::subject::request_body;
 
 /// A question set of `n` questions cycling through the three primitives, with
 /// choice cardinality `k`.
@@ -46,7 +46,7 @@ fn question_set(n: usize, k: usize) -> hyprstream_decision::QuestionSet {
 }
 
 fn wire_bytes(set: &hyprstream_decision::QuestionSet) -> (usize, usize) {
-    let request = request_to_json(
+    let request = request_body(
         set,
         &Entry::Str("The crate arrived damaged.".into()),
         "jev-stub-latest",
@@ -78,7 +78,7 @@ fn bench_wire_sizes(c: &mut Criterion) {
             &set,
             |b, set| {
                 b.iter(|| {
-                    black_box(serde_json::to_vec(&request_to_json(
+                    black_box(serde_json::to_vec(&request_body(
                         set,
                         &Entry::Str("The crate arrived damaged.".into()),
                         "jev-stub-latest",
@@ -100,7 +100,7 @@ fn bench_wire_sizes(c: &mut Criterion) {
             BenchmarkId::new("request_parse", format!("q{questions}-k{cardinality}")),
             &set,
             |b, set| {
-                let body = serde_json::to_vec(&request_to_json(
+                let body = serde_json::to_vec(&request_body(
                     set,
                     &Entry::Str("The crate arrived damaged.".into()),
                     "jev-stub-latest",

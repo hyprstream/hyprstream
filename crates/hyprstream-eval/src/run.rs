@@ -159,18 +159,14 @@ impl Harness {
     /// Run an [`EvalSet`] against a subject: one `decide` per row, answers
     /// validated by the Arrow batch builder (kind/cardinality/producer
     /// tolerance are enforced there — a malformed subject fails loudly), plus
-    /// the observation stream.
+    /// the observation stream. The version triple records the subject's
+    /// **resolved** model id after the run (HTTP alias resolution).
     pub async fn run_set(
         &self,
         set: &EvalSet,
         subject: &dyn Subject,
     ) -> Result<RunOutput, EvalError> {
         let question_set = set.question_set();
-        let version = VersionTriple {
-            schema: set.schema_version.clone(),
-            model: subject.model_id().to_owned(),
-            calib: None,
-        };
         let mut rows = Vec::with_capacity(set.rows.len());
         let mut observations = Vec::new();
         for (row_index, row) in set.rows.iter().enumerate() {
@@ -201,6 +197,11 @@ impl Harness {
             }
             rows.push(answers);
         }
+        let version = VersionTriple {
+            schema: set.schema_version.clone(),
+            model: subject.resolved_model_id(),
+            calib: None,
+        };
         let schema = DecisionSchema::new(set.questions.clone())?;
         let batch = schema.build_batch(&version, &rows)?;
         Ok(RunOutput {
@@ -214,17 +215,16 @@ impl Harness {
 
     /// Run loose [`EvalItem`]s against a subject (the bench shape). Each item
     /// is answered as its own one-question request; observations carry the
-    /// item's family/stratum/group tags through to scoring.
+    /// item's family/stratum/group tags through to scoring. Answers are
+    /// validated with the same rules the Arrow batch builder enforces for
+    /// [`Harness::run_set`] (presence, kind, cardinality, producer tolerance,
+    /// abstention/conformal-set invariants) — a malformed subject fails
+    /// loudly here too.
     pub async fn run_items(
         &self,
         items: &[EvalItem],
         subject: &dyn Subject,
     ) -> Result<RunOutput, EvalError> {
-        let version = VersionTriple {
-            schema: "items".to_owned(),
-            model: subject.model_id().to_owned(),
-            calib: None,
-        };
         let mut observations = Vec::with_capacity(items.len());
         for (row_index, item) in items.iter().enumerate() {
             let set = QuestionSet {
@@ -239,6 +239,12 @@ impl Harness {
                     item_id: item.id.clone(),
                     message: error.to_string(),
                 })?;
+            validate_answer_row(&item.question, &answers).map_err(|message| {
+                EvalError::InvalidAnswer {
+                    question_id: item.question.id.clone(),
+                    message,
+                }
+            })?;
             let probabilities = answers
                 .answers
                 .get(&item.question.id)
@@ -255,6 +261,11 @@ impl Harness {
                 truth: item.truth,
             });
         }
+        let version = VersionTriple {
+            schema: "items".to_owned(),
+            model: subject.resolved_model_id(),
+            calib: None,
+        };
         Ok(RunOutput {
             model_id: version.model.clone(),
             version,
@@ -263,4 +274,71 @@ impl Harness {
             schema_fingerprint: None,
         })
     }
+}
+
+/// The same row-level answer rules `DecisionSchema::build_batch` enforces,
+/// for one-question item runs (bench question ids are not identifier-safe —
+/// they contain `-` — so they cannot go through the Arrow validator itself).
+fn validate_answer_row(
+    question: &QuestionSpec,
+    row: &hyprstream_decision::arrow::AnswerRow,
+) -> Result<(), String> {
+    use hyprstream_decision::answer::AnswerValue;
+    use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
+    use hyprstream_decision::spec::QuestionKind;
+
+    let id = &question.id;
+    let answer = row
+        .answers
+        .get(id)
+        .ok_or_else(|| format!("row is missing an answer for question `{id}` (abstain explicitly instead)"))?;
+    for answered_id in row.answers.keys() {
+        if answered_id != id {
+            return Err(format!("row answers unknown question `{answered_id}`"));
+        }
+    }
+    let Some(value) = &answer.value else {
+        if answer.conformal_set.is_some() {
+            return Err("an abstained answer cannot carry a conformal set".to_owned());
+        }
+        return Ok(());
+    };
+    let kind_matches = matches!(
+        (&question.body, value),
+        (hyprstream_decision::spec::QuestionBody::Noul { .. }, AnswerValue::Noul { .. })
+            | (hyprstream_decision::spec::QuestionBody::Choice { .. }, AnswerValue::Choice { .. })
+            | (hyprstream_decision::spec::QuestionBody::Score { .. }, AnswerValue::Score { .. })
+    );
+    if !kind_matches {
+        let got = match value {
+            AnswerValue::Noul { .. } => QuestionKind::Noul,
+            AnswerValue::Choice { .. } => QuestionKind::Choice,
+            AnswerValue::Score { .. } => QuestionKind::Score,
+        };
+        return Err(format!(
+            "answer kind {got} does not match question kind {}",
+            question.kind
+        ));
+    }
+    let probabilities = value.probabilities();
+    if probabilities.len() != question.cardinality() {
+        return Err(format!(
+            "{} probabilities for a cardinality-{} question",
+            probabilities.len(),
+            question.cardinality()
+        ));
+    }
+    check_distribution(&probabilities, PRODUCER_SUM_TOLERANCE)
+        .map_err(|error| format!("distribution violates producer tolerance (D5): {error}"))?;
+    if let Some(set) = &answer.conformal_set {
+        let labels = question.labels();
+        for label in set {
+            if !labels.contains(label) {
+                return Err(format!(
+                    "conformal set member `{label}` is not one of the question's labels"
+                ));
+            }
+        }
+    }
+    Ok(())
 }

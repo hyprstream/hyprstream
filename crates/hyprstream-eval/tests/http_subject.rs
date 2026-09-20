@@ -102,3 +102,83 @@ async fn http_subject_surfaces_http_errors() {
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn http_subject_records_the_resolved_model_id() {
+    let (address, server) = serve_stub().await;
+    let subject = HttpSubject::new(
+        format!("http://{address}"),
+        "jev-stub-latest",
+        "eval-harness",
+    );
+    // Before the first call the requested string is the best known id.
+    assert_eq!(subject.requested_model(), "jev-stub-latest");
+    assert_eq!(subject.resolved_model_id(), "jev-stub-latest");
+    subject
+        .decide(&fixture(), &Entry::Str("The box was crushed.".into()), 0)
+        .await
+        .unwrap();
+    // The alias resolved to the stub's versioned id, and that is what runs
+    // must record.
+    assert_eq!(subject.requested_model(), "jev-stub-latest");
+    assert_eq!(
+        subject.resolved_model_id(),
+        hyprstream_decision_stub::mock::STUB_MODEL_VERSION
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn wire_preserves_declared_option_order_end_to_end() {
+    // The mock's distributions are a hash of the canonical question
+    // serialization, which is option-order sensitive. If the harness's
+    // request body reordered options (e.g. serde_json's sorted map keys),
+    // the stub would hash a different serialization than the declared set
+    // and the distributions would diverge from the in-process reference.
+    let (address, server) = serve_stub().await;
+    let subject = HttpSubject::new(format!("http://{address}"), "jev-stub-latest", "t");
+    let set = fixture();
+    let state = Entry::Str("The box was crushed.".into());
+    let row = subject.decide(&set, &state, 0).await.unwrap();
+    let reference =
+        hyprstream_decision_stub::mock::MockDecisionModel.answer_row(&set, "The box was crushed.", 0);
+    assert_eq!(
+        row, reference,
+        "the wire must carry the declared option order byte-for-byte"
+    );
+
+    // Control: the same questions with permuted option order hash
+    // differently — order genuinely flows through the wire.
+    let permuted = author::parse_yaml(
+        r#"
+state: "The box was crushed."
+questions:
+  is_refund:
+    type: noul
+    instructions: "The customer wants money back."
+  tone:
+    type: choice
+    criteria:
+      calm: ~
+      angry: "Hostile message"
+  severity:
+    type: score
+    criteria: ["unusable", "usable", "cosmetic"]
+"#,
+    )
+    .unwrap();
+    let permuted_reference = hyprstream_decision_stub::mock::MockDecisionModel.answer_row(
+        &permuted,
+        "The box was crushed.",
+        0,
+    );
+    assert_ne!(
+        reference.answers.get("tone").and_then(|a| a.value.as_ref()),
+        permuted_reference
+            .answers
+            .get("tone")
+            .and_then(|a| a.value.as_ref()),
+        "option order must change the mock's distribution"
+    );
+    server.abort();
+}

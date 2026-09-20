@@ -28,14 +28,22 @@ use crate::run::RunOutput;
 use crate::teacher::EnsembleOutput;
 
 /// Scoring knobs.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ScoreConfig {
     /// Bootstrap seed for all CIs (gate reports pin theirs; a run report pins
     /// its own so numbers are reproducible).
     pub bootstrap_seed: u64,
-    /// Fit families for the report's shift split (eval families are taken
-    /// from the observations). Defaults to none — a pure-eval report.
+    /// The split name recorded on the gate report (e.g. `"deterministic"`,
+    /// `"shift"`, `"zero-shot"`).
     pub split_name: &'static str,
+    /// Fit families for the report's shift split: families whose items were
+    /// synthesized into training data, used for distillation targets, or used
+    /// to fit calibration parameters. Observed families NOT in this list are
+    /// classified as held-out evaluation families; a family on both sides of
+    /// a true shift/zero-shot evaluation must simply not be observed here
+    /// (the protocol's disjointness check still applies to the declared
+    /// split). Defaults to none — a pure-eval report.
+    pub fit_families: Vec<String>,
 }
 
 impl Default for ScoreConfig {
@@ -43,7 +51,16 @@ impl Default for ScoreConfig {
         Self {
             bootstrap_seed: 0xE4A1,
             split_name: "eval",
+            fit_families: Vec::new(),
         }
+    }
+}
+
+impl ScoreConfig {
+    /// Declare the fit families (see [`ScoreConfig::fit_families`]).
+    pub fn with_fit_families(mut self, families: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.fit_families = families.into_iter().map(Into::into).collect();
+        self
     }
 }
 
@@ -119,20 +136,31 @@ pub struct ScoreReport {
     pub abstention_rate: f64,
     /// Argmax accuracy over labeled, answered observations.
     pub accuracy: Option<f64>,
+    /// Per-field negative log-likelihood, aligned with the gate report's
+    /// field rows. (P0.2's `FieldMetrics` type has no NLL slot and is owned
+    /// by the calibration crate, so NLL rides alongside the gate report here
+    /// rather than inside it.)
+    pub nll_by_field: Vec<(String, f64)>,
     /// Per-item lines.
     pub items: Vec<ItemScore>,
 }
 
-/// Field key for an observation: the question id for declared questions whose
-/// id is shared across rows (set runs), else the family × kind × cardinality
-/// group (item runs). We cannot distinguish the two cases per-observation, so
-/// the caller picks the mode; [`score_run`] uses the item-group mode when the
-/// run has no batch (loose items) and the question-id mode otherwise.
-fn field_key(obs: &crate::run::Observation, by_question: bool) -> String {
+/// Field key for an observation. Set runs key by question id (ids are shared
+/// across rows), prefixing the family when the run spans more than one family
+/// so families are never pooled into one field (the macro rule averages
+/// fields with equal weight — pooling would dilute a miscalibrated rare
+/// family). Item runs key by family × kind × cardinality, since every item
+/// carries its own question id. The caller picks the mode; [`score_run`] uses
+/// the item-group mode when the run has no batch (loose items) and the
+/// question-id mode otherwise.
+fn field_key(obs: &crate::run::Observation, by_question: bool, multi_family: bool) -> String {
+    let family = obs.family.as_deref().unwrap_or("unknown");
     if by_question {
+        if multi_family {
+            return format!("{family}/{}", obs.question_id);
+        }
         return obs.question_id.clone();
     }
-    let family = obs.family.as_deref().unwrap_or("unknown");
     let cardinality = obs
         .probabilities
         .as_ref()
@@ -140,29 +168,47 @@ fn field_key(obs: &crate::run::Observation, by_question: bool) -> String {
     format!("{family}/{}:{cardinality}", obs.kind)
 }
 
+/// Number of distinct family tags in the run (`None` family counts as one).
+fn family_count(observations: &[crate::run::Observation]) -> usize {
+    let mut families: Vec<&str> = observations
+        .iter()
+        .map(|obs| obs.family.as_deref().unwrap_or("unknown"))
+        .collect();
+    families.sort_unstable();
+    families.dedup();
+    families.len()
+}
+
+/// Per-field metrics plus the field's NLL (returned separately because
+/// P0.2's `FieldMetrics` has no NLL slot — see [`ScoreReport::nll_by_field`]).
 fn field_metrics(
     field: &str,
     family: &str,
     kind: QuestionKind,
     probs: &[&[f64]],
     labels: &[usize],
-) -> Result<FieldMetrics, EvalError> {
+) -> Result<(FieldMetrics, f64), EvalError> {
     let ordinal = kind == QuestionKind::Score;
-    Ok(FieldMetrics {
-        field: field.to_owned(),
-        family: family.to_owned(),
-        n: labels.len(),
-        ece: metrics::ece(probs, labels, GATE_BIN_COUNT)?,
-        brier: metrics::brier(probs, labels)?,
-        sce: ordinal.then(|| metrics::sce(probs, labels, GATE_BIN_COUNT)).transpose()?,
-        ace: ordinal.then(|| metrics::ace(probs, labels, GATE_BIN_COUNT)).transpose()?,
-        rps: ordinal.then(|| metrics::rps(probs, labels)).transpose()?,
-    })
+    let nll = metrics::nll(probs, labels)?;
+    Ok((
+        FieldMetrics {
+            field: field.to_owned(),
+            family: family.to_owned(),
+            n: labels.len(),
+            ece: metrics::ece(probs, labels, GATE_BIN_COUNT)?,
+            brier: metrics::brier(probs, labels)?,
+            sce: ordinal.then(|| metrics::sce(probs, labels, GATE_BIN_COUNT)).transpose()?,
+            ace: ordinal.then(|| metrics::ace(probs, labels, GATE_BIN_COUNT)).transpose()?,
+            rps: ordinal.then(|| metrics::rps(probs, labels)).transpose()?,
+        },
+        nll,
+    ))
 }
 
 /// Score a run's observations under the pinned protocol.
 pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport, EvalError> {
     let by_question = output.batch.is_some();
+    let multi_family = family_count(&output.observations) > 1;
     // Group labeled, answered observations into fields.
     let mut fields: BTreeMap<String, (QuestionKind, String, Vec<Vec<f64>>, Vec<usize>)> =
         BTreeMap::new();
@@ -175,7 +221,7 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
             (Some(probs), Some(truth)) => {
                 let probs64: Vec<f64> = probs.iter().map(|p| f64::from(*p)).collect();
                 let hit = metrics::argmax(&probs64) == truth;
-                let key = field_key(obs, by_question);
+                let key = field_key(obs, by_question, multi_family);
                 let family = obs.family.clone().unwrap_or_else(|| "unknown".to_owned());
                 let entry = fields
                     .entry(key)
@@ -203,16 +249,21 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
     }
 
     let mut field_rows = Vec::with_capacity(fields.len());
+    let mut nll_by_field = Vec::with_capacity(fields.len());
     for (key, (kind, family, probs, labels)) in &fields {
         let refs: Vec<&[f64]> = probs.iter().map(std::vec::Vec::as_slice).collect();
-        field_rows.push(field_metrics(key, family, *kind, &refs, labels)?);
+        let (metrics_row, nll) = field_metrics(key, family, *kind, &refs, labels)?;
+        field_rows.push(metrics_row);
+        nll_by_field.push((key.clone(), nll));
     }
 
+    // Held-out eval families = observed families minus declared fit families.
     let eval_families: Vec<String> = {
         let mut families: Vec<String> = output
             .observations
             .iter()
             .filter_map(|obs| obs.family.clone())
+            .filter(|family| !config.fit_families.contains(family))
             .collect();
         families.sort();
         families.dedup();
@@ -224,7 +275,7 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
         Some(GateReport::assemble(
             output.model_id.clone(),
             config.split_name,
-            ShiftSplit::new(std::iter::empty::<String>(), eval_families)?,
+            ShiftSplit::new(config.fit_families.clone(), eval_families)?,
             field_rows,
             config.bootstrap_seed,
         )?)
@@ -242,18 +293,28 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
 
     Ok(ScoreReport {
         gate,
-        by_family: breakdown(&output.observations, |obs| obs.family.clone()),
-        by_stratum: breakdown(&output.observations, |obs| obs.stratum.clone()),
+        by_family: breakdown(&output.observations, by_question, multi_family, |obs| {
+            obs.family.clone()
+        }),
+        by_stratum: breakdown(&output.observations, by_question, multi_family, |obs| {
+            obs.stratum.clone()
+        }),
         flip_rate: None,
         abstention_rate,
         accuracy,
+        nll_by_field,
         items,
     })
 }
 
-/// Macro-ECE + accuracy + abstention for one breakdown dimension.
+/// Macro-ECE + accuracy + abstention for one breakdown dimension. Field
+/// keying inside a bucket follows the same rule as the top-level fields
+/// (question id for set runs — two same-kind questions never merge into one
+/// field — family × kind × cardinality for item runs).
 fn breakdown(
     observations: &[crate::run::Observation],
+    by_question: bool,
+    multi_family: bool,
     key_of: impl Fn(&crate::run::Observation) -> Option<String>,
 ) -> Vec<BreakdownMetrics> {
     let mut buckets: BTreeMap<String, Vec<&crate::run::Observation>> = BTreeMap::new();
@@ -265,7 +326,6 @@ fn breakdown(
     buckets
         .into_iter()
         .map(|(key, bucket)| {
-            // Fields inside the bucket follow the same family×kind×card rule.
             let mut fields: BTreeMap<String, (Vec<Vec<f64>>, Vec<usize>)> = BTreeMap::new();
             let mut correct = 0usize;
             let mut labeled = 0usize;
@@ -278,8 +338,7 @@ fn breakdown(
                             correct += 1;
                         }
                         labeled += 1;
-                        let family = obs.family.as_deref().unwrap_or("unknown");
-                        let field = format!("{family}/{}:{}", obs.kind, probs.len());
+                        let field = field_key(obs, by_question, multi_family);
                         let entry = fields.entry(field).or_default();
                         entry.0.push(probs64);
                         entry.1.push(truth);
