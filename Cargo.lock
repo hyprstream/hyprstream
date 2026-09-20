@@ -7067,6 +7067,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-calibration"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "workspace-hack",
+]
+
+[[package]]
 name = "hyprstream-compositor"
 version = "0.1.0"
 dependencies = [
