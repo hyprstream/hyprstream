@@ -337,3 +337,47 @@ async fn untagged_observations_join_the_split_as_unknown() {
     assert!(gate.fields.iter().all(|f| f.family == "unknown"));
     assert_eq!(gate.shift_split.eval_families, vec!["unknown".to_owned()]);
 }
+
+#[tokio::test]
+async fn zero_probability_realized_label_scores_with_infinite_nll() {
+    // A valid (producer-tolerance) one-hot distribution can put zero mass on
+    // the realized label: NLL is legitimately infinite and must not abort
+    // scoring of the otherwise-scoreable run.
+    let items = vec![noul_item()]; // truth = 1
+    let subject = TruthSubject::new("overconfident").with_truth("val_q", 0);
+    let output = Harness.run_items(&items, &subject).await.unwrap();
+    let report = score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
+    let (_, nll) = report
+        .nll_by_field
+        .iter()
+        .find(|(key, _)| key.starts_with("validation/"))
+        .unwrap();
+    assert!(nll.is_infinite(), "zero-probability realized label: {nll}");
+    assert_eq!(report.accuracy, Some(0.0));
+    assert!(report.gate.is_some(), "the gate must still assemble");
+}
+
+#[tokio::test]
+async fn run_set_rejects_truth_for_undeclared_questions() {
+    // A misspelled truth key would otherwise be silently ignored, scoring the
+    // row as unlabeled and biasing every labeled denominator.
+    let set = hyprstream_eval::EvalSet {
+        name: "t".into(),
+        schema_version: "v1".into(),
+        questions: vec![noul_item().question],
+        rows: vec![hyprstream_eval::EvalRow {
+            id: "row-1".into(),
+            family: None,
+            stratum: None,
+            group: None,
+            state: Entry::Null,
+            truth: std::collections::BTreeMap::from([("val_q_typo".to_owned(), 1usize)]),
+        }],
+    };
+    let subject = TruthSubject::new("t");
+    let error = Harness.run_set(&set, &subject).await.err().unwrap();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::InvalidInput(_)),
+        "undeclared truth key must be InvalidInput, got {error:?}"
+    );
+}
