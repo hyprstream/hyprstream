@@ -68,7 +68,7 @@ generic-array = { version = "0.14", default-features = false, features = ["more_
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 gimli = { version = "0.33", default-features = false, features = ["read", "std", "write"] }
-half = { version = "2" }
+half = { version = "2", features = ["num-traits"] }
 hashbrown-5ef9efb8ec2df382 = { package = "hashbrown", version = "0.12", features = ["raw"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", features = ["serde"] }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
@@ -102,6 +102,7 @@ noq-proto = { version = "1", default-features = false, features = ["ring", "rust
 noq-udp = { version = "1", default-features = false, features = ["fast-apple-datapath", "tracing"] }
 num-bigint = { version = "0.4", features = ["rand"] }
 num-integer = { version = "0.1", features = ["i128"] }
+num-iter = { version = "0.1", default-features = false, features = ["i128", "std"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 object = { version = "0.39", default-features = false, features = ["read_core", "unaligned", "write"] }
 once_cell = { version = "1" }
@@ -233,7 +234,7 @@ generic-array = { version = "0.14", default-features = false, features = ["more_
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 gimli = { version = "0.33", default-features = false, features = ["read", "std", "write"] }
-half = { version = "2" }
+half = { version = "2", features = ["num-traits"] }
 hashbrown-5ef9efb8ec2df382 = { package = "hashbrown", version = "0.12", features = ["raw"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", features = ["serde"] }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
@@ -267,6 +268,7 @@ noq-proto = { version = "1", default-features = false, features = ["ring", "rust
 noq-udp = { version = "1", default-features = false, features = ["fast-apple-datapath", "tracing"] }
 num-bigint = { version = "0.4", features = ["rand"] }
 num-integer = { version = "0.1", features = ["i128"] }
+num-iter = { version = "0.1", default-features = false, features = ["i128", "std"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 object = { version = "0.39", default-features = false, features = ["read_core", "unaligned", "write"] }
 once_cell = { version = "1" }
@@ -356,6 +358,7 @@ ed25519-dalek-e027f7ab589cf689 = { package = "ed25519-dalek", version = "3.0.0-r
 enumflags2 = { version = "0.7", default-features = false, features = ["serde"] }
 flate2 = { version = "1", features = ["zlib-ng-compat"] }
 fuse-backend-rs = { version = "0.13", features = ["persist", "virtiofs"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
 hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["client", "http1", "http2", "runtime", "server"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "native-tokio", "ring", "tls12", "webpki-tokio"] }
@@ -400,6 +403,7 @@ ed25519-dalek-e027f7ab589cf689 = { package = "ed25519-dalek", version = "3.0.0-r
 enumflags2 = { version = "0.7", default-features = false, features = ["serde"] }
 flate2 = { version = "1", features = ["zlib-ng-compat"] }
 fuse-backend-rs = { version = "0.13", features = ["persist", "virtiofs"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
 hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["client", "http1", "http2", "runtime", "server"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "native-tokio", "ring", "tls12", "webpki-tokio"] }
@@ -443,6 +447,7 @@ ed25519-dalek-e027f7ab589cf689 = { package = "ed25519-dalek", version = "3.0.0-r
 enumflags2 = { version = "0.7", default-features = false, features = ["serde"] }
 flate2 = { version = "1", features = ["zlib-ng-compat"] }
 fuse-backend-rs = { version = "0.13", features = ["persist", "virtiofs"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
 hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["client", "http1", "http2", "runtime", "server"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "native-tokio", "ring", "tls12", "webpki-tokio"] }
@@ -487,6 +492,7 @@ ed25519-dalek-e027f7ab589cf689 = { package = "ed25519-dalek", version = "3.0.0-r
 enumflags2 = { version = "0.7", default-features = false, features = ["serde"] }
 flate2 = { version = "1", features = ["zlib-ng-compat"] }
 fuse-backend-rs = { version = "0.13", features = ["persist", "virtiofs"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
 hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["client", "http1", "http2", "runtime", "server"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "native-tokio", "ring", "tls12", "webpki-tokio"] }

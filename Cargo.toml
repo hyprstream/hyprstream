@@ -36,6 +36,7 @@ members = [
     "crates/hyprstream-ledger",
     "crates/hyprstream-pay",
     "crates/hyprstream-resource",
+    "crates/hyprstream-decision",
     "workspace-hack",
 ]
 default-members = [
