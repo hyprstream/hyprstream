@@ -1,0 +1,245 @@
+//! The contamination firewalls: the frozen **vob-1.1** benchmark manifest as
+//! a consumed artifact.
+//!
+//! Two firewalls (plan P0.6/P1.3):
+//!
+//! - **Family-level**: designated gate families are never synthesized into
+//!   training data. Synthesis families are structurally disjoint
+//!   (`family.rs`), and this module re-checks every generated item's family
+//!   against the manifest's `gate` designations at run time.
+//! - **Item-level**: no synthesized item may hash-collide with a frozen
+//!   benchmark item (dedup and the firewall use the same canonical hash).
+//!
+//! The loader **verifies the pins** before any check: the manifest file's
+//! blake3, the embedded release id, and the embedded DISCLOSURE digest must
+//! match the constants below, or loading fails loudly.
+
+use std::collections::HashSet;
+use std::path::Path;
+
+use hyprstream_bench::manifest::{blake3_hex, Manifest};
+
+use crate::item::SynthItem;
+
+/// Pinned frozen release id consumed by this pipeline.
+pub const EXPECTED_RELEASE: &str = "vob-1.1";
+
+/// Pinned blake3 of the frozen manifest file (`vob-1.1.manifest.json`).
+pub const EXPECTED_MANIFEST_BLAKE3: &str =
+    "a19596ff13fbf7c09c259d2ed2ec5c8aafdca49a23616099e5b17f84a0a5be8f";
+
+/// Pinned blake3 of the benchmark's frozen DISCLOSURE.md (also embedded in
+/// the manifest).
+pub const EXPECTED_DISCLOSURE_BLAKE3: &str =
+    "9bf26d86de584f07b1e4138dfcf197ff00c9563089365e861ffbabe084cb533d";
+
+/// The default repo-relative path of the frozen manifest.
+pub const DEFAULT_MANIFEST_PATH: &str = "crates/hyprstream-bench/manifest/vob-1.1.manifest.json";
+
+/// Errors from loading/verifying the consumed manifest.
+#[derive(Debug)]
+pub enum FirewallError {
+    /// Manifest file unreadable.
+    Io(std::io::Error),
+    /// Manifest JSON unparseable.
+    Parse(serde_json::Error),
+    /// The file's blake3 does not match [`EXPECTED_MANIFEST_BLAKE3`].
+    ManifestDigestMismatch { found: String },
+    /// The embedded release id does not match [`EXPECTED_RELEASE`].
+    ReleaseMismatch { found: String },
+    /// The embedded DISCLOSURE digest does not match
+    /// [`EXPECTED_DISCLOSURE_BLAKE3`].
+    DisclosureDigestMismatch { found: String },
+}
+
+impl std::fmt::Display for FirewallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "manifest unreadable: {err}"),
+            Self::Parse(err) => write!(f, "manifest unparseable: {err}"),
+            Self::ManifestDigestMismatch { found } => write!(
+                f,
+                "manifest digest mismatch: expected {EXPECTED_MANIFEST_BLAKE3}, found {found} — the consumed artifact is not the frozen vob-1.1 manifest"
+            ),
+            Self::ReleaseMismatch { found } => {
+                write!(f, "release mismatch: expected {EXPECTED_RELEASE}, found {found}")
+            }
+            Self::DisclosureDigestMismatch { found } => write!(
+                f,
+                "disclosure digest mismatch: expected {EXPECTED_DISCLOSURE_BLAKE3}, found {found}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FirewallError {}
+
+/// A synthesized item that hit a firewall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirewallViolation {
+    /// The item's family is a designated gate family.
+    GateFamily(String),
+    /// The item's canonical hash matches a frozen benchmark item.
+    ContaminatedItem {
+        /// Synthesized item id.
+        id: String,
+        /// Colliding hash.
+        hash: String,
+    },
+}
+
+impl std::fmt::Display for FirewallViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GateFamily(family) => write!(
+                f,
+                "family {family} is a designated gate family — never synthesized"
+            ),
+            Self::ContaminatedItem { id, hash } => write!(
+                f,
+                "synthesized item {id} hash-collides with frozen benchmark item {hash}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FirewallViolation {}
+
+/// The loaded, pin-verified firewall.
+#[derive(Debug, Clone)]
+pub struct Firewall {
+    release: String,
+    manifest_blake3: String,
+    item_hashes: HashSet<String>,
+    gate_families: HashSet<String>,
+}
+
+impl Firewall {
+    /// Load and pin-verify the frozen manifest from disk.
+    pub fn load(path: &Path) -> Result<Self, FirewallError> {
+        let bytes = std::fs::read(path).map_err(FirewallError::Io)?;
+        let digest = blake3_hex(&bytes);
+        let text = String::from_utf8_lossy(&bytes);
+        let manifest = Manifest::from_json(&text).map_err(FirewallError::Parse)?;
+        Self::from_verified_parts(manifest, digest)
+    }
+
+    /// Build from an already-parsed manifest plus its file digest. The pins
+    /// are still verified — constructing a firewall that does not match the
+    /// frozen vob-1.1 pins is an error, never a silent pass.
+    pub fn from_verified_parts(
+        manifest: Manifest,
+        manifest_blake3: String,
+    ) -> Result<Self, FirewallError> {
+        if manifest_blake3 != EXPECTED_MANIFEST_BLAKE3 {
+            return Err(FirewallError::ManifestDigestMismatch {
+                found: manifest_blake3,
+            });
+        }
+        if manifest.release != EXPECTED_RELEASE {
+            return Err(FirewallError::ReleaseMismatch {
+                found: manifest.release,
+            });
+        }
+        if manifest.disclosure.blake3 != EXPECTED_DISCLOSURE_BLAKE3 {
+            return Err(FirewallError::DisclosureDigestMismatch {
+                found: manifest.disclosure.blake3,
+            });
+        }
+        Ok(Self {
+            release: manifest.release,
+            manifest_blake3,
+            item_hashes: manifest
+                .items
+                .iter()
+                .map(|item| item.blake3.clone())
+                .collect(),
+            gate_families: manifest
+                .families
+                .iter()
+                .filter(|row| row.designation == "gate")
+                .map(|row| row.id.clone())
+                .collect(),
+        })
+    }
+
+    /// The consumed release id.
+    pub fn release(&self) -> &str {
+        &self.release
+    }
+
+    /// The consumed manifest's blake3 (recorded in row provenance).
+    pub fn manifest_blake3(&self) -> &str {
+        &self.manifest_blake3
+    }
+
+    /// The gate family ids.
+    pub fn gate_families(&self) -> &HashSet<String> {
+        &self.gate_families
+    }
+
+    /// Check a synthesized item against both firewalls.
+    pub fn check_item(&self, item: &SynthItem) -> Result<(), FirewallViolation> {
+        if self.gate_families.contains(item.family.as_str()) {
+            return Err(FirewallViolation::GateFamily(
+                item.family.as_str().to_owned(),
+            ));
+        }
+        let hash = item.hash();
+        if self.item_hashes.contains(&hash) {
+            return Err(FirewallViolation::ContaminatedItem {
+                id: item.id.clone(),
+                hash,
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether a raw canonical hash collides with a frozen item.
+    pub fn is_contaminated_hash(&self, hash: &str) -> bool {
+        self.item_hashes.contains(hash)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn committed_manifest_path() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../hyprstream-bench/manifest/vob-1.1.manifest.json")
+    }
+
+    #[test]
+    fn committed_manifest_loads_and_matches_all_pins() {
+        let firewall = Firewall::load(&committed_manifest_path()).unwrap();
+        assert_eq!(firewall.release(), EXPECTED_RELEASE);
+        assert_eq!(firewall.manifest_blake3(), EXPECTED_MANIFEST_BLAKE3);
+        assert_eq!(
+            firewall.gate_families(),
+            &HashSet::from(["temporal".to_owned(), "syllogism".to_owned()])
+        );
+    }
+
+    #[test]
+    fn digest_mismatch_fails_closed() {
+        let text = std::fs::read_to_string(committed_manifest_path()).unwrap();
+        let manifest = Manifest::from_json(&text).unwrap();
+        assert!(matches!(
+            Firewall::from_verified_parts(manifest, "f".repeat(64)),
+            Err(FirewallError::ManifestDigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn known_manifest_hash_is_flagged() {
+        let text = std::fs::read_to_string(committed_manifest_path()).unwrap();
+        let manifest = Manifest::from_json(&text).unwrap();
+        let first = manifest.items[0].blake3.clone();
+        let firewall =
+            Firewall::from_verified_parts(manifest, EXPECTED_MANIFEST_BLAKE3.to_owned()).unwrap();
+        assert!(firewall.is_contaminated_hash(&first));
+        assert!(!firewall.is_contaminated_hash(&"e".repeat(64)));
+    }
+}
