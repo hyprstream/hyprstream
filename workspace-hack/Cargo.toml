@@ -121,6 +121,7 @@ postgres-types = { version = "0.2", default-features = false, features = ["with-
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 proc-macro2 = { version = "1" }
 prost = { version = "0.13", features = ["prost-derive"] }
+prost-types = { version = "0.13" }
 pulley-interpreter = { version = "46", default-features = false, features = ["disas", "interp", "std"] }
 quote = { version = "1" }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
@@ -293,6 +294,7 @@ postgres-types = { version = "0.2", default-features = false, features = ["with-
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 proc-macro2 = { version = "1" }
 prost = { version = "0.13", features = ["prost-derive"] }
+prost-types = { version = "0.13" }
 pulley-interpreter = { version = "46", default-features = false, features = ["disas", "interp", "std"] }
 quote = { version = "1" }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }

@@ -79,9 +79,11 @@ impl Entry {
     }
 
     /// Compact-JSON form for structured positions inside arrays/objects (strings are
-    /// quoted there, unlike the top-level canonical text rule).
+    /// quoted there, and `null` must render as `null` — unlike the top-level canonical
+    /// text rule, where Null renders empty).
     fn write_json(&self, out: &mut String) {
         match self {
+            Self::Null => out.push_str("null"),
             Self::Str(text) => write_json_string(text, out),
             other => other.write_canonical(out),
         }
@@ -292,5 +294,20 @@ mod tests {
             "plain text"
         );
         assert_eq!(Entry::Null.canonical_text(), "");
+    }
+
+    #[test]
+    fn nested_nulls_render_as_json_null_not_empty() {
+        // A null inside a structured position must stay valid JSON: `{"a":null}` and
+        // `[null]`, never `{"a":}` or `[]` (which corrupts the canonical serialization
+        // and round-trips through parse_json).
+        let entry = Entry::Map(vec![(
+            "a".to_owned(),
+            Entry::Seq(vec![Entry::Null, Entry::Bool(true)]),
+        )]);
+        assert_eq!(entry.canonical_text(), r#"{"a":[null,true]}"#);
+        let reparsed: Entry = serde_json::from_str(&entry.canonical_text())
+            .unwrap_or_else(|error| panic!("valid JSON: {error}"));
+        assert_eq!(reparsed, entry);
     }
 }
