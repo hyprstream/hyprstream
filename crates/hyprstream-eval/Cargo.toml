@@ -19,7 +19,6 @@ hyprstream-bench = { version = "0.1", path = "../hyprstream-bench" }
 
 async-trait = { workspace = true }
 blake3 = { workspace = true }
-parking_lot = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -30,6 +29,7 @@ tonic = { version = "0.13" }
 [dev-dependencies]
 hyprstream-decision-stub = { version = "0.1", path = "../hyprstream-decision-stub" }
 criterion = { workspace = true }
+parking_lot = { workspace = true }
 tokio = { workspace = true }
 
 [lints]
