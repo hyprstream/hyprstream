@@ -140,7 +140,9 @@ pub struct ScoreReport {
     /// Per-field negative log-likelihood, aligned with the gate report's
     /// field rows. (P0.2's `FieldMetrics` type has no NLL slot and is owned
     /// by the calibration crate, so NLL rides alongside the gate report here
-    /// rather than inside it.)
+    /// rather than inside it.) A field whose realized labels ever sit at
+    /// zero probability reports `f64::INFINITY` — a legitimate measurement,
+    /// not a scoring failure.
     pub nll_by_field: Vec<(String, f64)>,
     /// Per-item lines.
     pub items: Vec<ItemScore>,
@@ -190,7 +192,10 @@ fn field_metrics(
     labels: &[usize],
 ) -> Result<(FieldMetrics, f64), EvalError> {
     let ordinal = kind == QuestionKind::Score;
-    let nll = metrics::nll(probs, labels)?;
+    // A valid distribution may assign zero probability to the realized label
+    // (an imperfect one-hot classifier): NLL is then legitimately infinite,
+    // not a scoring failure — the rest of the report must still assemble.
+    let nll = metrics::nll(probs, labels).unwrap_or(f64::INFINITY);
     Ok((
         FieldMetrics {
             field: field.to_owned(),

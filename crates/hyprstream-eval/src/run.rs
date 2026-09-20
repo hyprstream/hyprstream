@@ -167,6 +167,19 @@ impl Harness {
         subject: &dyn Subject,
     ) -> Result<RunOutput, EvalError> {
         let question_set = set.question_set();
+        // A truth entry keyed to an undeclared question would otherwise be
+        // silently ignored (the row scored as unlabeled), biasing every
+        // labeled denominator — fail loudly instead.
+        for row in &set.rows {
+            for question_id in row.truth.keys() {
+                if question_set.question(question_id).is_none() {
+                    return Err(EvalError::InvalidInput(format!(
+                        "row `{}` has a truth entry for undeclared question `{question_id}`",
+                        row.id
+                    )));
+                }
+            }
+        }
         let mut rows = Vec::with_capacity(set.rows.len());
         let mut observations = Vec::new();
         for (row_index, row) in set.rows.iter().enumerate() {
