@@ -159,14 +159,21 @@ impl Harness {
     /// Run an [`EvalSet`] against a subject: one `decide` per row, answers
     /// validated by the Arrow batch builder (kind/cardinality/producer
     /// tolerance are enforced there — a malformed subject fails loudly), plus
-    /// the observation stream. The version triple records the subject's
-    /// **resolved** model id after the run (HTTP alias resolution).
+    /// the observation stream. The decision schema and every row's truth keys
+    /// are validated **before** the first subject call (an HTTP-backed model
+    /// bills per row). The version triple records the subject's **resolved**
+    /// model id after the run (HTTP alias resolution).
     pub async fn run_set(
         &self,
         set: &EvalSet,
         subject: &dyn Subject,
     ) -> Result<RunOutput, EvalError> {
         let question_set = set.question_set();
+        // Validate the decision schema BEFORE any row reaches the subject:
+        // with an HTTP-backed model every row is a billed call, and a schema
+        // error (duplicate/reserved/identifier-unsafe question ids) is
+        // deterministic input rejection, not a runtime failure.
+        let schema = DecisionSchema::new(set.questions.clone())?;
         // A truth entry keyed to an undeclared question would otherwise be
         // silently ignored (the row scored as unlabeled), biasing every
         // labeled denominator — fail loudly instead.
@@ -215,7 +222,6 @@ impl Harness {
             model: subject.resolved_model_id(),
             calib: None,
         };
-        let schema = DecisionSchema::new(set.questions.clone())?;
         let batch = schema.build_batch(&version, &rows)?;
         Ok(RunOutput {
             model_id: version.model.clone(),

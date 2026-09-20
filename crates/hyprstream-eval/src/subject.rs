@@ -229,6 +229,16 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
             None => Err(invalid(format!("answer object is missing `{key}`"))),
             Some(Value::Null) => Ok(None),
             Some(Value::Object(map)) => {
+                // The key set must be exactly the declared labels: extra keys
+                // would be silently dropped from a distribution that still
+                // sums within tolerance, hiding a schema mismatch.
+                for key in map.keys() {
+                    if !labels.contains(key) {
+                        return Err(invalid(format!(
+                            "probabilities carry undeclared label `{key}`"
+                        )));
+                    }
+                }
                 let mut probabilities = Vec::with_capacity(labels.len());
                 for label in &labels {
                     let p = map
@@ -302,7 +312,7 @@ pub fn parse_response_answers(
 /// This is the reference client for every remote arm: the P0.7 stub, the
 /// TypeSafe adapter fronting frontier LLMs, or Jev itself — the harness
 /// speaks one wire and never adapts per provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpSubject {
     base_url: String,
     model: String,
@@ -311,6 +321,20 @@ pub struct HttpSubject {
     /// The server's resolved id (`response.model`), set on the first
     /// successful decide. `Arc` so clones observe the same resolution.
     resolved: std::sync::Arc<parking_lot::RwLock<Option<String>>>,
+}
+
+impl std::fmt::Debug for HttpSubject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the bearer token: Debug output lands in logs and panic
+        // diagnostics, and the token is a provider credential.
+        f.debug_struct("HttpSubject")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("token", &"<redacted>")
+            .field("client", &self.client)
+            .field("resolved", &self.resolved)
+            .finish()
+    }
 }
 
 impl HttpSubject {
@@ -658,6 +682,14 @@ questions:
             &serde_json::json!({"type":"choice","probabilities":{"angry":1.0}}),
         );
         assert!(missing_label.is_err());
+        // All declared labels present but an extra, undeclared one: the key
+        // set must match exactly (a truncated distribution that still sums
+        // within tolerance would hide a schema mismatch).
+        let extra_label = parse_answer(
+            tone,
+            &serde_json::json!({"type":"choice","probabilities":{"angry":0.5,"calm":0.4,"bored":0.1}}),
+        );
+        assert!(extra_label.is_err());
     }
 
     #[test]

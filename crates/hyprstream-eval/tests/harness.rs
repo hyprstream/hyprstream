@@ -381,3 +381,59 @@ async fn run_set_rejects_truth_for_undeclared_questions() {
         "undeclared truth key must be InvalidInput, got {error:?}"
     );
 }
+
+/// Counts decide calls, to prove input validation happens first.
+struct CountingSubject(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl Subject for CountingSubject {
+    fn model_id(&self) -> &str {
+        "counting"
+    }
+
+    async fn decide(
+        &self,
+        set: &QuestionSet,
+        _state: &Entry,
+        _row: usize,
+    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut answers = std::collections::BTreeMap::new();
+        for question in &set.questions {
+            answers.insert(
+                question.id.clone(),
+                QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.5 }),
+            );
+        }
+        Ok(AnswerRow { answers })
+    }
+}
+
+#[tokio::test]
+async fn run_set_validates_the_schema_before_calling_the_subject() {
+    // Duplicate question ids make DecisionSchema::new fail deterministically;
+    // with an HTTP-backed model every row is a billed call, so the failure
+    // must happen before the first decide.
+    let question = noul_item().question;
+    let set = hyprstream_eval::EvalSet {
+        name: "t".into(),
+        schema_version: "v1".into(),
+        questions: vec![question.clone(), question],
+        rows: vec![hyprstream_eval::EvalRow {
+            id: "row-1".into(),
+            family: None,
+            stratum: None,
+            group: None,
+            state: Entry::Null,
+            truth: std::collections::BTreeMap::new(),
+        }],
+    };
+    let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+    let result = Harness.run_set(&set, &subject).await;
+    assert!(result.is_err(), "duplicate question ids must fail");
+    assert_eq!(
+        subject.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the subject must not be called for an invalid schema"
+    );
+}

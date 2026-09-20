@@ -207,3 +207,14 @@ async fn teacher_answers_record_the_resolved_model_id() {
     );
     server.abort();
 }
+
+#[test]
+fn http_subject_debug_redacts_the_bearer_token() {
+    let subject = HttpSubject::new("http://example.invalid", "m", "super-secret-token");
+    let debug = format!("{subject:?}");
+    assert!(
+        !debug.contains("super-secret-token"),
+        "Debug must never print the bearer token: {debug}"
+    );
+    assert!(debug.contains("<redacted>"));
+}
