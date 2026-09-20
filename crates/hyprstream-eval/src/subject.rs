@@ -187,6 +187,24 @@ pub fn request_body(set: &QuestionSet, state: &Entry, model: &str) -> WireJson {
     ])
 }
 
+/// Renormalize a wire-accepted distribution to an exact f32 sum of 1
+/// (divide through, then correct the largest component — the same approach
+/// as the stub's mock). Wire distributions are accepted at consumer
+/// tolerance; the producer-side IR and batch validators require the tighter
+/// producer tolerance, so the boundary normalizes on the way in.
+fn normalize_distribution(probabilities: &mut [f32]) {
+    let sum: f32 = probabilities.iter().sum();
+    if sum > 0.0 {
+        for p in probabilities.iter_mut() {
+            *p /= sum;
+        }
+    }
+    let residual = 1.0 - probabilities.iter().sum::<f32>();
+    if let Some(max) = probabilities.iter_mut().max_by(|a, b| a.total_cmp(b)) {
+        *max += residual;
+    }
+}
+
 /// Parse one answer object from the response `answers` map back into the IR.
 /// A JSON `null` value position (`{"type":"noul","noul":null}`, …) is an
 /// abstention; anything structurally off is an [`EvalError::InvalidAnswer`].
@@ -221,6 +239,10 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
                 }
                 confidence::check_distribution(&probabilities, CONSUMER_SUM_TOLERANCE)
                     .map_err(|error| invalid(format!("distribution: {error}")))?;
+                // The wire accepts consumer-tolerance sums (e.g. a rounded
+                // [0.333, 0.333, 0.333]); renormalize so the IR meets the
+                // producer tolerance the run/batch validators require.
+                normalize_distribution(&mut probabilities);
                 Ok(Some(probabilities))
             }
             Some(_) => Err(invalid(format!("`{key}` is neither null nor an object"))),
@@ -636,5 +658,27 @@ questions:
             &serde_json::json!({"type":"choice","probabilities":{"angry":1.0}}),
         );
         assert!(missing_label.is_err());
+    }
+
+    #[test]
+    fn consumer_tolerance_wire_distributions_are_normalized() {
+        // A wire response rounded to consumer tolerance ([0.333, 0.333,
+        // 0.333] sums to 0.999) is legal on the wire; the IR it enters is
+        // validated at producer tolerance, so the boundary must renormalize.
+        let set = fixture();
+        let tone = set.question("tone").unwrap();
+        let parsed = parse_answer(
+            tone,
+            &serde_json::json!({
+                "type": "choice",
+                "probabilities": {"angry": 0.499, "calm": 0.5}
+            }),
+        )
+        .unwrap();
+        let probabilities = parsed.value.as_ref().unwrap().probabilities();
+        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE)
+            .unwrap();
+        // Renormalization must not reorder or skew: both components ~1/2.
+        assert!(probabilities.iter().all(|p| (*p - 0.5).abs() < 1e-3));
     }
 }
