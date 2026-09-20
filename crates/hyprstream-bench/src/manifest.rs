@@ -16,7 +16,7 @@ use crate::gen::{generate_all, BenchConfig};
 use crate::item::Item;
 
 /// Release id of the frozen benchmark.
-pub const RELEASE: &str = "vob-1.0";
+pub const RELEASE: &str = "vob-1.1";
 
 /// One manifest row per item.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

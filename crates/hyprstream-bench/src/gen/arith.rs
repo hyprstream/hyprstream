@@ -30,6 +30,9 @@ fn problem(seed: u64) -> Problem {
 
 fn transpose_slip(value: i64) -> i64 {
     let text = value.to_string();
+    // Load-bearing edge case: a palindrome-ish value (e.g. 22) transposes to
+    // itself, so this can return the answer unchanged. Both call sites rely
+    // on that: noul checks `slip == answer`, choice's `retain` drops it.
     if text.len() >= 2 {
         let mut chars: Vec<char> = text.chars().collect();
         let n = chars.len();

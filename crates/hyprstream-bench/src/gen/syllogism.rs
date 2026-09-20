@@ -1,7 +1,12 @@
 //! Set-logic syllogisms — **held-out gate family** (firewalled from training
 //! synthesis; measured by the P1.4 leg-(e) zero-shot transfer gate). Chains of
-//! All/Some/No premises over synthetic category names; validity is decided by
-//! the chain structure, so truth is mechanical.
+//! All premises over synthetic category names; validity is decided by the
+//! chain structure, so truth is mechanical.
+//!
+//! The category bindings are threaded through [`Chain`] — never recovered
+//! from the rendered text by position (r1 review blocker: positional
+//! extraction returned the middle term for invalid chains and mislabeled
+//! ~7.4% of the frozen vob-1.0 items).
 
 use hyprstream_decision::Entry;
 
@@ -18,11 +23,15 @@ const NAMES: [&str; 12] = [
 
 struct Chain {
     text: String,
+    /// First category (subject of premise 1).
+    a: &'static str,
+    /// Third category (predicate of the queried conclusion).
+    c: &'static str,
     /// Does `All A are C` follow from the premises?
     all_ac: bool,
 }
 
-fn chain(seed: u64, _stratum: Stratum) -> Chain {
+fn chain(seed: u64, stratum: Stratum) -> Chain {
     let mut rng = stream(seed);
     let base = rng.below(NAMES.len() as u64) as usize;
     let a = NAMES[base];
@@ -31,10 +40,12 @@ fn chain(seed: u64, _stratum: Stratum) -> Chain {
     // Valid chain: All A are B. All B are C. ⇒ All A are C.
     // Near-miss invalid chain: All A are B. All C are B. (⇏ All A are C) —
     // the classic undistributed-middle fallacy, one word swapped away from
-    // the valid form.
-    // Half of every stratum is the valid chain; the NearMiss invalid form is
-    // the undistributed-middle fallacy — one word swapped away from valid.
-    let valid = rng.below(2) == 0;
+    // the valid form. Strata differentiate difficulty: `clean` is mostly the
+    // valid transitive chain, `nearmiss` is mostly the fallacy.
+    let valid = match stratum {
+        Stratum::NearMiss => rng.below(4) == 0,
+        _ => rng.below(4) != 0,
+    };
     let text = if valid {
         format!("All {a} are {b}. All {b} are {c}.")
     } else {
@@ -42,45 +53,31 @@ fn chain(seed: u64, _stratum: Stratum) -> Chain {
     };
     Chain {
         text,
+        a,
+        c,
         all_ac: valid,
     }
 }
 
 pub fn noul(seed: u64, stratum: Stratum) -> Item {
     let chain = chain(seed, stratum);
-    let c_name = extract_third(&chain.text);
-    let a_name = extract_first(&chain.text);
     Item::noul(
         FAMILY,
         stratum,
         seed,
         Entry::Str(chain.text),
-        format!("Does it follow that all {a_name} are {c_name}?"),
+        format!("Does it follow that all {} are {}?", chain.a, chain.c),
         chain.all_ac,
     )
-}
-
-fn extract_first(text: &str) -> String {
-    text.split_whitespace().nth(1).unwrap_or("A").to_owned()
-}
-
-fn extract_third(text: &str) -> String {
-    text.split_whitespace()
-        .nth_back(0)
-        .unwrap_or("C")
-        .trim_end_matches('.')
-        .to_owned()
 }
 
 pub fn choice(seed: u64, stratum: Stratum) -> Item {
     let mut rng = stream(seed ^ 0xC0);
     let chain = chain(seed, stratum);
-    let a_name = extract_first(&chain.text);
-    let c_name = extract_third(&chain.text);
     let options = [
-        format!("All {a_name} are {c_name}"),
-        format!("No {a_name} are {c_name}"),
-        format!("Some {a_name} are not {c_name}"),
+        format!("All {} are {}", chain.a, chain.c),
+        format!("No {} are {}", chain.a, chain.c),
+        format!("Some {} are not {}", chain.a, chain.c),
         "None of these follow".to_owned(),
     ];
     let correct = if chain.all_ac { 0 } else { 3 };

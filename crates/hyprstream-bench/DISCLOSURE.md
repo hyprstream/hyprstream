@@ -1,12 +1,12 @@
-# Pre-committed disclosure — vob-1.0 benchmark results
+# Pre-committed disclosure — vob-1.1 benchmark results
 
 This text is **frozen at manifest freeze time** (its blake3 digest is pinned
-inside `manifest/vob-1.0.manifest.json`). Every published result measured
-against the vob-1.0 benchmark must ship with this disclosure verbatim.
+inside `manifest/vob-1.1.manifest.json`). Every published result measured
+against the vob-1.1 benchmark must ship with this disclosure verbatim.
 
 ---
 
-Results reported against vob-1.0 are claims about **mechanically checkable
+Results reported against vob-1.1 are claims about **mechanically checkable
 question families only** (arithmetic word problems, JSON well-formedness,
 unit conversion, plus the held-out gate families temporal reasoning and
 set-logic syllogisms). Truth on these items is computed, not judged.

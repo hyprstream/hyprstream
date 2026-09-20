@@ -1,4 +1,4 @@
-# hyprstream-bench — verifiable-outcome calibration benchmark (vob-1.0)
+# hyprstream-bench — verifiable-outcome calibration benchmark (vob-1.1)
 
 The System One program's truth anchor: score-bearing decision items with
 **mechanically verifiable outcomes**, emitted as jev-1 question specs
@@ -13,14 +13,14 @@ teacher-pretraining contamination by construction.
 - **Family holdout firewall**: `temporal` and `syllogism` are designated
   **gate** families, frozen at release time and never synthesized into
   training data; the zero-shot transfer gate measures the model on them.
-- **Frozen manifest**: `manifest/vob-1.0.manifest.json` holds a blake3 hash
+- **Frozen manifest**: `manifest/vob-1.1.manifest.json` holds a blake3 hash
   of every item, frozen before any synthesis run. It is the audit artifact
   for both the item-level contamination firewall and the family firewall.
 
 ## CLI
 
 ```text
-hyprstream-bench generate <outdir>   # items.jsonl + vob-1.0.manifest.json
+hyprstream-bench generate <outdir>   # items.jsonl + vob-1.1.manifest.json
 hyprstream-bench verify [manifest]   # regenerate + compare (default: committed)
 hyprstream-bench families            # print family designations (the firewall)
 ```
