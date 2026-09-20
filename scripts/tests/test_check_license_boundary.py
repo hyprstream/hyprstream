@@ -247,6 +247,7 @@ class LicenseBoundaryFixtures(unittest.TestCase):
             "hyprstream-k8s-pds": "AGPL-3.0-only",
             "hyprstream-ledger": "AGPL-3.0-only",
             "hyprstream-metrics": "AGPL-3.0-only",
+            "hyprstream-metrics-api": "Apache-2.0",
             "hyprstream-pds": "AGPL-3.0-only",
             "hyprstream-pds-service": "AGPL-3.0-only",
             "hyprstream-service": "AGPL-3.0-only",
@@ -263,8 +264,12 @@ class LicenseBoundaryFixtures(unittest.TestCase):
                         'license = "AGPL-3.0-only"',
                     ),
                     mit_packages=(),
-                    agpl_packages=("service",),
-                    apache_packages=(package, "middle"),
+                    agpl_packages=(
+                        ("service",) if license_name == "AGPL-3.0-only" else ("service", package)
+                    ),
+                    apache_packages=(
+                        (package, "middle") if license_name == "AGPL-3.0-only" else ("middle",)
+                    ),
                     permissive_roots=(),
                 )
                 self.assertNotEqual(result.returncode, 0)

@@ -3186,7 +3186,6 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     use crate::services::MetricsService;
     use hyprstream_metrics::query::QueryOrchestrator;
     use hyprstream_metrics::storage::duckdb::DuckDbBackend;
-    use hyprstream_metrics::StorageBackend as _;
 
     let config = load_config()?;
     let mc = &config.metrics;
@@ -3199,11 +3198,9 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     let orchestrator = Arc::new(
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let schema = hyprstream_metrics::metrics::get_metrics_schema();
-                backend
-                    .create_table("metrics", &schema)
+                hyprstream_metrics::create_schema_v2_tables(backend.as_ref())
                     .await
-                    .map_err(|e| anyhow::anyhow!("metrics table init: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("metrics schema v2 init: {e}"))?;
                 QueryOrchestrator::new(backend as Arc<dyn hyprstream_metrics::StorageBackend>)
                     .await
                     .map_err(|e| anyhow::anyhow!("QueryOrchestrator init: {e}"))

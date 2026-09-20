@@ -11,6 +11,10 @@ name = "hyprstream_metrics"
 path = "src/lib.rs"
 
 [dependencies]
+# Apache-2.0 API half: record types, producer API, calibration/decision-batch
+# stores, and the StorageBackend trait the engine backends implement.
+hyprstream-metrics-api = { path = "../hyprstream-metrics-api", version = "0.1.0" }
+
 # Data processing. Pinned EXACTLY (=1.4.3) so the caret requirement can't float
 # duckdb up to a newer 1.x (e.g. 1.10504.x) that pulls arrow-schema 58, which
 # skews against datafusion 50's arrow-schema 56 and breaks the MemTable/DFSchema

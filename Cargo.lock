@@ -7317,6 +7317,7 @@ dependencies = [
  "git2",
  "git2db",
  "hex",
+ "hyprstream-metrics-api",
  "lazy_static",
  "num_cpus",
  "parking_lot 0.12.4",
@@ -7333,6 +7334,19 @@ dependencies = [
  "tonic 0.13.1",
  "tracing",
  "uuid 1.18.1",
+]
+
+[[package]]
+name = "hyprstream-metrics-api"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tonic 0.13.1",
+ "uuid 1.18.1",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -19604,6 +19618,7 @@ dependencies = [
  "signature 2.2.0",
  "signature 3.0.0",
  "simd-adler32",
+ "simdutf8",
  "slab",
  "smallvec",
  "spin 0.9.8",
