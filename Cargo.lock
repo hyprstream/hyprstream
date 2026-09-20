@@ -7130,6 +7130,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-decision-head"
+version = "0.1.0"
+dependencies = [
+ "hyprstream-decision",
+ "tch",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokenizers",
+ "workspace-hack",
+]
+
+[[package]]
 name = "hyprstream-discovery"
 version = "0.1.0"
 dependencies = [
@@ -19472,6 +19484,7 @@ dependencies = [
  "aead",
  "aes-gcm",
  "ahash 0.8.12",
+ "aho-corasick",
  "anyhow",
  "arrayvec",
  "axum 0.7.9",
@@ -19483,6 +19496,7 @@ dependencies = [
  "bytemuck",
  "byteorder",
  "bytes",
+ "bzip2-sys",
  "capnp",
  "cc",
  "chrono",
@@ -19493,6 +19507,7 @@ dependencies = [
  "constant_time_eq 0.4.2",
  "crc32fast",
  "critical-section",
+ "crossbeam-epoch",
  "crossbeam-queue",
  "crossbeam-utils",
  "crypto-common 0.1.6",
@@ -19590,6 +19605,7 @@ dependencies = [
  "phf_shared 0.11.3",
  "pkcs8 0.10.2",
  "pkcs8 0.11.0",
+ "portable-atomic",
  "postcard",
  "postgres-types",
  "ppv-lite86",
