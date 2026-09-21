@@ -1974,11 +1974,12 @@ fn default_oauth_port() -> u16 {
     6791
 }
 
-/// Which backend stores user credentials and refresh tokens.
+/// Which backend stores account credentials.
 ///
-/// `Pglite` selects the shared embedded PGlite/Postgres relational store for
-/// the **account system of record** (UserStore). Token and device stores
-/// remain on RocksDB/Valkey — a pglite TokenStore does not exist.
+/// `Pglite` selects the embedded relational store; `Postgres` selects the
+/// networked RDS relational store. Token and device stores remain independent
+/// RocksDB/Valkey services — neither relational UserStore implements a token
+/// store.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CredentialsBackend {
@@ -1986,6 +1987,8 @@ pub enum CredentialsBackend {
     Valkey,
     /// Relational UserStore on the shared #1351 PGlite substrate.
     Pglite,
+    /// Networked relational UserStore on the RDS Postgres substrate.
+    Postgres,
 }
 
 fn default_credentials_backend() -> CredentialsBackend {
@@ -1997,8 +2000,8 @@ impl CredentialsBackend {
     /// UserStore columns as plaintext.
     pub fn ensure_allowed_for_build(self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self == Self::Pglite,
-            "encrypted credential storage requires credentials.backend = \"pglite\""
+            matches!(self, Self::Pglite | Self::Postgres),
+            "encrypted credential storage requires credentials.backend = \"pglite\" or \"postgres\""
         );
         Ok(())
     }
@@ -2025,7 +2028,8 @@ impl Default for ValkeyCredentialsConfig {
 
 /// Credentials storage configuration.
 ///
-/// Selects the backend for user profiles, pubkeys, and refresh tokens.
+/// Selects the backend for user profiles and pubkeys. OAuth refresh tokens use
+/// their independent token store.
 ///
 /// # Example TOML
 /// ```toml
@@ -4230,8 +4234,38 @@ mod tests {
     #[test]
     fn credential_pds_rejects_plaintext_capable_backends() {
         assert!(CredentialsBackend::Pglite.ensure_allowed_for_build().is_ok());
+        assert!(CredentialsBackend::Postgres.ensure_allowed_for_build().is_ok());
         assert!(CredentialsBackend::Rocksdb.ensure_allowed_for_build().is_err());
         assert!(CredentialsBackend::Valkey.ensure_allowed_for_build().is_err());
+    }
+
+    #[test]
+    fn credentials_backend_deserializes_postgres() {
+        let config: CredentialsConfig = toml::from_str("backend = \"postgres\"")
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(config.backend, CredentialsBackend::Postgres);
+    }
+
+    #[test]
+    fn nested_environment_selects_postgres_accounts_and_rds_cell() -> anyhow::Result<()> {
+        let source = [
+            ("HYPRSTREAM__CREDENTIALS__BACKEND", "postgres"),
+            ("HYPRSTREAM__RDS__CELL_ID", "staging-us-east-1"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        let config: HyprConfig = Config::builder()
+            .add_source(Config::try_from(&HyprConfig::default())?)
+            .add_source(HyprConfig::environment_source().source(Some(source)))
+            .build()?
+            .try_deserialize()?;
+
+        assert_eq!(config.credentials.backend, CredentialsBackend::Postgres);
+        assert_eq!(config.rds.cell_id, "staging-us-east-1");
+        let resolved_rds = config.rds.resolve_with(|_| None)?;
+        assert_eq!(resolved_rds.cell_id, "staging-us-east-1");
+        Ok(())
     }
 
     #[test]

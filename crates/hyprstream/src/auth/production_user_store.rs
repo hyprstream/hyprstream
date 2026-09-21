@@ -111,6 +111,18 @@ impl ProductionUserStore {
                     "credentials.backend = \"pglite\" but this binary lacks the pglite feature"
                 )
             }
+            CredentialsBackend::Postgres => {
+                #[cfg(feature = "postgres")]
+                {
+                    let store =
+                        super::PostgresUserStore::open_admitted(&Self::permit()).await?;
+                    Ok(Self::from_encrypted_backend(store))
+                }
+                #[cfg(not(feature = "postgres"))]
+                anyhow::bail!(
+                    "credentials.backend = \"postgres\" but this binary lacks the postgres feature"
+                )
+            }
             CredentialsBackend::Rocksdb => {
                 #[cfg(all(not(feature = "encrypted-account-admission"), feature = "rocksdb"))]
                 {
@@ -202,9 +214,8 @@ impl ProductionUserStore {
     }
 
     /// Admit a backend whose implementation is structurally marked as
-    /// encrypted-at-rest. PGlite uses this today; #1401's Postgres backend must
-    /// implement the same crate-private marker when restacked.
-    #[allow(dead_code)] // #1401 consumes this marker when Postgres is restacked.
+    /// encrypted-at-rest. PGlite and Postgres are both explicit admission
+    /// providers.
     pub(crate) fn from_encrypted_backend<T>(store: T) -> Self
     where
         T: EncryptedUserStoreBackend + 'static,
@@ -234,14 +245,16 @@ impl Deref for ProductionUserStore {
 
 /// Crate-private admission marker for encrypted-at-rest account backends.
 ///
-/// Keeping the implementation list here makes adding Postgres an explicit
+/// Keeping the implementation list here makes adding a backend an explicit
 /// security decision rather than something any `UserStore` implementation
 /// inherits automatically.
-#[allow(dead_code)] // #1401 implements this when Postgres is restacked.
 pub(crate) trait EncryptedUserStoreBackend: UserStore {}
 
 #[cfg(feature = "pglite")]
 impl EncryptedUserStoreBackend for super::PgliteUserStore {}
+
+#[cfg(feature = "postgres")]
+impl EncryptedUserStoreBackend for super::PostgresUserStore {}
 
 #[cfg(all(test, feature = "encrypted-account-admission"))]
 mod tests {
@@ -264,7 +277,7 @@ mod tests {
             };
             assert!(
                 error.to_string().contains(
-                    "encrypted credential storage requires credentials.backend = \"pglite\"",
+                    "encrypted credential storage requires credentials.backend = \"pglite\" or \"postgres\"",
                 ),
                 "unexpected admission error: {error:#}"
             );

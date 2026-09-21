@@ -253,7 +253,7 @@ encrypted-account-admission = []  # Mandatory source-level policy: no plaintext 
 # rocksdb C++ subtree.
 rocksdb = ["dep:rocksdb", "hyprstream-discovery/rocksdb"]
 credential-pds = ["encrypted-account-admission", "pglite", "rocksdb"]  # Production credential/PDS service profile; intentionally excludes metrics/DuckDB
-credential-pds-postgres = ["postgres"]  # Production credential/PDS with RDS Postgres backend (#1401)
+credential-pds-postgres = ["encrypted-account-admission", "postgres"]  # Production credential/PDS with RDS Postgres account backend (#1401); combine with pds-postgres,rocksdb for staging runtime
 metrics = ["encrypted-account-admission", "dep:hyprstream-metrics", "dep:hyprstream-flight"]  # Separate DuckDB-backed metrics/inference/Flight service build
 bnb = ["hyprstream-inference/bnb"]  # bitsandbytes KV cache quantization (gated code lives in hyprstream-inference)
 xet = ["git2db/xet-storage", "hyprstream-inference/xet"]  # Enable XET large file storage

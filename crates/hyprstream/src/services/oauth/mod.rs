@@ -1176,14 +1176,17 @@ impl Spawnable for OAuthService {
             oauth_state = oauth_state.with_jwt_key_timestamps(key_nbf, key_nbf + 14 * 86400);
 
             // Open persistent refresh token store (non-fatal — tokens simply don't survive restart).
-            // The token store is decoupled from the account backend: a pglite
-            // UserStore does not imply a pglite TokenStore — refresh tokens
-            // always go to RocksDB or Valkey.
+            // The token store is decoupled from the account backend: neither
+            // PGlite nor RDS Postgres UserStore implements a token store.
+            // Refresh tokens always go to RocksDB or Valkey.
             #[cfg(feature = "rocksdb")]
             let token_db_path = credentials_dir.join("oauth-tokens");
             let token_store: Option<Arc<dyn crate::services::oauth::token_store::TokenStore>> = match credentials_config.backend {
-                // Pglite account store falls through to RocksDB for tokens.
-                CredentialsBackend::Pglite | CredentialsBackend::Rocksdb => {
+                // Relational account stores deliberately fall through to
+                // RocksDB for durable OAuth refresh tokens.
+                CredentialsBackend::Pglite
+                | CredentialsBackend::Postgres
+                | CredentialsBackend::Rocksdb => {
                     #[cfg(feature = "rocksdb")]
                     {
                         match crate::services::oauth::token_store::RocksDbTokenStore::open(&token_db_path) {
