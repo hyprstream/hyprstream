@@ -121,14 +121,25 @@ impl TeacherEnsemble {
         item_id: &str,
     ) -> Result<EnsembleOutput, EvalError> {
         // Same preflight as both harness run paths, before any (possibly
-        // billed) teacher query: the set must be nonempty and every
-        // question must satisfy the jev-1 v1 profile.
+        // billed) teacher query: the set must be nonempty, every question
+        // must satisfy the jev-1 v1 profile, and question ids must be
+        // unique — the ensemble's `average` map is keyed by id, so a
+        // duplicate would silently collapse two declared questions into
+        // one (and an HTTP teacher would be billed before its side rejects
+        // the duplicate JSON keys).
         if set.questions.is_empty() {
             return Err(EvalError::InvalidInput(
                 "a teacher ensemble cannot answer an empty question set".to_owned(),
             ));
         }
+        let mut ids = std::collections::HashSet::with_capacity(set.questions.len());
         for question in &set.questions {
+            if !ids.insert(&question.id) {
+                return Err(EvalError::InvalidInput(format!(
+                    "duplicate question id `{}`",
+                    question.id
+                )));
+            }
             crate::run::validate_question_profile(question).map_err(EvalError::InvalidInput)?;
         }
         let mut teacher_answers = Vec::with_capacity(self.teachers.len());
@@ -402,6 +413,23 @@ questions:
             questions: vec![],
         };
         assert!(ensemble.decide(&empty, &Entry::Null, 0, "item").await.is_err());
+        // Duplicate question ids: the ensemble's `average` map is keyed by
+        // id, so a duplicate would silently collapse two declared questions
+        // into one.
+        let set = fixture();
+        let duplicated = QuestionSet {
+            state: None,
+            questions: vec![set.questions[0].clone(), set.questions[0].clone()],
+        };
+        let error = ensemble
+            .decide(&duplicated, &Entry::Null, 0, "item")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, EvalError::InvalidInput(_)),
+            "duplicate question ids must be InvalidInput, got {error:?}"
+        );
     }
 
     #[tokio::test]
