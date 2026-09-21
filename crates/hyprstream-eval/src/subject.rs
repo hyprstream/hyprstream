@@ -199,8 +199,10 @@ pub fn request_body(set: &QuestionSet, state: &Entry, model: &str) -> WireJson {
 /// component (the earliest tied maxima keep their win). Wire
 /// distributions are accepted at consumer tolerance; the producer-side IR
 /// and batch validators require the tighter producer tolerance, so the
-/// boundary normalizes on the way in.
-fn normalize_distribution(probabilities: &mut [f32]) {
+/// boundary normalizes on the way in. Also used for locally constructed
+/// distributions (TruthSubject's uniform fallback, teacher ensemble
+/// averages) that must satisfy the same producer tolerance.
+pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
     use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
 
     let sum: f32 = probabilities.iter().sum();

@@ -174,6 +174,13 @@ impl Harness {
         // error (duplicate/reserved/identifier-unsafe question ids) is
         // deterministic input rejection, not a runtime failure.
         let schema = DecisionSchema::new(set.questions.clone())?;
+        // The schema check covers Arrow column ids only; the full jev-1 v1
+        // question profile (v1 kinds, kind/body agreement, cardinalities,
+        // unique nonempty labels) is validated here too, before any billed
+        // subject call.
+        for question in &set.questions {
+            validate_question_profile(question).map_err(EvalError::InvalidInput)?;
+        }
         // A truth entry keyed to an undeclared question would otherwise be
         // silently ignored (the row scored as unlabeled), biasing every
         // labeled denominator — fail loudly instead. A truth index outside
@@ -257,6 +264,7 @@ impl Harness {
         // item N's invalid truth must not surface only after the preceding
         // N−1 items have invoked (and possibly billed) the subject.
         for item in items {
+            validate_question_profile(&item.question).map_err(EvalError::InvalidInput)?;
             if let Some(truth) = item.truth {
                 if truth >= item.question.cardinality() {
                     return Err(EvalError::InvalidInput(format!(
@@ -317,6 +325,74 @@ impl Harness {
             schema_fingerprint: None,
         })
     }
+}
+
+/// The jev-1 v1 question-profile rules the authoring layer enforces at
+/// parse time, applied to programmatically constructed questions (which
+/// bypass parsing): v1 kinds only, kind/body agreement, choice cardinality
+/// 2–255 with unique nonempty option names, score cardinality ≥ 2.
+/// `DecisionSchema::new` only validates Arrow column ids, so this runs in
+/// both run preflights, before the first subject call.
+pub(crate) fn validate_question_profile(question: &QuestionSpec) -> Result<(), String> {
+    use hyprstream_decision::spec::{QuestionBody, QuestionKind};
+
+    let id = &question.id;
+    if !question.kind.is_v1() {
+        return Err(format!(
+            "question `{id}` uses `{}`, reserved for profile v2",
+            question.kind
+        ));
+    }
+    let body_kind = match &question.body {
+        QuestionBody::Noul { .. } => QuestionKind::Noul,
+        QuestionBody::Choice { .. } => QuestionKind::Choice,
+        QuestionBody::Score { .. } => QuestionKind::Score,
+    };
+    if body_kind != question.kind {
+        return Err(format!(
+            "question `{id}` declares kind {} but carries a {body_kind} body",
+            question.kind
+        ));
+    }
+    match &question.body {
+        QuestionBody::Choice { options } => {
+            if options.len() < 2 {
+                return Err(format!(
+                    "choice question `{id}` needs at least 2 options, got {}",
+                    options.len()
+                ));
+            }
+            if options.len() > hyprstream_decision::MAX_CHOICE_OPTIONS {
+                return Err(format!(
+                    "choice question `{id}` supports at most {} options, got {}",
+                    hyprstream_decision::MAX_CHOICE_OPTIONS,
+                    options.len()
+                ));
+            }
+            let mut names = std::collections::HashSet::with_capacity(options.len());
+            for option in options {
+                if option.name.is_empty() {
+                    return Err(format!("choice question `{id}` has an empty option name"));
+                }
+                if !names.insert(&option.name) {
+                    return Err(format!(
+                        "choice question `{id}` repeats option `{}`",
+                        option.name
+                    ));
+                }
+            }
+        }
+        QuestionBody::Score { levels } => {
+            if levels.len() < 2 {
+                return Err(format!(
+                    "score question `{id}` needs at least 2 levels, got {}",
+                    levels.len()
+                ));
+            }
+        }
+        QuestionBody::Noul { .. } => {}
+    }
+    Ok(())
 }
 
 /// The same row-level answer rules `DecisionSchema::build_batch` enforces,

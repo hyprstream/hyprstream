@@ -182,13 +182,18 @@ fn combine(set: &QuestionSet, teacher_answers: Vec<TeacherAnswer>) -> EnsembleOu
                 None => argmaxes.push(None),
             }
         }
-        let mean: Vec<f32> = if answered > 0 {
+        // Both the answered-teacher mean (f64 → f32 conversion drift) and
+        // the all-abstained uniform fallback (rounded reciprocal — the same
+        // high-cardinality case TruthSubject handles) must satisfy the D5
+        // producer tolerance: the average is the P0.5 target distribution.
+        let mut mean: Vec<f32> = if answered > 0 {
             #[allow(clippy::cast_precision_loss)]
             sum.iter().map(|s| (s / answered as f64) as f32).collect()
         } else {
             let uniform = 1.0 / cardinality as f32;
             vec![uniform; cardinality]
         };
+        crate::subject::normalize_distribution(&mut mean);
         let ensemble_argmax = hyprstream_decision::confidence::argmax_index(&mean);
         let matches = argmaxes
             .iter()
@@ -255,6 +260,74 @@ questions:
     #[tokio::test]
     async fn empty_roster_is_rejected() {
         assert!(TeacherEnsemble::new(vec![]).is_err());
+    }
+
+    /// Abstains on every question.
+    struct AbstainSubject;
+
+    #[async_trait::async_trait]
+    impl Subject for AbstainSubject {
+        fn model_id(&self) -> &str {
+            "abstain-1"
+        }
+
+        async fn decide(
+            &self,
+            set: &QuestionSet,
+            _state: &Entry,
+            _row: usize,
+        ) -> Result<AnswerRow, EvalError> {
+            let mut answers = std::collections::BTreeMap::new();
+            for question in &set.questions {
+                answers.insert(
+                    question.id.clone(),
+                    hyprstream_decision::answer::QuestionAnswer::abstained(),
+                );
+            }
+            Ok(AnswerRow { answers })
+        }
+    }
+
+    #[tokio::test]
+    async fn all_abstained_average_is_producer_valid_at_high_cardinality() {
+        // 78 options: the naive `1.0 / 78` f32 uniform sums to ~1.0000011,
+        // beyond the D5 producer tolerance — the ensemble average is the
+        // P0.5 target and must be a valid distribution.
+        let options = (0..78)
+            .map(|i| hyprstream_decision::spec::ChoiceOption {
+                name: format!("o{i}"),
+                rubric: None,
+            })
+            .collect();
+        let set = QuestionSet {
+            state: None,
+            questions: vec![hyprstream_decision::spec::QuestionSpec {
+                id: "wide".into(),
+                kind: hyprstream_decision::QuestionKind::Choice,
+                instructions: None,
+                body: hyprstream_decision::spec::QuestionBody::Choice { options },
+            }],
+        };
+        let ensemble = TeacherEnsemble::new(vec![
+            Teacher {
+                id: "a".to_owned(),
+                tos_class: TosClass::Distributable,
+                subject: Box::new(AbstainSubject),
+            },
+            Teacher {
+                id: "b".to_owned(),
+                tos_class: TosClass::Distributable,
+                subject: Box::new(AbstainSubject),
+            },
+        ])
+        .unwrap();
+        let out = ensemble.decide(&set, &Entry::Null, 0, "item").await.unwrap();
+        let average = &out.average["wide"];
+        hyprstream_decision::confidence::check_distribution(
+            average,
+            hyprstream_decision::confidence::PRODUCER_SUM_TOLERANCE,
+        )
+        .unwrap();
     }
 
     /// A teacher emitting a wrong-cardinality distribution must be rejected
