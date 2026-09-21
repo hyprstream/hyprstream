@@ -581,13 +581,23 @@ impl Subject for TruthSubject {
             let mut probabilities = vec![0.0f32; cardinality];
             match self.truth.get(&question.id) {
                 Some(&index) if index < cardinality => probabilities[index] = 1.0,
+                // A configured-but-invalid truth is NOT the same as no
+                // truth: silently degrading the documented perfectly
+                // accurate anchor into a uniform subject corrupts
+                // sanity-check results.
+                Some(&index) => {
+                    return Err(EvalError::InvalidInput(format!(
+                        "truth index {index} configured for question `{}` is outside its cardinality {cardinality}",
+                        question.id
+                    )));
+                }
                 // Uniform fallback: the rounded f32 reciprocal can violate
                 // the producer sum tolerance at high cardinalities (78
                 // options sum to ~1.0000011), so renormalize. The D6-safe
                 // correction keeps the argmax at the earliest index (no f32
                 // vector of 78 exactly-equal components can meet the
                 // tolerance, so one component carries the residual).
-                _ => {
+                None => {
                     probabilities.fill(1.0 / cardinality as f32);
                     normalize_distribution(&mut probabilities);
                 }
@@ -814,6 +824,20 @@ questions:
             hyprstream_decision::confidence::argmax_index(&probabilities),
             Some(0),
             "D6: earliest index"
+        );
+    }
+
+    #[tokio::test]
+    async fn truth_subject_rejects_an_out_of_range_configured_truth() {
+        // A configured-but-invalid truth index must NOT degrade into the
+        // uniform fallback — that would silently turn the documented
+        // perfectly accurate anchor into an uncertain subject.
+        let set = fixture();
+        let subject = TruthSubject::new("truth").with_truth("tone", 7);
+        let error = subject.decide(&set, &Entry::Null, 0).await.err().unwrap();
+        assert!(
+            matches!(error, EvalError::InvalidInput(_)),
+            "out-of-range configured truth must be InvalidInput, got {error:?}"
         );
     }
 

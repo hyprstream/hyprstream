@@ -120,6 +120,17 @@ impl TeacherEnsemble {
         row: usize,
         item_id: &str,
     ) -> Result<EnsembleOutput, EvalError> {
+        // Same preflight as both harness run paths, before any (possibly
+        // billed) teacher query: the set must be nonempty and every
+        // question must satisfy the jev-1 v1 profile.
+        if set.questions.is_empty() {
+            return Err(EvalError::InvalidInput(
+                "a teacher ensemble cannot answer an empty question set".to_owned(),
+            ));
+        }
+        for question in &set.questions {
+            crate::run::validate_question_profile(question).map_err(EvalError::InvalidInput)?;
+        }
         let mut teacher_answers = Vec::with_capacity(self.teachers.len());
         for teacher in &self.teachers {
             let answer_row =
@@ -360,6 +371,37 @@ questions:
             }
             Ok(AnswerRow { answers })
         }
+    }
+
+    #[tokio::test]
+    async fn profile_violating_question_sets_are_rejected_before_querying() {
+        // A zero-option choice would otherwise be queried (and billed)
+        // against every teacher; with abstaining teachers it could even
+        // produce an empty "average" instead of an input error.
+        let set = QuestionSet {
+            state: None,
+            questions: vec![hyprstream_decision::spec::QuestionSpec {
+                id: "broken".into(),
+                kind: hyprstream_decision::QuestionKind::Choice,
+                instructions: None,
+                body: hyprstream_decision::spec::QuestionBody::Choice { options: vec![] },
+            }],
+        };
+        let ensemble = TeacherEnsemble::new(vec![teacher("a", 0)]).unwrap();
+        let error = ensemble
+            .decide(&set, &Entry::Null, 0, "item")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, EvalError::InvalidInput(_)),
+            "zero-option choice must be InvalidInput, got {error:?}"
+        );
+        let empty = QuestionSet {
+            state: None,
+            questions: vec![],
+        };
+        assert!(ensemble.decide(&empty, &Entry::Null, 0, "item").await.is_err());
     }
 
     #[tokio::test]
