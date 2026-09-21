@@ -73,9 +73,12 @@ pub struct BreakdownMetrics {
     /// Rows scored in this bucket.
     pub n: usize,
     /// Macro-averaged ECE over the bucket's fields (equal field weights).
-    pub macro_ece: f64,
-    /// Argmax accuracy over the bucket's scored rows.
-    pub accuracy: f64,
+    /// `None` when the bucket has no scored rows — an unmeasured calibration
+    /// value is never reported as a perfect `0.0`.
+    pub macro_ece: Option<f64>,
+    /// Argmax accuracy over the bucket's scored rows. `None` when the bucket
+    /// has no labeled, answered rows — unavailable, not zero accuracy.
+    pub accuracy: Option<f64>,
     /// Abstention rate over the bucket's rows.
     pub abstention_rate: f64,
 }
@@ -376,13 +379,9 @@ fn breakdown(
             BreakdownMetrics {
                 key,
                 n,
-                macro_ece: hyprstream_calibration::protocol::macro_average(&eces).unwrap_or(0.0),
+                macro_ece: hyprstream_calibration::protocol::macro_average(&eces),
                 #[allow(clippy::cast_precision_loss)]
-                accuracy: if labeled == 0 {
-                    0.0
-                } else {
-                    correct as f64 / labeled as f64
-                },
+                accuracy: (labeled > 0).then(|| correct as f64 / labeled as f64),
                 #[allow(clippy::cast_precision_loss)]
                 abstention_rate: if n == 0 {
                     0.0
