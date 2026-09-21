@@ -210,8 +210,38 @@ struct Attention {
     head_dim: i64,
 }
 
+/// Query-chunk size for attention score computation. A dense `[batch, heads, seq,
+/// seq]` f32 score tensor costs ~4 GiB at the advertised 8192-token large limit
+/// (16 heads, batch 1) — and in training every layer's probs stay live for
+/// backward, multiplying that by the layer count. Chunking the query dimension
+/// bounds the live score tensor to `chunk × (chunk + 2·window)` for local layers
+/// (keys outside the band are masked anyway) and `chunk × seq` for global layers,
+/// with bit-identical semantics: softmax rows are independent, and masked -inf
+/// entries contribute exactly zero whether or not they are materialized.
+const ATTN_QUERY_CHUNK: i64 = 1024;
+
 impl Attention {
-    fn forward(&self, hidden: &Tensor, rope: &Rotary, additive_mask: &Tensor) -> Tensor {
+    fn forward(
+        &self,
+        hidden: &Tensor,
+        rope: &Rotary,
+        additive_mask: &Tensor,
+        local_window: Option<i64>,
+    ) -> Tensor {
+        self.forward_chunked(hidden, rope, additive_mask, local_window, ATTN_QUERY_CHUNK)
+    }
+
+    /// `local_window` is the per-side sliding window (`local_attention // 2`) for
+    /// local layers, `None` for global layers; the additive mask must agree with it.
+    /// `query_chunk` bounds the live score tensor (production: [`ATTN_QUERY_CHUNK`]).
+    fn forward_chunked(
+        &self,
+        hidden: &Tensor,
+        rope: &Rotary,
+        additive_mask: &Tensor,
+        local_window: Option<i64>,
+        query_chunk: i64,
+    ) -> Tensor {
         let size = hidden.size();
         let (batch, seq, _) = (size[0], size[1], size[2]);
         let flat = hidden.reshape([batch * seq, size[2]]);
@@ -223,11 +253,32 @@ impl Attention {
         let k = rope.apply(&qkv.get(1));
         let v = qkv.get(2);
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let scores = q.matmul(&k.transpose(-1, -2)).to_kind(Kind::Float) * scale
-            + additive_mask.to_kind(Kind::Float);
-        let probs = scores.softmax(-1, Kind::Float).to_kind(hidden.kind());
-        probs
-            .matmul(&v)
+
+        let mut chunks = Vec::with_capacity(((seq + query_chunk - 1) / query_chunk) as usize);
+        let mut start = 0i64;
+        while start < seq {
+            let len = query_chunk.min(seq - start);
+            let q_c = q.narrow(2, start, len); // [B, H, len, d]
+                                               // Key band: the full sequence for global layers; [start-w, start+len+w)
+                                               // clamped for local layers — outside the band every mask entry is -inf,
+                                               // so slicing it away changes nothing.
+            let (k_lo, k_hi) = match local_window {
+                Some(w) => ((start - w).max(0), (start + len + w).min(seq)),
+                None => (0, seq),
+            };
+            let k_c = k.narrow(2, k_lo, k_hi - k_lo);
+            let v_c = v.narrow(2, k_lo, k_hi - k_lo);
+            // Mask slice for this query chunk × key band.
+            let mask_c = additive_mask
+                .narrow(2, start, len)
+                .narrow(3, k_lo, k_hi - k_lo);
+            let scores = q_c.matmul(&k_c.transpose(-1, -2)).to_kind(Kind::Float) * scale
+                + mask_c.to_kind(Kind::Float);
+            let probs = scores.softmax(-1, Kind::Float).to_kind(hidden.kind());
+            chunks.push(probs.matmul(&v_c));
+            start += len;
+        }
+        Tensor::cat(&chunks, 2) // [B, H, T, d]
             .permute([0, 2, 1, 3])
             .contiguous()
             .view([batch * seq, self.num_heads * self.head_dim])
@@ -432,7 +483,12 @@ impl Backbone for ModernBertEncoder {
                 &self.rope_local
             };
             let mask = self.additive_mask(seq, layer.global, hidden.kind(), hidden.device())?;
-            hidden = &hidden + layer.attn.forward(&normed, rope, &mask);
+            let window = if layer.global {
+                None
+            } else {
+                Some(self.local_window / 2)
+            };
+            hidden = &hidden + layer.attn.forward(&normed, rope, &mask, window);
             hidden = &hidden + layer.mlp.forward(&layer.mlp_norm.forward(&hidden));
         }
         Ok(self.final_norm.forward(&hidden))
@@ -468,6 +524,45 @@ mod tests {
         assert_eq!(base.num_hidden_layers, 22);
         assert_eq!(base.num_attention_heads, 12);
         assert_eq!(base.intermediate_size, 1152);
+    }
+
+    #[test]
+    fn chunked_attention_matches_single_chunk() {
+        // P1 memory fix regression: query chunking (production bound for the 8192-ctx
+        // memory wall) must not change the math — softmax rows are independent and
+        // band-sliced local keys are exactly the -inf-masked ones. Matmul
+        // accumulation order differs across chunk shapes, so compare to 1e-5
+        // (observed f32 reordering noise ~1e-6).
+        let cfg = ModernBertConfig::test_tiny();
+        let vs = nn::VarStore::new(Device::Cpu);
+        let enc = ModernBertEncoder::new(&vs.root().sub("model"), &cfg).unwrap();
+        let seq = 20i64;
+        let hidden = Tensor::randn([1, seq, cfg.hidden_size], (Kind::Float, Device::Cpu));
+
+        for layer in &enc.layers {
+            let (global, rope) = if layer.global {
+                (true, &enc.rope_global)
+            } else {
+                (false, &enc.rope_local)
+            };
+            let window = if global {
+                None
+            } else {
+                Some(cfg.local_attention / 2)
+            };
+            let mask = enc
+                .additive_mask(seq, global, Kind::Float, Device::Cpu)
+                .unwrap();
+            let whole = layer
+                .attn
+                .forward_chunked(&hidden, rope, &mask, window, seq);
+            let chunked = layer.attn.forward_chunked(&hidden, rope, &mask, window, 3);
+            let max_diff = (whole - chunked).abs().max().double_value(&[]);
+            assert!(
+                max_diff < 1e-5,
+                "global={global}: chunk boundary changes nothing ({max_diff})"
+            );
+        }
     }
 
     #[test]
@@ -534,8 +629,9 @@ mod tests {
             .to_kind(Kind::Float)
             .view([1, seq, cfg.hidden_size]);
         let rope = &enc.rope_local;
-        let out_a = local.attn.forward(&hidden_a, rope, &mask);
-        let out_b = local.attn.forward(&hidden_b, rope, &mask);
+        let window = Some(cfg.local_attention / 2);
+        let out_a = local.attn.forward(&hidden_a, rope, &mask, window);
+        let out_b = local.attn.forward(&hidden_b, rope, &mask, window);
         for pos in 0..(seq - cfg.local_attention / 2 - 1) {
             let diff = (out_a.get(0).get(pos) - out_b.get(0).get(pos))
                 .abs()

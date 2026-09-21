@@ -468,6 +468,37 @@ impl Qwen35Encoder {
     pub fn amputated_lm_head_names() -> &'static [&'static str] {
         &["lm_head.", "embed_out.", "mtp."]
     }
+
+    /// Normalize a source-checkpoint tensor name into this encoder's namespace,
+    /// or `None` when the tensor is not part of the text backbone (drop it at
+    /// conversion).
+    ///
+    /// Real hybrid-family checkpoints nest the text stack one level deeper than
+    /// the HF text-only layout (verified against the live Qwen3-VL safetensors
+    /// index): `model.language_model.<rest>` where this encoder expects
+    /// `model.<rest>`, plus a `model.visual.*` vision tower that is not part of
+    /// the decision model at all. The amputated LM-head prefixes
+    /// ([`Self::amputated_lm_head_names`]) also map to `None` here — conversion is
+    /// `filter_map(remap_checkpoint_name)`, one function, no separate drop list.
+    pub fn remap_checkpoint_name(name: &str) -> Option<String> {
+        if name.starts_with("model.visual.") {
+            return None; // vision tower: the decision model is text-only
+        }
+        let name = name
+            .strip_prefix("model.language_model.")
+            .map(|rest| format!("model.{rest}"))
+            .unwrap_or_else(|| name.to_owned());
+        // Amputated heads may sit at the checkpoint root (`lm_head.weight`) or
+        // nested under `model.` (e.g. `model.mtp.*`); cover both.
+        let bare = name.strip_prefix("model.").unwrap_or(&name);
+        if Self::amputated_lm_head_names()
+            .iter()
+            .any(|p| bare.starts_with(p))
+        {
+            return None;
+        }
+        Some(name)
+    }
 }
 
 #[allow(clippy::assign_op_pattern)]
@@ -505,6 +536,38 @@ impl Backbone for Qwen35Encoder {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_name_remap_handles_nested_and_text_only_layouts() {
+        // Verified against the live Qwen3-VL safetensors index: text weights nest
+        // under model.language_model.*, the vision tower under model.visual.*,
+        // lm_head at top level. Text-only checkpoints (model.*) pass through.
+        assert_eq!(
+            Qwen35Encoder::remap_checkpoint_name(
+                "model.language_model.layers.0.self_attn.q_proj.weight"
+            ),
+            Some("model.layers.0.self_attn.q_proj.weight".to_owned())
+        );
+        assert_eq!(
+            Qwen35Encoder::remap_checkpoint_name("model.language_model.embed_tokens.weight"),
+            Some("model.embed_tokens.weight".to_owned())
+        );
+        assert_eq!(
+            Qwen35Encoder::remap_checkpoint_name("model.layers.0.linear_attn.in_proj_qkv.weight"),
+            Some("model.layers.0.linear_attn.in_proj_qkv.weight".to_owned()),
+            "text-only layout passes through"
+        );
+        assert_eq!(
+            Qwen35Encoder::remap_checkpoint_name("model.visual.patch_embed.proj.weight"),
+            None,
+            "vision tower is dropped"
+        );
+        assert_eq!(Qwen35Encoder::remap_checkpoint_name("lm_head.weight"), None);
+        assert_eq!(
+            Qwen35Encoder::remap_checkpoint_name("model.mtp.layers.0.weight"),
+            None
+        );
+    }
 
     #[test]
     fn derived_layer_kinds_are_every_fourth_full_attention() {
