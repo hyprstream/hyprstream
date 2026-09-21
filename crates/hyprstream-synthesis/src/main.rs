@@ -112,7 +112,9 @@ fn synthesize(args: &[String]) -> i32 {
         {
             Some(config) => config,
             None => {
-                eprintln!("config unreadable or unparseable at {path}");
+                eprintln!(
+                    "config unreadable or unparseable at {path} (label_policy must be \"balanced\" or \"unlimited\")"
+                );
                 return 1;
             }
         },
@@ -180,7 +182,10 @@ fn parse_config(text: &str) -> Option<SynthConfig> {
         Some("balanced") => LabelPolicy::Balanced {
             slack: get_u64("label_slack").unwrap_or(1) as usize,
         },
-        _ => LabelPolicy::Unlimited,
+        Some("unlimited") | None => LabelPolicy::Unlimited,
+        // Unknown policies fail loud — silently dropping label control would
+        // skew a training run without any signal.
+        Some(_) => return None,
     };
     Some(SynthConfig {
         seed_base: get_u64("seed_base").unwrap_or(0x51A1),

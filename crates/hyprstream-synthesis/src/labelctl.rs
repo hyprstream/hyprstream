@@ -20,13 +20,6 @@ pub enum LabelPolicy {
     },
 }
 
-impl LabelPolicy {
-    /// Whether this policy performs control.
-    pub fn is_controlled(self) -> bool {
-        matches!(self, Self::Balanced { .. })
-    }
-}
-
 /// The running histogram, keyed by (kind, cardinality, label).
 #[derive(Debug, Default)]
 pub(crate) struct LabelController {

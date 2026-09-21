@@ -157,7 +157,7 @@ mod tests {
     fn row_with(probs: Vec<Vec<f32>>) -> CorpusRow {
         let n = probs.first().map_or(2, Vec::len);
         CorpusRow {
-            id: "syn1-x-noul-0000000000000001-r0-p0".to_owned(),
+            id: "syn1_x_noul_0000000000000001_r0_p0".to_owned(),
             family: "triage".to_owned(),
             group: "g".to_owned(),
             kind: "noul".to_owned(),

@@ -64,6 +64,95 @@ fn pipeline_is_bit_deterministic() {
 }
 
 #[test]
+fn label_histogram_is_recorded_under_unlimited_policy() {
+    // Regression (review): unlimited runs used to skip histogram recording
+    // entirely — the audit trail must exist under every policy.
+    let (teachers, _) = ensemble(&[("sim-a", TosClass::OpenWeights)]);
+    let refs: Vec<&dyn Teacher> = teachers.iter().map(|t| t as &dyn Teacher).collect();
+    let config = SynthConfig {
+        label_policy: LabelPolicy::Unlimited,
+        ..small_config()
+    };
+    let corpus = run(&config, &refs, &firewall()).unwrap();
+    assert!(!corpus.stats.label_histogram.is_empty());
+    let total: usize = corpus.stats.label_histogram.values().sum();
+    assert_eq!(total, corpus.stats.accepted);
+}
+
+#[test]
+fn reconstructed_specs_pass_the_arrow_identifier_contract() {
+    // Regression (review): synthesized question ids double as jev-1 question
+    // ids and flow into Arrow field names, so DecisionSchema's identifier
+    // grammar ([A-Za-z_][A-Za-z0-9_]*) must accept every one of them.
+    let (teachers, _) = ensemble(&[("sim-a", TosClass::OpenWeights)]);
+    let refs: Vec<&dyn Teacher> = teachers.iter().map(|t| t as &dyn Teacher).collect();
+    let corpus = run(&small_config(), &refs, &firewall()).unwrap();
+    assert!(!corpus.rows.is_empty());
+    for row in &corpus.rows {
+        let spec = row.question_spec().unwrap();
+        hyprstream_decision::arrow::DecisionSchema::new(vec![spec])
+            .unwrap_or_else(|err| panic!("{} rejected by DecisionSchema: {err}", row.id));
+    }
+}
+
+#[test]
+fn cli_rejects_unknown_label_policy() {
+    // Regression (review): an unknown label_policy must fail loud, never
+    // silently fall back to Unlimited.
+    let bin = env!("CARGO_BIN_EXE_hyprstream-synthesis");
+    let dir = std::env::temp_dir();
+    let roster_path = dir.join("p13-test-roster.json");
+    let config_path = dir.join("p13-test-config-bad.json");
+    std::fs::write(
+        &roster_path,
+        r#"{"teachers":[{"id":"sim","version":"simulated","tos_class":"open-weights"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &config_path,
+        r#"{"label_policy":"sometimes","base_items_per_family":1}"#,
+    )
+    .unwrap();
+    let bad = std::process::Command::new(bin)
+        .args([
+            "run",
+            "--roster",
+            roster_path.to_str().unwrap(),
+            "--manifest",
+            manifest_path().to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("label_policy"));
+
+    std::fs::write(
+        &config_path,
+        r#"{"label_policy":"unlimited","base_items_per_family":1}"#,
+    )
+    .unwrap();
+    let good = std::process::Command::new(bin)
+        .args([
+            "run",
+            "--roster",
+            roster_path.to_str().unwrap(),
+            "--manifest",
+            manifest_path().to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        good.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+}
+
+#[test]
 fn mandatory_augmentation_closure() {
     let (teachers, _) = ensemble(&[("sim-a", TosClass::OpenWeights)]);
     let refs: Vec<&dyn Teacher> = teachers.iter().map(|t| t as &dyn Teacher).collect();

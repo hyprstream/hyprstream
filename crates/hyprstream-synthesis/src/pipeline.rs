@@ -139,23 +139,20 @@ pub fn run(
                         }
                         let row =
                             CorpusRow::from_item(&item, teachers, answers, provenance.clone());
-                        if config.label_policy.is_controlled() {
-                            let mean = corrected_average(&row, &HashMap::new()).map_err(|_| {
-                                SynthError::BadTeacherAnswer {
-                                    teacher: "ensemble".to_owned(),
-                                    item: item.id.clone(),
-                                }
-                            })?;
-                            let label = argmax_label(&mean);
-                            if !labels.accept(
-                                config.label_policy,
-                                &row.kind,
-                                row.cardinality(),
-                                label,
-                            ) {
-                                stats.label_deferred += 1;
-                                continue;
+                        // The label histogram is recorded under every policy
+                        // (the audit trail must not depend on whether control
+                        // is on); only the deferral is policy-gated.
+                        let mean = corrected_average(&row, &HashMap::new()).map_err(|_| {
+                            SynthError::BadTeacherAnswer {
+                                teacher: "ensemble".to_owned(),
+                                item: item.id.clone(),
                             }
+                        })?;
+                        let label = argmax_label(&mean);
+                        if !labels.accept(config.label_policy, &row.kind, row.cardinality(), label)
+                        {
+                            stats.label_deferred += 1;
+                            continue;
                         }
                         corpus.rows.push(row);
                         stats.accepted += 1;

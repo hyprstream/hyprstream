@@ -698,11 +698,17 @@ mod tests {
                     let cardinality = item.question.cardinality();
                     assert!((2..=255).contains(&cardinality), "{}", item.id);
                     assert_eq!(item.question.id, item.id);
+                    // The jev-1 Arrow contract grammar: [A-Za-z_][A-Za-z0-9_]*.
+                    let mut chars = item.id.chars();
+                    let first = chars.next().unwrap_or('-');
                     assert!(
+                        first.is_ascii_alphabetic() || first == '_',
+                        "{}: identifier start",
                         item.id
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-                        "{}: identifier-safe",
+                    );
+                    assert!(
+                        chars.all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                        "{}: identifier-safe for Arrow field names",
                         item.id
                     );
                     match kind {

@@ -44,7 +44,7 @@ pub struct Provenance {
 /// per-teacher answers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CorpusRow {
-    /// Item id (`syn1-<family>-<kind>-<seed>-r<rotation>-p<paraphrase>`).
+    /// Item id (`syn1_<family>_<kind>_<seed>_r<rotation>_p<paraphrase>`).
     pub id: String,
     /// Synthetic family id.
     pub family: String,

@@ -12,12 +12,12 @@ use crate::family::SynthFamily;
 /// ensemble and live in the corpus row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SynthItem {
-    /// Stable item id: `syn1-<family>-<kind>-<seed:016x>-r<rotation>-p<paraphrase>`.
+    /// Stable item id: `syn1_<family>_<kind>_<seed:016x>_r<rotation>_p<paraphrase>`.
     pub id: String,
     /// Synthetic workflow family.
     pub family: SynthFamily,
     /// Augmentation group: every (rotation, paraphrase) variant of one base
-    /// item shares this id (the base item's id, `-r0-p0`).
+    /// item shares this id (the base item's id, `_r0_p0`).
     pub group: String,
     /// The raw seed this item was generated from (reproducibility handle).
     pub seed: u64,
@@ -49,8 +49,8 @@ impl SynthItem {
             QuestionBody::Score { .. } => QuestionKind::Score,
         };
         let base = base_id(family, kind, seed);
-        let id = format!("{base}-r{rotation}-p{paraphrase}");
-        let group = format!("{base}-r0-p0");
+        let id = format!("{base}_r{rotation}_p{paraphrase}");
+        let group = format!("{base}_r0_p0");
         let question = QuestionSpec {
             id: id.clone(),
             kind,
@@ -168,11 +168,13 @@ impl SynthItem {
     }
 }
 
-/// The base-item id shape (augmentation coordinates `-r0-p0` appended by
-/// [`SynthItem::new`]). Ids are identifier-safe (they double as jev-1
-/// question ids, which flow into Arrow field names).
+/// The base-item id shape (augmentation coordinates `_r0_p0` appended by
+/// [`SynthItem::new`]). Ids are identifier-safe under the jev-1 Arrow
+/// contract — `[A-Za-z_][A-Za-z0-9_]*`, the grammar
+/// `hyprstream_decision::arrow::DecisionSchema` enforces for question ids
+/// (they flow into Arrow field names, so no hyphens).
 fn base_id(family: SynthFamily, kind: QuestionKind, seed: u64) -> String {
-    format!("syn1-{}-{}-{seed:016x}", family.as_str(), kind.as_str())
+    format!("syn1_{}_{}_{seed:016x}", family.as_str(), kind.as_str())
 }
 
 fn write_field(out: &mut String, name: &str, value: &str) {
@@ -239,7 +241,7 @@ mod tests {
         // Regression lock: pinned golden digest (blake3 over canonical bytes).
         assert_eq!(
             item.hash(),
-            "b72d44c91b84f7994bfd685fe46910002e92f1e905e23dfaec7e044234cb532c"
+            "f5b751efcaa370fdca2fa1a7cd070228d3a2ee1cdfc0f31ed6df3836c29755f7"
         );
     }
 
