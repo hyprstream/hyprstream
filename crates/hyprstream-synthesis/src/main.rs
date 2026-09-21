@@ -174,6 +174,11 @@ fn synthesize(args: &[String]) -> i32 {
 
 fn parse_config(text: &str) -> Option<SynthConfig> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    // The config must be a JSON object; `[]`, `null`, or a bare string would
+    // otherwise silently yield the default configuration.
+    if !value.is_object() {
+        return None;
+    }
     // Strict presence semantics: an absent key takes the default, but a
     // present value that is not a u64 (false, -1, "16", 1.5, ...) fails loud
     // instead of silently reverting to the default.

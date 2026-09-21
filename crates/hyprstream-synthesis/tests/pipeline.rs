@@ -125,6 +125,10 @@ fn cli_rejects_malformed_config_values() {
             .unwrap()
     };
     for bad in [
+        r#"[]"#,
+        r#"null"#,
+        r#""balanced""#,
+        r#"42"#,
         r#"{"label_policy":"sometimes","base_items_per_family":1}"#,
         r#"{"label_policy":false,"base_items_per_family":1}"#,
         r#"{"label_policy":42,"base_items_per_family":1}"#,
