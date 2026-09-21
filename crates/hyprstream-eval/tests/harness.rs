@@ -437,3 +437,42 @@ async fn run_set_validates_the_schema_before_calling_the_subject() {
         "the subject must not be called for an invalid schema"
     );
 }
+
+#[tokio::test]
+async fn run_set_rejects_out_of_cardinality_truth_before_calling_the_subject() {
+    let set = hyprstream_eval::EvalSet {
+        name: "t".into(),
+        schema_version: "v1".into(),
+        questions: vec![noul_item().question],
+        rows: vec![hyprstream_eval::EvalRow {
+            id: "row-1".into(),
+            family: None,
+            stratum: None,
+            group: None,
+            state: Entry::Null,
+            // noul cardinality is 2; index 2 is out of range.
+            truth: std::collections::BTreeMap::from([("val_q".to_owned(), 2usize)]),
+        }],
+    };
+    let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+    let error = Harness.run_set(&set, &subject).await.err().unwrap();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::InvalidInput(_)),
+        "out-of-cardinality truth must be InvalidInput, got {error:?}"
+    );
+    assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn run_items_rejects_out_of_cardinality_truth_before_calling_the_subject() {
+    let mut item = noul_item();
+    item.truth = Some(2); // noul cardinality is 2
+    let items = vec![item];
+    let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+    let error = Harness.run_items(&items, &subject).await.err().unwrap();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::InvalidInput(_)),
+        "out-of-cardinality truth must be InvalidInput, got {error:?}"
+    );
+    assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}

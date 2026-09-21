@@ -176,13 +176,22 @@ impl Harness {
         let schema = DecisionSchema::new(set.questions.clone())?;
         // A truth entry keyed to an undeclared question would otherwise be
         // silently ignored (the row scored as unlabeled), biasing every
-        // labeled denominator — fail loudly instead.
+        // labeled denominator — fail loudly instead. A truth index outside
+        // the question's cardinality is likewise an input error, caught here
+        // rather than at scoring time (after every billed call).
         for row in &set.rows {
-            for question_id in row.truth.keys() {
-                if question_set.question(question_id).is_none() {
+            for (question_id, &label) in &row.truth {
+                let Some(question) = question_set.question(question_id) else {
                     return Err(EvalError::InvalidInput(format!(
                         "row `{}` has a truth entry for undeclared question `{question_id}`",
                         row.id
+                    )));
+                };
+                if label >= question.cardinality() {
+                    return Err(EvalError::InvalidInput(format!(
+                        "row `{}` truth index {label} is outside question `{question_id}`'s cardinality {}",
+                        row.id,
+                        question.cardinality()
                     )));
                 }
             }
@@ -246,6 +255,18 @@ impl Harness {
     ) -> Result<RunOutput, EvalError> {
         let mut observations = Vec::with_capacity(items.len());
         for (row_index, item) in items.iter().enumerate() {
+            // An out-of-cardinality truth index is an input error, caught
+            // before any subject call rather than at scoring time.
+            if let Some(truth) = item.truth {
+                if truth >= item.question.cardinality() {
+                    return Err(EvalError::InvalidInput(format!(
+                        "item `{}` truth index {truth} is outside question `{}`'s cardinality {}",
+                        item.id,
+                        item.question.id,
+                        item.question.cardinality()
+                    )));
+                }
+            }
             let set = QuestionSet {
                 state: Some(item.state.clone()),
                 questions: vec![item.question.clone()],
