@@ -187,21 +187,44 @@ pub fn request_body(set: &QuestionSet, state: &Entry, model: &str) -> WireJson {
     ])
 }
 
-/// Renormalize a wire-accepted distribution to an exact f32 sum of 1
-/// (divide through, then correct the largest component — the same approach
-/// as the stub's mock). Wire distributions are accepted at consumer
-/// tolerance; the producer-side IR and batch validators require the tighter
-/// producer tolerance, so the boundary normalizes on the way in.
+/// Renormalize an accepted distribution to producer tolerance: divide
+/// through, then — only if the divided vector still misses the f32
+/// sequential-sum tolerance — correct one maximal component by the
+/// residual. The correction preserves the D6 argmax on purpose: dumping
+/// the residual on an arbitrary maximum (or every correction landing on
+/// the last tied component) can turn a rounded tie (seven options at
+/// 0.1429) into a unique winner at the wrong index. A shortfall bumps the
+/// EARLIEST maximal component (a unique winner there matches the
+/// earliest-index tie-break); an overage shrinks the LATEST maximal
+/// component (the earliest tied maxima keep their win). Wire
+/// distributions are accepted at consumer tolerance; the producer-side IR
+/// and batch validators require the tighter producer tolerance, so the
+/// boundary normalizes on the way in.
 fn normalize_distribution(probabilities: &mut [f32]) {
+    use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
+
     let sum: f32 = probabilities.iter().sum();
     if sum > 0.0 {
         for p in probabilities.iter_mut() {
             *p /= sum;
         }
     }
+    if check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok() {
+        return;
+    }
     let residual = 1.0 - probabilities.iter().sum::<f32>();
-    if let Some(max) = probabilities.iter_mut().max_by(|a, b| a.total_cmp(b)) {
-        *max += residual;
+    let max = probabilities
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    #[allow(clippy::float_cmp)]
+    let index = if residual > 0.0 {
+        probabilities.iter().position(|p| *p == max)
+    } else {
+        probabilities.iter().rposition(|p| *p == max)
+    };
+    if let Some(index) = index {
+        probabilities[index] += residual;
     }
 }
 
@@ -556,7 +579,16 @@ impl Subject for TruthSubject {
             let mut probabilities = vec![0.0f32; cardinality];
             match self.truth.get(&question.id) {
                 Some(&index) if index < cardinality => probabilities[index] = 1.0,
-                _ => probabilities.fill(1.0 / cardinality as f32),
+                // Uniform fallback: the rounded f32 reciprocal can violate
+                // the producer sum tolerance at high cardinalities (78
+                // options sum to ~1.0000011), so renormalize. The D6-safe
+                // correction keeps the argmax at the earliest index (no f32
+                // vector of 78 exactly-equal components can meet the
+                // tolerance, so one component carries the residual).
+                _ => {
+                    probabilities.fill(1.0 / cardinality as f32);
+                    normalize_distribution(&mut probabilities);
+                }
             }
             let value = match &question.body {
                 QuestionBody::Noul { .. } => AnswerValue::Noul {
@@ -701,6 +733,86 @@ questions:
             &serde_json::json!({"type":"choice","probabilities":{"angry":0.5,"calm":0.4,"bored":0.1}}),
         );
         assert!(extra_label.is_err());
+    }
+
+    #[test]
+    fn wire_normalization_preserves_ties() {
+        // Seven options rounded to 0.1429 each (sum 1.0003, legal at
+        // consumer tolerance): normalization must not turn the tie into a
+        // unique winner — D6 earliest-index argmax depends on it.
+        let set = author::parse_yaml(
+            r#"
+questions:
+  pick:
+    type: choice
+    criteria: { o1: ~, o2: ~, o3: ~, o4: ~, o5: ~, o6: ~, o7: ~ }
+"#,
+        )
+        .unwrap();
+        let question = set.question("pick").unwrap();
+        let parsed = parse_answer(
+            question,
+            &serde_json::json!({
+                "type": "choice",
+                "probabilities": {"o1": 0.1429, "o2": 0.1429, "o3": 0.1429, "o4": 0.1429, "o5": 0.1429, "o6": 0.1429, "o7": 0.1429}
+            }),
+        )
+        .unwrap();
+        let probabilities = parsed.value.as_ref().unwrap().probabilities();
+        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE)
+            .unwrap();
+        assert!(
+            probabilities.windows(2).all(|w| w[0] == w[1]),
+            "the tie must survive normalization: {probabilities:?}"
+        );
+        assert_eq!(
+            hyprstream_decision::confidence::argmax_index(&probabilities),
+            Some(0),
+            "D6: earliest index on a tie"
+        );
+    }
+
+    #[tokio::test]
+    async fn truth_subject_uniform_fallback_is_producer_valid_at_high_cardinality() {
+        // 78 options: the naive `1.0 / 78` f32 fill sums to ~1.0000011,
+        // beyond producer tolerance — the fallback must renormalize.
+        let options = (0..78)
+            .map(|i| hyprstream_decision::spec::ChoiceOption {
+                name: format!("o{i}"),
+                rubric: None,
+            })
+            .collect();
+        let question = QuestionSpec {
+            id: "wide".into(),
+            kind: hyprstream_decision::QuestionKind::Choice,
+            instructions: None,
+            body: QuestionBody::Choice { options },
+        };
+        let set = QuestionSet {
+            state: None,
+            questions: vec![question],
+        };
+        let subject = TruthSubject::new("truth"); // no truth configured
+        let row = subject.decide(&set, &Entry::Null, 0).await.unwrap();
+        let probabilities = row.answers["wide"].value.as_ref().unwrap().probabilities();
+        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE)
+            .unwrap();
+        // No f32 vector of 78 exactly-equal components can meet the producer
+        // tolerance (best achievable error ~1.07e-6), so the fallback is as
+        // uniform as f32 allows: one component carries the residual, spread
+        // stays within a few ulps, and the D6 argmax is still the earliest
+        // index (the tie-break outcome).
+        let min = probabilities.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = probabilities.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            (max - min) / max < 1e-3,
+            "near-uniform: min {min}, max {max}"
+        );
+        assert_eq!(
+            hyprstream_decision::confidence::argmax_index(&probabilities),
+            Some(0),
+            "D6: earliest index"
+        );
     }
 
     #[test]
