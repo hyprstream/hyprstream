@@ -292,6 +292,18 @@
         "reason": "nix flake evaluation; pinned container on the amd64 pool"
       }
     },
+    "oci-runtime-validate.yml": {
+      "build-runtime-and-smoke-test-deferred": {
+        "target_class": "amd64-canary",
+        "reason": "seconds-long required-check placeholder (echo only: no build, no checkout, no credentials); arch-neutral, migrates trivially with any pinned container"
+      }
+    },
+    "pr-affected.yml": {
+      "pr-affected-merge-gate-deferred": {
+        "target_class": "amd64-canary",
+        "reason": "seconds-long required-check placeholder (echo only: no build, no checkout, no credentials); arch-neutral, migrates trivially with any pinned container"
+      }
+    },
     "publish-rpc-std-wasm.yml": {
       "build-package-smoke": {
         "target_class": "amd64-canary",
