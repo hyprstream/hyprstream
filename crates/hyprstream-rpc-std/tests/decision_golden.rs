@@ -242,7 +242,7 @@ fn check_golden_vector(vector: &GoldenVector) {
     );
 
     // --- capnp batch round-trip (answer emission) ---
-    let bytes = wire_roundtrip(&decision::batch_to_message(&vector.version, &vector.rows));
+    let bytes = wire_roundtrip(&decision::batch_to_message(&vector.version, &vector.rows).expect("encode"));
     let message = capnp::serialize::read_message(
         &mut &bytes[..],
         capnp::message::ReaderOptions::new(),
@@ -611,7 +611,7 @@ fn calib_none_is_distinct_from_empty_string() {
             "q",
             QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.5 }),
         )])];
-        let bytes = wire_roundtrip(&decision::batch_to_message(&version, &rows));
+        let bytes = wire_roundtrip(&decision::batch_to_message(&version, &rows).expect("encode"));
         let message = capnp::serialize::read_message(
             &mut &bytes[..],
             capnp::message::ReaderOptions::new(),
@@ -625,4 +625,50 @@ fn calib_none_is_distinct_from_empty_string() {
         .expect("decodes");
         assert_eq!(decoded.calib, calib, "calib {calib:?} round-trips exactly");
     }
+}
+
+/// Encode-side guards mirror the decode-side ones: an abstained answer with a
+/// conformal set is rejected instead of emitting a message the decoder would
+/// refuse, and the wire kind tag is derived from the body even when a
+/// directly-constructed spec carries a conflicting `kind`.
+#[test]
+fn encode_rejects_abstained_with_conformal_set_and_derives_kind_from_body() {
+    let version = VersionTriple {
+        schema: "s".into(),
+        model: "m".into(),
+        calib: None,
+    };
+    let mut invalid = row(vec![("q", QuestionAnswer::abstained())]);
+    invalid.answers.get_mut("q").expect("answer").conformal_set = Some(vec!["x".into()]);
+    let error = decision::batch_to_message(&version, &[invalid])
+        .err()
+        .expect("abstained with conformal set rejected at encode");
+    assert_eq!(
+        error,
+        decision::EncodeError::AbstainedWithConformalSet("q".into())
+    );
+
+    // kind tag follows the body, not a stale denormalized field.
+    let mut set: QuestionSet = hyprstream_decision::parse_yaml(
+        r#"
+questions:
+  q:
+    type: noul
+"#,
+    )
+    .expect("parses");
+    set.questions[0].kind = hyprstream_decision::QuestionKind::Score;
+    let bytes = wire_roundtrip(&decision::question_set_to_message(&set));
+    let message = capnp::serialize::read_message(
+        &mut &bytes[..],
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("parses");
+    let decoded = decision::question_set_from_reader(
+        message
+            .get_root::<hyprstream_rpc_std::decision_capnp::question_set::Reader<'_>>()
+            .expect("root"),
+    )
+    .expect("derived tag keeps the message decodable");
+    assert_eq!(decoded.questions[0].kind, hyprstream_decision::QuestionKind::Noul);
 }

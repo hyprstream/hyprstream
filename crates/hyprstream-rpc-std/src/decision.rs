@@ -60,6 +60,16 @@ pub enum DecodeError {
     EmptyQuestionSet,
 }
 
+/// Errors encoding IR into a `decision.capnp` message.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum EncodeError {
+    /// An abstained answer carried a conformal set — the wire contract forbids
+    /// it (abstention already says "no commitment") and this module's own
+    /// decoder rejects such messages.
+    #[error("abstained answer for question {0} carries a conformal set")]
+    AbstainedWithConformalSet(String),
+}
+
 impl From<capnp::Error> for DecodeError {
     fn from(error: capnp::Error) -> Self {
         Self::Capnp(error.to_string())
@@ -171,7 +181,14 @@ fn set_noul_criteria(
 
 fn set_question_spec(builder: &mut decision_capnp::question_spec::Builder<'_>, spec: &QuestionSpec) {
     builder.set_id(&spec.id);
-    builder.set_kind(question_kind_tag(spec.kind));
+    // The wire tag is derived from the body, never from the denormalized
+    // `kind` field: a directly-constructed IR value could carry a conflicting
+    // pair, and the decoder rejects kind/body mismatches.
+    builder.set_kind(question_kind_tag(match &spec.body {
+        QuestionBody::Noul { .. } => QuestionKind::Noul,
+        QuestionBody::Choice { .. } => QuestionKind::Choice,
+        QuestionBody::Score { .. } => QuestionKind::Score,
+    }));
     set_opt_entry(builder.reborrow().init_instructions(), spec.instructions.as_ref());
     match &spec.body {
         QuestionBody::Noul { criteria } => {
@@ -350,7 +367,7 @@ fn set_answer_value(mut builder: decision_capnp::answer_value::Builder<'_>, valu
 pub fn batch_to_message(
     version: &VersionTriple,
     rows: &[AnswerRow],
-) -> capnp::message::Builder<capnp::message::HeapAllocator> {
+) -> Result<capnp::message::Builder<capnp::message::HeapAllocator>, EncodeError> {
     let mut message = capnp::message::Builder::new_default();
     let mut root = message.init_root::<decision_capnp::decision_batch::Builder<'_>>();
     {
@@ -367,6 +384,9 @@ pub fn batch_to_message(
         let row_builder = rows_builder.reborrow().get(row_index as u32);
         let mut answers = row_builder.init_answers(row.answers.len() as u32);
         for (answer_index, (question_id, answer)) in row.answers.iter().enumerate() {
+            if answer.value.is_none() && answer.conformal_set.is_some() {
+                return Err(EncodeError::AbstainedWithConformalSet(question_id.clone()));
+            }
             let mut answer_builder = answers.reborrow().get(answer_index as u32);
             answer_builder.set_question_id(question_id);
             set_answer_value(
@@ -381,7 +401,7 @@ pub fn batch_to_message(
             }
         }
     }
-    message
+    Ok(message)
 }
 
 /// Decode a `DecisionBatch` message: the version triple plus one [`AnswerRow`]
