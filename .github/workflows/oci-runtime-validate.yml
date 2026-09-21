@@ -17,21 +17,46 @@ name: OCI Runtime Image Validation
 # workflow, Cargo.toml/Cargo.lock, crates/**, workspace-hack/**, and
 # rust-toolchain.toml — anything else cannot change what enters the image.
 on:
+  # pull_request exists ONLY so the required check context can report on PR
+  # heads — see the deferred-placeholder job below. The real build runs on
+  # merge_group (and workflow_dispatch) only.
+  pull_request:
   merge_group:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Merge-group runs must never be cancelled by a new PR push; manual dispatches
-# on the same ref supersede each other. The Graviton runner pool is shared and
-# scarce.
+# Merge-group runs must never be cancelled by a new PR push; the PR
+# placeholder and manual dispatches supersede themselves per ref. The
+# Graviton runner pool is shared and scarce.
 concurrency:
-  group: oci-runtime-validate-${{ github.ref }}
+  group: oci-runtime-validate-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'merge_group' }}
 
 jobs:
+  # Required-check placeholder. The protection ruleset requires the context
+  # "build-runtime-and-smoke-test", which the real job below only reports in
+  # merge_group/dispatch context; a required context that NEVER reports on a
+  # PR head blocks merge queue entry ("required status checks are expected").
+  # This no-op reports the required context as an immediate success on PRs —
+  # the real image build + smoke test gates the merge_group candidate.
+  # Skipped (not run) off pull_request so only one job ever emits the context.
+  build-runtime-and-smoke-test-deferred:
+    name: build-runtime-and-smoke-test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+    - run: |
+        echo "OCI runtime image validation is deferred to the merge queue:"
+        echo "this context is a placeholder success on PR heads; the real"
+        echo "cpu-arm64 runtime build + smoke test gates the merge_group"
+        echo "candidate (long CI runs gate at merge, not on every PR push)."
+
   build-runtime-and-smoke-test:
+    # The real job never runs on pull_request — the placeholder above reports
+    # the required context there instead.
+    if: github.event_name != 'pull_request'
     # Same self-hosted Graviton pool as build-image.yml and the merge gate:
     # native arm64 (no qemu), podman-only (Rocky 10 golden AMI).
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]

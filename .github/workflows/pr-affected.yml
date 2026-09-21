@@ -44,6 +44,24 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'merge_group' }}
 
 jobs:
+  # Required-check placeholder. The protection ruleset requires the context
+  # "pr-affected (merge gate)", which the real job only reports in merge_group
+  # context; a required context that NEVER reports on a PR head blocks merge
+  # queue entry ("required status checks are expected"). This no-op reports
+  # the required context as an immediate success on PRs — the blocking
+  # verdict is computed for real by the same-named job at merge_group time.
+  # Skipped (not run) on merge_group so only one job ever emits the context.
+  pr-affected-merge-gate-deferred:
+    name: pr-affected (merge gate)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+    - run: |
+        echo "Affected-set verdict is deferred to the merge queue: this context"
+        echo "is a placeholder success on PR heads; the real nextest+clippy run"
+        echo "gates the merge_group candidate. See the 'pr-affected (informational)'"
+        echo "check on this PR for best-effort early feedback."
+
   pr-affected:
     name: pr-affected (${{ github.event_name == 'merge_group' && 'merge gate' || 'informational' }})
     # The PR leg is feedback only: a failure must not block review. The merge
