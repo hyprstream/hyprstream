@@ -174,19 +174,24 @@ fn synthesize(args: &[String]) -> i32 {
 
 fn parse_config(text: &str) -> Option<SynthConfig> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    let get_u64 = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+    // Strict presence semantics: an absent key takes the default, but a
+    // present value that is not a u64 (false, -1, "16", 1.5, ...) fails loud
+    // instead of silently reverting to the default.
+    let get_u64 = |key: &str, default: u64| -> Option<u64> {
+        match value.get(key) {
+            None => Some(default),
+            Some(raw) => raw.as_u64(),
+        }
+    };
     // Checked narrowing: a value that does not fit u32/usize must fail loud,
     // never silently wrap into a different run configuration.
     let get_u32 = |key: &str, default: u32| -> Option<u32> {
-        match get_u64(key) {
-            None => Some(default),
-            Some(raw) => u32::try_from(raw).ok(),
-        }
+        u32::try_from(get_u64(key, u64::from(default))?).ok()
     };
     let policy = match value.get("label_policy") {
         None => LabelPolicy::Unlimited,
         Some(serde_json::Value::String(s)) if s == "balanced" => LabelPolicy::Balanced {
-            slack: usize::try_from(get_u64("label_slack").unwrap_or(1)).ok()?,
+            slack: usize::try_from(get_u64("label_slack", 1)?).ok()?,
         },
         Some(serde_json::Value::String(s)) if s == "unlimited" => LabelPolicy::Unlimited,
         // Unknown or non-string policies fail loud — silently dropping label
@@ -194,7 +199,7 @@ fn parse_config(text: &str) -> Option<SynthConfig> {
         Some(_) => return None,
     };
     Some(SynthConfig {
-        seed_base: get_u64("seed_base").unwrap_or(0x51A1),
+        seed_base: get_u64("seed_base", 0x51A1)?,
         base_items_per_family: get_u32("base_items_per_family", 16)?,
         paraphrase_variants: get_u32("paraphrase_variants", 2)?,
         label_policy: policy,

@@ -131,6 +131,10 @@ fn cli_rejects_malformed_config_values() {
         r#"{"label_policy":null,"base_items_per_family":1}"#,
         r#"{"base_items_per_family":4294967296}"#,
         r#"{"paraphrase_variants":4294967298}"#,
+        r#"{"base_items_per_family":false}"#,
+        r#"{"paraphrase_variants":-1}"#,
+        r#"{"seed_base":"0x51A1"}"#,
+        r#"{"label_policy":"balanced","label_slack":-1}"#,
     ] {
         let out = run_with(bad);
         assert_eq!(

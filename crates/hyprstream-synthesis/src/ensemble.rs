@@ -20,6 +20,11 @@ pub enum EnsembleError {
         /// Teacher id.
         teacher: String,
     },
+    /// A correction temperature was non-finite or non-positive.
+    BadTemperature {
+        /// Teacher id.
+        teacher: String,
+    },
 }
 
 impl std::fmt::Display for EnsembleError {
@@ -29,6 +34,10 @@ impl std::fmt::Display for EnsembleError {
             Self::BadVector { teacher } => {
                 write!(f, "teacher {teacher} answer is missing or the wrong width")
             }
+            Self::BadTemperature { teacher } => write!(
+                f,
+                "correction temperature for teacher {teacher} is not finite and positive"
+            ),
         }
     }
 }
@@ -55,9 +64,17 @@ pub fn corrected_average(
     row: &CorpusRow,
     temperatures: &HashMap<String, f64>,
 ) -> Result<Vec<f64>, EnsembleError> {
-    for id in temperatures.keys() {
+    for (id, temperature) in temperatures {
         if !row.teachers.iter().any(|answer| &answer.id == id) {
             return Err(EnsembleError::UnknownTeacher(id.clone()));
+        }
+        // This is the training-time correction path: a zero/negative/NaN/
+        // infinite temperature would produce NaN distributions or silently
+        // invert the learned probabilities, so it fails loud here.
+        if !temperature.is_finite() || *temperature <= 0.0 {
+            return Err(EnsembleError::BadTemperature {
+                teacher: id.clone(),
+            });
         }
     }
     let n = row.cardinality();
@@ -220,6 +237,26 @@ mod tests {
             corrected_average(&row, &corrections),
             Err(EnsembleError::UnknownTeacher(id)) if id == "ghost"
         ));
+    }
+
+    #[test]
+    fn invalid_temperatures_fail_loudly() {
+        let row = row_with(vec![vec![0.7, 0.3]]);
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut corrections = HashMap::new();
+            corrections.insert("t0".to_owned(), bad);
+            assert!(
+                matches!(
+                    corrected_average(&row, &corrections),
+                    Err(EnsembleError::BadTemperature { .. })
+                ),
+                "temperature {bad} must be rejected"
+            );
+        }
+        // Valid values still pass.
+        let mut corrections = HashMap::new();
+        corrections.insert("t0".to_owned(), 0.5);
+        assert!(corrected_average(&row, &corrections).is_ok());
     }
 
     #[test]
