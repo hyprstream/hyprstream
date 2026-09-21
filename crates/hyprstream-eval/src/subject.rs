@@ -294,6 +294,17 @@ pub fn parse_response_answers(
         .get("answers")
         .and_then(Value::as_object)
         .ok_or_else(|| EvalError::Http("response envelope is missing `answers`".to_owned()))?;
+    // Every response key must name a declared question: extra answers would
+    // otherwise be silently discarded, hiding a response/request schema
+    // mismatch behind a row that passes all per-question checks.
+    for key in answers.keys() {
+        if set.question(key).is_none() {
+            return Err(EvalError::InvalidAnswer {
+                question_id: key.clone(),
+                message: "response answers an undeclared question".to_owned(),
+            });
+        }
+    }
     let mut row = std::collections::BTreeMap::new();
     for question in &set.questions {
         let value = answers
@@ -690,6 +701,26 @@ questions:
             &serde_json::json!({"type":"choice","probabilities":{"angry":0.5,"calm":0.4,"bored":0.1}}),
         );
         assert!(extra_label.is_err());
+    }
+
+    #[test]
+    fn response_answers_reject_undeclared_question_ids() {
+        // A stale endpoint answering an extra, undeclared question would
+        // otherwise have the key silently discarded.
+        let set = fixture();
+        let body = serde_json::json!({
+            "answers": {
+                "is_refund": {"type": "noul", "noul": 0.5},
+                "tone": {"type": "choice", "probabilities": {"angry": 0.5, "calm": 0.5}},
+                "severity": {"type": "score", "probabilities": {"0": 0.34, "1": 0.33, "2": 0.33}},
+                "mystery": {"type": "noul", "noul": 0.5}
+            }
+        });
+        let error = parse_response_answers(&set, &body).err().unwrap();
+        assert!(
+            matches!(error, EvalError::InvalidAnswer { .. }),
+            "undeclared answer key must be InvalidAnswer, got {error:?}"
+        );
     }
 
     #[test]
