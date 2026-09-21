@@ -96,55 +96,51 @@ fn reconstructed_specs_pass_the_arrow_identifier_contract() {
 }
 
 #[test]
-fn cli_rejects_unknown_label_policy() {
-    // Regression (review): an unknown label_policy must fail loud, never
-    // silently fall back to Unlimited.
+fn cli_rejects_malformed_config_values() {
+    // Regression (review rounds): malformed config must fail loud — unknown
+    // or non-string label_policy never silently selects Unlimited, and
+    // out-of-range integers never wrap into a different run configuration.
     let bin = env!("CARGO_BIN_EXE_hyprstream-synthesis");
     let dir = std::env::temp_dir();
     let roster_path = dir.join("p13-test-roster.json");
-    let config_path = dir.join("p13-test-config-bad.json");
+    let config_path = dir.join("p13-test-config.json");
     std::fs::write(
         &roster_path,
         r#"{"teachers":[{"id":"sim","version":"simulated","tos_class":"open-weights"}]}"#,
     )
     .unwrap();
-    std::fs::write(
-        &config_path,
+    let run_with = |config: &str| -> std::process::Output {
+        std::fs::write(&config_path, config).unwrap();
+        std::process::Command::new(bin)
+            .args([
+                "run",
+                "--roster",
+                roster_path.to_str().unwrap(),
+                "--manifest",
+                manifest_path().to_str().unwrap(),
+                "--config",
+                config_path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+    for bad in [
         r#"{"label_policy":"sometimes","base_items_per_family":1}"#,
-    )
-    .unwrap();
-    let bad = std::process::Command::new(bin)
-        .args([
-            "run",
-            "--roster",
-            roster_path.to_str().unwrap(),
-            "--manifest",
-            manifest_path().to_str().unwrap(),
-            "--config",
-            config_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(bad.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&bad.stderr).contains("label_policy"));
-
-    std::fs::write(
-        &config_path,
-        r#"{"label_policy":"unlimited","base_items_per_family":1}"#,
-    )
-    .unwrap();
-    let good = std::process::Command::new(bin)
-        .args([
-            "run",
-            "--roster",
-            roster_path.to_str().unwrap(),
-            "--manifest",
-            manifest_path().to_str().unwrap(),
-            "--config",
-            config_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
+        r#"{"label_policy":false,"base_items_per_family":1}"#,
+        r#"{"label_policy":42,"base_items_per_family":1}"#,
+        r#"{"label_policy":null,"base_items_per_family":1}"#,
+        r#"{"base_items_per_family":4294967296}"#,
+        r#"{"paraphrase_variants":4294967298}"#,
+    ] {
+        let out = run_with(bad);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "config {bad} must be rejected, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let good = run_with(r#"{"label_policy":"unlimited","base_items_per_family":1}"#);
     assert!(
         good.status.success(),
         "stderr: {}",

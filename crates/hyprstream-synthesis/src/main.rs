@@ -175,22 +175,28 @@ fn synthesize(args: &[String]) -> i32 {
 fn parse_config(text: &str) -> Option<SynthConfig> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let get_u64 = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
-    let policy = match value
-        .get("label_policy")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some("balanced") => LabelPolicy::Balanced {
-            slack: get_u64("label_slack").unwrap_or(1) as usize,
+    // Checked narrowing: a value that does not fit u32/usize must fail loud,
+    // never silently wrap into a different run configuration.
+    let get_u32 = |key: &str, default: u32| -> Option<u32> {
+        match get_u64(key) {
+            None => Some(default),
+            Some(raw) => u32::try_from(raw).ok(),
+        }
+    };
+    let policy = match value.get("label_policy") {
+        None => LabelPolicy::Unlimited,
+        Some(serde_json::Value::String(s)) if s == "balanced" => LabelPolicy::Balanced {
+            slack: usize::try_from(get_u64("label_slack").unwrap_or(1)).ok()?,
         },
-        Some("unlimited") | None => LabelPolicy::Unlimited,
-        // Unknown policies fail loud — silently dropping label control would
-        // skew a training run without any signal.
+        Some(serde_json::Value::String(s)) if s == "unlimited" => LabelPolicy::Unlimited,
+        // Unknown or non-string policies fail loud — silently dropping label
+        // control would skew a training run without any signal.
         Some(_) => return None,
     };
     Some(SynthConfig {
         seed_base: get_u64("seed_base").unwrap_or(0x51A1),
-        base_items_per_family: get_u64("base_items_per_family").unwrap_or(16) as u32,
-        paraphrase_variants: get_u64("paraphrase_variants").unwrap_or(2) as u32,
+        base_items_per_family: get_u32("base_items_per_family", 16)?,
+        paraphrase_variants: get_u32("paraphrase_variants", 2)?,
         label_policy: policy,
     })
 }

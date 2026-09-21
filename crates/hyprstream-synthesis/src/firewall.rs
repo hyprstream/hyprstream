@@ -41,6 +41,8 @@ pub const DEFAULT_MANIFEST_PATH: &str = "crates/hyprstream-bench/manifest/vob-1.
 pub enum FirewallError {
     /// Manifest file unreadable.
     Io(std::io::Error),
+    /// The pinned DISCLOSURE file unreadable (missing = drift).
+    DisclosureIo(std::io::Error),
     /// Manifest JSON unparseable.
     Parse(serde_json::Error),
     /// The file's blake3 does not match [`EXPECTED_MANIFEST_BLAKE3`].
@@ -56,6 +58,9 @@ impl std::fmt::Display for FirewallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(err) => write!(f, "manifest unreadable: {err}"),
+            Self::DisclosureIo(err) => {
+                write!(f, "pinned DISCLOSURE file unreadable: {err}")
+            }
             Self::Parse(err) => write!(f, "manifest unparseable: {err}"),
             Self::ManifestDigestMismatch { found } => write!(
                 f,
@@ -73,6 +78,26 @@ impl std::fmt::Display for FirewallError {
 }
 
 impl std::error::Error for FirewallError {}
+
+/// Resolve the pinned DISCLOSURE file from the manifest's embedded
+/// repo-relative path. Prefers the repo root four levels above the manifest
+/// (`<root>/crates/hyprstream-bench/manifest/<file>`); falls back to the
+/// manifest's parent's parent so a copied layout still resolves — and still
+/// fails closed (`DisclosureIo`) if the file is absent.
+fn disclosure_path_for(manifest_path: &Path, manifest: &Manifest) -> Option<std::path::PathBuf> {
+    let embedded = Path::new(&manifest.disclosure.path);
+    if let Some(root) = manifest_path.ancestors().nth(4) {
+        let candidate = root.join(embedded);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    let file_name = embedded.file_name()?;
+    manifest_path
+        .parent()
+        .and_then(Path::parent)
+        .map(|dir| dir.join(file_name))
+}
 
 /// A synthesized item that hit a firewall.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,12 +140,24 @@ pub struct Firewall {
 }
 
 impl Firewall {
-    /// Load and pin-verify the frozen manifest from disk.
+    /// Load and pin-verify the frozen manifest from disk — and the frozen
+    /// DISCLOSURE text it points at. Checking only the manifest's embedded
+    /// disclosure digest would let a drifted or deleted DISCLOSURE.md pass
+    /// unnoticed; the file itself is read, hashed, and compared against both
+    /// the embedded pin and [`EXPECTED_DISCLOSURE_BLAKE3`].
     pub fn load(path: &Path) -> Result<Self, FirewallError> {
         let bytes = std::fs::read(path).map_err(FirewallError::Io)?;
         let digest = blake3_hex(&bytes);
         let text = String::from_utf8_lossy(&bytes);
         let manifest = Manifest::from_json(&text).map_err(FirewallError::Parse)?;
+        if let Some(disclosure_path) = disclosure_path_for(path, &manifest) {
+            let disclosure_bytes =
+                std::fs::read(&disclosure_path).map_err(FirewallError::DisclosureIo)?;
+            let found = blake3_hex(&disclosure_bytes);
+            if found != EXPECTED_DISCLOSURE_BLAKE3 || found != manifest.disclosure.blake3 {
+                return Err(FirewallError::DisclosureDigestMismatch { found });
+            }
+        }
         Self::from_verified_parts(manifest, digest)
     }
 
@@ -241,5 +278,49 @@ mod tests {
             Firewall::from_verified_parts(manifest, EXPECTED_MANIFEST_BLAKE3.to_owned()).unwrap();
         assert!(firewall.is_contaminated_hash(&first));
         assert!(!firewall.is_contaminated_hash(&"e".repeat(64)));
+    }
+
+    /// Copy the frozen artifacts into a `crates/hyprstream-bench` layout
+    /// under a temp root, optionally substituting the disclosure text.
+    fn staged_layout(disclosure: Option<&[u8]>) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("p13-fw-test-{}", std::process::id()));
+        let bench = root.join("crates/hyprstream-bench");
+        let manifest_dir = bench.join("manifest");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        std::fs::copy(
+            committed_manifest_path(),
+            manifest_dir.join("vob-1.1.manifest.json"),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(bench.join("DISCLOSURE.md"));
+        if let Some(bytes) = disclosure {
+            std::fs::write(bench.join("DISCLOSURE.md"), bytes).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn disclosure_file_is_read_and_verified_at_load() {
+        // Regression (review): checking only the manifest's embedded
+        // disclosure digest let a drifted or deleted DISCLOSURE.md pass.
+        let committed =
+            std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../hyprstream-bench/DISCLOSURE.md"))
+                .unwrap();
+
+        let good = staged_layout(Some(&committed));
+        Firewall::load(&good.join("crates/hyprstream-bench/manifest/vob-1.1.manifest.json"))
+            .unwrap();
+
+        let drifted = staged_layout(Some(b"tampered disclosure text"));
+        assert!(matches!(
+            Firewall::load(&drifted.join("crates/hyprstream-bench/manifest/vob-1.1.manifest.json")),
+            Err(FirewallError::DisclosureDigestMismatch { .. })
+        ));
+
+        let missing = staged_layout(None);
+        assert!(matches!(
+            Firewall::load(&missing.join("crates/hyprstream-bench/manifest/vob-1.1.manifest.json")),
+            Err(FirewallError::DisclosureIo(_))
+        ));
     }
 }
