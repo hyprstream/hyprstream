@@ -505,41 +505,12 @@ async fn run_items_preflights_every_truth_before_the_first_subject_call() {
     );
 }
 
-/// Answers with a Choice value regardless of the question (for the
-/// kind-vs-body disagreement regression).
-struct ChoiceSubject;
-
-#[async_trait::async_trait]
-impl Subject for ChoiceSubject {
-    fn model_id(&self) -> &str {
-        "choice-1"
-    }
-
-    async fn decide(
-        &self,
-        set: &QuestionSet,
-        _state: &Entry,
-        _row: usize,
-    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
-        let mut answers = std::collections::BTreeMap::new();
-        for question in &set.questions {
-            let n = question.cardinality();
-            answers.insert(
-                question.id.clone(),
-                QuestionAnswer::answered(AnswerValue::Choice {
-                    probabilities: vec![1.0 / n as f32; n],
-                }),
-            );
-        }
-        Ok(AnswerRow { answers })
-    }
-}
-
 #[tokio::test]
 async fn run_items_matches_answers_against_the_declared_kind() {
     // Programmatically inconsistent question: declared kind Noul, body
-    // Choice. Observations are grouped and scored under `kind`, so an
-    // answer matching only the body must be rejected.
+    // Choice. The jev-1 profile preflight rejects the question itself as
+    // InvalidInput before the subject is ever called (and answers can
+    // therefore never be scored under the wrong kind).
     let mut item = noul_item();
     item.question.body = hyprstream_decision::QuestionBody::Choice {
         options: vec![
@@ -554,15 +525,37 @@ async fn run_items_matches_answers_against_the_declared_kind() {
         ],
     };
     let items = vec![item];
-    let error = Harness
-        .run_items(&items, &ChoiceSubject)
-        .await
-        .err()
-        .unwrap();
+    let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+    let error = Harness.run_items(&items, &subject).await.err().unwrap();
     assert!(
-        matches!(error, hyprstream_eval::EvalError::InvalidAnswer { .. }),
-        "body-matching but kind-mismatched answer must be InvalidAnswer, got {error:?}"
+        matches!(error, hyprstream_eval::EvalError::InvalidInput(_)),
+        "kind/body disagreement must be InvalidInput, got {error:?}"
     );
+    assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn run_items_rejects_a_profile_violating_question_before_the_subject() {
+    // A one-option choice passes DecisionSchema's id checks but violates the
+    // jev-1 choice cardinality rule (2–255); a jev-1 endpoint would reject
+    // it, so the harness must fail before the first billed call.
+    let mut item = noul_item();
+    item.question.kind = hyprstream_decision::QuestionKind::Choice;
+    item.question.body = hyprstream_decision::QuestionBody::Choice {
+        options: vec![hyprstream_decision::spec::ChoiceOption {
+            name: "only".into(),
+            rubric: None,
+        }],
+    };
+    item.truth = None;
+    let items = vec![item];
+    let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+    let error = Harness.run_items(&items, &subject).await.err().unwrap();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::InvalidInput(_)),
+        "one-option choice must be InvalidInput, got {error:?}"
+    );
+    assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 /// Abstains on every question.
