@@ -308,7 +308,10 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
     Ok(ScoreReport {
         gate,
         by_family: breakdown(&output.observations, by_question, multi_family, |obs| {
-            obs.family.clone()
+            // Untagged rows score under the same "unknown" sentinel the gate
+            // and shift split use — omitting them would leave the family
+            // breakdown irreconcilable with the gate.
+            Some(obs.family.clone().unwrap_or_else(|| "unknown".to_owned()))
         }),
         by_stratum: breakdown(&output.observations, by_question, multi_family, |obs| {
             obs.stratum.clone()
