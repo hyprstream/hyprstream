@@ -223,7 +223,7 @@ fn check_golden_vector(vector: &GoldenVector) {
         .unwrap_or_else(|error| panic!("{}: authored spec must parse: {error}", vector.name));
 
     // --- capnp question-set round-trip (spec emission) ---
-    let bytes = wire_roundtrip(&decision::question_set_to_message(&set));
+    let bytes = wire_roundtrip(&decision::question_set_to_message(&set).expect("encode"));
     let message = capnp::serialize::read_message(
         &mut &bytes[..],
         capnp::message::ReaderOptions::new(),
@@ -431,7 +431,7 @@ questions:
     criteria: ["bad", "good"]
 "#;
     let set = hyprstream_decision::parse_yaml(yaml).expect("parses");
-    let bytes = wire_roundtrip(&decision::question_set_to_message(&set));
+    let bytes = wire_roundtrip(&decision::question_set_to_message(&set).expect("encode"));
     let message =
         capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
             .expect("parses");
@@ -658,7 +658,7 @@ questions:
     )
     .expect("parses");
     set.questions[0].kind = hyprstream_decision::QuestionKind::Score;
-    let bytes = wire_roundtrip(&decision::question_set_to_message(&set));
+    let bytes = wire_roundtrip(&decision::question_set_to_message(&set).expect("encode"));
     let message = capnp::serialize::read_message(
         &mut &bytes[..],
         capnp::message::ReaderOptions::new(),
@@ -671,4 +671,52 @@ questions:
     )
     .expect("derived tag keeps the message decodable");
     assert_eq!(decoded.questions[0].kind, hyprstream_decision::QuestionKind::Noul);
+}
+
+/// Encode-side distribution validation: NaN noul, out-of-range components,
+/// and sums outside the D5 producer tolerance are rejected before emission;
+/// an empty question set cannot be encoded into a message the decoder
+/// rejects.
+#[test]
+fn encode_rejects_invalid_distributions_and_empty_sets() {
+    let version = VersionTriple {
+        schema: "s".into(),
+        model: "m".into(),
+        calib: None,
+    };
+
+    let nan_noul = row(vec![(
+        "q",
+        QuestionAnswer::answered(AnswerValue::Noul { p_true: f32::NAN }),
+    )]);
+    let error = decision::batch_to_message(&version, &[nan_noul])
+        .err()
+        .expect("NaN noul rejected");
+    assert!(matches!(
+        error,
+        decision::EncodeError::NoulProbabilityOutOfRange(_, _)
+    ));
+
+    let bad_choice = row(vec![("q", answered_choice(&[0.9, 0.9]))]);
+    let error = decision::batch_to_message(&version, &[bad_choice])
+        .err()
+        .expect("sum outside producer tolerance rejected");
+    assert!(matches!(
+        error,
+        decision::EncodeError::InvalidDistribution(_, _)
+    ));
+
+    let negative = row(vec![("q", answered_score(&[1.1, -0.1]))]);
+    let error = decision::batch_to_message(&version, &[negative])
+        .err()
+        .expect("out-of-range component rejected");
+    assert!(matches!(
+        error,
+        decision::EncodeError::InvalidDistribution(_, _)
+    ));
+
+    let error = decision::question_set_to_message(&QuestionSet::default())
+        .err()
+        .expect("empty question set rejected at encode");
+    assert_eq!(error, decision::EncodeError::EmptyQuestionSet);
 }

@@ -14,6 +14,7 @@
 //!   distinct, mirroring D3/D4.
 //! - `null` = abstained; an abstained answer must not carry a conformal set.
 
+use hyprstream_decision::confidence::{check_distribution, DistributionError, PRODUCER_SUM_TOLERANCE};
 use hyprstream_decision::{
     AnswerRow, AnswerValue, ChoiceOption, Entry, NoulCriteria, QuestionAnswer, QuestionBody,
     QuestionKind, QuestionSet, QuestionSpec, VersionTriple,
@@ -68,6 +69,16 @@ pub enum EncodeError {
     /// decoder rejects such messages.
     #[error("abstained answer for question {0} carries a conformal set")]
     AbstainedWithConformalSet(String),
+    /// A question set with zero questions (the decoder rejects these).
+    #[error("empty question set cannot be encoded")]
+    EmptyQuestionSet,
+    /// A noul probability outside [0, 1] or not finite.
+    #[error("noul probability out of range for question {0}: {1}")]
+    NoulProbabilityOutOfRange(String, f32),
+    /// A choice/score vector violating the producer distribution contract
+    /// (finite components in [0, 1], sum within D5 producer tolerance).
+    #[error("invalid distribution for question {0}: {1}")]
+    InvalidDistribution(String, DistributionError),
 }
 
 impl From<capnp::Error> for DecodeError {
@@ -311,7 +322,10 @@ fn get_question_spec(
 /// Encode a question set as a `QuestionSet` message.
 pub fn question_set_to_message(
     set: &QuestionSet,
-) -> capnp::message::Builder<capnp::message::HeapAllocator> {
+) -> Result<capnp::message::Builder<capnp::message::HeapAllocator>, EncodeError> {
+    if set.questions.is_empty() {
+        return Err(EncodeError::EmptyQuestionSet);
+    }
     let mut message = capnp::message::Builder::new_default();
     let mut root = message.init_root::<decision_capnp::question_set::Builder<'_>>();
     set_opt_entry(root.reborrow().init_state(), set.state.as_ref());
@@ -320,7 +334,7 @@ pub fn question_set_to_message(
         let mut item = questions.reborrow().get(index as u32);
         set_question_spec(&mut item, spec);
     }
-    message
+    Ok(message)
 }
 
 /// Decode a `QuestionSet` message back into the IR.
@@ -386,6 +400,23 @@ pub fn batch_to_message(
         for (answer_index, (question_id, answer)) in row.answers.iter().enumerate() {
             if answer.value.is_none() && answer.conformal_set.is_some() {
                 return Err(EncodeError::AbstainedWithConformalSet(question_id.clone()));
+            }
+            match &answer.value {
+                Some(AnswerValue::Noul { p_true })
+                    if !p_true.is_finite() || !(0.0..=1.0).contains(p_true) =>
+                {
+                    return Err(EncodeError::NoulProbabilityOutOfRange(
+                        question_id.clone(),
+                        *p_true,
+                    ));
+                }
+                Some(AnswerValue::Choice { probabilities })
+                | Some(AnswerValue::Score { probabilities }) => {
+                    check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).map_err(|error| {
+                        EncodeError::InvalidDistribution(question_id.clone(), error)
+                    })?;
+                }
+                _ => {}
             }
             let mut answer_builder = answers.reborrow().get(answer_index as u32);
             answer_builder.set_question_id(question_id);

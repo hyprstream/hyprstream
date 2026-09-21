@@ -60,6 +60,9 @@ fn main() {
     let _ = std::fs::create_dir_all(&codegen_dir);
     for name in &schemas {
         if *name == "decision" {
+            // Remove any stale copy left by an earlier build in this checkout —
+            // the TS generator enumerates every .cgr in codegen-out/.
+            let _ = std::fs::remove_file(codegen_dir.join("decision.cgr"));
             continue;
         }
         let cgr_path = out_path.join(format!("{name}.cgr"));
