@@ -95,7 +95,7 @@ async fn truth_subject_scores_perfectly_on_bench_items() {
     assert!(flip.groups > 0);
     assert_eq!(flip.flip_rate, 0.0);
     for bucket in &report.by_family {
-        assert_eq!(bucket.accuracy, 1.0, "family {}", bucket.key);
+        assert_eq!(bucket.accuracy, Some(1.0), "family {}", bucket.key);
     }
 }
 
@@ -563,4 +563,47 @@ async fn run_items_matches_answers_against_the_declared_kind() {
         matches!(error, hyprstream_eval::EvalError::InvalidAnswer { .. }),
         "body-matching but kind-mismatched answer must be InvalidAnswer, got {error:?}"
     );
+}
+
+/// Abstains on every question.
+struct AbstainSubject;
+
+#[async_trait::async_trait]
+impl Subject for AbstainSubject {
+    fn model_id(&self) -> &str {
+        "abstain-1"
+    }
+
+    async fn decide(
+        &self,
+        set: &QuestionSet,
+        _state: &Entry,
+        _row: usize,
+    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+        let mut answers = std::collections::BTreeMap::new();
+        for question in &set.questions {
+            answers.insert(question.id.clone(), QuestionAnswer::abstained());
+        }
+        Ok(AnswerRow { answers })
+    }
+}
+
+#[tokio::test]
+async fn unmeasured_breakdown_metrics_are_absent_not_zero() {
+    // A family whose rows are all abstained has no scored rows: macro-ECE
+    // and accuracy must be absent, never a fake-perfect 0.0.
+    let items: Vec<EvalItem> = small_items().iter().take(6).map(EvalItem::from).collect();
+    let output = Harness.run_items(&items, &AbstainSubject).await.unwrap();
+    let report = score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
+    assert!(report.gate.is_none(), "no scored rows, no gate");
+    assert!(!report.by_family.is_empty());
+    for bucket in &report.by_family {
+        assert_eq!(bucket.macro_ece, None, "family {}", bucket.key);
+        assert_eq!(bucket.accuracy, None, "family {}", bucket.key);
+        assert_eq!(bucket.abstention_rate, 1.0, "family {}", bucket.key);
+    }
+    for bucket in &report.by_stratum {
+        assert_eq!(bucket.macro_ece, None, "stratum {}", bucket.key);
+        assert_eq!(bucket.accuracy, None, "stratum {}", bucket.key);
+    }
 }
