@@ -45,6 +45,19 @@ pub enum DecodeError {
     /// A noul probability fell outside [0, 1].
     #[error("noul probability out of range for question {0}: {1}")]
     NoulProbabilityOutOfRange(String, f32),
+    /// An empty question id (authoring rejects these; the wire must too).
+    #[error("empty question id on the wire")]
+    EmptyQuestionId,
+    /// An empty choice option name (authoring rejects these).
+    #[error("empty choice option name in question {0}")]
+    EmptyChoiceOptionName(String),
+    /// A repeated choice option name — labels must be unique for argmax and
+    /// conformal-set output to stay well-defined (authoring rejects these).
+    #[error("duplicate choice option name {1:?} in question {0}")]
+    DuplicateChoiceOptionName(String, String),
+    /// A question set with zero questions (authoring requires >= 1).
+    #[error("empty question set on the wire")]
+    EmptyQuestionSet,
 }
 
 impl From<capnp::Error> for DecodeError {
@@ -194,6 +207,9 @@ fn get_question_spec(
     reader: decision_capnp::question_spec::Reader<'_>,
 ) -> Result<QuestionSpec, DecodeError> {
     let id = reader.get_id()?.to_str()?.to_owned();
+    if id.is_empty() {
+        return Err(DecodeError::EmptyQuestionId);
+    }
     let kind = reader.get_kind()?;
     let instructions = get_opt_entry(reader.get_instructions()?)?;
     let body = match reader.get_body().which()? {
@@ -226,8 +242,15 @@ fn get_question_spec(
             let options = options?;
             let mut out = Vec::with_capacity(options.len() as usize);
             for option in options.iter() {
+                let name = option.get_name()?.to_str()?.to_owned();
+                if name.is_empty() {
+                    return Err(DecodeError::EmptyChoiceOptionName(id));
+                }
+                if out.iter().any(|existing: &ChoiceOption| existing.name == name) {
+                    return Err(DecodeError::DuplicateChoiceOptionName(id, name));
+                }
                 out.push(ChoiceOption {
-                    name: option.get_name()?.to_str()?.to_owned(),
+                    name,
                     rubric: get_opt_entry(option.get_rubric()?)?,
                 });
             }
@@ -293,6 +316,9 @@ pub fn question_set_from_reader(
     for spec in questions_reader.iter() {
         questions.push(get_question_spec(spec)?);
     }
+    if questions.is_empty() {
+        return Err(DecodeError::EmptyQuestionSet);
+    }
     Ok(QuestionSet { state, questions })
 }
 
@@ -331,8 +357,9 @@ pub fn batch_to_message(
         let mut triple = root.reborrow().init_version();
         triple.set_schema(&version.schema);
         triple.set_model(&version.model);
-        if let Some(calib) = &version.calib {
-            triple.set_calib(calib);
+        match &version.calib {
+            None => triple.reborrow().init_calib().set_none(()),
+            Some(calib) => triple.init_calib().set_some(calib),
         }
     }
     let mut rows_builder = root.init_rows(rows.len() as u32);
@@ -366,10 +393,11 @@ pub fn batch_from_reader(
     let version = VersionTriple {
         schema: triple.get_schema()?.to_str()?.to_owned(),
         model: triple.get_model()?.to_str()?.to_owned(),
-        calib: if triple.has_calib() {
-            Some(triple.get_calib()?.to_str()?.to_owned())
-        } else {
-            None
+        calib: match triple.get_calib()?.which()? {
+            crate::optional_capnp::option_text::None(()) => None,
+            crate::optional_capnp::option_text::Some(calib) => {
+                Some(calib?.to_str()?.to_owned())
+            }
         },
     };
     let rows_reader = reader.get_rows()?;

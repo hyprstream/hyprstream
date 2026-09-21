@@ -507,3 +507,122 @@ fn decode_rejects_kind_body_mismatch_and_reserved_types() {
         decision::DecodeError::ReservedQuestionType("span", _)
     ));
 }
+
+/// Wire-decode validation mirrors the authoring rules: empty ids, empty or
+/// duplicated option names, and empty question sets are rejected (not deferred
+/// to the Arrow surface).
+#[test]
+fn decode_rejects_invalid_wire_specs() {
+    use hyprstream_rpc_std::decision_capnp;
+
+    let build_and_decode = |build: &dyn Fn(
+        decision_capnp::question_set::Builder<'_>,
+    )|
+     -> Result<QuestionSet, decision::DecodeError> {
+        let mut message = capnp::message::Builder::new_default();
+        build(message.init_root::<decision_capnp::question_set::Builder<'_>>());
+        let bytes = wire_roundtrip(&message);
+        let message = capnp::serialize::read_message(
+            &mut &bytes[..],
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("parses");
+        decision::question_set_from_reader(
+            message
+                .get_root::<decision_capnp::question_set::Reader<'_>>()
+                .expect("root"),
+        )
+    };
+    let noul_question = |mut q: decision_capnp::question_spec::Builder<'_>, id: &str| {
+        q.set_id(id);
+        q.set_kind(decision_capnp::QuestionKind::Noul);
+        q.reborrow().init_instructions().set_none(());
+        q.init_body().init_noul().set_none(());
+    };
+
+    // Empty question id.
+    let error = build_and_decode(&|mut root| {
+        root.reborrow().init_state().set_none(());
+        let mut questions = root.init_questions(1);
+        noul_question(questions.reborrow().get(0), "");
+    })
+    .expect_err("empty id rejected");
+    assert_eq!(error, decision::DecodeError::EmptyQuestionId);
+
+    // Zero questions.
+    let error = build_and_decode(&|mut root| {
+        root.reborrow().init_state().set_none(());
+        root.init_questions(0);
+    })
+    .expect_err("empty question set rejected");
+    assert_eq!(error, decision::DecodeError::EmptyQuestionSet);
+
+    let choice_question = |mut q: decision_capnp::question_spec::Builder<'_>,
+                           names: &[&str]| {
+        q.set_id("c");
+        q.set_kind(decision_capnp::QuestionKind::Choice);
+        q.reborrow().init_instructions().set_none(());
+        let mut options = q.init_body().init_choice(names.len() as u32);
+        for (index, name) in names.iter().enumerate() {
+            let mut option = options.reborrow().get(index as u32);
+            option.set_name(name);
+            option.init_rubric().set_none(());
+        }
+    };
+
+    // Empty option name.
+    let error = build_and_decode(&|mut root| {
+        root.reborrow().init_state().set_none(());
+        let mut questions = root.init_questions(1);
+        choice_question(questions.reborrow().get(0), &["a", ""]);
+    })
+    .expect_err("empty option name rejected");
+    assert!(matches!(
+        error,
+        decision::DecodeError::EmptyChoiceOptionName(_)
+    ));
+
+    // Duplicate option name.
+    let error = build_and_decode(&|mut root| {
+        root.reborrow().init_state().set_none(());
+        let mut questions = root.init_questions(1);
+        choice_question(questions.reborrow().get(0), &["a", "b", "a"]);
+    })
+    .expect_err("duplicate option name rejected");
+    assert!(matches!(
+        error,
+        decision::DecodeError::DuplicateChoiceOptionName(_, _)
+    ));
+}
+
+/// The calib version survives a round-trip with the uncalibrated state
+/// distinct from any string value (explicit OptionText wrapper — a null Text
+/// pointer would collapse to "" in consumers without pointer-presence
+/// tracking).
+#[test]
+fn calib_none_is_distinct_from_empty_string() {
+    for calib in [None, Some(String::new()), Some("calib-1".to_owned())] {
+        let version = VersionTriple {
+            schema: "s".into(),
+            model: "m".into(),
+            calib: calib.clone(),
+        };
+        let rows = vec![row(vec![(
+            "q",
+            QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.5 }),
+        )])];
+        let bytes = wire_roundtrip(&decision::batch_to_message(&version, &rows));
+        let message = capnp::serialize::read_message(
+            &mut &bytes[..],
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("parses");
+        let (decoded, _) = decision::batch_from_reader(
+            message
+                .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
+                .expect("root"),
+        )
+        .expect("decodes");
+        assert_eq!(decoded.calib, calib, "calib {calib:?} round-trips exactly");
+    }
+}

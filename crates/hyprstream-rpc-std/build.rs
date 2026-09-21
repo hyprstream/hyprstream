@@ -51,10 +51,17 @@ fn main() {
 
     hyprstream_rpc_build::compile_schemas(schema_dir, out_path, import_paths, &schemas);
 
-    // Copy CGR files to stable codegen-out/ for TypeScript codegen
+    // Copy CGR files to stable codegen-out/ for TypeScript codegen.
+    // `decision` is excluded: it is a native-only data contract (recursive
+    // Entry type, zero request/response variants) and the TypeScript generator
+    // fails closed on it. P3.1 re-evaluates TS support when the decision
+    // surface gains service registration.
     let codegen_dir = Path::new(&manifest_dir).join("../../codegen-out");
     let _ = std::fs::create_dir_all(&codegen_dir);
     for name in &schemas {
+        if *name == "decision" {
+            continue;
+        }
         let cgr_path = out_path.join(format!("{name}.cgr"));
         if cgr_path.exists() {
             let _ = std::fs::copy(&cgr_path, codegen_dir.join(format!("{name}.cgr")));

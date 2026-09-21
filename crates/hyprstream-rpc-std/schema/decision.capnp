@@ -1,5 +1,7 @@
 @0xfe1d220e97eb195f;
 
+using Opt = import "/optional.capnp";
+
 # Cap'n Proto schema for the System One decision surface (P0.1b).
 #
 # jev-1 question-spec + answer wire types, mirroring the IR in
@@ -113,11 +115,14 @@ struct QuestionAnswer {
 }
 
 # Batch-level version triple: question-set schema version, resolved model id,
-# calibration-fit version (null pointer = uncalibrated raw distribution).
+# calibration-fit version. calib uses the explicit OptionText wrapper (not a
+# nullable Text pointer): pointer-null collapses to "" in consumers without
+# pointer-presence tracking, which would silently flip "uncalibrated" to a
+# calibration version of "" on a round-trip.
 struct VersionTriple {
   schema @0 :Text;
   model  @1 :Text;
-  calib  @2 :Text;
+  calib  @2 :Opt.OptionText;   # none = uncalibrated raw distribution
 }
 
 struct AnswerRow {
