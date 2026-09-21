@@ -179,6 +179,21 @@ fn parse_config(text: &str) -> Option<SynthConfig> {
     if !value.is_object() {
         return None;
     }
+    // Unknown keys fail loud: a misspelled setting must never silently fall
+    // back to its default.
+    const KNOWN_KEYS: [&str; 5] = [
+        "seed_base",
+        "base_items_per_family",
+        "paraphrase_variants",
+        "label_policy",
+        "label_slack",
+    ];
+    if value
+        .as_object()
+        .is_some_and(|object| object.keys().any(|key| !KNOWN_KEYS.contains(&key.as_str())))
+    {
+        return None;
+    }
     // Strict presence semantics: an absent key takes the default, but a
     // present value that is not a u64 (false, -1, "16", 1.5, ...) fails loud
     // instead of silently reverting to the default.
@@ -203,9 +218,14 @@ fn parse_config(text: &str) -> Option<SynthConfig> {
         // control would skew a training run without any signal.
         Some(_) => return None,
     };
+    let base_items_per_family = get_u32("base_items_per_family", 16)?;
+    // A zero-sized run writes an empty corpus while reporting success.
+    if base_items_per_family == 0 {
+        return None;
+    }
     Some(SynthConfig {
         seed_base: get_u64("seed_base", 0x51A1)?,
-        base_items_per_family: get_u32("base_items_per_family", 16)?,
+        base_items_per_family,
         paraphrase_variants: get_u32("paraphrase_variants", 2)?,
         label_policy: policy,
     })
