@@ -1,43 +1,34 @@
 name: OCI Runtime Image Validation
 
-# Build a CPU/arm64 runtime image on every PR that can break it, then run the
-# image and prove it executes, starts as its service, and either serves /health
-# or refuses cleanly at deployment-trust enforcement (a bare CI container has
-# no deployment CA). Before this workflow, NO pull_request-triggered job
-# built a runtime image — a runtime regression first appeared as a broken
-# publish on main (see docker-build.yml / build-image.yml trigger tables).
+# Build a CPU/arm64 runtime image for every merge candidate, then run the
+# image and prove it executes, starts as its service, and either serves
+# /health or refuses cleanly at deployment-trust enforcement (a bare CI
+# container has no deployment CA). This job gates at the merge queue
+# (merge_group) only — long CI runs gate at merge, not on every PR push.
 #
 # Validates the CPU arm64 path ONLY. CUDA/ROCm need GPU-host validation and
 # amd64 is not exercised here — both are noted gaps. The arm64 CPU path is the
 # one whose runtime base, library destinations, and USER directive changed in
 # the core-runtime migration.
 #
-# Path filter rationale: only files that are COPYed into the builder stage or
-# that define the image itself can affect the runtime artifact. Rust source
-# outside crates/ (e.g. docs, .github) cannot change what enters the image.
+# Trigger scoping: merge_group does not support `paths` filters, so the job
+# runs on every merge candidate. The files that can affect the runtime
+# artifact are unchanged from the former PR path filter: Dockerfile, this
+# workflow, Cargo.toml/Cargo.lock, crates/**, workspace-hack/**, and
+# rust-toolchain.toml — anything else cannot change what enters the image.
 on:
-  pull_request:
-    paths:
-      - 'Dockerfile'
-      - '.github/workflows/oci-runtime-validate.yml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/**'
-      # The generated workspace-hack is COPY'd into the release builder stage,
-      # so a hack-only change (e.g. hakari config) can alter or break the
-      # image without touching crates/.
-      - 'workspace-hack/**'
-      - 'rust-toolchain.toml'
+  merge_group:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Cancel stale runs when a new commit is pushed to the same PR — the
-# Graviton runner pool is shared and scarce.
+# Merge-group runs must never be cancelled by a new PR push; manual dispatches
+# on the same ref supersede each other. The Graviton runner pool is shared and
+# scarce.
 concurrency:
-  group: oci-runtime-validate-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: oci-runtime-validate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
 
 jobs:
   build-runtime-and-smoke-test:

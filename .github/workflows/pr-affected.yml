@@ -1,7 +1,7 @@
-# Affected-set PR check: fast feedback for leaf-crate changes.
+# Affected-set check: fast feedback for leaf-crate changes.
 #
-# Computes the workspace crates touched by a PR and runs nextest + clippy on
-# just that set in the pinned builder (~2-3 min for a leaf crate instead of
+# Computes the workspace crates touched by a change and runs nextest + clippy
+# on just that set in the pinned builder (~2-3 min for a leaf crate instead of
 # the full gate's ~30 min). Root manifests, workspace-hack, toolchain, or
 # .github changes fall back to the full default-members set. Pure-docs PRs
 # no-op. Runs on the same self-hosted graviton pool as every other build job
@@ -9,14 +9,20 @@
 # + CARGO_TARGET_DIR namespace (target/hyprstream-pr) so it never contends
 # with the merge gate's target dir.
 #
-# House rules: no continue-on-error, no `|| true` — the cargo commands below
-# must be able to fail. This job is informational at the repo level (not in
-# branch protection) and blocking for the crates it names.
+# Trigger split (long CI runs gate at merge, not on every PR push):
+#   - pull_request : INFORMATIONAL feedback leg. continue-on-error keeps the
+#     check green at the repo level even when the affected set fails — the
+#     same computation re-runs as the blocking verdict at merge time.
+#   - merge_group  : BLOCKING verdict ("pr-affected (merge gate)"), required
+#     by the protection ruleset. It runs the identical affected-set
+#     computation (pr_affected.py) against the synthetic merge candidate.
+# House rules: no `|| true` — the cargo commands below must be able to fail.
 name: PR affected-set
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  merge_group:
 
 permissions:
   contents: read
@@ -31,14 +37,18 @@ env:
   SCCACHE_BUCKET: ${{ vars.AWS_SCCACHE_BUCKET }}
   SCCACHE_REGION: ${{ vars.AWS_SCCACHE_REGION }}
 
+# PR legs cancel superseded runs on the same PR; merge_group runs are keyed
+# by the queue ref and are NEVER cancelled by a new PR push.
 concurrency:
-  group: pr-affected-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: pr-affected-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
 
 jobs:
   pr-affected:
-    name: pr-affected (informational + blocking for touched crates)
-    if: github.event_name == 'pull_request'
+    name: pr-affected (${{ github.event_name == 'merge_group' && 'merge gate' || 'informational' }})
+    # The PR leg is feedback only: a failure must not block review. The merge
+    # queue leg is the required, blocking verdict.
+    continue-on-error: ${{ github.event_name != 'merge_group' }}
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
     timeout-minutes: 90
     steps:
@@ -64,8 +74,12 @@ jobs:
 
     - name: Affected-set nextest + clippy (in rust-builder container)
       env:
-        BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        # pull_request: diff the PR head against its base. merge_group: diff
+        # the synthetic merge-candidate head against its main-side base —
+        # merge-base of those is the base itself, so the affected set is
+        # exactly the PR's changes against the latest main.
+        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
       run: |
         # Tests run as the image-baked unprivileged ci user (same as the
         # merge-gate build job): root ignores directory permissions, which
