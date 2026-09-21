@@ -253,10 +253,10 @@ impl Harness {
         items: &[EvalItem],
         subject: &dyn Subject,
     ) -> Result<RunOutput, EvalError> {
-        let mut observations = Vec::with_capacity(items.len());
-        for (row_index, item) in items.iter().enumerate() {
-            // An out-of-cardinality truth index is an input error, caught
-            // before any subject call rather than at scoring time.
+        // Preflight EVERY item's truth index before the first subject call:
+        // item N's invalid truth must not surface only after the preceding
+        // N−1 items have invoked (and possibly billed) the subject.
+        for item in items {
             if let Some(truth) = item.truth {
                 if truth >= item.question.cardinality() {
                     return Err(EvalError::InvalidInput(format!(
@@ -267,6 +267,9 @@ impl Harness {
                     )));
                 }
             }
+        }
+        let mut observations = Vec::with_capacity(items.len());
+        for (row_index, item) in items.iter().enumerate() {
             let set = QuestionSet {
                 state: Some(item.state.clone()),
                 questions: vec![item.question.clone()],
@@ -371,20 +374,18 @@ fn validate_one_answer(
         }
         return Ok(());
     };
-    let kind_matches = matches!(
-        (&question.body, value),
-        (hyprstream_decision::spec::QuestionBody::Noul { .. }, AnswerValue::Noul { .. })
-            | (hyprstream_decision::spec::QuestionBody::Choice { .. }, AnswerValue::Choice { .. })
-            | (hyprstream_decision::spec::QuestionBody::Score { .. }, AnswerValue::Score { .. })
-    );
-    if !kind_matches {
-        let got = match value {
-            AnswerValue::Noul { .. } => QuestionKind::Noul,
-            AnswerValue::Choice { .. } => QuestionKind::Choice,
-            AnswerValue::Score { .. } => QuestionKind::Score,
-        };
+    // Match against the DECLARED kind, not the body variant: a
+    // programmatically built question whose public `kind` and `body`
+    // disagree is scored under `kind`, so the answer must agree with `kind`
+    // too (the same rule `DecisionSchema` enforces).
+    let answer_kind = match value {
+        AnswerValue::Noul { .. } => QuestionKind::Noul,
+        AnswerValue::Choice { .. } => QuestionKind::Choice,
+        AnswerValue::Score { .. } => QuestionKind::Score,
+    };
+    if answer_kind != question.kind {
         return Err(format!(
-            "answer kind {got} does not match question kind {}",
+            "answer kind {answer_kind} does not match question kind {}",
             question.kind
         ));
     }

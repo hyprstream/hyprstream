@@ -336,6 +336,13 @@ async fn untagged_observations_join_the_split_as_unknown() {
     let gate = report.gate.as_ref().unwrap();
     assert!(gate.fields.iter().all(|f| f.family == "unknown"));
     assert_eq!(gate.shift_split.eval_families, vec!["unknown".to_owned()]);
+    // The family breakdown must reconcile with the gate: untagged rows
+    // appear under the same sentinel, not vanish from by_family.
+    assert!(
+        report.by_family.iter().any(|bucket| bucket.key == "unknown"),
+        "untagged rows must appear in by_family under `unknown`: {:?}",
+        report.by_family.iter().map(|b| &b.key).collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
@@ -475,4 +482,85 @@ async fn run_items_rejects_out_of_cardinality_truth_before_calling_the_subject()
         "out-of-cardinality truth must be InvalidInput, got {error:?}"
     );
     assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn run_items_preflights_every_truth_before_the_first_subject_call() {
+    // A bad truth on item N must fail before item 1 is ever sent to the
+    // (possibly billed) subject — not after N−1 calls.
+    let mut bad = noul_item();
+    bad.id = "val-2".into();
+    bad.truth = Some(2); // noul cardinality is 2
+    let items = vec![noul_item(), bad];
+    let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+    let error = Harness.run_items(&items, &subject).await.err().unwrap();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::InvalidInput(_)),
+        "out-of-cardinality truth must be InvalidInput, got {error:?}"
+    );
+    assert_eq!(
+        subject.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no item may reach the subject when a later item's truth is invalid"
+    );
+}
+
+/// Answers with a Choice value regardless of the question (for the
+/// kind-vs-body disagreement regression).
+struct ChoiceSubject;
+
+#[async_trait::async_trait]
+impl Subject for ChoiceSubject {
+    fn model_id(&self) -> &str {
+        "choice-1"
+    }
+
+    async fn decide(
+        &self,
+        set: &QuestionSet,
+        _state: &Entry,
+        _row: usize,
+    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+        let mut answers = std::collections::BTreeMap::new();
+        for question in &set.questions {
+            let n = question.cardinality();
+            answers.insert(
+                question.id.clone(),
+                QuestionAnswer::answered(AnswerValue::Choice {
+                    probabilities: vec![1.0 / n as f32; n],
+                }),
+            );
+        }
+        Ok(AnswerRow { answers })
+    }
+}
+
+#[tokio::test]
+async fn run_items_matches_answers_against_the_declared_kind() {
+    // Programmatically inconsistent question: declared kind Noul, body
+    // Choice. Observations are grouped and scored under `kind`, so an
+    // answer matching only the body must be rejected.
+    let mut item = noul_item();
+    item.question.body = hyprstream_decision::QuestionBody::Choice {
+        options: vec![
+            hyprstream_decision::spec::ChoiceOption {
+                name: "a".into(),
+                rubric: None,
+            },
+            hyprstream_decision::spec::ChoiceOption {
+                name: "b".into(),
+                rubric: None,
+            },
+        ],
+    };
+    let items = vec![item];
+    let error = Harness
+        .run_items(&items, &ChoiceSubject)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::InvalidAnswer { .. }),
+        "body-matching but kind-mismatched answer must be InvalidAnswer, got {error:?}"
+    );
 }
