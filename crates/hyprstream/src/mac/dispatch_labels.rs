@@ -102,6 +102,55 @@ pub mod policy_methods {
     pub const REFRESH_SERVICE_TOKEN: u16 = 19;
 }
 
+/// Canonical `InferenceRequest` union discriminants.
+///
+/// The values are the Cap'n Proto union discriminants: 0-based DECLARATION
+/// order of the members in `hyprstream-rpc-std/schema/inference.capnp` — NOT
+/// the members' explicit `@N` field ordinals (generateStream is `@1` on the
+/// wire-field axis but carries union discriminant 0). Every member declares
+/// `$dispatchMac("internal:pq-hybrid")`, so every row these constants index
+/// carries the schema-declared hybrid label. The drift test in this module
+/// decodes real serialized requests and pins representative values to the
+/// schema; changing the union order fails CI rather than silently relabeling
+/// the dispatch plane.
+pub mod inference_methods {
+    /// `generateStream` — tenant-authorized streaming generation.
+    pub const GENERATE_STREAM: u16 = 0;
+    pub const MODEL_INFO: u16 = 1;
+    pub const IS_READY: u16 = 2;
+    pub const APPLY_CHAT_TEMPLATE: u16 = 3;
+    pub const CREATE_LORA: u16 = 4;
+    pub const LOAD_LORA: u16 = 5;
+    pub const SAVE_LORA: u16 = 6;
+    pub const UNLOAD_LORA: u16 = 7;
+    pub const HAS_LORA: u16 = 8;
+    pub const SET_SESSION: u16 = 9;
+    pub const CLEAR_SESSION: u16 = 10;
+    pub const RELEASE_SESSION: u16 = 11;
+    pub const HEALTH_CHECK: u16 = 12;
+    /// `shutdown` — engine lifecycle management (`$scope(manage)`).
+    pub const SHUTDOWN: u16 = 13;
+    pub const TTT_WRITEBACK: u16 = 14;
+    pub const TTT_EVICT: u16 = 15;
+    pub const TRAIN_STEP: u16 = 16;
+    pub const TTT_ZERO: u16 = 17;
+    pub const GET_DELTA_STATUS: u16 = 18;
+    pub const SAVE_ADAPTATION: u16 = 19;
+    pub const SNAPSHOT_DELTA: u16 = 20;
+    pub const TRAIN_STEP_STREAM: u16 = 21;
+    pub const EXPORT_PEFT_ADAPTER: u16 = 22;
+    pub const MERGE_LORA: u16 = 23;
+    pub const CREATE_LORA_STREAM: u16 = 24;
+    pub const LOAD_LORA_STREAM: u16 = 25;
+    pub const SAVE_LORA_STREAM: u16 = 26;
+    pub const SAVE_ADAPTATION_STREAM: u16 = 27;
+    pub const SNAPSHOT_DELTA_STREAM: u16 = 28;
+    pub const EXPORT_PEFT_ADAPTER_STREAM: u16 = 29;
+    pub const MERGE_LORA_STREAM: u16 = 30;
+    pub const EMBED: u16 = 31;
+    pub const GET_LAYER_PROFILE: u16 = 32;
+}
+
 /// The deliberate subject clearance declared for the staging bootstrap
 /// services: an internal system principal presenting a verified classical
 /// key. The assurance axis is a *ceiling*, not a grant — evaluation clamps it
@@ -121,6 +170,32 @@ pub const BOOTSTRAP_SERVICE_CLEARANCE: SecurityLabel = SecurityLabel {
 /// this row is `service:oauth`, whose verified hybrid envelope is additionally
 /// checked by the regular PolicyService authorization and issuance guards.
 pub const OAUTH_ISSUANCE_LABEL: SecurityLabel = SecurityLabel {
+    level: Level::Internal,
+    assurance: Assurance::PqHybrid,
+    compartments: CompartmentSet::EMPTY,
+};
+
+/// Schema-declared label of every `InferenceRequest` member.
+///
+/// All `inference.capnp` members are annotated
+/// `$dispatchMac("internal:pq-hybrid")`; the schema is the security contract,
+/// so the declared rows carry the hybrid label rather than the bootstrap
+/// floor. Callers are the hybrid-enrolled internal services (`model`, `oai`)
+/// whose tenant/user authorization runs at their own layer; the verified
+/// PqHybrid key material of those envelopes is what lets them dominate this
+/// label.
+pub const INFERENCE_METHOD_LABEL: SecurityLabel = SecurityLabel {
+    level: Level::Internal,
+    assurance: Assurance::PqHybrid,
+    compartments: CompartmentSet::EMPTY,
+};
+
+/// Service subject clearance for the hybrid-enrolled runtime services whose
+/// RPC surfaces are schema-declared `internal:pq-hybrid` (`model`, `oai`,
+/// `inference`). Identical in value to [`OAUTH_ISSUANCE_LABEL`] and
+/// [`INFERENCE_METHOD_LABEL`]; the distinct names keep each declaration's
+/// review intent legible.
+pub const HYBRID_SERVICE_CLEARANCE: SecurityLabel = SecurityLabel {
     level: Level::Internal,
     assurance: Assurance::PqHybrid,
     compartments: CompartmentSet::EMPTY,
@@ -415,6 +490,303 @@ impl MacDispatchPep for DeclaredDispatchPep {
 
 static BOOTSTRAP_METHODS: &[DispatchMethodPolicy] = &[
     DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::GENERATE_STREAM,
+        },
+        method_name: "generateStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-authorized generation/embedding against the admitted engine; the handler enforces tenant binding, model admission, and the spend ledger (infer scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::MODEL_INFO,
+        },
+        method_name: "modelInfo",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "read-only introspection of the admitted engine; the handler retains tenant binding and readiness gating (query scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::IS_READY,
+        },
+        method_name: "isReady",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "read-only introspection of the admitted engine; the handler retains tenant binding and readiness gating (query scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::APPLY_CHAT_TEMPLATE,
+        },
+        method_name: "applyChatTemplate",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "read-only introspection of the admitted engine; the handler retains tenant binding and readiness gating (query scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::CREATE_LORA,
+        },
+        method_name: "createLora",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::LOAD_LORA,
+        },
+        method_name: "loadLora",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SAVE_LORA,
+        },
+        method_name: "saveLora",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::UNLOAD_LORA,
+        },
+        method_name: "unloadLora",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::HAS_LORA,
+        },
+        method_name: "hasLora",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "read-only introspection of the admitted engine; the handler retains tenant binding and readiness gating (query scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SET_SESSION,
+        },
+        method_name: "setSession",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::CLEAR_SESSION,
+        },
+        method_name: "clearSession",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::RELEASE_SESSION,
+        },
+        method_name: "releaseSession",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::HEALTH_CHECK,
+        },
+        method_name: "healthCheck",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "read-only introspection of the admitted engine; the handler retains tenant binding and readiness gating (query scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SHUTDOWN,
+        },
+        method_name: "shutdown",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "engine lifecycle management restricted to the verified hybrid model-service authority; the handler retains its own admission checks (manage scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::TTT_WRITEBACK,
+        },
+        method_name: "tttWriteback",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "TTT training/adaptation step against the tenant-bound engine; the handler enforces tenant binding (train scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::TTT_EVICT,
+        },
+        method_name: "tttEvict",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "TTT training/adaptation step against the tenant-bound engine; the handler enforces tenant binding (train scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::TRAIN_STEP,
+        },
+        method_name: "trainStep",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "TTT training/adaptation step against the tenant-bound engine; the handler enforces tenant binding (train scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::TTT_ZERO,
+        },
+        method_name: "tttZero",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "engine lifecycle management restricted to the verified hybrid model-service authority; the handler retains its own admission checks (manage scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::GET_DELTA_STATUS,
+        },
+        method_name: "getDeltaStatus",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "read-only introspection of the admitted engine; the handler retains tenant binding and readiness gating (query scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SAVE_ADAPTATION,
+        },
+        method_name: "saveAdaptation",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SNAPSHOT_DELTA,
+        },
+        method_name: "snapshotDelta",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::TRAIN_STEP_STREAM,
+        },
+        method_name: "trainStepStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "TTT training/adaptation step against the tenant-bound engine; the handler enforces tenant binding (train scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::EXPORT_PEFT_ADAPTER,
+        },
+        method_name: "exportPeftAdapter",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::MERGE_LORA,
+        },
+        method_name: "mergeLora",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::CREATE_LORA_STREAM,
+        },
+        method_name: "createLoraStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::LOAD_LORA_STREAM,
+        },
+        method_name: "loadLoraStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SAVE_LORA_STREAM,
+        },
+        method_name: "saveLoraStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SAVE_ADAPTATION_STREAM,
+        },
+        method_name: "saveAdaptationStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SNAPSHOT_DELTA_STREAM,
+        },
+        method_name: "snapshotDeltaStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::EXPORT_PEFT_ADAPTER_STREAM,
+        },
+        method_name: "exportPeftAdapterStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::MERGE_LORA_STREAM,
+        },
+        method_name: "mergeLoraStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::EMBED,
+        },
+        method_name: "embed",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-authorized generation/embedding against the admitted engine; the handler enforces tenant binding, model admission, and the spend ledger (infer scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::GET_LAYER_PROFILE,
+        },
+        method_name: "getLayerProfile",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "read-only introspection of the admitted engine; the handler retains tenant binding and readiness gating (query scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
         id: DispatchMethodId { service: "policy", method: policy_methods::CHECK },
         method_name: "check",
         label: SecurityLabel::bottom(),
@@ -521,16 +893,26 @@ static BOOTSTRAP_SERVICE_CLEARANCES: &[ServiceSubjectClearance] = &[
              clearance",
     },
     ServiceSubjectClearance {
+        service: "inference",
+        clearance: HYBRID_SERVICE_CLEARANCE,
+        justification: "the hybrid-enrolled engine service answers the declared \
+             internal:pq-hybrid inference rows; its handler retains tenant \
+             binding, admission, and spend-ledger checks",
+    },
+    ServiceSubjectClearance {
         service: "model",
-        clearance: BOOTSTRAP_SERVICE_CLEARANCE,
-        justification: "the staged synthetic model registers its key before \
-             its inference RPC surface can start",
+        clearance: HYBRID_SERVICE_CLEARANCE,
+        justification: "the hybrid-enrolled model service mediates tenant- \
+             authorized generation to the schema-declared internal:pq-hybrid \
+             inference surface; its load/tenant admission checks are unchanged",
     },
     ServiceSubjectClearance {
         service: "oai",
-        clearance: BOOTSTRAP_SERVICE_CLEARANCE,
-        justification: "the staged OpenAI-compatible API registers its key \
-             before accepting requests on its public HTTP surface",
+        clearance: HYBRID_SERVICE_CLEARANCE,
+        justification: "the hybrid-enrolled OpenAI-compatible API bridges \
+             verified browser sessions to the schema-declared internal:pq- \
+             hybrid model/inference surfaces; session and tenant authorization \
+             run at this layer",
     },
     ServiceSubjectClearance {
         service: "oauth",
@@ -608,7 +990,10 @@ mod tests {
             (policy_methods::REGISTER_SERVICE_KEY, "registerServiceKey"),
             (policy_methods::REFRESH_SERVICE_TOKEN, "refreshServiceToken"),
         ];
-        assert_eq!(table.methods().len(), expected.len());
+        assert!(
+            table.methods().len() > expected.len(),
+            "the table must also carry the inference surface declared below"
+        );
         for (method, name) in expected {
             let row = table
                 .resolve_row("policy", Some(&[*method]))
@@ -628,6 +1013,59 @@ mod tests {
             assert!(!row.justification.is_empty());
         }
 
+        // Every schema-declared inference member resolves to the hybrid label.
+        const INFERENCE_EXPECTED: &[(u16, &str)] = &[
+            (inference_methods::GENERATE_STREAM, "generateStream"),
+            (inference_methods::MODEL_INFO, "modelInfo"),
+            (inference_methods::IS_READY, "isReady"),
+            (inference_methods::APPLY_CHAT_TEMPLATE, "applyChatTemplate"),
+            (inference_methods::CREATE_LORA, "createLora"),
+            (inference_methods::LOAD_LORA, "loadLora"),
+            (inference_methods::SAVE_LORA, "saveLora"),
+            (inference_methods::UNLOAD_LORA, "unloadLora"),
+            (inference_methods::HAS_LORA, "hasLora"),
+            (inference_methods::SET_SESSION, "setSession"),
+            (inference_methods::CLEAR_SESSION, "clearSession"),
+            (inference_methods::RELEASE_SESSION, "releaseSession"),
+            (inference_methods::HEALTH_CHECK, "healthCheck"),
+            (inference_methods::SHUTDOWN, "shutdown"),
+            (inference_methods::TTT_WRITEBACK, "tttWriteback"),
+            (inference_methods::TTT_EVICT, "tttEvict"),
+            (inference_methods::TRAIN_STEP, "trainStep"),
+            (inference_methods::TTT_ZERO, "tttZero"),
+            (inference_methods::GET_DELTA_STATUS, "getDeltaStatus"),
+            (inference_methods::SAVE_ADAPTATION, "saveAdaptation"),
+            (inference_methods::SNAPSHOT_DELTA, "snapshotDelta"),
+            (inference_methods::TRAIN_STEP_STREAM, "trainStepStream"),
+            (inference_methods::EXPORT_PEFT_ADAPTER, "exportPeftAdapter"),
+            (inference_methods::MERGE_LORA, "mergeLora"),
+            (inference_methods::CREATE_LORA_STREAM, "createLoraStream"),
+            (inference_methods::LOAD_LORA_STREAM, "loadLoraStream"),
+            (inference_methods::SAVE_LORA_STREAM, "saveLoraStream"),
+            (inference_methods::SAVE_ADAPTATION_STREAM, "saveAdaptationStream"),
+            (inference_methods::SNAPSHOT_DELTA_STREAM, "snapshotDeltaStream"),
+            (
+                inference_methods::EXPORT_PEFT_ADAPTER_STREAM,
+                "exportPeftAdapterStream",
+            ),
+            (inference_methods::MERGE_LORA_STREAM, "mergeLoraStream"),
+            (inference_methods::EMBED, "embed"),
+            (inference_methods::GET_LAYER_PROFILE, "getLayerProfile"),
+        ];
+        for (method, name) in INFERENCE_EXPECTED {
+            let row = table
+                .resolve_row("inference", Some(&[*method]))
+                .unwrap_or_else(|| panic!("declared row for inference.{name} must resolve"));
+            assert_eq!(row.method_name, *name);
+            assert_eq!(row.id.service, "inference");
+            assert_eq!(
+                row.label,
+                INFERENCE_METHOD_LABEL,
+                "inference.{name} must retain its schema-declared hybrid label"
+            );
+            assert!(!row.justification.is_empty());
+        }
+
         // The seven staging bootstrap services each hold the deliberate
         // service subject clearance, and each declared caller's clearance
         // dominates every declared object label (the boot calls evaluate).
@@ -638,6 +1076,7 @@ mod tests {
             [
                 "discovery",
                 "event",
+                "inference",
                 "model",
                 "oai",
                 "oauth",
@@ -645,11 +1084,15 @@ mod tests {
                 "registry"
             ]
         );
+        // Hybrid-enrolled runtime services hold the hybrid clearance; the
+        // bootstrap identity-lifecycle services stay at the floor.
+        const HYBRID_SERVICES: &[&str] = &["inference", "model", "oai", "oauth"];
         for row in table.clearances() {
-            let expected_clearance = if row.service == "oauth" {
-                OAUTH_ISSUANCE_LABEL
-            } else {
-                BOOTSTRAP_SERVICE_CLEARANCE
+            let is_hybrid = HYBRID_SERVICES.contains(&row.service);
+            let expected_clearance = match row.service {
+                "oauth" => OAUTH_ISSUANCE_LABEL,
+                "model" | "oai" | "inference" => HYBRID_SERVICE_CLEARANCE,
+                _ => BOOTSTRAP_SERVICE_CLEARANCE,
             };
             assert_eq!(row.clearance, expected_clearance);
             assert_eq!(
@@ -661,17 +1104,22 @@ mod tests {
             for method in table.methods() {
                 let ctx = SecurityContext::from_clearance(
                     row.clearance,
-                    if row.service == "oauth" {
+                    if is_hybrid {
                         hyprstream_rpc::auth::mac::VerifiedKeyMaterial::PqHybrid
                     } else {
                         hyprstream_rpc::auth::mac::VerifiedKeyMaterial::Classical
                     },
                 );
-                let expected = row.service == "oauth" || method.id.method != policy_methods::ISSUE_TOKEN;
+                // Hybrid-enrolled services dominate every declared row
+                // (verified PqHybrid key material x hybrid clearance); floor
+                // services dominate only the floor-labelled bootstrap rows —
+                // never the schema-declared hybrid rows (issueToken,
+                // inference.*).
+                let expected = is_hybrid || method.label == SecurityLabel::bottom();
                 assert_eq!(
                     ctx.can_access(&method.label),
                     expected,
-                    "only verified hybrid service:oauth may dominate issueToken; {} against {} ({})",
+                    "{} against {} ({})",
                     row.service,
                     method.label,
                     method.method_name
@@ -1147,6 +1595,67 @@ mod tests {
             hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
             policy_methods::REFRESH_SERVICE_TOKEN,
             "the declared refreshServiceToken discriminant must match the schema union ordinal"
+        );
+
+        // inference.generateStream — lowest declared ordinal (schema assigns
+        // no @0 member; the union starts at @1).
+        let mut message = Builder::new_default();
+        {
+            let mut req = message
+                .init_root::<hyprstream_rpc_std::inference_capnp::inference_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_generate_stream();
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            inference_methods::GENERATE_STREAM,
+            "the declared generateStream discriminant must match the schema union ordinal"
+        );
+
+        // inference.healthCheck — mid-table ordinal 13.
+        let mut message = Builder::new_default();
+        {
+            let mut req = message
+                .init_root::<hyprstream_rpc_std::inference_capnp::inference_request::Builder>();
+            req.set_id(1);
+            req.set_health_check(());
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            inference_methods::HEALTH_CHECK,
+            "the declared healthCheck discriminant must match the schema union ordinal"
+        );
+
+        // inference.embed — high ordinal 32.
+        let mut message = Builder::new_default();
+        {
+            let mut req = message
+                .init_root::<hyprstream_rpc_std::inference_capnp::inference_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_embed();
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            inference_methods::EMBED,
+            "the declared embed discriminant must match the schema union ordinal"
+        );
+
+        // inference.getLayerProfile — highest declared ordinal 33.
+        let mut message = Builder::new_default();
+        {
+            let mut req = message
+                .init_root::<hyprstream_rpc_std::inference_capnp::inference_request::Builder>();
+            req.set_id(1);
+            req.set_get_layer_profile(());
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            inference_methods::GET_LAYER_PROFILE,
+            "the declared getLayerProfile discriminant must match the schema union ordinal"
         );
     }
 
