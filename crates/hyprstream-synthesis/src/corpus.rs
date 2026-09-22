@@ -307,16 +307,41 @@ impl Corpus {
         out
     }
 
-    /// Parse a JSONL corpus.
+    /// Serialize rows as JSONL with the run statistics as a required final
+    /// `{"synth_stats": ...}` line (review thread 2026-09-22 21:20): the
+    /// stats are the audit trail for label control, dedup, and the applied
+    /// correction temperatures — a rows-only export loses exactly the
+    /// information a consumer needs to reproduce temperature-dependent
+    /// balanced selection. [`Self::from_jsonl`] accepts both forms.
+    pub fn to_jsonl_with_stats(&self, publishable_only: bool) -> String {
+        let mut out = self.to_jsonl(publishable_only);
+        let stats = serde_json::json!({ "synth_stats": self.stats });
+        let _ = writeln!(out, "{stats}");
+        out
+    }
+
+    /// Parse a JSONL corpus. A trailing `{"synth_stats": ...}` line (see
+    /// [`Self::to_jsonl_with_stats`]) populates the audit trail; a
+    /// rows-only export yields default stats.
     pub fn from_jsonl(text: &str) -> Result<Self, serde_json::Error> {
         let mut rows = Vec::new();
+        let mut stats = SynthStats::default();
         for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            if serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|value| value.get("synth_stats").is_some())
+            {
+                #[derive(serde::Deserialize)]
+                struct StatsLine {
+                    #[serde(rename = "synth_stats")]
+                    stats: SynthStats,
+                }
+                stats = serde_json::from_str::<StatsLine>(line)?.stats;
+                continue;
+            }
             rows.push(CorpusRow::from_json_line(line)?);
         }
-        Ok(Self {
-            rows,
-            stats: SynthStats::default(),
-        })
+        Ok(Self { rows, stats })
     }
 }
 
@@ -390,6 +415,15 @@ mod tests {
         assert_eq!(corpus.publishable().count(), 1);
         assert_eq!(corpus.to_jsonl(true).lines().count(), 1);
         assert_eq!(corpus.to_jsonl(false).lines().count(), 2);
+        // The stats-bearing export carries the audit trail through a
+        // round-trip; the rows-only export stays a valid (default-stats)
+        // input.
+        let with_stats = corpus.to_jsonl_with_stats(false);
+        assert_eq!(with_stats.lines().count(), 3);
+        let parsed = Corpus::from_jsonl(&with_stats).unwrap();
+        assert_eq!(parsed.stats, corpus.stats);
+        let rows_only = Corpus::from_jsonl(&corpus.to_jsonl(false)).unwrap();
+        assert_eq!(rows_only.stats, SynthStats::default());
     }
 
     #[test]

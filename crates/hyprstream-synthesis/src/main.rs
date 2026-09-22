@@ -193,7 +193,7 @@ fn synthesize(args: &[String]) -> i32 {
         }
     };
     let publishable_only = has_flag(args, "--publishable-only");
-    let jsonl = corpus.to_jsonl(publishable_only);
+    let jsonl = corpus.to_jsonl_with_stats(publishable_only);
     match flag_value(args, "--out") {
         Some(path) => {
             if let Err(err) =
