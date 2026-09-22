@@ -73,13 +73,46 @@ run_phase "native release build" cargo build --release
 # contract/unit tests. Live DB tests skip themselves green unless
 # HYPRSTREAM_POSTGRES_TEST_URL_FILE points at a scratch database.
 run_phase "pds-postgres feature check" cargo check -p hyprstream --locked --all-targets --features pds-postgres
+# Fail a lane when its filter selects zero tests: libtest exits 0 on "0
+# filtered in", so a renamed or moved module would otherwise pass vacuously.
+# The --list probe reuses the already-built test binary (no extra compile).
+# The probe's cargo exit is captured before any pipeline and surfaced as-is:
+# a nonzero probe (e.g. failed test build) fails the lane even if the output
+# still contains test lines.
+assert_tests_selected() {
+  local label="$1"
+  shift
+  local list_output list_status selected
+  if list_output=$(cargo test "$@" --list --format=terse); then
+    list_status=0
+  else
+    list_status=$?
+  fi
+  if [ "${list_status}" -ne 0 ]; then
+    echo "::error::${label}: test-selection probe failed (cargo exit ${list_status}); refusing to guess selection"
+    return "${list_status}"
+  fi
+  selected=$(printf '%s\n' "${list_output}" | grep -c ': test$' || true)
+  if [ "${selected}" -eq 0 ]; then
+    echo "::error::${label}: filter selected 0 tests (stale namespace?); refusing to pass a vacuous lane"
+    return 1
+  fi
+  echo "${label}: ${selected} tests selected"
+}
+
 # The KV shell and RDS contract tests live in hyprstream-pds (pgsql_kv:: and
 # rds::tests::); the resolver-side Postgres accepted-state authority tests
 # live in hyprstream-discovery (checkpointed_pds::pg_tests::). The app crate
-# keeps the store-level PG tests (services::discovery::pg_tests::).
-run_phase "pds-postgres contract tests" cargo test -p hyprstream --locked --lib --features pds-postgres -- services::discovery::pg_tests::
-run_phase "hyprstream-pds postgres contract tests" cargo test -p hyprstream-pds --locked --lib --features postgres -- pgsql_kv:: rds::tests::
-run_phase "discovery postgres authority contract tests" cargo test -p hyprstream-discovery --locked --lib --features postgres,rocksdb -- checkpointed_pds::
+# keeps the store-level PG tests (services::pds_record_rocksdb::pg_tests::).
+# Serial: the four live tests share one scratch database (repo-head CAS and
+# the first-boot marker are shared keys).
+app_pg_test_args=(-p hyprstream --locked --lib --features pds-postgres -- services::pds_record_rocksdb::pg_tests::)
+assert_tests_selected "pds-postgres contract tests" "${app_pg_test_args[@]}"
+run_phase "pds-postgres contract tests" cargo test "${app_pg_test_args[@]}" --test-threads=1
+# The PgKv and discovery live-test lanes share one scratch database per
+# lane; --test-threads=1 matches the isolation used in their qualification.
+run_phase "hyprstream-pds postgres contract tests" cargo test -p hyprstream-pds --locked --lib --features postgres -- pgsql_kv:: rds::tests:: --test-threads=1
+run_phase "discovery postgres authority contract tests" cargo test -p hyprstream-discovery --locked --lib --features postgres,rocksdb -- checkpointed_pds:: --test-threads=1
 
 # Prove the production credential profile is causal: omitting it must fail the
 # build, never silently skip the deployable target. Compile-only and negative
