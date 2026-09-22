@@ -238,3 +238,41 @@ fn http_subject_debug_redacts_the_bearer_token() {
     );
     assert!(debug.contains("<redacted>"));
 }
+
+#[tokio::test]
+async fn http_subject_rejects_a_response_without_the_resolved_model() {
+    // The serving contract requires `response.model` to name the resolved
+    // version; accepting its absence would attribute answers to the
+    // requested alias or a version cached from an unrelated earlier
+    // response.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0u8; 65536];
+            let _ = socket.read(&mut buffer).await;
+            let body = r#"{"answers":{"is_refund":{"type":"noul","noul":0.5},"tone":{"type":"choice","probabilities":{"angry":0.5,"calm":0.5}},"severity":{"type":"score","probabilities":{"0":0.34,"1":0.33,"2":0.33}}}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let subject = HttpSubject::new(format!("http://{address}"), "some-model", "t");
+    let error = subject
+        .decide_with_version(&fixture(), &Entry::Str("The box was crushed.".into()), 0)
+        .await
+        .err()
+        .unwrap();
+    match error {
+        hyprstream_eval::EvalError::Http(message) => {
+            assert!(message.contains("model"), "the error must name the missing field: {message}");
+        }
+        other => panic!("a model-less response must be an Http error, got {other:?}"),
+    }
+    server.abort();
+}

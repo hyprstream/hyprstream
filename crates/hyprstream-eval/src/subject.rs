@@ -462,14 +462,17 @@ impl HttpSubject {
         &self.model
     }
     /// POST one decide request, returning the parsed answers and the model
-    /// version THIS response resolved to (when the server reported one).
-    /// The version travels with the answers so a concurrent run sharing
-    /// this subject cannot overwrite the resolved slot in between.
+    /// version THIS response resolved to. The version travels with the
+    /// answers so a concurrent run sharing this subject cannot overwrite
+    /// the resolved slot in between. The serving contract requires
+    /// `response.model` to identify the resolved version — a response
+    /// without it is rejected, never attributed to the requested alias or
+    /// a version cached from an unrelated earlier response.
     async fn post(
         &self,
         set: &QuestionSet,
         state: &Entry,
-    ) -> Result<(AnswerRow, Option<String>), EvalError> {
+    ) -> Result<(AnswerRow, String), EvalError> {
         let body = request_body(set, state, &self.model);
         let response = self
             .client
@@ -493,13 +496,14 @@ impl HttpSubject {
         }
         let parsed: Value = serde_json::from_str(&text)
             .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
-        let resolved = parsed
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if let Some(model) = &resolved {
-            *self.resolved.write() = Some(model.clone());
-        }
+        let Some(resolved) = parsed.get("model").and_then(Value::as_str) else {
+            return Err(EvalError::Http(
+                "response is missing the resolved `model` id the serving contract requires"
+                    .to_owned(),
+            ));
+        };
+        let resolved = resolved.to_owned();
+        *self.resolved.write() = Some(resolved.clone());
         Ok((parse_response_answers(set, &parsed)?, resolved))
     }
 }
@@ -532,9 +536,7 @@ impl Subject for HttpSubject {
         state: &Entry,
         _row: usize,
     ) -> Result<(AnswerRow, String), EvalError> {
-        let (answers, resolved) = self.post(set, state).await?;
-        let resolved = resolved.unwrap_or_else(|| self.resolved_model_id());
-        Ok((answers, resolved))
+        self.post(set, state).await
     }
 }
 
