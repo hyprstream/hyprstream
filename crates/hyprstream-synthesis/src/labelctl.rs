@@ -54,7 +54,10 @@ impl LabelController {
             .counts
             .get(&(kind.to_owned(), cardinality, label))
             .unwrap_or(&0);
-        if current <= min + slack.saturating_sub(1) {
+        // Saturating: an effectively unlimited slack (e.g. usize::MAX from a
+        // tuned config) must not overflow the threshold — a debug panic or a
+        // release wrap to zero would permanently defer the bucket.
+        if current <= min.saturating_add(slack.saturating_sub(1)) {
             self.bump(kind, cardinality, label);
             true
         } else {
@@ -105,6 +108,21 @@ mod tests {
             controller.histogram().get(&("noul".to_owned(), 2, 1)),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn huge_slack_saturates_instead_of_overflowing() {
+        // Regression (review): `min + slack - 1` with slack = usize::MAX
+        // overflowed once every label had been accepted (debug panic;
+        // release wrap to a zero threshold that permanently deferred rows).
+        let mut controller = LabelController::default();
+        let policy = LabelPolicy::Balanced { slack: usize::MAX };
+        for _ in 0..2 {
+            assert!(controller.accept(policy, "noul", 2, 0));
+            assert!(controller.accept(policy, "noul", 2, 1));
+        }
+        // min is now 2; the threshold must saturate, not overflow.
+        assert!(controller.accept(policy, "noul", 2, 0));
     }
 
     #[test]
