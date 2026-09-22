@@ -29,7 +29,9 @@ use hyprstream_core::auth::identity_store::BootstrapPubkey;
 use hyprstream_core::auth::service_jwt::issue_or_load_service_jwt;
 use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::config::TokenConfig;
-use hyprstream_rpc_std::policy_client::{PolicyCheck, RegisterServiceKey, ResolveServiceKey};
+use hyprstream_rpc_std::policy_client::{
+    IssueToken, IssueTokenProfile, PolicyCheck, RegisterServiceKey, ResolveServiceKey,
+};
 use hyprstream_core::services::PolicyService;
 use hyprstream_rpc_std::policy_client::PolicyClient;
 use hyprstream_rpc::auth::mac::global_mac_dispatch_pep;
@@ -111,6 +113,39 @@ fn mint_service_jwt(
     .expect("mint service JWT")
 }
 
+/// Register a distinct active interactive session through the same process-global
+/// authority the production OAuth flow uses before it calls PolicyService.
+async fn register_active_session(
+    issuer: &str,
+    sid: &str,
+    subject: &str,
+    tenant: &str,
+) -> Result<()> {
+    if hyprstream_rpc::auth::global_session_registry().is_none() {
+        let _ = hyprstream_rpc::auth::set_global_session_registry(Arc::new(
+            hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+        ));
+    }
+    let registry = hyprstream_rpc::auth::global_session_registry()
+        .ok_or_else(|| anyhow::anyhow!("session registry was not initialized"))?;
+    let now = chrono::Utc::now().timestamp();
+    registry
+        .register_session(
+            hyprstream_rpc::auth::SessionKey::oidc(issuer, sid),
+            hyprstream_rpc::auth::SessionState {
+                subject: subject.to_owned(),
+                tenant: tenant.to_owned(),
+                kind: hyprstream_rpc::auth::SessionKind::Interactive,
+                created_at: now,
+                expires_at: now + 3600,
+                status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                clearance_epoch: 0,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_oauth_policy_check_reaches_the_real_handler() -> Result<()> {
     install_crypto();
@@ -144,14 +179,189 @@ async fn authenticated_oauth_policy_check_reaches_the_real_handler() -> Result<(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authenticated_hybrid_oauth_issue_token_reaches_the_real_authorization_boundary() -> Result<()> {
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep();
+
+    // The production PEP is activation-controlled and every process starts
+    // FloorOnly: the anonymous-floor subject context can dominate the floor
+    // `check` row but can never dominate the schema-declared Internal/PqHybrid
+    // `issueToken` row, even with a perfect service clearance. Widen the
+    // operator control identity-aware for this test (the same mechanism the
+    // mac_enforcing_gate T8 contract exercises) and narrow on drop. This
+    // synthetic evidence tests the control mechanism only; production staging
+    // activation stays an operator gate.
+    let coverage = hyprstream_rpc::auth::mac::GenesisReport {
+        labeled: vec!["policy.issueToken".to_owned()],
+        unlabeled: Vec::new(),
+        ill_formed: Vec::new(),
+    };
+    let evidence = hyprstream_rpc::auth::mac::MacActivationEvidence {
+        genesis: &coverage,
+        mediation_integrity_g2: true,
+        denial_handling_g4: true,
+        observability_g5: true,
+        runbook_signoff_g6: true,
+        revocation_reload_g7: true,
+    };
+    hyprstream_rpc::auth::mac::global_mac_activation_control()
+        .widen_identity_aware(&evidence)?;
+    struct NarrowOnDrop;
+    impl Drop for NarrowOnDrop {
+        fn drop(&mut self) {
+            hyprstream_rpc::auth::mac::global_mac_activation_control().narrow_to_floor();
+        }
+    }
+    let _narrow = NarrowOnDrop;
+
+    let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
+    let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
+    let oauth_key = SigningKey::from_bytes(&OAUTH_KEY);
+    let credentials = tempfile::TempDir::new()?;
+    let oauth_jwt = mint_service_jwt(&credentials, "oauth", &ca_jwt_key, &oauth_key);
+    let tag = format!("mac-policy-issue-token-{}", uuid::Uuid::new_v4());
+    let client = spawn_policy_and_client(&tag, &oauth_key, Some(oauth_jwt)).await?;
+
+    // Match the authorization-code cold-signup issuance shape: OAuth asks the
+    // PolicyService to mint for an explicit hosted account subject and tenant,
+    // so the handler must apply target-tenant policy:IssueToken/manage as well
+    // as the interactive session, client ID, audience, and signing guards.
+    let subject = format!("cold-signup-{}", uuid::Uuid::new_v4());
+    let tenant = "did:web:tilde.staging.lab.hyprstream.com";
+    let issuer = "https://tilde.staging.lab.hyprstream.com";
+    let sid = format!("sid-{}", uuid::Uuid::new_v4());
+    register_active_session(issuer, &sid, &subject, tenant).await?;
+
+    let minted = client
+        .issue_token(&IssueToken {
+            requested_scopes: Some(vec!["openid".to_owned(), "profile".to_owned()]),
+            ttl: Some(300),
+            audience: Some(issuer.to_owned()),
+            subject: Some(subject),
+            user_pub_key: None,
+            dpop_jkt: None,
+            issuer: Some(issuer.to_owned()),
+            tenant: Some(tenant.to_owned()),
+            require_clearance: false,
+            session_id: Some(sid.clone()),
+            issuance_profile: IssueTokenProfile::InteractiveSession,
+            client_id: Some("cold-signup-browser".to_owned()),
+        })
+        .await
+        .expect("verified hybrid service:oauth must pass the declared issueToken PEP and real PolicyService authorization boundary");
+    assert!(!minted.token.is_empty(), "the real handler must mint a token");
+    let claims = hyprstream_rpc::auth::decode_unverified(&minted.token)?;
+    assert_eq!(claims.sid.as_deref(), Some(sid.as_str()));
+    assert_eq!(claims.tenant.as_deref(), Some(tenant));
+    assert_eq!(claims.client_id.as_deref(), Some("cold-signup-browser"));
+
+    // A signed, hybrid bootstrap service with no scoped token-issuer
+    // clearance cannot borrow OAuth's authority. The uniform dispatch denial
+    // occurs before the handler, so it cannot mint or expose its policy state.
+    let discovery_key = SigningKey::from_bytes(&DISCOVERY_KEY);
+    let discovery_credentials = tempfile::TempDir::new()?;
+    let discovery_jwt = mint_service_jwt(
+        &discovery_credentials,
+        "discovery",
+        &ca_jwt_key,
+        &discovery_key,
+    );
+    let denied_tag = format!("mac-policy-issue-token-deny-{}", uuid::Uuid::new_v4());
+    let denied_client =
+        spawn_policy_and_client(&denied_tag, &discovery_key, Some(discovery_jwt)).await?;
+    let denied = denied_client
+        .issue_token(&IssueToken {
+            requested_scopes: Some(vec!["openid".to_owned()]),
+            ttl: Some(300),
+            audience: Some(issuer.to_owned()),
+            subject: Some("other-subject".to_owned()),
+            user_pub_key: None,
+            dpop_jkt: None,
+            issuer: Some(issuer.to_owned()),
+            tenant: Some(tenant.to_owned()),
+            require_clearance: false,
+            session_id: Some(sid),
+            issuance_profile: IssueTokenProfile::InteractiveSession,
+            client_id: Some("cold-signup-browser".to_owned()),
+        })
+        .await;
+    let error = denied.expect_err("a non-OAuth service must not reach issueToken");
+    assert!(
+        format!("{error:?}").contains(hyprstream_rpc::service::dispatch::DISPATCH_DENIED),
+        "non-OAuth issueToken must fail at the uniform dispatch boundary: {error:?}"
+    );
+    Ok(())
+}
+
 /// The PolicyService's JWT key source, wired the way the service factory wires
 /// `ServiceContext::cluster_key_source()` for the offline (no JWKS fetcher)
 /// path: the purpose-derived CA JWT key plus its composite pair.
 fn cluster_key_source(ca_jwt_key: &SigningKey) -> Arc<ClusterKeySource> {
     let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&derive_mesh_mldsa_key(ca_jwt_key));
+    // The OAuth fixture mints real session tokens through PolicyService's
+    // shared signing boundary (`sign_token`), so the source must carry a
+    // mint-capable composite ledger with an active Policy-role pair — the same
+    // shape the production factory wires. Without it the issuance path fails
+    // closed with SIGNING_NOT_CONFIGURED even when every MAC gate permits.
+    let mut role_pairs = Vec::new();
+    for (seed, role) in [
+        (0x2Fu8, hyprstream_rpc::auth::CompositePairRole::OAuth),
+        (0x30u8, hyprstream_rpc::auth::CompositePairRole::Policy),
+    ] {
+        let ed = SigningKey::from_bytes(&[seed; 32]);
+        let (pq, pq_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let kid =
+            hyprstream_core::auth::jwt::composite_kid(&pq_vk, &ed.verifying_key());
+        role_pairs.push(hyprstream_rpc::auth::CompositeKeyPair::signing(
+            kid,
+            std::sync::Arc::new(pq),
+            std::sync::Arc::new(ed),
+            role,
+            hyprstream_rpc::auth::CompositePairState::Active,
+            0,
+            i64::MAX,
+        ));
+    }
+    // mint_snapshot() reads the COMMITTED on-disk ledger generation (flock +
+    // committed marker + committed ledger file) and requires the in-memory
+    // publication to match it exactly, so a bare publish() is not enough.
+    let dir = std::env::temp_dir().join(format!(
+        "hyprstream-mac-dispatch-fixture-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).expect("fixture composite authority dir");
+    let ledger = dir.join("ledger.json");
+    let committed = dir.join("committed");
+    let committed_ledger_prefix = dir.join("committed-ledger");
+    let key_set = std::sync::Arc::new(hyprstream_rpc::auth::CompositeKeySet::default());
+    key_set.configure_authority(
+        ledger.clone(),
+        committed.clone(),
+        committed_ledger_prefix.clone(),
+        dir.join("lock"),
+    );
+    const GENERATION: u64 = 1;
+    const DIGEST: &str = "mac-dispatch-boot-labeling-fixture";
+    key_set
+        .publish(GENERATION, DIGEST.to_owned(), role_pairs)
+        .expect("fixture composite ledger publication");
+    std::fs::write(
+        &committed,
+        format!(r#"{{"version":{GENERATION},"component_digest":"{DIGEST}"}}"#),
+    )
+    .expect("fixture committed marker");
+    std::fs::write(
+        committed_ledger_prefix.with_file_name(format!(
+            "committed-ledger-{GENERATION}-{DIGEST}.json"
+        )),
+        format!(r#"{{"version":{GENERATION},"component_digest":"{DIGEST}"}}"#),
+    )
+    .expect("fixture committed ledger");
     Arc::new(
         ClusterKeySource::new(ca_jwt_key.verifying_key(), ISSUER.to_owned())
-            .with_ca_composite_key(ca_pq_vk),
+            .with_ca_composite_key(ca_pq_vk)
+            .with_composite_key_set(key_set),
     )
 }
 
