@@ -95,6 +95,11 @@ pub enum DecodeError {
     /// non-empty) — the row would only fail later in Arrow emission.
     #[error("conformal set member impossible for the answer kind (question {0})")]
     ConformalLabelImpossible(String),
+    /// A zero-answer row — it cannot bind to any valid question set (which
+    /// requires at least one question) and always fails Arrow emission
+    /// with MissingAnswer.
+    #[error("answer row on the wire carries zero answers")]
+    EmptyAnswerRow,
 }
 
 /// Errors encoding IR into a `decision.capnp` message.
@@ -183,6 +188,10 @@ pub enum EncodeError {
     /// — the decoder rejects the same rows, so encode mirrors the rule.
     #[error("conformal set member impossible for the answer kind (question {0})")]
     ConformalLabelImpossible(String),
+    /// A zero-answer row — the decoder rejects these (they cannot bind to
+    /// any valid question set), so encode mirrors the rule.
+    #[error("answer row cannot be encoded with zero answers")]
+    EmptyAnswerRow,
 }
 
 impl From<capnp::Error> for DecodeError {
@@ -592,11 +601,14 @@ fn set_answer_value(mut builder: decision_capnp::answer_value::Builder<'_>, valu
 fn has_impossible_conformal_label(members: &[String], value: &AnswerValue) -> bool {
     match value {
         AnswerValue::Noul { .. } => members.iter().any(|m| m != "false" && m != "true"),
-        AnswerValue::Score { probabilities } => members.iter().any(|m| {
-            m.parse::<usize>()
-                .map(|index| index >= probabilities.len())
-                .unwrap_or(true)
-        }),
+        AnswerValue::Score { probabilities } => {
+            // Score labels are derived exactly as `index.to_string()` — a
+            // permissive integer parse would admit noncanonical strings
+            // ("01", "+1") that Arrow emission later rejects.
+            let canonical: Vec<String> =
+                (0..probabilities.len()).map(|index| index.to_string()).collect();
+            members.iter().any(|m| !canonical.contains(m))
+        }
         AnswerValue::Choice { .. } => members.iter().any(String::is_empty),
     }
 }
@@ -622,6 +634,9 @@ pub fn batch_to_message(
     }
     let mut rows_builder = root.init_rows(rows.len() as u32);
     for (row_index, row) in rows.iter().enumerate() {
+        if row.answers.is_empty() {
+            return Err(EncodeError::EmptyAnswerRow);
+        }
         let row_builder = rows_builder.reborrow().get(row_index as u32);
         let mut answers = row_builder.init_answers(row.answers.len() as u32);
         for (answer_index, (question_id, answer)) in row.answers.iter().enumerate() {
@@ -717,6 +732,9 @@ pub fn batch_from_reader(
     let mut rows = Vec::with_capacity(rows_reader.len() as usize);
     for row in rows_reader.iter() {
         let mut answers = std::collections::BTreeMap::new();
+        if row.get_answers()?.is_empty() {
+            return Err(DecodeError::EmptyAnswerRow);
+        }
         for answer in row.get_answers()?.iter() {
             let question_id = answer.get_question_id()?.to_str()?.to_owned();
             if question_id.is_empty() {

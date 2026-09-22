@@ -1060,6 +1060,72 @@ fn conformal_labels_are_validated_against_the_answer_kind() {
     );
 }
 
+/// Round 9: zero-answer rows are rejected at both boundaries (they cannot
+/// bind to any valid question set and always fail Arrow emission with
+/// MissingAnswer), and score conformal members must be the canonical
+/// decimal labels ("0", "1", ...) — a permissive integer parse would admit
+/// "01"/"+1" that Arrow emission later rejects.
+#[test]
+fn empty_rows_and_noncanonical_score_labels_are_rejected() {
+    let version = VersionTriple {
+        schema: "s".into(),
+        model: "m".into(),
+        calib: None,
+    };
+
+    // Encode: zero-answer row rejected.
+    assert!(matches!(
+        decision::batch_to_message(&version, &[AnswerRow::default()]),
+        Err(decision::EncodeError::EmptyAnswerRow)
+    ));
+
+    // Encode: a noncanonical score label ("01" for a 2-level score) is
+    // rejected even though a permissive parse would call it in range.
+    let mut noncanonical = row(vec![(
+        "q",
+        QuestionAnswer::answered(AnswerValue::Score {
+            probabilities: vec![0.7, 0.3],
+        }),
+    )]);
+    noncanonical
+        .answers
+        .get_mut("q")
+        .expect("answer")
+        .conformal_set = Some(vec!["01".into()]);
+    assert!(matches!(
+        decision::batch_to_message(&version, &[noncanonical]),
+        Err(decision::EncodeError::ConformalLabelImpossible(_))
+    ));
+
+    // Decode: zero-answer row rejected.
+    let raw_batch = |answers: u32| -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut root = message
+                .init_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Builder<'_>>();
+            let mut triple = root.reborrow().init_version();
+            triple.set_schema("s");
+            triple.set_model("m");
+            triple.init_calib().set_none(());
+            root.init_rows(1).get(0).init_answers(answers);
+        }
+        wire_roundtrip(&message)
+    };
+    let bytes = raw_batch(0);
+    let message = capnp::serialize::read_message(
+        &mut &bytes[..],
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("parses");
+    let reader = message
+        .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
+        .expect("root");
+    assert!(matches!(
+        decision::batch_from_reader(reader),
+        Err(decision::DecodeError::EmptyAnswerRow)
+    ));
+}
+
 /// The encoder mirrors the decode-side answer rules (round 7): an empty
 /// BTreeMap key and distribution lengths no valid spec could match
 /// (choice 2-255, score >= 2) are rejected, so a successful encode stays
