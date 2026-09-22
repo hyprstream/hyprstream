@@ -149,13 +149,24 @@ impl Firewall {
         let bytes = std::fs::read(path).map_err(FirewallError::Io)?;
         let text = String::from_utf8_lossy(&bytes);
         let manifest = Manifest::from_json(&text).map_err(FirewallError::Parse)?;
-        if let Some(disclosure_path) = disclosure_path_for(path, &manifest) {
-            let disclosure_bytes =
-                std::fs::read(&disclosure_path).map_err(FirewallError::DisclosureIo)?;
-            let found = blake3_hex(&disclosure_bytes);
-            if found != EXPECTED_DISCLOSURE_BLAKE3 || found != manifest.disclosure.blake3 {
-                return Err(FirewallError::DisclosureDigestMismatch { found });
-            }
+        // An unresolvable disclosure path (e.g. the manifest supplied as a
+        // single-component relative path) must fail closed, not silently
+        // skip the disclosure verification.
+        let disclosure_path = disclosure_path_for(path, &manifest).ok_or_else(|| {
+            FirewallError::DisclosureIo(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "cannot resolve pinned DISCLOSURE path {} relative to {}",
+                    manifest.disclosure.path,
+                    path.display()
+                ),
+            ))
+        })?;
+        let disclosure_bytes =
+            std::fs::read(&disclosure_path).map_err(FirewallError::DisclosureIo)?;
+        let found = blake3_hex(&disclosure_bytes);
+        if found != EXPECTED_DISCLOSURE_BLAKE3 || found != manifest.disclosure.blake3 {
+            return Err(FirewallError::DisclosureDigestMismatch { found });
         }
         Self::from_verified_bytes(&bytes)
     }

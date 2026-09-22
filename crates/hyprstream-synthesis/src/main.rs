@@ -77,10 +77,13 @@ fn reject_unknown_args(
         if bool_flags.contains(&arg) {
             index += 1;
         } else if value_flags.contains(&arg) {
-            if index + 1 >= args.len() {
-                return Some(format!("{arg} requires a value"));
+            match args.get(index + 1) {
+                // A following flag token is not a value: `--out
+                // --publishable-only` must report the missing argument, not
+                // create a file literally named `--publishable-only`.
+                Some(next) if !next.starts_with('-') => index += 2,
+                _ => return Some(format!("{arg} requires a value")),
             }
-            index += 2;
         } else {
             return Some(format!("unrecognized argument {arg}"));
         }

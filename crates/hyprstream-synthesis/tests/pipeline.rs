@@ -465,6 +465,15 @@ fn cli_rejects_unknown_arguments() {
         ],
         vec!["run", "--roster", roster, "--manifest", &manifest, "stray"],
         vec!["run", "--roster"],
+        vec![
+            "run",
+            "--roster",
+            roster,
+            "--manifest",
+            &manifest,
+            "--out",
+            "--publishable-only",
+        ],
         vec!["roster-md", "--roster", roster, "--verbse"],
     ] {
         let out = std::process::Command::new(bin)
@@ -494,5 +503,41 @@ fn cli_rejects_unknown_arguments() {
         good.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&good.stderr)
+    );
+}
+
+#[test]
+fn cli_fails_closed_when_disclosure_path_is_unresolvable() {
+    // Regression (review): supplying the pinned manifest as a single-
+    // component relative path made disclosure_path_for return None, and the
+    // loader silently skipped disclosure verification — the exact pinned
+    // bytes would load even with DISCLOSURE.md absent or drifted. The
+    // unresolvable branch now fails closed with DisclosureIo.
+    let bin = env!("CARGO_BIN_EXE_hyprstream-synthesis");
+    let dir = std::env::temp_dir().join(format!("p13-fw-bare-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(manifest_path(), dir.join("vob-1.1.manifest.json")).unwrap();
+    let roster_path = dir.join("roster.json");
+    std::fs::write(
+        &roster_path,
+        r#"{"teachers":[{"id":"sim","version":"simulated","tos_class":"open-weights"}]}"#,
+    )
+    .unwrap();
+    let out = std::process::Command::new(bin)
+        .current_dir(&dir)
+        .args([
+            "run",
+            "--roster",
+            roster_path.to_str().unwrap(),
+            "--manifest",
+            "vob-1.1.manifest.json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("DISCLOSURE"),
+        "stderr must name the disclosure failure: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
