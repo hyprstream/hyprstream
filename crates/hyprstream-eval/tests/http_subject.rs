@@ -276,3 +276,38 @@ async fn http_subject_rejects_a_response_without_the_resolved_model() {
     }
     server.abort();
 }
+
+#[tokio::test]
+async fn http_subject_rejects_an_empty_resolved_model() {
+    // `"model":""` is the same contract violation as a missing field:
+    // accepting it would produce runs and Arrow version triples with no
+    // model provenance (set runs only fail later, in BatchSink::persist_run).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0u8; 65536];
+            let _ = socket.read(&mut buffer).await;
+            let body = r#"{"model":"","answers":{"is_refund":{"type":"noul","noul":0.5},"tone":{"type":"choice","probabilities":{"angry":0.5,"calm":0.5}},"severity":{"type":"score","probabilities":{"0":0.34,"1":0.33,"2":0.33}}}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let subject = HttpSubject::new(format!("http://{address}"), "some-model", "t");
+    let error = subject
+        .decide_with_version(&fixture(), &Entry::Str("The box was crushed.".into()), 0)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::Http(_)),
+        "an empty model must be an Http error, got {error:?}"
+    );
+    server.abort();
+}
