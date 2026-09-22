@@ -20,6 +20,7 @@ readonly STAGING_POSTGRES_IMAGE_FEATURES='otel,gittorrent,xet,credential-pds-pos
 # module move or an empty filter cannot silently turn this into a green skip.
 run_live_module() {
   local filter="$1"
+  local sentinel="$2"
   local log
   local passed
   log="$(mktemp "${TMPDIR:-/tmp}/hyprstream-postgres-qualification.XXXXXX.log")"
@@ -37,6 +38,11 @@ run_live_module() {
     echo "PostgreSQL qualification skipped ${filter}" >&2
     return 1
   fi
+  if ! grep -Fq "test ${sentinel} ... ok" "${log}"; then
+    rm -f "${log}"
+    echo "PostgreSQL qualification missed required test ${sentinel}" >&2
+    return 1
+  fi
   passed="$(sed -nE 's/^test result: ok\. ([0-9]+) passed;.*$/\1/p' "${log}" | tail -n 1)"
   rm -f "${log}"
   if [[ ! "${passed}" =~ ^[1-9][0-9]*$ ]]; then
@@ -46,6 +52,9 @@ run_live_module() {
   printf 'postgres-qualification filter=%s passed=%s\n' "${filter}" "${passed}"
 }
 
-run_live_module 'auth::postgres_store::tests::'
-run_live_module 'services::pds_record_pg::tests::live_'
-run_live_module 'services::pds_record_rocksdb::pg_tests::live_'
+run_live_module 'auth::postgres_store::tests::' \
+  'auth::postgres_store::tests::add_list_remove_pubkey'
+run_live_module 'services::pds_record_pg::tests::live_' \
+  'services::pds_record_pg::tests::live_put_get_roundtrip_and_absent'
+run_live_module 'services::pds_record_rocksdb::pg_tests::live_' \
+  'services::pds_record_rocksdb::pg_tests::live_two_handle_persistence_and_visibility'
