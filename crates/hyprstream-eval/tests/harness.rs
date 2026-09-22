@@ -809,3 +809,99 @@ async fn run_set_validates_each_row_before_requesting_the_next() {
         "row 3 must not be requested after row 2 failed validation"
     );
 }
+
+/// Reports a stale global version but binds a fresh one to each response —
+/// the shape an HTTP subject presents when a concurrent run overwrites the
+/// shared resolved slot between a decide and a later resolved_model_id read.
+struct FreshPerResponseSubject;
+
+#[async_trait::async_trait]
+impl Subject for FreshPerResponseSubject {
+    fn model_id(&self) -> &str {
+        "alias"
+    }
+
+    fn resolved_model_id(&self) -> String {
+        "stale-global".to_owned()
+    }
+
+    async fn decide(
+        &self,
+        set: &QuestionSet,
+        _state: &Entry,
+        _row: usize,
+    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+        let mut answers = std::collections::BTreeMap::new();
+        for question in &set.questions {
+            answers.insert(
+                question.id.clone(),
+                QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.5 }),
+            );
+        }
+        Ok(AnswerRow { answers })
+    }
+
+    async fn decide_with_version(
+        &self,
+        set: &QuestionSet,
+        state: &Entry,
+        row: usize,
+    ) -> Result<(AnswerRow, String), hyprstream_eval::EvalError> {
+        Ok((self.decide(set, state, row).await?, "fresh-v42".to_owned()))
+    }
+}
+
+#[tokio::test]
+async fn teacher_answers_use_the_version_bound_to_each_response() {
+    // Teacher provenance is persisted raw: it must record the version from
+    // the same exchange as the answers, never a later global read.
+    let ensemble = hyprstream_eval::TeacherEnsemble::new(vec![hyprstream_eval::Teacher {
+        id: "t1".into(),
+        tos_class: hyprstream_eval::TosClass::InternalOnly,
+        subject: Box::new(FreshPerResponseSubject),
+    }])
+    .unwrap();
+    let set = QuestionSet {
+        state: None,
+        questions: vec![noul_item().question],
+    };
+    let output = ensemble.decide(&set, &Entry::Null, 0, "item-1").await.unwrap();
+    assert_eq!(output.teacher_answers.len(), 1);
+    assert_eq!(output.teacher_answers[0].model_id, "fresh-v42");
+}
+
+#[test]
+fn flip_rate_skips_members_whose_question_the_base_row_abstained_on() {
+    // The base row answered q1 but abstained on q2 (abstentions never enter
+    // a group), so q2 has NO base prediction: an answered rotated q2 member
+    // must be skipped, not compared against q1's base (the old single-base
+    // fallback recorded a spurious flip there). q1 is label-stable, so the
+    // flip rate is exactly 0.
+    use hyprstream_eval::{flip_rate_with_labels, Observation};
+    let obs = |id: &str, question_id: &str, probabilities: Vec<f32>| Observation {
+        id: id.into(),
+        question_id: question_id.into(),
+        kind: hyprstream_decision::QuestionKind::Choice,
+        family: None,
+        stratum: None,
+        group: Some("g".into()),
+        probabilities: Some(probabilities),
+        truth: None,
+    };
+    let observations = vec![
+        obs("g", "q1", vec![0.8, 0.1, 0.1]),
+        // (no base observation for q2 — the base row abstained on it)
+        obs("g-p1", "q1", vec![0.8, 0.1, 0.1]),
+        obs("g-p1", "q2", vec![0.1, 0.8, 0.1]),
+    ];
+    let labels_of = |question_id: &str| -> Option<Vec<String>> {
+        match question_id {
+            "q1" => Some(vec!["a".into(), "b".into(), "c".into()]),
+            "q2" => Some(vec!["x".into(), "y".into(), "z".into()]),
+            _ => None,
+        }
+    };
+    let flip = flip_rate_with_labels(&observations, labels_of);
+    assert_eq!(flip.groups, 1);
+    assert_eq!(flip.flip_rate, 0.0);
+}
